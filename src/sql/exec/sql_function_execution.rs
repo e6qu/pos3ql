@@ -728,7 +728,7 @@ impl SqlExecution {
                             &mut self.pending_write,
                         )
                     } else {
-                        let output_mark = context.responder.buffer.mark();
+                        let output_mark = context.responder.mark();
                         let PlpgsqlExecHost::Routine {
                             engine,
                             guc,
@@ -759,7 +759,7 @@ impl SqlExecution {
                                 )
                             })
                             .map_err(response_full)?;
-                        context.responder.buffer.truncate_to(output_mark);
+                        context.responder.truncate_to(output_mark);
                         result.map(|()| 0)
                     }
                 },

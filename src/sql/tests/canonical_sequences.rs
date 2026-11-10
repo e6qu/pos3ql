@@ -511,7 +511,7 @@ fn sequence_advances_from_another_transaction_survive_cold_commit_retries() {
     {
         assert_eq!(wait, StatementWait::ObjectIo);
         assert!(Instant::now() < deadline, "cold SELECT did not finish");
-        session.send.truncate_to(output_mark);
+        output_mark.truncate_unsent(&mut session.send);
         engine.bind_query_connection(session.connection_id);
         status = crate::mem::guard::forbid_alloc(|| {
             for slot in 0..engine.block_read_slots() {

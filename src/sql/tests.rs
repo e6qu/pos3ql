@@ -18290,7 +18290,7 @@ fn run_with_fixed_memory_and_ddl_capacity(
                 wait,
             } => {
                 assert_eq!(wait, StatementWait::ObjectIo);
-                buffer.truncate_to(output_mark);
+                output_mark.truncate_unsent(&mut buffer);
                 resume_statement = completed_statements;
                 engine.commit_wal().unwrap();
             }
@@ -19330,7 +19330,7 @@ fn critical_cache_pressure_parks_writers_while_checkpoint_turns_make_progress() 
                 } => {
                     assert_eq!(wait, StatementWait::CacheCapacity);
                     assert_eq!(completed_statements, 0);
-                    assert_eq!(output_mark, 0);
+                    assert_eq!(output_mark, crate::pg::overflow::OutputMark::new(0, 0));
                     assert!(session.send.is_empty());
                     waited = true;
                     waiting_turns += 1;
@@ -62595,7 +62595,7 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
         status,
         ExecutionStatus::Blocked {
             completed_statements: 0,
-            output_mark: 0,
+            output_mark: crate::pg::overflow::OutputMark::new(0, 0),
             wait: crate::sql::StatementWait::Lock,
         },
         "{}",
@@ -94709,7 +94709,7 @@ fn maintenance_metadata_cache_admission_waits_before_sequences_and_triggers_in_b
                     &mut session.cursors, &session.guc, &mut responder, session.connection_id, false).unwrap() {
                     ExtendedExecutionStatus::Complete(_) => ExecutionStatus::Complete,
                     ExtendedExecutionStatus::Blocked { wait } => ExecutionStatus::Blocked {
-                        completed_statements: 0, output_mark: responder.buffer.mark(), wait,
+                        completed_statements: 0, output_mark: responder.mark(), wait,
                     },
                 }
             } else {
@@ -95690,7 +95690,7 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
         });
         namespace.borrow_mut().faults.fail_from_op = None;
         engine.commit_wal().unwrap();
-        session.send.truncate_to(output_mark);
+        output_mark.truncate_unsent(&mut session.send);
         let status = crate::mem::guard::forbid_alloc(|| {
             engine.execute_simple_from(
                 "COMMIT",
@@ -97409,7 +97409,10 @@ fn parallel_commit_begin_boundary_preserves_prefixes_and_sequence_gaps() {
                     wait,
                 } => {
                     assert_eq!(wait, StatementWait::ObjectIo);
-                    assert_eq!(session.send.len(), output_mark);
+                    assert_eq!(
+                        output_mark,
+                        crate::pg::overflow::OutputMark::new(session.send.len(), 0)
+                    );
                     assert!(session.transaction.staged_commit().is_some());
                     completed_statements
                 }
@@ -97470,7 +97473,7 @@ fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
                     ExtendedExecutionStatus::Complete(_) => ExecutionStatus::Complete,
                     ExtendedExecutionStatus::Blocked { wait } => ExecutionStatus::Blocked {
                         completed_statements: 0,
-                        output_mark: responder.buffer.mark(),
+                        output_mark: responder.mark(),
                         wait,
                     },
                 }

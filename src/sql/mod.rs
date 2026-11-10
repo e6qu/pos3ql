@@ -896,6 +896,8 @@ pub enum StatementWait {
     Lock,
     ObjectIo,
     CacheCapacity,
+    /// Queued output must reach the client before the connection continues.
+    ClientOutput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -907,7 +909,7 @@ pub enum ExecutionStatus {
     /// when the message resumes.
     Blocked {
         completed_statements: usize,
-        output_mark: usize,
+        output_mark: crate::pg::overflow::OutputMark,
         wait: StatementWait,
     },
 }
@@ -8919,6 +8921,11 @@ impl Engine {
         self.wal_upload
     }
 
+    /// The shared pool that queues result output for slow clients.
+    pub(crate) fn result_spool(&self) -> std::sync::Arc<crate::mem::lease_pool::LeasePool> {
+        std::sync::Arc::clone(self.storage.result_spool())
+    }
+
     /// Makes a previously failed committed batch object-store durable before a
     /// later statement can observe it.
     fn retry_pending_wal_upload(&mut self) -> Result<(), SqlError> {
@@ -10383,6 +10390,7 @@ impl Engine {
             StatementWait::Lock => self.storage.lock_wait_generation(connection),
             StatementWait::ObjectIo => self.lock_generation(),
             StatementWait::CacheCapacity => self.cache_capacity_generation(),
+            StatementWait::ClientOutput => 0,
         }
     }
 
@@ -11319,12 +11327,12 @@ impl Engine {
             responder.error(error.sqlstate, error.message.as_str())?;
             return Ok(ExecutionStatus::Complete);
         }
-        let output_mark = responder.buffer.mark();
+        let output_mark = responder.mark();
         let result = self.execute_simple_from(
             text, 0, arena, txn, sqlprep, cursors, guc, responder, conn_id, false,
         )?;
         if let Err(error) = self.commit_wal() {
-            responder.buffer.truncate_to(output_mark);
+            responder.truncate_to(output_mark);
             responder.error(error.sqlstate, error.message.as_str())?;
         }
         Ok(result)
@@ -11446,7 +11454,7 @@ impl Engine {
                 {
                     return Ok(ExecutionStatus::Blocked {
                         completed_statements: resume_statement,
-                        output_mark: responder.buffer.mark(),
+                        output_mark: responder.mark(),
                         wait: if txn.staged_commit().is_some()
                             || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                         {
@@ -11579,7 +11587,7 @@ impl Engine {
                         {
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
-                                output_mark: responder.buffer.mark(),
+                                output_mark: responder.mark(),
                                 wait: if error.sqlstate == sqlstate::INTERNAL_IO_WAIT {
                                     StatementWait::ObjectIo
                                 } else {
@@ -11677,7 +11685,7 @@ impl Engine {
                     {
                         return Ok(ExecutionStatus::Blocked {
                             completed_statements: statement_index,
-                            output_mark: responder.buffer.mark(),
+                            output_mark: responder.mark(),
                             wait: if txn.staged_commit().is_some()
                                 || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                             {
@@ -11700,7 +11708,7 @@ impl Engine {
                     Ok(true) => {
                         return Ok(ExecutionStatus::Blocked {
                             completed_statements: statement_index,
-                            output_mark: responder.buffer.mark(),
+                            output_mark: responder.mark(),
                             wait: StatementWait::CacheCapacity,
                         });
                     }
@@ -11724,14 +11732,14 @@ impl Engine {
                     txn.suspended_statement_context().is_some(),
                     Some(self.storage.advisory_journal()),
                 );
-                let output_mark = responder.buffer.mark();
+                let output_mark = responder.mark();
                 let statement_mark =
                     txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
                 let plan_owner = sqlprep
                     .transient_owner(statement_index)
                     .and_then(|owner| self.storage.begin_advisory_statement().map(|()| owner));
                 let outcome = match plan_owner {
-                    Ok(owner) => type_input_plans::with_owner(owner, || {
+                    Ok(owner) => match type_input_plans::with_owner(owner, || {
                         type_inputs::with_source(
                             type_inputs::Source::RootCommand {
                                 statement: statement_index,
@@ -11753,7 +11761,23 @@ impl Engine {
                                 )
                             },
                         )
-                    })?,
+                    }) {
+                        Ok(outcome) => outcome,
+                        Err(WireFull) => {
+                            // The client output spool is exhausted: the result
+                            // fails like any statement error after its sent rows.
+                            sequence_scope.discard(guc.seq_session());
+                            txn.release_suspended_statement();
+                            if txn.is_explicit() {
+                                txn.failed = true;
+                            } else {
+                                cursors.on_rollback();
+                                self.rollback_txn(txn, guc);
+                            }
+                            responder.replace_with_overflow_error(output_mark)?;
+                            return Ok(ExecutionStatus::Complete);
+                        }
+                    },
                     Err(error) => Err(error),
                 };
                 let outcome = outcome
@@ -11800,7 +11824,7 @@ impl Engine {
                             self.storage.preserve_advisory_statement();
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
-                                output_mark: responder.buffer.mark(),
+                                output_mark: responder.mark(),
                                 wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
                                     StatementWait::ObjectIo
                                 } else {
@@ -11950,7 +11974,7 @@ impl Engine {
                 {
                     return Ok(ExecutionStatus::Blocked {
                         completed_statements: statement_count,
-                        output_mark: responder.buffer.mark(),
+                        output_mark: responder.mark(),
                         wait: if txn.staged_commit().is_some()
                             || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                         {
@@ -12279,7 +12303,7 @@ impl Engine {
                             self.storage.lock_mark(),
                         );
                         emit_parse_warnings(&mut parser, responder)?;
-                        let output_mark = responder.buffer.mark();
+                        let output_mark = responder.mark();
                         let outcome = if resuming_utility {
                             self.commit_txn_with_triggers(
                                 txn,
@@ -12680,7 +12704,7 @@ impl Engine {
                 }
             };
             txn.compact_completed_constraints();
-            let response_mark = responder.buffer.mark();
+            let response_mark = responder.mark();
             responder.function_call_response(&value, binary_result)?;
             if txn.is_implicit()
                 && let Err(error) = self.commit_txn_with_triggers(
@@ -12710,7 +12734,7 @@ impl Engine {
                         },
                     });
                 }
-                responder.buffer.truncate_to(response_mark);
+                responder.truncate_to(response_mark);
                 responder.error(error.sqlstate, error.message.as_str())?;
                 responder.ready_for_query(txn.status_byte())?;
                 return Ok(ExtendedExecutionStatus::Complete(false));
@@ -12908,7 +12932,7 @@ impl Engine {
                         progress.waiting.is_some(),
                         Some(self.storage.advisory_journal()),
                     );
-                    let output_mark = responder.buffer.mark();
+                    let output_mark = responder.mark();
                     let result = if lock_timeout_expired {
                         Ok(Err(sql_err!(
                             sqlstate::LOCK_NOT_AVAILABLE,
@@ -12956,7 +12980,7 @@ impl Engine {
                             }
                         }
                         Ok(Err(error)) => {
-                            responder.buffer.truncate_to(output_mark);
+                            responder.truncate_to(output_mark);
                             let error = if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                                 || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                             {
@@ -13161,7 +13185,7 @@ impl Engine {
                 resumed,
                 Some(self.storage.advisory_journal()),
             );
-            let output_mark = responder.buffer.mark();
+            let output_mark = responder.mark();
             let effect_reads = self
                 .ckpt
                 .as_ref()
@@ -13197,7 +13221,7 @@ impl Engine {
                     Ok(scope.finish(guc.seq_session()))
                 }
                 Ok(Err(error)) => {
-                    responder.buffer.truncate_to(output_mark);
+                    responder.truncate_to(output_mark);
                     let error = if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                         || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                     {
@@ -15223,7 +15247,7 @@ impl Engine {
             self.work.reset();
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
-            let output_mark = responder.buffer.mark();
+            let output_mark = responder.mark();
             let outcome = self.execute_select_once(
                 statement,
                 arena,
@@ -15239,7 +15263,7 @@ impl Engine {
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                 return Ok(Err(error));
             }
-            responder.buffer.truncate_to(output_mark);
+            responder.truncate_to(output_mark);
             let Some(pending) = invocations.take_pending() else {
                 return Ok(Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -15328,7 +15352,7 @@ impl Engine {
                 self.work.reset();
                 self.storage.set_read_snapshot(source_snapshot);
                 invocations.begin_attempt();
-                let output_mark = responder.buffer.mark();
+                let output_mark = responder.mark();
                 let outcome = {
                     let sequence =
                         sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
@@ -15343,7 +15367,7 @@ impl Engine {
                 if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                     return Ok(Err(error));
                 }
-                responder.buffer.truncate_to(output_mark);
+                responder.truncate_to(output_mark);
                 let Some(pending) = invocations.take_pending() else {
                     return Ok(Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -15621,7 +15645,7 @@ impl Engine {
             self.work.reset();
             invocations.begin_attempt();
             let attempt_arena_mark = arena.mark();
-            let output_mark = responder.buffer.mark();
+            let output_mark = responder.mark();
             let statement_mark =
                 txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
             let boundary = completion_handoff.then_some(txn::WriteCompletionBoundary {
@@ -15684,7 +15708,7 @@ impl Engine {
             }
             self.rollback_waiting_statement(txn, statement_mark);
             self.dml_scratch.clear();
-            responder.buffer.truncate_to(output_mark);
+            responder.truncate_to(output_mark);
             // The failed attempt has emitted or encoded every value it owns.
             // Keep prior invocation results below the mark and reclaim only
             // the materialization that will be rebuilt on the next attempt.
@@ -17609,7 +17633,7 @@ impl Engine {
                         Err(error) => return Ok(Err(parse_error_to_sql(&error))),
                     };
                     parser.set_type_inputs(body_inputs.bindings);
-                    let output_mark = responder.buffer.mark();
+                    let output_mark = responder.mark();
                     let statements =
                         match arena.alloc_slice_with(parser::statement_capacity(body), |_| None) {
                             Ok(statements) => statements,
@@ -17621,7 +17645,7 @@ impl Engine {
                             Ok(Some(statement)) => statement,
                             Ok(None) => break,
                             Err(error) => {
-                                responder.buffer.truncate_to(output_mark);
+                                responder.truncate_to(output_mark);
                                 return Ok(Err(parse_error_to_sql(&error)));
                             }
                         };
@@ -17700,7 +17724,7 @@ impl Engine {
                                 _ => None,
                             };
                             let Some(output_query) = output_query else {
-                                responder.buffer.truncate_to(output_mark);
+                                responder.truncate_to(output_mark);
                                 return Ok(Err(sql_err!(
                                     sqlstate::INVALID_FUNCTION_DEFINITION,
                                     "SQL procedure with output parameters must end with a query"
@@ -17745,7 +17769,7 @@ impl Engine {
                                     Ok(())
                                 },
                             ) {
-                                responder.buffer.truncate_to(output_mark);
+                                responder.truncate_to(output_mark);
                                 return Ok(Err(error));
                             }
                             if output_rows == 0 {
@@ -17766,16 +17790,16 @@ impl Engine {
                         ) {
                             Ok(Ok(())) => {}
                             Ok(Err(error)) => {
-                                responder.buffer.truncate_to(output_mark);
+                                responder.truncate_to(output_mark);
                                 return Ok(Err(error));
                             }
                             Err(error) => {
-                                responder.buffer.truncate_to(output_mark);
+                                responder.truncate_to(output_mark);
                                 return Err(error);
                             }
                         }
                     }
-                    responder.buffer.truncate_to(output_mark);
+                    responder.truncate_to(output_mark);
                     if output_count != 0 {
                         let mut description = [ColDesc::new("", types::oid::TEXT, -1);
                             crate::storage::MAX_ROUTINE_ARGUMENTS];

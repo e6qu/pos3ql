@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod conn;
+pub mod overflow;
 pub mod pginput;
 pub mod pgoutput;
 pub mod replication_client;

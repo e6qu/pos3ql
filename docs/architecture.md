@@ -67,15 +67,34 @@ download cannot hold up the next checkpoint.
 The rule for statements: a statement can yield until it performs its first
 **effect** — something a restart could not undo or repeat. Effects are calling
 a volatile function or a user routine body, issuing `nextval`/`setval`, and
-flushing output to the client. After the first effect, the remaining reads of
-that statement block until the statement ends.
+output actually reaching the client. After the first effect, the remaining
+reads of that statement block until the statement ends.
+
+**The worker never waits for a client.** A result larger than the
+connection's send buffer (`conn_send_buffer_bytes`) queues in the
+connection's **overflow area**: rows lease space from the shared result spool
+(`result_spool_bytes` / `result_spool_leases`), and a private reserve the
+size of the send buffer always holds the closing `CommandComplete`,
+`ErrorResponse` and `ReadyForQuery`. Socket writes are non-blocking for both
+plaintext and TLS. While a client reads slowly, the statement still finishes,
+and the connection then waits for the client to read its queued output before
+it processes the next message (pipelined messages wait in order); other
+connections keep running. A client that falls further behind than the spool
+receives the rows already queued, then `54000` naming `result_spool_bytes`, and
+its session stays usable; an implicit transaction rolls back and an explicit
+one becomes failed. Notifications are held while a result is in progress and
+delivered after it. Bytes leave during a statement only where no object-store
+publication can follow: in local mode, and for a lone `SELECT`, `SHOW`,
+`VALUES` or `TABLE` in object-store mode; other output waits for durable
+publication before any byte is written.
 
 | Path | Cold storage read |
 |---|---|
 | Queries before their first effect, including reads inside explicit transactions | Yields |
 | Journal uploads and the commit's wait for its durable receipt | Yields |
 | Maintenance: checkpoint capture, merges, index builds, journal and saved-file cleanup | Yields, using a separate maintenance read owner and fixed clients |
-| A statement after its first effect (volatile function, routine body, sequence change, first output flush) | Blocks until the statement ends |
+| A statement after its first effect (volatile function, routine body, sequence change, first output byte reaching the client) | Blocks until the statement ends |
+| Output queued for a slow client | Never blocks; the connection waits for the client between messages |
 | Writing statements: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, DDL, `CALL`, `DO`, `COPY FROM` | Blocks for the whole statement |
 | Commit processing, deferred constraint triggers, `SET CONSTRAINTS`, `PREPARE TRANSACTION`, `COMMIT PREPARED`/`ROLLBACK PREPARED` | Blocks |
 | `COPY` rows and completion; logical-replication apply and initial copy | Blocks |
@@ -106,6 +125,7 @@ replays instead of running the effect again.
 | Completed function results, argument values, selected functions and casts, sequence and advisory-lock receipts | The statement arena's retained region (the invocation log), within existing statement capacity |
 | Checked literal inputs saved with routines and stored definitions | `table_metadata_bytes` / `table_metadata_leases`, with `routine_input_slots` control records |
 | Execution schemas | `definition_image_slots` |
+| Result output queued for a slow client | Rows: `result_spool_bytes` / `result_spool_leases`, released as soon as the client drains them. Closing messages: a private reserve of `conn_send_buffer_bytes` per connection |
 
 Further rules that apply to every saved owner:
 
@@ -389,6 +409,7 @@ explicitly.
 | `statistics_bytes` / `statistics_leases` | Analyzed-column statistics images | Starter: 1 MiB and 1,024 ranges. `ANALYZE orders(total)` merges that column with existing records and reserves the replacement before publishing |
 | `index_statistics_slots` | Index activity counters | Starter: 4,096. Reserved at index creation; a table without indexes owns none |
 | `definition_image_slots` | Retained execution-schema identities | A paused trigger pins its completion's existing image rather than reserving another |
+| `result_spool_bytes` / `result_spool_leases` | Result rows queued behind clients that read slower than statements produce them | A connection holds at most one lease, growing geometrically and returned once its queue drains. Exhaustion fails only the lagging statement with `54000` after the rows already queued |
 | `memtable_bytes` | Resident row heap | At most 4,294,967,295 bytes per buffer, two buffers reserved; a cache limit, not total table size |
 
 **Example:** a function with 128 declared locals and one named input stages
@@ -404,6 +425,8 @@ row-work memory.
 | `routine_input_slots` | Plan-control records per backend (starter: 128), also bounding watched plans. Values lease actual bytes from `table_metadata_bytes` |
 | `max_ddl_per_transaction` | DDL event controls per transaction; actual-length records use `table_metadata_bytes` |
 | `cursor_query_bytes` | Per-cursor query state, including the declared type IDs a `WITH HOLD` cursor keeps after commit |
+| `conn_send_buffer_bytes` | Reserved twice per connection: the send buffer and the private output reserve that holds a result's closing messages. The largest single backend message must fit it |
+| Held notifications | 64 KiB per connection for notifications that arrive while a result is in progress; a listener further behind is closed rather than sent a truncated stream |
 
 Tables store their actual columns, not a maximum-width array; dropped columns
 keep their PostgreSQL column numbers. Committed schemas, pending edits and

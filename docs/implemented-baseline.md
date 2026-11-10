@@ -135,9 +135,19 @@ redirect it to replacement data; a new query sees the replacement.
 an unread order and maintenance replaces saved files. The resumed report still
 returns its original values.
 
-Large results send one header and one completion. After the first network
-flush, the rest of the result is read without yielding; retaining the output
-position across waits is tracked in
+Large results send one header and one completion, over the simple protocol
+and an unpaged extended `Execute` alike. A client that reads slowly never
+stalls the server: rows that do not fit the send buffer queue in the shared
+result spool, other sessions keep running, and the slow connection continues
+with its next message once its client has read the result.
+
+**Example:** a reporting tool runs `SELECT * FROM orders` over a slow link and
+reads it gradually. Meanwhile other applications keep inserting orders. If the
+tool falls behind by more than `result_spool_bytes`, it receives the rows
+already queued followed by `54000` naming that setting, and its session stays
+usable. After the first byte of a result reaches the client, the rest of that
+statement reads cold storage without yielding; retaining the output position
+across those waits is tracked in
 [the plan](../PLAN.md#pause-and-resume-every-query-path).
 
 A physical table rewrite follows PostgreSQL's

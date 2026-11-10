@@ -197,6 +197,7 @@ class Node:
             "execution_control_bytes": "256KiB", "execution_control_leases": 256,
             "table_metadata_bytes": "64MiB", "table_metadata_leases": 8192,
             "statistics_bytes": "1MiB", "statistics_leases": 1024,
+            "result_spool_bytes": "16MiB", "result_spool_leases": 64,
             "index_statistics_slots": 4096,
             "max_ddl_per_transaction": 16, "max_value_indexes": 8,
             "max_indexes": 8, "max_extended_statistics": 64,

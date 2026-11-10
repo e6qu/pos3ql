@@ -3013,9 +3013,9 @@ impl Server {
     }
 
     /// Delivers every queued notification to the connections listening on its
-    /// channel, then clears the outbox. A listener whose send buffer cannot hold
-    /// the message (it is not draining its socket) is closed rather than sent a
-    /// truncated stream.
+    /// channel, then clears the outbox. A listener inside a result holds the
+    /// frame until that result ends; one whose held frames exceed their fixed
+    /// buffer is closed rather than sent a truncated stream.
     fn deliver_notifications(&mut self) {
         for n_index in 0..self.engine.notifications().len() {
             // `Notification` is `Copy`, so lift it out and drop the engine

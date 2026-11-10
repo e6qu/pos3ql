@@ -15772,6 +15772,8 @@ pub struct Storage {
     pub(crate) execution_control: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     metadata_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     statistics_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    /// Client result output queued behind slow readers.
+    result_spool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     row_overlay: std::sync::Arc<RowOverlayPool>,
     row_walks: RowWalkPool,
     snapshot_reclamation: SnapshotReclamation,
@@ -18748,6 +18750,7 @@ impl Storage {
         let wait = match reason {
             crate::sql::StatementWait::ObjectIo => (Some("Extension"), Some("ObjectStorageRead")),
             crate::sql::StatementWait::CacheCapacity => (Some("Extension"), Some("CacheCapacity")),
+            crate::sql::StatementWait::ClientOutput => (Some("Client"), Some("ClientWrite")),
             crate::sql::StatementWait::Lock => {
                 lock_wait.map_or((None, None), |event| (Some("Lock"), Some(event)))
             }
@@ -20907,6 +20910,10 @@ impl Storage {
                 config.statistics_bytes,
                 config.statistics_leases,
             ),
+            crate::mem::lease_pool::LeasePool::budget_bytes(
+                config.result_spool_bytes,
+                config.result_spool_leases,
+            ),
             SnapshotReclamation::budget_bytes(),
             row_ownership::HeapRowOwnership::budget_bytes(config),
             type_reference_moves::DefinitionPublication::budget_bytes(config),
@@ -21185,6 +21192,12 @@ impl Storage {
             crate::mem::lease_pool::Purpose::STATISTICS,
             config.statistics_bytes,
             config.statistics_leases,
+        )?;
+        let result_spool = crate::mem::lease_pool::LeasePool::new(
+            budget,
+            crate::mem::lease_pool::Purpose::RESULT_SPOOL,
+            config.result_spool_bytes,
+            config.result_spool_leases,
         )?;
         let table_definition_images =
             definition_images::TableDefinitionImagePool::new(config, budget, &metadata_pool)?;
@@ -22001,6 +22014,7 @@ impl Storage {
             execution_control,
             metadata_pool,
             statistics_pool,
+            result_spool,
             row_overlay,
             row_walks,
             snapshot_reclamation,
@@ -51859,6 +51873,10 @@ impl Storage {
                     locks.table.capacity()
                 )
             })
+    }
+
+    pub(crate) fn result_spool(&self) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
+        &self.result_spool
     }
 
     pub(crate) fn lock_mark(&self) -> u64 {

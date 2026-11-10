@@ -45,6 +45,12 @@ impl Purpose {
         leases: "statistics_leases",
         ranges: "statistics free ranges",
     };
+    pub(crate) const RESULT_SPOOL: Self = Self {
+        pool: "result spool pool",
+        bytes: "result_spool_bytes",
+        leases: "result_spool_leases",
+        ranges: "result spool free ranges",
+    };
 }
 
 #[repr(C, align(64))]
@@ -467,6 +473,9 @@ impl<T> MutableSlice<T> {
     pub(crate) fn max_entries(&self) -> usize {
         self.pool.max_entries::<T>()
     }
+    pub(crate) fn capacity_entries(&self) -> usize {
+        self.capacity
+    }
 
     pub(crate) fn reserve_exact(&mut self, entries: usize) -> Result<(), LeaseError> {
         if entries <= self.capacity {
@@ -568,6 +577,14 @@ impl<T> MutableSlice<T> {
         }
         self.len = len;
         Ok(())
+    }
+
+    /// Drops the initialized suffix past `len` while keeping the reservation.
+    pub(crate) fn truncate(&mut self, len: usize)
+    where
+        T: Copy,
+    {
+        self.len = self.len.min(len);
     }
 
     /// Convert owned elements while retaining the same byte and descriptor

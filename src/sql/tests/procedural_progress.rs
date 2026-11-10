@@ -1254,7 +1254,7 @@ fn retained_write_completion_keeps_returning_rows_and_trigger_effects_through_lo
                     )),
                     ["42", "1"]
                 );
-                writer.send.truncate_to(output_mark);
+                output_mark.truncate_unsent(&mut writer.send);
                 writer.arena.recycle_front();
                 status = crate::mem::guard::forbid_alloc(|| {
                     engine.execute_simple_from(
@@ -1282,7 +1282,7 @@ fn retained_write_completion_keeps_returning_rows_and_trigger_effects_through_lo
             };
             assert_eq!(wait, StatementWait::Lock);
             holder.success(&mut engine, "COMMIT", true);
-            writer.send.truncate_to(output_mark);
+            output_mark.truncate_unsent(&mut writer.send);
             writer.arena.recycle_front();
             status = crate::mem::guard::forbid_alloc(|| {
                 engine.execute_simple_from(
@@ -1398,7 +1398,7 @@ fn retained_write_completion_keeps_lock_calls_around_completed_nested_functions(
                 if released {
                     holder.success(&mut engine, "COMMIT", true);
                 }
-                writer.send.truncate_to(output_mark);
+                output_mark.truncate_unsent(&mut writer.send);
                 writer.arena.recycle_front();
                 status = crate::mem::guard::forbid_alloc(|| {
                     engine.execute_simple_from(
@@ -1607,7 +1607,7 @@ fn retained_nested_write_completion_returns_once_to_its_waiting_parent() {
                     if released {
                         holder.success(&mut engine, "COMMIT", true);
                     }
-                    writer.send.truncate_to(output_mark);
+                    output_mark.truncate_unsent(&mut writer.send);
                     writer.arena.recycle_front();
                     status = crate::mem::guard::forbid_alloc(|| {
                         engine.execute_simple_from(
@@ -1705,7 +1705,7 @@ fn retained_nested_write_completion_keeps_dynamic_returned_records_and_bindings(
                 if released {
                     holder.success(&mut engine, "COMMIT", true);
                 }
-                writer.send.truncate_to(output_mark);
+                output_mark.truncate_unsent(&mut writer.send);
                 writer.arena.recycle_front();
                 status = crate::mem::guard::forbid_alloc(|| {
                     engine.execute_simple_from(

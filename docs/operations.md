@@ -35,6 +35,8 @@ example; physical limits are in
 | `statistics_bytes` | yes | Bytes for analyzed-column statistics. |
 | `statistics_leases` | yes | Concurrent owned ranges in `statistics_bytes`, including retained images. |
 | `index_statistics_slots` | yes | Index lifetimes sharing activity counters, including retained readers. |
+| `result_spool_bytes` | yes | Shared bytes queuing result rows for clients that read slower than statements produce them; a multiple of 64 (e.g. `16MiB`). A client further behind gets `54000` naming this setting after the rows already queued. |
+| `result_spool_leases` | yes | Connections that can hold queued result rows at once (e.g. `max_connections`). |
 | `large_object_pages` | no (default `8192`, must be nonzero) | Resident 2 KiB large-object pages. |
 
 ## Operational listener

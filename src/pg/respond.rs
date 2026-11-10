@@ -7,6 +7,11 @@ use crate::sql::ast::ExplainSerialize;
 use crate::sql::types::{ColDesc, Datum};
 use crate::stack_format;
 
+use std::sync::Arc;
+
+use crate::mem::lease_pool::LeasePool;
+
+use super::overflow::{OutputClass, OutputMark, OverflowExhaustion, ResultOverflow};
 use super::wire::{self, MsgOut, WireFull};
 
 /// Maximum result columns whose per-column format we track (matches the
@@ -69,18 +74,97 @@ impl ResultFmt {
 /// A deterministic emitter of one COPY row's escaped bytes.
 pub type CopyRowWriter<'a> = dyn Fn(&mut dyn FnMut(&[u8])) + 'a;
 
-/// Where a full send buffer drains (blocking) so arbitrarily large results
-/// stream instead of failing with 54000: nowhere, a raw fd (plaintext), or the
-/// connection's TLS session (the plaintext is encrypted, then written to the
-/// blocking socket). The borrows share the Responder's lifetime — all are
-/// disjoint fields of the same connection, live for the streamed query.
-pub enum FlushSink<'b> {
+/// The connection transport a responder may write without blocking while a
+/// statement runs: none, a raw fd (plaintext), or the TLS session.
+pub(crate) enum ClientWriter<'b> {
     None,
     Fd(i32),
     Tls {
         session: &'b mut crate::pg::tls::ServerSession,
         socket: &'b mut std::net::TcpStream,
     },
+}
+
+/// Connection output beyond the send buffer. A full send buffer first tries
+/// one non-blocking write (when the caller allows output before
+/// publication), then queues complete messages in the overflow area; the
+/// statement never waits for the client.
+pub(crate) struct OutputSink<'b> {
+    overflow: &'b mut ResultOverflow,
+    spool: Option<Arc<LeasePool>>,
+    writer: ClientWriter<'b>,
+    /// The transport failed; the connection closes after this statement.
+    failed: bool,
+    /// Overflow length that triggers the next write attempt.
+    next_write_at: usize,
+}
+
+impl<'b> OutputSink<'b> {
+    pub(crate) fn new(
+        overflow: &'b mut ResultOverflow,
+        spool: Option<Arc<LeasePool>>,
+        writer: ClientWriter<'b>,
+    ) -> Self {
+        Self {
+            overflow,
+            spool,
+            writer,
+            failed: false,
+            next_write_at: 0,
+        }
+    }
+
+    /// Writes queued output until the transport would block, refilling `send`
+    /// from the overflow at message boundaries.
+    fn write_available(&mut self, send: &mut FixedBuf) {
+        if matches!(self.writer, ClientWriter::None) || self.failed {
+            return;
+        }
+        loop {
+            if send.is_empty() && !self.overflow.refill(send) {
+                break;
+            }
+            let accepted = match &mut self.writer {
+                ClientWriter::None => unreachable!("checked above"),
+                ClientWriter::Fd(fd) => {
+                    let data = send.readable();
+                    let n = unsafe { libc::write(*fd, data.as_ptr().cast(), data.len()) };
+                    if n > 0 {
+                        n as usize
+                    } else if n < 0 {
+                        match std::io::Error::last_os_error().kind() {
+                            std::io::ErrorKind::Interrupted => continue,
+                            std::io::ErrorKind::WouldBlock => 0,
+                            _ => {
+                                self.failed = true;
+                                0
+                            }
+                        }
+                    } else {
+                        0
+                    }
+                }
+                ClientWriter::Tls { session, socket } => {
+                    match session.queue_nonblocking(socket, send.readable()) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            self.failed = true;
+                            0
+                        }
+                    }
+                }
+            };
+            if accepted == 0 {
+                break;
+            }
+            // A sent prefix cannot be rolled back by a statement retry.
+            crate::sql::query::protect_statement_effects();
+            send.consume(accepted);
+            self.overflow.record_written(accepted);
+            let _ = self.overflow.refill(send);
+        }
+        self.next_write_at = self.overflow.len().saturating_add(send.capacity() / 2);
+    }
 }
 
 pub(crate) enum CursorRowOutput<'b> {
@@ -103,9 +187,9 @@ pub struct Responder<'b> {
     /// does not itself retain the result column's catalog type.
     result_type_oids: [i32; MAX_RESULT_COLS],
     result_columns: usize,
-    /// Where a full send buffer drains so large results stream. The socket is
-    /// put in blocking mode by the caller for the duration.
-    flush: FlushSink<'b>,
+    /// Where output goes once `buffer` is full; without one, a full buffer
+    /// fails the message with `WireFull`.
+    output: Option<OutputSink<'b>>,
     /// Session value-rendering settings (DateStyle, time zone).
     render: crate::sql::guc::RenderContext,
     /// EXPLAIN ANALYZE executes through the ordinary executor but suppresses
@@ -116,7 +200,7 @@ pub struct Responder<'b> {
     suppress_command_complete: bool,
     /// Last complete frame produced by the typed command writer. DDL keeps
     /// its tag in statement memory while end triggers run, preserving notices.
-    last_command_completion: Option<(usize, usize)>,
+    last_command_completion: Option<(OutputMark, usize)>,
     /// Typed affected-row count for an internally executed DML command. This
     /// never derives state from a serialized command tag.
     affected_rows: Option<u64>,
@@ -557,7 +641,7 @@ impl<'b> Responder<'b> {
             formats: ResultFmt::ALL_TEXT,
             result_type_oids: [0; MAX_RESULT_COLS],
             result_columns: 0,
-            flush: FlushSink::None,
+            output: None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
@@ -578,7 +662,7 @@ impl<'b> Responder<'b> {
             formats,
             result_type_oids: [0; MAX_RESULT_COLS],
             result_columns: 0,
-            flush: FlushSink::None,
+            output: None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
@@ -600,7 +684,7 @@ impl<'b> Responder<'b> {
             formats: ResultFmt::ALL_TEXT,
             result_type_oids: [0; MAX_RESULT_COLS],
             result_columns: 0,
-            flush: FlushSink::None,
+            output: None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: true,
@@ -623,7 +707,7 @@ impl<'b> Responder<'b> {
             formats,
             result_type_oids: [0; MAX_RESULT_COLS],
             result_columns: 0,
-            flush: FlushSink::None,
+            output: None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
@@ -636,22 +720,68 @@ impl<'b> Responder<'b> {
         }
     }
 
-    /// Enables streaming: a full buffer drains to `fd` and the message is
-    /// retried. `fd` must be a blocking socket for the drain to complete.
-    pub fn with_flush(mut self, fd: i32) -> Self {
-        self.flush = FlushSink::Fd(fd);
+    /// Queues output that does not fit `buffer` in the connection's overflow
+    /// area instead of failing the statement.
+    pub(crate) fn with_output(mut self, sink: OutputSink<'b>) -> Self {
+        self.output = Some(sink);
         self
     }
 
-    /// Enables streaming over a TLS session: a full buffer is encrypted and
-    /// written to the (blocking) socket, then the message is retried.
-    pub fn with_flush_tls(
-        mut self,
-        session: &'b mut crate::pg::tls::ServerSession,
-        socket: &'b mut std::net::TcpStream,
-    ) -> Self {
-        self.flush = FlushSink::Tls { session, socket };
-        self
+    /// Whether the client transport failed during this statement.
+    pub(crate) fn transport_failed(&self) -> bool {
+        self.output.as_ref().is_some_and(|sink| sink.failed)
+    }
+
+    /// Position in the logical output stream (send buffer, then overflow).
+    pub(crate) fn mark(&self) -> OutputMark {
+        match &self.output {
+            Some(sink) => OutputMark::new(
+                self.buffer.len() + sink.overflow.len(),
+                sink.overflow.written(),
+            ),
+            None => OutputMark::new(self.buffer.len(), 0),
+        }
+    }
+
+    fn excess_since(&self, mark: OutputMark) -> Option<usize> {
+        match &self.output {
+            Some(sink) => mark.excess(
+                self.buffer.len() + sink.overflow.len(),
+                sink.overflow.written(),
+            ),
+            None => mark.excess(self.buffer.len(), 0),
+        }
+    }
+
+    /// Whether output after `mark` is still entirely unsent.
+    pub(crate) fn can_truncate_to(&self, mark: OutputMark) -> bool {
+        self.excess_since(mark).is_some()
+    }
+
+    /// Discards unsent output after `mark`. Output that already reached the
+    /// client cannot be retracted; callers check [`Self::can_truncate_to`]
+    /// where a prefix may have been written.
+    pub(crate) fn truncate_to(&mut self, mark: OutputMark) {
+        let excess = self
+            .excess_since(mark)
+            .expect("output after the mark is still unsent");
+        let overflow = self.output.as_mut().map(|sink| &mut *sink.overflow);
+        assert!(super::overflow::truncate_output(
+            self.buffer,
+            overflow,
+            excess
+        ));
+    }
+
+    /// The last `bytes` of queued output (one complete message or less).
+    fn tail(&self, bytes: usize) -> &[u8] {
+        if let Some(sink) = &self.output
+            && !sink.overflow.is_empty()
+        {
+            return sink.overflow.tail(bytes).expect("queued tail");
+        }
+        let readable = self.buffer.readable();
+        &readable[readable.len() - bytes..]
     }
 
     /// Sets the session value-rendering context (DateStyle / time zone).
@@ -684,94 +814,72 @@ impl<'b> Responder<'b> {
         }
     }
 
-    /// Drains the whole send buffer to the flush sink, blocking. Returns
-    /// whether it fully drained (false = the sink errored or there is none).
-    fn drain(&mut self) -> bool {
-        if !self.buffer.is_empty() && !matches!(self.flush, FlushSink::None) {
-            // A sent prefix cannot be rolled back by a statement retry.
-            crate::sql::query::protect_statement_effects();
+    /// Appends one complete message after all queued output. `build` may
+    /// run more than once, so it must be deterministic.
+    fn emit(
+        &mut self,
+        class: OutputClass,
+        build: impl Fn(&mut FixedBuf) -> Result<(), WireFull>,
+    ) -> Result<(), WireFull> {
+        let Some(sink) = self.output.as_mut() else {
+            return Self::append_message(self.buffer, &build);
+        };
+        if sink.overflow.is_empty() && Self::append_message(self.buffer, &build).is_ok() {
+            return Ok(());
         }
-        match &mut self.flush {
-            FlushSink::None => false,
-            FlushSink::Fd(fd) => {
-                let fd = *fd;
-                while !self.buffer.is_empty() {
-                    let data = self.buffer.readable();
-                    let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
-                    if n > 0 {
-                        self.buffer.consume(n as usize);
-                    } else if n < 0 {
-                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                        {
-                            continue;
-                        }
-                        return false;
-                    } else {
-                        return false;
-                    }
-                }
-                true
-            }
-            FlushSink::Tls { session, socket } => {
-                // Encrypt the whole buffer through the session onto the blocking
-                // socket, then mark it consumed in one step.
-                if !session.write_all_blocking(socket, self.buffer.readable()) {
-                    return false;
-                }
-                let n = self.buffer.readable().len();
-                self.buffer.consume(n);
-                true
+        // Retry a full send buffer at once; with output already queued, retry
+        // once half a send buffer more has accumulated.
+        if sink.overflow.is_empty() || sink.overflow.len() >= sink.next_write_at {
+            sink.write_available(self.buffer);
+            if sink.overflow.is_empty() && Self::append_message(self.buffer, &build).is_ok() {
+                return Ok(());
             }
         }
+        sink.overflow.push(sink.spool.as_ref(), class, &build)
     }
 
-    /// Builds a message with `build`; on a full buffer, drains to the flush
-    /// sink (if streaming) and retries once.
+    fn append_message(
+        buffer: &mut FixedBuf,
+        build: &dyn Fn(&mut FixedBuf) -> Result<(), WireFull>,
+    ) -> Result<(), WireFull> {
+        // Compaction can move unread bytes; save the boundary afterwards.
+        let _ = buffer.writable();
+        let mark = buffer.mark();
+        build(buffer).inspect_err(|_| buffer.truncate_to(mark))
+    }
+
     fn with_retry(
         &mut self,
         build: impl Fn(&mut FixedBuf) -> Result<(), WireFull>,
     ) -> Result<(), WireFull> {
-        // A partially drained send buffer can compact during the first append.
-        // Save the retry boundary only after that compaction.
-        let _ = self.buffer.writable();
-        let mark = self.buffer.mark();
-        match build(self.buffer) {
-            Ok(()) => Ok(()),
-            Err(WireFull) => {
-                self.buffer.truncate_to(mark);
-                if matches!(self.flush, FlushSink::None) {
-                    return Err(WireFull);
-                }
-                if self.buffer.is_empty() {
-                    // The message alone exceeds the whole buffer.
-                    return Err(WireFull);
-                }
-                if !self.drain() {
-                    return Err(WireFull);
-                }
-                let result = build(self.buffer);
-                if result.is_err() {
-                    self.buffer.truncate_to(0);
-                }
-                result
-            }
-        }
+        self.emit(OutputClass::Bulk, build)
+    }
+
+    fn control(
+        &mut self,
+        build: impl Fn(&mut FixedBuf) -> Result<(), WireFull>,
+    ) -> Result<(), WireFull> {
+        self.emit(OutputClass::Control, build)
     }
 
     pub fn parse_complete(&mut self) -> Result<(), WireFull> {
-        MsgOut::begin(self.buffer, wire::MSG_PARSE_COMPLETE).finish()
+        self.control(|buffer| MsgOut::begin(buffer, wire::MSG_PARSE_COMPLETE).finish())
     }
 
     pub fn bind_complete(&mut self) -> Result<(), WireFull> {
-        MsgOut::begin(self.buffer, wire::MSG_BIND_COMPLETE).finish()
+        self.control(|buffer| MsgOut::begin(buffer, wire::MSG_BIND_COMPLETE).finish())
     }
 
     pub fn close_complete(&mut self) -> Result<(), WireFull> {
-        MsgOut::begin(self.buffer, wire::MSG_CLOSE_COMPLETE).finish()
+        self.control(|buffer| MsgOut::begin(buffer, wire::MSG_CLOSE_COMPLETE).finish())
+    }
+
+    pub fn portal_suspended(&mut self) -> Result<(), WireFull> {
+        self.control(|buffer| MsgOut::begin(buffer, wire::MSG_PORTAL_SUSPENDED).finish())
     }
 
     pub fn no_data(&mut self) -> Result<(), WireFull> {
-        MsgOut::begin(self.buffer, wire::MSG_NO_DATA).finish()
+        self.control(|buffer| MsgOut::begin(buffer, wire::MSG_NO_DATA).finish())
     }
 
     pub(crate) fn function_call_response(
@@ -793,65 +901,83 @@ impl<'b> Responder<'b> {
 
     /// Reports every inferred or client-specified parameter type OID.
     pub fn parameter_description(&mut self, oids: &[i32]) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_PARAMETER_DESCRIPTION);
-        m.u16(oids.len() as u16);
-        for &oid in oids {
-            m.i32(oid);
-        }
-        m.finish()
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_PARAMETER_DESCRIPTION);
+            m.u16(oids.len() as u16);
+            for &oid in oids {
+                m.i32(oid);
+            }
+            m.finish()
+        })
     }
 
     pub fn auth_ok(&mut self) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
-        m.i32(wire::AUTH_OK);
-        m.finish()
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_AUTHENTICATION);
+            m.i32(wire::AUTH_OK);
+            m.finish()
+        })
     }
 
     pub fn auth_cleartext_password(&mut self) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
-        m.i32(wire::AUTH_CLEARTEXT);
-        m.finish()
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_AUTHENTICATION);
+            m.i32(wire::AUTH_CLEARTEXT);
+            m.finish()
+        })
     }
 
     pub fn auth_md5_password(&mut self, salt: &[u8; 4]) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
-        m.i32(wire::AUTH_MD5);
-        m.bytes(salt);
-        m.finish()
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_AUTHENTICATION);
+            m.i32(wire::AUTH_MD5);
+            m.bytes(salt);
+            m.finish()
+        })
     }
 
     pub fn auth_sasl_mechanisms(&mut self) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
-        m.i32(wire::AUTH_SASL);
-        m.cstr("SCRAM-SHA-256");
-        m.u8(0); // end of mechanism list
-        m.finish()
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_AUTHENTICATION);
+            m.i32(wire::AUTH_SASL);
+            m.cstr("SCRAM-SHA-256");
+            m.u8(0); // end of mechanism list
+            m.finish()
+        })
     }
 
     pub fn auth_sasl_continue(&mut self, payload: &str) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
-        m.i32(wire::AUTH_SASL_CONTINUE);
-        m.bytes(payload.as_bytes());
-        m.finish()
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_AUTHENTICATION);
+            m.i32(wire::AUTH_SASL_CONTINUE);
+            m.bytes(payload.as_bytes());
+            m.finish()
+        })
     }
 
     pub fn auth_sasl_final(&mut self, payload: &str) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
-        m.i32(wire::AUTH_SASL_FINAL);
-        m.bytes(payload.as_bytes());
-        m.finish()
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_AUTHENTICATION);
+            m.i32(wire::AUTH_SASL_FINAL);
+            m.bytes(payload.as_bytes());
+            m.finish()
+        })
     }
 
     pub fn parameter_status(&mut self, name: &str, value: &str) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_PARAMETER_STATUS);
-        m.cstr(name).cstr(value);
-        m.finish()
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_PARAMETER_STATUS);
+            m.cstr(name).cstr(value);
+            m.finish()
+        })
     }
 
     pub fn backend_key_data(&mut self, pid: i32, key: &[u8]) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_BACKEND_KEY_DATA);
-        m.i32(pid).bytes(key);
-        m.finish()
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_BACKEND_KEY_DATA);
+            m.i32(pid).bytes(key);
+            m.finish()
+        })
     }
 
     pub fn negotiate_protocol_version(
@@ -859,19 +985,23 @@ impl<'b> Responder<'b> {
         newest_minor: i32,
         unrecognized_options: &[&str],
     ) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_NEGOTIATE_VERSION);
-        m.i32(newest_minor);
-        m.i32(unrecognized_options.len() as i32);
-        for opt in unrecognized_options {
-            m.cstr(opt);
-        }
-        m.finish()
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_NEGOTIATE_VERSION);
+            m.i32(newest_minor);
+            m.i32(unrecognized_options.len() as i32);
+            for opt in unrecognized_options {
+                m.cstr(opt);
+            }
+            m.finish()
+        })
     }
 
     pub fn ready_for_query(&mut self, tx_status: u8) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_READY_FOR_QUERY);
-        m.u8(tx_status);
-        m.finish()
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_READY_FOR_QUERY);
+            m.u8(tx_status);
+            m.finish()
+        })
     }
 
     pub fn row_description(&mut self, columns: &[ColDesc]) -> Result<(), WireFull> {
@@ -1668,29 +1798,52 @@ impl<'b> Responder<'b> {
 
     /// Forwards complete pre-encoded wire messages.
     pub fn raw(&mut self, bytes: &[u8]) -> Result<(), WireFull> {
-        if self.buffer.append(bytes) {
-            Ok(())
-        } else {
-            Err(WireFull)
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let length = rest
+                .get(1..5)
+                .and_then(|header| <[u8; 4]>::try_from(header).ok())
+                .and_then(|header| usize::try_from(i32::from_be_bytes(header)).ok())
+                .and_then(|length| length.checked_add(1))
+                .filter(|length| *length >= 5 && *length <= rest.len())
+                .expect("raw output holds complete backend messages");
+            let (message, tail) = rest.split_at(length);
+            self.control(|buffer| {
+                if buffer.append(message) {
+                    Ok(())
+                } else {
+                    Err(WireFull)
+                }
+            })?;
+            rest = tail;
         }
+        Ok(())
     }
 
     pub fn command_complete(&mut self, tag: &str) -> Result<(), WireFull> {
         if self.discard_query_output || self.suppress_command_complete {
             return Ok(());
         }
-        // Compact before saving an absolute offset; MsgOut appends without
-        // consuming bytes, so the completed frame remains at this position.
-        let _ = self.buffer.writable();
-        let start = self.buffer.mark();
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_COMMAND_COMPLETE);
-        m.cstr(tag);
-        if let Err(error) = m.finish() {
-            self.buffer.truncate_to(start);
-            return Err(error);
-        }
-        self.last_command_completion = Some((start, self.buffer.mark()));
+        let start = self.mark();
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_COMMAND_COMPLETE);
+            m.cstr(tag);
+            m.finish()
+        })?;
+        self.last_command_completion = Some((start, tag.len() + 6));
         Ok(())
+    }
+
+    /// The tag of the last CommandComplete, while it still ends the output.
+    pub(crate) fn completion_tag(&self) -> Option<crate::util::StackStr<64>> {
+        let (start, length) = self.last_command_completion?;
+        if self.excess_since(start) != Some(length) {
+            return None;
+        }
+        let frame = self.tail(length);
+        core::str::from_utf8(&frame[5..length - 1])
+            .ok()
+            .map(crate::util::StackStr::from_str)
     }
 
     pub(crate) fn begin_command_completion_capture(&mut self) {
@@ -1702,27 +1855,24 @@ impl<'b> Responder<'b> {
         arena: &'a Arena,
         retain: bool,
     ) -> Result<Option<&'a str>, ArenaFull> {
-        let Some((start, end)) = self.last_command_completion.take() else {
+        let Some((start, length)) = self.last_command_completion.take() else {
             return Ok(None);
         };
         assert_eq!(
-            end,
-            self.buffer.mark(),
+            self.excess_since(start),
+            Some(length),
             "command completion must finish statement output"
         );
-        assert!(
-            end >= start + 6,
-            "command completion has a header and terminator"
-        );
         let retained = if retain {
-            let tag = core::str::from_utf8(&self.buffer.filled_mut()[start + 5..end - 1])
+            let frame = self.tail(length);
+            let tag = core::str::from_utf8(&frame[5..length - 1])
                 .expect("command tags originate as UTF-8 strings");
             arena.alloc_str(tag).map(Some)
         } else {
             Ok(None)
         };
         // Also remove success if the statement reservation cannot retain it.
-        self.buffer.truncate_to(start);
+        self.truncate_to(start);
         retained
     }
 
@@ -1770,7 +1920,7 @@ impl<'b> Responder<'b> {
     }
 
     pub fn empty_query_response(&mut self) -> Result<(), WireFull> {
-        MsgOut::begin(self.buffer, wire::MSG_EMPTY_QUERY_RESPONSE).finish()
+        self.control(|buffer| MsgOut::begin(buffer, wire::MSG_EMPTY_QUERY_RESPONSE).finish())
     }
 
     /// NoticeResponse at NOTICE severity. Dropped when `client_min_messages`
@@ -1851,27 +2001,29 @@ impl<'b> Responder<'b> {
         message: &str,
         diagnostic: Option<&crate::sql::eval::Diagnostic>,
     ) -> Result<(), WireFull> {
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_NOTICE_RESPONSE);
-        m.u8(b'S');
-        m.cstr(severity);
-        m.u8(b'V');
-        m.cstr(severity);
-        m.u8(b'C');
-        m.cstr(sqlstate);
-        m.u8(b'M');
-        m.cstr(message);
-        if let Some(d) = diagnostic {
-            if let Some(detail) = &d.detail {
-                m.u8(b'D');
-                m.cstr(detail.as_str());
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_NOTICE_RESPONSE);
+            m.u8(b'S');
+            m.cstr(severity);
+            m.u8(b'V');
+            m.cstr(severity);
+            m.u8(b'C');
+            m.cstr(sqlstate);
+            m.u8(b'M');
+            m.cstr(message);
+            if let Some(d) = diagnostic {
+                if let Some(detail) = &d.detail {
+                    m.u8(b'D');
+                    m.cstr(detail.as_str());
+                }
+                if let Some(h) = &d.hint {
+                    m.u8(b'H');
+                    m.cstr(h.as_str());
+                }
             }
-            if let Some(h) = &d.hint {
-                m.u8(b'H');
-                m.cstr(h.as_str());
-            }
-        }
-        m.u8(0);
-        m.finish()
+            m.u8(0);
+            m.finish()
+        })
     }
 
     /// ErrorResponse with the fields every client expects: severity (twice,
@@ -1891,81 +2043,201 @@ impl<'b> Responder<'b> {
         message: &str,
     ) -> Result<(), WireFull> {
         let diagnostic = crate::sql::eval::take_diagnostic();
-        let mut m = MsgOut::begin(self.buffer, wire::MSG_ERROR_RESPONSE);
-        m.u8(b'S');
-        m.cstr(severity);
-        m.u8(b'V');
-        m.cstr(severity);
-        m.u8(b'C');
-        m.cstr(sqlstate);
-        m.u8(b'M');
-        m.cstr(message);
-        if let Some(d) = &diagnostic {
-            if let Some(detail) = &d.detail {
-                m.u8(b'D');
-                m.cstr(detail.as_str());
+        self.control(|buffer| {
+            let mut m = MsgOut::begin(buffer, wire::MSG_ERROR_RESPONSE);
+            m.u8(b'S');
+            m.cstr(severity);
+            m.u8(b'V');
+            m.cstr(severity);
+            m.u8(b'C');
+            m.cstr(sqlstate);
+            m.u8(b'M');
+            m.cstr(message);
+            if let Some(d) = &diagnostic {
+                if let Some(detail) = &d.detail {
+                    m.u8(b'D');
+                    m.cstr(detail.as_str());
+                }
+                if let Some(h) = &d.hint {
+                    m.u8(b'H');
+                    m.cstr(h.as_str());
+                }
             }
-            if let Some(h) = &d.hint {
-                m.u8(b'H');
-                m.cstr(h.as_str());
-            }
-        }
-        m.u8(0);
-        m.finish()
+            m.u8(0);
+            m.finish()
+        })
     }
 
-    /// Rolls back everything after `mark` and reports the error instead;
-    /// used when a response overflows the send buffer.
-    pub fn replace_with_overflow_error(&mut self, mark: usize) -> Result<(), WireFull> {
-        self.buffer.truncate_to(mark);
+    /// Reports a response that exceeded its output capacity. Unsent output
+    /// after `mark` is discarded; output that already reached the client
+    /// stays, and the error follows it as in a PostgreSQL result that fails
+    /// midway. The message names the exhausted setting.
+    pub fn replace_with_overflow_error(&mut self, mark: OutputMark) -> Result<(), WireFull> {
+        if self.can_truncate_to(mark) {
+            self.truncate_to(mark);
+        }
+        let exhaustion = self
+            .output
+            .as_mut()
+            .and_then(|sink| sink.overflow.take_exhaustion())
+            .unwrap_or(OverflowExhaustion::NoSpool);
+        let mut message = crate::util::StackStr::<512>::new();
+        let _ = core::fmt::Write::write_fmt(&mut message, format_args!("{exhaustion}"));
         self.error(
             crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "statement response exceeds its configured buffer",
+            message.as_str(),
         )
     }
 }
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
+    fn message_kinds(mut bytes: &[u8], out: &mut [u8]) -> usize {
+        let mut count = 0;
+        while !bytes.is_empty() {
+            let length = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize + 1;
+            out[count] = bytes[0];
+            count += 1;
+            bytes = &bytes[length..];
+        }
+        count
+    }
+
+    #[test]
+    fn overflow_output_keeps_messages_whole_and_marks_span_both_tiers() {
+        use crate::mem::lease_pool::{LeasePool, Purpose};
+        use crate::pg::overflow::ResultOverflow;
+        let mut budget = crate::mem::Budget::new(1 << 20);
+        let arena = crate::mem::arena::Arena::new(&mut budget, "tags", 64).unwrap();
+        let spool = LeasePool::new(&mut budget, Purpose::RESULT_SPOOL, 192, 1).unwrap();
+        // The private reserve must hold the named exhaustion error.
+        let mut overflow = ResultOverflow::new(&mut budget, 256).unwrap();
+        let mut send = super::FixedBuf::new(&mut budget, "send", 256).unwrap();
+        let row = crate::sql::types::Datum::Text("abcdefghijklmnopqrstuvwx");
+        crate::mem::guard::forbid_alloc(|| {
+            let mut responder =
+                super::Responder::new(&mut send).with_output(super::OutputSink::new(
+                    &mut overflow,
+                    Some(spool.clone()),
+                    super::ClientWriter::None,
+                ));
+            for _ in 0..9 {
+                responder.data_row(core::slice::from_ref(&row)).unwrap();
+            }
+            // Seven rows fill the send buffer; two wait in the shared spool.
+            assert_eq!(responder.buffer.len(), 245);
+            let mark = responder.mark();
+            responder.data_row(core::slice::from_ref(&row)).unwrap();
+            responder.notice("00000", "rolled back").unwrap();
+            responder.truncate_to(mark);
+            assert_eq!(responder.mark(), mark);
+            responder.command_complete("SELECT 3").unwrap();
+            assert_eq!(responder.completion_tag().unwrap().as_str(), "SELECT 3");
+            let tag = responder
+                .take_command_completion_tag(&arena, true)
+                .unwrap()
+                .unwrap();
+            responder.command_complete(tag).unwrap();
+            // Rows stop at the spool limit; terminal messages use the reserve.
+            let failed = loop {
+                let before = responder.mark();
+                if responder.data_row(core::slice::from_ref(&row)).is_err() {
+                    break before;
+                }
+            };
+            assert_eq!(responder.mark(), failed);
+            responder.replace_with_overflow_error(failed).unwrap();
+            responder.ready_for_query(b'I').unwrap();
+        });
+        let mut kinds = [0u8; 32];
+        let mut count = message_kinds(send.readable(), &mut kinds);
+        send.clear();
+        while overflow.refill(&mut send) {
+            count += message_kinds(send.readable(), &mut kinds[count..]);
+            send.clear();
+        }
+        let kinds = &kinds[..count];
+        assert!(
+            kinds.starts_with(b"DDDDDDDDDCD") && kinds.ends_with(b"EZ"),
+            "{}",
+            String::from_utf8_lossy(kinds)
+        );
+        assert!(kinds[10..count - 2].iter().all(|kind| *kind == b'D'));
+        assert!(overflow.is_empty());
+    }
+
     #[test]
     #[cfg(unix)]
-    fn completion_streaming_preserves_compacted_prefix_and_discards_failed_retry() {
+    fn overflow_output_writes_without_blocking_and_preserves_order() {
+        use crate::mem::lease_pool::{LeasePool, Purpose};
+        use crate::pg::overflow::ResultOverflow;
         use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
         let (writer, mut reader) = UnixStream::pair().unwrap();
-        writer.set_nonblocking(false).unwrap();
-        reader.set_nonblocking(false).unwrap();
-        let mut budget = crate::mem::Budget::new(64);
-        let mut buffer = super::FixedBuf::new(&mut budget, "completion streaming", 64).unwrap();
-        let mut responder = super::Responder::new(&mut buffer).with_flush(writer.as_raw_fd());
+        writer.set_nonblocking(true).unwrap();
+        // Fill the socket so the first writes accept nothing.
+        let filler = [0u8; 4096];
+        let mut filled = 0usize;
+        loop {
+            let n =
+                unsafe { libc::write(writer.as_raw_fd(), filler.as_ptr().cast(), filler.len()) };
+            if n <= 0 {
+                break;
+            }
+            filled += n as usize;
+        }
+        let mut budget = crate::mem::Budget::new(1 << 20);
+        let spool = LeasePool::new(&mut budget, Purpose::RESULT_SPOOL, 1 << 16, 1).unwrap();
+        let mut overflow = ResultOverflow::new(&mut budget, 64).unwrap();
+        let mut send = super::FixedBuf::new(&mut budget, "send", 64).unwrap();
+        let rows = 200u32;
         crate::mem::guard::forbid_alloc(|| {
-            assert!(responder.buffer.append(&[0xa5; 50]));
-            responder.buffer.consume(20);
-            responder
-                .data_row(&[crate::sql::types::Datum::Text(
-                    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-                )])
-                .unwrap();
-            let mut previous = [0; 30];
-            reader.read_exact(&mut previous).unwrap();
-            assert_eq!(previous, [0xa5; 30]);
-            assert_eq!(responder.buffer.len(), 51);
-            assert_eq!(responder.buffer.readable()[0], b'D');
-            assert!(responder.data_row(&[crate::sql::types::Datum::Text(
-                "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-            )]).is_err());
-            assert!(responder.buffer.is_empty());
-            let mut sent = [0; 51];
-            reader.read_exact(&mut sent).unwrap();
-            assert_eq!(sent[0], b'D');
-            assert_eq!(&sent[1..5], &50_u32.to_be_bytes());
-            assert_eq!(&sent[7..11], &40_u32.to_be_bytes());
-            assert_eq!(&sent[11..], &[b'x'; 40]);
-            responder.command_complete_rows("INSERT 0 1", 1).unwrap();
-            assert_eq!(responder.take_affected_rows(), Some(1));
-            assert_eq!(responder.buffer.readable()[0], b'C');
+            let mut responder =
+                super::Responder::new(&mut send).with_output(super::OutputSink::new(
+                    &mut overflow,
+                    Some(spool.clone()),
+                    super::ClientWriter::Fd(writer.as_raw_fd()),
+                ));
+            for value in 0..rows / 2 {
+                responder
+                    .data_row(&[crate::sql::types::Datum::Int4(1000 + value as i32)])
+                    .unwrap();
+            }
+            assert!(!responder.transport_failed());
         });
+        assert_eq!(overflow.written(), 0, "a full socket accepts nothing");
+        let mut sink = vec![0u8; filled];
+        reader.read_exact(&mut sink).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut responder =
+                super::Responder::new(&mut send).with_output(super::OutputSink::new(
+                    &mut overflow,
+                    Some(spool.clone()),
+                    super::ClientWriter::Fd(writer.as_raw_fd()),
+                ));
+            for value in rows / 2..rows {
+                responder
+                    .data_row(&[crate::sql::types::Datum::Int4(1000 + value as i32)])
+                    .unwrap();
+            }
+        });
+        assert!(overflow.written() > 0);
+        let total = (rows as usize) * 15;
+        let queued = send.len() + overflow.len();
+        assert_eq!(overflow.written() as usize + queued, total);
+        let mut received = vec![0u8; overflow.written() as usize];
+        reader.read_exact(&mut received).unwrap();
+        received.extend_from_slice(send.readable());
+        send.clear();
+        while overflow.refill(&mut send) {
+            received.extend_from_slice(send.readable());
+            send.clear();
+        }
+        for (index, frame) in received.chunks(15).enumerate() {
+            assert_eq!(frame[0], b'D');
+            assert_eq!(&frame[11..15], (1000 + index).to_string().as_bytes());
+        }
     }
 
     use super::*;

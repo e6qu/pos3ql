@@ -205,30 +205,26 @@ impl ServerSession {
         })
     }
 
-    /// Encrypts and writes all of `data`, blocking until the socket accepts it
-    /// (the large-result streaming path puts the socket in blocking mode).
-    /// Returns false on error. Records are flushed as they are produced so
-    /// rustls never buffers the whole result.
-    pub fn write_all_blocking(&mut self, socket: &mut TcpStream, data: &[u8]) -> bool {
-        let session = self.session();
-        guard::tls_scope(|| {
-            let mut written = 0;
-            while written < data.len() {
-                match session.writer().write(&data[written..]) {
-                    Ok(0) => return false,
-                    Ok(n) => written += n,
-                    Err(_) => return false,
-                }
-                while session.wants_write() {
-                    match session.write_tls(socket) {
-                        Ok(_) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(_) => return false,
-                    }
-                }
-            }
-            true
-        })
+    /// Hands plaintext to the session and pushes ciphertext to the
+    /// non-blocking socket. Returns how much plaintext the session accepted;
+    /// `Ok(0)` means its record buffer is full and the socket would block, so
+    /// the caller keeps write interest until `wants_write` clears. rustls
+    /// 0.23 reports a full outgoing buffer (64 KiB by default) as a zero-byte
+    /// write rather than an error.
+    pub fn queue_nonblocking(
+        &mut self,
+        socket: &mut TcpStream,
+        data: &[u8],
+    ) -> std::io::Result<usize> {
+        let accepted = self.queue(data)?;
+        self.flush_nonblocking(socket)?;
+        if accepted != 0 || data.is_empty() {
+            return Ok(accepted);
+        }
+        // Flushing may have freed record space.
+        let accepted = self.queue(data)?;
+        self.flush_nonblocking(socket)?;
+        Ok(accepted)
     }
 }
 

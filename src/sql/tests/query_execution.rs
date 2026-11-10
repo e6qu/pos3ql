@@ -281,7 +281,7 @@ fn cold_cursor_fetch(
                 output_mark, wait, ..
             } => {
                 assert_eq!(wait, StatementWait::ObjectIo);
-                session.send.truncate_to(output_mark);
+                output_mark.truncate_unsent(&mut session.send);
                 assert!(
                     session.send.readable().is_empty(),
                     "a suspended FETCH must not emit a partial response"

@@ -66,7 +66,8 @@ number.
 **Done today:** ordered AFTER-trigger work; nested INSERT/UPDATE/DELETE;
 trigger frames; PL/pgSQL calls inside `PERFORM`, `SELECT ... INTO` and
 declaration initializers; SQL-language function bodies, child calls and return
-checks; SQL cursors executing from retained query state. The
+checks; SQL cursors executing from retained query state; client output that
+never blocks the worker on a slow reader. The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
 
@@ -81,10 +82,11 @@ is owned.
   of row progress in multirow updates with saved progress: a child statement must
   see earlier changed rows before the next row is written, and each operation
   keeps its own transition table and firing order.
-- **Results and cursors:** after the first network flush, continue a large
-  result with one header, every row once and one completion. Saving a held
-  cursor at commit yields during storage waits. Cursors keep declared record
-  and domain types after their source query ends.
+- **Results and cursors:** a slow client no longer stalls the worker (output
+  queues in the result spool), but once a large result's first byte reaches
+  the client its remaining storage reads block; resume it row by row instead.
+  Saving a held cursor at commit yields during storage waits. Cursors keep
+  declared record and domain types after their source query ends.
 
 **Done when:**
 

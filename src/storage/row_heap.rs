@@ -2006,7 +2006,7 @@ mod tests {
             assert_eq!(budget.used(), 0);
         }
         let error = crate::config::Config::parse(
-                "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8388608\nrow_work_leases = 128\nexecution_control_bytes = 262144\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nindex_statistics_slots = 4096\nmemtable_bytes = 4GiB"
+                "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8388608\nrow_work_leases = 128\nexecution_control_bytes = 262144\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nindex_statistics_slots = 4096\nmemtable_bytes = 4GiB"
             )
             .unwrap_err();
         assert!(error.message.contains("row-location"), "{error}");

@@ -959,6 +959,34 @@ def test_paged_portal_capacity_is_a_named_error_not_a_disconnect():
     s.close()
 
 
+def test_unpaged_execute_streams_results_larger_than_the_send_buffer():
+    # Only paged portals retain a bounded result; an unpaged Execute queues
+    # its output for the client like a simple Query.
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    parse = frontend_message(
+        b"P", b"\x00SELECT repeat('x', 1024) FROM generate_series(1,1000)\x00\x00\x00"
+    )
+    bind = frontend_message(b"B", b"\x00\x00" + struct.pack("!hhh", 0, 0, 0))
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + execute + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    kinds = [kind for kind, _ in output]
+    check(
+        "unpaged Execute: a 1 MiB result arrives whole, without 54000",
+        kinds == [b"1", b"2"] + [b"D"] * 1000 + [b"C", b"Z"]
+        and output[-2][1] == b"SELECT 1000\x00",
+        kinds[:5] + kinds[-3:],
+    )
+    s.close()
+
+
 def test_named_portals_cannot_be_silently_rebound():
     s = connect()
     s.sendall(startup_payload(0))

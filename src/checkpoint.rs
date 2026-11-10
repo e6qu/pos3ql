@@ -20983,17 +20983,31 @@ mod stored_dependency_tests {
         checkpointer.enable_async_block_reads();
         let blocks = checkpointer.block_stack();
         let (socket, mut peer) = UnixStream::pair().unwrap();
-        let mut budget = Budget::new(32);
+        socket.set_nonblocking(true).unwrap();
+        let mut budget = Budget::new(64);
         let mut buffer =
             crate::mem::buffer::FixedBuf::new(&mut budget, "stream output", 32).unwrap();
-        for streaming in [false, true] {
+        let mut overflow = crate::pg::overflow::ResultOverflow::new(&mut budget, 32).unwrap();
+        // Without output space the row fails; queued overflow keeps reads
+        // restartable; only bytes that reached the client protect effects.
+        for mode in 0..3 {
             buffer.clear();
+            overflow.clear();
             crate::mem::guard::forbid_alloc(|| {
                 let reads = checkpointer.deferred_atomic_block_read_scope();
                 let effects = crate::sql::query::enter_statement_read_effect_scope(Some(&reads));
                 let mut responder = crate::pg::respond::Responder::new(&mut buffer);
-                if streaming {
-                    responder = responder.with_flush(socket.as_raw_fd());
+                if mode != 0 {
+                    let writer = if mode == 2 {
+                        crate::pg::respond::ClientWriter::Fd(socket.as_raw_fd())
+                    } else {
+                        crate::pg::respond::ClientWriter::None
+                    };
+                    responder = responder.with_output(crate::pg::respond::OutputSink::new(
+                        &mut overflow,
+                        None,
+                        writer,
+                    ));
                 }
                 for value in [1, 2] {
                     responder
@@ -21002,20 +21016,29 @@ mod stored_dependency_tests {
                 }
                 assert!(blocks.lock().unwrap().async_gets_enabled());
                 let third = responder.data_row(&[crate::sql::types::Datum::Int4(3)]);
-                if streaming {
-                    third.unwrap();
-                    assert!(!blocks.lock().unwrap().async_gets_enabled());
-                    let mut sent = [0u8; 24];
-                    peer.read_exact(&mut sent).unwrap();
-                    assert_eq!(sent[0], b'D');
-                    assert_eq!(sent[12], b'D');
-                    assert_eq!(responder.buffer.readable().len(), 12);
-                    let nested = checkpointer.atomic_block_read_scope();
-                    drop(nested);
-                    assert!(!blocks.lock().unwrap().async_gets_enabled());
-                } else {
-                    assert!(third.is_err());
-                    assert!(blocks.lock().unwrap().async_gets_enabled());
+                match mode {
+                    0 => {
+                        assert!(third.is_err());
+                        assert!(blocks.lock().unwrap().async_gets_enabled());
+                    }
+                    1 => {
+                        // Rows need a spool; control output may use the reserve.
+                        assert!(third.is_err());
+                        responder.command_complete("SELECT 2").unwrap();
+                        assert!(blocks.lock().unwrap().async_gets_enabled());
+                    }
+                    _ => {
+                        third.unwrap();
+                        assert!(!blocks.lock().unwrap().async_gets_enabled());
+                        let mut sent = [0u8; 24];
+                        peer.read_exact(&mut sent).unwrap();
+                        assert_eq!(sent[0], b'D');
+                        assert_eq!(sent[12], b'D');
+                        assert_eq!(responder.buffer.readable().len(), 12);
+                        let nested = checkpointer.atomic_block_read_scope();
+                        drop(nested);
+                        assert!(!blocks.lock().unwrap().async_gets_enabled());
+                    }
                 }
                 drop(effects);
                 drop(reads);

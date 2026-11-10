@@ -27,8 +27,20 @@ use crate::storage::SqlName;
 use crate::util::StackStr;
 
 use super::REPORTED_SERVER_VERSION;
-use super::respond::{MAX_RESULT_COLS, Responder, ResultFmt};
+use super::overflow::{OutputMark, ResultOverflow};
+use super::respond::{ClientWriter, MAX_RESULT_COLS, OutputSink, Responder, ResultFmt};
 use super::wire::{self, MsgIn, WireFull};
+
+/// NotificationResponse frames held while a connection is inside a result.
+/// Eight maximum-size frames; a listener that falls further behind is closed
+/// rather than sent a truncated stream.
+pub const HELD_NOTIFICATION_BYTES: usize = 8 * 8192;
+
+/// A responder whose output queues after the connection's overflow, so a
+/// message never overtakes earlier queued output.
+fn output<'a>(send: &'a mut FixedBuf, overflow: &'a mut ResultOverflow) -> Responder<'a> {
+    Responder::new(send).with_output(OutputSink::new(overflow, None, ClientWriter::None))
+}
 
 /// PostgreSQL's unsigned 16-bit Parse/Bind parameter boundary.
 pub const MAX_BIND_PARAMS: usize = crate::sql::prep::MAX_PREP_PARAMS;
@@ -382,7 +394,7 @@ pub enum After {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingResponse {
     after: After,
-    publication_mark: Option<usize>,
+    publication_mark: Option<OutputMark>,
 }
 
 impl PendingResponse {
@@ -406,6 +418,12 @@ pub struct Conn {
     stream: Option<TcpStream>,
     pub recv: FixedBuf,
     pub send: FixedBuf,
+    /// Complete output messages that did not fit `send`.
+    overflow: ResultOverflow,
+    /// Notifications received while a result was in progress.
+    held_notifications: FixedBuf,
+    /// Output after this mark waits for the reactor's publication barrier.
+    publication_hold: Option<OutputMark>,
     pub arena: Arena,
     pub txn: TxnState,
     pub sqlprep: SqlPreparedPool,
@@ -577,6 +595,13 @@ impl Conn {
             stream: None,
             recv: FixedBuf::new(budget, "conn_recv", config.conn_recv_buffer_bytes)?,
             send: FixedBuf::new(budget, "conn_send", config.conn_send_buffer_bytes)?,
+            overflow: ResultOverflow::new(budget, config.conn_send_buffer_bytes)?,
+            held_notifications: FixedBuf::new(
+                budget,
+                "conn_held_notifications",
+                HELD_NOTIFICATION_BYTES,
+            )?,
+            publication_hold: None,
             arena: Arena::new(budget, "conn_sql_arena", config.sql_arena_bytes)?,
             txn: TxnState::new_with_config(budget, config)?,
             sqlprep: SqlPreparedPool::new(config, budget)?,
@@ -638,6 +663,9 @@ impl Conn {
         self.stream = Some(stream);
         self.recv.clear();
         self.send.clear();
+        self.overflow.reset();
+        self.held_notifications.clear();
+        self.publication_hold = None;
         self.arena.reset();
         self.txn.clear();
         self.sqlprep.clear();
@@ -687,6 +715,10 @@ impl Conn {
     }
 
     pub fn close(&mut self) -> Option<TcpStream> {
+        // Return any spool lease to other connections immediately.
+        self.overflow.clear();
+        self.held_notifications.clear();
+        self.publication_hold = None;
         self.copy = None;
         self.copy_buf.clear();
         self.copy_transition_scratch.clear();
@@ -706,9 +738,47 @@ impl Conn {
     }
 
     pub fn wants_write(&self) -> bool {
-        !self.send.is_empty()
+        self.flushable_bytes() != 0
             || self.replication_completion_pending
             || self.tls.as_ref().is_some_and(|t| t.wants_write())
+    }
+
+    /// Queued output not held behind the publication barrier.
+    fn flushable_bytes(&self) -> usize {
+        let queued = self.send.len() + self.overflow.len();
+        match self.publication_hold {
+            Some(mark) => queued - mark.excess(queued, self.overflow.written()).unwrap_or(0),
+            None => queued,
+        }
+    }
+
+    pub(crate) fn output_mark(&self) -> OutputMark {
+        OutputMark::new(
+            self.send.len() + self.overflow.len(),
+            self.overflow.written(),
+        )
+    }
+
+    /// Discards unsent output after `mark`; false if some of it already left.
+    fn truncate_output(&mut self, mark: OutputMark) -> bool {
+        let queued = self.send.len() + self.overflow.len();
+        match mark.excess(queued, self.overflow.written()) {
+            Some(excess) => {
+                super::overflow::truncate_output(&mut self.send, Some(&mut self.overflow), excess)
+            }
+            None => false,
+        }
+    }
+
+    /// Output queued behind this connection's send buffer, for tests.
+    #[cfg(test)]
+    pub(crate) fn overflow_bytes(&self) -> usize {
+        self.overflow.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parked_wait(&self) -> Option<crate::sql::StatementWait> {
+        self.parked.then_some(self.parked_wait)
     }
 
     pub(crate) fn owns_pending_object_reads(&self) -> bool {
@@ -775,10 +845,13 @@ impl Conn {
     pub(crate) fn terminate_by_administrator(&mut self) -> bool {
         self.recv.clear();
         self.send.clear();
+        self.overflow.clear();
+        self.held_notifications.clear();
+        self.publication_hold = None;
         self.finish_lock_wait();
         self.replication_completion_pending = false;
         self.start_termination();
-        Responder::new(&mut self.send)
+        output(&mut self.send, &mut self.overflow)
             .fatal(
                 sqlstate::ADMIN_SHUTDOWN,
                 "terminating connection due to administrator command",
@@ -791,9 +864,21 @@ impl Conn {
     }
 
     pub(crate) fn cancel_parked(&mut self, engine: &mut Engine) -> bool {
-        if !self.parked {
+        // A connection waiting only for its client to read finished output
+        // has no running statement; PostgreSQL ignores such a cancel.
+        if !self.parked || self.parked_wait == crate::sql::StatementWait::ClientOutput {
             return false;
         }
+        self.abort_parked(
+            engine,
+            sqlstate::QUERY_CANCELED,
+            "canceling statement due to user request",
+        )
+    }
+
+    /// Ends the parked statement with `message`, consuming only its frontend
+    /// message (and, for the extended protocol, input through Sync).
+    fn abort_parked(&mut self, engine: &mut Engine, code: &str, message: &str) -> bool {
         if self.txn.staged_commit().is_some() {
             self.txn.defer_concurrent_index_cancel();
             return false;
@@ -870,15 +955,13 @@ impl Conn {
         } else if synchronized {
             self.phase = Phase::Ready;
         }
-        let mut responder = Responder::new(&mut self.send);
-        let sent = responder.error(
-            sqlstate::QUERY_CANCELED,
-            "canceling statement due to user request",
-        );
+        let status = self.txn.status_byte();
+        let mut responder = output(&mut self.send, &mut self.overflow);
+        let sent = responder.error(code, message);
         let sent = if extended && !synchronized {
             sent
         } else {
-            sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+            sent.and_then(|()| responder.ready_for_query(status))
         };
         sent.is_ok()
     }
@@ -888,21 +971,54 @@ impl Conn {
     /// the buffer's queued messages intact; the caller then closes the
     /// connection rather than emit a truncated message.
     pub fn queue_notification(&mut self, pid: i32, channel: &str, payload: &str) -> bool {
-        let mark = self.send.mark();
-        let mut message = wire::MsgOut::begin(&mut self.send, wire::MSG_NOTIFICATION_RESPONSE);
-        message.i32(pid);
-        message.cstr(channel);
-        message.cstr(payload);
-        if message.finish().is_ok() {
+        // PostgreSQL never interleaves a notification into a result. While
+        // a statement is parked, queued output is draining, or a response
+        // waits for publication, the frame is held until that output ends.
+        let build = |buffer: &mut FixedBuf| {
+            let mut message = wire::MsgOut::begin(buffer, wire::MSG_NOTIFICATION_RESPONSE);
+            message.i32(pid);
+            message.cstr(channel);
+            message.cstr(payload);
+            message.finish()
+        };
+        if !self.inside_result() && self.held_notifications.is_empty() {
+            let mark = self.send.mark();
+            if build(&mut self.send).is_ok() {
+                return true;
+            }
+            self.send.truncate_to(mark);
+        }
+        let _ = self.held_notifications.writable();
+        let mark = self.held_notifications.mark();
+        if build(&mut self.held_notifications).is_ok() {
             true
         } else {
-            self.send.truncate_to(mark);
+            self.held_notifications.truncate_to(mark);
             false
         }
     }
 
+    fn inside_result(&self) -> bool {
+        self.parked || !self.overflow.is_empty() || self.publication_hold.is_some()
+    }
+
+    /// Moves held notifications behind completed output once no result is
+    /// in progress.
+    fn release_held_notifications(&mut self) {
+        while !self.inside_result() && !self.held_notifications.is_empty() {
+            let bytes = self.held_notifications.readable();
+            let length = 1 + i32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+            if !self.send.append(&bytes[..length]) {
+                break;
+            }
+            self.held_notifications.consume(length);
+        }
+    }
+
     fn transport_output_empty(&self) -> bool {
-        self.send.is_empty() && self.tls.as_ref().is_none_or(|tls| !tls.wants_write())
+        self.send.is_empty()
+            && self.overflow.is_empty()
+            && self.tls.as_ref().is_none_or(|tls| !tls.wants_write())
     }
 
     /// Half-closes only after the complete FatalResponse is on the socket.
@@ -976,7 +1092,7 @@ impl Conn {
         if space.is_empty() {
             // Inbound message larger than the receive buffer: a protocol
             // limit, reported before closing.
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             let _ = responder.error(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "message exceeds the connection receive buffer",
@@ -996,7 +1112,8 @@ impl Conn {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return PendingResponse::closed(),
         }
-        let output_mark = self.send.mark();
+        let output_mark = self.output_mark();
+        self.publication_hold = Some(output_mark);
         PendingResponse {
             after: self.process(engine, cancel_key, auth, tls_config),
             publication_mark: Some(output_mark),
@@ -1011,13 +1128,17 @@ impl Conn {
         mut pending: PendingResponse,
         publication_error: Option<&SqlError>,
     ) -> After {
+        self.publication_hold = None;
         if pending.after != After::Close
             && let (Some(output_mark), Some(error)) = (pending.publication_mark, publication_error)
         {
             // No success response may cross the object-store durability
             // boundary.  The journal remains available for a later retry,
             // but this client receives an explicit unknown-outcome error.
-            self.send.truncate_to(output_mark);
+            if !self.truncate_output(output_mark) {
+                // Part of this response already reached the client.
+                return After::Close;
+            }
             let staged = self.txn.staged_commit().is_some();
             if staged {
                 self.recv.clear();
@@ -1026,7 +1147,8 @@ impl Conn {
                 self.start_termination();
                 pending.after = After::Continue;
             }
-            let mut responder = Responder::new(&mut self.send);
+            let status = self.txn.status_byte();
+            let mut responder = output(&mut self.send, &mut self.overflow);
             let sent = if staged {
                 responder.fatal(
                     "08007",
@@ -1035,12 +1157,13 @@ impl Conn {
             } else {
                 responder
                     .error(error.sqlstate, error.message.as_str())
-                    .and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+                    .and_then(|()| responder.ready_for_query(status))
             };
             if sent.is_err() {
                 pending.after = After::Close;
             }
         }
+        self.release_held_notifications();
         let flushed = self.flush();
         self.activate_pending_tls();
         if flushed.is_ok()
@@ -1055,20 +1178,20 @@ impl Conn {
     }
 
     pub fn on_writable(&mut self) -> After {
-        let flushed = self.flush();
+        let mut flushed = self.flush();
+        if flushed.is_ok() && self.transport_output_empty() && !self.held_notifications.is_empty() {
+            self.release_held_notifications();
+            flushed = self.flush();
+        }
         self.activate_pending_tls();
         if flushed.is_ok()
             && let Some(after) = self.finish_termination_output()
         {
             return after;
         }
-        if flushed.is_ok()
-            && self.send.is_empty()
-            && self.tls.as_ref().is_none_or(|tls| !tls.wants_write())
-            && self.replication_completion_pending
-        {
+        if flushed.is_ok() && self.transport_output_empty() && self.replication_completion_pending {
             self.replication_completion_pending = false;
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             if responder
                 .command_complete("COPY 0")
                 .and_then(|()| responder.command_complete("START_REPLICATION"))
@@ -1113,6 +1236,12 @@ impl Conn {
             {
                 return After::Close;
             }
+            if !self.overflow.is_empty() {
+                // The client must read queued output before the connection
+                // processes its next message.
+                self.park(crate::sql::StatementWait::ClientOutput, 0);
+                return After::Continue;
+            }
             let after = match self.phase {
                 Phase::Startup => self.process_startup(engine, cancel_key, auth, tls_config),
                 Phase::AwaitPassword
@@ -1155,13 +1284,19 @@ impl Conn {
                 crate::sql::StatementWait::CacheCapacity => {
                     self.parked_generation != engine.cache_capacity_generation()
                 }
+                crate::sql::StatementWait::ClientOutput => self.transport_output_empty(),
             };
         if !ready {
             return None;
         }
         self.parked = false;
-        let output_mark = self.send.mark();
+        let output_mark = self.output_mark();
+        self.publication_hold = Some(output_mark);
         let after = loop {
+            if !self.overflow.is_empty() {
+                self.park(crate::sql::StatementWait::ClientOutput, 0);
+                break After::Continue;
+            }
             let step = match self.phase {
                 Phase::AwaitLoginCommit => self.finish_startup(engine, cancel_key),
                 _ => self.process_message(engine),
@@ -1308,7 +1443,7 @@ impl Conn {
                 result
             }
             _ => {
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 let _ = responder.error(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "unsupported protocol version (this server speaks 3.0-3.2)",
@@ -1353,7 +1488,7 @@ impl Conn {
                 "database" => {
                     self.database = StackStr::from_str(value);
                     if self.database.is_truncated() {
-                        let mut responder = Responder::new(&mut self.send);
+                        let mut responder = output(&mut self.send, &mut self.overflow);
                         let _ = responder.error(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             "database name exceeds 64 bytes",
@@ -1368,7 +1503,7 @@ impl Conn {
                         "true" | "on" | "yes" | "1" => ReplicationMode::Physical,
                         "false" | "off" | "no" | "0" => ReplicationMode::None,
                         _ => {
-                            let mut responder = Responder::new(&mut self.send);
+                            let mut responder = output(&mut self.send, &mut self.overflow);
                             let _ = responder.error(
                                 sqlstate::INVALID_PARAMETER_VALUE,
                                 "invalid replication startup parameter",
@@ -1389,7 +1524,7 @@ impl Conn {
             }
         }
         if !user_seen {
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             let _ = responder.error(
                 "28000",
                 "no PostgreSQL user name specified in startup packet",
@@ -1409,14 +1544,14 @@ impl Conn {
                 return Step::Close;
             }
             if let Err(error) = engine.apply_system_settings(&self.guc) {
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 let _ = responder.error(error.sqlstate, error.message.as_str());
                 return Step::Close;
             }
             if let Some(role) = engine.role_login(session_user.as_str())
                 && let Err(error) = engine.apply_role_settings(role.slot, &self.guc)
             {
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 let _ = responder.error(error.sqlstate, error.message.as_str());
                 return Step::Close;
             }
@@ -1445,7 +1580,7 @@ impl Conn {
                 _ => self.guc.set_config(key, Some(value), false).map(|_| ()),
             };
             if let Err(error) = result {
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 let _ = responder.error(error.sqlstate, error.message.as_str());
                 return Step::Close;
             }
@@ -1480,7 +1615,7 @@ impl Conn {
 
         // Version negotiation happens before any auth request.
         {
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             if (requested_minor > wire::NEWEST_MINOR as u16 || n_unknown > 0)
                 && responder
                     .negotiate_protocol_version(
@@ -1496,12 +1631,12 @@ impl Conn {
         match auth.mode {
             AuthMode::Trust if !self.auth_reject => self.finish_startup(engine, cancel_key),
             AuthMode::Trust => {
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 let _ = responder.error("28000", "role is not permitted to log in");
                 Step::Close
             }
             AuthMode::Password => {
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 if responder.auth_cleartext_password().is_err() {
                     return Step::Close;
                 }
@@ -1513,7 +1648,7 @@ impl Conn {
                     self.login_verifier,
                     LoginVerifier::Role(crate::storage::RoleCredential::Scram(_))
                 ) {
-                    let mut responder = Responder::new(&mut self.send);
+                    let mut responder = output(&mut self.send, &mut self.overflow);
                     if responder.auth_sasl_mechanisms().is_err() {
                         return Step::Close;
                     }
@@ -1530,7 +1665,7 @@ impl Conn {
                     {
                         return Step::Close;
                     }
-                    let mut responder = Responder::new(&mut self.send);
+                    let mut responder = output(&mut self.send, &mut self.overflow);
                     if responder.auth_md5_password(&self.auth_md5_salt).is_err() {
                         return Step::Close;
                     }
@@ -1539,7 +1674,7 @@ impl Conn {
                 }
             }
             AuthMode::ScramSha256 => {
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 if responder.auth_sasl_mechanisms().is_err() {
                     return Step::Close;
                 }
@@ -1553,7 +1688,7 @@ impl Conn {
     /// AuthenticationOk, parameter statuses, key data, ReadyForQuery.
     fn finish_startup(&mut self, engine: &mut Engine, cancel_key: &[u8]) -> Step {
         let Some(database) = self.auth_database else {
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             let _ = responder.error(
                 sqlstate::INVALID_CATALOG_NAME,
                 stack_format!(
@@ -1570,7 +1705,7 @@ impl Conn {
                 return Step::Close;
             };
             if !engine.role_can_connect(login) {
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 let _ = responder.error(
                     sqlstate::INSUFFICIENT_PRIVILEGE,
                     stack_format!(
@@ -1583,7 +1718,7 @@ impl Conn {
                 return Step::Close;
             }
             if !engine.reserve_role_connection(login) {
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 let _ = responder.error(
                     sqlstate::TOO_MANY_CONNECTIONS,
                     "too many connections for role",
@@ -1592,7 +1727,7 @@ impl Conn {
             }
             if !engine.reserve_database_connection(database, login.superuser) {
                 engine.release_role_connection(login);
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 let message = if !database.allow_connections {
                     "database is not currently accepting connections"
                 } else {
@@ -1612,7 +1747,7 @@ impl Conn {
                 .and_then(|()| engine.finish_pending_transaction(&mut self.txn, &self.guc))
         } else {
             self.arena.reset();
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             engine.execute_login_event_triggers(
                 &mut self.txn,
                 &mut self.sqlprep,
@@ -1640,7 +1775,7 @@ impl Conn {
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
                 return Step::Parked;
             }
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             let _ = responder.error(error.sqlstate, error.message.as_str());
             if let Some(role) = self.authenticated_role.take() {
                 engine.release_role_connection(role);
@@ -1707,7 +1842,7 @@ impl Conn {
             ssl_cipher,
             ssl_bits,
         ) {
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             let _ = responder.error(error.sqlstate, error.message.as_str());
             if let Some(role) = self.authenticated_role.take() {
                 engine.release_role_connection(role);
@@ -1717,7 +1852,7 @@ impl Conn {
             }
             return Step::Close;
         }
-        let mut responder = Responder::new(&mut self.send);
+        let mut responder = output(&mut self.send, &mut self.overflow);
         let mut write_all = || -> Result<(), WireFull> {
             responder.auth_ok()?;
             for (k, v) in [
@@ -1766,7 +1901,7 @@ impl Conn {
         }
         if msg_type != wire::FMSG_PASSWORD {
             // Anything else during auth is a protocol violation.
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             let _ = responder.error(
                 sqlstate::PROTOCOL_VIOLATION,
                 "expected a password/SASL response during authentication",
@@ -1865,7 +2000,7 @@ impl Conn {
                 }
                 match self.scram.first(server, client_first, &nonce) {
                     Ok(ScramStep::Continue(payload)) => {
-                        let mut responder = Responder::new(&mut self.send);
+                        let mut responder = output(&mut self.send, &mut self.overflow);
                         if responder.auth_sasl_continue(payload.as_str()).is_err() {
                             return Step::Close;
                         }
@@ -1893,7 +2028,7 @@ impl Conn {
                     Ok(ScramStep::Final(_)) if self.auth_reject => auth_failed(&mut self.send),
                     Ok(ScramStep::Final(sig)) => {
                         {
-                            let mut responder = Responder::new(&mut self.send);
+                            let mut responder = output(&mut self.send, &mut self.overflow);
                             if responder.auth_sasl_final(sig.as_str()).is_err() {
                                 return Step::Close;
                             }
@@ -1919,7 +2054,7 @@ impl Conn {
             }
         }
         self.release_closed_statement_plans();
-        match Responder::new(&mut self.send).ready_for_query(self.txn.status_byte()) {
+        match output(&mut self.send, &mut self.overflow).ready_for_query(self.txn.status_byte()) {
             Ok(()) => Step::Continue,
             Err(WireFull) => Step::Close,
         }
@@ -1946,7 +2081,7 @@ impl Conn {
                 wire::FMSG_QUERY | wire::FMSG_TERMINATE | wire::FMSG_FLUSH
             )
         {
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             let _ = responder.error(
                 sqlstate::PROTOCOL_VIOLATION,
                 "physical replication connections accept only the simple query protocol",
@@ -2034,7 +2169,7 @@ impl Conn {
                                 lock_timeout_expired,
                             )
                             .and_then(|()| {
-                                let mut responder = Responder::new(&mut self.send);
+                                let mut responder = output(&mut self.send, &mut self.overflow);
                                 engine.commit_txn_with_triggers(
                                     &mut self.txn,
                                     &self.guc,
@@ -2069,7 +2204,7 @@ impl Conn {
                             return Step::Parked;
                         }
                         self.cursors.on_rollback();
-                        if Responder::new(&mut self.send)
+                        if output(&mut self.send, &mut self.overflow)
                             .error(error.sqlstate, error.message.as_str())
                             .is_err()
                         {
@@ -2086,7 +2221,7 @@ impl Conn {
                 wire::FMSG_CLOSE => self.handle_close(total),
                 wire::FMSG_FUNCTION_CALL => self.handle_function_call(engine, total),
                 _ => {
-                    let mut responder = Responder::new(&mut self.send);
+                    let mut responder = output(&mut self.send, &mut self.overflow);
                     let _ = responder.error(
                         sqlstate::PROTOCOL_VIOLATION,
                         "unknown frontend message type",
@@ -2149,7 +2284,7 @@ impl Conn {
                 .and_then(|()| engine.finish_pending_transaction(&mut self.txn, &self.guc))
             {
                 Ok(()) => {
-                    return if Responder::new(&mut self.send)
+                    return if output(&mut self.send, &mut self.overflow)
                         .ready_for_query(self.txn.status_byte())
                         .is_ok()
                     {
@@ -2184,7 +2319,7 @@ impl Conn {
                             error.message.as_str(),
                         );
                     }
-                    let _ = Responder::new(&mut self.send)
+                    let _ = output(&mut self.send, &mut self.overflow)
                         .error(error.sqlstate, error.message.as_str());
                     return Step::Close;
                 }
@@ -2305,7 +2440,7 @@ impl Conn {
             }
         }
         let result = {
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             engine.execute_large_object_fast_path(
                 function_oid,
                 &arguments[..argument_oids.len()],
@@ -2345,7 +2480,7 @@ impl Conn {
         } else {
             engine.rollback_txn(&mut self.txn, &self.guc);
         }
-        let mut responder = Responder::new(&mut self.send);
+        let mut responder = output(&mut self.send, &mut self.overflow);
         if responder
             .error(state.as_ref(), message)
             .and_then(|()| responder.ready_for_query(self.txn.status_byte()))
@@ -2358,7 +2493,7 @@ impl Conn {
     }
 
     fn protocol_error(&mut self, message: &str) -> Step {
-        let mut responder = Responder::new(&mut self.send);
+        let mut responder = output(&mut self.send, &mut self.overflow);
         let _ = responder.error(sqlstate::PROTOCOL_VIOLATION, message);
         Step::Close
     }
@@ -2385,7 +2520,7 @@ impl Conn {
                 self.copy = None;
                 self.copy_buf.clear();
                 engine.finish_backend_statement(&self.txn, self.id);
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 let sent = responder.error(sqlstate::QUERY_CANCELED, detail.as_str());
                 if extended {
                     self.phase = Phase::SkipToSync;
@@ -2410,7 +2545,7 @@ impl Conn {
                 self.copy_transition_scratch.clear();
                 self.copy = None;
                 self.copy_buf.clear();
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 let sent = responder.error(
                     sqlstate::PROTOCOL_VIOLATION,
                     "unexpected message type during COPY from stdin",
@@ -2513,7 +2648,7 @@ impl Conn {
                     );
                 }
                 self.stop_replication(engine);
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 if responder.copy_done().is_err() {
                     Step::Close
                 } else {
@@ -2540,7 +2675,7 @@ impl Conn {
                     "logical replication terminated by client: {message}"
                 );
                 self.stop_replication(engine);
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 if responder
                     .error(sqlstate::QUERY_CANCELED, detail.as_str())
                     .and_then(|()| responder.ready_for_query(self.txn.status_byte()))
@@ -2574,7 +2709,7 @@ impl Conn {
             return After::Continue;
         };
         let mark = self.send.mark();
-        let mut responder = Responder::new(&mut self.send);
+        let mut responder = output(&mut self.send, &mut self.overflow);
         let now = Instant::now();
         match engine.emit_replication_transaction_for_origin(
             stream.scan_lsn,
@@ -2628,7 +2763,7 @@ impl Conn {
             Err(error) => {
                 self.send.truncate_to(mark);
                 self.start_termination();
-                if Responder::new(&mut self.send)
+                if output(&mut self.send, &mut self.overflow)
                     .error(error.sqlstate, error.message.as_str())
                     .is_ok()
                 {
@@ -2650,7 +2785,7 @@ impl Conn {
     fn fail_replication_stream(&mut self, engine: &mut Engine, error: SqlError) -> Step {
         self.stop_replication(engine);
         self.start_termination();
-        if Responder::new(&mut self.send)
+        if output(&mut self.send, &mut self.overflow)
             .error(error.sqlstate, error.message.as_str())
             .is_ok()
         {
@@ -2746,7 +2881,7 @@ impl Conn {
                 } else {
                     copy.line = copy.line.saturating_add(1);
                     let outcome = {
-                        let mut responder = Responder::new(&mut self.send);
+                        let mut responder = output(&mut self.send, &mut self.overflow);
                         engine.copy_row_line(
                             &copy.setup,
                             line,
@@ -2835,7 +2970,7 @@ impl Conn {
                     if !copy.end_seen && copy.failed.is_none() {
                         let row = &self.copy_buf.readable()[..len];
                         let outcome = {
-                            let mut responder = Responder::new(&mut self.send);
+                            let mut responder = output(&mut self.send, &mut self.overflow);
                             engine.copy_row_binary(
                                 &copy.setup,
                                 row,
@@ -2896,7 +3031,7 @@ impl Conn {
             {
                 copy.line = copy.line.saturating_add(1);
                 let outcome = {
-                    let mut responder = Responder::new(&mut self.send);
+                    let mut responder = output(&mut self.send, &mut self.overflow);
                     engine.copy_row_line(
                         &copy.setup,
                         line,
@@ -2925,7 +3060,7 @@ impl Conn {
                 Err(e)
             }
             None => {
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 engine
                     .copy_finish(
                         &copy.setup,
@@ -2971,7 +3106,7 @@ impl Conn {
             self.cursors.on_rollback();
         }
         engine.finish_backend_statement(&self.txn, self.id);
-        let mut responder = Responder::new(&mut self.send);
+        let mut responder = output(&mut self.send, &mut self.overflow);
         let sent = match outcome {
             Ok(count) => {
                 if copy.ignored > 0
@@ -3183,7 +3318,7 @@ impl Conn {
         };
         let lock_timeout_expired = self.lock_timeout_expired();
         let bound_inputs = {
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             engine.admit_type_input_source(
                 crate::sql::type_inputs::Source::RootCommand { statement: 0 },
                 query,
@@ -3281,7 +3416,7 @@ impl Conn {
         self.release_closed_statement_plans();
         self.finish_lock_wait();
 
-        let mut responder = Responder::new(&mut self.send);
+        let mut responder = output(&mut self.send, &mut self.overflow);
         match responder.parse_complete() {
             Ok(()) => Step::Continue,
             Err(WireFull) => Step::Close,
@@ -3605,7 +3740,7 @@ impl Conn {
         };
         let prepared = &self.prepared[stmt_slot];
         let planned = crate::sql::type_input_plans::with_owner(self.portals[slot].plan, || {
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             engine.admit_extended_plan(
                 prepared.query(),
                 params,
@@ -3661,7 +3796,7 @@ impl Conn {
         portal.completion.clear();
         portal.returned_rows = false;
 
-        let mut responder = Responder::new(&mut self.send);
+        let mut responder = output(&mut self.send, &mut self.overflow);
         match responder.bind_complete() {
             Ok(()) => Step::Continue,
             Err(WireFull) => Step::Close,
@@ -3700,7 +3835,7 @@ impl Conn {
                         .cursors
                         .fetch_description(name, crate::pg::respond::ResultFmt::ALL_TEXT)
                     {
-                        let mut responder = Responder::new(&mut self.send);
+                        let mut responder = output(&mut self.send, &mut self.overflow);
                         return match responder.cursor_row_description(description, formats) {
                             Ok(()) => Step::Continue,
                             Err(WireFull) => Step::Close,
@@ -3814,7 +3949,7 @@ impl Conn {
         }
         if self.portals[portal_slot].execution == PortalExecution::Complete {
             let portal = &self.portals[portal_slot];
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             return if portal.completion.as_str().is_empty() {
                 match responder.empty_query_response() {
                     Ok(()) => Step::Continue,
@@ -3840,6 +3975,7 @@ impl Conn {
                 self.arena.reset();
             }
             let lock_timeout_expired = self.lock_timeout_expired();
+            let send_mark = self.output_mark();
             let portal = &mut self.portals[portal_slot];
             let prepared = &self.prepared[portal.statement];
             // Bind owns this slot even after its prepared name is closed.
@@ -3869,7 +4005,9 @@ impl Conn {
             // Paged execution goes through the portal's result buffer so
             // later Execute messages can continue draining it.
             let rfmt = portal.result_formats;
-            let send_mark = self.send.mark();
+            let stream_early = !engine.publication_required() || simple_query_can_stream(text);
+            let mut completion = None;
+            let mut transport_failed = false;
             let result = crate::sql::type_input_plans::with_owner(portal.plan, || {
                 if paged {
                     portal.result.clear();
@@ -3890,8 +4028,17 @@ impl Conn {
                         crate::sql::StatementTimeoutEntry::Nested,
                     )
                 } else {
-                    let mut responder = Responder::for_execute(&mut self.send, rfmt);
-                    engine.execute_extended_selected(
+                    let writer = match (stream_early, self.tls.as_mut(), self.stream.as_mut()) {
+                        (false, _, _) | (true, _, None) => ClientWriter::None,
+                        (true, Some(session), Some(socket)) => {
+                            ClientWriter::Tls { session, socket }
+                        }
+                        (true, None, Some(socket)) => ClientWriter::Fd(socket.as_raw_fd()),
+                    };
+                    let mut responder = Responder::for_execute(&mut self.send, rfmt).with_output(
+                        OutputSink::new(&mut self.overflow, Some(engine.result_spool()), writer),
+                    );
+                    let result = engine.execute_extended_selected(
                         text,
                         &self.arena,
                         params,
@@ -3905,9 +4052,18 @@ impl Conn {
                         lock_timeout_expired,
                         prepared.type_inputs(),
                         crate::sql::StatementTimeoutEntry::Nested,
-                    )
+                    );
+                    completion = responder.completion_tag();
+                    transport_failed = responder.transport_failed();
+                    result
                 }
             });
+            if transport_failed {
+                if engine.take_pending_copy().is_some() {
+                    engine.copy_abort(&mut self.txn, &self.guc);
+                }
+                return Step::Close;
+            }
             let pending_copy = engine.take_pending_copy();
             if !matches!(
                 result,
@@ -3940,7 +4096,9 @@ impl Conn {
                     if paged {
                         // Forward the buffered error output.
                         let portal = &mut self.portals[portal_slot];
-                        let bytes_ok = self.send.append(portal.result.readable());
+                        let bytes_ok = output(&mut self.send, &mut self.overflow)
+                            .raw(portal.result.readable())
+                            .is_ok();
                         portal.result.clear();
                         if !bytes_ok {
                             return Step::Close;
@@ -3950,15 +4108,24 @@ impl Conn {
                     return Step::Continue;
                 }
                 Ok(crate::sql::ExtendedExecutionStatus::Blocked { wait }) => {
+                    self.park(wait, engine.statement_wait_generation(wait, self.id));
+                    engine.park_backend_statement(self.id, wait);
                     if !self.txn.has_pending_write_completion() {
                         if paged {
                             self.portals[portal_slot].result.clear();
-                        } else {
-                            self.send.truncate_to(send_mark);
+                        } else if !self.truncate_output(send_mark) {
+                            // A restart would repeat rows the client already has.
+                            return if self.abort_parked(
+                                engine,
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "statement cannot wait after part of its result was sent",
+                            ) {
+                                Step::Continue
+                            } else {
+                                Step::Close
+                            };
                         }
                     }
-                    self.park(wait, engine.statement_wait_generation(wait, self.id));
-                    engine.park_backend_statement(self.id, wait);
                     return Step::Parked;
                 }
                 Err(WireFull) => {
@@ -3972,7 +4139,9 @@ impl Conn {
             if let Some((setup, deadline)) = pending_copy {
                 if paged {
                     let portal = &mut self.portals[portal_slot];
-                    let bytes_ok = self.send.append(portal.result.readable());
+                    let bytes_ok = output(&mut self.send, &mut self.overflow)
+                        .raw(portal.result.readable())
+                        .is_ok();
                     portal.result.clear();
                     if !bytes_ok {
                         engine.copy_abort(&mut self.txn, &self.guc);
@@ -4001,13 +4170,8 @@ impl Conn {
             if paged {
                 self.portals[portal_slot].execution = PortalExecution::Paging;
             } else {
-                let completion = command_completion_in(
-                    self.send.filled_mut().get(send_mark..).unwrap_or_default(),
-                )
-                .map(crate::util::StackStr::from_str)
-                .unwrap_or_default();
                 let portal = &mut self.portals[portal_slot];
-                portal.completion = completion;
+                portal.completion = completion.unwrap_or_default();
                 portal.execution = PortalExecution::Complete;
                 self.apply_protocol_reset(engine);
                 return Step::Continue;
@@ -4019,7 +4183,7 @@ impl Conn {
         let mut sent = 0i32;
         loop {
             if max_rows > 0 && sent == max_rows {
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 return match resp_portal_suspended(&mut responder) {
                     Ok(()) => Step::Continue,
                     Err(WireFull) => Step::Close,
@@ -4040,7 +4204,7 @@ impl Conn {
                     return Step::Close;
                 };
                 portal.completion = crate::util::StackStr::from_str(tag);
-                let mut responder = Responder::new(&mut self.send);
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 let result = if portal.returned_rows {
                     let page_tag = command_tag_rows(tag, sent as u64);
                     responder.command_complete(page_tag.as_str())
@@ -4054,7 +4218,16 @@ impl Conn {
                     Err(WireFull) => Step::Close,
                 };
             }
-            if !self.send.append(&data[..total_msg]) {
+            // A page can exceed the send buffer; the overflow keeps it whole.
+            if Responder::new(&mut self.send)
+                .with_output(OutputSink::new(
+                    &mut self.overflow,
+                    Some(engine.result_spool()),
+                    ClientWriter::None,
+                ))
+                .raw(&data[..total_msg])
+                .is_err()
+            {
                 return Step::Close;
             }
             if msg_type == wire::MSG_DATA_ROW {
@@ -4106,7 +4279,7 @@ impl Conn {
             }
         }
         self.release_closed_statement_plans();
-        let mut responder = Responder::new(&mut self.send);
+        let mut responder = output(&mut self.send, &mut self.overflow);
         match responder.close_complete() {
             Ok(()) => Step::Continue,
             Err(WireFull) => Step::Close,
@@ -4121,7 +4294,7 @@ impl Conn {
         // allocates from the arena — all disjoint fields.
         let payload = &self.recv.readable()[5..total];
         let Ok(text) = MsgIn::new(payload).cstr() else {
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             let _ = responder.error(sqlstate::PROTOCOL_VIOLATION, "malformed Query message");
             return Step::Close;
         };
@@ -4136,27 +4309,24 @@ impl Conn {
         } else {
             self.arena.reset();
         }
-        let mark = self.send.mark();
-        // Stream large results: put the socket in blocking mode so the
-        // Responder can drain a full send buffer straight to the client and
-        // continue, instead of failing with 54000. Restored afterward.
-        let fd = self.stream.as_ref().map(|s| s.as_raw_fd());
-        if let Some(stream) = self.stream.as_ref() {
-            let _ = stream.set_nonblocking(false);
-        }
-        let result = {
+        let mark = self.output_mark();
+        // A full send buffer spills into the overflow area; the worker never
+        // waits for this client. Bytes may leave during the statement only
+        // when they cannot precede an object-store publication.
+        let stream_early = !engine.publication_required() || simple_query_can_stream(text);
+        let (result, transport_failed) = {
             let lock_timeout_expired = self.lock_timeout_expired();
-            let mut responder = Responder::new(&mut self.send);
-            // Over TLS the drain must encrypt through the session onto the
-            // blocking socket; in the clear it writes the fd directly.
-            if !engine.publication_required() || simple_query_can_stream(text) {
-                if let Some(session) = self.tls.as_mut() {
-                    responder = responder.with_flush_tls(session, self.stream.as_mut().unwrap());
-                } else if let Some(fd) = fd {
-                    responder = responder.with_flush(fd);
-                }
-            }
-            engine.execute_simple_from_selected(
+            let writer = match (stream_early, self.tls.as_mut(), self.stream.as_mut()) {
+                (false, _, _) | (true, _, None) => ClientWriter::None,
+                (true, Some(session), Some(socket)) => ClientWriter::Tls { session, socket },
+                (true, None, Some(socket)) => ClientWriter::Fd(socket.as_raw_fd()),
+            };
+            let mut responder = Responder::new(&mut self.send).with_output(OutputSink::new(
+                &mut self.overflow,
+                Some(engine.result_spool()),
+                writer,
+            ));
+            let result = engine.execute_simple_from_selected(
                 text,
                 self.resume_statement,
                 &self.arena,
@@ -4167,10 +4337,11 @@ impl Conn {
                 &mut responder,
                 self.id,
                 lock_timeout_expired,
-            )
+            );
+            (result, responder.transport_failed())
         };
-        if let Some(stream) = self.stream.as_ref() {
-            let _ = stream.set_nonblocking(true);
+        if transport_failed {
+            return Step::Close;
         }
         let status = self.txn.status_byte();
         let step = match result {
@@ -4203,8 +4374,7 @@ impl Conn {
                     return Step::Continue;
                 }
                 engine.finish_backend_statement(&self.txn, self.id);
-                let mut responder = Responder::new(&mut self.send);
-                match responder.ready_for_query(status) {
+                match output(&mut self.send, &mut self.overflow).ready_for_query(status) {
                     Ok(()) => Step::Continue,
                     Err(WireFull) => Step::Close,
                 }
@@ -4214,20 +4384,46 @@ impl Conn {
                 output_mark,
                 wait,
             }) => {
-                self.send.truncate_to(output_mark);
                 self.resume_statement = completed_statements;
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
                 engine.park_backend_statement(self.id, wait);
                 self.arena.recycle_front();
+                if !self.truncate_output(output_mark) {
+                    // A restart would repeat rows the client already has.
+                    return if self.abort_parked(
+                        engine,
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "statement cannot wait after part of its result was sent",
+                    ) {
+                        Step::Continue
+                    } else {
+                        Step::Close
+                    };
+                }
                 return Step::Parked;
             }
             Err(WireFull) => {
+                // Even the private output reserve is full: end the statement
+                // with an explicit error after the queued output.
                 self.sqlprep.clear_request_type_inputs();
                 if engine.take_pending_copy().is_some() {
                     engine.copy_abort(&mut self.txn, &self.guc);
                     self.copy_transition_scratch.clear();
                 }
-                let mut responder = Responder::new(&mut self.send);
+                crate::sql::sequence::finish_statement(self.guc.seq_session());
+                self.finish_lock_wait();
+                self.resume_statement = 0;
+                if self.txn.is_explicit() {
+                    self.txn.failed = true;
+                } else if self.txn.is_active() {
+                    engine.rollback_txn(&mut self.txn, &self.guc);
+                }
+                if !self.txn.is_active() {
+                    self.cursors.on_rollback();
+                }
+                engine.finish_backend_statement(&self.txn, self.id);
+                let status = self.txn.status_byte();
+                let mut responder = output(&mut self.send, &mut self.overflow);
                 let recovered = responder
                     .replace_with_overflow_error(mark)
                     .and_then(|()| responder.ready_for_query(status));
@@ -4277,7 +4473,7 @@ impl Conn {
                     Datum::Null
                 },
             ];
-            let mut responder = Responder::new(&mut self.send);
+            let mut responder = output(&mut self.send, &mut self.overflow);
             if responder
                 .row_description(&columns)
                 .and_then(|()| responder.data_row(&values))
@@ -4294,7 +4490,7 @@ impl Conn {
             let command = {
                 let payload = &self.recv.readable()[5..total];
                 let Ok(text) = MsgIn::new(payload).cstr() else {
-                    let mut responder = Responder::new(&mut self.send);
+                    let mut responder = output(&mut self.send, &mut self.overflow);
                     let _ =
                         responder.error(sqlstate::PROTOCOL_VIOLATION, "malformed Query message");
                     return Step::Close;
@@ -4310,7 +4506,7 @@ impl Conn {
                     let restart_lsn = match engine.create_replication_slot(name, behavior) {
                         Ok(lsn) => lsn,
                         Err(error) => {
-                            let mut responder = Responder::new(&mut self.send);
+                            let mut responder = output(&mut self.send, &mut self.overflow);
                             if responder
                                 .error(error.sqlstate, error.message.as_str())
                                 .and_then(|()| responder.ready_for_query(b'I'))
@@ -4350,7 +4546,7 @@ impl Conn {
                             Ok(name) => Some(name),
                             Err(error) => {
                                 let _ = engine.drop_replication_slot(name);
-                                let mut responder = Responder::new(&mut self.send);
+                                let mut responder = output(&mut self.send, &mut self.overflow);
                                 if responder
                                     .error(error.sqlstate, error.message.as_str())
                                     .and_then(|()| responder.ready_for_query(b'I'))
@@ -4373,7 +4569,7 @@ impl Conn {
                             .map_or(Datum::Null, |name| Datum::Text(name.as_str())),
                         Datum::Text("pgoutput"),
                     ];
-                    let mut responder = Responder::new(&mut self.send);
+                    let mut responder = output(&mut self.send, &mut self.overflow);
                     if responder
                         .row_description(&columns)
                         .and_then(|()| responder.data_row(&values))
@@ -4388,7 +4584,7 @@ impl Conn {
                 }
                 Ok(LogicalReplicationCommand::DropSlot { name }) => {
                     if let Err(error) = engine.drop_replication_slot(name) {
-                        let mut responder = Responder::new(&mut self.send);
+                        let mut responder = output(&mut self.send, &mut self.overflow);
                         if responder
                             .error(error.sqlstate, error.message.as_str())
                             .and_then(|()| responder.ready_for_query(b'I'))
@@ -4399,7 +4595,7 @@ impl Conn {
                         self.recv.consume(total);
                         return Step::Continue;
                     }
-                    let mut responder = Responder::new(&mut self.send);
+                    let mut responder = output(&mut self.send, &mut self.overflow);
                     if responder
                         .command_complete("DROP_REPLICATION_SLOT")
                         .and_then(|()| responder.ready_for_query(b'I'))
@@ -4412,7 +4608,7 @@ impl Conn {
                 }
                 Ok(LogicalReplicationCommand::AlterSlot { name, behavior }) => {
                     if let Err(error) = engine.alter_replication_slot(name, behavior) {
-                        let mut responder = Responder::new(&mut self.send);
+                        let mut responder = output(&mut self.send, &mut self.overflow);
                         if responder
                             .error(error.sqlstate, error.message.as_str())
                             .and_then(|()| responder.ready_for_query(b'I'))
@@ -4423,7 +4619,7 @@ impl Conn {
                         self.recv.consume(total);
                         return Step::Continue;
                     }
-                    let mut responder = Responder::new(&mut self.send);
+                    let mut responder = output(&mut self.send, &mut self.overflow);
                     if responder
                         .command_complete("ALTER_REPLICATION_SLOT")
                         .and_then(|()| responder.ready_for_query(b'I'))
@@ -4445,7 +4641,7 @@ impl Conn {
                         publication,
                         &mut self.replication_publications,
                     ) {
-                        let mut responder = Responder::new(&mut self.send);
+                        let mut responder = output(&mut self.send, &mut self.overflow);
                         let _ = responder
                             .error(error.sqlstate, error.message.as_str())
                             .and_then(|()| responder.ready_for_query(b'I'));
@@ -4455,7 +4651,7 @@ impl Conn {
                     if let Err(error) = engine
                         .validate_replication_publications(self.replication_publications.as_slice())
                     {
-                        let mut responder = Responder::new(&mut self.send);
+                        let mut responder = output(&mut self.send, &mut self.overflow);
                         let _ = responder
                             .error(error.sqlstate, error.message.as_str())
                             .and_then(|()| responder.ready_for_query(b'I'));
@@ -4466,7 +4662,7 @@ impl Conn {
                     {
                         Ok(lsn) => lsn,
                         Err(error) => {
-                            let mut responder = Responder::new(&mut self.send);
+                            let mut responder = output(&mut self.send, &mut self.overflow);
                             let _ = responder
                                 .error(error.sqlstate, error.message.as_str())
                                 .and_then(|()| responder.ready_for_query(b'I'));
@@ -4474,7 +4670,7 @@ impl Conn {
                             return Step::Continue;
                         }
                     };
-                    let mut responder = Responder::new(&mut self.send);
+                    let mut responder = output(&mut self.send, &mut self.overflow);
                     if responder.copy_both_response().is_err() {
                         engine.deactivate_replication_slot(name.as_str());
                         return Step::Close;
@@ -4496,7 +4692,7 @@ impl Conn {
                     return Step::Continue;
                 }
                 Err(error) => {
-                    let mut responder = Responder::new(&mut self.send);
+                    let mut responder = output(&mut self.send, &mut self.overflow);
                     if responder
                         .error(error.sqlstate, error.message.as_str())
                         .and_then(|()| responder.ready_for_query(b'I'))
@@ -4514,7 +4710,7 @@ impl Conn {
             ReplicationMode::Logical => "unsupported logical replication command",
             ReplicationMode::None => unreachable!("only replication connections reach this path"),
         };
-        let mut responder = Responder::new(&mut self.send);
+        let mut responder = output(&mut self.send, &mut self.overflow);
         if responder
             .error(sqlstate::FEATURE_NOT_SUPPORTED, message)
             .and_then(|()| responder.ready_for_query(b'I'))
@@ -4526,39 +4722,50 @@ impl Conn {
         Step::Continue
     }
 
-    /// Writes as much of the send buffer as the socket accepts.
-    /// `Err` means the connection is broken.
+    /// Writes queued output until the socket would block, refilling the send
+    /// buffer from the overflow at message boundaries. Output after the
+    /// publication hold stays queued. `Err` means the connection is broken.
     fn flush(&mut self) -> Result<(), ()> {
         if self.stream.is_none() {
             return Err(());
         }
-        if let Some(tls) = self.tls.as_mut() {
+        loop {
+            if self.send.is_empty() {
+                let _ = self.overflow.refill(&mut self.send);
+            }
+            let allowed = self.flushable_bytes().min(self.send.len());
+            if allowed == 0 {
+                break;
+            }
+            let data = &self.send.readable()[..allowed];
             let socket = self.stream.as_mut().unwrap();
-            // Hand the plaintext to the session (it buffers into records), then
-            // push as much ciphertext to the socket as it accepts. Leftover
-            // ciphertext stays queued in rustls; `wants_write` keeps write
-            // interest registered until it drains.
-            while !self.send.is_empty() {
-                match tls.queue(self.send.readable()) {
-                    Ok(0) => return Err(()),
-                    Ok(n) => self.send.consume(n),
+            let accepted = if let Some(tls) = self.tls.as_mut() {
+                // rustls reports a full record buffer as a zero-byte write;
+                // its ciphertext stays queued and `wants_write` keeps write
+                // interest registered until the socket accepts it.
+                match tls.queue_nonblocking(socket, data) {
+                    Ok(n) => n,
                     Err(_) => return Err(()),
                 }
-            }
-            return match tls.flush_nonblocking(socket) {
-                Ok(()) => Ok(()),
-                Err(_) => Err(()),
+            } else {
+                match socket.write(data) {
+                    Ok(0) => return Err(()),
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return Err(()),
+                }
             };
-        }
-        let stream = self.stream.as_mut().unwrap();
-        while !self.send.is_empty() {
-            match stream.write(self.send.readable()) {
-                Ok(0) => return Err(()),
-                Ok(n) => self.send.consume(n),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return Err(()),
+            if accepted == 0 {
+                break;
             }
+            self.send.consume(accepted);
+            self.overflow.record_written(accepted);
+            let _ = self.overflow.refill(&mut self.send);
+        }
+        if let Some(tls) = self.tls.as_mut() {
+            tls.flush_nonblocking(self.stream.as_mut().unwrap())
+                .map_err(|_| ())?;
         }
         Ok(())
     }
@@ -5597,8 +5804,7 @@ fn record_copy_input_error(send: &mut FixedBuf, copy: &mut CopyInProgress, error
 }
 
 fn resp_portal_suspended(responder: &mut Responder) -> Result<(), crate::pg::wire::WireFull> {
-    use crate::pg::wire::{MSG_PORTAL_SUSPENDED, MsgOut};
-    MsgOut::begin(responder.buffer, MSG_PORTAL_SUSPENDED).finish()
+    responder.portal_suspended()
 }
 
 fn command_completion_in(mut bytes: &[u8]) -> Option<&str> {
@@ -5972,6 +6178,10 @@ fn ext_err<S: AsRef<str>>(send: &mut FixedBuf, phase: &mut Phase, code: S, messa
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 #[path = "conn/bind_inputs_tests.rs"]
 mod bind_inputs_tests;
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[path = "conn/result_output_tests.rs"]
+mod result_output_tests;
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
@@ -7927,7 +8137,7 @@ mod tests {
                 crate::mem::guard::forbid_alloc(|| conn.finish_response(
                     PendingResponse {
                         after: After::Continue,
-                        publication_mark: Some(0),
+                        publication_mark: Some(OutputMark::new(0, conn.overflow.written())),
                     },
                     None,
                 )),
@@ -9901,7 +10111,7 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| connection.finish_response(
                 PendingResponse {
                     after: After::Continue,
-                    publication_mark: Some(0)
+                    publication_mark: Some(OutputMark::new(0, connection.overflow.written()))
                 },
                 Some(&error)
             )),

@@ -26727,21 +26727,6 @@ fn execute_trigger_step<'a>(
     }
     let retained_parent = context.txn.write_completion_boundary.is_some()
         && matches!(&context.host, PlpgsqlExecHost::Routine { .. });
-    let (statement, input_plan) = {
-        let transition = TriggerTransition {
-            definition,
-            old,
-            new: new.as_deref(),
-        };
-        let row = TriggerLocalScope {
-            locals,
-            values: &local_values[..locals.len()],
-            found: status.found,
-            invocation,
-            transition: &transition,
-        };
-        prepare_static_plpgsql_statement(context, statement, &row)?
-    };
     let position = match status.pending_statement.take() {
         Some(position) => {
             if let Err(((), error)) = position.with_resume(
@@ -26755,6 +26740,29 @@ fn execute_trigger_step<'a>(
             position
         }
         None => super::sequence::SavedStatementPosition::capture()?,
+    };
+    let (statement, input_plan) = {
+        let transition = TriggerTransition {
+            definition,
+            old,
+            new: new.as_deref(),
+        };
+        let row = TriggerLocalScope {
+            locals,
+            values: &local_values[..locals.len()],
+            found: status.found,
+            invocation,
+            transition: &transition,
+        };
+        match prepare_static_plpgsql_statement(context, statement, &row) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if control_flow::is_execution_wait(&error) {
+                    status.pending_statement = Some(position);
+                }
+                return Err(error);
+            }
+        }
     };
     let mut execute = || match statement {
         TriggerStatement::Null => execute_trigger_statement(|| Ok(None)),

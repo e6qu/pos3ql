@@ -687,12 +687,15 @@ impl SavedStatementPosition {
         clippy::result_large_err,
         reason = "failed admission returns its original unattached owner without allocating"
     )]
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn with_resume<T, R>(
         &self,
         owner: T,
         tail: super::lock::AdvisoryPositionTail,
         execute: impl for<'session> FnOnce(T, &mut StatementPositionAdmission<'session>) -> R,
     ) -> Result<R, (T, SqlError)> {
+        #[cfg(test)]
+        let caller = core::panic::Location::caller();
         with_statement_context(|context| {
             let mut admission = StatementPositionAdmission {
                 session: None,
@@ -727,7 +730,16 @@ impl SavedStatementPosition {
                     replay.effects_next = effects_next;
                     session.statement_replay.set(replay);
                     #[cfg(test)]
-                    trace_replay("attach", arena, replay);
+                    {
+                        trace_replay("attach", arena, replay);
+                        REPLAY_TRACE.with(|trace| {
+                            let mut log = trace.get();
+                            if let Some(entry) = &mut log.entries[log.count - 1] {
+                                entry.caller = caller;
+                            }
+                            trace.set(log);
+                        });
+                    }
                     session.restore_last_sequence(saved.lastval);
                 }
                 _ => return Err((owner, replay_changed())),

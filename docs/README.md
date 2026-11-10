@@ -1,65 +1,30 @@
 # Find the guide you need
 
-Start with the [overview](../README.md) for where the project is today and the
-[plan](../PLAN.md) for what remains. The guides below describe current behavior;
-an example of a future goal is labeled as remaining work in the plan.
+Start with the [overview](../README.md). The guides describe current behavior;
+unfinished work lives only in the [roadmap](../PLAN.md).
 
-| Your question | Start here |
+| Your question | Guide |
 |---|---|
-| How do requests, commits, column groups and caches work? | [Architecture](architecture.md) |
-| What are the size and throughput limits? | [Physical limits](architecture.md#memory-and-physical-size), [performance](performance.md#estimating-bandwidth-and-throughput) |
+| Can my application use this PostgreSQL feature? | [Compatibility and limits](postgresql-18-compatibility.md), [SQL/JSON](sql-json.md), [SQL/XML](sql-xml.md) |
+| What can my application rely on today? | [What works today](implemented-baseline.md) |
+| How do requests, commits, storage layout and caches work? | [Architecture](architecture.md) |
+| What are the memory and size limits? | [Physical limits](architecture.md#memory-and-physical-size) |
+| How do I install, configure, monitor or replace a server? | [Installation](../packaging/README.md), [operations](operations.md) |
 | How do scheduled tasks and migrations run? | [Scheduling and migrations](operations.md#scheduled-work-and-schema-migrations) |
-| Can my application use this PostgreSQL feature? | [Compatibility and limits](postgresql-18-compatibility.md) |
-| How do I install, monitor, or replace a server? | [Installation](../packaging/README.md), [operations](operations.md) |
-| How do I recover an earlier state or copy the database? | [Backup and restore](backup-restore.md) |
 | What happens if the local disk or object store fails? | [Object storage](object-storage.md) |
+| How do I back up, restore or copy a database? | [Backup and restore](backup-restore.md), [logical replication](logical-replication.md) |
 | Will an upgrade read my existing data? | [Durable formats](durable-format.md) |
-| How do I compare speed and resource use with PostgreSQL? | [Performance](performance.md) |
-| What does an unfamiliar term mean? | [Glossary](terminology.md) |
-
-## Current guidance
-
-| Document | What it explains |
-|---|---|
-| [Project overview](../README.md) | Purpose, status, destination, and first run |
-| [Roadmap](../PLAN.md) | Remaining work, its order, and how we know it is done |
-| [Architecture](architecture.md) | Request path, object-store optimizations, physical bounds and source map |
-| [What works today](implemented-baseline.md) | Application behavior, transaction visibility and schema changes |
-| [PostgreSQL 18 compatibility](postgresql-18-compatibility.md) | Supported behavior, capacity limits, and features outside the design |
-| [Contributing](../CONTRIBUTING.md) | Development, verification, and PR workflow |
-| [Agent rules](../AGENTS.md) | Required engineering and change rules |
-| [Terminology](terminology.md) | Naming and glossary |
-| [Blocked defects](../BUGS.md) | Genuine blockers to repairing known bugs |
-
-## Operations and internals
-
-- [Installation](../packaging/README.md)
-- [Operations, credentials, readiness, and replacement](operations.md)
-- [Backup, export, and point-in-time recovery](backup-restore.md)
-- [S3-compatible storage profile and qualification](object-storage.md)
-- [Durable formats and binary compatibility](durable-format.md)
-- [Immutable index navigation](index-navigation.md)
-- [Performance harness and interpretation](performance.md)
-
-## Specialized compatibility
-
-- [Logical replication](logical-replication.md)
-- [SQL/JSON](sql-json.md)
-- [SQL/XML and XPath](sql-xml.md)
-
-## Designs still to implement
-
-- [Sharing fixed resources according to load](adaptive-resources.md): shared
-  workload policies for the existing fixed pools, read/write demand, future
-  row/column layout and bounded batching.
+| How do indexes find rows in saved files? | [Index navigation](index-navigation.md) |
+| How fast is it, and how do I measure? | [Performance](performance.md), [retained benchmarks](../benchmarks/README.md) |
+| How will capacity sharing and feedback control work? | [Resource design](adaptive-resources.md) (unfinished) |
+| What does a term mean? | [Glossary](terminology.md) |
+| How do I contribute? | [Contributing](../CONTRIBUTING.md), [engineering rules](../AGENTS.md) |
+| Which defects are blocked? | [Blocked defects](../BUGS.md) |
 
 ## Evidence and provenance
 
-- [Retained benchmarks](../benchmarks/README.md): dated raw artifacts and reports.
-- [Implementation history](history/README.md): immutable implementation records and completed investigations.
-- Fixture generation: `tests/data/README.md` in the source repository.
-- Original third-party tests and checksums: `vendor/README.md` and `vendor/SHA256SUMS`.
-
-Keep current behavior in the guide that explains it and unfinished work in
-PLAN.md. Preserve original measurements, third-party sources, and completed
-investigations; their dates and revisions matter when interpreting a result.
+- [Retained benchmarks](../benchmarks/README.md): dated raw results and reports.
+- [Implementation history](history/README.md): earlier plans and completed
+  investigations at fixed revisions.
+- Fixture generation: `tests/data/README.md`.
+- Third-party tests and checksums: `vendor/README.md` and `vendor/SHA256SUMS`.

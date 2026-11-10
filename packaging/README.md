@@ -1,13 +1,11 @@
 # Installing the release archive
 
-**User example:** install a release on a Linux x86-64 host, configure where
-it saves data, and check readiness before sending application traffic. The
-starter configuration does not make an object store or credentials for you.
-The installed operations guide described below covers monitoring and replacement.
+**User example:** install a release on a Linux x86-64 host, point it at your
+object store, and check readiness before sending application traffic. You
+must create the bucket and credentials yourself.
 
-The archive contains one Linux executable and its operator files. Create the
-`pos3ql` system user before installation. Replace `VERSION` with the downloaded
-release version, verify the adjacent checksum, and enter the extracted archive:
+Create the `pos3ql` system user first. Replace `VERSION` with the release
+version, verify the checksum, and extract:
 
 ```sh
 pos3ql_archive=pos3ql-vVERSION-x86_64-unknown-linux-gnu.tar.gz
@@ -26,11 +24,10 @@ sudo install -m 0644 lib/systemd/system/pos3ql.service /etc/systemd/system/pos3q
 sudo install -m 0644 lib/systemd/system/pos3ql-failover.service /etc/systemd/system/pos3ql-failover.service
 ```
 
-Configure object storage,
-TLS, authentication, memory capacities, and an owner-only object-store
-credential file before enabling the service. Review the architecture and physical
-limits in `share/doc/pos3ql/docs/architecture.md`; the starter file is an example,
-not a qualified production size or throughput profile. Then run:
+Before enabling the service, configure object storage, TLS, authentication,
+memory capacities, and an owner-only object-store credential file. The
+starter file is an example, not a qualified production size; physical limits
+are in `share/doc/pos3ql/docs/architecture.md`. Then:
 
 ```sh
 sudo systemctl daemon-reload
@@ -38,16 +35,11 @@ sudo systemctl enable --now pos3ql
 curl --fail http://127.0.0.1:9187/readyz
 ```
 
-The installed archive includes its documentation. See
-`share/doc/pos3ql/docs/README.md` for the documentation index and
-`share/doc/pos3ql/docs/operations.md` for probes, credential rotation, alerts,
-and controlled replacement. The canonical guides live under that documentation index.
+The documentation index is `share/doc/pos3ql/docs/README.md`. Probes,
+credential rotation, alerts, controlled replacement, and the failover
+procedure are in `share/doc/pos3ql/docs/operations.md`.
 
-On one passive candidate for a durable object prefix, copy
+For automatic failover, on one passive candidate per durable prefix copy
 `etc/pos3ql/pos3ql-failover.conf.example` to
 `/etc/pos3ql/pos3ql-failover.conf`, set the primary and candidate readiness
-URLs, and keep `pos3ql.service` disabled. Enable `pos3ql-failover.service`
-instead. After the configured consecutive-failure threshold, the monitor
-starts the candidate once and waits for fence-validating readiness. Follow the
-failover procedure in `share/doc/pos3ql/docs/operations.md`; use one promotion
-authority for each prefix.
+URLs, keep `pos3ql.service` disabled, and enable `pos3ql-failover.service`.

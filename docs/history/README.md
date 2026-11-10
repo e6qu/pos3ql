@@ -1,26 +1,26 @@
 # Historical implementation records
 
-Use the current guides and plan to decide what works now and what remains.
-The fixed revisions below preserve earlier plans, investigations, and original
-observations. A statement in an old snapshot may describe a limit since removed
-or work since completed.
+These fixed revisions preserve earlier plans, investigations, and
+observations. They may describe limits since removed or work since completed;
+use the current [roadmap](../../PLAN.md),
+[compatibility contract](../postgresql-18-compatibility.md), and
+[benchmark evidence index](../../benchmarks/README.md) for present decisions.
+For example, an old report of costly checkpoint rewrites measured the binary
+and workload recorded there, not today's code. Offline, use
+`git show REVISION:PATH`.
 
-For example, an old report showing costly checkpoint rewrites describes the
-binary and workload recorded there. It is evidence for that investigation,
-not a measurement of today's code.
+## Before the architecture review
 
-## Before this architecture review
-
-Revision `27af086bff6a9e02f5c05bac1774b6bea50cc03c` preserves the
+Revision `27af086bff6a9e02f5c05bac1774b6bea50cc03c`:
 [earlier detailed behavior narrative](https://github.com/e6qu/pos3ql/blob/27af086bff6a9e02f5c05bac1774b6bea50cc03c/docs/implemented-baseline.md).
-Current application behavior is consolidated in the [behavior guide](../implemented-baseline.md)
-and code/storage structure in [architecture](../architecture.md). Old implementation
-steps are historical evidence, not additional open roadmap items.
+Current behavior is in the [behavior guide](../implemented-baseline.md) and
+[architecture](../architecture.md); old implementation steps are not open
+roadmap items.
 
 ## Original implementation record
 
-Revision `708d5b475845492bdaa29dd573a6f508770acc62` (PR #599) preserves the
-implementation record before the first documentation consolidation.
+Revision `708d5b475845492bdaa29dd573a6f508770acc62` (PR #599), before the
+first documentation consolidation:
 
 | Record | Immutable snapshot |
 |---|---|
@@ -32,30 +32,25 @@ implementation record before the first documentation consolidation.
 
 ## Ownership preparation and benchmark catalog
 
-Revision `51a21b6b7393022b92c4f6f86c889e9fa3394b93` (PR #605) preserves the
-records before the current consolidation:
+Revision `51a21b6b7393022b92c4f6f86c889e9fa3394b93` (PR #605):
 
 - [Roadmap and evolving conclusions](https://github.com/e6qu/pos3ql/blob/51a21b6b7393022b92c4f6f86c889e9fa3394b93/PLAN.md)
 - [Resolved investigations](https://github.com/e6qu/pos3ql/blob/51a21b6b7393022b92c4f6f86c889e9fa3394b93/BUGS.md)
 - [Detailed ownership summary](https://github.com/e6qu/pos3ql/blob/51a21b6b7393022b92c4f6f86c889e9fa3394b93/docs/implemented-baseline.md)
 - [Complete dated benchmark catalog](https://github.com/e6qu/pos3ql/blob/51a21b6b7393022b92c4f6f86c889e9fa3394b93/benchmarks/README.md)
 
-[PR #604](https://github.com/e6qu/pos3ql/pull/604) retains the routine-lookup
-profiling and row-version ownership investigation.
-[PR #605](https://github.com/e6qu/pos3ql/pull/605) retains issued-reader validation.
-[PR #606](https://github.com/e6qu/pos3ql/pull/606) records heap ownership and
-compaction repair, including [focused validation](https://github.com/e6qu/pos3ql/actions/runs/37767694197).
+Related pull requests:
 
-[PR #623](https://github.com/e6qu/pos3ql/pull/623) records the retained-reader
-qualification and the fixes that keep metadata-only ALTER from needlessly
-rewriting rows while still enforcing uniqueness. Its full CI evidence covers
-the preparation merged in PRs #620–#622.
+- [PR #604](https://github.com/e6qu/pos3ql/pull/604): routine-lookup profiling
+  and row-version ownership investigation.
+- [PR #605](https://github.com/e6qu/pos3ql/pull/605): issued-reader validation.
+- [PR #606](https://github.com/e6qu/pos3ql/pull/606): heap ownership and
+  compaction repair, with
+  [focused validation](https://github.com/e6qu/pos3ql/actions/runs/37767694197).
+- [PR #623](https://github.com/e6qu/pos3ql/pull/623): retained-reader
+  qualification and fixes that keep metadata-only ALTER from rewriting rows
+  while still enforcing uniqueness; its CI covers PRs #620–#622.
 
-For an offline checkout, use `git show REVISION:PATH` with the corresponding
-revision above. Use the current [roadmap](../../PLAN.md),
-[compatibility contract](../postgresql-18-compatibility.md), and
-[benchmark evidence index](../../benchmarks/README.md) for present decisions.
-
-Original raw benchmark artifacts, generator provenance, and upstream licenses
-remain in their existing locations. Do not regenerate them during an editorial
-cleanup or reinterpret exploratory timings as production qualification.
+Raw benchmark artifacts, generator provenance, and upstream licenses stay in
+their original locations. Do not regenerate them or treat exploratory timings
+as production qualification.

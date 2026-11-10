@@ -1,86 +1,65 @@
 # Measuring performance and resource use
 
 The benchmark suite runs the same PostgreSQL client against pos3ql and
-PostgreSQL 18. Each run records the database, workload, response times,
-completed work, and resource use in versioned JSON files.
-`tools/benchmark-report.py` builds a report from those raw files.
+PostgreSQL 18. Each run records the commit, binary, workload, response times,
+completed work and resource use in versioned JSON files;
+`tools/benchmark-report.py` builds a report from them.
+
+**No representative deployment has been measured yet.** Existing results use
+an instrumented fixture or MinIO/SeaweedFS on the same host. They show tested
+behavior and exploratory costs, not production speed, a maximum database size
+or a provider ranking. The work to change that is
+[measuring a first deployment baseline](../PLAN.md#measure-a-first-deployment-baseline)
+and [qualifying production deployment](../PLAN.md#qualify-production-deployment).
 
 ## What the numbers can tell you
 
 **User example:** an orders screen makes many small lookups while background
 work updates orders. Measure both the usual response time and the slow tail,
-with and without checkpoints. A good average can hide requests that users
-experience as stalls. A p95 of 20 ms means 95% of measured requests finished
-within 20 ms; p99 describes the slowest 1% boundary.
+with and without checkpoints. A p95 of 20 ms means 95% of measured requests
+finished within 20 ms; p99 is the boundary of the slowest 1%. A good average
+can hide requests that users experience as stalls.
 
 | Your question | Measure |
 |---|---|
 | How quickly can users look up a cached order? | Warm-memory and warm-disk reads |
 | What happens after losing local caches? | Empty-cache recovery and first object reads |
 | Do background jobs stall users? | Mixed reads/writes with and without checkpoints |
-| Does an index reduce storage work? | Access paths, object requests, and bytes fetched |
+| Does an index reduce storage work? | Access paths, object requests and bytes fetched |
 | Does the layout avoid expensive rewrites? | Bytes written for updates and maintenance relative to changed data |
-| Will more connections or workers help? | Completed work, latency, errors, CPU, and memory as concurrency changes |
+| Will more connections help? | Completed work, latency, errors, CPU and memory as concurrency changes |
 | How long until a replica shows an update? | Observed subscriber catch-up time |
 
-Compare with two vanilla PostgreSQL 18 controls: available host resources and
-an equal CPU/memory allowance. Both use ordinary local durable storage. pos3ql
-uses object storage, a network path, and local caches. Record those differences
-so someone choosing a database knows what was actually compared.
+Every run compares against two vanilla PostgreSQL 18 controls on ordinary
+local durable storage:
 
-Existing results use a fixture and same-host MinIO/SeaweedFS. They establish
-tested behavior and exploratory costs, not production speed or a provider
-ranking. Separate storage services, fixed hardware, repeated runs, and actual
-failover routing remain in [the plan](../PLAN.md).
+- **host-available:** no container CPU or memory limit;
+- **resource-matched:** Docker limited to the CPUs available to pos3ql and to
+  pos3ql's exact fixed startup memory plan, with memory and memory-plus-swap
+  limits equal so it cannot borrow swap. The report validates these limits from
+  Docker metadata.
 
-## Current execution and evidence limits
-
-SQL CPU work still uses one worker; eligible object I/O overlaps. `query_workspace_slots` reserves
-independent statement arenas and DML row-selection buffers, leased together
-through a fixed, ordered dispatcher pool. More slots isolate state and account
-for memory; they do not currently add execution throughput. Subscription apply
-and bootstrap COPY use separately owned buffers, and streaming COPY keeps
-transition rows in each connection's startup buffer. Heap reads can retain
-bytes while other bytes are appended, but that does not enable concurrent SQL.
-
-In durable mode, success waits for an immutable journal upload and an update
-of the commit head. Transactions completed in one event-loop turn can share
-that publication. Connections keep their responses in fixed buffers until it
-finishes, including statements resumed after lock or object-read waits. A
-failed publication replaces guarded success responses with an explicit
-unknown-outcome error. Buffers and queues do not grow at runtime.
-
-One active process writes to each object prefix. Starting a replacement
-transfers that ownership and prevents the old process from publishing further
-changes. The packaged monitor can start a passive candidate after repeated
-readiness failures. There is no time-based ownership lease or read-only
-shared-snapshot protocol. Logical subscribers are separate, asynchronous,
-independently durable databases.
-
-Eligible two-source equality joins use a bounded hash build for tables,
-catalogs, and derived results, including external runs. NULL keys, duplicate
-matches, extra ON conditions, and LEFT JOIN preservation share the same path.
-A build beyond the fixed entry ceiling chooses a nested-loop plan before
-execution. [The compatibility guide](postgresql-18-compatibility.md) records
-other SQL and capacity limits.
+Both receive the same SQL workload, concurrency, row count and stopping rule;
+duration-bound runs can complete different operation counts. End-to-end latency
+and throughput are directly comparable for the stated setups. Storage requests,
+cache tiers and recovery describe each system's different persistence design and
+are reported separately.
 
 ## Estimating bandwidth and throughput
 
-A SQL statement is a command such as SELECT or UPDATE. A transaction can contain
-several statements and one commit. The benchmark's `ops/s` is its recorded
-workload operation count divided by elapsed time; it is not automatically SQL
-statements per second or committed transactions per second. Specify which unit
-you measured, how errors count, and whether connection and commit time are
-included.
+A SQL statement is a command such as SELECT or UPDATE; a transaction can
+contain several statements and one commit. The benchmark's `ops/s` is its
+workload operation count divided by elapsed time. It is not automatically
+statements or committed transactions per second. State which unit you measured,
+how errors count, and whether connection and commit time are included.
 
-There is no current qualified production TPS, QPS, maximum database size or
-sustained bandwidth result. [Architecture](architecture.md#memory-and-physical-size)
-lists hard physical limits and configurable inventories. Do not infer a
-petabyte database or unlimited throughput from object-store capacity alone.
+[Architecture](architecture.md#memory-and-physical-size) lists hard physical
+limits and configurable inventories. Do not infer a petabyte database or
+unlimited throughput from object-store capacity alone.
 
-For planning, use explicit assumptions. If average request occupancy is `L`
-seconds, a read transfers `S` bytes, `C` request slots are usable, and available
-link bandwidth is `B` bytes/second, an optimistic read ceiling is:
+**Reads.** If average request occupancy is `L` seconds, a read transfers `S`
+bytes, `C` request slots are usable and link bandwidth is `B` bytes/second, an
+optimistic ceiling is:
 
 ```text
 completed object reads/second <= min(C / L, B / S)
@@ -89,81 +68,65 @@ useful query rate <= completed reads/second / uncached reads per query
 
 This excludes CPU, signing/TLS, metadata reads, queueing, retries, contention,
 maintenance and protocol traffic. Smaller ranged reads change `S`; cache hits
-avoid object requests. More slots can hide latency until another limit dominates.
+avoid object requests. More slots hide latency until another limit dominates.
 
-**Calculated example, not a measured deployment:** assume four read slots,
-20 ms average occupancy per 256 KiB response, and 100 MiB/s available to data
-responses. The slot bound is `4 / 0.020 = 200` reads/s; the bandwidth bound is
-`100 MiB / 256 KiB = 400` reads/s. The smaller bound gives at most 50 MiB/s.
-If every query needs eight such uncached reads, the storage ceiling is 25
-queries/s before CPU and other traffic. This is not a forecast for cached
-queries or for an actual S3-compatible provider.
+*Calculated example, not a measurement:* four read slots, 20 ms occupancy per
+256 KiB response and 100 MiB/s for data. The slot bound is `4 / 0.020 = 200`
+reads/s; the bandwidth bound is `100 MiB / 256 KiB = 400` reads/s. The smaller
+bound gives at most 50 MiB/s. At eight uncached reads per query, the storage
+ceiling is 25 queries/s before CPU and other traffic.
 
-Commit latency has a different critical path. Batch bytes and descriptor must
-be durable before the conditional commit-head update. Grouping transactions
-amortizes that work but does not remove ordered root publication.
+**Commits.** Journal bytes and their descriptor must be durable before the
+conditional commit-head update. Grouping transactions amortizes that work but
+does not remove ordered head publication.
 
-**Calculated example:** assume the two independent uploads overlap and each
-phase, including the later root update, takes 20 ms; assume no overlap between
-successive batches and negligible transfer/CPU costs. That is at least 40 ms
-per batch, at most 25 batches/s. With `commit_queue_slots` at least eight and
-log bytes fitting their reserved buffers, eight transactions per batch would
-give an optimistic 200 committed transactions/s under those assumptions. One
-transaction per batch would give 25. Real batch occupancy, bytes, network
-latency and CPU must be measured; the server does not promise these rates or
-promise eight transactions per batch.
+*Calculated example:* the two uploads overlap and each phase, including the
+head update, takes 20 ms, with no overlap between batches and negligible
+transfer/CPU cost. That is at least 40 ms per batch, at most 25 batches/s. With
+`commit_queue_slots` of at least eight and eight transactions per batch, that is
+an optimistic 200 committed transactions/s; one per batch gives 25. The server
+promises neither these rates nor any batch occupancy.
 
-One CPU worker imposes another ceiling: if SQL processing itself costs 2 ms per
-operation, that worker can perform at most 500 operations/s before maintenance
-and scheduling overhead. The example's 2 ms is an assumption, not a measured
-pos3ql execution cost. Network and CPU ceilings cannot simply be added.
+**CPU.** SQL runs on one CPU worker. If processing costs an assumed 2 ms per
+operation, that worker completes at most 500 operations/s before maintenance
+and scheduling. Network and CPU ceilings cannot simply be added.
 
 ## What the retained measurements actually show
 
 The [2026-09-23 resource-matched matrix](https://github.com/e6qu/pos3ql/blob/708d5b475845492bdaa29dd573a6f508770acc62/benchmarks/baselines/2026-09-23-resource-matched-postgresql-10000/report.md)
-records revision `90861f1bb8b464b8032e79fac8d6a28681aaa9ba`, 10,000 rows,
-four clients, 12 available CPUs and a 949.81 MiB fixed pos3ql plan. MinIO and
-SeaweedFS ran on the same host; matched PostgreSQL had the same CPU quota and
-memory allowance and used its recorded ordinary durable storage.
+records revision `90861f1bb8b464b8032e79fac8d6a28681aaa9ba`, 10,000 rows, four
+clients, 12 available CPUs and a 949.81 MiB fixed pos3ql plan, with MinIO and
+SeaweedFS on the same host.
 
 | Historical workload | pos3ql ops/s | pos3ql p99 | Matched PostgreSQL ops/s | Matched PostgreSQL p99 |
 |---|---:|---:|---:|---:|
 | MinIO, mixed with checkpoints | 130.43 | 557.86 ms | 3,152.76 | 10.05 ms |
 | SeaweedFS, mixed with checkpoints | 130.27 | 441.96 ms | 3,488.84 | 7.33 ms |
 
-These results expose a substantial gap in those old setups. They are not
-measurements of the current branch, realistic independent-storage qualification
-or evidence that either provider is faster. Preserve their raw artifacts and
-workload definitions. Current capacity and performance claims require a new,
-repeated run with independently operated storage, recorded hardware and network,
-working-set sizes, errors, CPU, memory, requests and transferred bytes. Retain
-both host-available and resource-matched vanilla PostgreSQL controls.
+These expose a substantial gap in that old setup. They do not measure the
+current code, and they do not show that either provider is faster.
+[The benchmark index](../benchmarks/README.md) lists all retained runs;
+[implementation history](history/README.md) keeps the checkpoint optimization
+chronology.
 
 ## Running the suite
 
-Run full builds, test gates, and large benchmark runs on dedicated or GitHub
-runners as described in [contributing](../CONTRIBUTING.md#development-and-resource-policy).
-The examples below are for those hosts.
-
-The smoke suite needs Rust, Python 3, and `nc`:
+Run full builds and large benchmark runs on dedicated or GitHub runners, as
+described in [contributing](../CONTRIBUTING.md#development-and-resource-policy).
 
 ```sh
-tools/run-performance.sh smoke /tmp/pos3ql-performance-smoke
+tools/run-performance.sh [smoke|full|checkpoint] [output-directory]
 ```
 
-The full and checkpoint suites need Docker for their resource-matched
-PostgreSQL 18 control. `POS3QL_BENCH_POSTGRES_PORT` can name an existing
-PostgreSQL 18 instance for the host-available control, but the matched control
-still runs in Docker:
+| Mode | Needs | Defaults |
+|---|---|---|
+| `smoke` | Rust, Python 3, `nc` | Fixed: 128 rows, capacity 512, 8 operations, 4 clients, no replicas, 16 catalog views |
+| `full` | Also Docker | 10,000 rows, capacity 16,384, 500 operations, 8 clients (minimum 4), 2 replicas, 128 catalog views |
+| `checkpoint` | Also Docker | As `full`, but only setup and mixed checkpoint pressure; requires zero replicas and zero catalog views |
 
-```sh
-tools/run-performance.sh full ./performance-results/local
-```
-
-To repeat only setup and mixed checkpoint pressure without replicas, use
-`checkpoint` mode. It runs the same workload against vanilla PostgreSQL 18,
-retains the same raw workload schema, and requires
-`POS3QL_BENCH_REPLICAS=0`:
+`full` needs at least four clients so the synchronized update workload can
+enforce the group-commit amplification gate. Table capacity must cover the setup
+rows plus every row the clients insert.
 
 ```sh
 POS3QL_BENCH_ROWS=1000 POS3QL_BENCH_TABLE_CAPACITY=2048 \
@@ -172,42 +135,45 @@ POS3QL_BENCH_DISK_CACHE_MIB=1024 \
 tools/run-performance.sh checkpoint ./performance-results/checkpoint
 ```
 
-The default pos3ql durable tier is the instrumented fixture. Select a pinned
-local MinIO or SeaweedFS container with `POS3QL_BENCH_OBJECT_STORE`:
+### Settings
+
+| Variable | Meaning |
+|---|---|
+| `POS3QL_BENCH_ROWS`, `_TABLE_CAPACITY`, `_OPERATIONS`, `_CLIENTS`, `_REPLICAS` | Workload sizing (ignored by `smoke`) |
+| `POS3QL_BENCH_CATALOG_RELATIONS` | Ordinary views in an isolated schema, for relation-name and `pg_class` lookup as the catalog grows |
+| `POS3QL_BENCH_DISK_CACHE_MIB` | Fixed local disk block cache (default 128) |
+| `POS3QL_BENCH_TIMEOUT_SECONDS` | Per-query socket timeout (default 30). A timeout is a failed measurement to investigate, not one to fix by extending the deadline |
+| `POS3QL_BENCH_OBJECT_STORE` | `fixture` (default), `minio`, `seaweedfs` or `external` |
+| `POS3QL_BENCH_OBJECT_LATENCY_MS` | Fixture-only injected request latency (default 2; must be 0 elsewhere) |
+| `POS3QL_BENCH_MINIO_IMAGE`, `_SEAWEEDFS_IMAGE` | Override the pinned image digests; Docker's resolved image ID is recorded |
+| `POS3QL_BENCH_POSTGRES_PORT` | Use an existing PostgreSQL 18 instance as the host-available control (the matched control still runs in Docker) |
+| `POS3QL_BENCH_POSTGRES_STORAGE` | Describes that instance's storage medium |
+| `POS3QL_BENCH_CHECKPOINT_PROFILE` | `1` builds the checkpoint profiling feature (`checkpoint` mode only) |
+
+The PostgreSQL controls must run PostgreSQL 18 with `fsync`,
+`full_page_writes` and `synchronous_commit` on. The harness records
+`version()`, durability and resource settings, and, for Docker, the resolved
+image ID and mounts rather than a mutable tag.
+
+### Object-store matrix
 
 ```sh
-POS3QL_BENCH_OBJECT_STORE=minio \
-  tools/run-performance.sh checkpoint ./performance-results/minio
-POS3QL_BENCH_OBJECT_STORE=seaweedfs \
-  tools/run-performance.sh checkpoint ./performance-results/seaweedfs
+tools/run-performance-matrix.sh [checkpoint|full] ./performance-results/object-matrix
 ```
 
-Run the fixture, MinIO, and SeaweedFS consecutively, each paired with its own
-host-available and resource-matched vanilla PostgreSQL 18 controls, with:
+This runs the fixture, MinIO and SeaweedFS in turn, each with both PostgreSQL
+controls, and rejects mismatched commits, binaries or workload shapes in the
+combined report. The fixture retains exact request and byte counters. MinIO and
+SeaweedFS run without injected latency and report request metrics as
+unavailable rather than estimating them. They are independent S3-compatible
+implementations on the benchmark host, not independently operated services.
 
-```sh
-tools/run-performance-matrix.sh checkpoint ./performance-results/object-matrix
-```
+### External object storage
 
-The combined report rejects different commits, binaries, or workload shapes
-across the three runs. The fixture retains exact request and byte counters and
-defaults to 2 ms injected request latency. MinIO and SeaweedFS run without
-artificial latency and report request metrics as unavailable rather than
-substituting an estimate. Their immutable image references can be overridden
-with `POS3QL_BENCH_MINIO_IMAGE` and `POS3QL_BENCH_SEAWEEDFS_IMAGE`; each run
-also records Docker's resolved image ID. These local containers are independent
-S3-compatible implementations on the benchmark host, not independently
-operated object-storage services.
-
-Use the `external` profile for the representative run against an existing,
+The `external` profile is for the representative run against an existing,
 independently operated S3-compatible service. It requires TLS, an existing
-bucket, explicit service and infrastructure descriptions, and credentials with
-read, write, list, and delete access. The endpoint is a `host:port` authority,
-not a URL. Path addressing is the default; set
-`POS3QL_BENCH_OBJECT_STORE_ADDRESSING=virtual_hosted` when the service requires
-virtual-hosted buckets. Temporary credentials can include
-`POS3QL_BENCH_OBJECT_STORE_SESSION_TOKEN`, and a private trust root can be set
-with `POS3QL_BENCH_OBJECT_STORE_TLS_CA_FILE`.
+bucket, credentials with read, write, list and delete access, and explicit
+descriptions of the service, infrastructure and storage media:
 
 ```sh
 POS3QL_BENCH_OBJECT_STORE=external \
@@ -227,256 +193,171 @@ POS3QL_BENCH_MATCHED_POSTGRES_STORAGE='resource-matched PostgreSQL local medium'
 tools/run-performance.sh full ./performance-results/representative
 ```
 
-The harness generates a unique object prefix for each external run and records
-it with the endpoint, bucket, region, addressing mode, TLS state, network,
-hardware, and cache descriptions. Set
-`POS3QL_BENCH_OBJECT_STORE_PREFIX` only when a caller-managed unique namespace
-is needed. External objects remain in that prefix after the run so cold
-recovery evidence is reproducible; remove them after retaining the artifacts.
-Access keys, secret keys, session tokens, and custom trust-root contents are
-never written to benchmark artifacts; a custom trust root is identified only
-by its SHA-256 digest. Provider request counters remain
-unavailable unless the provider supplies separate evidence.
+- The endpoint is a `host:port` authority, not a URL.
+- `POS3QL_BENCH_OBJECT_STORE_ADDRESSING` is `path` (default) or
+  `virtual_hosted`.
+- Optional: `POS3QL_BENCH_OBJECT_STORE_SESSION_TOKEN` for temporary
+  credentials, `POS3QL_BENCH_OBJECT_STORE_TLS_CA_FILE` for a private trust root.
+- Each run gets a unique generated prefix; set `POS3QL_BENCH_OBJECT_STORE_PREFIX`
+  only for a caller-managed unique namespace. Objects stay there so cold recovery
+  is reproducible; remove them after retaining the artifacts.
+- Keys, secrets, session tokens and trust-root contents are never written to
+  artifacts; a custom trust root is identified only by its SHA-256 digest.
+- Provider request counters are unavailable unless the provider supplies
+  separate evidence.
 
-For an existing host-available PostgreSQL instance, set
-`POS3QL_BENCH_POSTGRES_STORAGE` to describe its storage medium. The full run
-requires PostgreSQL 18 with `fsync`, `full_page_writes`, and
-`synchronous_commit` enabled. It records `version()`, durability and resource
-settings, and, for Docker, the resolved image ID and mounts rather than
-treating a mutable image tag as provenance. Its defaults
-can be overridden with `POS3QL_BENCH_ROWS`,
-`POS3QL_BENCH_TABLE_CAPACITY`, `POS3QL_BENCH_OPERATIONS`,
-`POS3QL_BENCH_CLIENTS`, `POS3QL_BENCH_REPLICAS`, and, for the fixture only,
-`POS3QL_BENCH_OBJECT_LATENCY_MS`. `POS3QL_BENCH_DISK_CACHE_MIB` sizes the
-fixed local disk block cache (default 128 MiB), and
-`POS3QL_BENCH_TIMEOUT_SECONDS` sets the per-query socket timeout (default 30
-seconds). Both settings are recorded in the environment manifest; the timeout
-also appears in each workload file. A timeout is a failed measurement to
-investigate, not a result to improve by extending the deadline. The capacity
-must cover both the setup rows and all rows inserted by the configured clients
-and operations.
-Full mode requires at least four clients so its synchronized update workload
-can enforce the group-commit amplification bound; smaller values are rejected
-before measurement.
-Full mode also creates 128 ordinary views in an isolated schema and measures
-exact relation-name resolution plus `pg_class` lookup as unrelated catalog
-relations grow. Smoke mode uses 16 views. Override either count with
-the positive `POS3QL_BENCH_CATALOG_RELATIONS` value; the focused checkpoint
-mode requires zero so catalog setup cannot change its publication profile.
-The selected count is recorded in the environment and every workload
-artifact. Both PostgreSQL controls receive the same catalog and warm lookup
-workload, while pos3ql also repeats it after empty-local-cache recovery.
-CPU and resident-memory sampling uses `/proc` on Linux; peak RSS remains
-available through `ps` on other supported systems.
+### Output
 
-The output directory contains an environment manifest with the commit, binary
-hash, toolchain, machine, resources, and workload sizing; one raw JSON file
-per workload; separate
-recovery JSON intervals for initial/warm-disk/empty-local-cache starts, one
-freshness interval per logical replica, Docker's resolved PostgreSQL image IDs
-when Docker is used, `postgresql-server.json` and
-`postgresql-matched-server.json` with PostgreSQL's settings, storage
-description, and container limits,
-the pos3ql startup log with its fixed memory plan, and a derived `report.md`.
+The output directory contains:
 
-Recovery timing ends after the process reports startup complete and its SQL
-listener accepts connections. This includes restoration from shared storage.
+- an environment manifest: commit, binary hash, toolchain, machine, resources,
+  workload sizing, disk cache size, timeout and catalog view count;
+- one raw JSON file per workload, recovery JSON for initial, warm-disk and
+  empty-local-cache starts, and one freshness interval per logical replica;
+- `postgresql-server.json` and `postgresql-matched-server.json` with
+  PostgreSQL settings, storage description and container limits;
+- the pos3ql startup log with its fixed memory plan, and a derived `report.md`;
+- on failure, server logs in `server-logs/`, workload errors and the host
+  inventory.
 
-Failed benchmark runs retain server logs in the output's `server-logs/` directory,
-alongside workload errors and the host inventory. SQL `version()` reports the
-compilation target rather than a fixed host label.
+Recovery timing ends when the process reports startup complete and its SQL
+listener accepts connections, including restoration from shared storage. CPU
+and resident-memory sampling use `/proc` on Linux; other systems report peak
+RSS through `ps`.
 
-Both controls run the stock PostgreSQL 18 image with its ordinary local
-storage and database settings. The host-available control has no container CPU
-or memory limit. The resource-matched control limits Docker to the CPUs
-available to the pos3ql process and to pos3ql's exact fixed startup memory
-plan; its memory and memory-plus-swap limits are equal so it cannot borrow swap.
-The report validates those values from Docker metadata. Resource matching
-equalizes availability, while each engine remains free to consume less than
-its limit.
+## Measured scenarios
 
-Both systems receive the same SQL workload, concurrency, row count, and
-stopping rule; duration-bound runs can complete different operation counts.
-pos3ql instead publishes durable state to object storage. A representative
-comparison must record PostgreSQL's
-storage medium and settings alongside pos3ql's object store, network, and cache
-conditions. End-to-end latency and throughput can be compared directly for the
-stated setups; storage request, cache-tier, and recovery measurements describe
-each system's different persistence design and must be reported separately.
-The bundled suite defaults to an instrumented object-store fixture backed by
-local temporary storage. The object-store matrix adds pinned local MinIO and
-SeaweedFS implementations. Their PostgreSQL comparisons are exploratory
-baselines; the representative qualification in [PLAN.md](../PLAN.md) also
-requires pinned hardware and an independently operated compatible object
-store.
+“Warm” means data is already cached; “object-cold” means the path must read
+from object storage. A “covering” index contains the requested values, so
+eligible reads need not fetch the table row. These are tested paths, not a
+promise that every query uses them.
+
+| Scenario | Boundary measured |
+|---|---|
+| warm memory | Repeated hash-index point reads in the process that created and checkpointed the data |
+| BRIN point pruning | Warm and object-cold equality probes through a BRIN key and bitmap plan |
+| BRIN inclusion filtering | Warm and object-cold range-overlap probes through `range_inclusion_ops` and a bitmap plan |
+| GiST inclusion filtering | Warm and object-cold range-overlap probes through a GiST key generation |
+| GiST geometric pruning | Warm and object-cold point-in-box probes through immutable bounding-box navigation |
+| GiST K-nearest-neighbor | Warm and object-cold `<-> point` ordered limits through a covering GiST generation |
+| GIN array postings | Warm and object-cold array-containment probes |
+| GIN posting unions | Warm and object-cold multi-token array-overlap probes, including an absent token |
+| GIN full-text postings | Warm and object-cold lexeme probes |
+| GIN `jsonb_ops` postings | Warm and object-cold top-level existence probes |
+| GIN `jsonb_path_ops` postings | Warm and object-cold containment probes |
+| SP-GiST prefix filtering | Warm and object-cold text-prefix probes |
+| SP-GiST geometric pruning | Warm and object-cold point-in-box probes |
+| SP-GiST K-nearest-neighbor | Warm and object-cold `<-> point` ordered limits through a covering k-d point generation |
+| indexed tail range | Selective high-key ranges, including a cold run that records bounded key-block reads |
+| ordered limit | Descending key-only `ORDER BY ... LIMIT` scans that fetch no base tuples, warm and object-cold |
+| parameterized join | 32-key nested-loop probes whose inner table uses its B-tree, warm and after an empty-local-cache restart |
+| large catalog | `regclass` resolution and `pg_class` lookup among many unrelated views, warm and after empty-local-cache recovery |
+| warm disk | Graceful restart with the same local data directory |
+| empty local caches | Restart from a new local directory against the unchanged object prefix |
+| concurrent updates | Synchronized hash-index target probes, commit latency and journal/commit-head PUT amplification |
+| checkpoint interference | Mixed reads and updates with and without overlapping explicit checkpoints |
+| PostgreSQL 18 | Single and concurrent point reads, inserts, scans and mixed throughput through the same wire client |
+| logical replicas | Aggregate reads across one through N subscribers, plus observed catch-up time |
+
+Each workload reports attempted and completed operations, errors, elapsed time,
+operations per second, p50/p95/p99/maximum/mean latency, process CPU, peak RSS,
+RSS divided by the fixed memory plan, maintenance count, index/sequential scan
+deltas, and object requests and payload bytes by PUT, full GET, ranged GET, LIST
+and DELETE. The instrumented fixture speaks the same S3 profile as other test
+endpoints; its metrics file and injected latency are test instrumentation, and
+production code never calls a private endpoint.
 
 ## Measuring shared startup capacity
 
-Run the following on a CI runner, with a new output directory:
+On a CI runner, with a new output directory:
 
 ```sh
 python3 tools/measure-embedded-capacity.py --output NEW_DIRECTORY \
   --budget-limit-bytes 2147483648
 ```
 
-The explicit 2 GiB ceiling rejects an oversized reservation; it does not allocate
-2 GiB. The 64-sample matrix uses equal explicit `row_overlay_slots`,
+The 2 GiB ceiling rejects an oversized reservation; it does not allocate 2 GiB.
+The 64-sample matrix fixes equal explicit `row_overlay_slots`,
 `row_work_bytes`, `row_work_leases`, `definition_image_slots`,
 `execution_control_bytes` (256 KiB), `execution_control_leases` (256),
 `table_metadata_bytes` (64 MiB), `table_metadata_leases` (8,192),
 `statistics_bytes` (1 MiB), `statistics_leases` (1,024) and
-`index_statistics_slots` (4,096) for
-1/8/32/128 configured tables in both transaction modes. Each combination runs
-empty, one-hot-table, evenly distributed, moving-demand, wide-schema and
-replacement workloads. The wide schema has 64 nullable columns. Replacement
-creates a unique index, adds a column, rolls back to a savepoint, then drops and
-recreates the index before checking row counts and sums. Metadata-pool backing
-and free-range control reservations must stay constant across table counts.
-Two additional profiles distribute rows across all tables and analyze every
-column, using two-column and 64-column schemas. The latter also changes a
-column's type, analyzes that column, then rolls back to a savepoint. These
-profiles exercise statistics ownership separately from the original six;
-historical samples do not contain them. Statistics backing, free-range controls
-and index-counter reservations must also remain constant.
-The output retains the exact commands, revision, compiler,
-binary digest, named budget draws and raw JSON measurements, with checksums.
-Digests read files in bounded 1 MiB chunks. The script runs the helper's focused
-metric tests before building and sampling it.
+`index_statistics_slots` (4,096) across 1/8/32/128 configured tables in both
+transaction modes. Each combination runs:
 
-RSS metric version 2 identifies every source explicitly in samples,
-`environment.json` and the report. On Linux, `startup_peak_rss_bytes` and
-`final_peak_rss_bytes` use `VmHWM` from `/proc/self/status`, which belongs to the
-current program's address space. Separate `startup_current_rss_bytes` and
-`final_current_rss_bytes` record `VmRSS`. The helper reads an 8 KiB fixed buffer
-and rejects missing fields, invalid units, overflow or oversized status output;
-it does not substitute another counter. Linux's `kB` values are converted to
-bytes by multiplying by 1,024. These are kernel RSS accounting snapshots, not
-exact allocator byte counts.
+- empty, one-hot-table, evenly distributed, moving-demand, wide-schema (64
+  nullable columns) and replacement workloads; replacement creates a unique
+  index, adds a column, rolls back to a savepoint, then drops and recreates the
+  index and checks row counts and sums;
+- two statistics profiles that spread rows across all tables and analyze every
+  column with two-column and 64-column schemas; the wide one also changes a
+  column type, analyzes it and rolls back to a savepoint. Older samples lack
+  these profiles.
 
-`startup_getrusage_maxrss_bytes` and `final_getrusage_maxrss_bytes` are separate
-diagnostics. On Linux, [exec preserves the previous address space's peak](https://github.com/torvalds/linux/blob/v7.0/fs/exec.c#L838)
-for `getrusage`, whereas [the proc counters use the current address space](https://github.com/torvalds/linux/blob/v7.0/fs/proc/task_mmu.c#L34).
-A launcher using `vfork` or `CLONE_VM` can therefore impose its earlier peak on
-the child's `getrusage` result, even after freeing that memory. The
-bounded diagnostic in `tools/tests/test_measure_embedded_capacity.py`
-compares a 32 MiB allocate/free launch with ordinary fork/exec, independently of
-engine measurements. Earlier unlabelled `getrusage` peaks must not be treated as
-engine-only memory or compared as this new metric. Their named startup budget
-components remain valid.
+Metadata, statistics and index-counter backing and their free-range controls
+must stay constant across table counts. The output keeps the exact commands,
+revision, compiler, binary digest, named budget draws and raw JSON with
+checksums. The script runs the helper's metric tests before building.
 
-On macOS, the primary source remains `getrusage` in bytes, explicitly labelled
-`darwin_getrusage_ru_maxrss`; current RSS is `null`. The CI matrix runs on Linux.
-Fresh version-2 samples are required before making a new resident-memory claim.
+**Resident memory (RSS metric version 2).** Every sample names its source.
 
-Compare the named shared pools at equal settings. Total memory can still rise
-with table identities, catalog/history structures, connection metadata and
-other independent reservations. Peak resident memory measures touched pages;
-it is different from reserved bytes and the 128 MiB virtual query stack.
-Populated measurements include a separately reported session reservation. Empty
-samples start no session and report zero session reservation and draw. This
-single-session matrix does not measure retained-reader pressure; ownership,
-exhaustion and cancellation regressions cover that behavior separately. Fresh CI
-artifacts are still required to accept the current shared-metadata integration.
-These small local-only workloads establish neither object-store throughput nor a
-production embedded minimum; retain the historical evidence unchanged.
+| Field | Linux source | macOS source |
+|---|---|---|
+| `startup_peak_rss_bytes`, `final_peak_rss_bytes` | `VmHWM` in `/proc/self/status` | `getrusage`, labelled `darwin_getrusage_ru_maxrss` |
+| `startup_current_rss_bytes`, `final_current_rss_bytes` | `VmRSS` | `null` |
+| `startup_getrusage_maxrss_bytes`, `final_getrusage_maxrss_bytes` | `getrusage` diagnostic | — |
 
-## Retained evidence
+The helper reads `/proc` into a fixed 8 KiB buffer, converts `kB` by
+multiplying by 1,024, and rejects missing fields, invalid units, overflow or
+oversized output rather than substituting another counter. These are kernel RSS
+snapshots, not allocator byte counts. On Linux,
+[exec preserves the previous address space's peak](https://github.com/torvalds/linux/blob/v7.0/fs/exec.c#L838)
+for `getrusage`, while
+[the proc counters use the current address space](https://github.com/torvalds/linux/blob/v7.0/fs/proc/task_mmu.c#L34),
+so a launcher using `vfork` or `CLONE_VM` can impose its own earlier peak.
+`tools/tests/test_measure_embedded_capacity.py` demonstrates this with a 32 MiB
+allocate/free launch. Earlier unlabelled `getrusage` peaks are not engine-only
+memory and are not comparable to version 2; their named budget components remain
+valid. CI runs on Linux, and a new resident-memory claim needs fresh version-2
+samples.
 
-[The benchmark index](../benchmarks/README.md) links the original raw runs and
-reports, including the fixture/MinIO/SeaweedFS matrix with both vanilla
-PostgreSQL controls. The [historical notes](history/README.md) preserve the
-checkpoint optimization chronology. These shared-host runs establish
-implementation and request-shape evidence; differing operation counts and
-generation shapes prevent a controlled production timing ratio.
-
-## Measured scenarios
-
-The labels below name exact harness workloads. “Warm” means data is already
-in a cache; “object-cold” means the path must read from object storage. A
-“covering” index contains the requested values so eligible reads need not fetch
-the table row. These are tested paths, not a promise that every SQL query will
-use them.
-
-| Scenario | Boundary measured |
-|---|---|
-| warm memory | Repeated hash-index point reads in the process that created and checkpointed the data |
-| BRIN point pruning | Repeated warm and object-cold equality probes through a dedicated BRIN key and bitmap plan |
-| BRIN inclusion filtering | Repeated warm and object-cold range-overlap probes through `range_inclusion_ops` and a bitmap plan |
-| GiST inclusion filtering | Repeated warm and object-cold range-overlap probes through a dedicated GiST key generation |
-| GiST geometric pruning | Repeated warm and object-cold point-in-box probes through immutable bounding-box navigation |
-| GiST K-nearest-neighbor | Repeated warm and object-cold `<-> point` ordered limits through a covering geometric GiST generation |
-| GIN array postings | Repeated warm and object-cold array-containment probes through exact-token posting navigation |
-| GIN posting unions | Repeated warm and object-cold multi-token array-overlap probes, including an absent token |
-| GIN full-text postings | Repeated warm and object-cold lexeme probes through exact-token posting navigation |
-| GIN `jsonb_ops` postings | Repeated warm and object-cold top-level existence probes through exact-token posting navigation |
-| GIN `jsonb_path_ops` postings | Repeated warm and object-cold containment probes through exact-token posting navigation |
-| SP-GiST prefix filtering | Repeated warm and object-cold text-prefix probes through an SP-GiST plan |
-| SP-GiST geometric pruning | Repeated warm and object-cold point-in-box probes through the same object-native navigation boundary |
-| SP-GiST K-nearest-neighbor | Repeated warm and object-cold `<-> point` ordered limits through a covering k-d point generation |
-| indexed tail range | Repeated selective high-key ranges, including a cold-object run that records bounded key-block reads |
-| ordered limit | Repeated descending key-only `ORDER BY ... LIMIT` scans that must fetch no base tuples, warm and object-cold |
-| parameterized join | Repeated 32-key nested-loop probes whose inner table must use its B-tree, warm and after a dedicated empty-local-cache restart |
-| large catalog | Exact `regclass` resolution and `pg_class` lookup across a configurable schema of unrelated ordinary views, warm and after empty-local-cache recovery |
-| warm disk | Graceful restart with the same disposable local data directory |
-| empty local caches | Restart from a new local directory against the unchanged durable object prefix |
-| concurrent updates | Synchronized hash-index target probes, commit latency, and immutable-batch/commit-head PUT amplification |
-| checkpoint interference | Mixed reads and updates with and without overlapping explicit checkpoints |
-| PostgreSQL 18 | Single/concurrent point reads, inserts, scans, and mixed-workload throughput through the same wire client |
-| logical replicas | Aggregate reads across one through N durable subscribers, plus observed catch-up time |
-
-Each workload reports attempted and completed operations, errors, elapsed
-time, operations per second, p50/p95/p99/maximum/mean latency, process CPU,
-peak RSS, RSS divided by the declared fixed memory plan, maintenance count,
-table index/sequential scan deltas, and object requests and payload bytes by
-PUT, full GET, ranged GET, LIST, and DELETE. The instrumented object-store
-oracle speaks the same locked S3 profile as the other test endpoints. Its
-optional metrics file and deterministic latency are test-process
-instrumentation; production code never calls a private endpoint or a provider
-branch.
+Compare named shared pools at equal settings. Total memory still rises with
+table identities, catalog and history structures, connection metadata and other
+independent reservations. Peak RSS counts touched pages, which differs from
+reserved bytes and from the 128 MiB virtual query stack. Populated samples
+report a separate session reservation; empty samples start no session. This
+single-session matrix does not measure retained-reader pressure, object-store
+throughput or an embedded production minimum.
 
 ## CI policy
 
-CI checks correct answers, complete runs, memory use, and intended access paths.
-For example, an indexed order lookup must not become a full-table scan while
-still appearing fast on a tiny dataset. Hosted-runner timing is recorded, but
-absolute speed is not a pass/fail threshold on those noisy hosts.
+CI checks correct answers, complete runs, memory use and intended access paths.
+For example, an indexed order lookup must not become a full-table scan that
+still looks fast on a tiny dataset. Hosted-runner timing is recorded but never
+a pass/fail threshold: stable timing thresholds need pinned hardware and an
+independently operated object store. Logical-replica speedup is reported, not
+required to be linear.
 
-CI runs the smoke suite and retains all raw artifacts. It gates zero errors
-and complete operation counts, present and ordered percentiles, peak RSS no
-more than 125% of the fixed plan, the stable object-operation metric schema,
-at least one index scan per hash point-read, BRIN point or inclusion probe,
-GiST inclusion, spatial, or K-nearest-neighbor probe, every GIN posting probe,
-SP-GiST prefix, spatial, or K-nearest-neighbor probe, btree tail-range,
-btree ordered-limit, parameterized-btree-join, or hash-targeted
-synchronized-update operation and
-zero sequential scans in the complete resident warm-memory paths, actual
-shared-object reads during empty-local-cache recovery, and concurrent commit
-PUT amplification below 1.75 PUTs per transaction. Ordered-limit runs also
-require zero base-tuple fetches. These access-path gates keep a timing
-improvement from concealing a return to full-table reads or updates. The
-analyzed fixture has a fixed 8 KiB non-projected row body, so the
-small smoke dataset spans enough immutable table blocks for a selective cold
-index probe to remain a meaningful costed physical choice. The ordered-limit
-fixture uses a descending btree with `INCLUDE (payload)` and projects both key
-and payload, so its zero-fetch gate exercises durable covering-index behavior
-rather than only key decoding. The GiST and SP-GiST K-nearest-neighbor fixtures
-likewise carry their projected identifier and payload in the immutable index
-generation; their warm and cold performance gates reject an added Sort or a
-base-tuple fetch, while the cold-object correctness regression rejects
-complete-generation reads for finite limits. The
-ungrouped durable shape is three PUTs per transaction: immutable journal bytes,
-their descriptor, and a compare-and-swap commit-head update. The first two
-uploads can overlap; the commit head is published after both complete.
+CI runs the smoke suite, retains all raw artifacts, and requires:
 
-Absolute timing is recorded but is not a hosted-runner gate. Stable regression
-thresholds require pinned hardware and an independently operated compatible
-object store; noisy CI timing is not evidence. Logical-replica speedup is also
-reported rather than required to be linear.
+- zero errors and complete operation counts;
+- present, ordered percentiles and the stable object-operation metric schema;
+- peak RSS at most 125% of the fixed memory plan;
+- at least one index scan per operation, and zero sequential scans in the
+  resident warm-memory paths, for hash point reads, BRIN, GiST, GIN and SP-GiST
+  probes, B-tree tail ranges, ordered limits, parameterized joins and
+  hash-targeted synchronized updates;
+- zero base-tuple fetches for ordered limits and for the GiST and SP-GiST
+  K-nearest-neighbor fixtures, and no added Sort for the latter;
+- actual object reads during empty-local-cache recovery;
+- concurrent commit amplification below 1.75 PUTs per transaction.
 
-## Remaining qualification
-
-SQL CPU execution still uses one worker. The [roadmap](../PLAN.md#remaining-work) defines
-the shared-state and worker prerequisites, representative deployment inputs,
-and required scaling, recovery, freshness, and failover evidence. Timing claims
-require repeated long runs on pinned hardware with independent object storage;
-retain both PostgreSQL controls and each system's actual persistence settings.
+The ungrouped durable shape is three PUTs per transaction: journal bytes, their
+descriptor, and a compare-and-swap commit-head update published after both
+uploads complete. The analyzed fixture has a fixed 8 KiB row body so the small
+smoke dataset spans enough immutable blocks for a selective cold index probe to
+be a meaningful costed choice. The ordered-limit fixture uses a descending
+B-tree with `INCLUDE (payload)` and projects both columns, so its zero-fetch
+gate exercises durable covering-index reads. A separate cold-object correctness
+regression rejects reading complete K-nearest-neighbor index generations for
+finite limits.

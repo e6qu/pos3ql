@@ -135,8 +135,8 @@ wal_record_kinds! {
     KIND_BRIN_MAINTENANCE = 132;
 /// Text-search definitions retain two-byte catalog positions.
     KIND_SET_TEXT_SEARCH = 133;
-/// Wide relation column sets. V2 publication and original trigger records
-/// remain readable as one-word sets.
+/// Wide relation column sets. V2 publication alterations and original trigger
+/// records remain readable as one-word sets; V2 publication creation is rejected.
     KIND_CREATE_PUBLICATION_V3 = 139;
     KIND_ALTER_PUBLICATION_V3 = 140;
     KIND_CREATE_TRIGGER_V2 = 141;
@@ -149,7 +149,7 @@ wal_record_kinds! {
 /// Kind 69 remains decodable so existing journals retain their durable meaning.
     KIND_SET_POLICY_V2 = 146;
 /// Enum label counts widened from one byte to the startup-configured capacity.
-/// Kind 23 remains decodable so existing journals retain their durable meaning.
+/// Kinds 23 and 147 are rejected; only the current enum kind is decoded.
     KIND_CREATE_ENUM_V2 = 147;
     KIND_CREATE_ENUM_V3 = 149;
     KIND_ANALYZE_EXTENDED_STATISTICS_V2 = 150;

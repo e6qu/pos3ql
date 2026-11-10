@@ -1,498 +1,308 @@
 # Contributing to pos3ql
 
 Read [README.md](README.md), [architecture](docs/architecture.md),
-[PLAN.md](PLAN.md), [AGENTS.md](AGENTS.md), and
-[terminology](docs/terminology.md) before changing a boundary. License terms are
-in [LICENSE](LICENSE).
+[PLAN.md](PLAN.md), and [terminology](docs/terminology.md) before changing a
+boundary. [AGENTS.md](AGENTS.md) holds the binding engineering and change rules
+(PostgreSQL strictness, no silent fallbacks, fixed runtime memory, object
+storage as the durable tier, commit and PR format, the Boyscout Rule); this
+guide does not repeat them. License terms are in [LICENSE](LICENSE).
 
 ## Choose and scope a change
 
-Use the roadmap's remaining sequence and completion criteria. Reproduce a bug
-or identify the missing behavior before implementing it. Batch related code,
-regressions, recovery/capacity work, and documentation into one complete PR.
-Fix incidental bugs you encounter. BUGS.md is reserved for repairs prevented
-by a stated external blocker or genuine intractability.
+Pick work from the [milestones](PLAN.md#milestones). Reproduce a bug or identify
+the missing behavior before implementing it. Keep current behavior in its
+owning [document](docs/README.md), unfinished work in PLAN.md, and only blocked
+defects in BUGS.md. Completed investigations live in PRs and the
+[history index](docs/history/README.md); do not append progress journals.
 
-Every PR updates PLAN.md and BUGS.md. Keep current behavior in its owning
-[document](docs/README.md); put provenance and observations with their evidence.
-Keep PLAN.md focused on open gates and acceptance criteria; BUGS.md contains
-only blocked defects. Preserve completed investigations in PRs and the
-[history index](docs/history/README.md), without appending progress journals.
+When changing concurrency, preserve which versions transactions see, lock order,
+durable success responses, safe retries, reader lifetimes and bounded queues.
+Keep the [format inventory](docs/durable-format.md) accurate; format changes must
+preserve recovery of data written by the current version. A new runtime
+dependency requires an explicit policy decision and a memory-accounting review.
 
 ## Write documentation people can use
 
-Begin with what the reader can do, what happens, and what the limits mean.
-Explain technical terms at first use and add a small example from the user's
-point of view. Mark future behavior as a goal rather than implying it works.
+Start with what the reader can do, what happens, and what the limits mean. For
+example, say that "a confirmed order survives loss of the server's disk in
+object-store mode" before detailing journal publication and compare-and-swap.
+For a capacity limit, say which operation fails, whether the limit is
+configurable, and when a change takes effect.
 
-For example, explain that “a confirmed order survives loss of the server's
-disk in object-store mode” before detailing journal publication and
-compare-and-swap. For a capacity limit, say which operation fails, whether the
-limit is configurable, and when a change takes effect. Keep exact formats,
-numbers, error codes, and source provenance in the appropriate technical guide.
-
-Use the documentation index to avoid repeating the same contract across files.
-Preserve dated measurements and upstream licenses; simplify current guidance
-without rewriting historical evidence.
-Link historical benchmark evidence with immutable GitHub URLs. Release archives
-ship the benchmark index; their links must not depend on baseline files being
-installed locally.
-
-Architecture claims must identify current code paths and remaining gaps. Distinguish
-hard encodings, startup reservations, configured examples, calculated ceilings and
-measured results. State throughput units and workload/hardware/revision; never
-turn addressable bytes or same-host timings into a production capacity promise.
-Comments explain current invariants and costs, including repeated network work
-on retries. Remove completed-work narration from current guides and the roadmap;
-retain immutable evidence and upstream provenance in their indexes.
-
-## Engineering boundaries
-
-- Match vanilla PostgreSQL strictly at SQL, SQLSTATE, wire, and catalog inputs
-  and outputs. Unsupported client-visible behavior must fail explicitly.
-- Fix repeated causes through types, input validation, and common update paths.
-  Avoid needless wrappers and fallbacks. Make consequential settings and arguments
-  explicit; do not silently choose different behavior when a request fails.
-- Charge runtime buffers and pools exactly at startup. No growing collections,
-  heap allocation, or allocating sorts after the runtime memory freeze.
-  Exhaustion names the capacity. Object-store TLS is isolated and budgeted.
-- Keep durable data in object storage and cache state disposable. Provider
-  behavior belongs in the shared object-store contract, not database logic.
-- When changing concurrency, preserve which versions transactions see, lock
-  order, durable success responses, safe retries, reader lifetimes, and bounded
-  queues. The [glossary](docs/terminology.md) defines the technical terms.
-- Backward compatibility with earlier pos3ql versions is not required.
-  Keep the [format inventory](docs/durable-format.md) accurate and reject
-  unsupported identities before interpreting their bytes. Format changes must
-  preserve recovery of data written by the current version.
-
-The runtime dependency policy is the standard library, libc, and the isolated
-object-store TLS component and its dependencies. A new dependency requires an
-explicit policy decision and memory-accounting review.
+- Distinguish hard encodings, startup reservations, configured examples,
+  calculated ceilings and measured results. State throughput units and the
+  workload, hardware and revision; never turn addressable bytes or same-host
+  timings into a production capacity promise.
+- Link historical benchmark evidence with immutable GitHub URLs. Release
+  archives ship the benchmark index, so its links must not depend on local
+  baseline files.
+- Preserve dated measurements, upstream licenses, pins and checksums; corpora
+  in `vendor/` must pass `tools/check-vendor.sh`.
 
 ## Development and resource policy
 
-Use the Rust toolchain exercised by CI. PostgreSQL 18 supplies reference results;
-external suites also use Python 3, Docker, and the client tools installed by
-the workflow that owns the check. Native build, lint and boundary checks cover
-Linux amd64, Linux arm64 and macOS arm64. See `Cargo.toml`, `examples/dev.conf`, and
-`.github/workflows/` for the actual build and environment definitions.
+Use the Rust toolchain exercised by CI. PostgreSQL 18 supplies reference
+results; external suites also need Python 3, Docker and the client tools
+installed by the owning workflow. `Cargo.toml`, `examples/dev.conf` and
+`.github/workflows/` define the actual build and environment.
 
-The Linux arm64 and macOS arm64 jobs build every target with `native-ci` and one
-Cargo worker. That profile retains debug assertions, overflow checks and
-source-line backtraces while omitting full variable/type debug data. Native lint
-uses the same profile. Cargo progress and timing reports identify unfinished
-build work; native test artifacts still require a completed build of the checked
-revision. Keep the 15-minute build limit and require both native execution jobs;
-a cancelled producer and its skipped tests do not qualify as passing CI.
+Protect the interactive machine. Full builds, full test gates and large
+benchmark or evidence regeneration run on GitHub runners. Local work is serial,
+low priority and monitored through the workspace's resource guard: keep at
+least 64 GiB free disk, generated `target` data below 2 GiB, and each workload
+at or below 1 GiB sampled aggregate RSS with a 180-second deadline. If the guard
+refuses or a limit is reached, move the work to CI; do not bypass the guard or
+raise its limits.
 
-The macOS mutex gate runs the core ownership tests and a direct Apple API
-control on macOS arm64 under ThreadSanitizer. It rebuilds the standard library
-with the same instrumentation, uses no race suppressions, and retains its log.
-To compare the foreign-target Miri model with direct Apple calls, run
-`cargo miri test -p pos3ql-mutex-model --lib --target aarch64-apple-darwin -- core_mutex_direct_native_api`.
-The November 9 nightly, rustc `5b7b37aef`, emulates an unlocked unfair lock by
-[writing zero atomically](https://github.com/rust-lang/rust/blob/5b7b37aef/src/tools/miri/src/shims/unix/macos/sync.rs#L410)
-and later [reading it non-atomically](https://github.com/rust-lang/rust/blob/5b7b37aef/src/tools/miri/src/shims/unix/macos/sync.rs#L127).
-The failing [run](https://github.com/e6qu/pos3ql/actions/runs/42578259095/job/129034044286)
-records that access inside the emulated API. Native instrumentation validates
-the actual Apple primitive; the production lock is unchanged. Linux memory
-ownership remains checked with Miri.
-
-The configured SQL-session test harness records the most recent query-memory
-error's source location and the arena's requested, remaining and capacity bytes
-without allocating. Failed success assertions include those values, whether a
-temporary region was active, and wire output. Distinguish genuine exhaustion
-from an allocation blocked by a temporary borrow before changing a limit. This diagnostic is test-only and keeps client errors unchanged.
-Sequence replay failures likewise retain their most recent source location and
-whether sequence/input effects remain unread in fixed thread-local test storage.
-Success assertions print that diagnostic so a changed call, invalid saved cursor
-and unconsumed effect can be distinguished.
-The definition-image retry regression also prints the failing capture's caller,
-transaction mode and retry number. Its caller record uses fixed thread-local
-test storage; the client-visible error stays unchanged.
-
-Each build or test workflow first calls the shared Rust source checks.
-A formatting failure keeps its test matrix from starting and retains a
-`formatting-<revision>` artifact containing the correction. Apply that patch
-before pushing again. After formatting, `cargo clippy --all-targets` checks that
-the Rust code compiles and passes lint, with warnings treated as failures. Build and test
-matrices start only after both checks pass, so one compiler error does not
-launch dozens of copies of the same failing build.
-
-When adding a required configuration setting, update file samples, generators
-and embedded test configuration strings, including those outside `config.rs`.
-Capacity tests must reach the intended limit and print the actual error when
-its diagnostic differs; an earlier missing-setting error is not limit coverage.
-
-Library coverage shards require `COVERAGE_NATIVE_DEBUGGER=gdb` or `none`.
-CI uses `gdb` to print every thread's stack if a native test crashes. It runs
-the exact executable reported by Cargo with the configured `RUST_MIN_STACK`,
-the same test selection and ordinary test parallelism. A crash still fails
-the job; the debugger does not retry or resume it. GDB launches the executable
-directly: rebuilding thousands of test filters as one shell argument exceeds
-Linux's argument-size limit before the tests start.
-Coverage builds, library execution, server execution and reports all select the
-`coverage` Cargo profile. It inherits release behavior with optimization level
-1, reducing instrumented compilation cost within the fixed job budget. Verify
-both build and execution timings on the checked revision. Production
-release builds and their correctness/performance gates keep release settings.
-The 70% merged coverage floor and all test selections remain unchanged.
-A historical crash reproduction records its source revision, compiler/coverage
-versions, original test partition, stack limit, ordinary test parallelism and
-process outcome. Its artifact describes that failed revision. Finish current-head
-validation separately and remove temporary historical CI jobs before merging.
-
-SQL test harnesses prepare their Python clients with
-`tests/external/python_env.py VENV`. Dependencies and wheel hashes are pinned in
-`tests/external/requirements.lock`, with links to their PyPI release metadata.
-For example, an interrupted download retries up to three times with the same
-15-second request timeout; a failed installation never marks the environment
-ready. Verified wheels are cached and installed without network access. CI
-shares that cache through `.github/actions/python-test-environment`.
-
-Protect the interactive machine. Full builds, full test gates, and large
-benchmark/evidence regeneration run on GitHub runners. Local work is serial,
-low priority, and monitored: preserve at least 64 GiB free disk, keep generated
-`target` data below 2 GiB, and keep each workload at or below 1 GiB sampled
-aggregate RSS with a 180-second deadline. Use the workspace's provided resource
-guard for local checks. If it refuses or a limit is reached,
-move the workload to CI; do not bypass the guard or raise limits automatically.
-
-Failed crash-recovery jobs retain `crash-failure-a` or `crash-failure-b` artifacts.
-They include the generated object-store fixture, server and SQL logs, and an
-ordered `object-audit.jsonl` of writes, deletions and recovery roots. The audit
-omits credentials and subscription connection strings. Use these records to
-trace a missing block to its publication and deletion; keep the failing seed
-and request deadlines when fixing it.
-The synthetic S3 server retains a filename boundary behind each opaque listing
-token. Deleting a returned page or inserting an earlier filename must not repeat
-or skip later files; client-side ordering validation remains strict.
-The ingestion job also retains its object-store fixture, server logs and mutation
-audit as `ingest-failure`. Retention works without a crash-only SQL output file.
-The second crash job builds once and repeats its seed with explicit 0, 1 and
-5 ms object-store delays. Each case keeps its own `latency-N` fixture, so a
-timing-dependent failure can be compared with completed cases from that job.
-
-On a suitable dedicated runner, a focused regression can be selected with:
+A focused regression on a suitable runner:
 
 ```sh
 cargo test --lib --locked regression_name -- --nocapture
 ```
 
-Start a built development executable with `examples/dev.conf`; that configuration
-uses local-only durability. Keep credentials in an owner-only file and never
-include them in commits, PR bodies, logs, or retained evidence.
+`examples/dev.conf` starts a development executable with local-only
+durability. Keep credentials in an owner-only file and out of commits, PR
+bodies, logs and retained evidence.
 
-## Verification
+SQL test harnesses build their Python clients with
+`tests/external/python_env.py VENV`. Packages and wheel hashes are pinned in
+`tests/external/requirements.lock` (with PyPI release links). Downloads retry up
+to three times with the same 15-second timeout; a failed install never marks
+the environment ready. CI shares the verified wheel cache through
+`.github/actions/python-test-environment`.
 
-The driver gate pins pgJDBC 42.7.4 from [Maven Central](https://repo.maven.apache.org/maven2/org/postgresql/postgresql/42.7.4/).
-Its SHA-256 is `188976721ead8e8627eb6d8389d500dccc0c9bebd885268a3047180274a6031e`
-(artifact retrieved 2026-10-28; the repository's SHA-1 is
-`264310fd7b2cd76738787dc0b9f7ea2e3b11adc1`). The script verifies the checksum
-and jar structure on fresh downloads and CI cache restores. Keep the version,
-checksum, source and cache key together when changing this fixture dependency.
+When adding a required configuration setting, update file samples, generators
+and embedded test configuration strings, including those outside `config.rs`.
 
-Use the existing fixtures and allocation guard for changed runtime behavior.
-Set accepted mock sockets' blocking mode explicitly. Wait for socket readiness
-using the original deadline; a mock server reporting a completed write does not
-guarantee that its client can read the bytes yet. Cleanup regressions should hold
-backup, manifest, roster, listing and deletion responses separately, check that
-cached SQL remains runnable, and verify retention before deleting any file.
-Verify metadata through client behavior: anonymous record fields, named
-composite-domain arrays, old/new `RETURNING` names and schema-qualified views
-must work through preparation and execution. Cross-reference index operator
-classes with `pg_opclass` and `pg_opfamily`, including virtual large-value
-indexes. Check index comments both before and after cold recovery and name
-reuse. For concurrent rebuilds, prove replacement publication precedes writer
-waits and cancellation preserves already committed catalog phases.
-Native crashes require thread backtraces; a retry or longer deadline is not a
-repair. Keep the failing selection, parallelism and original capacity limits.
-Verify the invariant or external contract, not a test that merely restates the
-implementation. Boundary changes generally need accepted/rejected capacity,
-rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
-For procedural frame changes, run long nested loops in both transaction modes
-at the existing statement capacity. Include a shadowed counter, a caught error
-and a nonlocal exit; verify locals and `FOUND`, and prove inactive frames release
-references before temporary memory is reused. Exhaust the separate control pool,
-prove no declaration initializer ran, and verify capacity returns after owners
-drop while other active calls keep their positions. Cover both frame-byte and
-numeric-scope and output-binding lease exhaustion, including partially reserved
-directories and live scopes whose directory has dropped. Preserve local-value
-owners across moves and failed admission, and release parameter staging after
-initialization. Frame positions and resources must have one owner, without an
-address-based pairing check. Prove numeric layout scratch can be dropped while
-its owned scopes remain usable. Bind the immutable source owner and the original
-execution workspace explicitly when rebuilding syntax in separate parsing memory.
-Schema handoffs must pin the existing configured image cell. Cover physical and
-synthetic shapes, stale and foreign identifiers, last release after the chain
-and storage drop, recycled chain links, concurrent releases and unchanged
-nested-trigger exhaustion pressure in both transaction modes.
-Assignment planning also has a one-image regression for repeated INSERT,
-conflict UPDATE, ordinary UPDATE, MERGE and DELETE descriptions, with no heap
-allocation or writes during discovery.
-The retry regression enables a bounded native call trace only around its
-expected-success attempt. It uses the allocator guard's native tracing API,
-without Rust heap allocation; Miri keeps the source-location diagnostic and
-does not invoke foreign backtrace functions.
-Reject a replacement image even if its text is identical; preserve workspace
-identity checks while active local values borrow its memory. Keep deadline ownership proofs
-independent of the host clock under Miri isolation.
-Saved output bytes must survive dropping their source arena and external pool
-owner. Decoded copies must survive buffer growth, replacement and owner drop.
-Force fragmented growth and failed replacement; preserve the published value
-and return every range. At unchanged statement capacity, exhaust the saved-byte
-budget in both transaction modes, verify rollback of earlier writes and no loop
-body effects, then reuse the same pool successfully.
-Repeat queries and nested results on every iteration at unchanged capacity;
-short loops cannot prove that discarded work is reclaimed. Function comparisons
-must cover output names in `FROM`, nulls, whole and nested named rows, and field
-constraints that call helpers with side effects. Keep extended fixtures within
-their configured catalog limits by releasing completed definitions between
-transactions; retain every assertion and the original capacities.
-Test repeated and nested error handlers with unchanged statement memory.
-Saved SQLERRM values must survive reuse, absent stacked fields must be empty
-text, and an exhausted diagnostic buffer must leave its outer handler usable.
-Handler views must borrow owned buffers rather than copy storage handles.
-Destroy source arenas and external pool owners before reading retained errors;
-keep copied fields valid after their diagnostic owner drops. Cover fragmented
-growth, byte/descriptor exhaustion, depth admission, rethrow and reuse. In both
-transaction modes, reject handler-directory admission before initializers and
-verify that failed text capture rolls back earlier writes without entering its
-handler, then admits a successful call at the original capacity. Keep the shared
-PostgreSQL fixture for 512 nested diagnostic calls: every call must preserve its
-outer detail, return buffer capacity, and issue one audit row and sequence value.
-Test indexed execution positions after releasing their original parsing
-storage. Resumption must retain the selected source, definitions and types;
-reparsing a replacement definition must not redirect unfinished work. Capture
-source bytes before initializers; test byte/descriptor and parse-memory failures,
-capacity recovery, source/input/arena destruction and shared-owner drop. Compare
-a function replacing its own definition with PostgreSQL: the current call returns
-the original result and the next call uses the replacement. Distinguish lexer
-buffer exhaustion (`54000`) from malformed SQL (`42601`) and prove failed scans
-release their temporary memory.
-Coverage library partitions stream compiler output and each test's progress
-through the native allocation-error reporter. Use those timestamps to locate
-deadline overruns; buffered output must not hide the last running test.
-SQL and wire behavior needs comparison with actual PostgreSQL, including
-SQLSTATEs, types, result shape, and values. SQLSTATE-only and exact-message
-corpora share the same reference connection settings, including UTC and the
-test extension directory. Both capture verbose diagnostics, preserving primary
-messages for failure reports; the normalizer explicitly selects the fields to
-compare. A mismatch prints both raw diagnostic streams. Comparison style must
-not change fixture availability.
-Corpus comparisons echo each sent SQL command and retain its results and command
-tags in stdout. COPY errors retain their command's source position even when
-psql drains input before reporting the error; other diagnostic positions stay
-exact. The shared SQL lexer recognizes input boundaries, including COPY options,
-without treating quoted text or COPY data as SQL. This follows [psql's query echo and status output](https://github.com/postgres/postgres/blob/REL_18_6/src/bin/psql/common.c#L1088),
-and preserves ordering even for repeated commands on one input line. They retain
-stdout bytes verbatim and compare stderr diagnostics separately with their source
-file and SQL line number. This preserves which
-statement failed while removing whole notice/warning records and secondary
-DETAIL/HINT fields, including continuation lines. Diagnostic bytes outside UTF-8
-are escaped losslessly rather than replaced; primary error messages remain
-comparison inputs in exact-message mode.
-The Differential workflow keeps complete failed comparisons and server logs in
-`differential-failure-<shard>-<revision>` artifacts for seven days. Download those
-when its console preview ends before the mismatch you need. The other corpus
-harness prints the complete diff, including when coverage forces rows to disk.
-The port-based corpus harness requires an external reference at `127.0.0.1`;
-forward a remote reference explicitly instead of supplying a host it cannot use.
-Synchronize concurrent catalog changes before comparing current permission
-lookups. For example, after another connection grants access to `orders`,
-`LOCK TABLE orders IN ACCESS SHARE MODE` acquires a new relation lock and makes
-PostgreSQL process pending cache changes. A constant-only `pg_get_acl` query can
-otherwise reuse cached information in repeatable read. Keep checking ordinary
-catalog listings against the older transaction snapshot. See PostgreSQL 18.6's
-[relation lock refresh](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/storage/lmgr/lmgr.c#L110-L130)
-and [catalog snapshot invalidation](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/cache/inval.c#L768-L789).
-Finite floating-point math supplied by the host C library can differ in its
-last bits between the runner and PostgreSQL container. Compare those selected
-values with an explicit error bound in the SQL fixture; preserve exact checks
-for zero/infinity landmarks, types and SQL errors. Do not normalize all floating
-output or round runtime results to match one host. This follows
-[PostgreSQL's math contract](https://www.postgresql.org/docs/18/functions-math.html).
-Use the same relation kind on both sides when checking accepted commands. For
-example, a PostgreSQL plain table cannot establish whether a command is accepted
-on a foreign table; use a PostgreSQL foreign table for that boundary.
+### Regenerate PostgreSQL-derived tables
 
-The object-store simulator models remote storage with growing fixture vectors.
-Keep simulator uploads outside allocation-forbidden scopes when checking client
-execution. For example, a guarded MERGE can read a saved source table; use the
-external object-store checks for a VALUES source that writes temporary files.
-
-Required PR workflows are:
-
-| Workflow | Verification |
-|---|---|
-| CI | Architecture/bug/vendor guards, tool tests, all-target build, formatting, lint, library shards, object-store qualification, recovery/fault simulation, release install, and performance smoke |
-| Differential | PostgreSQL comparisons, vendored SQLLogicTest/regression slices, generated queries, and external execution paths |
-| Drivers | JDBC, pgx, node-postgres, psycopg2, SQLAlchemy and Alembic against PostgreSQL and pos3ql |
-| coverage | Instrumented library/external shards and merged coverage gate |
-
-The workflow files define exact commands and supported environments. A focused
-runner validates iteration; it does not replace complete PR gates. Remove
-temporary validation workflows before the final PR head. Fix failures on the
-same PR branch and rerun the affected gates; merge only when every required
-check passes on that head.
-
-CI builds all targets and runs Clippy natively on Linux amd64, Linux arm64 and
-macOS arm64. The jobs verify their compiler host before building; the arm64 jobs
-also exercise socket readiness, mutexes and libc collation. Use libc's platform
-types at C boundaries: `c_char` need not have the same signedness on every target.
-Function-call regressions run before the broader native boundary cases, so a
-broken call contract stops the job without waiting through unrelated tests.
-Native storage fixtures stay outside interpreter startup; their shared helpers
-remain available to the selected ownership tests. The formatting gate checks
-the included native fixture file explicitly because Cargo does not traverse it.
-
-Python client dependencies and their wheel hashes are pinned in
-`tests/external/requirements.lock`. SQLAlchemy and Alembic run with both psycopg2
-and psycopg 3. The same fixtures check ORM changes, returned identities, savepoints,
-type conversion, reflection, streaming, migration upgrades/downgrades and schema
-drift against both servers. Drivers retains transcripts, package versions and
-server logs even when an application operation fails.
-
-PostgreSQL comparison shards share one release binary built from their checkout.
-Each shard verifies its recorded revision and checksum before use. The CI harness
-takes an explicit executable path and never compiles during a comparison run.
-
-Root-cause execution timeouts using step timings, logs, resource use, and the
-smallest reproducer. Fix the slow work, deadlock, resource contention, or workload
-partitioning; do not increase timeout durations. A job waiting without an assigned
-runner is a scheduling delay, not evidence of an execution timeout.
-Every runner job declares its own bounded timeout. A shorter step timeout is
-additional protection; it never substitutes for another job's missing timeout.
-
-Tests inspecting an unfinished durable commit hold the HTTP fixture's upload
-responses until the inspection finishes. Release the hold before draining
-publication. A response that happens to arrive slowly is not a synchronization
-point; keep existing deadlines and phase limits.
-
-Native Linux arm64 and macOS arm64 builds compile all targets once. Separate
-test jobs run that build's library test executable with the full native filter
-lists; each build, test and lint job retains its 15-minute ceiling. The artifact
-helper checks the source revision, target, byte length and SHA256 before running
-the executable. Test workers also restore `RUST_MIN_STACK` from the checked-in
-Cargo configuration, which direct executable launches do not read. This keeps
-a slow cold build from consuming the tests' time
-budget without rebuilding or dropping cases.
-
-Regenerate built-in catalog metadata from the pinned PostgreSQL 18.6 reference
-with explicit container and output arguments:
+All generators pin PostgreSQL 18.6 (`REL_18_6`), reject other versions, and
+record their source and checksums.
 
 ```sh
+# Built-in catalog metadata, from a running reference container.
 tools/generate-pg18-catalog-metadata.sh pos3ql-pg18-ref src/sql/catalog_metadata.rs
-```
 
-The generator rejects other server versions and records the source version and
-container image. It includes the input/output routine identities reported by
-`pg_type`; user-defined domains, enums, arrays and row types derive those
-identities from their type definitions.
-
-Planner procedure attributes use the pinned upstream `REL_18_6` files
-[`pg_proc.dat`](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat)
-and [`pg_proc.h`](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.h):
-
-```sh
+# Planner procedure attributes from upstream pg_proc.dat and pg_proc.h.
 python3 tools/generate-pg18-planner-properties.py \
   --source /path/to/pg_proc.dat --header /path/to/pg_proc.h \
   --type-io-source src/sql/catalog_builtin_properties.rs \
   --output src/sql/catalog_planner_properties.rs
-```
 
-The generator verifies all three source checksums before writing. It supplements
-the callable declarations with internal type input/output facts; SQL functions
-keep their initialized catalog attributes. These facts do not add callable functions.
-
-The catalog comparison also checks built-in view SQL against the PostgreSQL
-service. To regenerate its static definitions from retained `catalog-metadata.json`
-evidence, supply the evidence URL and destination explicitly:
-
-```sh
+# Built-in view SQL from retained catalog-metadata.json evidence (--mode check compares).
 python3 tools/generate-pg18-view-definitions.py --mode write \
   --metadata /path/to/catalog-metadata.json --source https://example/evidence \
   --output src/sql/catalog_view_definitions.rs
 ```
 
-The generator requires PostgreSQL 18.6, records the metadata checksum and source,
-and retains the upstream license reference. Its `check` mode compares SQL while
-preserving the provenance of the checked-in generation.
+`tools/generate-pg18-type-layouts.py` takes the same `--mode`, `--metadata`,
+`--source` and `--output` arguments and writes `src/sql/type_layouts.rs`. Those
+layouts describe PostgreSQL's catalog and wire contracts, not pos3ql's object
+block layout. Planner sources are
+[`pg_proc.dat`](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat)
+and [`pg_proc.h`](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.h);
+they add no callable functions.
 
-Physical type properties use the same captured metadata. Generate them with
-`tools/generate-pg18-type-layouts.py`, supplying the same explicit `--mode`,
-`--metadata`, `--source`, and `--output` arguments, with
-`src/sql/type_layouts.rs` as the destination. These values describe PostgreSQL's
-catalog and wire contracts; they do not select pos3ql's object block layout.
+## Verification
 
-CI also exercises shared heap publication and saved row and index file ownership with
-Miri, alongside allocation-forbidden concurrent regressions.
-`tools/test-miri-ownership.sh LOG GROUP` runs an ownership group on a suitable
-runner. Run both explicit groups, `memory-sql` and `storage`. Each has a
-15-minute job budget and shares one interpreter startup. The explicit
-`miri-ownership` Cargo feature omits unrelated test modules
-only under Miri; native builds retain their full test set. This avoids spending
-interpreter time constructing test descriptions that the ownership gate never
-runs. Miri without that feature keeps the broader test harness available.
-Keep ownership cases beside their runtime modules and shared helpers outside
-native fixture modules. Tests constructing an anonymous invocation must install an explicit SQL plan
-owner through `type_input_plans::with_owner`, as the command executor does.
-Keep missing production ownership an error.
-List every selected case by its complete Rust name in
-`tools/miri-ownership-tests.txt`; its module must stay enabled in ownership mode.
-Every manifest entry belongs to exactly one group. Both jobs must finish
-successfully; a cancelled job does not qualify even if its last test passed.
-The script checks that every selected proof passes exactly once, with none
-missing, failed or ignored, and retains the group's manifest beside its log.
-Preserve the full proof set when reducing interpreter startup work.
-Polling tests release each snapshot before reusing its fixed scratch arena,
-even when writers are slow.
-Coverage stops at a failed build or instrumentation setup and retains its
-diagnostics; it must never run a cached executable after that failure.
-Native test shards preserve failed exit codes and resolve allocation-abort
-addresses with the runner's `addr2line`, so the log names the allocating code.
-The wire suite stops at its first transport timeout and captures the live Linux
-server stack and operational state before cleaning up the failed connection.
-Stack arguments are omitted; protocol coverage installs its debugger explicitly.
+### Required PR workflows
 
-PostgreSQL service and client containers use Docker's official image from
-[Google's Docker Hub cache](https://docs.cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images),
-pinned to the Linux amd64 image manifest used by these jobs. The PostgreSQL 18.6
-manifest is `sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b`,
-selected from official image index
-`sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336`.
-Pin the platform manifest directly: pulling the whole index can fail on mirrored
-attestation descriptors that are unnecessary for running the server.
-Keep service images, container selectors, and client adapters on the same digest.
-Verify updated manifests against Docker Hub's official image and
-retain that comparison in the PR; do not switch registries silently on failure.
-SeaweedFS qualification uses the upstream GHCR release image at the same digest
-as its Docker Hub publication. Registry changes preserve image provenance.
+| Workflow | File | Gates |
+|---|---|---|
+| CI | `ci.yml` | Formatting and type checks; architecture, bug, docs, vendor, timeout and duplicate guards; tool tests; Linux amd64 build and Clippy; 8 library shards (`tools/test-lib-shard.sh N-of-8`); native build, test and lint on Linux arm64 and macOS arm64; macOS mutex ThreadSanitizer gate; Miri ownership (`memory-sql`, `storage`); object-store qualification; storage VOPR; release install; performance smoke; embedded capacity |
+| Differential | `differential.yml` | One release binary, then sharded PostgreSQL comparisons, vendored SQLLogicTest and regression slices, generated queries and external execution paths (`tests/external/ci_diff.sh`) |
+| Drivers | `drivers.yml` | pgJDBC, pgx, node-postgres, psycopg2, and SQLAlchemy/Alembic with both psycopg2 and psycopg 3, against PostgreSQL and pos3ql (`tests/external/ci_drivers.sh`) |
+| coverage | `coverage.yml` | Instrumented library and external shards (`tools/coverage.sh`), crash torture, merged 70% line floor (`tools/coverage-merge.py 70`) |
 
-For benchmarks, follow [performance.md](docs/performance.md). Keep raw artifacts,
-revision/binary hashes, tool and service provenance, hardware, storage, network,
-and workload settings. Compare against stock PostgreSQL with its ordinary local
-durable tier. Report host-available and resource-matched controls separately;
-shared-host runs are exploratory, and hosted-runner timing is not a production
-performance gate. Preserve upstream corpora, licenses, pins, and checksums in
-`vendor/`; changes must pass `tools/check-vendor.sh`.
+Each workflow first calls `formatting.yml`: `cargo fmt --check` plus
+`rustfmt --check --edition 2024 src/storage/native_tests.rs` (Cargo does not
+traverse that file), then `cargo clippy --locked --all-targets -- -Dwarnings`.
+Build and test matrices start only after both pass, so one compiler error does
+not launch dozens of failing builds. A formatting failure retains a
+`formatting-<revision>` artifact with the correction patch; apply it before
+pushing again.
+
+A focused runner validates iteration; it does not replace the PR gates. Remove
+temporary validation workflows before the final head.
+
+### Time budget and sharding
+
+- Every runner job declares exactly one `timeout-minutes`, at most 15
+  (`tools/check-ci-timeouts.sh`). A shorter step timeout is extra protection,
+  not a substitute.
+- Keep existing budgets. When work outgrows a job, shard it instead of raising
+  the timeout: coverage uses `COVERAGE_SHARD` (`lib:N-of-4`, `run:<groups>`,
+  `runtest:<groups>`), and external harness groups use `POS3QL_RUN_GROUPS`.
+  Coverage tracing and `runtest:` correctness shards stay in separate matrix
+  entries.
+- Bound compiler concurrency and debug data rather than adding time. Native
+  arm64 jobs build every target once with the `native-ci` profile and
+  `--jobs 1` (debug assertions, overflow checks and line backtraces, without
+  full variable debug data); separate test jobs run that build's library
+  executable with the full native filter lists. The artifact helper checks
+  revision, target, length and SHA-256, and restores `RUST_MIN_STACK` from the
+  checked-in Cargo configuration.
+- Coverage builds and runs use the `coverage` profile (release with
+  optimization level 1). Production release builds keep release settings.
+- Preserve explicit profiles, assertions, native targets and test selections.
+
+### Native targets
+
+- Native Linux amd64, Linux arm64 and macOS arm64 builds, lint and boundary
+  regressions must pass. Jobs verify their compiler host first. Use libc's
+  declared C types at C boundaries (`c_char` signedness differs by target).
+- Function-call regressions run before broader native boundary cases, so a
+  broken call contract fails fast.
+- Native SQL and storage fixtures stay in native gates and never enter
+  interpreter startup; Miri ownership cases live beside their runtime modules.
+- The macOS mutex gate runs every `core_mutex_` ownership case and a direct
+  Apple API control under ThreadSanitizer, rebuilding the standard library with
+  the same instrumentation and no race suppressions.
+
+### Miri ownership
+
+`tools/test-miri-ownership.sh LOG GROUP` runs one of the two groups,
+`memory-sql` and `storage`. The `miri-ownership` Cargo feature omits unrelated
+test modules under Miri only, so interpreter startup does not compile
+irrelevant fixtures; native builds keep the full test set.
+
+- List every case by its full Rust name in `tools/miri-ownership-tests.txt`;
+  each belongs to exactly one group and its module stays enabled in ownership
+  mode. The script fails on any missing, repeated, failed or ignored proof.
+- Both groups must complete. Reducing startup work must not drop proofs.
+- Tests that build an anonymous invocation install an explicit SQL plan owner
+  through `type_input_plans::with_owner`, as the command executor does.
+- Keep deadline proofs independent of the host clock under Miri isolation.
+
+Linux memory ownership is checked with Miri; Apple locks are checked natively
+because the Miri model is wrong for them. Nightly rustc `5b7b37aef` emulates an
+unlocked unfair lock by
+[writing zero atomically](https://github.com/rust-lang/rust/blob/5b7b37aef/src/tools/miri/src/shims/unix/macos/sync.rs#L410)
+and later [reading it non-atomically](https://github.com/rust-lang/rust/blob/5b7b37aef/src/tools/miri/src/shims/unix/macos/sync.rs#L127)
+([failing run](https://github.com/e6qu/pos3ql/actions/runs/42578259095/job/129034044286)).
+To compare the two:
+`cargo miri test -p pos3ql-mutex-model --lib --target aarch64-apple-darwin -- core_mutex_direct_native_api`.
+
+### Pinned external inputs
+
+- pgJDBC 42.7.4 from
+  [Maven Central](https://repo.maven.apache.org/maven2/org/postgresql/postgresql/42.7.4/),
+  SHA-256 `188976721ead8e8627eb6d8389d500dccc0c9bebd885268a3047180274a6031e`
+  (retrieved 2026-10-28; repository SHA-1
+  `264310fd7b2cd76738787dc0b9f7ea2e3b11adc1`). The script verifies checksum and
+  jar structure on download and cache restore. Change version, checksum, source
+  and cache key together.
+- PostgreSQL 18.6 containers come from
+  [Google's Docker Hub cache](https://docs.cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images),
+  pinned to the Linux amd64 manifest
+  `sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b`
+  from official index
+  `sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336`.
+  Pin the platform manifest, not the index (mirrored attestation descriptors
+  can fail to pull). Keep services, selectors and client adapters on one
+  digest; verify updates against Docker Hub and record the comparison in the
+  PR.
+- SeaweedFS qualification uses the upstream GHCR release image at the same
+  digest as its Docker Hub publication.
+
+### Writing regressions
+
+Test the invariant or external contract, not a restatement of the
+implementation. Boundary changes generally need accepted and rejected
+capacity, rollback, failure cleanup, WAL/checkpoint and empty-cache recovery.
+
+- **Compare with PostgreSQL.** SQL and wire behavior must match SQLSTATEs,
+  types, result shape and values. Use the same relation kind on both sides (a
+  plain table cannot show what a foreign table accepts). Before comparing
+  permission lookups after another connection's grant, run
+  `LOCK TABLE orders IN ACCESS SHARE MODE` so PostgreSQL processes pending
+  cache changes ([lock refresh](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/storage/lmgr/lmgr.c#L110-L130),
+  [snapshot invalidation](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/cache/inval.c#L768-L789)).
+  Compare host-libm floating results with an explicit error bound in the
+  fixture, keeping exact checks for zero/infinity, types and errors
+  ([math contract](https://www.postgresql.org/docs/18/functions-math.html)).
+- **Corpus harnesses** echo each command and keep stdout verbatim, matching
+  [psql's echo and status output](https://github.com/postgres/postgres/blob/REL_18_6/src/bin/psql/common.c#L1088);
+  stderr diagnostics are compared separately with file and line, and the
+  normalizer selects compared fields. The port-based harness needs its
+  reference at `127.0.0.1`; forward a remote reference explicitly.
+- **Capacity.** Capacity tests must reach the intended limit and print the
+  actual error if it differs; an earlier missing-setting error is not limit
+  coverage. Run long and repeated work (nested loops, queries per iteration,
+  error handlers) at unchanged capacity in both transaction modes: short loops
+  cannot prove reclamation. Keep fixtures within catalog limits by releasing
+  completed definitions, never by raising capacities or dropping assertions.
+- **Ownership.** Saved values, diagnostics and execution positions must
+  survive dropping their source arena, pool owner or parsing storage, and
+  return every range on failure. Distinguish lexer buffer exhaustion (`54000`)
+  from malformed SQL (`42601`).
+- **Synchronization.** Hold fixture responses explicitly (for example, HTTP
+  upload responses while inspecting an unfinished commit); a slow response is
+  not a synchronization point. Set mock sockets' blocking mode explicitly and
+  wait for readiness within the original deadline. Polling tests reclaim each
+  snapshot's scratch space before reuse rather than relying on thread
+  scheduling. Keep time-only timezone expectations independent of the day or
+  season the test runs.
+- **Simulator.** The object-store simulator grows fixture vectors; keep its
+  uploads outside allocation-forbidden scopes and use the external
+  object-store checks for paths that write temporary files.
+
+### Diagnosing failures
+
+- Root-cause timeouts from step timings, logs, resource use and the smallest
+  reproducer; fix the slow work, deadlock, contention or partitioning. Do not
+  extend timeouts. A job waiting for a runner is a scheduling delay, not an
+  execution timeout.
+- Keep compiler and per-test progress visible through cancellation. Native
+  builds retain `native-build-progress-<target>-<revision>` (Cargo progress and
+  timings); coverage library shards stream compiler output and each test's
+  progress so the last running test is visible.
+- Native crashes need thread backtraces; a retry or longer deadline is not a
+  repair. Library coverage requires `COVERAGE_NATIVE_DEBUGGER=gdb` or `none`;
+  CI uses `gdb` to print every thread's stack without retrying. Native shards
+  keep failed exit codes and resolve allocation-abort addresses with
+  `addr2line`. The wire suite stops at its first transport timeout and
+  captures the live server stack. Keep the failing selection, parallelism,
+  seed and capacity limits when fixing.
+- Coverage stops at a failed build or instrumentation setup and never runs a
+  cached executable afterwards.
+- SQL-session harness assertions print the last query-memory error's source
+  location and requested, remaining and capacity bytes, plus whether a
+  temporary region was active, without allocating. Check for a temporary
+  borrow before changing a limit. Sequence replay and definition-image retry
+  failures print similar test-only diagnostics.
+- Retained artifacts:
+
+  | Artifact | Contents |
+  |---|---|
+  | `differential-failure-<shard>-<revision>` | Complete failed comparisons and server logs (7 days) |
+  | `crash-failure-a`, `crash-failure-b` | Object-store fixture, server and SQL logs, `object-audit.jsonl` of writes, deletions and recovery roots (no credentials); job b repeats its seed at 0, 1 and 5 ms storage delay, one `latency-N` fixture each |
+  | `ingest-failure` | Ingestion fixture, server logs and mutation audit |
+  | `miri-ownership-<group>-<revision>` | Log and selected manifest |
+  | `macos-mutex-<revision>` | ThreadSanitizer log |
+  | `driver-evidence-<revision>` | Driver transcripts, package versions, server logs |
+
+### Merge qualification
+
+Fix failures on the same PR branch and rerun the affected gates. A cancelled
+build, a skipped test or a still-running gate is incomplete qualification; a PR
+merges only after every required check passes on its head.
+
+For benchmarks, follow [performance.md](docs/performance.md); hosted-runner
+timing is not a production performance gate.
 
 ## Pull requests and commits
 
-Describe the behavior changed, why, verification performed, and material limits.
-Distinguish passing focused tests from still-running complete gates. Open a
-reviewable PR and resolve failures there rather than creating replacement branches.
-
-Every commit message is exactly one line of at most 80 characters, with no body,
-trailers, AI attribution, authored-by text, or co-authored-by text. Use ordinary
-Git author metadata. PRs are squash-merged after passing CI. Supply the squash
-subject and an explicitly empty body; match the checked head when merging:
+Describe the behavior changed, why, verification performed and material
+limits. Distinguish passing focused tests from still-running gates. Resolve
+failures in the open PR rather than creating replacement branches. Commit and
+squash format are in [AGENTS.md](AGENTS.md#change-rules); merge against the
+checked head:
 
 ```sh
 gh pr merge PR_NUMBER --squash --match-head-commit FULL_HEAD_SHA \
   --subject 'One-line subject of at most 80 characters' --body ''
 ```
 
-Follow the repository's authorization and review policy before merging. Verify
-the resulting commit contains only the intended subject.
+Follow the repository's authorization and review policy, then verify the
+resulting commit contains only the intended subject.

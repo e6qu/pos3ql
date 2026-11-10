@@ -8849,6 +8849,9 @@ impl Engine {
         }
         self.wal.commit();
         if !self.wal_upload {
+            // The local journal is the durable copy; no batch awaits
+            // publication, so the reactor must not schedule a retry for it.
+            self.wal.clear_batch_marker();
             self.durable_lsn = self.wal.last_lsn();
             return Ok(true);
         }

@@ -82197,6 +82197,30 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
 }
 
 #[test]
+fn local_journal_commits_leave_no_publication_deadline_for_an_idle_reactor() {
+    let config = test_config("local-journal-idle-deadline");
+    assert!(!config.wal_upload);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    engine.enable_async_durability();
+    session.success(&mut engine, "CREATE TABLE idle_local (id int)", false);
+    session.success(&mut engine, "INSERT INTO idle_local VALUES (1)", false);
+    // An immediate deadline would make every idle reactor wait time out at once.
+    assert!(
+        engine
+            .advance_wal_publication(std::time::Instant::now(), CommitProgressMode::Reactor)
+            .unwrap()
+    );
+    assert_eq!(engine.wal.pending_batch_bytes(), 0);
+    assert_eq!(engine.next_publication_deadline(), None);
+    assert!(!engine.durable_retry_pending());
+    assert_eq!(engine.durable_lsn(), engine.journal_lsn());
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
 fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

@@ -37,6 +37,10 @@ CREATE PROCEDURE routine_defs.started() LANGUAGE sql AS 'START TRANSACTION';
 CALL routine_defs.started();
 CREATE FUNCTION routine_defs.vacuum() RETURNS void LANGUAGE sql AS 'VACUUM';
 SELECT routine_defs.vacuum();
+CREATE FUNCTION routine_defs.atomic() RETURNS integer LANGUAGE sql BEGIN ATOMIC COMMIT; END;
+CREATE FUNCTION routine_defs.atomic() RETURNS void LANGUAGE sql
+  BEGIN ATOMIC SELECT 1; CREATE TABLE routine_defs.atomic_rows(a integer); END;
+CREATE FUNCTION routine_defs.atomic() RETURNS void LANGUAGE sql BEGIN ATOMIC CHECKPOINT; END;
 SELECT a FROM routine_defs.result_rows ORDER BY a;
 START TRANSACTION;
 COMMIT;

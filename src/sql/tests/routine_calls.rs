@@ -4175,3 +4175,42 @@ fn relation_row_types_in_routine_signatures_are_rejected_explicitly() {
         ),
     ]);
 }
+
+/// PostgreSQL's parse analysis accepts only queries, data changes and CALL in
+/// a `BEGIN ATOMIC` body, naming any other statement by its command tag before
+/// checking the declared result.
+#[test]
+fn unquoted_bodies_reject_utility_statements_at_creation() {
+    use super::routine_identity_diagnostics::diagnostics;
+    let config = test_config("unquoted-body-utilities");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for (body, tag) in [
+        ("COMMIT", "COMMIT"),
+        ("VACUUM", "VACUUM"),
+        ("SAVEPOINT a", "SAVEPOINT"),
+        ("CHECKPOINT", "CHECKPOINT"),
+        ("CREATE TABLE atomic_rows(a integer)", "CREATE TABLE"),
+        ("SET search_path = public", "SET"),
+        ("SELECT 1; NOTIFY atomic_channel", "NOTIFY"),
+        ("START TRANSACTION", "START TRANSACTION"),
+        ("ROLLBACK TO a", "ROLLBACK"),
+        ("RELEASE a", "RELEASE"),
+    ] {
+        let sql = format!(
+            "CREATE FUNCTION atomic_utility() RETURNS integer LANGUAGE sql \
+             BEGIN ATOMIC {body}; END"
+        );
+        let output = session.execute(&mut engine, &sql, true);
+        assert_eq!(
+            diagnostics(&output),
+            [(
+                'E',
+                "0A000".to_owned(),
+                format!("{tag} is not yet supported in unquoted SQL function body")
+            )],
+            "{sql}"
+        );
+    }
+}

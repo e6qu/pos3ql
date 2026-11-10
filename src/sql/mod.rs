@@ -1389,6 +1389,73 @@ fn statement_tag(statement: &Stmt<'_>) -> &'static str {
     }
 }
 
+/// PostgreSQL's command tag for a statement that a `BEGIN ATOMIC` body cannot
+/// hold; `None` for the queries, data changes and `CALL` it accepts.
+pub(crate) fn unquoted_body_unsupported_tag(statement: &Stmt<'_>) -> Option<&'static str> {
+    use ast::DiscardTarget;
+    Some(match statement {
+        Stmt::Select(_)
+        | Stmt::SetQuery(_)
+        | Stmt::Insert(_)
+        | Stmt::Update(_)
+        | Stmt::Delete(_)
+        | Stmt::Merge(_)
+        | Stmt::Call { .. } => return None,
+        Stmt::With { statement, .. } => return unquoted_body_unsupported_tag(statement),
+        Stmt::Begin(_, start) => start.command_name(),
+        Stmt::Commit => "COMMIT",
+        Stmt::Rollback | Stmt::RollbackToSavepoint(_) => "ROLLBACK",
+        Stmt::Savepoint(_) => "SAVEPOINT",
+        Stmt::ReleaseSavepoint(_) => "RELEASE",
+        Stmt::PrepareTransaction(_) => "PREPARE TRANSACTION",
+        Stmt::CommitPrepared(_) => "COMMIT PREPARED",
+        Stmt::RollbackPrepared(_) => "ROLLBACK PREPARED",
+        Stmt::Vacuum { .. } => "VACUUM",
+        Stmt::Analyze(_) => "ANALYZE",
+        Stmt::Checkpoint => "CHECKPOINT",
+        Stmt::Set { .. }
+        | Stmt::SetRole { .. }
+        | Stmt::SetSessionAuthorization { .. }
+        | Stmt::SetTransaction { .. }
+        | Stmt::SetCatalog { .. }
+        | Stmt::SetTransactionSnapshot(_) => "SET",
+        Stmt::Reset(_) => "RESET",
+        Stmt::Show(_) | Stmt::ShowAll => "SHOW",
+        Stmt::SetConstraints { .. } => "SET CONSTRAINTS",
+        Stmt::Copy(_) => "COPY",
+        Stmt::LockTable { .. } => "LOCK TABLE",
+        Stmt::Truncate { .. } => "TRUNCATE TABLE",
+        Stmt::Notify { .. } => "NOTIFY",
+        Stmt::Listen { .. } => "LISTEN",
+        Stmt::Unlisten { .. } => "UNLISTEN",
+        Stmt::Load { .. } => "LOAD",
+        Stmt::Discard(DiscardTarget::All) => "DISCARD ALL",
+        Stmt::Discard(DiscardTarget::Plans) => "DISCARD PLANS",
+        Stmt::Discard(DiscardTarget::Sequences) => "DISCARD SEQUENCES",
+        Stmt::Discard(DiscardTarget::Temporary) => "DISCARD TEMP",
+        Stmt::Prepare { .. } => "PREPARE",
+        Stmt::ExecutePrepared { .. } => "EXECUTE",
+        Stmt::Deallocate(Some(_)) => "DEALLOCATE",
+        Stmt::Deallocate(None) => "DEALLOCATE ALL",
+        Stmt::DeclareCursor { .. } => "DECLARE CURSOR",
+        Stmt::FetchCursor { move_only, .. } => {
+            if *move_only {
+                "MOVE"
+            } else {
+                "FETCH"
+            }
+        }
+        Stmt::CloseCursor(Some(_)) => "CLOSE CURSOR",
+        Stmt::CloseCursor(None) => "CLOSE CURSOR ALL",
+        Stmt::Do { .. } => "DO",
+        Stmt::Explain { .. } => "EXPLAIN",
+        Stmt::Cluster { .. } => "CLUSTER",
+        Stmt::Reindex { .. } => "REINDEX",
+        Stmt::RefreshMaterializedView { .. } => "REFRESH MATERIALIZED VIEW",
+        other => return Some(event_trigger_tag(other).unwrap_or("utility statement")),
+    })
+}
+
 fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
     Some(match statement {
         Stmt::CreateTable(_) => "CREATE TABLE",

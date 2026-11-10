@@ -1850,10 +1850,15 @@ pub(crate) const ROUTINE_RESULT_STATEMENT_DETAIL: &str =
 /// Parses a SQL-language function body. PostgreSQL permits supported SQL
 /// statements before the final result; transaction control is rejected only
 /// when execution reaches it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "routine parsing keeps its result contract, body form and input sources explicit"
+)]
 pub(crate) fn parse_routine_function_program<'a>(
     body: &'a str,
     arena: &'a Arena,
     result: RoutineResultContract<'_>,
+    unquoted: bool,
     routine_name: &'a str,
     parameters: &[crate::storage::RoutineArgumentDef],
     inputs: &'a [super::type_inputs::Binding<'a>],
@@ -1882,6 +1887,25 @@ pub(crate) fn parse_routine_function_program<'a>(
         count += 1;
     }
     validate(&parser)?;
+    // PostgreSQL's parse analysis rejects utilities in a `BEGIN ATOMIC` body
+    // before it checks the result.
+    if unquoted
+        && let Some(tag) = parsed[..count]
+            .iter()
+            .flatten()
+            .find_map(|step| match step {
+                RoutinePrelude::Statement(statement) => {
+                    super::unquoted_body_unsupported_tag(statement)
+                }
+                RoutinePrelude::Forbidden(name) => Some(*name),
+            })
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} is not yet supported in unquoted SQL function body",
+            tag
+        ));
+    }
     let declared = match result {
         RoutineResultContract::Returns(declared) => Some(declared),
         RoutineResultContract::Void | RoutineResultContract::Deferred => None,
@@ -1972,6 +1996,7 @@ pub(crate) fn parse_stored_routine_function_program<'a>(
         executable,
         arena,
         result,
+        body_kind == crate::storage::RoutineBodyKind::Atomic,
         routine_name,
         parameters,
         inputs,

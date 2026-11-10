@@ -4072,3 +4072,44 @@ fn function_definitions_use_postgresql_layout() {
         ]
     );
 }
+
+/// PL/pgSQL cannot run CALL yet; it fails loudly instead of misreporting the
+/// statement as malformed. A utility command run with EXECUTE ... INTO keeps
+/// PostgreSQL's wording.
+#[test]
+fn plpgsql_call_is_rejected_as_unsupported() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    const UNSUPPORTED: &[super::routine_identity_diagnostics::Expected] =
+        &[('E', "0A000", "CALL is not supported in PL/pgSQL")];
+    check(&[
+        (
+            "CREATE TABLE call_rows(a integer); \
+             CREATE PROCEDURE call_insert(x integer) LANGUAGE sql \
+                 AS 'INSERT INTO call_rows VALUES (x)'",
+            NONE,
+        ),
+        ("DO $$BEGIN CALL call_insert(1); END$$", UNSUPPORTED),
+        (
+            "CREATE FUNCTION calls_procedure() RETURNS void LANGUAGE plpgsql \
+             AS $$BEGIN call call_insert(1); END$$",
+            UNSUPPORTED,
+        ),
+        (
+            "DO $$BEGIN EXECUTE 'CALL call_insert(2)'; END$$",
+            UNSUPPORTED,
+        ),
+        (
+            "DO $$DECLARE r integer; BEGIN EXECUTE 'CALL call_insert(3)' INTO r; END$$",
+            UNSUPPORTED,
+        ),
+        (
+            "DO $$DECLARE r integer; BEGIN EXECUTE 'CREATE TABLE into_rows(a integer)' INTO r; END$$",
+            &[(
+                'E',
+                "42601",
+                "INTO used with a command that cannot return data",
+            )],
+        ),
+        ("SELECT count(*) FROM call_rows", NONE),
+    ]);
+}

@@ -290,7 +290,12 @@ still fail with `42601` and `syntax error: <description>`: type modifiers
 1000` in PostgreSQL), COPY targets and options, storage parameters, sequence,
 role and large-object values, and SQL/JSON result types. An unsupported cast
 reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
-`42846` `cannot cast type integer to timestamp without time zone`. The
+`42846` `cannot cast type integer to timestamp without time zone`.
+PL/pgSQL `CALL`, written directly or run with `EXECUTE`, fails with `0A000`
+(`CALL is not supported in PL/pgSQL`); supporting it needs output parameters
+assigned to the caller's variables, PostgreSQL's transaction-control rules for
+the calling chain, and a saved call position so the called procedure can pause
+and resume like other nested routines. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

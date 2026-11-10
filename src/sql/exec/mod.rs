@@ -18437,6 +18437,16 @@ where
     }
 }
 
+/// Procedures called from PL/pgSQL would need their output parameters
+/// assigned to variables and their transaction control checked against the
+/// calling chain; pos3ql runs CALL only as a top-level statement.
+fn plpgsql_call_unsupported() -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "CALL is not supported in PL/pgSQL"
+    )
+}
+
 fn unsupported_trigger_body() -> SqlError {
     sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,
@@ -20361,6 +20371,9 @@ fn parse_trigger_statement<'a>(
     }
     if let Some(assignment) = parse_trigger_local_assignment(segment, arena)? {
         return Ok(TriggerStatement::LocalAssign(assignment));
+    }
+    if strip_trigger_keyword(segment, "call").is_some() {
+        return Err(plpgsql_call_unsupported());
     }
     Err(unsupported_trigger_body())
 }
@@ -25595,6 +25608,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "procedural-language catalog mutation is not supported"
                 ))),
+                Stmt::Call { .. } => Ok(Err(plpgsql_call_unsupported())),
                 _ => Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "PL/pgSQL utility command is not implemented"
@@ -27989,10 +28003,11 @@ fn execute_trigger_step<'a>(
                         }
                         debug_assert_eq!(affected, row_count as u64);
                     }
+                    Stmt::Call { .. } => return Err(plpgsql_call_unsupported()),
                     _ => {
                         return Err(sql_err!(
                             sqlstate::SYNTAX_ERROR,
-                            "EXECUTE of a utility command cannot have an INTO clause"
+                            "INTO used with a command that cannot return data"
                         ));
                     }
                 }

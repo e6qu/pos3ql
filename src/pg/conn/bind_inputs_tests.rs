@@ -3104,3 +3104,99 @@ fn concurrent_index_receipts_keep_exact_effects_cancel_and_cold_states() {
         }
     }
 }
+
+#[test]
+fn extended_write_type_descriptions_restore_the_owning_sessions_search_path() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for portal_description in [false, true] {
+            let config = config(&format!("describe-session-path-{portal_description}"), mode);
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer = Conn::new(&config, &mut budget).unwrap();
+            let mut observer = Conn::new(&config, &mut budget).unwrap();
+            writer.id = 1;
+            observer.id = 2;
+            writer.phase = Phase::Ready;
+            observer.phase = Phase::Ready;
+            query(
+                &mut writer,
+                &mut engine,
+                "CREATE SCHEMA description_home; CREATE SCHEMA description_other; CREATE TABLE description_home.orders(id integer); SET search_path=description_home,public",
+            );
+            let search_path = writer.guc.search_path();
+            query(
+                &mut observer,
+                &mut engine,
+                "SET search_path=description_other,public",
+            );
+            let database = crate::sql::execution_database_oid();
+            engine.select_database(database).unwrap();
+            parse(
+                &mut writer,
+                &mut engine,
+                "INSERT INTO orders VALUES($1) RETURNING id",
+                &[crate::sql::types::oid::INT4],
+            );
+            query(&mut observer, &mut engine, "SELECT current_schema");
+            engine.select_database(database).unwrap();
+            message(
+                &mut writer,
+                &mut engine,
+                wire::FMSG_BIND,
+                &bind_payload("result", &[Some(b"7")]),
+                false,
+            );
+            assert_eq!(
+                first_row(&query(&mut observer, &mut engine, "SELECT current_schema")),
+                "description_other"
+            );
+            engine.select_database(database).unwrap();
+            let description = message(
+                &mut writer,
+                &mut engine,
+                wire::FMSG_DESCRIBE,
+                if portal_description {
+                    b"Presult\0"
+                } else {
+                    b"Sbound\0"
+                },
+                false,
+            );
+            assert!(has_message(&description, wire::MSG_ROW_DESCRIPTION));
+            assert_eq!(
+                has_message(&description, wire::MSG_PARAMETER_DESCRIPTION),
+                !portal_description
+            );
+            assert_eq!(writer.guc.search_path(), search_path);
+            assert_eq!(
+                first_row(&query(&mut observer, &mut engine, "SELECT current_schema")),
+                "description_other"
+            );
+            engine.select_database(database).unwrap();
+            let mut execute = b"result\0".to_vec();
+            execute.extend_from_slice(&0i32.to_be_bytes());
+            assert_eq!(
+                first_row(&message(
+                    &mut writer,
+                    &mut engine,
+                    wire::FMSG_EXECUTE,
+                    &execute,
+                    false
+                )),
+                "7"
+            );
+            message(&mut writer, &mut engine, wire::FMSG_SYNC, &[], false);
+            assert_eq!(
+                first_row(&query(
+                    &mut writer,
+                    &mut engine,
+                    "SELECT count(*) FROM orders"
+                )),
+                "1"
+            );
+        }
+    }
+}

@@ -156,6 +156,13 @@ query. Expanded views retain their original schema and name while aliases
 control which names SQL can reference. `RETURNING` adds the target's old/new
 names without adding duplicate sources of unqualified columns.
 
+Parse, Bind and Describe each restore the connection's user, search path and
+timezone after selecting its database. Another client's work cannot lend them
+its lookup context. Describing a statement neither issues a new command nor
+renews the deadline. For example, after `SET search_path = orders_app, public`,
+a parameterized `INSERT INTO orders VALUES ($1) RETURNING id` describes the
+`orders_app` table even when another connection uses a different search path.
+
 Protocol preparation distinguishes starting a command from executing a block of
 commands. A JDBC client can prepare and bind a standalone `COMMIT PREPARED`
 without making it an explicit transaction. An earlier execution before `Sync`,
@@ -209,9 +216,32 @@ immutable before publication. Execution reads their stored bytes directly;
 even an older mutable handle cannot reopen that allocation for writing.
 Callback lookup exposes the invocation log only inside a scoped closure. Its
 installer keeps the restoring guard private and restores the previous owner on
-success, errors or unwinding.
-This owns the call's inputs. The running body and enclosing write still need
-complete ownership across a scheduler return.
+success, errors or unwinding. Resumed expression evaluation uses that saved
+owner, rather than rebinding the log to its new temporary workspace.
+Owned procedural expressions also retain an unfinished PL/pgSQL scalar or
+set-returning body. Its source, arguments, local values, pending child work,
+statement position and call environment survive recycling temporary query memory.
+Moving a call log transfers its unfinished body once; failed relocation preserves
+the original owner. A paused function removes its timing entry from the worker
+and restores it on resumption, so another client's work is not charged as its
+child. Tracking still counts one completed call.
+For example, after writing an audit row and issuing an order number, a function
+waiting for an advisory lock continues with the same local text and number.
+Declaration initializers and their type checks retain separate query receipts
+and replay positions. If an initializer calls a function that writes an audit
+row before waiting, that child resumes once; checking a domain afterward cannot
+re-evaluate the initializer. A completed value stays owned while its conversion
+waits. Expression positions without a retained invocation log still return
+`0A000` before a scheduler return could lose completed child work.
+The same saved environment restores the selected search path and its published
+schema names, as well as settings, effective user, timestamps and original
+statement deadline. A failed reattachment restores the caller's environment.
+The actual argument and local widths determine the reservations; paused bodies
+use `execution_control_bytes`/`execution_control_leases` and
+`row_work_bytes`/`row_work_leases`, without a new per-table allocation.
+General SQL-language bodies, return checks that can wait, other expression
+positions and the enclosing write still need complete ownership before their
+synchronous storage protection can be removed.
 Completed scalar values and table-source rows keep their encoded bytes in
 checked arena allocations too. Their result directory stores handles and effect
 receipts, rather than references to returned values or row slices. For example,
@@ -249,21 +279,18 @@ scope. Their row scans may reclaim temporary storage without retaining a
 caller's unfinished input frames in that storage. Returning from the nested
 query restores the caller's input scope, including after an error.
 
-Waiting for another connection's lock can require restarting an unfinished
-function body. Completed cursor operations and checked routine inputs keep
-their results and sequence effects. A caught input-check error keeps its exact
-failed attempt too; replay restores that error without running the check again.
-If restarting would lose their data writes
-or session changes, the command fails explicitly with `0A000` and rolls back;
-it does not silently repeat or discard those effects. Retaining the remaining
-function-body execution position is still a roadmap item.
+Owned procedural queries preserve the unfinished function as well as completed
+cursor operations and checked inputs. Other expression positions still need
+that ownership before they can yield safely. If restarting would lose data
+writes or session changes, an unsupported path returns `0A000` and rolls back.
 
-With `SET track_functions = 'all'`, function statistics separate time spent in
-the function from time spent in its children. An active timer owns its entry
-in a fixed 1,024-entry stack on the SQL execution thread. Completing the call,
-returning an error or unwinding releases that entry; exhaustion returns `54000`
-and names the function timing stack. Saving timing across a function-body pause
-remains part of retaining that unfinished call.
+With `SET track_functions = 'all'`, function statistics separate elapsed time in
+the function from time spent in its children. An active timer owns one of 1,024
+entries on the SQL execution thread. Pausing transfers its timestamps to the
+unfinished call and releases that entry; resumption admits it again. Another
+client's calls cannot become its children. Completing, failing or unwinding
+releases the entry; exhaustion returns `54000` and names the function timing
+stack. The call count is published only after successful completion.
 
 Numeric `FOR` loops reserve reusable local-variable frames before running a
 call's local initializers. The reservation follows maximum simultaneous loop
@@ -573,7 +600,7 @@ frame, so the original owner can still resume it. Resetting the original owner's
 arena invalidates its receipts explicitly.
 Unowned row phases still reject suspension with `0A000`; their full continuations
 remain required before enabling those waits. The remaining expression paths,
-unfinished function bodies and query positions also need complete ownership
+unowned function callers and query positions also need complete ownership
 before their temporary memory can be released across a scheduler return.
 Dependency collection distinguishes catalog relations from materialized rows.
 For example, a trigger can `UPDATE orders FROM changed_rows` using its transition
@@ -647,8 +674,9 @@ append overwrites any unpublished bytes. `RETURN NEXT` releases expression and
 conversion scratch after each row. Output-variable bindings reserve their actual
 count before local initialization, rather than a maximum-width array for every
 invocation. At function completion, exported rows receive independent statement
-storage before the collector releases its leases. These owners do not yet make
-the whole invocation resumable across connection-scheduler returns.
+storage before the collector releases its leases. A suspended PL/pgSQL body
+keeps this collector with its lexical frame; general SQL-language functions
+still need their own unfinished-query positions.
 Input admission also releases parser/dependency scratch when no checked values
 or planner candidates need retaining. Expressions and static statements with no
 input substitutions reuse their compiled source while keeping the normal
@@ -656,7 +684,10 @@ input-owner scope. `PERFORM` uses a scoped arena for query work and nested
 invocation receipts; both are released when the query finishes. Only its row
 count and `FOUND` return to the interpreter. Prior locals, handler diagnostics
 and input bindings stay outside that workspace.
-It does not yet save a function's execution position across a storage wait.
+When the enclosing operation owns the query, an actual wait transfers its
+receipts and unfinished PL/pgSQL calls out of that temporary workspace.
+Synchronous storage protection remains until the enclosing write and remaining
+expression paths can also yield safely.
 
 Procedural exception scopes share savepoint admission, transaction-log rewind
 and remote savepoint mirroring with explicit SQL savepoints. Every admission,

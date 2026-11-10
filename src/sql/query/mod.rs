@@ -1317,7 +1317,24 @@ impl<'a> RoutineResultShape<'a> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutineExecution {
+    /// The command's effect journal must approve restarting an unfinished body.
+    StatementReplay,
+    /// The caller retains this query and the unfinished function body together.
+    Retained,
+}
+
+pub(crate) struct SuspendedRoutineCall {
+    pub(super) body: super::exec::SuspendedFunction,
+    pub(super) timing: super::statistics::PausedFunctionTiming,
+    pub(super) plan_owner: super::type_input_plans::Owner,
+    pub(super) snapshot: u32,
+}
+
 pub(crate) struct RoutineInvocationState {
+    pub(super) suspended: RefCell<Option<SuspendedRoutineCall>>,
+    pub(super) execution: RoutineExecution,
     next: Cell<usize>,
     pending: Cell<Option<PendingRoutineInvocation>>,
     pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
@@ -1438,8 +1455,10 @@ pub(crate) fn protect_statement_effects() {
 }
 
 impl RoutineInvocationState {
-    pub(crate) fn new(arena: &Arena) -> Self {
+    pub(crate) fn new(arena: &Arena, execution: RoutineExecution) -> Self {
         Self {
+            suspended: RefCell::new(None),
+            execution,
             next: Cell::new(0),
             pending: Cell::new(None),
             pending_replay: Cell::new(None),

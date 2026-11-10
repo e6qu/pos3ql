@@ -10,6 +10,7 @@ use crate::sql_err;
 struct FunctionTimingFrame {
     started: i64,
     child_micros: u64,
+    parent_reported_micros: u64,
 }
 
 // This bounds only nested timing frames, not the number of routine calls in a
@@ -20,6 +21,7 @@ impl FunctionTimingFrame {
     const EMPTY: Self = Self {
         started: 0,
         child_micros: 0,
+        parent_reported_micros: 0,
     };
 }
 
@@ -44,9 +46,33 @@ pub(crate) struct FunctionTiming {
     _thread: core::marker::PhantomData<*mut ()>,
 }
 
+/// A waiting call owns timestamps, without keeping a worker's timing slot.
+#[must_use = "retain a paused timer with its unfinished call"]
+pub(crate) struct PausedFunctionTiming(Option<FunctionTimingFrame>);
+
 impl FunctionTiming {
     pub(crate) fn finish(mut self) -> Option<(u64, u64)> {
         self.depth.take().map(finish_function_timing)
+    }
+
+    pub(crate) fn pause(mut self) -> PausedFunctionTiming {
+        PausedFunctionTiming(self.depth.take().map(pop_function_timing))
+    }
+}
+
+impl PausedFunctionTiming {
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed timing admission returns the saved call's original timestamps"
+    )]
+    pub(crate) fn resume(self) -> Result<FunctionTiming, (Self, SqlError)> {
+        match self.0 {
+            Some(frame) => push_function_timing(frame).map_err(|error| (self, error)),
+            None => Ok(FunctionTiming {
+                depth: None,
+                _thread: core::marker::PhantomData,
+            }),
+        }
     }
 }
 
@@ -65,6 +91,14 @@ pub(crate) fn begin_function_timing(enabled: bool) -> Result<FunctionTiming, Sql
             _thread: core::marker::PhantomData,
         });
     }
+    push_function_timing(FunctionTimingFrame {
+        started: crate::sql::datetime::now_micros(),
+        child_micros: 0,
+        parent_reported_micros: 0,
+    })
+}
+
+fn push_function_timing(frame: FunctionTimingFrame) -> Result<FunctionTiming, SqlError> {
     FUNCTION_TIMING.with(|stack| {
         let mut stack = stack.borrow_mut();
         if stack.depth == stack.frames.len() {
@@ -75,10 +109,7 @@ pub(crate) fn begin_function_timing(enabled: bool) -> Result<FunctionTiming, Sql
             ));
         }
         let depth = stack.depth;
-        stack.frames[depth] = FunctionTimingFrame {
-            started: crate::sql::datetime::now_micros(),
-            child_micros: 0,
-        };
+        stack.frames[depth] = frame;
         stack.depth += 1;
         Ok(FunctionTiming {
             depth: Some(depth),
@@ -88,6 +119,12 @@ pub(crate) fn begin_function_timing(enabled: bool) -> Result<FunctionTiming, Sql
 }
 
 fn finish_function_timing(depth: usize) -> (u64, u64) {
+    let frame = pop_function_timing(depth);
+    let total = frame.parent_reported_micros;
+    (total, total.saturating_sub(frame.child_micros))
+}
+
+fn pop_function_timing(depth: usize) -> FunctionTimingFrame {
     FUNCTION_TIMING.with(|stack| {
         let mut stack = stack.borrow_mut();
         assert_eq!(
@@ -96,16 +133,20 @@ fn finish_function_timing(depth: usize) -> (u64, u64) {
             "function timers finish in reverse call order"
         );
         stack.depth -= 1;
-        let frame = stack.frames[stack.depth];
+        let mut frame = stack.frames[stack.depth];
         let total = crate::sql::datetime::now_micros()
             .saturating_sub(frame.started)
             .max(0) as u64;
         if stack.depth != 0 {
             let parent = stack.depth - 1;
-            stack.frames[parent].child_micros =
-                stack.frames[parent].child_micros.saturating_add(total);
+            // Earlier pauses have already charged their elapsed prefix to the
+            // same parent. Resuming charges only the unreported suffix.
+            stack.frames[parent].child_micros = stack.frames[parent]
+                .child_micros
+                .saturating_add(total.saturating_sub(frame.parent_reported_micros));
         }
-        (total, total.saturating_sub(frame.child_micros))
+        frame.parent_reported_micros = total;
+        frame
     })
 }
 
@@ -378,6 +419,104 @@ fn execute_unrecorded(
 mod ownership_tests {
     use super::*;
     use crate::sql::datetime::test_clock;
+
+    #[test]
+    fn paused_function_timers_keep_elapsed_time_without_charging_other_calls() {
+        let _clock = test_clock::enter(1_000);
+        crate::mem::guard::forbid_alloc(|| {
+            let parent = begin_function_timing(true).unwrap();
+            let child = {
+                let _clock = test_clock::enter(1_010);
+                begin_function_timing(true).unwrap()
+            };
+            let child = {
+                let _clock = test_clock::enter(1_030);
+                child.pause()
+            };
+            let parent = {
+                let _clock = test_clock::enter(1_040);
+                parent.pause()
+            };
+            FUNCTION_TIMING.with(|stack| assert_eq!(stack.borrow().depth, 0));
+            let other = {
+                let _clock = test_clock::enter(1_050);
+                begin_function_timing(true).unwrap()
+            };
+            {
+                let _clock = test_clock::enter(1_070);
+                assert_eq!(other.finish(), Some((20, 20)));
+            }
+            let parent = {
+                let _clock = test_clock::enter(1_100);
+                parent.resume().ok().unwrap()
+            };
+            let child = {
+                let _clock = test_clock::enter(1_120);
+                child.resume().ok().unwrap()
+            };
+            let child = {
+                let _clock = test_clock::enter(1_130);
+                child.pause()
+            };
+            let parent = {
+                let _clock = test_clock::enter(1_140);
+                parent.pause()
+            };
+            let parent = {
+                let _clock = test_clock::enter(1_141);
+                parent.resume().ok().unwrap()
+            };
+            let child = {
+                let _clock = test_clock::enter(1_142);
+                child.resume().ok().unwrap()
+            };
+            {
+                let _clock = test_clock::enter(1_150);
+                assert_eq!(child.finish(), Some((140, 140)));
+            }
+            {
+                let _clock = test_clock::enter(1_170);
+                assert_eq!(parent.finish(), Some((170, 30)));
+            }
+            assert_eq!(
+                begin_function_timing(false)
+                    .unwrap()
+                    .pause()
+                    .resume()
+                    .ok()
+                    .unwrap()
+                    .finish(),
+                None
+            );
+            FUNCTION_TIMING.with(|stack| assert_eq!(stack.borrow().depth, 0));
+        });
+    }
+
+    #[test]
+    fn failed_paused_timer_admission_preserves_timestamps_and_stack_capacity() {
+        let _clock = test_clock::enter(1_000);
+        let mut occupied = Vec::with_capacity(MAX_FUNCTION_TIMING_DEPTH);
+        let paused = begin_function_timing(true).unwrap().pause();
+        for _ in 0..MAX_FUNCTION_TIMING_DEPTH {
+            occupied.push(begin_function_timing(true).unwrap());
+        }
+        let paused = crate::mem::guard::forbid_alloc(|| {
+            let (paused, error) = paused.resume().err().unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            FUNCTION_TIMING
+                .with(|stack| assert_eq!(stack.borrow().depth, MAX_FUNCTION_TIMING_DEPTH));
+            paused
+        });
+        while let Some(timer) = occupied.pop() {
+            drop(timer);
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            let _clock = test_clock::enter(1_700);
+            assert_eq!(paused.resume().ok().unwrap().finish(), Some((700, 700)));
+            drop(begin_function_timing(true).unwrap().pause());
+            FUNCTION_TIMING.with(|stack| assert_eq!(stack.borrow().depth, 0));
+        });
+    }
 
     #[test]
     fn function_timers_account_nested_children_without_allocating() {

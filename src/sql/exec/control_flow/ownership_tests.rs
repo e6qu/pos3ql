@@ -258,7 +258,10 @@ fn suspended_query_attachment_keeps_receipts_after_rejecting_a_foreign_arena() {
             .execution(&owner, &code)
             .unwrap()
             .start(program.body);
-        let calls = crate::sql::query::RoutineInvocationState::new(&owner);
+        let calls = crate::sql::query::RoutineInvocationState::new(
+            &owner,
+            crate::sql::query::RoutineExecution::StatementReplay,
+        );
         calls
             .complete(
                 crate::sql::query::OwnedRoutineResult::capture_scalar(Datum::Int4(73), &owner)

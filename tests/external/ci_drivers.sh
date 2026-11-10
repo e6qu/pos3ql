@@ -147,6 +147,13 @@ if ! "$POS3QL_VENV/bin/python" tests/external/builtin_inventory.py \
   bad "built-in catalog inventory capture"
 fi
 
+# Functions retain arguments, local values and completed writes across a real
+# client wait. Compare both protocols and cancellation cleanup with PostgreSQL.
+function_progress() {
+  "$POS3QL_VENV/bin/python" "$DRV/function_progress.py" --user "$PGUSER" "$2" "$3" > "$1" 2>&1
+}
+diff_driver function-progress function_progress
+
 # --- pgJDBC (Java) ---------------------------------------------------------
 JDBC_VER=42.7.4
 JDBC_SHA256=188976721ead8e8627eb6d8389d500dccc0c9bebd885268a3047180274a6031e

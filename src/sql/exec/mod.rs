@@ -801,6 +801,7 @@ pub(crate) use describe::{
 };
 pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
 
+mod call_environment;
 mod control_flow;
 mod diagnostics;
 mod execution_frame;
@@ -809,6 +810,10 @@ mod loop_rows;
 mod numeric_loops;
 mod set_rows;
 mod transition_rows;
+pub(super) use call_environment::CallEnvironment;
+mod function_execution;
+pub(super) use function_execution::execute as execute_plpgsql_function;
+pub(super) use function_execution::{FunctionOutput, SuspendedFunction};
 mod trigger_firing;
 mod write_completion;
 pub(super) use write_completion::SuspendedWriteCompletion;
@@ -4030,7 +4035,7 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
             level: trigger.level,
             before,
         },
-        trigger_firing::FiringEnvironment::new(config, security),
+        call_environment::CallEnvironment::new(config, security),
     )
 }
 
@@ -17038,62 +17043,6 @@ fn plpgsql_function_program_kind(routine: &crate::storage::RoutineDef) -> Plpgsq
     }
 }
 
-fn plpgsql_output_value<'a>(
-    engine: &super::Engine,
-    routine: &crate::storage::RoutineDef,
-    locals: &[TriggerLocalDecl],
-    values: &[Datum<'a>],
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<Datum<'a>, SqlError> {
-    let outputs = routine
-        .parameters()
-        .iter()
-        .filter(|parameter| parameter.mode.is_output());
-    if matches!(routine.kind, crate::storage::RoutineKind::Function { .. }) {
-        let Some(parameter) = outputs.into_iter().next() else {
-            return Ok(Datum::Null);
-        };
-        return Ok(locals
-            .iter()
-            .position(|local| local.name == parameter.name)
-            .filter(|_| !parameter.name.as_str().is_empty())
-            .map_or(Datum::Null, |index| values[index]));
-    }
-    let mut fields = [RecordField {
-        name: "",
-        type_oid: 0,
-        value: Datum::Null,
-    }; MAX_ROUTINE_ARGUMENTS];
-    let mut count = 0usize;
-    for parameter in outputs {
-        fields[count] = RecordField {
-            name: arena
-                .alloc_str(parameter.name.as_str())
-                .map_err(|_| super::query::arena_full_pub())?,
-            type_oid: engine
-                .storage
-                .routine_type_oid(parameter.ctype, parameter.user_type, txid)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "PL/pgSQL output type is absent from the type catalog"
-                    )
-                })?,
-            value: locals
-                .iter()
-                .position(|local| local.name == parameter.name)
-                .filter(|_| !parameter.name.as_str().is_empty())
-                .map_or(Datum::Null, |index| values[index]),
-        };
-        count += 1;
-    }
-    let fields = arena
-        .alloc_slice_copy(&fields[..count])
-        .map_err(|_| super::query::arena_full_pub())?;
-    Ok(Datum::Record(&*fields))
-}
-
 #[derive(Clone, Copy)]
 struct TriggerAssignment<'a> {
     column: SqlName,
@@ -21692,380 +21641,6 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     Ok(output_count)
 }
 
-/// Executes a scalar PL/pgSQL function through the same bounded interpreter
-/// as procedures and triggers. A function return is evaluated while its local
-/// scope is still live, so a local cannot escape as an untyped name.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "stored function execution owns its complete typed call context"
-)]
-pub(crate) fn execute_plpgsql_function<'a>(
-    engine: &mut super::Engine,
-    txn: &mut TxnState,
-    sqlprep: &mut super::prep::SqlPreparedPool,
-    cursors: &mut super::cursor::CursorPool,
-    guc: &super::guc::GucState,
-    routine: &crate::storage::RoutineDef,
-    input_collation: crate::sql::ast::Collation,
-    inputs: &'a [Datum<'a>],
-    arena: &'a Arena,
-    responder: &mut Responder<'_>,
-) -> Result<Datum<'a>, SqlError> {
-    let program_kind = plpgsql_function_program_kind(routine);
-    let (program, code) = compile_plpgsql_execution(
-        routine.body.as_str(),
-        program_kind,
-        &engine.storage,
-        txn.txid,
-        arena,
-        &|name| {
-            routine
-                .parameters()
-                .iter()
-                .any(|parameter| parameter.name == name)
-                || routine.result_columns[..routine.result_column_count]
-                    .iter()
-                    .any(|column| column.name == name)
-        },
-    )?;
-    let declaration_capacity = routine
-        .arguments()
-        .iter()
-        .filter(|parameter| !parameter.name.as_str().is_empty())
-        .count()
-        .saturating_add(
-            routine
-                .parameters()
-                .iter()
-                .filter(|parameter| {
-                    parameter.mode.is_output() && !parameter.name.as_str().is_empty()
-                })
-                .count(),
-        )
-        .saturating_add(program.locals.len());
-    let declarations = arena
-        .alloc_slice_with(declaration_capacity, |_| empty_plpgsql_local())
-        .map_err(|_| super::query::arena_full_pub())?;
-    let mut seeded = allocate_plpgsql_local_values(
-        &engine.storage.execution_control,
-        routine
-            .arguments()
-            .iter()
-            .filter(|parameter| !parameter.name.as_str().is_empty())
-            .count(),
-    )?;
-    let mut declaration_count = 0usize;
-    for (input_index, parameter) in routine.arguments().iter().copied().enumerate() {
-        if parameter.name.as_str().is_empty() {
-            continue;
-        }
-        declarations[declaration_count] = TriggerLocalDecl {
-            scope: PlpgsqlScope::Invocation,
-            name: parameter.name,
-            ctype: parameter.ctype,
-            user_type: parameter.user_type,
-            type_mod: -1,
-            record_shape: None,
-            constant: false,
-            not_null: false,
-        };
-        seeded[declaration_count] = inputs[input_index];
-        declaration_count += 1;
-    }
-    let seeded_count = declaration_count;
-    for parameter in routine
-        .parameters()
-        .iter()
-        .copied()
-        .filter(|parameter| parameter.mode.is_output() && !parameter.name.as_str().is_empty())
-    {
-        if declarations[..declaration_count]
-            .iter()
-            .any(|prior| prior.name == parameter.name)
-        {
-            continue;
-        }
-        declarations[declaration_count] = TriggerLocalDecl {
-            scope: PlpgsqlScope::Invocation,
-            name: parameter.name,
-            ctype: parameter.ctype,
-            user_type: parameter.user_type,
-            type_mod: -1,
-            record_shape: None,
-            constant: false,
-            not_null: false,
-        };
-        declaration_count += 1;
-    }
-    for local in program.locals {
-        declarations[declaration_count] = *local;
-        declaration_count += 1;
-    }
-    let locals = &declarations[..declaration_count];
-    let definition = crate::storage::RelationDefinition::EMPTY;
-    let invocation = TriggerInvocation::function(routine, program_kind, input_collation, arena)?
-        .with_input_sites(program.input_sites);
-    let mut context = TriggerExecContext {
-        host: PlpgsqlExecHost::Routine {
-            engine,
-            guc,
-            sqlprep,
-            cursors,
-            transaction_context: PlpgsqlTransactionContext::Atomic,
-        },
-        txn,
-        arena,
-        params: inputs,
-        responder,
-    };
-    let mut execution = execution_frame::ExecutionFrame::new(
-        context.arena,
-        &code,
-        locals,
-        0,
-        &context.storage().execution_control,
-        &context.storage().row_work,
-    )?;
-    execution.initialize(
-        &mut context,
-        invocation,
-        TriggerTransition {
-            definition,
-            old: None,
-            new: None,
-        },
-        &code,
-        &seeded[..seeded_count],
-    )?;
-    drop(seeded);
-    let mut no_new = None;
-    match execution.execute_block(
-        &mut context,
-        definition,
-        invocation,
-        None,
-        &mut no_new,
-        false,
-        None,
-        &code,
-    )? {
-        Some(TriggerFlow::Return(TriggerReturnValue::Value(value))) => Ok(value),
-        None if program_kind == PlpgsqlProgramKind::VoidFunction => Ok(Datum::Text("")),
-        Some(TriggerFlow::Return(TriggerReturnValue::Void))
-            if program_kind == PlpgsqlProgramKind::VoidFunction =>
-        {
-            Ok(Datum::Text(""))
-        }
-        None | Some(TriggerFlow::Return(TriggerReturnValue::Void))
-            if program_kind == PlpgsqlProgramKind::OutputFunction =>
-        {
-            plpgsql_output_value(
-                engine,
-                routine,
-                &execution.locals,
-                &execution.values,
-                txn.txid,
-                arena,
-            )
-        }
-        None => Err(sql_err!(
-            sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
-            "control reached end of function without RETURN"
-        )),
-        Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
-            Err(unsupported_trigger_body())
-        }
-    }
-}
-
-/// Collects set-function rows in shared work memory, then exports independent
-/// statement-owned rows for the enclosing query's invocation receipt.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "stored set-function execution owns its complete typed call context"
-)]
-pub(crate) fn execute_plpgsql_table_function<'a>(
-    engine: &mut super::Engine,
-    txn: &mut TxnState,
-    sqlprep: &mut super::prep::SqlPreparedPool,
-    cursors: &mut super::cursor::CursorPool,
-    guc: &super::guc::GucState,
-    routine: &crate::storage::RoutineDef,
-    input_collation: crate::sql::ast::Collation,
-    inputs: &'a [Datum<'a>],
-    arena: &'a Arena,
-    responder: &mut Responder<'_>,
-) -> Result<&'a [&'a [u8]], SqlError> {
-    let (program, code) = compile_plpgsql_execution(
-        routine.body.as_str(),
-        PlpgsqlProgramKind::SetFunction,
-        &engine.storage,
-        txn.txid,
-        arena,
-        &|name| {
-            routine
-                .parameters()
-                .iter()
-                .any(|parameter| parameter.name == name)
-                || routine.result_columns[..routine.result_column_count]
-                    .iter()
-                    .any(|column| column.name == name)
-        },
-    )?;
-    let declaration_capacity = routine
-        .arguments()
-        .iter()
-        .filter(|parameter| !parameter.name.as_str().is_empty())
-        .count()
-        .saturating_add(routine.result_column_count)
-        .saturating_add(program.locals.len());
-    let declarations = arena
-        .alloc_slice_with(declaration_capacity, |_| empty_plpgsql_local())
-        .map_err(|_| super::query::arena_full_pub())?;
-    let mut seeded = allocate_plpgsql_local_values(
-        &engine.storage.execution_control,
-        routine
-            .arguments()
-            .iter()
-            .filter(|parameter| !parameter.name.as_str().is_empty())
-            .count(),
-    )?;
-    let mut declaration_count = 0usize;
-    for (input_index, parameter) in routine.arguments().iter().copied().enumerate() {
-        if parameter.name.as_str().is_empty() {
-            continue;
-        }
-        declarations[declaration_count] = TriggerLocalDecl {
-            scope: PlpgsqlScope::Invocation,
-            name: parameter.name,
-            ctype: parameter.ctype,
-            user_type: parameter.user_type,
-            type_mod: -1,
-            record_shape: None,
-            constant: false,
-            not_null: false,
-        };
-        seeded[declaration_count] = inputs[input_index];
-        declaration_count += 1;
-    }
-    let seeded_count = declaration_count;
-    let output_columns = &routine.result_columns[..routine.result_column_count];
-    for output in output_columns {
-        if output.name.as_str().is_empty()
-            || declarations[..declaration_count]
-                .iter()
-                .any(|prior| prior.name == output.name)
-        {
-            continue;
-        }
-        declarations[declaration_count] = TriggerLocalDecl {
-            scope: PlpgsqlScope::Invocation,
-            name: output.name,
-            ctype: output.ctype,
-            user_type: output.user_type,
-            type_mod: -1,
-            record_shape: None,
-            constant: false,
-            not_null: false,
-        };
-        declaration_count += 1;
-    }
-    for local in program.locals {
-        declarations[declaration_count] = *local;
-        declaration_count += 1;
-    }
-    let locals = &declarations[..declaration_count];
-    let definition = crate::storage::RelationDefinition::EMPTY;
-    let invocation = TriggerInvocation::function(
-        routine,
-        PlpgsqlProgramKind::SetFunction,
-        input_collation,
-        arena,
-    )?
-    .with_input_sites(program.input_sites);
-    let mut context = TriggerExecContext {
-        host: PlpgsqlExecHost::Routine {
-            engine,
-            guc,
-            sqlprep,
-            cursors,
-            transaction_context: PlpgsqlTransactionContext::Atomic,
-        },
-        txn,
-        arena,
-        params: inputs,
-        responder,
-    };
-    let mut execution = execution_frame::ExecutionFrame::new(
-        context.arena,
-        &code,
-        locals,
-        output_columns.len(),
-        &context.storage().execution_control,
-        &context.storage().row_work,
-    )?;
-    let locals = &execution.locals;
-    execution
-        .status
-        .collect_set_rows(PlpgsqlSetResult::for_routine(
-            routine,
-            &context.storage().row_work,
-        )?);
-    let output_local_indices = arena
-        .alloc_slice_with(output_columns.len(), |_| 0usize)
-        .map_err(|_| super::query::arena_full_pub())?;
-    for (index, output) in output_columns.iter().enumerate() {
-        output_local_indices[index] = locals
-            .iter()
-            .position(|local| local.name == output.name)
-            .filter(|_| !output.name.as_str().is_empty())
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "set-returning output \"{}\" needs a name",
-                    output.name.as_str()
-                )
-            })?;
-    }
-    execution.initialize(
-        &mut context,
-        invocation,
-        TriggerTransition {
-            definition,
-            old: None,
-            new: None,
-        },
-        &code,
-        &seeded[..seeded_count],
-    )?;
-    drop(seeded);
-    execution.status.set_output_locals(
-        &output_local_indices[..output_columns.len()],
-        execution.values.len(),
-    );
-    let mut no_new = None;
-    match execution.execute_block(
-        &mut context,
-        definition,
-        invocation,
-        None,
-        &mut no_new,
-        false,
-        None,
-        &code,
-    )? {
-        None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => execution
-            .status
-            .set_result
-            .as_ref()
-            .expect("set invocation owns its result collector")
-            .rows(arena),
-        Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
-            Err(unsupported_trigger_body())
-        }
-    }
-}
-
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod trigger_program_tests {
     use super::*;
@@ -23452,6 +23027,7 @@ fn eval_procedural_expression<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     expression: &'a Expr<'a>,
     row: &TriggerLocalScope<'_, 'a>,
+    mut continuation: Option<&mut Option<super::query::RoutineInvocationState>>,
 ) -> Result<Datum<'a>, SqlError> {
     let arena = context.arena;
     let params = context.params;
@@ -23550,31 +23126,25 @@ fn eval_procedural_expression<'a>(
         engine
             .execute_retained_expression(
                 arena,
-                None,
+                continuation.as_deref_mut(),
                 snapshot,
                 context.txn,
                 sqlprep,
                 cursors,
                 guc,
                 context.responder,
-                |storage, _work, sequences, invocations, _cursors| {
-                    super::query::with_routine_invocation_scope(
-                        Some(super::query::RoutineInvocationContext::new(
-                            invocations,
-                            arena,
-                        )),
-                        || {
-                            let catalog = super::query::storage_catalog(storage, arena, txid);
-                            let subqueries = super::query::ProceduralSubqueries { storage, txid };
-                            let hooks = EvalHooks {
-                                catalog: Some(&catalog),
-                                sequences: Some(sequences),
-                                subquery_executor: Some(&subqueries),
-                                ..NO_HOOKS
-                            };
-                            eval_full(expression, arena, params, row, &hooks)
-                        },
-                    )
+                |storage, _work, sequences, _invocations, _cursors| {
+                    // The engine installs the invocation log's actual owner,
+                    // which can differ from this workspace after a wait.
+                    let catalog = super::query::storage_catalog(storage, arena, txid);
+                    let subqueries = super::query::ProceduralSubqueries { storage, txid };
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(sequences),
+                        subquery_executor: Some(&subqueries),
+                        ..NO_HOOKS
+                    };
+                    eval_full(expression, arena, params, row, &hooks)
                 },
             )
             .map_err(|_| {
@@ -23611,7 +23181,7 @@ fn bind_plpgsql_dynamic_query<'a>(
     scope: &TriggerLocalScope<'_, 'a>,
     kind: DynamicCommandKind,
 ) -> Result<BoundPlpgsqlCommand<'a>, SqlError> {
-    let command = eval_procedural_expression(context, query.command, scope)?;
+    let command = eval_procedural_expression(context, query.command, scope, None)?;
     if command.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -23645,7 +23215,7 @@ fn bind_plpgsql_dynamic_query<'a>(
     }
     for (index, expression) in query.arguments.iter().copied().enumerate() {
         arguments[index] = detached_trigger_datum(
-            eval_procedural_expression(context, expression, scope)?,
+            eval_procedural_expression(context, expression, scope, None)?,
             context.arena,
         )?;
     }
@@ -26368,18 +25938,16 @@ fn trigger_local_index(locals: &[TriggerLocalDecl], name: SqlName) -> Result<usi
 }
 
 fn coerce_plpgsql_local<'a>(
-    context: &TriggerExecContext<'_, 'a, '_>,
     local: TriggerLocalDecl,
     value: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: &dyn crate::sql::eval::SequenceAccess,
 ) -> Result<Datum<'a>, SqlError> {
-    let sequences = crate::sql::sequence::SeqEval::new(
-        context.storage(),
-        context.seq_session(),
-        context.txn.txid,
-    );
     let value = match local.record_shape {
         Some(PlpgsqlRecordShape::Table(slot)) => {
-            coerce_plpgsql_table_rowtype(context, slot, value)?
+            coerce_plpgsql_table_rowtype(slot, value, storage, txid, arena, sequences)?
         }
         Some(PlpgsqlRecordShape::Dynamic) | None => coerce_routine_argument(
             value,
@@ -26388,13 +25956,13 @@ fn coerce_plpgsql_local<'a>(
                 ctype: local.ctype,
                 user_type: local.user_type,
             },
-            context.storage(),
-            context.txn.txid,
-            context.arena,
-            Some(&sequences),
+            storage,
+            txid,
+            arena,
+            Some(sequences),
         )?,
     };
-    let value = apply_typmod(value, local.ctype, local.type_mod, context.arena)?;
+    let value = apply_typmod(value, local.ctype, local.type_mod, arena)?;
     if local.not_null && value.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -26406,15 +25974,13 @@ fn coerce_plpgsql_local<'a>(
 }
 
 fn coerce_plpgsql_table_rowtype<'a>(
-    context: &TriggerExecContext<'_, 'a, '_>,
     slot: u16,
     value: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: &dyn crate::sql::eval::SequenceAccess,
 ) -> Result<Datum<'a>, SqlError> {
-    let sequences = crate::sql::sequence::SeqEval::new(
-        context.storage(),
-        context.seq_session(),
-        context.txn.txid,
-    );
     if value.is_null() {
         return Ok(Datum::Null);
     }
@@ -26427,9 +25993,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
             ));
         }
     };
-    let definition = context
-        .storage()
-        .table_def(usize::from(slot), context.txn.txid);
+    let definition = storage.table_def(usize::from(slot), txid);
     if fields.len() != definition.n_columns {
         return Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
@@ -26444,16 +26008,9 @@ fn coerce_plpgsql_table_rowtype<'a>(
         value: Datum::Null,
     }; MAX_COLUMNS];
     for (index, (source, column)) in fields.iter().zip(definition.columns()).enumerate() {
-        let cast = prepare_assignment_cast(
-            source.type_oid,
-            column,
-            context.storage(),
-            context.txn.txid,
-            context.arena,
-        )?;
+        let cast = prepare_assignment_cast(source.type_oid, column, storage, txid, arena)?;
         coerced[index] = RecordField {
-            name: context
-                .arena
+            name: arena
                 .alloc_str(column.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
             type_oid: column.ctype.oid(),
@@ -26465,15 +26022,14 @@ fn coerce_plpgsql_table_rowtype<'a>(
                     defined: cast.as_ref(),
                     site: None,
                 },
-                context.storage(),
-                context.txn.txid,
-                context.arena,
-                Some(&sequences),
+                storage,
+                txid,
+                arena,
+                Some(sequences),
             )?,
         };
     }
-    let fields = context
-        .arena
+    let fields = arena
         .alloc_slice_copy(&coerced[..definition.n_columns])
         .map_err(|_| super::query::arena_full_pub())?;
     Ok(Datum::Record(&*fields))
@@ -26494,7 +26050,19 @@ fn assign_trigger_local<'a>(
             locals[index].name.as_str()
         ));
     }
-    values[index] = coerce_plpgsql_local(context, locals[index], value)?;
+    let sequences = crate::sql::sequence::SeqEval::new(
+        context.storage(),
+        context.seq_session(),
+        context.txn.txid,
+    );
+    values[index] = coerce_plpgsql_local(
+        locals[index],
+        value,
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+        &sequences,
+    )?;
     Ok(())
 }
 
@@ -26518,7 +26086,7 @@ fn trigger_format_message<'a>(
             let _ = message.write_char('%');
             continue;
         }
-        let value = eval_procedural_expression(context, arguments[argument], scope)?;
+        let value = eval_procedural_expression(context, arguments[argument], scope, None)?;
         argument += 1;
         if value.is_null() {
             let _ = message.write_str("<NULL>");
@@ -26540,7 +26108,7 @@ fn trigger_diagnostic_text<'a, const N: usize>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     scope: &TriggerLocalScope<'_, 'a>,
 ) -> Result<StackStr<N>, SqlError> {
-    let value = eval_procedural_expression(context, expression, scope)?;
+    let value = eval_procedural_expression(context, expression, scope, None)?;
     if value.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -26608,6 +26176,7 @@ fn trigger_condition<'a>(
                 new,
             },
         },
+        None,
     )? {
         Datum::Bool(value) => Ok(value),
         Datum::Null => Ok(false),
@@ -27204,7 +26773,12 @@ fn execute_trigger_step<'a>(
                                 invocation,
                                 transition: &transition,
                             };
-                            match eval_procedural_expression(&mut context, expression, &scope)? {
+                            match eval_procedural_expression(
+                                &mut context,
+                                expression,
+                                &scope,
+                                None,
+                            )? {
                                 Datum::Record(fields) => {
                                     if fields.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
                                         return Err(sql_err!(
@@ -27352,7 +26926,7 @@ fn execute_trigger_step<'a>(
                         transition: &transition,
                     };
                     TriggerReturnValue::Value(eval_procedural_expression(
-                        context, expression, &scope,
+                        context, expression, &scope, None,
                     )?)
                 }
             };
@@ -27412,7 +26986,7 @@ fn execute_trigger_step<'a>(
                 &scope,
                 hooks.catalog,
             )?;
-            let value = eval_procedural_expression(context, assignment.expression, &scope)?;
+            let value = eval_procedural_expression(context, assignment.expression, &scope, None)?;
             let value = coerce_assignment(
                 value,
                 &definition.columns()[column],
@@ -27447,7 +27021,7 @@ fn execute_trigger_step<'a>(
                 invocation,
                 transition: &transition,
             };
-            let value = eval_procedural_expression(context, assignment.expression, &scope)?;
+            let value = eval_procedural_expression(context, assignment.expression, &scope, None)?;
             if locals.iter().any(|local| local.name == assignment.name) {
                 assign_trigger_local(context, locals, local_values, assignment.name, value)?;
             } else if TriggerStatusVariable::parse(assignment.name.as_str()).is_some() {
@@ -27957,12 +27531,11 @@ fn execute_trigger_step<'a>(
             };
             let params = context.params;
             let txid = context.txn.txid;
-            let continuation =
-                if retained_parent && invocation.program_kind == PlpgsqlProgramKind::Trigger {
-                    Some(&mut status.pending_query)
-                } else {
-                    None
-                };
+            let continuation = if retained_parent {
+                Some(&mut status.pending_query)
+            } else {
+                None
+            };
             let (selected, row_count) =
                 execute_procedural_query(context, continuation, |storage, sequence| {
                     let mut selected = [Datum::Null; MAX_COLUMNS];
@@ -28561,12 +28134,11 @@ fn execute_trigger_step<'a>(
                 let arena = context.arena;
                 let params = context.params;
                 let txid = context.txn.txid;
-                let continuation =
-                    if retained_parent && invocation.program_kind == PlpgsqlProgramKind::Trigger {
-                        Some(&mut status.pending_query)
-                    } else {
-                        None
-                    };
+                let continuation = if retained_parent {
+                    Some(&mut status.pending_query)
+                } else {
+                    None
+                };
                 execute_procedural_query(&mut context, continuation, |storage, sequence| {
                     let mut row_count = 0u64;
                     super::query::select_into_rows(
@@ -28622,7 +28194,7 @@ fn execute_trigger_step<'a>(
             };
             let message = match assertion.message {
                 Some(message) => {
-                    let value = eval_procedural_expression(context, message, &scope)?;
+                    let value = eval_procedural_expression(context, message, &scope, None)?;
                     if value.is_null() {
                         stack_format!(192, "assertion failed")
                     } else {
@@ -29181,17 +28753,17 @@ fn execute_trigger_step<'a>(
                     transition: &transition,
                 };
                 let lower = trigger_loop_integer(
-                    eval_procedural_expression(context, lower, &scope)?,
+                    eval_procedural_expression(context, lower, &scope, None)?,
                     context.arena,
                     "lower bound",
                 )?;
                 let upper = trigger_loop_integer(
-                    eval_procedural_expression(context, upper, &scope)?,
+                    eval_procedural_expression(context, upper, &scope, None)?,
                     context.arena,
                     "upper bound",
                 )?;
                 let step = trigger_loop_integer(
-                    eval_procedural_expression(context, step, &scope)?,
+                    eval_procedural_expression(context, step, &scope, None)?,
                     context.arena,
                     "BY value",
                 )?;
@@ -29308,8 +28880,12 @@ fn execute_trigger_step<'a>(
                                     invocation,
                                     transition: &transition,
                                 };
-                                let array =
-                                    eval_procedural_expression(&mut context, expression, &scope)?;
+                                let array = eval_procedural_expression(
+                                    &mut context,
+                                    expression,
+                                    &scope,
+                                    None,
+                                )?;
                                 let Datum::Array { element, raw } = array else {
                                     if array.is_null() {
                                         return Err(sql_err!(
@@ -29441,6 +29017,7 @@ fn execute_trigger_step<'a>(
                                 new: new.as_deref(),
                             },
                         },
+                        None,
                     )? {
                         Datum::Bool(value) => value,
                         Datum::Null => false,
@@ -29474,11 +29051,11 @@ fn execute_trigger_step<'a>(
             };
             let operand = program
                 .operand
-                .map(|expression| eval_procedural_expression(context, expression, &scope))
+                .map(|expression| eval_procedural_expression(context, expression, &scope, None))
                 .transpose()?;
             let mut selected = None;
             for branch in program.branches {
-                let value = eval_procedural_expression(context, branch.when, &scope)?;
+                let value = eval_procedural_expression(context, branch.when, &scope, None)?;
                 let matches = match operand {
                     Some(operand) => {
                         let catalog = crate::sql::query::storage_catalog(

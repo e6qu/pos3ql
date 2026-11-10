@@ -273,7 +273,10 @@ mod tests {
                 if !query.prepare_row(storage, txid, observed_at, work, buffers)? {
                     return Ok(Some(false));
                 }
-                let invocations = crate::sql::query::RoutineInvocationState::new(work);
+                let invocations = crate::sql::query::RoutineInvocationState::new(
+                    work,
+                    crate::sql::query::RoutineExecution::StatementReplay,
+                );
                 invocations.begin_attempt();
                 if !query.evaluate_predicate(storage, txid, work, None, &invocations, work)? {
                     query.finish_row(false);

@@ -238,7 +238,7 @@ pub fn set_session_schemas(schemas: SessionSchemas) {
     SESSION_SCHEMAS.with(|s| *s.borrow_mut() = schemas);
 }
 
-fn session_schemas() -> SessionSchemas {
+pub(crate) fn session_schemas() -> SessionSchemas {
     SESSION_SCHEMAS.with(|s| *s.borrow())
 }
 

@@ -15896,13 +15896,8 @@ impl Engine {
             if matches!(&executed, Err(BodyError::Sql(error)) if matches!(error.sqlstate.internal_control(), Some(sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT)))
                 && let Some(body) = suspended
             {
-                let progress = match sequence::SavedStatementPosition::capture() {
-                    Ok(progress) => progress,
-                    Err(error) => return Ok(Err(error)),
-                };
                 *invocations.suspended.borrow_mut() = Some(query::SuspendedRoutineCall {
                     body,
-                    progress,
                     timing: timed.pause(),
                     plan_owner: pending.plan_owner,
                     snapshot,
@@ -15967,7 +15962,6 @@ impl Engine {
         };
         let query::SuspendedRoutineCall {
             mut body,
-            progress,
             timing,
             plan_owner,
             snapshot,
@@ -15977,7 +15971,6 @@ impl Engine {
             Err((timing, error)) => {
                 *invocations.suspended.borrow_mut() = Some(query::SuspendedRoutineCall {
                     body,
-                    progress,
                     timing,
                     plan_owner,
                     snapshot,
@@ -16018,20 +16011,9 @@ impl Engine {
                     Some(sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT)
                 )
             });
-            // The invocation also owns input preparation outside the body frame.
-            if (retained.is_ok() || paused)
-                && let Err(error) = progress.advance_consumed_prefix()
-            {
-                return Ok(Err(error));
-            }
             if paused {
-                let progress = match sequence::SavedStatementPosition::capture() {
-                    Ok(progress) => progress,
-                    Err(error) => return Ok(Err(error)),
-                };
                 *invocations.suspended.borrow_mut() = Some(query::SuspendedRoutineCall {
                     body,
-                    progress,
                     timing: timed.pause(),
                     plan_owner,
                     snapshot,
@@ -18141,7 +18123,10 @@ impl Engine {
         let mut result = loop {
             if let Some(command) = &txn.concurrent_index
                 && let Some(cursor) = command.replay
-                && let Err(error) = sequence::restore_replay_cursor(cursor)
+                && let Err(error) = sequence::restore_replay_cursor(
+                    cursor,
+                    sequence::ReplayInputPosition::RecordedEnd,
+                )
             {
                 break Ok(Err(error));
             }

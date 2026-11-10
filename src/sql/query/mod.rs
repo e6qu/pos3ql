@@ -1342,7 +1342,6 @@ pub(crate) enum RoutineExecution {
 
 pub(crate) struct SuspendedRoutineCall {
     pub(super) body: super::exec::SuspendedFunction,
-    pub(super) progress: super::sequence::SavedStatementPosition,
     pub(super) timing: super::statistics::PausedFunctionTiming,
     pub(super) plan_owner: super::type_input_plans::Owner,
     pub(super) snapshot: u32,
@@ -1545,7 +1544,10 @@ impl RoutineInvocationState {
                     "SQL routine invocation changed from a table source to a scalar expression"
                 ));
             };
-            super::sequence::restore_replay_cursor(saved.replay)?;
+            super::sequence::restore_replay_cursor(
+                saved.replay,
+                super::sequence::ReplayInputPosition::KeepConsumed,
+            )?;
             return Ok(Some(value.scalar(statement_arena, query_arena)?));
         }
         self.pending_replay
@@ -1593,7 +1595,10 @@ impl RoutineInvocationState {
                     "intrinsic invocation changed result shape"
                 ));
             };
-            super::sequence::restore_replay_cursor(saved.replay)?;
+            super::sequence::restore_replay_cursor(
+                saved.replay,
+                super::sequence::ReplayInputPosition::KeepConsumed,
+            )?;
             return value.scalar(statement_arena, query_arena);
         }
         self.pending_replay
@@ -1652,7 +1657,10 @@ impl RoutineInvocationState {
                     "SQL routine invocation changed from a scalar expression to a table source"
                 ));
             };
-            super::sequence::restore_replay_cursor(saved.replay)?;
+            super::sequence::restore_replay_cursor(
+                saved.replay,
+                super::sequence::ReplayInputPosition::KeepConsumed,
+            )?;
             return Ok(Some(rows));
         }
         self.pending_replay

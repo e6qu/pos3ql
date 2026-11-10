@@ -572,6 +572,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                     replay
                         .copied()
                         .unwrap_or(super::super::sequence::StatementReplayCursor::EMPTY),
+                    super::super::sequence::ReplayInputPosition::KeepConsumed,
                 )?;
                 self.next.set(next_input);
                 self.invocation.set(next_invocation);

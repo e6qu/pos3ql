@@ -299,9 +299,6 @@ impl SuspendedSqlFunction {
                 admission.commit();
                 attached = true;
                 let result = state.execute(&parsed, arguments, &mut context);
-                if result.is_ok() || result.as_ref().is_err_and(control_flow::is_execution_wait) {
-                    position.advance_consumed_prefix()?;
-                }
                 if result.as_ref().is_err_and(control_flow::is_execution_wait) {
                     state.environment = SavedCallEnvironment::capture(
                         &environment,

@@ -15896,8 +15896,13 @@ impl Engine {
             if matches!(&executed, Err(BodyError::Sql(error)) if matches!(error.sqlstate.internal_control(), Some(sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT)))
                 && let Some(body) = suspended
             {
+                let progress = match sequence::SavedStatementPosition::capture() {
+                    Ok(progress) => progress,
+                    Err(error) => return Ok(Err(error)),
+                };
                 *invocations.suspended.borrow_mut() = Some(query::SuspendedRoutineCall {
                     body,
+                    progress,
                     timing: timed.pause(),
                     plan_owner: pending.plan_owner,
                     snapshot,
@@ -15962,6 +15967,7 @@ impl Engine {
         };
         let query::SuspendedRoutineCall {
             mut body,
+            progress,
             timing,
             plan_owner,
             snapshot,
@@ -15971,6 +15977,7 @@ impl Engine {
             Err((timing, error)) => {
                 *invocations.suspended.borrow_mut() = Some(query::SuspendedRoutineCall {
                     body,
+                    progress,
                     timing,
                     plan_owner,
                     snapshot,
@@ -16005,14 +16012,26 @@ impl Engine {
                     error
                 )),
             };
-            if retained.as_ref().is_err_and(|error| {
+            let paused = retained.as_ref().is_err_and(|error| {
                 matches!(
                     error.sqlstate.internal_control(),
                     Some(sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT)
                 )
-            }) {
+            });
+            // The invocation also owns input preparation outside the body frame.
+            if (retained.is_ok() || paused)
+                && let Err(error) = progress.advance_consumed_prefix()
+            {
+                return Ok(Err(error));
+            }
+            if paused {
+                let progress = match sequence::SavedStatementPosition::capture() {
+                    Ok(progress) => progress,
+                    Err(error) => return Ok(Err(error)),
+                };
                 *invocations.suspended.borrow_mut() = Some(query::SuspendedRoutineCall {
                     body,
+                    progress,
                     timing: timed.pause(),
                     plan_owner,
                     snapshot,

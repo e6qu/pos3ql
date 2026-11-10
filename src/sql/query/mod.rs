@@ -1342,6 +1342,7 @@ pub(crate) enum RoutineExecution {
 
 pub(crate) struct SuspendedRoutineCall {
     pub(super) body: super::exec::SuspendedFunction,
+    pub(super) progress: super::sequence::SavedStatementPosition,
     pub(super) timing: super::statistics::PausedFunctionTiming,
     pub(super) plan_owner: super::type_input_plans::Owner,
     pub(super) snapshot: u32,

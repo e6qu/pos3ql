@@ -506,69 +506,76 @@ fn sql_return_checks_resume_after_the_body_without_reissuing_values() {
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
     ] {
-        let mut config = test_config(&format!("sql-return-check-progress-{mode:?}"));
-        config.transaction_mode = mode;
-        config.execution_control_bytes = 64 << 10;
-        config.execution_control_leases = 64;
-        config.row_work_bytes = 128 << 10;
-        config.row_work_leases = 64;
-        let mut budget = test_engine_budget(&config, 1 << 29);
-        let mut engine = Engine::new(&config, &mut budget).unwrap();
-        let mut writer =
-            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
-        let mut holder =
-            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-        writer.success(&mut engine,"CREATE SEQUENCE sql_return_numbers; CREATE TABLE sql_return_root(id integer); CREATE TABLE sql_return_audit(stage text,n bigint); \
+        for later in [false, true] {
+            let mut config = test_config(&format!("sql-return-check-progress-{mode:?}-{later}"));
+            config.transaction_mode = mode;
+            config.execution_control_bytes = 64 << 10;
+            config.execution_control_leases = 64;
+            config.row_work_bytes = 128 << 10;
+            config.row_work_leases = 64;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer =
+                ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            let post_wait = if later {
+                "PERFORM nextval('sql_return_numbers');"
+            } else {
+                ""
+            };
+            writer.success(&mut engine,&format!("CREATE SEQUENCE sql_return_numbers; CREATE TABLE sql_return_root(id integer); CREATE TABLE sql_return_audit(stage text,n bigint); \
             CREATE FUNCTION sql_return_check(n bigint) RETURNS boolean LANGUAGE plpgsql STRICT AS $$ \
-            BEGIN INSERT INTO sql_return_audit VALUES('check',n); PERFORM pg_advisory_xact_lock(204); RETURN n>0; END$$; \
+            BEGIN INSERT INTO sql_return_audit VALUES('check',n); PERFORM pg_advisory_xact_lock(204); {post_wait} RETURN n>0; END$$; \
             CREATE DOMAIN sql_return_domain AS bigint CHECK(sql_return_check(VALUE)); \
             CREATE FUNCTION sql_return_parent() RETURNS sql_return_domain LANGUAGE SQL AS $$ \
             INSERT INTO sql_return_audit VALUES('body',1); SELECT nextval('sql_return_numbers') $$; \
             CREATE FUNCTION sql_return_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
             DECLARE answer bigint; BEGIN SELECT sql_return_parent() INTO answer; INSERT INTO sql_return_audit VALUES('caller',answer); RETURN NEW; END$$; \
-            CREATE TRIGGER sql_return_trigger AFTER INSERT ON sql_return_root FOR EACH ROW EXECUTE FUNCTION sql_return_trigger()",true);
-        holder.success(&mut engine, "BEGIN; SELECT pg_advisory_lock(204)", true);
-        let sql = "INSERT INTO sql_return_root VALUES(1)";
-        let mut status = writer.execute_status(&mut engine, sql, true);
-        for _ in 0..3 {
-            assert!(
-                matches!(status, ExecutionStatus::Blocked { .. }),
-                "{mode:?}: {status:?}: {}",
-                String::from_utf8_lossy(writer.send.readable())
-            );
-            assert_eq!(
-                data_rows(&holder.success(
-                    &mut engine,
-                    "SELECT last_value FROM sql_return_numbers",
-                    true
-                )),
-                ["1"]
-            );
+            CREATE TRIGGER sql_return_trigger AFTER INSERT ON sql_return_root FOR EACH ROW EXECUTE FUNCTION sql_return_trigger()"),true);
+            holder.success(&mut engine, "BEGIN; SELECT pg_advisory_lock(204)", true);
+            let sql = "INSERT INTO sql_return_root VALUES(1)";
+            let mut status = writer.execute_status(&mut engine, sql, true);
+            for _ in 0..3 {
+                assert!(
+                    matches!(status, ExecutionStatus::Blocked { .. }),
+                    "{mode:?}: {status:?}: {}",
+                    String::from_utf8_lossy(writer.send.readable())
+                );
+                assert_eq!(
+                    data_rows(&holder.success(
+                        &mut engine,
+                        "SELECT last_value FROM sql_return_numbers",
+                        true
+                    )),
+                    ["1"]
+                );
+                status = resume_function_progress_wait(&mut engine, &mut writer, sql, status);
+            }
+            holder.success(&mut engine, "SELECT pg_advisory_unlock(204)", true);
             status = resume_function_progress_wait(&mut engine, &mut writer, sql, status);
-        }
-        holder.success(&mut engine, "SELECT pg_advisory_unlock(204)", true);
-        status = resume_function_progress_wait(&mut engine, &mut writer, sql, status);
-        assert_eq!(status, ExecutionStatus::Complete);
-        assert!(
-            error_sqlstates(writer.send.readable()).is_empty(),
-            "{}; sequence replay error: {:?}",
-            String::from_utf8_lossy(writer.send.readable()),
-            sequence::take_replay_error_diagnostic(),
-        );
-        holder.success(&mut engine, "COMMIT", true);
-        assert_eq!(data_rows(&writer.success(&mut engine,"SELECT stage,n FROM sql_return_audit ORDER BY stage; SELECT last_value FROM sql_return_numbers; \
-            SELECT currval('sql_return_numbers'),lastval()",true)),["body|1","caller|1","check|1","1","1|1"]);
-        writer.success(&mut engine, "INSERT INTO sql_return_root VALUES(2)", true);
-        assert_eq!(
+            assert_eq!(status, ExecutionStatus::Complete);
+            assert!(
+                error_sqlstates(writer.send.readable()).is_empty(),
+                "{}; sequence replay error: {:?}",
+                String::from_utf8_lossy(writer.send.readable()),
+                sequence::take_replay_error_diagnostic(),
+            );
+            holder.success(&mut engine, "COMMIT", true);
+            assert_eq!(data_rows(&writer.success(&mut engine,"SELECT stage,n FROM sql_return_audit ORDER BY stage; SELECT last_value FROM sql_return_numbers; \
+            SELECT currval('sql_return_numbers'),lastval()",true)),["body|1","caller|1","check|1",if later { "2" } else { "1" },if later { "2|2" } else { "1|1" }]);
+            writer.success(&mut engine, "INSERT INTO sql_return_root VALUES(2)", true);
+            assert_eq!(
             data_rows(&writer.success(
                 &mut engine,
                 "SELECT count(*) FROM sql_return_audit; SELECT last_value FROM sql_return_numbers",
                 true
             )),
-            ["6", "2"]
+            ["6", if later { "4" } else { "2" }]
         );
-        drop((holder, writer, engine));
-        std::fs::remove_dir_all(config.data_dir).unwrap();
+            drop((holder, writer, engine));
+            std::fs::remove_dir_all(config.data_dir).unwrap();
+        }
     }
 }
 

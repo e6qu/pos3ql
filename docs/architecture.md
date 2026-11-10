@@ -243,7 +243,8 @@ SQL-language scalar and table functions retain their current body statement,
 selected source and dependencies, arguments, checked inputs and result work in
 the same fixed pools. A completed statement is skipped after a wait. Re-evaluating
 an expression preserves the input checks completed before the pause while leaving
-later receipts pending. An unfinished child call resumes before its statement is
+later receipts pending. The invocation owns caller-side preparation as well as
+its saved body position. An unfinished child call resumes before its statement is
 evaluated again, with its original effect receipts. Nested INSERT/UPDATE/DELETE completion retains returned rows
 while its AFTER triggers finish. For example, an order function can write an audit
 entry, wait in a child function, then return the original order without writing

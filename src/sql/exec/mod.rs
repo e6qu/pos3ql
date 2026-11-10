@@ -18560,9 +18560,11 @@ fn split_trigger_statements<'a>(
                 let mut lexer = Lexer::new(remaining, scratch);
                 let mut depth = 0usize;
                 loop {
-                    let token = lexer
-                        .next_token()
-                        .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                    let token = lexer.next_token().map_err(|error| {
+                        super::parse_error_to_sql(&super::parser::ParseError::lexical(
+                            error, remaining,
+                        ))
+                    })?;
                     match token {
                         Tok::Op("(") => depth += 1,
                         Tok::Op(")") if depth > 0 => depth -= 1,
@@ -18734,9 +18736,9 @@ fn scan_trigger_top_level<T>(
             let mut lexer = Lexer::new(text, scratch);
             let mut depth = 0usize;
             loop {
-                let token = lexer
-                    .next_token()
-                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                let token = lexer.next_token().map_err(|error| {
+                    super::parse_error_to_sql(&super::parser::ParseError::lexical(error, text))
+                })?;
                 match token {
                     Tok::Op("(" | "[") => depth += 1,
                     Tok::Op(")" | "]") => {
@@ -18785,9 +18787,9 @@ fn parse_plpgsql_identifier_prefix(
         .with_remaining_region(|scratch| {
             use crate::sql::lexer::{Lexer, Tok};
             let mut lexer = Lexer::new(source, scratch);
-            let token = lexer
-                .next_token()
-                .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+            let token = lexer.next_token().map_err(|error| {
+                super::parse_error_to_sql(&super::parser::ParseError::lexical(error, source))
+            })?;
             let name = match token {
                 Tok::Ident(name) | Tok::QuotedIdent(name) => SqlName::parse(name)?,
                 _ => {
@@ -18817,9 +18819,9 @@ fn parse_plpgsql_identifier<'source>(
         .with_remaining_region(|scratch| {
             use crate::sql::lexer::{Lexer, Tok};
             let mut lexer = Lexer::new(source, scratch);
-            let token = lexer
-                .next_token()
-                .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+            let token = lexer.next_token().map_err(|error| {
+                super::parse_error_to_sql(&super::parser::ParseError::lexical(error, source))
+            })?;
             let (name, quoted) = match token {
                 Tok::Ident(name) => (SqlName::parse(name)?, false),
                 Tok::QuotedIdent(name) => (SqlName::parse(name)?, true),
@@ -18834,7 +18836,9 @@ fn parse_plpgsql_identifier<'source>(
             if !matches!(
                 lexer
                     .next_token()
-                    .map_err(|error| super::parse_error_to_sql(&error.into()))?,
+                    .map_err(|error| super::parse_error_to_sql(
+                        &super::parser::ParseError::lexical(error, source)
+                    ))?,
                 Tok::Eof
             ) {
                 return Err(sql_err!(
@@ -18964,14 +18968,16 @@ fn parse_trigger_select_into<'a>(
         .with_remaining_region(|scratch| {
             use crate::sql::lexer::{Lexer, Tok};
             let mut lexer = Lexer::new(after_into, scratch);
-            let mut token = lexer
-                .next_token()
-                .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+            let mut token = lexer.next_token().map_err(|error| {
+                super::parse_error_to_sql(&super::parser::ParseError::lexical(error, after_into))
+            })?;
             let strict = matches!(token, Tok::Ident(word) if word.eq_ignore_ascii_case("strict"));
             if strict {
-                token = lexer
-                    .next_token()
-                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                token = lexer.next_token().map_err(|error| {
+                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
+                        error, after_into,
+                    ))
+                })?;
             }
             let mut count = 0usize;
             loop {
@@ -18989,15 +18995,19 @@ fn parse_trigger_select_into<'a>(
                 };
                 count += 1;
                 let end = lexer.token_end();
-                token = lexer
-                    .next_token()
-                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                token = lexer.next_token().map_err(|error| {
+                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
+                        error, after_into,
+                    ))
+                })?;
                 if !matches!(token, Tok::Op(",")) {
                     return Ok((count, strict, end));
                 }
-                token = lexer
-                    .next_token()
-                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                token = lexer.next_token().map_err(|error| {
+                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
+                        error, after_into,
+                    ))
+                })?;
             }
         })
         .map_err(|_| super::query::arena_full_pub())??;
@@ -20117,9 +20127,12 @@ fn parse_plpgsql_cursor_motion<'a>(
             let mut lexer = Lexer::new(motion_and_variable, scratch);
             let mut last = None;
             loop {
-                let token = lexer
-                    .next_token()
-                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                let token = lexer.next_token().map_err(|error| {
+                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
+                        error,
+                        motion_and_variable,
+                    ))
+                })?;
                 if matches!(token, Tok::Eof) {
                     break;
                 }
@@ -20342,12 +20355,12 @@ fn parse_trigger_statement<'a>(
     {
         use crate::sql::lexer::{Lexer, Tok};
         let mut lexer = Lexer::new(segment, arena);
-        let first = lexer
-            .next_token()
-            .map_err(|error| super::parse_error_to_sql(&error.into()))?;
-        let second = lexer
-            .next_token()
-            .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+        let first = lexer.next_token().map_err(|error| {
+            super::parse_error_to_sql(&super::parser::ParseError::lexical(error, segment))
+        })?;
+        let second = lexer.next_token().map_err(|error| {
+            super::parse_error_to_sql(&super::parser::ParseError::lexical(error, segment))
+        })?;
         // A utility starts with two words; assignment punctuation belongs to
         // the local-variable parser even when the variable is named alter.
         if matches!(

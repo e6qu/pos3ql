@@ -1576,7 +1576,9 @@ fn procedural_lexical_exhaustion_is_a_resource_error_and_releases_scan_memory() 
             let mut lexer = crate::sql::lexer::Lexer::new(sql, &tiny);
             let error = lexer.next_token().unwrap_err();
             assert_eq!(error.kind.sqlstate(), "54000");
-            let error = super::super::super::parse_error_to_sql(&error.into());
+            let error = super::super::super::parse_error_to_sql(
+                &crate::sql::parser::ParseError::lexical(error, sql),
+            );
             assert_eq!(error.sqlstate, "54000");
             assert_eq!(error.message.as_str(), "statement too large for SQL arena");
         }

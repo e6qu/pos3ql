@@ -228,6 +228,8 @@ pub struct ParseError {
     /// Byte offset in the parsed text that PostgreSQL reports as the error
     /// cursor (the ErrorResponse `P` field), or `None` when it reports none.
     pub cursor: Option<usize>,
+    /// PostgreSQL's HINT for this error, if it sends one.
+    pub hint: Option<&'static str>,
 }
 
 impl ParseError {
@@ -237,27 +239,20 @@ impl ParseError {
             message: stack_format!(96, "{}", text),
             sqlstate: sqlstate::SYNTAX_ERROR,
             cursor: None,
+            hint: None,
         }
-    }
-}
-
-impl From<LexError> for ParseError {
-    fn from(e: LexError) -> Self {
-        let mut error = ParseError::new(e.at, e.message);
-        error.sqlstate = e.kind.sqlstate();
-        error.cursor = e.cursor();
-        error
     }
 }
 
 impl ParseError {
     /// A scanner error on `text`, echoing the scanned text as PostgreSQL does.
-    fn lexical(error: LexError, text: &str) -> Self {
+    pub(crate) fn lexical(error: LexError, text: &str) -> Self {
         Self {
             at: error.at,
             message: error.render(text),
             sqlstate: error.kind.sqlstate(),
             cursor: error.cursor(),
+            hint: error.hint,
         }
     }
 }
@@ -1259,6 +1254,7 @@ impl<'a> Parser<'a> {
                         message: StackStr::from_str("cannot specify both SCROLL and NO SCROLL"),
                         sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
                         cursor: None,
+                        hint: None,
                     });
                 }
                 scroll = crate::sql::cursor::CursorScroll::Scroll;
@@ -1270,6 +1266,7 @@ impl<'a> Parser<'a> {
                         message: StackStr::from_str("cannot specify both SCROLL and NO SCROLL"),
                         sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
                         cursor: None,
+                        hint: None,
                     });
                 }
                 scroll = crate::sql::cursor::CursorScroll::NoScroll;
@@ -1283,6 +1280,7 @@ impl<'a> Parser<'a> {
                 message: StackStr::from_str("cannot specify both ASENSITIVE and INSENSITIVE"),
                 sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
                 cursor: None,
+                hint: None,
             });
         }
         self.expect_ident("cursor")?;
@@ -1307,6 +1305,7 @@ impl<'a> Parser<'a> {
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
+                hint: None,
             });
         }
         if let Some(clause) = query.locking.first() {
@@ -1347,6 +1346,7 @@ impl<'a> Parser<'a> {
                     ),
                     sqlstate: state,
                     cursor: None,
+                    hint: None,
                 });
             }
         }
@@ -1667,6 +1667,7 @@ impl<'a> Parser<'a> {
                 message: stack_format!(96, "EXPLAIN option BUFFERS requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
+                hint: None,
             });
         }
         if options.wal && !options.analyze {
@@ -1675,6 +1676,7 @@ impl<'a> Parser<'a> {
                 message: stack_format!(96, "EXPLAIN option WAL requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
+                hint: None,
             });
         }
         if timing_enabled_explicitly && !options.analyze {
@@ -1683,6 +1685,7 @@ impl<'a> Parser<'a> {
                 message: stack_format!(96, "EXPLAIN option TIMING requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
+                hint: None,
             });
         }
         if options.serialize != ExplainSerialize::None && !options.analyze {
@@ -1691,6 +1694,7 @@ impl<'a> Parser<'a> {
                 message: stack_format!(96, "EXPLAIN option SERIALIZE requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
+                hint: None,
             });
         }
         if options.plan_mode == ExplainPlanMode::Generic && options.analyze {
@@ -1702,6 +1706,7 @@ impl<'a> Parser<'a> {
                 ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
+                hint: None,
             });
         }
         let statement = self.statement()?;
@@ -2187,6 +2192,7 @@ impl<'a> Parser<'a> {
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
+                hint: None,
             });
         }
         Ok(Stmt::Do { body })
@@ -2662,6 +2668,7 @@ impl<'a> Parser<'a> {
                     message: stack_format!(96, "operator {}.{} does not exist", schema, operator),
                     sqlstate: sqlstate::UNDEFINED_FUNCTION,
                     cursor: None,
+                    hint: None,
                 });
             }
             match operator {
@@ -2676,6 +2683,7 @@ impl<'a> Parser<'a> {
                     ),
                     sqlstate: sqlstate::WRONG_OBJECT_TYPE,
                     cursor: None,
+                    hint: None,
                 }),
             }
         } else if self.eat_ident("desc")? {
@@ -3692,6 +3700,7 @@ impl<'a> Parser<'a> {
                         message: StackStr::from_str("DEFAULT namespace is not supported"),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                         cursor: None,
+                        hint: None,
                     });
                 }
                 let uri = self.expression(0)?;
@@ -4003,6 +4012,7 @@ impl<'a> Parser<'a> {
                     message: stack_format!(96, "tablesample method {} does not exist", method_name),
                     sqlstate: sqlstate::UNDEFINED_OBJECT,
                     cursor: None,
+                    hint: None,
                 });
             }
         };
@@ -4028,6 +4038,7 @@ impl<'a> Parser<'a> {
                 ),
                 sqlstate: sqlstate::INVALID_TABLESAMPLE_ARGUMENT,
                 cursor: None,
+                hint: None,
             });
         }
         self.expect_op(")")?;
@@ -4300,6 +4311,7 @@ impl<'a> Parser<'a> {
                             message: stack_format!(96, "COPY format \"{}\" does not exist", other),
                             sqlstate: sqlstate::UNDEFINED_OBJECT,
                             cursor: None,
+                            hint: None,
                         });
                     }
                 };
@@ -4418,6 +4430,7 @@ impl<'a> Parser<'a> {
                     message: stack_format!(96, "cannot specify {} in BINARY mode", name),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
+                    hint: None,
                 });
             }
         }
@@ -4441,6 +4454,7 @@ impl<'a> Parser<'a> {
                     message: stack_format!(96, "COPY {} requires CSV mode", name),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
+                    hint: None,
                 });
             }
         }
@@ -4474,6 +4488,7 @@ impl<'a> Parser<'a> {
                 message: stack_format!(96, "COPY {} must be a single one-byte character", what),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
+                hint: None,
             });
         }
         Ok(bytes[0])
@@ -4504,6 +4519,7 @@ impl<'a> Parser<'a> {
                 message: stack_format!(96, "COPY {} requires a quoted string", what),
                 sqlstate: sqlstate::SYNTAX_ERROR,
                 cursor: None,
+                hint: None,
             }),
         }
     }
@@ -4586,6 +4602,7 @@ impl<'a> Parser<'a> {
             message: stack_format!(96, "COPY option \"{}\" is not supported", option),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
             cursor: None,
+            hint: None,
         }
     }
 
@@ -4595,6 +4612,7 @@ impl<'a> Parser<'a> {
             message: stack_format!(96, "{} is not supported", what),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
             cursor: None,
+            hint: None,
         }
     }
 
@@ -4663,6 +4681,7 @@ impl<'a> Parser<'a> {
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                         cursor: None,
+                        hint: None,
                     });
                 }
                 if self.eat_op(")")? {
@@ -4686,6 +4705,7 @@ impl<'a> Parser<'a> {
                             message: stack_format!(96, "unsupported ANALYZE option \"ANALYZE\""),
                             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                             cursor: None,
+                            hint: None,
                         });
                     }
                     if core::mem::replace(&mut saw_analyze, true) {
@@ -4723,6 +4743,7 @@ impl<'a> Parser<'a> {
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                         cursor: None,
+                        hint: None,
                     });
                 }
                 break;
@@ -5369,6 +5390,7 @@ impl<'a> Parser<'a> {
                         message: stack_format!(96, "unrecognized REINDEX option \"{}\"", option),
                         sqlstate: sqlstate::SYNTAX_ERROR,
                         cursor: None,
+                        hint: None,
                     });
                 }
                 if !self.eat_op(",")? {
@@ -6635,6 +6657,7 @@ impl<'a> Parser<'a> {
                 ),
                 sqlstate: sqlstate::INVALID_GRANT_OPERATION,
                 cursor: None,
+                hint: None,
             });
         }
         if grant {
@@ -7224,6 +7247,7 @@ impl<'a> Parser<'a> {
             message: stack_format!(96, "statistics option value {} is out of range", value),
             sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
             cursor: None,
+            hint: None,
         })
     }
 
@@ -7249,6 +7273,7 @@ impl<'a> Parser<'a> {
                     message: stack_format!(96, "unrecognized parameter \"{}\"", name),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
+                    hint: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -7273,6 +7298,7 @@ impl<'a> Parser<'a> {
                     message: stack_format!(96, "unrecognized parameter \"{}\"", name),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
+                    hint: None,
                 });
             };
             if core::mem::replace(selected, true) {
@@ -7377,6 +7403,7 @@ impl<'a> Parser<'a> {
             message: stack_format!(96, "transaction identifier \"{}\" is too long", value),
             sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
             cursor: None,
+            hint: None,
         })
     }
 
@@ -7592,6 +7619,7 @@ impl<'a> Parser<'a> {
                     message: stack_format!(96, "number of columns does not match number of values"),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
+                    hint: None,
                 });
             }
             for (name, value) in names.as_slice().iter().zip(values.as_slice()) {
@@ -8568,6 +8596,7 @@ impl<'a> Parser<'a> {
                 message: stack_format!(96, "precision for type float must be at least 1 bit"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
+                hint: None,
             });
         }
         if precision > 53 {
@@ -8576,6 +8605,7 @@ impl<'a> Parser<'a> {
                 message: stack_format!(96, "precision for type float must be less than 54 bits"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
+                hint: None,
             });
         }
         Ok(if precision <= 24 { "float4" } else { "float8" })
@@ -8704,6 +8734,7 @@ impl<'a> Parser<'a> {
                         message: stack_format!(96, "length for type {} must be at least 1", base),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                         cursor: None,
+                        hint: None,
                     });
                 }
                 // PostgreSQL 18.6 varbit.c: MaxAttrSize * BITS_PER_BYTE.
@@ -8717,6 +8748,7 @@ impl<'a> Parser<'a> {
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                         cursor: None,
+                        hint: None,
                     });
                 }
                 Ok(TypeMod::BitLength(nums[0] as usize).encode())
@@ -8902,6 +8934,7 @@ impl<'a> Parser<'a> {
                     message: stack_format!(96, "search_path identifier is longer than 63 bytes"),
                     sqlstate: sqlstate::NAME_TOO_LONG,
                     cursor: None,
+                    hint: None,
                 });
             }
             if count != 0 {
@@ -8952,6 +8985,7 @@ impl<'a> Parser<'a> {
                     message: stack_format!(96, "parameter \"{}\" requires a single value", name),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
+                    hint: None,
                 });
             }
         }
@@ -9160,6 +9194,7 @@ impl<'a> Parser<'a> {
             message: crate::stack_format!(96, "statement too large for SQL arena"),
             sqlstate: crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
             cursor: None,
+            hint: None,
         })
     }
 
@@ -9404,6 +9439,7 @@ impl<'a> Parser<'a> {
                 message: stack_format!(96, "target lists can have at most 1664 entries"),
                 sqlstate: sqlstate::TOO_MANY_COLUMNS,
                 cursor: None,
+                hint: None,
             });
         }
         let index = flat.len();
@@ -9466,6 +9502,7 @@ impl<'a> Parser<'a> {
                     message: stack_format!(96, "CUBE is limited to 12 elements"),
                     sqlstate: sqlstate::TOO_MANY_COLUMNS,
                     cursor: None,
+                    hint: None,
                 });
             }
             for subset in 0usize..(1usize << terms.len()) {
@@ -9517,6 +9554,7 @@ impl<'a> Parser<'a> {
             message: stack_format!(96, "too many grouping sets present (maximum 4096)"),
             sqlstate: sqlstate::STATEMENT_TOO_COMPLEX,
             cursor: None,
+            hint: None,
         }
     }
 
@@ -9593,6 +9631,7 @@ impl<'a> Parser<'a> {
             message: stack_format!(96, "syntax error: {}", expected),
             sqlstate: sqlstate::SYNTAX_ERROR,
             cursor: None,
+            hint: None,
         }
     }
 
@@ -9603,6 +9642,7 @@ impl<'a> Parser<'a> {
             ParseError {
                 at: self.peek_at,
                 cursor: Some(self.peek_at),
+                hint: None,
                 message: StackStr::from_str("syntax error at end of input"),
                 sqlstate: sqlstate::SYNTAX_ERROR,
             }
@@ -9617,6 +9657,7 @@ impl<'a> Parser<'a> {
         ParseError {
             at: start,
             cursor: Some(start),
+            hint: None,
             message: stack_format!(96, "syntax error at or near \"{}\"", &self.text[start..end]),
             sqlstate: sqlstate::SYNTAX_ERROR,
         }
@@ -9634,6 +9675,7 @@ impl<'a> Parser<'a> {
             message: StackStr::from_str(message),
             sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
             cursor: None,
+            hint: None,
         }
     }
 
@@ -9644,6 +9686,7 @@ impl<'a> Parser<'a> {
             message: stack_format!(96, "{}", message),
             sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
             cursor: None,
+            hint: None,
         }
     }
 
@@ -9653,6 +9696,7 @@ impl<'a> Parser<'a> {
             message: stack_format!(96, "{} exceeds fixed limit of {}", what, max),
             sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
             cursor: None,
+            hint: None,
         }
     }
 }

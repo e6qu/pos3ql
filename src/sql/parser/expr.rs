@@ -2807,6 +2807,7 @@ impl<'a> Parser<'a> {
                 message: crate::stack_format!(96, "type \"pg_catalog.{}\" does not exist", name),
                 sqlstate: crate::sql::eval::sqlstate::UNDEFINED_OBJECT,
                 cursor: None,
+                hint: None,
             });
         }
         if modified {
@@ -2946,6 +2947,7 @@ impl<'a> Parser<'a> {
             message: crate::stack_format!(96, "interval field value out of range: \"{}\"", lit),
             sqlstate: sqlstate::INTERVAL_FIELD_OVERFLOW,
             cursor: None,
+            hint: None,
         };
         // A part that is not a number at all is malformed input (22007); a
         // number that is simply too large for its field is out of range (22015).
@@ -2958,6 +2960,7 @@ impl<'a> Parser<'a> {
             ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
             cursor: None,
+            hint: None,
         };
         let value = lit.trim();
         let (sign, rest) = match value.strip_prefix('-') {
@@ -3014,6 +3017,7 @@ impl<'a> Parser<'a> {
             ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
             cursor: None,
+            hint: None,
         };
         let value = lit.trim();
 
@@ -3144,6 +3148,7 @@ impl<'a> Parser<'a> {
                 ),
                 sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
                 cursor: None,
+                hint: None,
             });
         }
         let (word, keep_fraction) = clock_field_word(field);

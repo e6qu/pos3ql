@@ -23960,6 +23960,9 @@ pub(crate) fn report_parse_error(
     e: &ParseError,
     text: &str,
 ) -> Result<(), WireFull> {
+    if let Some(hint) = e.hint {
+        eval::stash_diagnostic(None, Some(crate::util::StackStr::from_str(hint)));
+    }
     match e.cursor {
         Some(at) => responder.error_at(
             e.sqlstate,

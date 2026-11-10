@@ -332,9 +332,8 @@ if "$PY" "$EXT/result_streams.py" --host 127.0.0.1 --p3 "$P3_PORT" \
 else bad "stalled result clients"; cat "$WORK/result_streams.out"; fi
 
 # --- SQL cursor execution timing, checked against the PostgreSQL reference ---
-# Function-source projections, sorted FOR UPDATE and backward SCROLL fetches
-# still differ in pos3ql (PLAN.md, results and cursors), so only the
-# reference must pass today.
+# Sorted FOR UPDATE and backward SCROLL fetches still differ in pos3ql
+# (PLAN.md, results and cursors), so only the reference must pass today.
 echo "=== SQL cursor execution (real PostgreSQL) ==="
 if "$PY" "$EXT/cursor_execution.py" --host "$PGHOST" --port "$PGPORT" \
   --user "$PGUSER" --database postgres --output "$WORK/cursor-pg.json" \

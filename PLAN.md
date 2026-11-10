@@ -87,14 +87,12 @@ is owned.
   single-table `SELECT` from a simple Query or an unpaged `Execute` does today.
   Remaining: paged and named portals (`Execute` with a row limit still buffers
   into `portal_result_bytes`), `FETCH` output, `COPY TO`, and more retained
-  shapes (joins, sorting, grouping, subqueries, set operations). Three cursor
-  differences keep `tests/external/cursor_execution.py` on PostgreSQL only: a
-  cursor over a set-returning function such as `generate_series` runs its
-  projection at `DECLARE` instead of per `FETCH` (retaining the function's
-  position needs a fixed-memory generator per function, not materialized
-  rows); a sorted `FOR UPDATE` cursor locks its rows at `DECLARE`; and a
-  `SCROLL` cursor returns saved values on backward fetches instead of
-  evaluating its projection again. Saving a held cursor at commit
+  shapes (joins, sorting, grouping, subqueries, set operations, and more
+  set-returning functions than `generate_series` and one-array `unnest`). Two
+  cursor differences keep `tests/external/cursor_execution.py` on PostgreSQL
+  only: a sorted `FOR UPDATE` cursor locks its rows at `DECLARE` instead of
+  per `FETCH`, and a `SCROLL` cursor returns saved values on backward fetches
+  instead of evaluating its projection again. Saving a held cursor at commit
   yields during storage waits. Cursors keep declared record and domain types
   after their source query ends.
 

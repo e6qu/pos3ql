@@ -268,15 +268,18 @@ pub(crate) fn finish_statement(session: &SeqSession) {
 type ReplayErrorDiagnostic = (
     &'static core::panic::Location<'static>,
     Option<(bool, bool)>,
+    Option<(bool, bool)>,
 );
 
 #[cfg(test)]
 thread_local! {
     static LAST_REPLAY_ERROR: Cell<Option<ReplayErrorDiagnostic>> = const { Cell::new(None) };
+    static LAST_PREFIX_ADVANCE: Cell<Option<(bool, bool)>> = const { Cell::new(None) };
 }
 
 #[cfg(test)]
 pub(crate) fn take_replay_error_diagnostic() -> Option<ReplayErrorDiagnostic> {
+    LAST_PREFIX_ADVANCE.with(|prefix| prefix.set(None));
     LAST_REPLAY_ERROR.with(Cell::take)
 }
 
@@ -291,7 +294,8 @@ fn replay_changed() -> SqlError {
                 (replay.next.is_some(), replay.effects_next.is_some())
             })
         });
-        LAST_REPLAY_ERROR.with(|location| location.set(Some((caller, pending))));
+        let prefix = LAST_PREFIX_ADVANCE.with(Cell::get);
+        LAST_REPLAY_ERROR.with(|location| location.set(Some((caller, pending, prefix))));
     }
     sql_err!(
         sqlstate::SERIALIZATION_FAILURE,
@@ -538,6 +542,53 @@ impl Drop for StatementPositionAdmission<'_> {
 impl SavedStatementPosition {
     pub(crate) fn capture() -> Result<Self, SqlError> {
         begin_replay_cursor().map(Self)
+    }
+
+    /// Re-evaluating an owned phase can rewind its journal. Keep the prefix
+    /// completed before the pause without consuming any later receipts.
+    pub(crate) fn advance_consumed_prefix(&self) -> Result<(), SqlError> {
+        with_statement_context(|context| {
+            let (Some(saved), Some((arena, session))) = (self.0, context) else {
+                return if self.0.is_none() && context.is_none() {
+                    Ok(())
+                } else {
+                    Err(replay_changed())
+                };
+            };
+            let mut replay = session.statement_replay.get();
+            #[cfg(test)]
+            let before = replay;
+            validate_cursor(arena, replay, saved)?;
+            let sequence_end = sequence_position(arena, replay, saved.sequences)?;
+            let effect_end = effect_position(arena, replay, saved.effects)?;
+            let mut next = replay.next;
+            while next != sequence_end {
+                let Some(handle) = next else { break };
+                super::query::check_timeout()?;
+                next = arena.retained(handle).ok_or_else(replay_changed)?.next;
+            }
+            if next == sequence_end {
+                replay.next = sequence_end;
+            }
+            let mut next = replay.effects_next;
+            while next != effect_end {
+                let Some(handle) = next else { break };
+                super::query::check_timeout()?;
+                next = handle.next(arena)?;
+            }
+            if next == effect_end {
+                replay.effects_next = effect_end;
+            }
+            #[cfg(test)]
+            LAST_PREFIX_ADVANCE.with(|prefix| {
+                prefix.set(Some((
+                    before.next != replay.next,
+                    before.effects_next != replay.effects_next,
+                )));
+            });
+            session.statement_replay.set(replay);
+            Ok(())
+        })
     }
 
     pub(crate) fn take(&mut self) -> Self {
@@ -1676,6 +1727,67 @@ mod tests {
             scope.finish(guc.seq_session()).unwrap();
         });
         crate::sql::publish_execution_identity(prior);
+    }
+
+    #[test]
+    fn consumed_prefix_keeps_later_receipts_and_does_not_rewind_new_progress() {
+        let mut budget = Budget::new(64 << 10);
+        let arena = Arena::new(&mut budget, "consumed prefix journal", 48 << 10).unwrap();
+        let output = Arena::new(&mut budget, "consumed prefix output", 16 << 10).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        let calls = Cell::new(0);
+        let plan = |slot| {
+            let mut bytes = [0; 16];
+            bytes[0] = slot;
+            bytes[8] = 1;
+            super::super::type_input_plans::PlanId::from_key_bytes(&bytes).unwrap()
+        };
+        let issue = |value| {
+            statement_call(
+                session,
+                SequenceCall {
+                    operation: SequenceOperation::Next,
+                    source: None,
+                },
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(value)
+                },
+            )
+            .unwrap()
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let scope = enter_statement(&arena, session, false, None);
+            let start = begin_replay_cursor().unwrap();
+            assert_eq!(issue(1), 1);
+            ready_routine_input(plan(1), &output).unwrap();
+            let prefix = SavedStatementPosition::capture().unwrap();
+            assert_eq!(issue(2), 2);
+            ready_routine_input(plan(2), &output).unwrap();
+            let later_input = session.statement_replay.get().effects_tail;
+            rewind_replay_cursor(start).unwrap();
+            prefix.advance_consumed_prefix().unwrap();
+            assert!(session.statement_replay.get().effects_next == later_input);
+            assert_eq!(issue(99), 2);
+            ready_routine_input(plan(2), &output).unwrap();
+            assert_eq!(calls.get(), 2);
+            prefix.advance_consumed_prefix().unwrap();
+            assert!(session.statement_replay.get().effects_next.is_none());
+            assert_eq!(issue(3), 3);
+            ready_routine_input(plan(3), &output).unwrap();
+            assert_eq!(calls.get(), 3);
+            scope.finish(session).unwrap();
+            drop(scope);
+            let scope = enter_statement(&arena, session, false, None);
+            let before = begin_replay_cursor().unwrap();
+            assert_eq!(
+                prefix.advance_consumed_prefix().unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            rewind_replay_cursor(before).unwrap();
+            scope.finish(session).unwrap();
+        });
     }
 
     #[test]

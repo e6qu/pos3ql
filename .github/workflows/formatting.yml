@@ -75,4 +75,6 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-source-check-dependencies-${{ hashFiles('Cargo.lock') }}
       - name: Diagnose retained SQL function phases
-        run: cargo test --locked --lib --profile native-ci --jobs 1 sql::tests::function_progress::sql_ -- --test-threads=1 --nocapture
+        run: |
+          cargo test --locked --lib --profile native-ci --jobs 1 consumed_prefix_keeps_later_receipts -- --test-threads=1 --nocapture
+          cargo test --locked --lib --profile native-ci --jobs 1 sql::tests::function_progress::sql_ -- --test-threads=1 --nocapture

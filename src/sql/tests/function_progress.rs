@@ -491,7 +491,7 @@ fn sql_final_writes_keep_returned_rows_while_after_triggers_wait() {
             );
             holder.success(&mut engine, "COMMIT", true);
             assert_eq!(data_rows(&writer.success(&mut engine,"SELECT id FROM sql_write_target; SELECT stage,n FROM sql_write_audit ORDER BY stage; \
-                SELECT last_value FROM sql_write_numbers",true)),["1","after|2","caller|1","prelude|1","visible|1","2"]);
+                SELECT last_value FROM sql_write_numbers; SELECT currval('sql_write_numbers'),lastval()",true)),["1","after|2","caller|1","prelude|1","visible|1","2","2|2"]);
             writer.success(&mut engine, "INSERT INTO sql_write_root VALUES(2)", true);
             assert_eq!(data_rows(&writer.success(&mut engine,"SELECT count(*) FROM sql_write_target; SELECT count(*) FROM sql_write_audit; SELECT last_value FROM sql_write_numbers",true)),["2","8","4"]);
             drop((holder, writer, engine));
@@ -556,7 +556,8 @@ fn sql_return_checks_resume_after_the_body_without_reissuing_values() {
             sequence::take_replay_error_diagnostic(),
         );
         holder.success(&mut engine, "COMMIT", true);
-        assert_eq!(data_rows(&writer.success(&mut engine,"SELECT stage,n FROM sql_return_audit ORDER BY stage; SELECT last_value FROM sql_return_numbers",true)),["body|1","caller|1","check|1","1"]);
+        assert_eq!(data_rows(&writer.success(&mut engine,"SELECT stage,n FROM sql_return_audit ORDER BY stage; SELECT last_value FROM sql_return_numbers; \
+            SELECT currval('sql_return_numbers'),lastval()",true)),["body|1","caller|1","check|1","1","1|1"]);
         writer.success(&mut engine, "INSERT INTO sql_return_root VALUES(2)", true);
         assert_eq!(
             data_rows(&writer.success(

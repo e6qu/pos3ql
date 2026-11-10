@@ -26,7 +26,7 @@ psql:tests/external/sql/errors.sql:16: ERROR:  22003: bigint out of range
 SELECT nosuchfunc(1);
 psql:tests/external/sql/errors.sql:17: ERROR:  42883: function nosuchfunc(integer) does not exist
 SELECT 1 +;
-psql:tests/external/sql/errors.sql:18: ERROR:  42601: syntax error: expected an expression
+psql:tests/external/sql/errors.sql:18: ERROR:  42601: syntax error at or near ";"
 SELECT count(*), id FROM t_err;
 psql:tests/external/sql/errors.sql:19: ERROR:  42803: column "t_err.id" must appear in the GROUP BY clause or be used in an aggregate function
 DROP TABLE missing_table;

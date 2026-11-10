@@ -37,6 +37,20 @@ pub struct LexError {
     pub at: usize,
     pub message: StackStrMsg,
     pub kind: LexErrorKind,
+    /// End of the text PostgreSQL's scanner echoes as `at or near "..."`,
+    /// which starts at `at`; `None` for errors reported without it.
+    pub near_end: Option<usize>,
+}
+
+impl LexError {
+    /// The message as PostgreSQL's `scanner_yyerror` reports it for `text`,
+    /// the input this error's offsets index.
+    pub fn render(&self, text: &str) -> StackStr<96> {
+        let Some(near) = self.near_end.and_then(|end| text.get(self.at..end)) else {
+            return StackStr::from_str(self.message);
+        };
+        crate::stack_format!(96, "{} at or near \"{}\"", self.message, near)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,11 +145,16 @@ impl<'a> Lexer<'a> {
                 Ok(Tok::Op(operator))
             }
             '+' | '-' | '*' | '/' | '%' | '^' | '<' | '>' | '=' | '!' | '|' | '~' | '&' | '#'
-            | '@' | '?' => self.operator(),
+            | '@' | '?' | '`' => self.operator(),
             ':' => {
                 if rest.starts_with("::") {
                     self.at += 2;
                     Ok(Tok::Op("::"))
+                } else if rest.starts_with(":=") {
+                    // PostgreSQL's COLON_EQUALS: a named argument or a
+                    // PL/pgSQL assignment.
+                    self.at += 2;
+                    Ok(Tok::Op(":="))
                 } else {
                     // A lone colon is the array-slice separator (`a[1:3]`); the
                     // parser rejects it anywhere else.
@@ -148,7 +167,7 @@ impl<'a> Lexer<'a> {
             '$' => self.dollar(),
             '0'..='9' => self.number(),
             _ if c == '_' || c.is_alphabetic() => self.ident(),
-            _ => Err(self.error("unexpected character")),
+            _ => Err(self.syntax_error()),
         }
     }
 
@@ -233,6 +252,7 @@ impl<'a> Lexer<'a> {
                     at: start,
                     message: "identifier longer than 128 bytes",
                     kind: LexErrorKind::Syntax,
+                    near_end: None,
                 });
             }
             let stored = self.arena_str(folded.as_str(), start)?;
@@ -252,7 +272,21 @@ impl<'a> Lexer<'a> {
             && i + 1 < bytes.len()
             && matches!(bytes[i + 1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
         {
+            let radix = match bytes[i + 1] {
+                b'x' | b'X' => 16,
+                b'o' | b'O' => 8,
+                _ => 2,
+            };
             i += 2;
+            let digits = i;
+            while i < bytes.len()
+                && ((bytes[i] as char).is_digit(radix) || (bytes[i] == b'_' && i > digits))
+            {
+                i += 1;
+            }
+            if i > digits {
+                self.reject_trailing_junk(start, i, "trailing junk after numeric literal")?;
+            }
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
@@ -280,8 +314,37 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
+        self.reject_trailing_junk(start, i, "trailing junk after numeric literal")?;
         self.at = i;
         Ok(Tok::Num(&self.text[start..i]))
+    }
+
+    /// PostgreSQL rejects an identifier character directly after a number or
+    /// parameter (`1a`, `$1a`) instead of reading an alias or a new token.
+    fn reject_trailing_junk(
+        &self,
+        start: usize,
+        end: usize,
+        message: &'static str,
+    ) -> Result<(), LexError> {
+        let rest = &self.text[end..];
+        if !rest
+            .chars()
+            .next()
+            .is_some_and(|c| c == '_' || c.is_alphabetic())
+        {
+            return Ok(());
+        }
+        let length = rest
+            .char_indices()
+            .find(|(_, c)| !is_identifier_continue(*c))
+            .map_or(rest.len(), |(index, _)| index);
+        Err(LexError {
+            at: start,
+            message,
+            kind: LexErrorKind::Syntax,
+            near_end: Some(end + length),
+        })
     }
 
     fn plain_string(&mut self) -> Result<Tok<'a>, LexError> {
@@ -294,9 +357,10 @@ impl<'a> Lexer<'a> {
             match bytes.get(i) {
                 None => {
                     return Err(LexError {
-                        at: start,
-                        message: "unterminated string",
+                        at: self.token_start,
+                        message: "unterminated quoted string",
                         kind: LexErrorKind::Syntax,
+                        near_end: Some(self.text.len()),
                     });
                 }
                 Some(b'\'') if bytes.get(i + 1) == Some(&b'\'') => {
@@ -347,9 +411,10 @@ impl<'a> Lexer<'a> {
             match bytes.get(i) {
                 None => {
                     return Err(LexError {
-                        at: start,
-                        message: "unterminated string",
+                        at: self.token_start,
+                        message: "unterminated quoted string",
                         kind: LexErrorKind::Syntax,
+                        near_end: Some(self.text.len()),
                     });
                 }
                 Some(b'\'') if bytes.get(i + 1) == Some(&b'\'') => {
@@ -360,9 +425,10 @@ impl<'a> Lexer<'a> {
                 Some(b'\'') => break,
                 Some(b'\\') => {
                     let esc = bytes.get(i + 1).ok_or(LexError {
-                        at: start,
-                        message: "unterminated string",
+                        at: self.token_start,
+                        message: "unterminated quoted string",
                         kind: LexErrorKind::Syntax,
+                        near_end: Some(self.text.len()),
                     })?;
                     if matches!(esc, b'0'..=b'7') {
                         let mut value = 0u16;
@@ -418,6 +484,7 @@ impl<'a> Lexer<'a> {
                                     at: i,
                                     message: "invalid Unicode escape value",
                                     kind: LexErrorKind::Syntax,
+                                    near_end: None,
                                 })?;
                         let mut encoded = [0u8; 4];
                         let encoded = character.encode_utf8(&mut encoded).as_bytes();
@@ -463,6 +530,7 @@ impl<'a> Lexer<'a> {
             at,
             message: "invalid Unicode escape",
             kind: LexErrorKind::UnicodeEscape,
+            near_end: None,
         };
         if bytes.get(at) != Some(&b'\\') {
             return Err(invalid);
@@ -488,6 +556,7 @@ impl<'a> Lexer<'a> {
             at,
             message: "invalid byte sequence for encoding UTF8",
             kind: LexErrorKind::Encoding,
+            near_end: None,
         }
     }
 
@@ -496,6 +565,7 @@ impl<'a> Lexer<'a> {
             at,
             message: "invalid Unicode surrogate pair",
             kind: LexErrorKind::Syntax,
+            near_end: None,
         }
     }
 
@@ -512,9 +582,14 @@ impl<'a> Lexer<'a> {
             match bytes.get(i) {
                 None => {
                     return Err(LexError {
-                        at: start,
-                        message: "unterminated bit string",
+                        at: self.token_start,
+                        message: if hex {
+                            "unterminated hexadecimal string literal"
+                        } else {
+                            "unterminated bit string literal"
+                        },
                         kind: LexErrorKind::Syntax,
+                        near_end: Some(self.text.len()),
                     });
                 }
                 Some(b'\'') => break,
@@ -544,9 +619,10 @@ impl<'a> Lexer<'a> {
             match bytes.get(i) {
                 None => {
                     return Err(LexError {
-                        at: start,
+                        at: self.token_start,
                         message: "unterminated quoted identifier",
                         kind: LexErrorKind::Syntax,
+                        near_end: Some(self.text.len()),
                     });
                 }
                 Some(b'"') if bytes.get(i + 1) == Some(&b'"') => {
@@ -562,8 +638,9 @@ impl<'a> Lexer<'a> {
         if raw.is_empty() {
             return Err(LexError {
                 at: start,
-                message: "zero-length quoted identifier",
+                message: "zero-length delimited identifier",
                 kind: LexErrorKind::Syntax,
+                near_end: Some(start + 2),
             });
         }
         if !has_escape {
@@ -599,14 +676,17 @@ impl<'a> Lexer<'a> {
                 at: start,
                 message: "parameter number too large",
                 kind: LexErrorKind::Syntax,
+                near_end: None,
             })?;
             if n == 0 {
                 return Err(LexError {
                     at: start,
                     message: "there is no parameter $0",
                     kind: LexErrorKind::Syntax,
+                    near_end: None,
                 });
             }
+            self.reject_trailing_junk(start, start + 1 + digits, "trailing junk after parameter")?;
             self.at += 1 + digits;
             return Ok(Tok::Param(n));
         }
@@ -617,7 +697,7 @@ impl<'a> Lexer<'a> {
             .map_or(rest.len() - 1, |(i, _)| i);
         let after_tag = 1 + tag_len;
         if !rest[after_tag..].starts_with('$') {
-            return Err(self.error("unexpected '$'"));
+            return Err(self.syntax_error());
         }
         let open = &rest[..after_tag + 1]; // e.g. "$tag$"
         let body_start = self.at + open.len();
@@ -626,6 +706,7 @@ impl<'a> Lexer<'a> {
                 at: start,
                 message: "unterminated dollar-quoted string",
                 kind: LexErrorKind::Syntax,
+                near_end: Some(self.text.len()),
             });
         };
         let body = &self.text[body_start..body_start + close_rel];
@@ -645,7 +726,12 @@ impl<'a> Lexer<'a> {
                 let bytes = rest.as_bytes();
                 while depth > 0 {
                     if i + 1 >= bytes.len() {
-                        return Err(self.error("unterminated block comment"));
+                        return Err(LexError {
+                            at: self.at,
+                            message: "unterminated /* comment",
+                            kind: LexErrorKind::Syntax,
+                            near_end: Some(self.text.len()),
+                        });
                     }
                     if bytes[i] == b'/' && bytes[i + 1] == b'*' {
                         depth += 1;
@@ -674,11 +760,14 @@ impl<'a> Lexer<'a> {
         &self.text[self.at..]
     }
 
-    fn error(&self, message: &'static str) -> LexError {
+    /// PostgreSQL's grammar error for a character no token starts with.
+    fn syntax_error(&self) -> LexError {
+        let length = self.rest().chars().next().map_or(0, char::len_utf8);
         LexError {
             at: self.at,
-            message,
+            message: "syntax error",
             kind: LexErrorKind::Syntax,
+            near_end: Some(self.at + length),
         }
     }
 
@@ -687,6 +776,7 @@ impl<'a> Lexer<'a> {
             at,
             message: "statement too large for SQL arena",
             kind: LexErrorKind::Memory,
+            near_end: None,
         }
     }
 

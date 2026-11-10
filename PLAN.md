@@ -280,7 +280,17 @@ resolved one. Expressions are shown as stored, not deparsed: `pg_get_expr`,
 `pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
 `text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
 the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
-than one deparsed statement per line. The
+than one deparsed statement per line. Syntax errors use PostgreSQL's wording
+(`syntax error at or near "FROM"`, `unterminated quoted string at or near
+"'abc"`) but do not report the cursor position (the `P` field that psql shows
+as `LINE 1:` and a caret), and an echoed token longer than the 96-byte parser
+message is cut short. Checks the parser makes where PostgreSQL checks later
+still fail with `42601` and `syntax error: <description>`: type modifiers
+(`numeric(2000)` is `22023` `NUMERIC precision 2000 must be between 1 and
+1000` in PostgreSQL), COPY targets and options, storage parameters, sequence,
+role and large-object values, and SQL/JSON result types. An unsupported cast
+reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
+`42846` `cannot cast type integer to timestamp without time zone`. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

@@ -253,9 +253,7 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("ties")? {
                     FrameExclusion::Ties
                 } else {
-                    return Err(self.err_here(
-                        "expected NO OTHERS, CURRENT ROW, GROUP, or TIES after EXCLUDE",
-                    ));
+                    return Err(self.syntax_error_here());
                 }
             } else {
                 FrameExclusion::NoOthers

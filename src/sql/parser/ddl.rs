@@ -265,7 +265,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("to")?;
             AlterEventTriggerAction::Rename(self.col_ident("new event trigger name")?)
         } else {
-            return Err(self.err_here("expected an ALTER EVENT TRIGGER action"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterEventTrigger { name, action })
     }
@@ -406,7 +406,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("read_write")? {
             Ok(AggregateFinalModify::ReadWrite)
         } else {
-            Err(self.unexpected("expected READ_ONLY, SHAREABLE, or READ_WRITE"))
+            Err(self.syntax_error_here())
         }
     }
 
@@ -578,7 +578,7 @@ impl<'a> Parser<'a> {
                 self.aggregate_option_equals()?;
                 let operator = match self.peeked {
                     Tok::Ident(value) | Tok::Op(value) => value,
-                    _ => return Err(self.unexpected("expected an operator")),
+                    _ => return Err(self.syntax_error_here()),
                 };
                 self.advance()?;
                 options.sort_operator = Some(operator);
@@ -594,14 +594,14 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("unsafe")? {
                     RoutineParallel::Unsafe
                 } else {
-                    return Err(self.unexpected("expected SAFE, RESTRICTED, or UNSAFE"));
+                    return Err(self.syntax_error_here());
                 });
             } else if self.eat_ident("hypothetical")? {
                 if options.hypothetical.replace(true).is_some() {
                     return Err(self.duplicate_aggregate_option("HYPOTHETICAL"));
                 }
             } else {
-                return Err(self.unexpected("expected an aggregate option"));
+                return Err(self.syntax_error_here());
             }
             if self.eat_op(")")? {
                 break;
@@ -821,7 +821,7 @@ impl<'a> Parser<'a> {
                 enabled,
             }
         } else {
-            return Err(self.err_here("expected an ALTER INDEX action"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterIndex {
             name,
@@ -1082,14 +1082,14 @@ impl<'a> Parser<'a> {
                     self.any_qual_name("text search configuration name")?,
                 )
             } else {
-                return Err(self.err_here("expected PARSER or COPY"));
+                return Err(self.syntax_error_here());
             };
             self.expect_op(")")?;
             return Ok(Stmt::CreateTextSearchConfiguration(
                 CreateTextSearchConfiguration { name, source },
             ));
         }
-        Err(self.err_here("expected PARSER, TEMPLATE, DICTIONARY, or CONFIGURATION"))
+        Err(self.syntax_error_here())
     }
 
     pub(super) fn foreign_options(&mut self) -> Result<&'a [ForeignOption<'a>], ParseError> {
@@ -1303,7 +1303,7 @@ impl<'a> Parser<'a> {
                 &[]
             };
             if handler.is_none() && validator.is_none() && options.is_empty() {
-                return Err(self.err_here("expected a foreign-data wrapper alteration"));
+                return Err(self.syntax_error_here());
             }
             AlterForeignDataWrapperAction::Definition {
                 handler,
@@ -1338,7 +1338,7 @@ impl<'a> Parser<'a> {
                 &[]
             };
             if version.is_none() && options.is_empty() {
-                return Err(self.err_here("expected a foreign server alteration"));
+                return Err(self.syntax_error_here());
             }
             AlterForeignServerAction::Definition { version, options }
         };
@@ -1419,7 +1419,7 @@ impl<'a> Parser<'a> {
                 return self.create_view(true, persistence);
             }
             if persistence != RelationPersistence::Permanent {
-                return Err(self.err_here("expected VIEW after CREATE OR REPLACE TEMPORARY"));
+                return Err(self.syntax_error_here());
             }
             if self.eat_ident("function")? {
                 return self.create_routine(source_position, true, true);
@@ -1444,9 +1444,7 @@ impl<'a> Parser<'a> {
                 }
                 return self.create_language(true, trusted);
             }
-            return Err(self.unexpected(
-                "expected RULE, VIEW, FUNCTION, PROCEDURE, AGGREGATE, TRANSFORM, or TRIGGER after CREATE OR REPLACE",
-            ));
+            return Err(self.syntax_error_here());
         }
         if self.eat_ident("unique")? {
             self.expect_ident("index")?;
@@ -1595,7 +1593,7 @@ impl<'a> Parser<'a> {
         let persistence = if let Some(scope) = temporary_scope {
             if !(self.eat_ident("temporary")? || self.eat_ident("temp")?) {
                 let _ = scope;
-                return Err(self.err_here("expected TEMPORARY or TEMP after GLOBAL or LOCAL"));
+                return Err(self.syntax_error_here());
             }
             RelationPersistence::Temporary
         } else if self.eat_ident("unlogged")? {
@@ -1805,7 +1803,7 @@ impl<'a> Parser<'a> {
                 }
                 to_sql = Some(self.transform_function()?);
             } else {
-                return Err(self.err_here("expected FROM SQL or TO SQL transform function"));
+                return Err(self.syntax_error_here());
             }
             if !self.eat_op(",")? {
                 break;
@@ -2109,7 +2107,7 @@ impl<'a> Parser<'a> {
                 AlterOperatorAction::ResetSelectivity(selectivity_reset)
             }
         } else {
-            return Err(self.err_here("expected OWNER TO or SET in ALTER OPERATOR"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterOperator { identity, action })
     }
@@ -2296,7 +2294,7 @@ impl<'a> Parser<'a> {
                     return Err(self.err_here("VALIDATOR specified more than once"));
                 }
             } else {
-                return Err(self.unexpected("language option"));
+                return Err(self.syntax_error_here());
             }
         }
         Ok(Stmt::CreateLanguage(crate::sql::ast::CreateLanguage {
@@ -2358,7 +2356,7 @@ impl<'a> Parser<'a> {
                 }
                 cascade = true;
             } else {
-                return Err(self.unexpected("expected SCHEMA, VERSION, or CASCADE"));
+                return Err(self.syntax_error_here());
             }
         }
         Ok(Stmt::CreateExtension {
@@ -2726,7 +2724,7 @@ impl<'a> Parser<'a> {
                 AlterStatisticsAction::SetTarget(target)
             }
         } else {
-            return Err(self.err_here("expected OWNER, RENAME, or SET after ALTER STATISTICS"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterStatistics { name, action })
     }
@@ -3096,7 +3094,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("version")?;
             AlterDatabaseAction::RefreshCollationVersion
         } else {
-            return Err(self.err_here("expected an ALTER DATABASE action"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterDatabase { name, action })
     }
@@ -3120,7 +3118,7 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             AlterTablespaceAction::ResetOptions(options)
         } else {
-            return Err(self.err_here("expected a tablespace alteration"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterTablespace { name, action })
     }
@@ -3193,7 +3191,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("delete")? {
                 Kind::Delete
             } else {
-                return Err(self.unexpected("expected ALL, SELECT, INSERT, UPDATE, or DELETE"));
+                return Err(self.syntax_error_here());
             }
         } else {
             Kind::All
@@ -3290,7 +3288,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("of")?;
             TriggerTiming::InsteadOf
         } else {
-            return Err(self.err_here("expected BEFORE, AFTER, or INSTEAD OF for CREATE TRIGGER"));
+            return Err(self.syntax_error_here());
         };
         let mut events = [TriggerEvent::Insert; 4];
         let mut event_count = 0usize;
@@ -3325,8 +3323,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("truncate")? {
                 TriggerEvent::Truncate
             } else {
-                return Err(self
-                    .err_here("expected INSERT, UPDATE, DELETE, or TRUNCATE for CREATE TRIGGER"));
+                return Err(self.syntax_error_here());
             };
             if events[..event_count].contains(&event) {
                 return Err(self.err_here("trigger event specified more than once"));
@@ -3403,7 +3400,7 @@ impl<'a> Parser<'a> {
                 (Some(old), Some(new)) => TriggerTransitionTables::OldNew { old, new },
                 (Some(old), None) => TriggerTransitionTables::Old(old),
                 (None, Some(new)) => TriggerTransitionTables::New(new),
-                (None, None) => return Err(self.err_here("expected OLD TABLE or NEW TABLE")),
+                (None, None) => return Err(self.syntax_error_here()),
             }
         } else {
             TriggerTransitionTables::None
@@ -3476,7 +3473,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_ident("execute")?;
         if !self.eat_ident("function")? && !self.eat_ident("procedure")? {
-            return Err(self.err_here("expected FUNCTION or PROCEDURE after EXECUTE"));
+            return Err(self.syntax_error_here());
         }
         let function = self.qual_name("trigger function")?;
         self.expect_op("(")?;
@@ -3491,7 +3488,7 @@ impl<'a> Parser<'a> {
                         self.advance()?;
                         value
                     }
-                    _ => return Err(self.unexpected("expected trigger argument")),
+                    _ => return Err(self.syntax_error_here()),
                 };
                 self.push(&mut arguments, argument)?;
                 if self.eat_op(")")? {
@@ -3744,7 +3741,9 @@ impl<'a> Parser<'a> {
                 }
             } else {
                 if !has_returns {
-                    return Err(self.unexpected("RETURNS clause or OUT parameters"));
+                    return Err(
+                        self.invalid_function_definition("function result type must be specified")
+                    );
                 }
                 RoutineCreateKind::Function {
                     set_returning: self.eat_ident("setof")?,
@@ -3772,7 +3771,7 @@ impl<'a> Parser<'a> {
         while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
             if self.eat_ident("language")? {
                 if language.is_some() {
-                    return Err(self.unexpected("one LANGUAGE clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 language = Some(if self.eat_ident("sql")? {
                     crate::sql::ast::RoutineLanguage::Sql
@@ -3792,7 +3791,7 @@ impl<'a> Parser<'a> {
                 });
             } else if self.eat_ident("as")? {
                 if body.is_some() {
-                    return Err(self.unexpected("one AS clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 let source = self.str_literal("function body")?;
                 if self.eat_op(",")? {
@@ -3809,7 +3808,7 @@ impl<'a> Parser<'a> {
                 body = Some(crate::sql::ast::RoutineBody::String(source));
             } else if self.eat_ident("return")? {
                 if body.is_some() {
-                    return Err(self.unexpected("one routine body"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 let start = self.peek_at;
                 let _ = self.expression(0)?;
@@ -3818,7 +3817,7 @@ impl<'a> Parser<'a> {
                 ));
             } else if self.eat_ident("begin")? {
                 if body.is_some() {
-                    return Err(self.unexpected("one routine body"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 self.expect_ident("atomic")?;
                 let start = self.peek_at;
@@ -3829,7 +3828,7 @@ impl<'a> Parser<'a> {
                         break end;
                     }
                     if self.peeked == Tok::Eof {
-                        return Err(self.unexpected("END"));
+                        return Err(self.syntax_error_here());
                     }
                     let _ = self.statement()?;
                     self.expect_op(";")?;
@@ -3840,7 +3839,7 @@ impl<'a> Parser<'a> {
                 ));
             } else if self.eat_ident("strict")? {
                 if strict_seen {
-                    return Err(self.unexpected("one null-input clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 strict_seen = true;
                 attributes.strict = true;
@@ -3850,7 +3849,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("null")?;
                 self.expect_ident("input")?;
                 if strict_seen {
-                    return Err(self.unexpected("one null-input clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 strict_seen = true;
                 attributes.strict = true;
@@ -3859,31 +3858,31 @@ impl<'a> Parser<'a> {
                 self.expect_ident("null")?;
                 self.expect_ident("input")?;
                 if strict_seen {
-                    return Err(self.unexpected("one null-input clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 strict_seen = true;
                 attributes.strict = false;
             } else if self.eat_ident("immutable")? {
                 if volatility_seen {
-                    return Err(self.unexpected("one volatility clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 volatility_seen = true;
                 attributes.volatility = crate::sql::ast::RoutineVolatility::Immutable;
             } else if self.eat_ident("stable")? {
                 if volatility_seen {
-                    return Err(self.unexpected("one volatility clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 volatility_seen = true;
                 attributes.volatility = crate::sql::ast::RoutineVolatility::Stable;
             } else if self.eat_ident("volatile")? {
                 if volatility_seen {
-                    return Err(self.unexpected("one volatility clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 volatility_seen = true;
                 attributes.volatility = crate::sql::ast::RoutineVolatility::Volatile;
             } else if self.eat_ident("parallel")? {
                 if parallel_seen {
-                    return Err(self.unexpected("one PARALLEL clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 parallel_seen = true;
                 attributes.parallel = if self.eat_ident("safe")? {
@@ -3896,7 +3895,7 @@ impl<'a> Parser<'a> {
                 };
             } else if self.eat_ident("security")? {
                 if security_seen {
-                    return Err(self.unexpected("one SECURITY clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 security_seen = true;
                 attributes.security_definer = if self.eat_ident("definer")? {
@@ -3908,7 +3907,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("external")? {
                 self.expect_ident("security")?;
                 if security_seen {
-                    return Err(self.unexpected("one SECURITY clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 security_seen = true;
                 attributes.security_definer = if self.eat_ident("definer")? {
@@ -3919,20 +3918,20 @@ impl<'a> Parser<'a> {
                 };
             } else if self.eat_ident("leakproof")? {
                 if leakproof_seen {
-                    return Err(self.unexpected("one LEAKPROOF clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 leakproof_seen = true;
                 attributes.leakproof = true;
             } else if self.eat_ident("not")? {
                 self.expect_ident("leakproof")?;
                 if leakproof_seen {
-                    return Err(self.unexpected("one LEAKPROOF clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 leakproof_seen = true;
                 attributes.leakproof = false;
             } else if self.eat_ident("cost")? {
                 if cost_seen {
-                    return Err(self.unexpected("one COST clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 cost_seen = true;
                 let Tok::Num(raw) = self.peeked else {
@@ -3947,7 +3946,7 @@ impl<'a> Parser<'a> {
                 self.advance()?;
             } else if self.eat_ident("rows")? {
                 if rows_seen {
-                    return Err(self.unexpected("one ROWS clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 rows_seen = true;
                 let Tok::Num(raw) = self.peeked else {
@@ -4005,10 +4004,11 @@ impl<'a> Parser<'a> {
                     config_count += 1;
                 }
             } else {
-                return Err(self.unexpected("routine option"));
+                return Err(self.syntax_error_here());
             }
         }
-        let language = language.ok_or_else(|| self.unexpected("LANGUAGE clause"))?;
+        let language =
+            language.ok_or_else(|| self.invalid_function_definition("no language specified"))?;
         if body.is_some_and(|body| {
             !matches!(body, crate::sql::ast::RoutineBody::String(_))
                 && language != crate::sql::ast::RoutineLanguage::Sql
@@ -4027,7 +4027,7 @@ impl<'a> Parser<'a> {
                 || cost_seen
                 || rows_seen)
         {
-            return Err(self.unexpected("procedure option"));
+            return Err(self.syntax_error_here());
         }
         if attributes.rows.is_some()
             && !matches!(
@@ -4083,7 +4083,8 @@ impl<'a> Parser<'a> {
             language,
             attributes,
             configs: self.arena_slice(&configs[..config_count])?,
-            body: body.ok_or_else(|| self.unexpected("routine body"))?,
+            body: body
+                .ok_or_else(|| self.invalid_function_definition("no function body specified"))?,
         }))
     }
 
@@ -4175,10 +4176,10 @@ impl<'a> Parser<'a> {
             });
         }
         let Some(role) = role else {
-            return Err(self.unexpected("expected SET or RESET for ALTER ROLE ALL"));
+            return Err(self.syntax_error_here());
         };
         if database.is_some() {
-            return Err(self.unexpected("expected SET or RESET after IN DATABASE"));
+            return Err(self.syntax_error_here());
         }
         if self.eat_ident("rename")? {
             self.expect_ident("to")?;
@@ -4190,7 +4191,7 @@ impl<'a> Parser<'a> {
         let _ = self.eat_ident("with")?;
         let options = self.role_options()?;
         if options == RoleOptions::EMPTY {
-            return Err(self.unexpected("expected a role option"));
+            return Err(self.syntax_error_here());
         }
         Ok(Stmt::AlterRole { role, options })
     }
@@ -4231,7 +4232,7 @@ impl<'a> Parser<'a> {
                 new_name: self.any_ident("new group name")?,
             });
         }
-        Err(self.unexpected("expected ADD USER, DROP USER, or RENAME TO"))
+        Err(self.syntax_error_here())
     }
 
     fn role_options(&mut self) -> Result<RoleOptions<'a>, ParseError> {
@@ -4277,7 +4278,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("limit")?;
             let negative = self.eat_op("-")?;
             let Tok::Num(raw) = self.peeked else {
-                return Err(self.unexpected("expected connection limit"));
+                return Err(self.syntax_error_here());
             };
             let parsed = raw
                 .parse::<i32>()
@@ -4290,7 +4291,7 @@ impl<'a> Parser<'a> {
         } else if allow_sysid && self.eat_ident("sysid")? {
             let negative = self.eat_op("-")?;
             let Tok::Num(raw) = self.peeked else {
-                return Err(self.unexpected("expected SYSID"));
+                return Err(self.syntax_error_here());
             };
             let parsed = raw
                 .parse::<i32>()
@@ -4469,7 +4470,7 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("drop")? {
                     crate::sql::ast::OnCommitAction::Drop
                 } else {
-                    return Err(self.err_here("expected PRESERVE ROWS, DELETE ROWS, or DROP"));
+                    return Err(self.syntax_error_here());
                 };
                 has_on_commit = true;
             } else {
@@ -4582,7 +4583,7 @@ impl<'a> Parser<'a> {
                 let _ = self.column_default_expression()?;
                 default_text = Some(self.text[start..self.peek_at].trim_end());
             } else if cname.is_some() {
-                return Err(self.err_here("expected NOT NULL or CHECK after CONSTRAINT"));
+                return Err(self.syntax_error_here());
             } else {
                 break;
             }
@@ -4689,9 +4690,7 @@ impl<'a> Parser<'a> {
                 AlterDomainAction::Rename(self.col_ident("new domain name")?)
             }
         } else {
-            return Err(
-                self.err_here("expected ADD, DROP, RENAME, SET or VALIDATE after ALTER DOMAIN")
-            );
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterDomain { name, action })
     }
@@ -4890,12 +4889,10 @@ impl<'a> Parser<'a> {
                     cascade,
                 }
             } else {
-                return Err(self.err_here("expected SET DATA TYPE after ALTER ATTRIBUTE"));
+                return Err(self.syntax_error_here());
             }
         } else {
-            return Err(
-                self.err_here("expected composite attribute or enum action after ALTER TYPE")
-            );
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterType { name, action })
     }
@@ -5062,15 +5059,13 @@ impl<'a> Parser<'a> {
         }
         match self.peeked {
             Tok::Num(text) => {
-                let magnitude: i128 = text
-                    .parse()
-                    .map_err(|_| self.unexpected("expected an integer"))?;
+                let magnitude: i128 = text.parse().map_err(|_| self.syntax_error_here())?;
                 self.advance()?;
                 let value = if negative { -magnitude } else { magnitude };
                 i64::try_from(value)
                     .map_err(|_| self.unexpected("sequence option value out of range for bigint"))
             }
-            _ => Err(self.unexpected("expected an integer")),
+            _ => Err(self.syntax_error_here()),
         }
     }
 
@@ -5129,7 +5124,7 @@ impl<'a> Parser<'a> {
                         options.cycle = Some(false);
                     }
                 } else {
-                    return Err(self.err_here("expected an identity sequence option"));
+                    return Err(self.syntax_error_here());
                 }
             }
         }
@@ -5209,7 +5204,7 @@ impl<'a> Parser<'a> {
             }
         } else {
             let Some(n) = name else {
-                return Err(self.err_here("expected schema name or AUTHORIZATION"));
+                return Err(self.syntax_error_here());
             };
             SchemaName::Explicit(n)
         };
@@ -5583,7 +5578,7 @@ impl<'a> Parser<'a> {
                 }
                 let raw = match self.peeked {
                     Tok::Num(raw) | Tok::Str(raw) => raw,
-                    _ => return Err(self.err_here("expected an integer")),
+                    _ => return Err(self.syntax_error_here()),
                 };
                 let value = raw
                     .parse::<u16>()
@@ -5664,7 +5659,7 @@ impl<'a> Parser<'a> {
                 }
                 let raw = match self.peeked {
                     Tok::Num(raw) | Tok::Str(raw) => raw,
-                    _ => return Err(self.err_here("expected an integer")),
+                    _ => return Err(self.syntax_error_here()),
                 };
                 let value = raw
                     .parse::<u16>()
@@ -6057,7 +6052,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("delete")? {
             RuleEvent::Delete
         } else {
-            return Err(self.err_here("expected SELECT, INSERT, UPDATE, or DELETE rule event"));
+            return Err(self.syntax_error_here());
         };
         self.expect_ident("to")?;
         let table = self.qual_name("rule relation")?;
@@ -6535,7 +6530,7 @@ impl<'a> Parser<'a> {
             let (tables, schemas) = self.publication_targets(false)?;
             AlterPublicationAction::DropTargets { tables, schemas }
         } else {
-            return Err(self.err_here("expected SET, ADD, or DROP after ALTER PUBLICATION"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterPublication { name, action })
     }
@@ -6616,7 +6611,7 @@ impl<'a> Parser<'a> {
                     }
                 }
             } else {
-                return Err(self.err_here("expected TABLE or TABLES IN SCHEMA in publication"));
+                return Err(self.syntax_error_here());
             }
             if self.peeked == Tok::Ident("table") || self.peeked == Tok::Ident("tables") {
                 continue;
@@ -6831,9 +6826,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("configuration")? {
                 TextSearchObjectKind::Configuration
             } else {
-                return Err(
-                    self.err_here("expected PARSER, TEMPLATE, DICTIONARY, or CONFIGURATION")
-                );
+                return Err(self.syntax_error_here());
             };
             let if_exists = if self.eat_ident("if")? {
                 self.expect_ident("exists")?;
@@ -7430,7 +7423,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("schema")?;
             AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
         } else {
-            return Err(self.unexpected("expected OWNER, RENAME, or SET SCHEMA"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterAggregate { aggregate, action })
     }
@@ -7639,7 +7632,7 @@ impl<'a> Parser<'a> {
         }
         let _ = self.eat_ident("restrict")?;
         if action_count == 0 {
-            return Err(self.unexpected("routine alteration action"));
+            return Err(self.syntax_error_here());
         }
         Ok(Stmt::AlterRoutine {
             kind,
@@ -7945,7 +7938,7 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 if cons_name.is_some() {
-                    return Err(self.err_here("expected a table constraint after CONSTRAINT name"));
+                    return Err(self.syntax_error_here());
                 }
                 self.col_ident("column name")?
             };
@@ -8086,7 +8079,7 @@ impl<'a> Parser<'a> {
                         crate::sql::ast::ColGen::Identity(spec) => identity = Some(spec),
                     }
                 } else if col_cons_name.is_some() {
-                    return Err(self.err_here("expected a column constraint after CONSTRAINT name"));
+                    return Err(self.syntax_error_here());
                 } else {
                     break;
                 }
@@ -8179,7 +8172,7 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("drop")? {
                     crate::sql::ast::OnCommitAction::Drop
                 } else {
-                    return Err(self.err_here("expected PRESERVE ROWS, DELETE ROWS, or DROP"));
+                    return Err(self.syntax_error_here());
                 };
                 has_on_commit = true;
             } else {
@@ -8258,7 +8251,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("hash")? {
             PartitionStrategy::Hash
         } else {
-            return Err(self.err_here("expected RANGE, LIST, or HASH after PARTITION BY"));
+            return Err(self.syntax_error_here());
         };
         self.expect_op("(")?;
         let mut columns = ArenaList::new(self.arena);
@@ -8336,7 +8329,7 @@ impl<'a> Parser<'a> {
                     clause.comments = including;
                     clause.statistics = including;
                 }
-                _ => return Err(self.err_here("expected a LIKE option after INCLUDING/EXCLUDING")),
+                _ => return Err(self.syntax_error_here()),
             }
             self.advance()?;
         }
@@ -8541,7 +8534,9 @@ impl<'a> Parser<'a> {
             let not_attribute = if self.peeked == Tok::Ident("not") {
                 let mut lookahead = self.lexer.clone();
                 matches!(
-                    lookahead.next_token()?,
+                    lookahead
+                        .next_token()
+                        .map_err(|error| ParseError::lexical(error, self.text))?,
                     Tok::Ident("deferrable") | Tok::Ident("enforced") | Tok::Ident("valid")
                 )
             } else {
@@ -8628,7 +8623,7 @@ impl<'a> Parser<'a> {
                 Ok(FkAction::SetDefault)
             }
         } else {
-            Err(self.err_here("expected NO ACTION, RESTRICT, CASCADE, SET NULL, or SET DEFAULT"))
+            Err(self.syntax_error_here())
         }
     }
 

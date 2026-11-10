@@ -18588,7 +18588,7 @@ fn trigger_assignment_operator(
     scan_trigger_top_level(statement, arena, |token, start, _| {
         use crate::sql::lexer::Tok;
         Ok(match token {
-            Tok::Op(":") if statement[start..].starts_with(":=") => Some((start, 2)),
+            Tok::Op(":=") => Some((start, 2)),
             Tok::Op("=") => Some((start, 1)),
             _ => None,
         })

@@ -4257,6 +4257,11 @@ fn comparable(a: ColType, b: ColType) -> bool {
     // `json` has no equality operator in PostgreSQL — two documents that differ
     // only in whitespace or key order are the same value but not the same text,
     // so it declines to say. `jsonb`, which is canonicalized, does compare.
+    // PostgreSQL's array comparison operators accept every array type; an
+    // element type without equality or ordering fails when they run.
+    if a == b && matches!(a, ColType::Array(_)) {
+        return true;
+    }
     if !a.has_builtin_equality() || !b.has_builtin_equality() {
         return false;
     }
@@ -4537,10 +4542,7 @@ pub(crate) fn builtin_binary_type(
                 && ro != oid::UNKNOWN
                 && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro))
                 && (!comparable(a, b)
-                    || (a == ColType::Cid && b == ColType::Cid && *operator != Eq)
-                    || (matches!(a, ColType::Array(crate::sql::types::ArrElem::Cid))
-                        && matches!(b, ColType::Array(crate::sql::types::ArrElem::Cid))
-                        && !matches!(*operator, Eq | NotEq)))
+                    || (a == ColType::Cid && b == ColType::Cid && *operator != Eq))
             {
                 let sym = match operator {
                     Eq => "=",

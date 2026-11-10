@@ -7,6 +7,7 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod array_element_comparisons;
 mod builtin_aggregate_resolution;
 mod builtin_argument_binding;
 mod canonical_sequences;

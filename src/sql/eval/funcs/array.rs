@@ -385,6 +385,7 @@ pub(crate) fn dispatch<'a>(
                         "searching for elements in multidimensional arrays is not supported"
                     ));
                 }
+                require_search_equality(element, shape.dimension_count(), &target)?;
                 let lower = shape.lower_bound(0).unwrap_or(1);
                 let start = if args.len() == 3 {
                     match eval_full(args[2], arena, params, row, hooks)? {
@@ -451,6 +452,7 @@ pub(crate) fn dispatch<'a>(
                         "searching for elements in multidimensional arrays is not supported"
                     ));
                 }
+                require_search_equality(element, shape.dimension_count(), &target)?;
                 let lower = shape.lower_bound(0).unwrap_or(1);
                 let matches = |el: &Datum| -> Result<bool, SqlError> {
                     Ok(if target.is_null() {
@@ -605,6 +607,13 @@ pub(crate) fn dispatch<'a>(
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "array_remove does not support multidimensional arrays"
+                    ));
+                }
+                // PostgreSQL needs the element equality for any non-empty
+                // array, even to remove or replace NULLs.
+                if shape.dimension_count() > 0 && !source.to_coltype().has_builtin_equality() {
+                    return Err(crate::sql::eval::operators::could_not_identify_equality(
+                        source.to_coltype(),
                     ));
                 }
                 let (element, replacement) = if is_replace {
@@ -964,4 +973,19 @@ pub(crate) fn dispatch<'a>(
             _ => unreachable!("dispatch guard admitted an unhandled name"),
         }
     })())
+}
+
+/// `array_position` and `array_positions` need the element equality only to
+/// search a non-empty array for a non-NULL value, as in PostgreSQL.
+fn require_search_equality(
+    element: ArrElem,
+    dimensions: usize,
+    target: &Datum<'_>,
+) -> Result<(), SqlError> {
+    if dimensions > 0 && !target.is_null() && !element.to_coltype().has_builtin_equality() {
+        return Err(crate::sql::eval::operators::could_not_identify_equality(
+            element.to_coltype(),
+        ));
+    }
+    Ok(())
 }

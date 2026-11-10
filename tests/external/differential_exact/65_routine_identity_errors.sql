@@ -43,3 +43,16 @@ DROP AGGREGATE identity_agg2(ORDER BY int);
 DROP FUNCTION identity_fn(int), identity_fn(text), identity_fn(int);
 DROP PROCEDURE identity_proc;
 DROP SCHEMA identity_hidden CASCADE;
+
+-- Arrays of types without comparison operators fail when compared.
+SELECT ARRAY['a']::refcursor[] = ARRAY['a']::refcursor[];
+SELECT ARRAY['a']::refcursor[] <> ARRAY['a']::refcursor[];
+SELECT ARRAY['a']::refcursor[] = ARRAY['a','b']::refcursor[];
+SELECT ARRAY['a']::refcursor[] < ARRAY['a','b']::refcursor[];
+SELECT ARRAY['{}']::json[] = ARRAY['{}']::json[];
+SELECT '{}'::json[] >= '{}'::json[];
+SELECT '{}'::cid[] < '{}'::cid[];
+SELECT NULLIF(ARRAY['a']::refcursor[], ARRAY['b']::refcursor[]);
+SELECT ARRAY['a']::refcursor[] @> '{}'::refcursor[];
+SELECT array_position('{a}'::refcursor[], 'a');
+SELECT array_remove('{a}'::refcursor[], NULL);

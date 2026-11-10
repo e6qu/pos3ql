@@ -199,6 +199,10 @@ pub(crate) fn array_set_op<'a>(
             "operator requires two arrays"
         ));
     };
+    // PostgreSQL looks up the element equality before it reads either array.
+    if !le.to_coltype().has_builtin_equality() {
+        return Err(could_not_identify_equality(le.to_coltype()));
+    }
     let member = |needle: &Datum<'a>, elem, raw: &'a [u8]| -> Result<bool, SqlError> {
         if needle.is_null() {
             return Ok(false);
@@ -552,6 +556,16 @@ fn compare_numeric_int(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlE
         }
         _ => unreachable!("compare_numeric_int only for numeric/int pairs"),
     }
+}
+
+/// PostgreSQL's error when an array operation needs equality on an element
+/// type that has none (`json`, `refcursor`).
+pub(crate) fn could_not_identify_equality(element: ColType) -> SqlError {
+    sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "could not identify an equality operator for type {}",
+        element.name()
+    )
 }
 
 pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlError> {
@@ -1093,6 +1107,29 @@ pub(crate) fn compare_datums_as(
             },
         ) => left_slot.cmp(right_slot).then_with(|| left.cmp(right)),
         (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {
+            let element_type = element.to_coltype();
+            if matches!(operator, "=" | "<>") && !element_type.has_builtin_equality() {
+                // PostgreSQL's array_eq answers "not equal" for different
+                // shapes before it needs the element equality operator.
+                let shape_a = array::shape(ra).expect("array datum invariant");
+                let shape_b = array::shape(rb).expect("array datum invariant");
+                let same_shape = shape_a.dimension_count() == shape_b.dimension_count()
+                    && (0..shape_a.dimension_count()).all(|index| {
+                        shape_a.dimension(index) == shape_b.dimension(index)
+                            && shape_a.lower_bound(index) == shape_b.lower_bound(index)
+                    });
+                if !same_shape {
+                    return Ok(Ordering::Less);
+                }
+                return Err(could_not_identify_equality(element_type));
+            }
+            if !matches!(operator, "=" | "<>") && !element_type.has_builtin_ordering() {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "could not identify a comparison function for type {}",
+                    element_type.name()
+                ));
+            }
             // PostgreSQL compares contents first, then dimensionality and bounds.
             let (length_a, length_b) = (array::len(ra), array::len(rb));
             for (x, y) in array::elements(ra, *element).zip(array::elements(rb, *element)) {
@@ -1366,25 +1403,6 @@ pub(crate) fn compare<'a>(
             sqlstate::UNDEFINED_FUNCTION,
             "operator does not exist: cid {} cid",
             symbol
-        ));
-    }
-    if matches!(
-        (&l, &r),
-        (
-            Datum::Array {
-                element: crate::sql::types::ArrElem::Cid,
-                ..
-            },
-            Datum::Array {
-                element: crate::sql::types::ArrElem::Cid,
-                ..
-            }
-        )
-    ) && !matches!(operator, BinaryOp::Eq | BinaryOp::NotEq)
-    {
-        return Err(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "could not identify a comparison function for type cid"
         ));
     }
     let ord = compare_datums_as(symbol, &l, &r)?;

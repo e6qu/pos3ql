@@ -3563,6 +3563,54 @@ pub fn eval_full<'a>(
         } else {
             expression
         };
+        if !super::query::input_progress::owns_value()
+            && super::query::with_active_routine_invocations(|context| context.is_some())
+            && let Expr::Call {
+                name,
+                bound_oid,
+                args,
+                ..
+            } = expression
+            && (bound_oid.is_some()
+                || !hooks
+                    .catalog
+                    .is_some_and(|catalog| catalog.has_routine_candidate(name, args.len())))
+            && super::catalog::builtin_routine_properties(name, *bound_oid, &[])
+                .is_some_and(|(volatile, _)| volatile)
+        {
+            let mut base = crate::storage::SqlName::EMPTY;
+            let parsed = super::identifiers::for_each_qualified_identifier(
+                name,
+                super::identifiers::IdentifierGrammar::Sql,
+                true,
+                |identifier| {
+                    base = identifier.sql_name()?;
+                    Ok(())
+                },
+            )
+            .is_ok();
+            let journaled = parsed
+                && (matches!(
+                    base.as_str(),
+                    "nextval"
+                        | "currval"
+                        | "lastval"
+                        | "setval"
+                        | "pg_advisory_lock"
+                        | "pg_advisory_lock_shared"
+                        | "pg_try_advisory_lock"
+                        | "pg_try_advisory_lock_shared"
+                        | "pg_advisory_xact_lock"
+                        | "pg_advisory_xact_lock_shared"
+                        | "pg_try_advisory_xact_lock"
+                        | "pg_try_advisory_xact_lock_shared"
+                ) || super::engine_intrinsic_result_type(base.as_str(), args.len()).is_some());
+            if !journaled {
+                // An enclosing argument journal owns completed values. A bare
+                // query projection still needs its own position before replay.
+                super::query::record_unowned_value();
+            }
+        }
         let run = || {
             let _query_inputs = matches!(
                 expression,

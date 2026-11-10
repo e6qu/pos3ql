@@ -1055,6 +1055,10 @@ pub(crate) fn value<'a>(
     attempt.value(site, arena, evaluate)
 }
 
+pub(crate) fn owns_value() -> bool {
+    ACTIVE_INPUT.with(|active| active.get().is_some())
+}
+
 pub(super) fn definition<'a>(
     routine: &mut RoutineDef,
     slot: usize,

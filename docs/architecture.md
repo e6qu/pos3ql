@@ -257,6 +257,9 @@ Remaining PL/pgSQL return checks, unowned expression positions and unfinished
 write-row phases still need ownership before synchronous storage protection can
 be removed. A callback requiring a restart after an unowned write effect returns
 `0A000`, `SQL row expression requires retained write progress`.
+The invocation log also refuses a restart after an unsaved volatile value, such
+as a random number or current wall-clock reading. Argument input journals own
+their completed values; bare query projections need retained row positions.
 Completed scalar values and table-source rows keep their encoded bytes in
 checked arena allocations too. Their result directory stores handles and effect
 receipts, rather than references to returned values or row slices. For example,

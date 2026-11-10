@@ -15381,19 +15381,23 @@ impl Engine {
                 error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                     || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
             })
-        }) && let Some(continuation) = continuation
-        {
-            let target = frame.retention_owner();
-            let saved = if owner.identity() == target.identity() {
-                Ok(invocations)
-            } else {
-                invocations.relocate(owner, target)
-            };
-            match saved {
-                Ok(saved) => *continuation = Some(saved),
-                Err((original, error)) => {
-                    *continuation = Some(original);
-                    return Ok(Err(error));
+        }) {
+            if let Err(error) = invocations.require_replay() {
+                return Ok(Err(error));
+            }
+            if let Some(continuation) = continuation {
+                let target = frame.retention_owner();
+                let saved = if owner.identity() == target.identity() {
+                    Ok(invocations)
+                } else {
+                    invocations.relocate(owner, target)
+                };
+                match saved {
+                    Ok(saved) => *continuation = Some(saved),
+                    Err((original, error)) => {
+                        *continuation = Some(original);
+                        return Ok(Err(error));
+                    }
                 }
             }
         }
@@ -15717,6 +15721,9 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) = invocations.require_replay() {
+            return Ok(Err(error));
+        }
         let outcome = type_input_plans::with_owner(pending.plan_owner, || {
             query::protect_statement_effects();
             let contract = match pending.target {

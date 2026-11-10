@@ -44,10 +44,10 @@ def exercise(host, port, user, protocol, shape):
             PERFORM pg_advisory_xact_lock(846201);
             INSERT INTO audit VALUES('after',n,saved);"""
         if sql_body:
-            if shape == "sql_return_domain":
+            if shape in ("sql_return_domain", "sql_table_domain"):
                 admin.execute(f"CREATE FUNCTION sql_check(p text) RETURNS boolean LANGUAGE plpgsql STRICT AS $$ {child} RETURN true; END$$")
                 admin.execute("CREATE DOMAIN sql_checked_payload AS text CHECK(sql_check(VALUE))")
-                sql_signature = "RETURNS sql_checked_payload"
+                sql_signature = "RETURNS TABLE(payload sql_checked_payload)" if shape == "sql_table_domain" else "RETURNS sql_checked_payload"
                 final = "SELECT p"
             else:
                 admin.execute(f"CREATE FUNCTION sql_child(p text) {signature} LANGUAGE plpgsql AS $$ {child} {finish} END$$")
@@ -127,10 +127,10 @@ def exercise(host, port, user, protocol, shape):
             writer.execute("INSERT INTO orders VALUES(%s,%s)", (3, "fresh"))
             expected_length = {"scalar": 8194, "initializer": 8194, "domain": 8194, "table": 16387, "timezone": 22,
                                "sql_scalar": 8194, "sql_atomic": 8194, "sql_table": 16387,
-                               "sql_write": 8192, "sql_return_domain": 8192}[shape]
+                               "sql_write": 8192, "sql_return_domain": 8192, "sql_table_domain": 8192}[shape]
             expected_fresh = {"scalar": 7, "initializer": 7, "domain": 7, "table": 13, "timezone": 22,
                               "sql_scalar": 7, "sql_atomic": 7, "sql_table": 13,
-                              "sql_write": 5, "sql_return_domain": 5}[shape]
+                              "sql_write": 5, "sql_return_domain": 5, "sql_table_domain": 5}[shape]
             audit = admin.execute("SELECT stage,n,length(payload) FROM audit ORDER BY n,stage,length(payload)").fetchall()
             prefix = [("sql-prelude", 0, 5), ("sql-prelude", 0, 8192)] if sql_body else []
             assert audit == prefix + [("after", 1, 8192), ("before", 1, 8192), ("caller", 1, expected_length),
@@ -148,6 +148,53 @@ def exercise(host, port, user, protocol, shape):
             admin.execute("DROP SCHEMA function_progress_driver CASCADE")
 
 
+def result_order(host, port, user, protocol):
+    factory = psycopg.ClientCursor if protocol == "simple" else psycopg.Cursor
+    with psycopg.connect(host=host, port=port, user=user, dbname="postgres",
+                        autocommit=True, connect_timeout=5, cursor_factory=factory) as connection:
+        connection.execute("DROP SCHEMA IF EXISTS sql_result_order_driver CASCADE")
+        connection.execute("CREATE SCHEMA sql_result_order_driver")
+        connection.execute("SET search_path=sql_result_order_driver,public")
+        try:
+            connection.execute("CREATE SEQUENCE issued")
+            connection.execute("CREATE TABLE audit(n bigint)")
+            connection.execute("CREATE TABLE target(n bigint)")
+            connection.execute("CREATE DOMAIN positive AS bigint NOT NULL CHECK(VALUE>0)")
+            connection.execute("""CREATE FUNCTION first_value() RETURNS bigint LANGUAGE SQL AS $$
+                INSERT INTO audit VALUES(0); SELECT nextval('issued') FROM generate_series(1,3) $$""")
+            assert connection.execute("SELECT first_value()").fetchone() == (1,)
+            assert connection.execute("SELECT last_value FROM issued").fetchone() == (1,)
+            connection.execute("""CREATE FUNCTION checked_rows() RETURNS SETOF positive LANGUAGE SQL AS $$
+                INSERT INTO audit VALUES(1); SELECT nextval('issued')-3 FROM generate_series(1,3) $$""")
+            try:
+                connection.execute("SELECT * FROM checked_rows()").fetchall()
+                raise AssertionError("invalid first result was accepted")
+            except psycopg.Error as error:
+                assert error.sqlstate == "23514", str(error)
+            assert connection.execute("SELECT last_value FROM issued").fetchone() == (2,)
+            assert connection.execute("SELECT n FROM audit ORDER BY n").fetchall() == [(0,)]
+            connection.execute("""CREATE FUNCTION all_writes() RETURNS bigint LANGUAGE SQL AS $$
+                INSERT INTO target VALUES(nextval('issued')),(nextval('issued')) RETURNING n $$""")
+            assert connection.execute("SELECT all_writes()").fetchone() == (3,)
+            assert connection.execute("SELECT n FROM target ORDER BY n").fetchall() == [(3,), (4,)]
+            connection.execute("""CREATE FUNCTION record_overflow(OUT a integer,OUT b integer) LANGUAGE SQL AS $$
+                INSERT INTO audit VALUES(9); SELECT 2147483648::bigint,1 $$""")
+            try:
+                connection.execute("SELECT record_overflow()").fetchall()
+                raise AssertionError("out-of-range declared record field was accepted")
+            except psycopg.Error as error:
+                assert error.sqlstate == "22003", str(error)
+            assert connection.execute("SELECT n FROM audit ORDER BY n").fetchall() == [(0,)]
+            connection.execute("""CREATE FUNCTION empty_value() RETURNS positive LANGUAGE SQL AS $$
+                SELECT NULL::bigint WHERE false $$""")
+            empty = connection.execute("SELECT empty_value() IS NULL").fetchone()[0]
+            assert empty is True
+            print(json.dumps(dict(protocol=protocol, shape="result_order", first=1,
+                                  failed_row_sequence=2, written=[3,4], record_error="22003", empty=empty), sort_keys=True))
+        finally:
+            connection.execute("DROP SCHEMA sql_result_order_driver CASCADE")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("host")
@@ -156,8 +203,9 @@ def main():
     args = parser.parse_args()
     for protocol in ("simple", "extended"):
         for shape in ("scalar", "table", "timezone", "initializer", "domain",
-                      "sql_scalar", "sql_table", "sql_atomic", "sql_write", "sql_return_domain"):
+                      "sql_scalar", "sql_table", "sql_atomic", "sql_write", "sql_return_domain", "sql_table_domain"):
             exercise(args.host, args.port, args.user, protocol, shape)
+        result_order(args.host, args.port, args.user, protocol)
 
 
 if __name__ == "__main__":

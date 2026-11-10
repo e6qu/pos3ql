@@ -1350,6 +1350,7 @@ pub(crate) struct SuspendedRoutineCall {
 pub(crate) struct RoutineInvocationState {
     pub(super) suspended: RefCell<Option<SuspendedRoutineCall>>,
     pub(super) execution: RoutineExecution,
+    unowned_values: Cell<bool>,
     next: Cell<usize>,
     pending: Cell<Option<PendingRoutineInvocation>>,
     pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
@@ -1469,11 +1470,22 @@ pub(crate) fn protect_statement_effects() {
     });
 }
 
+pub(crate) fn record_unowned_value() {
+    if !input_progress::owns_value() {
+        with_active_routine_invocations(|context| {
+            if let Some((calls, _)) = context {
+                calls.unowned_values.set(true);
+            }
+        });
+    }
+}
+
 impl RoutineInvocationState {
     pub(crate) fn new(arena: &Arena, execution: RoutineExecution) -> Self {
         Self {
             suspended: RefCell::new(None),
             execution,
+            unowned_values: Cell::new(false),
             next: Cell::new(0),
             pending: Cell::new(None),
             pending_replay: Cell::new(None),
@@ -1486,6 +1498,16 @@ impl RoutineInvocationState {
     pub(crate) fn require_arena(&self, arena: &Arena) -> Result<(), SqlError> {
         if self.owner != arena.identity() {
             return Err(inactive_pending_call());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn require_replay(&self) -> Result<(), SqlError> {
+        if self.unowned_values.get() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "expression restart requires owned volatile values"
+            ));
         }
         Ok(())
     }

@@ -429,6 +429,10 @@ Write-row phases without a saved continuation still return `0A000`,
 `SQL row expression requires retained write progress`, if a callback would require
 restarting a changed row or other unowned effect. Protected storage waits remain
 synchronous until those enclosing phases have complete ownership.
+Likewise, repeating an unsaved `random()` or wall-clock value before an unfinished
+callback returns `0A000`, `expression restart requires owned volatile values`.
+Completed arguments and scalar return values keep their owned values; general
+query-row positions still need that ownership before such a query can restart.
 Cancellation and capacity errors roll back SQL writes; sequence numbers already
 issued remain consumed, as in PostgreSQL.
 

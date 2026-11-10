@@ -152,14 +152,7 @@ impl SqlResult {
                 if !*present {
                     let captured = shape.capture(values, arena)?;
                     let captured = if write {
-                        coerce_routine_argument(
-                            captured,
-                            source.return_type,
-                            storage,
-                            txid,
-                            arena,
-                            Some(sequences),
-                        )?
+                        coerce_sql_result(captured, source, storage, txid, arena, Some(sequences))?
                     } else {
                         captured
                     };
@@ -226,6 +219,7 @@ struct SqlExecution {
     finished_body: bool,
     pending_query: Option<query::RoutineInvocationState>,
     pending_write: Option<write_completion::PendingNestedWrite>,
+    command: Option<crate::sql::txn::SuspendedTriggerSql>,
     step_position: Option<sequence::SavedStatementPosition>,
     suspended_position: Option<sequence::SavedStatementPosition>,
 }
@@ -386,37 +380,66 @@ impl SqlExecution {
         while !self.finished_body {
             self.enter_step()?;
             let final_step = self.step == parsed.program.preceding.len();
-            let result = if final_step {
-                match parsed.program.result {
-                    query::RoutineFunctionResult::Query(query) => {
-                        self.query(query, arguments, context, true)
-                    }
-                    query::RoutineFunctionResult::DataModification(statement) => {
-                        self.statement(statement, arguments, context, true)
-                    }
-                    query::RoutineFunctionResult::Void(statement) => {
-                        self.statement(statement, arguments, context, false)
-                    }
-                    query::RoutineFunctionResult::Forbidden(statement) => {
-                        Err(query::routine_forbidden_statement_error(statement))
+            let mut command = if let Some(command) = self.command.take() {
+                match command.resume(context.txn) {
+                    Ok(command) => command,
+                    Err((command, error)) => {
+                        self.command = Some(command);
+                        return Err(error);
                     }
                 }
             } else {
-                match parsed
-                    .program
-                    .preceding
-                    .get(self.step)
-                    .ok_or_else(changed)?
-                {
-                    query::RoutinePrelude::Statement(statement) => {
-                        self.statement(statement, arguments, context, false)
+                context.txn.enter_trigger_sql(context.host.storage())?
+            };
+            let result = {
+                let mut statement_context = TriggerExecContext {
+                    host: context.host.reborrow(),
+                    txn: &mut command,
+                    arena: context.arena,
+                    params: context.params,
+                    responder: context.responder,
+                };
+                if final_step {
+                    match parsed.program.result {
+                        query::RoutineFunctionResult::Query(query) => {
+                            self.query(query, arguments, &mut statement_context, true)
+                        }
+                        query::RoutineFunctionResult::DataModification(statement) => {
+                            self.statement(statement, arguments, &mut statement_context, true)
+                        }
+                        query::RoutineFunctionResult::Void(statement) => {
+                            self.statement(statement, arguments, &mut statement_context, false)
+                        }
+                        query::RoutineFunctionResult::Forbidden(statement) => {
+                            Err(query::routine_forbidden_statement_error(statement))
+                        }
                     }
-                    query::RoutinePrelude::Forbidden(statement) => {
-                        Err(query::routine_forbidden_statement_error(statement))
+                } else {
+                    match parsed
+                        .program
+                        .preceding
+                        .get(self.step)
+                        .ok_or_else(changed)?
+                    {
+                        query::RoutinePrelude::Statement(statement) => {
+                            self.statement(statement, arguments, &mut statement_context, false)
+                        }
+                        query::RoutinePrelude::Forbidden(statement) => {
+                            Err(query::routine_forbidden_statement_error(statement))
+                        }
                     }
                 }
             };
-            result?;
+            match result {
+                Err(error) if control_flow::is_execution_wait(&error) => {
+                    self.command = Some(command.suspend());
+                    return Err(error);
+                }
+                result => {
+                    drop(command);
+                    result?;
+                }
+            }
             self.pending_query = None;
             self.step_position = None;
             if final_step {
@@ -441,16 +464,15 @@ impl SqlExecution {
                 if *checked {
                     return Ok(FunctionOutput::Scalar(value));
                 }
-                let target = self.source.return_type;
                 let txid = context.txn.txid;
                 execute_procedural_query(
                     context,
                     (self.policy == query::RoutineExecution::Retained)
                         .then_some(&mut self.pending_query),
                     |storage, sequences| {
-                        coerce_routine_argument(
+                        coerce_sql_result(
                             value,
-                            target,
+                            &self.source,
                             storage,
                             txid,
                             arena,
@@ -716,22 +738,25 @@ impl SqlExecution {
                         else {
                             return Err(changed());
                         };
-                        let result = engine
-                            .execute_routine_stmt(
-                                statement,
-                                arena,
-                                arguments,
-                                context.txn,
-                                sqlprep,
-                                cursors,
-                                guc,
-                                context.responder,
-                                if capture {
-                                    Some(&mut capture_rows)
-                                } else {
-                                    None
-                                },
-                            )
+                        let result = context
+                            .responder
+                            .without_query_output(|responder| {
+                                engine.execute_routine_stmt(
+                                    statement,
+                                    arena,
+                                    arguments,
+                                    context.txn,
+                                    sqlprep,
+                                    cursors,
+                                    guc,
+                                    responder,
+                                    if capture {
+                                        Some(&mut capture_rows)
+                                    } else {
+                                        None
+                                    },
+                                )
+                            })
                             .map_err(response_full)?;
                         context.responder.buffer.truncate_to(output_mark);
                         result.map(|()| 0)
@@ -822,7 +847,7 @@ impl SqlExecution {
     clippy::too_many_arguments,
     reason = "SQL calls capture their selected contract and original execution services"
 )]
-pub(super) fn execute_sql_function<'a>(
+pub(in crate::sql) fn execute_sql_function<'a>(
     engine: &mut super::super::Engine,
     transaction: &mut TxnState,
     prepared: &mut super::super::prep::SqlPreparedPool,
@@ -904,7 +929,14 @@ pub(super) fn execute_sql_function<'a>(
         .map_err(|_| query::arena_full_pub())?;
     for (selected, input) in input_types.iter_mut().zip(body_inputs.bindings) {
         if crate::storage::NamedTypeKind::from_oid(input.type_oid).is_some() {
-            *selected = catalog_column_type(&engine.storage, transaction.txid, input.type_oid)?.1;
+            *selected = catalog_column_type(&engine.storage, transaction.txid, input.type_oid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "selected SQL input type is unavailable"
+                    )
+                })?
+                .1;
         }
     }
     let types = engine.storage.select_type_definition_graph(
@@ -966,6 +998,7 @@ pub(super) fn execute_sql_function<'a>(
             finished_body: false,
             pending_query: None,
             pending_write: None,
+            command: None,
             step_position: None,
             suspended_position: None,
         })
@@ -991,6 +1024,42 @@ fn response_full(_: WireFull) -> SqlError {
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
         "SQL function response exceeds the send buffer"
     )
+}
+
+fn coerce_sql_result<'a>(
+    value: Datum<'a>,
+    source: &SqlSource,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<Datum<'a>, SqlError> {
+    if matches!(
+        source.kind,
+        crate::storage::RoutineKind::RecordFunction {
+            set_returning: false
+        }
+    ) {
+        let Datum::Record(fields) = value else {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "SQL record result has no declared fields"
+            ));
+        };
+        if fields.len() != source.columns.len() {
+            return Err(changed());
+        }
+        let fields = arena
+            .alloc_slice_copy(fields)
+            .map_err(|_| query::arena_full_pub())?;
+        for (field, column) in fields.iter_mut().zip(source.columns.iter().copied()) {
+            field.value =
+                coerce_routine_argument(field.value, column, storage, txid, arena, sequences)?;
+        }
+        Ok(Datum::Record(fields))
+    } else {
+        coerce_routine_argument(value, source.return_type, storage, txid, arena, sequences)
+    }
 }
 
 fn changed() -> SqlError {

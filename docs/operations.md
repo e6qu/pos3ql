@@ -15,8 +15,8 @@ still owns writes.
 `pos3ql --config <path>` is required. Every limit is fixed at startup: the
 server reserves the memory the file implies and returns a named error when a
 pool is exhausted. Sizes accept `KiB`, `MiB`, and `GiB`. A missing required
-setting fails startup. [`examples/dev.conf`](../examples/dev.conf) is a full
-example; physical limits are in
+setting fails startup. Full examples are `examples/dev.conf` in the source
+tree and the packaged `/etc/pos3ql/pos3ql.conf`; physical limits are in
 [memory and physical size](architecture.md#memory-and-physical-size).
 
 | Setting | Required | Bounds |

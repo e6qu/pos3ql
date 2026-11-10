@@ -69,8 +69,9 @@ Complete these connected execution paths:
   and rollback boundary, rather than undoing inserted rows before a constraint
   can inspect them. Replace the explicit row-progress rejection for multirow
   updates with an owner for completed rows and the current callback; prove that
-  a child reads earlier changed rows before the next row is written. Each insert/update/delete operation keeps its own completed
-  transition table and firing order.
+  a child reads earlier changed rows before the next row is written. Each
+  insert/update/delete operation keeps its own completed transition table and
+  firing order.
 - Preserve remaining expression values, complex query positions and cursor
   progress. After the first result flush, continue with one header, every row
   once and one completion. `FETCH` must not execute effects for unfetched rows;

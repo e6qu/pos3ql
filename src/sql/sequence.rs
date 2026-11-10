@@ -269,112 +269,18 @@ type ReplayErrorDiagnostic = (
     &'static core::panic::Location<'static>,
     Option<(bool, bool)>,
     Option<(bool, bool)>,
-    ReplayTraceLog,
 );
 
 #[cfg(test)]
 thread_local! {
     static LAST_REPLAY_ERROR: Cell<Option<ReplayErrorDiagnostic>> = const { Cell::new(None) };
     static LAST_CURSOR_RESTORE: Cell<Option<(bool, bool)>> = const { Cell::new(None) };
-    static REPLAY_TRACE: Cell<ReplayTraceLog> = const { Cell::new(ReplayTraceLog::EMPTY) };
 }
 
 #[cfg(test)]
 pub(crate) fn take_replay_error_diagnostic() -> Option<ReplayErrorDiagnostic> {
     LAST_CURSOR_RESTORE.with(|prefix| prefix.set(None));
-    let result = LAST_REPLAY_ERROR.with(Cell::take);
-    REPLAY_TRACE.with(|trace| trace.set(ReplayTraceLog::EMPTY));
-    result
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-struct ReplayTrace {
-    event: &'static str,
-    caller: &'static core::panic::Location<'static>,
-    nested: bool,
-    next: usize,
-    length: usize,
-    plan: Option<super::type_input_plans::PlanId>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-pub(crate) struct ReplayTraceLog {
-    entries: [Option<ReplayTrace>; 128],
-    count: usize,
-}
-
-#[cfg(test)]
-impl ReplayTraceLog {
-    const EMPTY: Self = Self {
-        entries: [None; 128],
-        count: 0,
-    };
-}
-
-#[cfg(test)]
-impl core::fmt::Debug for ReplayTraceLog {
-    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        output
-            .debug_list()
-            .entries(self.entries[..self.count].iter().flatten().map(|entry| {
-                (
-                    entry.event,
-                    entry.caller,
-                    entry.nested,
-                    entry.next,
-                    entry.length,
-                    entry.plan,
-                )
-            }))
-            .finish()
-    }
-}
-
-#[cfg(test)]
-#[track_caller]
-fn trace_replay(event: &'static str, arena: &Arena, replay: StatementSequenceReplay) {
-    let mut length = 0;
-    let mut next_index = None;
-    let mut next = replay.effects_head;
-    let mut plan = None;
-    while let Some(handle) = next {
-        if Some(handle) == replay.effects_next {
-            next_index = Some(length);
-            if let EffectHandle::ReadyInput(handle) = handle {
-                plan = arena.retained(handle).map(|effect| effect.plan);
-            }
-        }
-        length += 1;
-        if length > 256 {
-            break;
-        }
-        next = match handle {
-            EffectHandle::ReadyInput(handle) => {
-                arena.retained(handle).and_then(|effect| effect.next)
-            }
-            EffectHandle::Full(handle) => arena.retained(handle).and_then(|effect| effect.next),
-        };
-    }
-    let entry = ReplayTrace {
-        event,
-        caller: core::panic::Location::caller(),
-        nested: replay.journal.is_some(),
-        next: next_index.unwrap_or(length),
-        length,
-        plan,
-    };
-    REPLAY_TRACE.with(|trace| {
-        let mut log = trace.get();
-        if log.count == log.entries.len() {
-            log.entries.copy_within(1.., 0);
-            log.count -= 1;
-        }
-        log.entries[log.count] = Some(entry);
-        log.count += 1;
-        trace.set(log);
-    });
+    LAST_REPLAY_ERROR.with(Cell::take)
 }
 
 #[cfg_attr(test, track_caller)]
@@ -389,8 +295,7 @@ fn replay_changed() -> SqlError {
             })
         });
         let prefix = LAST_CURSOR_RESTORE.with(Cell::get);
-        let trace = REPLAY_TRACE.with(Cell::get);
-        LAST_REPLAY_ERROR.with(|location| location.set(Some((caller, pending, prefix, trace))));
+        LAST_REPLAY_ERROR.with(|location| location.set(Some((caller, pending, prefix))));
     }
     sql_err!(
         sqlstate::SERIALIZATION_FAILURE,
@@ -647,8 +552,6 @@ impl StatementPositionAdmission<'_> {
                 EffectPosition::capture(self.prior.effects_next, self.prior.effects_tail);
             current.effects_next = completed_input_position(arena, current, completed)?;
             session.statement_replay.set(current);
-            #[cfg(test)]
-            trace_replay("caller-inputs", arena, current);
             Ok(())
         })
     }
@@ -687,15 +590,12 @@ impl SavedStatementPosition {
         clippy::result_large_err,
         reason = "failed admission returns its original unattached owner without allocating"
     )]
-    #[cfg_attr(test, track_caller)]
     pub(crate) fn with_resume<T, R>(
         &self,
         owner: T,
         tail: super::lock::AdvisoryPositionTail,
         execute: impl for<'session> FnOnce(T, &mut StatementPositionAdmission<'session>) -> R,
     ) -> Result<R, (T, SqlError)> {
-        #[cfg(test)]
-        let caller = core::panic::Location::caller();
         with_statement_context(|context| {
             let mut admission = StatementPositionAdmission {
                 session: None,
@@ -729,17 +629,6 @@ impl SavedStatementPosition {
                     replay.next = next;
                     replay.effects_next = effects_next;
                     session.statement_replay.set(replay);
-                    #[cfg(test)]
-                    {
-                        trace_replay("attach", arena, replay);
-                        REPLAY_TRACE.with(|trace| {
-                            let mut log = trace.get();
-                            if let Some(entry) = &mut log.entries[log.count - 1] {
-                                entry.caller = caller;
-                            }
-                            trace.set(log);
-                        });
-                    }
                     session.restore_last_sequence(saved.lastval);
                 }
                 _ => return Err((owner, replay_changed())),
@@ -866,8 +755,6 @@ pub(crate) fn finish_replay_cursor(
         let replay = session.statement_replay.get();
         validate_cursor(arena, replay, start)?;
         let boundary = cursor_boundary(session, replay)?;
-        #[cfg(test)]
-        trace_replay("complete", arena, replay);
         let mut values = ArenaList::new(scratch);
         {
             let mut add = |slot, created_at| -> Result<(), SqlError> {
@@ -961,8 +848,6 @@ pub(crate) fn rewind_replay_cursor(start: Option<StatementReplayStart>) -> Resul
             admit_advisory(start.advisory, super::lock::AdvisoryPositionTail::Appended)?;
         session.restore_last_sequence(start.lastval);
         session.statement_replay.set(replay);
-        #[cfg(test)]
-        trace_replay("rewind-or-restore", arena, replay);
         if let Some(advisory) = &mut advisory {
             advisory.commit();
         }
@@ -1041,8 +926,6 @@ pub(crate) fn restore_replay_cursor(
             )));
         });
         session.statement_replay.set(replay);
-        #[cfg(test)]
-        trace_replay("rewind-or-restore", arena, replay);
         if let Some(advisory) = &mut advisory {
             advisory.commit();
         }
@@ -1325,8 +1208,6 @@ pub(crate) fn ready_routine_input(
             replay.effects_tail = Some(handle);
         }
         session.statement_replay.set(replay);
-        #[cfg(test)]
-        trace_replay("ready-input", arena, replay);
         Ok(())
     })
 }
@@ -1429,8 +1310,6 @@ pub(crate) fn statement_effect<'a>(
             }
         }
         session.statement_replay.set(child);
-        #[cfg(test)]
-        trace_replay("enter-effect", arena, child);
         super::query::protect_statement_effects();
         let attempt = execute();
         effect.children = session.statement_replay.get();
@@ -1439,8 +1318,6 @@ pub(crate) fn statement_effect<'a>(
         effect.replayable = !attempt.rewound_state && !effect.children.nonreplayable;
         parent.nonreplayable |= !effect.replayable;
         session.statement_replay.set(parent);
-        #[cfg(test)]
-        trace_replay("leave-effect", arena, parent);
         let result = match attempt.result {
             Ok(_) if effect.children.next.is_some() || effect.children.effects_next.is_some() => {
                 Err(replay_changed())

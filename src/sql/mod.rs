@@ -935,6 +935,8 @@ pub(crate) struct PendingResultStream {
     pub(crate) owner: type_input_plans::Owner,
     /// The statement's original deadline; the stream keeps it across waits.
     pub(crate) deadline: i64,
+    /// Output after this mark belongs to the discarded attempt.
+    pub(crate) output_mark: crate::pg::overflow::OutputMark,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11364,7 +11366,8 @@ impl Engine {
             text, 0, arena, txn, sqlprep, cursors, guc, responder, conn_id, false,
         )?;
         if let Err(error) = self.commit_wal() {
-            responder.truncate_to(output_mark);
+            // An error replaces only output the client has not received.
+            let _ = responder.truncate_to(output_mark);
             responder.error(error.sqlstate, error.message.as_str())?;
         }
         Ok(result)
@@ -11812,7 +11815,7 @@ impl Engine {
                 if let Some(reason) = spooled {
                     self.record_result_spool(reason);
                 }
-                if promoted && let Some(owner) = stream_owner {
+                if let (Some(promoted), Some(owner)) = (promoted, stream_owner) {
                     // Nothing of this attempt reached the client and it started
                     // no effect: discard it and reopen as a resumable stream.
                     sequence_scope.discard(guc.seq_session());
@@ -11822,6 +11825,7 @@ impl Engine {
                         source_end: *source_end,
                         owner,
                         deadline: query::statement_deadline(),
+                        output_mark: promoted,
                     });
                     return Ok(ExecutionStatus::Blocked {
                         completed_statements: statement_index,
@@ -12425,7 +12429,27 @@ impl Engine {
                                     if let Some(reason) = spooled {
                                         self.record_result_spool(reason);
                                     }
-                                    if promoted && let Ok(owner) = type_input_plans::owner() {
+                                    if let Some(promoted) = promoted {
+                                        let owner = match type_input_plans::owner() {
+                                            Ok(owner) => owner,
+                                            Err(error) => {
+                                                sequence_scope.discard(guc.seq_session());
+                                                txn.release_suspended_statement();
+                                                if txn.is_explicit() {
+                                                    txn.failed = true;
+                                                } else {
+                                                    cursors.on_rollback();
+                                                    self.rollback_txn(txn, guc);
+                                                }
+                                                responder.error(
+                                                    error.sqlstate,
+                                                    error.message.as_str(),
+                                                )?;
+                                                return Ok(ExtendedExecutionStatus::Complete(
+                                                    false,
+                                                ));
+                                            }
+                                        };
                                         // Nothing reached the client and no effect
                                         // started: reopen as a resumable stream.
                                         sequence_scope.discard(guc.seq_session());
@@ -12435,6 +12459,7 @@ impl Engine {
                                             source_end: text.len(),
                                             owner,
                                             deadline: query::statement_deadline(),
+                                            output_mark: promoted,
                                         });
                                         return Ok(ExtendedExecutionStatus::Blocked {
                                             wait: StatementWait::ClientOutput,
@@ -12831,7 +12856,8 @@ impl Engine {
                         },
                     });
                 }
-                responder.truncate_to(response_mark);
+                // An error replaces only output the client has not received.
+                let _ = responder.truncate_to(response_mark);
                 responder.error(error.sqlstate, error.message.as_str())?;
                 responder.ready_for_query(txn.status_byte())?;
                 return Ok(ExtendedExecutionStatus::Complete(false));
@@ -13077,7 +13103,8 @@ impl Engine {
                             }
                         }
                         Ok(Err(error)) => {
-                            responder.truncate_to(output_mark);
+                            // An error replaces only output the client has not received.
+                            let _ = responder.truncate_to(output_mark);
                             let error = if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                                 || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                             {
@@ -13318,7 +13345,8 @@ impl Engine {
                     Ok(scope.finish(guc.seq_session()))
                 }
                 Ok(Err(error)) => {
-                    responder.truncate_to(output_mark);
+                    // An error replaces only output the client has not received.
+                    let _ = responder.truncate_to(output_mark);
                     let error = if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                         || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                     {
@@ -15360,7 +15388,10 @@ impl Engine {
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                 return Ok(Err(error));
             }
-            responder.truncate_to(output_mark);
+            if let Err(error) = responder.truncate_to(output_mark) {
+                // Rows already sent cannot be withdrawn for another attempt.
+                return Ok(Err(error));
+            }
             let Some(pending) = invocations.take_pending() else {
                 return Ok(Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -15464,7 +15495,10 @@ impl Engine {
                 if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                     return Ok(Err(error));
                 }
-                responder.truncate_to(output_mark);
+                if let Err(error) = responder.truncate_to(output_mark) {
+                    // Rows already sent cannot be withdrawn for another attempt.
+                    return Ok(Err(error));
+                }
                 let Some(pending) = invocations.take_pending() else {
                     return Ok(Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -15805,7 +15839,10 @@ impl Engine {
             }
             self.rollback_waiting_statement(txn, statement_mark);
             self.dml_scratch.clear();
-            responder.truncate_to(output_mark);
+            if let Err(error) = responder.truncate_to(output_mark) {
+                // Rows already sent cannot be withdrawn for another attempt.
+                return Ok(Err(error));
+            }
             // The failed attempt has emitted or encoded every value it owns.
             // Keep prior invocation results below the mark and reclaim only
             // the materialization that will be rebuilt on the next attempt.
@@ -17742,7 +17779,8 @@ impl Engine {
                             Ok(Some(statement)) => statement,
                             Ok(None) => break,
                             Err(error) => {
-                                responder.truncate_to(output_mark);
+                                // An error replaces only output the client has not received.
+                                let _ = responder.truncate_to(output_mark);
                                 return Ok(Err(parse_error_to_sql(&error)));
                             }
                         };
@@ -17821,7 +17859,8 @@ impl Engine {
                                 _ => None,
                             };
                             let Some(output_query) = output_query else {
-                                responder.truncate_to(output_mark);
+                                // An error replaces only output the client has not received.
+                                let _ = responder.truncate_to(output_mark);
                                 return Ok(Err(sql_err!(
                                     sqlstate::INVALID_FUNCTION_DEFINITION,
                                     "SQL procedure with output parameters must end with a query"
@@ -17866,7 +17905,8 @@ impl Engine {
                                     Ok(())
                                 },
                             ) {
-                                responder.truncate_to(output_mark);
+                                // An error replaces only output the client has not received.
+                                let _ = responder.truncate_to(output_mark);
                                 return Ok(Err(error));
                             }
                             if output_rows == 0 {
@@ -17887,16 +17927,20 @@ impl Engine {
                         ) {
                             Ok(Ok(())) => {}
                             Ok(Err(error)) => {
-                                responder.truncate_to(output_mark);
+                                // An error replaces only output the client has not received.
+                                let _ = responder.truncate_to(output_mark);
                                 return Ok(Err(error));
                             }
                             Err(error) => {
-                                responder.truncate_to(output_mark);
+                                // An error replaces only output the client has not received.
+                                let _ = responder.truncate_to(output_mark);
                                 return Err(error);
                             }
                         }
                     }
-                    responder.truncate_to(output_mark);
+                    if let Err(error) = responder.truncate_to(output_mark) {
+                        return Ok(Err(error));
+                    }
                     if output_count != 0 {
                         let mut description = [ColDesc::new("", types::oid::TEXT, -1);
                             crate::storage::MAX_ROUTINE_ARGUMENTS];

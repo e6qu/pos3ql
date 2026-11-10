@@ -4,6 +4,7 @@
 use crate::mem::arena::{Arena, ArenaFull};
 use crate::mem::buffer::FixedBuf;
 use crate::sql::ast::ExplainSerialize;
+use crate::sql::eval::SqlError;
 use crate::sql::types::{ColDesc, Datum};
 use crate::stack_format;
 
@@ -103,6 +104,10 @@ pub(crate) struct OutputSink<'b> {
     /// A result stream keeps at most one row beyond `send` and parks; that
     /// row may use the private reserve instead of the shared spool.
     rows_use_reserve: bool,
+    /// With object-store publication, the effect epoch at which writing may
+    /// continue: once the statement starts an effect (a write through a
+    /// routine, a sequence change), its output waits for publication.
+    publication_epoch: Option<u64>,
 }
 
 /// Why a result that outgrew the send buffer queued in the result spool
@@ -128,8 +133,9 @@ enum Promotion {
     Armed { mark: OutputMark, epoch: u64 },
     /// The statement's overflow queues; `spooled` records why.
     Declined(SpoolReason),
-    /// The statement stopped at its first overflow and must reopen as a stream.
-    Requested,
+    /// The statement stopped at its first overflow and must reopen as a
+    /// stream; output after `mark` belongs to the discarded attempt.
+    Requested { mark: OutputMark },
 }
 
 impl<'b> OutputSink<'b> {
@@ -147,7 +153,16 @@ impl<'b> OutputSink<'b> {
             promotion: Promotion::Disabled,
             spooled: None,
             rows_use_reserve: false,
+            publication_epoch: None,
         }
+    }
+
+    /// Stops early writes once the statement starts an effect that the
+    /// object-store publication barrier must cover.
+    pub(crate) fn guard_publication(mut self, publication_required: bool) -> Self {
+        self.publication_epoch =
+            publication_required.then(crate::sql::query::statement_effect_epoch);
+        self
     }
 
     /// Lets a top-level `SELECT` in this output resume as a result stream.
@@ -166,7 +181,15 @@ impl<'b> OutputSink<'b> {
     /// Writes queued output until the transport would block, refilling `send`
     /// from the overflow at message boundaries.
     fn write_available(&mut self, send: &mut FixedBuf) {
-        if matches!(self.writer, ClientWriter::None) || self.failed {
+        if matches!(self.writer, ClientWriter::None)
+            || self.failed
+            || self
+                .publication_epoch
+                .is_some_and(|epoch| epoch != crate::sql::query::statement_effect_epoch())
+            // An attempt that may replay its routine calls could still repeat
+            // its rows; they stay queued until it can no longer restart.
+            || crate::sql::query::statement_attempt_may_restart()
+        {
             return;
         }
         loop {
@@ -208,6 +231,10 @@ impl<'b> OutputSink<'b> {
             }
             // A sent prefix cannot be rolled back by a statement retry.
             crate::sql::query::protect_statement_effects();
+            if self.publication_epoch.is_some() {
+                // This write is not itself an effect that needs publication.
+                self.publication_epoch = Some(crate::sql::query::statement_effect_epoch());
+            }
             send.consume(accepted);
             self.overflow.record_written(accepted);
             let _ = self.overflow.refill(send);
@@ -802,24 +829,20 @@ impl<'b> Responder<'b> {
         }
     }
 
-    /// Whether output after `mark` is still entirely unsent.
-    pub(crate) fn can_truncate_to(&self, mark: OutputMark) -> bool {
-        self.excess_since(mark).is_some()
-    }
-
-    /// Discards unsent output after `mark`. Output that already reached the
-    /// client cannot be retracted; callers check [`Self::can_truncate_to`]
-    /// where a prefix may have been written.
-    pub(crate) fn truncate_to(&mut self, mark: OutputMark) {
-        let excess = self
-            .excess_since(mark)
-            .expect("output after the mark is still unsent");
+    /// Discards unsent output after `mark` so a statement attempt can run
+    /// again. Output that already reached the client cannot be retracted, so
+    /// such an attempt fails with `0A000` instead of repeating rows.
+    pub(crate) fn truncate_to(&mut self, mark: OutputMark) -> Result<(), SqlError> {
+        let Some(excess) = self.excess_since(mark) else {
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "statement cannot restart after part of its result reached the client"
+            ));
+        };
         let overflow = self.output.as_mut().map(|sink| &mut *sink.overflow);
-        assert!(super::overflow::truncate_output(
-            self.buffer,
-            overflow,
-            excess
-        ));
+        let truncated = super::overflow::truncate_output(self.buffer, overflow, excess);
+        debug_assert!(truncated, "unsent output covers the excess");
+        Ok(())
     }
 
     /// The last `bytes` of queued output (one complete message or less).
@@ -873,7 +896,7 @@ impl<'b> Responder<'b> {
         let Some(sink) = self.output.as_mut() else {
             return Self::append_message(self.buffer, &build);
         };
-        if sink.promotion == Promotion::Requested {
+        if matches!(sink.promotion, Promotion::Requested { .. }) {
             // The attempt is being discarded; nothing more of it may queue.
             return Err(WireFull);
         }
@@ -894,7 +917,7 @@ impl<'b> Responder<'b> {
                 && epoch == crate::sql::query::statement_effect_epoch()
                 && crate::sql::sequence::ensure_statement_effects_replayable().is_ok();
             if restartable {
-                sink.promotion = Promotion::Requested;
+                sink.promotion = Promotion::Requested { mark };
                 return Err(WireFull);
             }
             sink.promotion = Promotion::Declined(SpoolReason::Effects);
@@ -946,16 +969,20 @@ impl<'b> Responder<'b> {
         }
     }
 
-    /// Ends a statement's promotion decision: whether it requested a stream,
-    /// and why its overflow queued instead.
-    pub(crate) fn finish_promotion(&mut self) -> (bool, Option<SpoolReason>) {
+    /// Ends a statement's promotion decision: the mark of a requested stream
+    /// (output after it belongs to the discarded attempt), and why its
+    /// overflow queued instead.
+    pub(crate) fn finish_promotion(&mut self) -> (Option<OutputMark>, Option<SpoolReason>) {
         let Some(sink) = self.output.as_mut() else {
-            return (false, None);
+            return (None, None);
         };
         if sink.promotion == Promotion::Disabled {
-            return (false, None);
+            return (None, None);
         }
-        let requested = sink.promotion == Promotion::Requested;
+        let requested = match sink.promotion {
+            Promotion::Requested { mark } => Some(mark),
+            _ => None,
+        };
         sink.promotion = Promotion::Allowed;
         (requested, sink.spooled.take())
     }
@@ -1936,7 +1963,7 @@ impl<'b> Responder<'b> {
         }
     }
 
-    /// Forwards complete pre-encoded wire messages.
+    /// Forwards complete pre-encoded wire messages; rows are bulk output.
     pub fn raw(&mut self, bytes: &[u8]) -> Result<(), WireFull> {
         let mut rest = bytes;
         while !rest.is_empty() {
@@ -1948,7 +1975,14 @@ impl<'b> Responder<'b> {
                 .filter(|length| *length >= 5 && *length <= rest.len())
                 .expect("raw output holds complete backend messages");
             let (message, tail) = rest.split_at(length);
-            self.control(|buffer| {
+            // Rows may only queue in the shared spool; the private reserve
+            // stays free for the result's closing messages.
+            let class = if matches!(message[0], wire::MSG_DATA_ROW | b'd') {
+                OutputClass::Bulk
+            } else {
+                OutputClass::Control
+            };
+            self.emit(class, |buffer| {
                 if buffer.append(message) {
                     Ok(())
                 } else {
@@ -2012,7 +2046,8 @@ impl<'b> Responder<'b> {
             Ok(None)
         };
         // Also remove success if the statement reservation cannot retain it.
-        self.truncate_to(start);
+        self.truncate_to(start)
+            .expect("the completion checked above is still unsent");
         retained
     }
 
@@ -2213,9 +2248,8 @@ impl<'b> Responder<'b> {
     /// stays, and the error follows it as in a PostgreSQL result that fails
     /// midway. The message names the exhausted setting.
     pub fn replace_with_overflow_error(&mut self, mark: OutputMark) -> Result<(), WireFull> {
-        if self.can_truncate_to(mark) {
-            self.truncate_to(mark);
-        }
+        // Output that already reached the client stays; the error follows it.
+        let _ = self.truncate_to(mark);
         let exhaustion = self
             .output
             .as_mut()
@@ -2269,7 +2303,7 @@ mod tests {
             let mark = responder.mark();
             responder.data_row(core::slice::from_ref(&row)).unwrap();
             responder.notice("00000", "rolled back").unwrap();
-            responder.truncate_to(mark);
+            responder.truncate_to(mark).unwrap();
             assert_eq!(responder.mark(), mark);
             responder.command_complete("SELECT 3").unwrap();
             assert_eq!(responder.completion_tag().unwrap().as_str(), "SELECT 3");
@@ -2307,6 +2341,43 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn publication_guard_stops_early_writes_after_an_effect() {
+        use crate::mem::lease_pool::{LeasePool, Purpose};
+        use crate::pg::overflow::ResultOverflow;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let (writer, _reader) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let mut budget = crate::mem::Budget::new(1 << 20);
+        let spool = LeasePool::new(&mut budget, Purpose::RESULT_SPOOL, 1 << 16, 1).unwrap();
+        let mut overflow = ResultOverflow::new(&mut budget, 256).unwrap();
+        let mut send = super::FixedBuf::new(&mut budget, "send", 256).unwrap();
+        let row = crate::sql::types::Datum::Text("abcdefghijklmnopqrstuvwx");
+        for (guarded, effect) in [(true, true), (true, false), (false, true)] {
+            send.clear();
+            overflow.reset();
+            let mut responder = super::Responder::new(&mut send).with_output(
+                super::OutputSink::new(
+                    &mut overflow,
+                    Some(spool.clone()),
+                    super::ClientWriter::Fd(writer.as_raw_fd()),
+                )
+                .guard_publication(guarded),
+            );
+            if effect {
+                crate::sql::query::protect_statement_effects();
+            }
+            for _ in 0..20 {
+                responder.data_row(core::slice::from_ref(&row)).unwrap();
+            }
+            drop(responder);
+            // With publication, output after an effect waits for it.
+            assert_eq!(overflow.written() == 0, guarded && effect);
+        }
+    }
+
+    #[test]
     fn promotion_requests_a_stream_only_before_effects_and_sent_bytes() {
         use crate::mem::lease_pool::{LeasePool, Purpose};
         use crate::pg::overflow::ResultOverflow;
@@ -2334,8 +2405,8 @@ mod tests {
             assert_eq!(full, WireFull);
             // A discarded attempt queues nothing more, not even errors.
             assert!(responder.error("XX000", "after the request").is_err());
-            assert_eq!(responder.finish_promotion(), (true, None));
-            responder.truncate_to(mark);
+            assert_eq!(responder.finish_promotion(), (Some(mark), None));
+            responder.truncate_to(mark).unwrap();
 
             // An effect before the first overflow keeps the statement on the spool.
             responder.arm_promotion();
@@ -2345,9 +2416,9 @@ mod tests {
             }
             assert_eq!(
                 responder.finish_promotion(),
-                (false, Some(super::SpoolReason::Effects))
+                (None, Some(super::SpoolReason::Effects))
             );
-            responder.truncate_to(mark);
+            responder.truncate_to(mark).unwrap();
 
             responder.decline_promotion(super::SpoolReason::Shape);
             for _ in 0..12 {
@@ -2355,7 +2426,7 @@ mod tests {
             }
             assert_eq!(
                 responder.finish_promotion(),
-                (false, Some(super::SpoolReason::Shape))
+                (None, Some(super::SpoolReason::Shape))
             );
             assert!(responder.promotion_allowed());
         });

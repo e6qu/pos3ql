@@ -75,6 +75,7 @@ statistics_bytes = 1MiB
 statistics_leases = 1024
 result_spool_bytes = 16MiB
 result_spool_leases = 64
+result_stream_bytes = 256KiB
 index_statistics_slots = 4096
 max_value_indexes = 64
 memtable_bytes = 256MiB

@@ -975,3 +975,151 @@ fn stream_rows_wait_for_locks_without_repeating_delivered_rows_or_effects() {
     let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
     assert_eq!(&kinds[kinds.len() - 2..], b"CZ");
 }
+
+#[test]
+fn publication_hold_keeps_output_after_early_writes_queued() {
+    let config = Config::default_dev();
+    let mut budget = Budget::new(256 << 20);
+    let mut conn = Conn::new(&config, &mut budget).unwrap();
+    assert!(conn.send.append(b"Z\0\0\0\x05I"));
+    // Early writes passed the hold mark: what remains follows the mark and
+    // must wait for publication instead of becoming flushable.
+    conn.publication_hold = Some(OutputMark::new(0, 0));
+    conn.overflow.record_written(10);
+    assert_eq!(conn.flushable_bytes(), 0);
+    assert!(!conn.wants_write());
+    conn.publication_hold = Some(OutputMark::new(6, conn.overflow.written()));
+    assert_eq!(conn.flushable_bytes(), 6);
+    conn.publication_hold = None;
+    assert!(conn.wants_write());
+}
+
+#[test]
+fn paged_portal_rows_use_the_spool_and_fail_by_name_when_it_is_full() {
+    for (spool_bytes, exhausted) in [(16 << 20, false), (1024, true)] {
+        let mut config = fixture_config(
+            crate::config::TransactionMode::Mvcc,
+            &format!("paged-{exhausted}"),
+            spool_bytes,
+        );
+        config.conn_send_buffer_bytes = 16 << 10;
+        let mut fixture = Fixture::with_config(config);
+        let (mut conn, mut client) = connection(&mut fixture, 1);
+        let mut input = frontend(
+            wire::FMSG_PARSE,
+            b"\0SELECT repeat('x', 1000) FROM generate_series(1, 60)\0\0\0",
+        );
+        input.extend_from_slice(&frontend(wire::FMSG_BIND, b"\0\0\0\0\0\0\0\0"));
+        input.extend_from_slice(&frontend(wire::FMSG_EXECUTE, b"\0\0\0\0\x32"));
+        input.extend_from_slice(&frontend(wire::FMSG_SYNC, b""));
+        client.write_all(&input).unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+        let response = messages(&response);
+        let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+        let rows = kinds.iter().filter(|kind| **kind == b'D').count();
+        if exhausted {
+            assert!(rows < 50);
+            assert_eq!(&kinds[kinds.len() - 2..], b"EZ");
+            let error = response[kinds.len() - 2].1;
+            assert_eq!(sqlstate_of(error), "54000");
+            assert!(
+                error
+                    .windows(b"result_spool_bytes".len())
+                    .any(|part| part == b"result_spool_bytes")
+            );
+        } else {
+            assert_eq!(rows, 50);
+            assert_eq!(&kinds[kinds.len() - 2..], b"sZ");
+        }
+        let response = run(&mut conn, &mut fixture.engine, &mut client, "SELECT 5");
+        assert!(
+            messages(&response)
+                .iter()
+                .any(|message| message.0 == b'D' && first_text(message.1) == "5")
+        );
+    }
+}
+
+#[test]
+fn queued_output_does_not_turn_a_lock_wait_into_a_client_wait() {
+    let mut fixture = fixture(crate::config::TransactionMode::Mvcc, "lock-park", 16 << 20);
+    let (mut conn, mut client) = connection(&mut fixture, 1);
+    let (mut holder, mut holder_client) = connection(&mut fixture, 2);
+    run(
+        &mut holder,
+        &mut fixture.engine,
+        &mut holder_client,
+        "BEGIN; SELECT pg_advisory_xact_lock(7)",
+    );
+    let mut sql = String::from(BIG);
+    sql.push_str("; SELECT pg_advisory_xact_lock(7)");
+    client.write_all(&query(&sql)).unwrap();
+    assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+    assert_eq!(conn.parked_wait(), Some(crate::sql::StatementWait::Lock));
+    assert!(conn.overflow_bytes() > 0);
+    // A wake whose lock is still held keeps the statement waiting for it.
+    let generation = fixture.engine.lock_generation() + 1;
+    if let Some(pending) = conn.retry_parked(&mut fixture.engine, KEY, generation, false) {
+        conn.finish_response(pending, None);
+    }
+    assert_eq!(conn.parked_wait(), Some(crate::sql::StatementWait::Lock));
+    assert!(conn.cancel_parked(&mut fixture.engine));
+    let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert_eq!(&kinds[kinds.len() - 2..], b"EZ");
+    assert_eq!(sqlstate_of(response[kinds.len() - 2].1), "57014");
+    run(
+        &mut holder,
+        &mut fixture.engine,
+        &mut holder_client,
+        "COMMIT",
+    );
+}
+
+#[test]
+fn routine_replays_never_repeat_or_panic_after_rows_reach_the_client() {
+    let mut fixture = fixture(
+        crate::config::TransactionMode::Mvcc,
+        "routine-replay",
+        16 << 20,
+    );
+    let (mut conn, mut client) = connection(&mut fixture, 1);
+    run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "CREATE TABLE audit(v int); CREATE FUNCTION audit_row(v int) RETURNS int \
+         LANGUAGE sql VOLATILE AS 'INSERT INTO audit VALUES ($1) RETURNING $1'",
+    );
+    // A first call after rows already left cannot replay the statement:
+    // it fails loudly instead of repeating rows.
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "SELECT g, repeat('x', 200), CASE WHEN g = 4000 THEN audit_row(g) END \
+         FROM generate_series(1, 5000) g",
+    );
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert_eq!(&kinds[kinds.len() - 2..], b"EZ");
+    assert_eq!(sqlstate_of(response[kinds.len() - 2].1), "0A000");
+    let rows: Vec<_> = response
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .collect();
+    assert_rows(&rows, rows.len());
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "SELECT count(*) FROM audit",
+    );
+    assert!(
+        messages(&response)
+            .iter()
+            .any(|message| message.0 == b'D' && first_text(message.1) == "0")
+    );
+}

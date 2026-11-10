@@ -1440,6 +1440,17 @@ pub(crate) fn statement_effect_epoch() -> u64 {
     STATEMENT_EFFECT_EPOCH.with(Cell::get)
 }
 
+/// Whether the running statement attempt has invoked a routine whose result
+/// a later attempt would replay. Such an attempt may still restart, so its
+/// output must not leave for the client yet.
+pub(crate) fn statement_attempt_may_restart() -> bool {
+    with_active_routine_invocations(|context| {
+        context.is_some_and(|(invocations, _)| {
+            invocations.next.get() != 0 || invocations.pending.get().is_some()
+        })
+    })
+}
+
 pub(crate) struct StatementReadEffectScope<'a> {
     previous: Option<core::ptr::NonNull<crate::checkpoint::AtomicBlockReadScope>>,
     _reads: Option<&'a crate::checkpoint::AtomicBlockReadScope>,

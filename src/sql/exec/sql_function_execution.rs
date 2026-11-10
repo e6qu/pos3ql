@@ -759,7 +759,7 @@ impl SqlExecution {
                                 )
                             })
                             .map_err(response_full)?;
-                        context.responder.truncate_to(output_mark);
+                        context.responder.truncate_to(output_mark)?;
                         result.map(|()| 0)
                     }
                 },

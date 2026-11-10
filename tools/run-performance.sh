@@ -308,6 +308,7 @@ statistics_bytes = $STATISTICS_BYTES
 statistics_leases = $STATISTICS_LEASES
 result_spool_bytes = 16MiB
 result_spool_leases = 64
+result_stream_bytes = 256KiB
 index_statistics_slots = $INDEX_STATISTICS_SLOTS
 value_index_rows = $TABLE_CAPACITY
 max_value_indexes = 24

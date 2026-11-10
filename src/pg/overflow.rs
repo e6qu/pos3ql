@@ -9,7 +9,9 @@
 //! `result_spool_bytes` pool and returned as soon as it drains. The private
 //! reserve has `conn_send_buffer_bytes` and is never shared, so the terminal
 //! messages of a result (CommandComplete, ErrorResponse, ReadyForQuery) always
-//! fit even when other connections hold the whole spool.
+//! fit even when other connections hold the whole spool. Every message is
+//! encoded in the private reserve first, so one message larger than
+//! `conn_send_buffer_bytes` fails with an error naming that setting.
 
 use std::sync::Arc;
 
@@ -36,6 +38,10 @@ pub(crate) enum OverflowExhaustion {
     Spool(LeaseError),
     /// No shared spool is attached to this output.
     NoSpool,
+    /// One message is larger than the reserve it is encoded in.
+    MessageTooLarge,
+    /// Closing messages already occupy the reserve after the spool filled.
+    ReserveInUse,
 }
 
 impl core::fmt::Display for OverflowExhaustion {
@@ -46,6 +52,11 @@ impl core::fmt::Display for OverflowExhaustion {
                 "statement response exceeds the client output spool: {error}"
             ),
             Self::NoSpool => f.write_str("statement response exceeds its configured buffer"),
+            Self::MessageTooLarge => f.write_str("a result message exceeds conn_send_buffer_bytes"),
+            Self::ReserveInUse => f.write_str(
+                "statement response exceeds the client output spool \
+                 (result_spool_bytes, result_spool_leases)",
+            ),
         }
     }
 }
@@ -130,11 +141,13 @@ impl ResultOverflow {
         if !self.private.is_empty() {
             // The private reserve is the tail; ordering keeps later output there.
             if class == OutputClass::Bulk {
-                return Err(self.exhaust(OverflowExhaustion::NoSpool));
+                return Err(self.exhaust(OverflowExhaustion::ReserveInUse));
             }
             return Self::build_into(&mut self.private, build);
         }
-        Self::build_into(&mut self.private, build)?;
+        if Self::build_into(&mut self.private, build).is_err() {
+            return Err(self.exhaust(OverflowExhaustion::MessageTooLarge));
+        }
         let Some(spool) = spool else {
             if class == OutputClass::Bulk {
                 self.private.clear();
@@ -308,6 +321,11 @@ impl OutputMark {
             .excess(send.len(), self.written)
             .expect("mark precedes send");
         send.truncate_to(send.mark() - excess);
+    }
+
+    /// Whether this mark was taken no later than `other` within one output.
+    pub(crate) fn precedes(self, other: Self) -> bool {
+        self.queued + self.written as usize <= other.queued + other.written as usize
     }
 
     /// Unsent bytes to remove so the output ends at this mark, or `None`

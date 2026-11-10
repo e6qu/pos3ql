@@ -42,6 +42,15 @@ fn output<'a>(send: &'a mut FixedBuf, overflow: &'a mut ResultOverflow) -> Respo
     Responder::new(send).with_output(OutputSink::new(overflow, None, ClientWriter::None))
 }
 
+/// Like [`output`], with the shared spool for forwarded rows.
+fn spooled_output<'a>(
+    send: &'a mut FixedBuf,
+    overflow: &'a mut ResultOverflow,
+    spool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+) -> Responder<'a> {
+    Responder::new(send).with_output(OutputSink::new(overflow, Some(spool), ClientWriter::None))
+}
+
 /// PostgreSQL's unsigned 16-bit Parse/Bind parameter boundary.
 pub const MAX_BIND_PARAMS: usize = crate::sql::prep::MAX_PREP_PARAMS;
 
@@ -755,7 +764,11 @@ impl Conn {
     fn flushable_bytes(&self) -> usize {
         let queued = self.send.len() + self.overflow.len();
         match self.publication_hold {
-            Some(mark) => queued - mark.excess(queued, self.overflow.written()).unwrap_or(0),
+            // Once early writes passed the mark, everything still queued
+            // follows it and waits for publication.
+            Some(mark) => mark
+                .excess(queued, self.overflow.written())
+                .map_or(0, |excess| queued - excess),
             None => queued,
         }
     }
@@ -1321,11 +1334,15 @@ impl Conn {
         self.parked = false;
         let output_mark = self.output_mark();
         self.publication_hold = Some(output_mark);
+        let mut resuming = true;
         let after = loop {
-            if !self.overflow.is_empty() {
+            // The parked message resumes even while earlier output is queued;
+            // only a following message waits for the client.
+            if !resuming && !self.overflow.is_empty() {
                 self.park(crate::sql::StatementWait::ClientOutput, 0);
                 break After::Continue;
             }
+            resuming = false;
             let step = match self.phase {
                 Phase::AwaitLoginCommit => self.finish_startup(engine, cancel_key),
                 _ => self.process_message(engine),
@@ -4069,6 +4086,7 @@ impl Conn {
                     };
                     let mut responder = Responder::for_execute(&mut self.send, rfmt).with_output(
                         OutputSink::new(&mut self.overflow, Some(engine.result_spool()), writer)
+                            .guard_publication(engine.publication_required())
                             .allow_promotion(),
                     );
                     let result = engine.execute_extended_selected(
@@ -4106,29 +4124,35 @@ impl Conn {
                 let pending = engine
                     .take_pending_result_stream()
                     .expect("a promoted statement records its source");
-                assert!(
-                    truncate_connection_output(&mut self.send, &mut self.overflow, send_mark),
-                    "a promoted statement sent no output"
+                let discarded = truncate_connection_output(
+                    &mut self.send,
+                    &mut self.overflow,
+                    pending.output_mark,
                 );
                 let opened = {
                     let mut responder = Responder::for_execute(&mut self.send, rfmt).with_output(
                         OutputSink::new(&mut self.overflow, None, ClientWriter::None).for_stream(),
                     );
-                    match engine.open_result_stream(
-                        &mut self.result_stream,
-                        crate::sql::cursor::StreamProtocol::Extended {
-                            portal: portal_slot,
-                        },
-                        text,
-                        params,
-                        param_oids,
-                        pending.owner,
-                        pending.deadline,
-                        &mut self.txn,
-                        &self.guc,
-                        &mut responder,
-                        self.id,
-                    ) {
+                    match discarded
+                        .then_some(())
+                        .ok_or_else(promoted_output_sent)
+                        .and_then(|()| {
+                            engine.open_result_stream(
+                                &mut self.result_stream,
+                                crate::sql::cursor::StreamProtocol::Extended {
+                                    portal: portal_slot,
+                                },
+                                text,
+                                params,
+                                param_oids,
+                                pending.owner,
+                                pending.deadline,
+                                &mut self.txn,
+                                &self.guc,
+                                &mut responder,
+                                self.id,
+                            )
+                        }) {
                         Ok(()) => Ok(true),
                         Err(error) => engine
                             .fail_result_stream(
@@ -4183,9 +4207,13 @@ impl Conn {
                     if paged {
                         // Forward the buffered error output.
                         let portal = &mut self.portals[portal_slot];
-                        let bytes_ok = output(&mut self.send, &mut self.overflow)
-                            .raw(portal.result.readable())
-                            .is_ok();
+                        let bytes_ok = spooled_output(
+                            &mut self.send,
+                            &mut self.overflow,
+                            engine.result_spool(),
+                        )
+                        .raw(portal.result.readable())
+                        .is_ok();
                         portal.result.clear();
                         if !bytes_ok {
                             return Step::Close;
@@ -4226,9 +4254,10 @@ impl Conn {
             if let Some((setup, deadline)) = pending_copy {
                 if paged {
                     let portal = &mut self.portals[portal_slot];
-                    let bytes_ok = output(&mut self.send, &mut self.overflow)
-                        .raw(portal.result.readable())
-                        .is_ok();
+                    let bytes_ok =
+                        spooled_output(&mut self.send, &mut self.overflow, engine.result_spool())
+                            .raw(portal.result.readable())
+                            .is_ok();
                     portal.result.clear();
                     if !bytes_ok {
                         engine.copy_abort(&mut self.txn, &self.guc);
@@ -4306,16 +4335,24 @@ impl Conn {
                 };
             }
             // A page can exceed the send buffer; the overflow keeps it whole.
-            if Responder::new(&mut self.send)
-                .with_output(OutputSink::new(
-                    &mut self.overflow,
-                    Some(engine.result_spool()),
-                    ClientWriter::None,
-                ))
-                .raw(&data[..total_msg])
-                .is_err()
-            {
-                return Step::Close;
+            let mut responder = Responder::new(&mut self.send).with_output(OutputSink::new(
+                &mut self.overflow,
+                Some(engine.result_spool()),
+                ClientWriter::None,
+            ));
+            if responder.raw(&data[..total_msg]).is_err() {
+                // The spool cannot hold this page: the rows already queued
+                // stay, then the named error, and input skips to Sync.
+                let mark = responder.mark();
+                let reported = responder.replace_with_overflow_error(mark);
+                portal.result.clear();
+                portal.active = false;
+                portal.execution = PortalExecution::Fresh;
+                self.phase = Phase::SkipToSync;
+                return match reported {
+                    Ok(()) => Step::Continue,
+                    Err(WireFull) => Step::Close,
+                };
             }
             if msg_type == wire::MSG_DATA_ROW {
                 sent += 1;
@@ -4421,6 +4458,7 @@ impl Conn {
                 };
                 let mut responder = Responder::new(&mut self.send).with_output(
                     OutputSink::new(&mut self.overflow, Some(engine.result_spool()), writer)
+                        .guard_publication(engine.publication_required())
                         .allow_promotion(),
                 );
                 let result = engine.execute_simple_from_selected(
@@ -4580,8 +4618,11 @@ impl Conn {
                 (true, Some(session), Some(socket)) => ClientWriter::Tls { session, socket },
                 (true, None, Some(socket)) => ClientWriter::Fd(socket.as_raw_fd()),
             };
-            let mut responder = Responder::for_execute(&mut self.send, formats)
-                .with_output(OutputSink::new(&mut self.overflow, None, writer).for_stream());
+            let mut responder = Responder::for_execute(&mut self.send, formats).with_output(
+                OutputSink::new(&mut self.overflow, None, writer)
+                    .for_stream()
+                    .guard_publication(engine.publication_required()),
+            );
             let step = engine.continue_result_stream(
                 &mut self.result_stream,
                 &self.arena,
@@ -4651,29 +4692,32 @@ impl Conn {
         let pending = engine
             .take_pending_result_stream()
             .expect("a promoted statement records its source");
-        assert!(
-            self.truncate_output(output_mark),
-            "a promoted statement sent no output"
-        );
+        debug_assert!(output_mark.precedes(pending.output_mark));
+        let discarded = self.truncate_output(pending.output_mark);
         let text = query_text(&self.recv, total);
         let source = &text[pending.source_start..pending.source_end];
         let failed = {
             let mut responder = Responder::new(&mut self.send).with_output(
                 OutputSink::new(&mut self.overflow, None, ClientWriter::None).for_stream(),
             );
-            match engine.open_result_stream(
-                &mut self.result_stream,
-                crate::sql::cursor::StreamProtocol::Simple { statement },
-                source,
-                &[],
-                &[],
-                pending.owner,
-                pending.deadline,
-                &mut self.txn,
-                &self.guc,
-                &mut responder,
-                self.id,
-            ) {
+            let opened = if discarded {
+                engine.open_result_stream(
+                    &mut self.result_stream,
+                    crate::sql::cursor::StreamProtocol::Simple { statement },
+                    source,
+                    &[],
+                    &[],
+                    pending.owner,
+                    pending.deadline,
+                    &mut self.txn,
+                    &self.guc,
+                    &mut responder,
+                    self.id,
+                )
+            } else {
+                Err(promoted_output_sent())
+            };
+            match opened {
                 Ok(()) => return None,
                 Err(error) => engine.fail_result_stream(
                     &mut self.result_stream,
@@ -4708,8 +4752,11 @@ impl Conn {
                 (true, Some(session), Some(socket)) => ClientWriter::Tls { session, socket },
                 (true, None, Some(socket)) => ClientWriter::Fd(socket.as_raw_fd()),
             };
-            let mut responder = Responder::new(&mut self.send)
-                .with_output(OutputSink::new(&mut self.overflow, None, writer).for_stream());
+            let mut responder = Responder::new(&mut self.send).with_output(
+                OutputSink::new(&mut self.overflow, None, writer)
+                    .for_stream()
+                    .guard_publication(engine.publication_required()),
+            );
             let step = engine.continue_result_stream(
                 &mut self.result_stream,
                 &self.arena,
@@ -5090,6 +5137,14 @@ impl Conn {
         }
         Ok(())
     }
+}
+
+/// A promoted attempt's output reached the client; the stream cannot start.
+fn promoted_output_sent() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "promoted statement output reached the client before its stream opened"
+    )
 }
 
 /// Discards a connection's unsent output after `mark`; false if some of it

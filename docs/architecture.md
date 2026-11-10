@@ -85,8 +85,12 @@ its session stays usable; an implicit transaction rolls back and an explicit
 one becomes failed. Notifications are held while a result is in progress and
 delivered after it. Bytes leave during a statement only where no object-store
 publication can follow: in local mode, and for a lone `SELECT`, `SHOW`,
-`VALUES` or `TABLE` in object-store mode; other output waits for durable
-publication before any byte is written.
+`VALUES` or `TABLE` in object-store mode until it starts an effect; other
+output waits for durable publication before any byte is written. A statement
+attempt that has called a SQL-language routine may still replay, so its rows
+stay queued until it finishes; if such a routine is first called after rows
+already reached the client, the statement fails with `0A000` instead of
+repeating them.
 
 **Large results resume row by row.** Before a top-level `SELECT` runs (simple
 Query, or an unpaged extended `Execute`), the engine decides whether it can
@@ -450,7 +454,7 @@ row-work memory.
 | `max_ddl_per_transaction` | DDL event controls per transaction; actual-length records use `table_metadata_bytes` |
 | `cursor_query_bytes` | Per-cursor query state, including the declared type IDs a `WITH HOLD` cursor keeps after commit |
 | `conn_send_buffer_bytes` | Reserved twice per connection: the send buffer and the private output reserve that holds a result's closing messages. The largest single backend message must fit it |
-| `result_stream_bytes` | One result stream per connection (starter: 256 KiB); zero disables streams. The estimate counts every resident row of the table, so a table with many uncheckpointed rows spools instead |
+| `result_stream_bytes` | One result stream per connection; required (starter: 256 KiB, minimum 64 KiB); zero disables streams. The estimate counts every resident row of the table, so a table with many uncheckpointed rows spools instead |
 | Held notifications | 64 KiB per connection for notifications that arrive while a result is in progress; a listener further behind is closed rather than sent a truncated stream |
 
 Tables store their actual columns, not a maximum-width array; dropped columns

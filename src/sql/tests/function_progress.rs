@@ -70,6 +70,15 @@ fn saved_advisory_unlock_results_survive_later_function_calls() {
         writer.success(&mut engine, "SELECT pg_advisory_lock(305)", true);
         assert_eq!(data_rows(&writer.success(&mut engine,
             "SELECT pg_advisory_unlock_all(),advisory_result_child(); SELECT last_value FROM advisory_result_numbers", true)), ["|2","2"]);
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT pg_stat_reset_shared(),pg_stat_reset_slru(),advisory_result_child(); \
+                SELECT last_value FROM advisory_result_numbers",
+                true
+            )),
+            ["||3", "3"]
+        );
         drop((writer, engine));
         std::fs::remove_dir_all(config.data_dir).unwrap();
     }

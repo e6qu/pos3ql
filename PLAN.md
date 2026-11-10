@@ -67,7 +67,9 @@ Complete these connected execution paths:
   Include combined commands, rules, data-modifying common table expressions,
   COPY, replication apply and deferred triggers. Retain the original command
   and rollback boundary, rather than undoing inserted rows before a constraint
-  can inspect them. Each insert/update/delete operation keeps its own completed
+  can inspect them. Replace the explicit row-progress rejection for multirow
+  updates with an owner for completed rows and the current callback; prove that
+  a child reads earlier changed rows before the next row is written. Each insert/update/delete operation keeps its own completed
   transition table and firing order.
 - Preserve remaining expression values, complex query positions and cursor
   progress. After the first result flush, continue with one header, every row

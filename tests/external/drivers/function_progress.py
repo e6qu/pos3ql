@@ -199,9 +199,11 @@ def result_order(host, port, user, protocol):
             connection.execute("SELECT pg_advisory_lock(305)")
             unlocked_all = connection.execute("SELECT pg_advisory_unlock_all(),lock_receipt()").fetchone()
             assert unlocked_all == ("", 42), unlocked_all
+            reset = connection.execute("SELECT pg_stat_reset_shared(),pg_stat_reset_slru(),lock_receipt()").fetchone()
+            assert reset == ("", "", 42), reset
             print(json.dumps(dict(protocol=protocol, shape="result_order", first=1,
                                   failed_row_sequence=2, written=[3,4], record_error="22003", empty=empty,
-                                  unlocked=unlocked, unlocked_all=unlocked_all), sort_keys=True))
+                                  unlocked=unlocked, unlocked_all=unlocked_all, reset=reset), sort_keys=True))
         finally:
             connection.execute("DROP SCHEMA sql_result_order_driver CASCADE")
 

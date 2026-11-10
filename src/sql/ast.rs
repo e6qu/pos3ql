@@ -505,6 +505,23 @@ impl TransactionIsolation {
     }
 }
 
+/// The spelling that opened a transaction block; PostgreSQL reports it as the
+/// command tag and in SQL-function errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionStart {
+    Begin,
+    StartTransaction,
+}
+
+impl TransactionStart {
+    pub const fn command_name(self) -> &'static str {
+        match self {
+            Self::Begin => "BEGIN",
+            Self::StartTransaction => "START TRANSACTION",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransactionCharacteristics {
     pub isolation: Option<TransactionIsolation>,
@@ -598,7 +615,7 @@ pub enum Stmt<'a> {
     Update(Update<'a>),
     Delete(Delete<'a>),
     Merge(Merge<'a>),
-    Begin(TransactionCharacteristics),
+    Begin(TransactionCharacteristics, TransactionStart),
     Commit,
     Rollback,
     PrepareTransaction(PreparedTransactionId),

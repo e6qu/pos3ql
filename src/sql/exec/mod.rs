@@ -36531,6 +36531,26 @@ pub(crate) fn validate_routine_body(
         });
     }
     let formal_scope = enter_routine_parameter_types(
+    // PostgreSQL's validator checks the final statement only when
+    // `check_function_bodies` is on and no argument is polymorphic.
+    let sql_result = if check_string_body
+        && !arguments[..argument_count]
+            .iter()
+            .any(|argument| argument.polymorphic_type().is_some())
+    {
+        super::query::RoutineResultContract::declared(
+            storage,
+            txn.txid,
+            kind,
+            &result_columns[..result_column_count],
+            parameters[..routine.arguments.len()]
+                .iter()
+                .any(|parameter| parameter.mode.is_output()),
+            arena,
+        )?
+    } else {
+        super::query::RoutineResultContract::Deferred
+    };
         &arguments[..argument_count],
         Some(&super::query::storage_catalog(storage, arena, txn.txid)),
         crate::sql::ast::Collation::None,
@@ -36560,16 +36580,11 @@ pub(crate) fn validate_routine_body(
                 resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
                 validate_plpgsql_parameter_names(&parameters[..routine.arguments.len()])?;
             } else {
-                let returns_void = matches!(
-                    kind,
-                    crate::storage::RoutineKind::Function { result }
-                        if result.ctype == ColType::Void
-                );
                 let program = super::query::parse_stored_routine_function_program(
                     body_kind,
                     body_text,
                     arena,
-                    returns_void,
+                    sql_result,
                     routine.name.name,
                     &arguments[..argument_count],
                     body_inputs,
@@ -36631,16 +36646,11 @@ pub(crate) fn validate_routine_body(
                 // The parsed PL/pgSQL program is the persisted contract. SQL
                 // routine dependency analysis applies only to LANGUAGE SQL.
             } else {
-                let returns_void = matches!(
-                    kind,
-                    crate::storage::RoutineKind::SetFunction { result }
-                        if result.ctype == ColType::Void
-                );
                 let program = super::query::parse_stored_routine_function_program(
                     body_kind,
                     body_text,
                     arena,
-                    returns_void,
+                    sql_result,
                     routine.name.name,
                     &arguments[..argument_count],
                     body_inputs,
@@ -36700,7 +36710,7 @@ pub(crate) fn validate_routine_body(
                     body_kind,
                     body_text,
                     arena,
-                    true,
+                    sql_result,
                     routine.name.name,
                     &arguments[..argument_count],
                     body_inputs,

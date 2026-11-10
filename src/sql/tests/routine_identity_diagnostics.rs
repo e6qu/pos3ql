@@ -23,6 +23,33 @@ pub(super) fn diagnostics(bytes: &[u8]) -> Vec<(char, String, String)> {
     found
 }
 
+/// Each error's SQLSTATE, message, DETAIL and cursor position, in wire order.
+pub(super) fn error_fields(bytes: &[u8]) -> Vec<(String, String, Option<String>, Option<String>)> {
+    let mut found = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let tag = bytes[offset];
+        let length = u32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        if tag == b'E' {
+            let payload = &bytes[offset + 5..offset + 1 + length];
+            let field = |key: u8| {
+                payload
+                    .split(|byte| *byte == 0)
+                    .find(|value| value.first() == Some(&key))
+                    .map(|value| String::from_utf8(value[1..].to_vec()).unwrap())
+            };
+            found.push((
+                field(b'C').unwrap(),
+                field(b'M').unwrap(),
+                field(b'D'),
+                field(b'P'),
+            ));
+        }
+        offset += 1 + length;
+    }
+    found
+}
+
 /// One expected diagnostic: (`N` or `E`, SQLSTATE, message).
 pub(super) type Expected = (char, &'static str, &'static str);
 

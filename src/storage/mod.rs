@@ -9467,6 +9467,32 @@ impl AggregateRoutine {
 }
 
 impl RoutineKind {
+    /// PostgreSQL's `prorettype` that a SQL-language body must produce, with
+    /// `record` for a procedure that has output parameters. `None` means the
+    /// final statement is unchecked: a `void` result or a procedure without
+    /// outputs.
+    pub(crate) fn checked_body_result(
+        self,
+        result_columns: &[RoutineArgumentDef],
+        output_parameters: bool,
+    ) -> Option<RoutineResult> {
+        let result = match self {
+            Self::Function { result } | Self::SetFunction { result } => result,
+            Self::TableFunction if result_columns.len() == 1 => RoutineResult {
+                ctype: result_columns[0].ctype,
+                user_type: result_columns[0].user_type,
+            },
+            Self::RecordFunction { .. } | Self::TableFunction => {
+                RoutineResult::builtin(ColType::Record)
+            }
+            Self::Procedure if output_parameters => RoutineResult::builtin(ColType::Record),
+            Self::Procedure | Self::Trigger | Self::EventTrigger | Self::Aggregate(_) => {
+                return None;
+            }
+        };
+        (result.ctype != ColType::Void).then_some(result)
+    }
+
     pub(crate) const fn function_result(self) -> Option<ColType> {
         match self {
             Self::Function { result } | Self::SetFunction { result } => Some(result.ctype),

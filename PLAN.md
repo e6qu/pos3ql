@@ -269,7 +269,14 @@ and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
 with `0A000` where PostgreSQL changes the catalog entry; `array_replace` takes
 the replacement's runtime type, so `array_replace('{a}'::refcursor[], 'a',
 'b')` fails with `42804` where PostgreSQL returns `{b}`; `information_schema`
-domains such as `cardinal_number` do not exist. The
+domains such as `cardinal_number` do not exist. `CREATE FUNCTION` checks that
+a SQL body ends with a result statement but not its column count or types, so
+`RETURNS integer AS 'SELECT 1, 2'` fails only when called (`42P13`, `Final
+statement must return exactly one column.`) and `RETURNS integer AS 'SELECT
+''a''::text'` converts at the call where PostgreSQL rejects the definition
+(`Actual return type is text.`). A polymorphic SQL function's runtime result
+mismatch names the declared type (`anyelement`) where PostgreSQL names the
+resolved one. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

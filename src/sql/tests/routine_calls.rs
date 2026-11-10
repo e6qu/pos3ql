@@ -3672,9 +3672,8 @@ fn empty_sql_bodies_are_void_routines_that_do_nothing() {
             "CREATE FUNCTION empty_integer() RETURNS integer LANGUAGE sql AS ''",
             &[(
                 'E',
-                "0A000",
-                "SQL function body must end with a SELECT query or data-modifying statement \
-                 with RETURNING",
+                "42P13",
+                "return type mismatch in function declared to return integer",
             )],
         ),
     ]);
@@ -3694,5 +3693,319 @@ fn empty_sql_bodies_are_void_routines_that_do_nothing() {
         [
             "CREATE OR REPLACE FUNCTION public.empty_atomic() RETURNS void LANGUAGE sql BEGIN ATOMIC\nEND|t"
         ]
+    );
+}
+
+/// PostgreSQL 18.6 `check_sql_stmt_retval` results, captured from a reference
+/// server: the declared type is named by `format_type_be`, and output
+/// parameters of a procedure form a `record`.
+#[test]
+fn sql_bodies_must_end_with_the_declared_result_statement() {
+    use super::routine_identity_diagnostics::error_fields;
+    const STATEMENT: &str =
+        "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.";
+    let config = test_config("sql-body-result-statement");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE result_rows(a integer); CREATE SCHEMA hidden; \
+         CREATE TYPE hidden.pair AS (a integer)",
+        true,
+    );
+    let mismatch = |session: &mut ConfiguredTransactionSession,
+                    engine: &mut Engine,
+                    sql: &str,
+                    declared: &str,
+                    detail: &str| {
+        let output = session.execute(engine, sql, true);
+        assert_eq!(
+            error_fields(&output),
+            [(
+                "42P13".to_owned(),
+                format!("return type mismatch in function declared to return {declared}"),
+                Some(detail.to_owned()),
+                None,
+            )],
+            "{sql}"
+        );
+    };
+    for (sql, declared) in [
+        (
+            "CREATE FUNCTION r() RETURNS integer LANGUAGE sql AS ''",
+            "integer",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS integer LANGUAGE sql AS ';;'",
+            "integer",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS integer LANGUAGE sql BEGIN ATOMIC END",
+            "integer",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS integer LANGUAGE sql \
+             AS 'INSERT INTO result_rows VALUES (1)'",
+            "integer",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS integer LANGUAGE sql \
+             AS 'SELECT 1; INSERT INTO result_rows VALUES (1)'",
+            "integer",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS integer LANGUAGE sql AS 'SELECT 1; COMMIT'",
+            "integer",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS SETOF integer LANGUAGE sql AS ''",
+            "integer",
+        ),
+        (
+            "CREATE FUNCTION r(OUT a integer, OUT b integer) LANGUAGE sql AS ''",
+            "record",
+        ),
+        (
+            "CREATE FUNCTION r(OUT a integer) LANGUAGE sql AS ''",
+            "integer",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS TABLE(a integer) LANGUAGE sql AS ''",
+            "integer",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS TABLE(a integer, b text) LANGUAGE sql AS ''",
+            "record",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS SETOF record LANGUAGE sql AS ''",
+            "record",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS integer[] LANGUAGE sql AS ''",
+            "integer[]",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS varchar(3) LANGUAGE sql AS ''",
+            "character varying",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS timestamptz LANGUAGE sql AS ''",
+            "timestamp with time zone",
+        ),
+        (
+            "CREATE FUNCTION r() RETURNS hidden.pair LANGUAGE sql AS ''",
+            "hidden.pair",
+        ),
+        (
+            "CREATE PROCEDURE r(OUT a integer) LANGUAGE sql AS ''",
+            "record",
+        ),
+        (
+            "CREATE PROCEDURE r(INOUT a integer) LANGUAGE sql BEGIN ATOMIC END",
+            "record",
+        ),
+        (
+            "CREATE PROCEDURE r(INOUT a integer) LANGUAGE sql \
+             AS 'SELECT 1; INSERT INTO result_rows VALUES (1)'",
+            "record",
+        ),
+    ] {
+        mismatch(&mut session, &mut engine, sql, declared, STATEMENT);
+    }
+    // With body checks off, PostgreSQL stores the routine and reports the
+    // mismatch when a call reaches it. Polymorphic arguments skip the check.
+    type Calls<'a> = &'a [(&'a str, &'a str, &'a str)];
+    let deferred: [(&str, Calls); 2] = [
+        (
+            "CREATE FUNCTION deferred_empty() RETURNS integer LANGUAGE sql AS ''; \
+             CREATE FUNCTION deferred_atomic() RETURNS integer LANGUAGE sql BEGIN ATOMIC END; \
+             CREATE FUNCTION deferred_write() RETURNS integer LANGUAGE sql \
+                 AS 'INSERT INTO result_rows VALUES (1)'; \
+             CREATE FUNCTION deferred_rows() RETURNS SETOF integer LANGUAGE sql AS ''; \
+             CREATE FUNCTION deferred_wide() RETURNS integer LANGUAGE sql AS 'SELECT 1, 2'",
+            &[
+                ("SELECT deferred_empty()", "integer", STATEMENT),
+                ("SELECT deferred_atomic()", "integer", STATEMENT),
+                ("SELECT deferred_write()", "integer", STATEMENT),
+                ("SELECT * FROM deferred_rows()", "integer", STATEMENT),
+                (
+                    "SELECT deferred_wide()",
+                    "integer",
+                    "Final statement must return exactly one column.",
+                ),
+            ],
+        ),
+        (
+            "CREATE PROCEDURE deferred_output(OUT a integer) LANGUAGE sql AS ''; \
+             CREATE PROCEDURE deferred_inout(INOUT a integer) LANGUAGE sql BEGIN ATOMIC END; \
+             CREATE PROCEDURE deferred_wide_output(INOUT a integer) LANGUAGE sql \
+                 AS 'SELECT 1, 2'; \
+             CREATE PROCEDURE deferred_narrow_output(INOUT a integer, OUT b integer) \
+                 LANGUAGE sql AS 'SELECT 1'",
+            &[
+                ("CALL deferred_output(NULL)", "record", STATEMENT),
+                ("CALL deferred_inout(1)", "record", STATEMENT),
+                (
+                    "CALL deferred_wide_output(1)",
+                    "record",
+                    "Final statement returns too many columns.",
+                ),
+                (
+                    "CALL deferred_narrow_output(1, NULL)",
+                    "record",
+                    "Final statement returns too few columns.",
+                ),
+            ],
+        ),
+    ];
+    for (definitions, calls) in deferred {
+        let output = session.execute(
+            &mut engine,
+            &format!("SET check_function_bodies = off; {definitions}; RESET check_function_bodies"),
+            true,
+        );
+        assert_eq!(error_fields(&output), [], "{definitions}");
+        for (sql, declared, detail) in calls {
+            mismatch(&mut session, &mut engine, sql, declared, detail);
+        }
+        session.success(
+            &mut engine,
+            "DROP ROUTINE IF EXISTS deferred_empty, deferred_atomic, deferred_write, deferred_rows, \
+                 deferred_wide, deferred_output, deferred_inout, deferred_wide_output, \
+                 deferred_narrow_output",
+            true,
+        );
+    }
+    session.success(
+        &mut engine,
+        "CREATE FUNCTION polymorphic_empty(x anyelement) RETURNS anyelement \
+             LANGUAGE sql AS ''",
+        true,
+    );
+    let output = session.success(
+        &mut engine,
+        "SELECT count(*) FROM result_rows; \
+         SELECT proname FROM pg_proc WHERE proname = 'polymorphic_empty'",
+        true,
+    );
+    assert_eq!(data_rows(&output), ["0", "polymorphic_empty"]);
+}
+
+/// Procedures with output parameters take the final statement's first row,
+/// including a data-modifying statement's RETURNING row, as PostgreSQL does.
+#[test]
+fn sql_procedure_outputs_come_from_the_final_statement_first_row() {
+    use super::routine_identity_diagnostics::error_fields;
+    let config = test_config("sql-procedure-output-rows");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(
+        &mut engine,
+        "CREATE TABLE output_rows(a integer); \
+         CREATE PROCEDURE first_row(INOUT a integer) LANGUAGE sql \
+             AS 'SELECT * FROM generate_series(a, a + 2)'; \
+         CREATE PROCEDURE returned_row(INOUT a integer, OUT b text) LANGUAGE sql \
+             AS 'INSERT INTO output_rows VALUES (a), (a + 1) RETURNING a, ''x'''; \
+         CALL first_row(4); CALL returned_row(7, NULL); \
+         SELECT a FROM output_rows ORDER BY a",
+        true,
+    );
+    assert_eq!(data_rows(&output), ["4", "7|x", "7", "8"]);
+    let output = session.execute(
+        &mut engine,
+        "CREATE PROCEDURE no_row(INOUT a integer) LANGUAGE sql AS 'SELECT 1 WHERE false'; \
+         CALL no_row(1)",
+        true,
+    );
+    assert_eq!(
+        error_fields(&output),
+        [(
+            "XX000".to_owned(),
+            "procedure returned null record".to_owned(),
+            None,
+            None
+        )]
+    );
+}
+
+/// PostgreSQL stores transaction control in an SQL body and rejects it, under
+/// `CreateCommandName`'s spelling, when execution reaches the statement.
+#[test]
+fn sql_bodies_reject_transaction_control_when_reached() {
+    use super::routine_identity_diagnostics::diagnostics;
+    let config = test_config("sql-body-transaction-control");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE control_rows(a integer); \
+         CREATE FUNCTION control_function() RETURNS void LANGUAGE sql \
+             AS 'INSERT INTO control_rows VALUES (1); COMMIT'; \
+         CREATE FUNCTION control_vacuum() RETURNS void LANGUAGE sql AS 'VACUUM'",
+        true,
+    );
+    let mut expect = |sql: &str, state: &str, message: &str| {
+        let output = session.execute(&mut engine, sql, true);
+        assert_eq!(
+            diagnostics(&output),
+            [('E', state.to_owned(), message.to_owned())],
+            "{sql}"
+        );
+    };
+    for (index, (statement, name)) in [
+        ("BEGIN", "BEGIN"),
+        ("START TRANSACTION", "START TRANSACTION"),
+        ("COMMIT", "COMMIT"),
+        ("END", "COMMIT"),
+        ("ROLLBACK", "ROLLBACK"),
+        ("ABORT", "ROLLBACK"),
+        ("SAVEPOINT a", "SAVEPOINT"),
+        ("RELEASE SAVEPOINT a", "RELEASE"),
+        ("ROLLBACK TO SAVEPOINT a", "ROLLBACK"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        expect(
+            &format!(
+                "CREATE PROCEDURE control_{index}() LANGUAGE sql \
+                 AS 'INSERT INTO control_rows VALUES (1); {statement}'; \
+                 CALL control_{index}()"
+            ),
+            "0A000",
+            &format!("{name} is not allowed in an SQL function"),
+        );
+    }
+    expect(
+        "SELECT control_function()",
+        "0A000",
+        "COMMIT is not allowed in an SQL function",
+    );
+    expect(
+        "SELECT control_vacuum()",
+        "25001",
+        "VACUUM cannot be executed from a function",
+    );
+    // CHECKPOINT is not transaction control; PostgreSQL runs it in a body.
+    session.success(
+        &mut engine,
+        "CREATE FUNCTION control_checkpoint() RETURNS void LANGUAGE sql AS 'CHECKPOINT'; \
+         SELECT control_checkpoint()",
+        true,
+    );
+    let output = session.success(
+        &mut engine,
+        "START TRANSACTION; SELECT count(*) FROM control_rows; END",
+        true,
+    );
+    assert_eq!(data_rows(&output), ["0"]);
+    assert!(
+        output
+            .windows(b"START TRANSACTION\0".len())
+            .any(|window| window == b"START TRANSACTION\0")
     );
 }

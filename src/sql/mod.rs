@@ -982,7 +982,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         }
         Stmt::Select(_)
         | Stmt::SetQuery(_)
-        | Stmt::Begin(_)
+        | Stmt::Begin(..)
         | Stmt::Commit
         | Stmt::Rollback
         | Stmt::PrepareTransaction(_)
@@ -11712,7 +11712,7 @@ impl Engine {
                     responder.error(e.sqlstate, e.message.as_str())?;
                     return Ok(ExecutionStatus::Complete);
                 }
-                if matches!(statement, Stmt::Begin(_))
+                if matches!(statement, Stmt::Begin(..))
                     && txn.is_implicit()
                     && let Err(error) = self.commit_txn_with_triggers(
                         txn,
@@ -12575,7 +12575,7 @@ impl Engine {
                                     && index_completion.is_none()
                                     && !matches!(
                                         statement,
-                                        Stmt::Begin(_)
+                                        Stmt::Begin(..)
                                             | Stmt::Commit
                                             | Stmt::Rollback
                                             | Stmt::PrepareTransaction(_)
@@ -17824,20 +17824,57 @@ impl Engine {
                             output_count += 1;
                         }
                     }
-                    // An empty body is a procedure that does nothing.
-                    if statement_count == 0 && output_count != 0 {
-                        return Ok(Err(sql_err!(
-                            sqlstate::INVALID_FUNCTION_DEFINITION,
-                            "SQL procedure with output parameters must end with a query"
+                    // Output parameters form a `record` that the final statement
+                    // must produce; PostgreSQL checks it before running the body.
+                    if output_count != 0
+                        && !statement_count
+                            .checked_sub(1)
+                            .and_then(|last| statements[last].as_ref())
+                            .is_some_and(|statement| {
+                                matches!(statement, Stmt::Select(_) | Stmt::SetQuery(_))
+                                    || query::statement_returns_rows(statement)
+                            })
+                    {
+                        return Ok(Err(query::routine_result_mismatch(
+                            "record",
+                            query::ROUTINE_RESULT_STATEMENT_DETAIL,
                         )));
                     }
                     let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
                     let mut output_rows = 0usize;
+                    // The final statement's first row supplies the outputs.
+                    let mut store_output = |values: &[Datum<'_>]| -> Result<(), SqlError> {
+                        if output_rows != 0 {
+                            return Ok(());
+                        }
+                        if values.len() != output_count {
+                            return Err(query::routine_result_mismatch(
+                                "record",
+                                if values.len() > output_count {
+                                    "Final statement returns too many columns."
+                                } else {
+                                    "Final statement returns too few columns."
+                                },
+                            ));
+                        }
+                        let encoded = exec::encode_projected_pub(values, arena)?;
+                        for (column, output) in output_values[..output_count].iter_mut().enumerate()
+                        {
+                            *output = exec::decode_projected_col_record(encoded, column, arena)?;
+                        }
+                        output_rows = 1;
+                        Ok(())
+                    };
                     for (index, statement) in statements[..statement_count]
                         .iter()
                         .map(|statement| statement.as_ref().expect("parsed procedure statement"))
                         .enumerate()
                     {
+                        if let Some(name) = query::routine_statement_forbidden(statement) {
+                            // An error replaces only output the client has not received.
+                            let _ = responder.truncate_to(output_mark);
+                            return Ok(Err(query::routine_forbidden_statement_error(name)));
+                        }
                         let statement = match query::bind_stored_routine_statement(
                             statement,
                             &self.storage,
@@ -17850,36 +17887,21 @@ impl Engine {
                             Ok(statement) => statement,
                             Err(error) => return Ok(Err(error)),
                         };
-                        if matches!(statement, Stmt::Commit) {
-                            return Ok(Err(sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "COMMIT is not allowed in an SQL function"
-                            )));
-                        }
-                        if matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_)) {
-                            return Ok(Err(sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "ROLLBACK is not allowed in an SQL function"
-                            )));
-                        }
                         // A top-level CALL has no enclosing query workspace; reclaim each
                         // suppressed internal result exactly as the ordinary dispatcher
                         // did before routine dispatch gained a non-resetting mode.
                         self.work.reset();
-                        if output_count != 0 && index + 1 == statement_count {
-                            let output_query = match statement {
-                                Stmt::Select(select) => Some(query::RoutineQuery::Select(select)),
-                                Stmt::SetQuery(set) => Some(query::RoutineQuery::Set(set)),
-                                _ => None,
-                            };
-                            let Some(output_query) = output_query else {
-                                // An error replaces only output the client has not received.
-                                let _ = responder.truncate_to(output_mark);
-                                return Ok(Err(sql_err!(
-                                    sqlstate::INVALID_FUNCTION_DEFINITION,
-                                    "SQL procedure with output parameters must end with a query"
-                                )));
-                            };
+                        let final_output = output_count != 0 && index + 1 == statement_count;
+                        let output_query = match statement {
+                            Stmt::Select(select) if final_output => {
+                                Some(query::RoutineQuery::Select(select))
+                            }
+                            Stmt::SetQuery(set) if final_output => {
+                                Some(query::RoutineQuery::Set(set))
+                            }
+                            _ => None,
+                        };
+                        if let Some(output_query) = output_query {
                             let sequence =
                                 sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                             if let Err(error) = query::execute_bound_routine_query(
@@ -17892,42 +17914,18 @@ impl Engine {
                                 &completed[..declared.argument_count],
                                 false,
                                 Some(&sequence),
-                                &mut |values| {
-                                    if values.len() != output_count {
-                                        return Err(sql_err!(
-                                            sqlstate::SYNTAX_ERROR,
-                                            "SQL procedure query returns {} columns but {} output parameters were declared",
-                                            values.len(),
-                                            output_count
-                                        ));
-                                    }
-                                    if output_rows != 0 {
-                                        return Err(sql_err!(
-                                            sqlstate::CARDINALITY_VIOLATION,
-                                            "SQL procedure output query returned more than one row"
-                                        ));
-                                    }
-                                    let encoded = exec::encode_projected_pub(values, arena)?;
-                                    for (column, output) in
-                                        output_values[..output_count].iter_mut().enumerate()
-                                    {
-                                        *output = exec::decode_projected_col_record(
-                                            encoded, column, arena,
-                                        )?;
-                                    }
-                                    output_rows = 1;
-                                    Ok(())
-                                },
+                                &mut |values| store_output(values),
                             ) {
                                 // An error replaces only output the client has not received.
                                 let _ = responder.truncate_to(output_mark);
                                 return Ok(Err(error));
                             }
-                            if output_rows == 0 {
-                                output_values[..output_count].fill(Datum::Null);
-                            }
                             continue;
                         }
+                        let mut capture =
+                            |_: &Storage, _: u32, _: &dyn SequenceAccess, values: &[Datum<'_>]| {
+                                store_output(values)
+                            };
                         match self.execute_routine_stmt(
                             statement,
                             arena,
@@ -17937,7 +17935,7 @@ impl Engine {
                             cursors,
                             guc,
                             responder,
-                            None,
+                            final_output.then_some(&mut capture as &mut ReturningCapture<'_>),
                         ) {
                             Ok(Ok(())) => {}
                             Ok(Err(error)) => {
@@ -17951,6 +17949,13 @@ impl Engine {
                                 return Err(error);
                             }
                         }
+                    }
+                    if output_count != 0 && output_rows == 0 {
+                        let _ = responder.truncate_to(output_mark);
+                        return Ok(Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "procedure returned null record"
+                        )));
                     }
                     if let Err(error) = responder.truncate_to(output_mark) {
                         return Ok(Err(error));
@@ -18770,7 +18775,7 @@ impl Engine {
             )
         }) && !matches!(
             statement,
-            Stmt::Begin(_)
+            Stmt::Begin(..)
                 | Stmt::Commit
                 | Stmt::Rollback
                 | Stmt::PrepareTransaction(_)
@@ -20808,14 +20813,14 @@ impl Engine {
                         responder,
                     },
                 ),
-            Stmt::Begin(characteristics) => {
+            Stmt::Begin(characteristics, start) => {
                 if txn.is_explicit() {
                     // PostgreSQL warns and continues.
                     responder.warning(
                         crate::sql::eval::sqlstate::ACTIVE_SQL_TRANSACTION,
                         "there is already a transaction in progress",
                     )?;
-                    responder.command_complete("BEGIN")?;
+                    responder.command_complete(start.command_name())?;
                     return Ok(Ok(()));
                 }
                 if let Err(error) = self.ensure_txn(txn, TxnMode::Explicit, guc) {
@@ -20827,7 +20832,7 @@ impl Engine {
                     return Ok(Err(error));
                 }
                 txn.apply_begin_characteristics(*characteristics);
-                responder.command_complete("BEGIN")?;
+                responder.command_complete(start.command_name())?;
                 Ok(Ok(()))
             }
             Stmt::Commit => {
@@ -21732,7 +21737,7 @@ impl Engine {
             };
             if matches!(
                 statement,
-                Stmt::Begin(_)
+                Stmt::Begin(..)
                     | Stmt::Commit
                     | Stmt::Rollback
                     | Stmt::Savepoint(_)

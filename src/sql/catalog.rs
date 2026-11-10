@@ -13873,6 +13873,28 @@ fn routine_declared_signature<'a>(
         .map_err(|_| super::eval::arena_full())
 }
 
+/// Names a routine type as PostgreSQL's `format_type_be` does: a named type
+/// is schema-qualified only when its schema is not on the search path.
+pub(crate) fn routine_type_display<'a>(
+    storage: &Storage,
+    txid: u32,
+    result: crate::storage::RoutineResult,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let mut text = StackStr::<320>::new();
+    let qualified = result
+        .user_type
+        .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
+    write_routine_type_name(&mut text, result.ctype, result.user_type, qualified)
+        .map_err(|_| super::eval::arena_full())?;
+    if text.is_truncated() {
+        return Err(super::eval::arena_full());
+    }
+    arena
+        .alloc_str(text.as_str())
+        .map_err(|_| super::eval::arena_full())
+}
+
 fn write_routine_type_name(
     output: &mut impl core::fmt::Write,
     ctype: ColType,

@@ -83,6 +83,13 @@ Functions and expressions:
 - Stored defaults keep the objects and overloads chosen at creation, even after
   renames, schema moves, or new overloads; `nextval('order_numbers'::text)`
   looks the name up at each call.
+- A SQL function or procedure with a result must end with a `SELECT` or a
+  data-modifying statement with `RETURNING`. Otherwise `CREATE` fails with
+  `42P13` (`return type mismatch in function declared to return integer`);
+  with `check_function_bodies = off` the error comes from the first call.
+  Procedure output parameters take the final statement's first row.
+  Transaction control in a SQL body (`COMMIT`, `SAVEPOINT`) is stored, and a
+  call that reaches it fails with `0A000`, as in PostgreSQL.
 - A built-in function cannot implement `CREATE CAST` or `CREATE OPERATOR`
   (`0A000`). Aggregate support functions can name supported built-ins.
 - A missing-function message that does not fit the fixed 192-byte error

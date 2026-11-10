@@ -34354,7 +34354,7 @@ fn set_show_transaction_and_show_all() {
     assert!(run("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE").contains("SET"));
     assert!(run("BEGIN ISOLATION LEVEL REPEATABLE READ").contains("BEGIN"));
     assert!(run("ROLLBACK").contains("ROLLBACK"));
-    assert!(run("START TRANSACTION READ ONLY").contains("BEGIN"));
+    assert!(run("START TRANSACTION READ ONLY").contains("START TRANSACTION"));
     assert!(run("ROLLBACK").contains("ROLLBACK"));
     assert!(
         run("BEGIN ISOLATION LEVEL READ COMMITTED, READ WRITE, NOT DEFERRABLE").contains("BEGIN")
@@ -41101,7 +41101,8 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
              SELECT clean_routine_value()",
         );
         assert!(
-            String::from_utf8_lossy(&void_transaction_control).contains("25001"),
+            String::from_utf8_lossy(&void_transaction_control)
+                .contains("SAVEPOINT is not allowed in an SQL function"),
             "{}",
             String::from_utf8_lossy(&void_transaction_control)
         );
@@ -41128,7 +41129,8 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
              SELECT transaction_control_in_function()",
         );
         assert!(
-            String::from_utf8_lossy(&transaction_control).contains("25001"),
+            String::from_utf8_lossy(&transaction_control)
+                .contains("SAVEPOINT is not allowed in an SQL function"),
             "{}",
             String::from_utf8_lossy(&transaction_control)
         );
@@ -41364,7 +41366,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
                AS 'INSERT INTO routine_lookup VALUES (3, 42)'",
         );
         assert!(
-            String::from_utf8_lossy(&invalid_body).contains("0A000"),
+            String::from_utf8_lossy(&invalid_body).contains("42P13"),
             "{}",
             String::from_utf8_lossy(&invalid_body)
         );
@@ -94186,9 +94188,16 @@ fn type_reference_moves_sequence_programs_require_session_execution() {
         "SELECT 0 UNION ALL SELECT nextval('s')",
         "SELECT currval('s'); SELECT 0",
     ] {
-        let program =
-            query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
-                .unwrap();
+        let program = query::parse_routine_function_program(
+            body,
+            &arena,
+            query::RoutineResultContract::Returns("integer"),
+            "f",
+            &[],
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(
             query::routine_program_access(&program),
             query::RoutineProgramAccess::Sequences,
@@ -94202,9 +94211,16 @@ fn type_reference_moves_sequence_programs_require_session_execution() {
         "SELECT nextval('s'); INSERT INTO t VALUES(1) RETURNING 1",
         "WITH changed AS(INSERT INTO t VALUES(1) RETURNING id) SELECT id FROM changed",
     ] {
-        let program =
-            query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
-                .unwrap();
+        let program = query::parse_routine_function_program(
+            body,
+            &arena,
+            query::RoutineResultContract::Returns("integer"),
+            "f",
+            &[],
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(
             query::routine_program_access(&program),
             query::RoutineProgramAccess::Engine,
@@ -94212,9 +94228,16 @@ fn type_reference_moves_sequence_programs_require_session_execution() {
         );
     }
     for body in ["SELECT 1", "SELECT abs(-1)", "SELECT random()"] {
-        let program =
-            query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
-                .unwrap();
+        let program = query::parse_routine_function_program(
+            body,
+            &arena,
+            query::RoutineResultContract::Returns("integer"),
+            "f",
+            &[],
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(
             query::routine_program_access(&program),
             query::RoutineProgramAccess::ReadOnly,

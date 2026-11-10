@@ -1737,13 +1737,19 @@ impl<'a> Parser<'a> {
             Tok::Ident("begin") => {
                 self.advance()?;
                 let characteristics = self.transaction_modifiers(true)?;
-                Ok(Stmt::Begin(characteristics))
+                Ok(Stmt::Begin(
+                    characteristics,
+                    crate::sql::ast::TransactionStart::Begin,
+                ))
             }
             Tok::Ident("start") => {
                 self.advance()?;
                 self.expect_ident("transaction")?;
                 let characteristics = self.transaction_modifiers(false)?;
-                Ok(Stmt::Begin(characteristics))
+                Ok(Stmt::Begin(
+                    characteristics,
+                    crate::sql::ast::TransactionStart::StartTransaction,
+                ))
             }
             Tok::Ident("commit") | Tok::Ident("end") => {
                 self.advance()?;
@@ -11975,7 +11981,7 @@ mod tests {
                 assert!(matches!(expression, Expr::IsNull { negated: true, .. }));
                 assert!(matches!(
                     p.next_stmt().unwrap().unwrap(),
-                    Stmt::Begin(TransactionCharacteristics::EMPTY)
+                    Stmt::Begin(TransactionCharacteristics::EMPTY, _)
                 ));
                 assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Commit));
                 assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Rollback));

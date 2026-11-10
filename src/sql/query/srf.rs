@@ -5959,7 +5959,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 routine.body_kind,
                 body,
                 arena,
-                scalar_result == Some(ColType::Void),
+                super::RoutineResultContract::stored(storage, txid, routine, arena)?,
                 name,
                 routine.arguments(),
                 inputs,
@@ -6088,11 +6088,12 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 &mut |values| {
                     let expected_columns = table_columns.map_or(1, <[_]>::len);
                     if values.len() != expected_columns {
-                        return Err(sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "SQL function query must return {} column{}",
+                        return Err(super::routine_result_width_mismatch(
+                            super::RoutineResultContract::stored(storage, txid, routine, arena)?
+                                .name(),
+                            table_columns.is_none(),
+                            values.len(),
                             expected_columns,
-                            if expected_columns == 1 { "" } else { "s" }
                         ));
                     }
                     let encoded = if let Some(output) = table_columns {

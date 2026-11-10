@@ -42,6 +42,33 @@ struct ParsedSource<'a> {
 }
 
 impl SqlSource {
+    /// Only functions run here; their kind carries any output record.
+    fn result_contract<'a>(
+        &self,
+        storage: &Storage,
+        transaction: u32,
+        arena: &'a Arena,
+    ) -> Result<query::RoutineResultContract<'a>, SqlError> {
+        query::RoutineResultContract::declared(
+            storage,
+            transaction,
+            self.kind,
+            &self.columns,
+            false,
+            arena,
+        )
+    }
+
+    fn declared_result<'a>(
+        &self,
+        storage: &Storage,
+        transaction: u32,
+        arena: &'a Arena,
+    ) -> Result<&'a str, SqlError> {
+        self.result_contract(storage, transaction, arena)
+            .map(query::RoutineResultContract::name)
+    }
+
     fn parse<'a>(
         &self,
         storage: &Storage,
@@ -62,7 +89,7 @@ impl SqlSource {
             self.body_kind,
             text,
             arena,
-            self.kind.function_result() == Some(ColType::Void),
+            self.result_contract(storage, transaction, arena)?,
             name,
             &self.parameters,
             inputs,
@@ -150,7 +177,11 @@ impl SqlResult {
                 checked,
             } => {
                 if !*present {
-                    let captured = shape.capture(values, arena)?;
+                    let captured = shape.capture(
+                        values,
+                        || source.declared_result(storage, txid, arena),
+                        arena,
+                    )?;
                     let captured = if write {
                         coerce_sql_result(captured, source, storage, txid, arena, Some(sequences))?
                     } else {
@@ -170,11 +201,14 @@ impl SqlResult {
                         source.columns.len()
                     };
                 if values.len() != width {
-                    return Err(sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "SQL function query must return {} column{}",
+                    return Err(query::routine_result_width_mismatch(
+                        source.declared_result(storage, txid, arena)?,
+                        !matches!(
+                            source.kind.function_result(),
+                            Some(ColType::Record | ColType::Composite(_))
+                        ),
+                        values.len(),
                         width,
-                        if width == 1 { "" } else { "s" }
                     ));
                 }
                 let converted = arena

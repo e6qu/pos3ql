@@ -109,8 +109,16 @@ def summarize(messages):
 
 
 def stalled_client(host, port, user, database):
-    sock = socket.create_connection((host, port), timeout=60)
+    # Size the receive buffer before connecting: TCP never shrinks a window
+    # it already advertised, so shrinking it afterwards lets Linux overrun the
+    # buffer, drop loopback segments and stall in backed-off retransmissions.
+    family, kind, protocol, _, address = socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM
+    )[0]
+    sock = socket.socket(family, kind, protocol)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    sock.settimeout(60)
+    sock.connect(address)
     startup(sock, user, database)
     return sock
 

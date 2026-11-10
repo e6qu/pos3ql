@@ -20,7 +20,7 @@ fn query(sql: &str) -> Vec<u8> {
     frontend(wire::FMSG_QUERY, &payload)
 }
 
-fn set_buffer(socket: &TcpStream, option: libc::c_int, bytes: libc::c_int) {
+fn set_buffer(socket: &impl AsRawFd, option: libc::c_int, bytes: libc::c_int) {
     assert_eq!(
         unsafe {
             libc::setsockopt(
@@ -37,11 +37,17 @@ fn set_buffer(socket: &TcpStream, option: libc::c_int, bytes: libc::c_int) {
 
 /// A loopback pair whose kernel buffers hold only a few kilobytes, so a
 /// result of a megabyte cannot hide in them.
+///
+/// The client end is the accepted socket, so it inherits the listener's
+/// receive buffer before the handshake advertises a window. TCP never
+/// shrinks an advertised window: shrinking the buffer after connecting lets
+/// Linux overrun it, drop loopback segments and recover only through
+/// backed-off retransmission timeouts, stalling the transfer for seconds.
 fn socket_pair() -> (TcpStream, TcpStream) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (server, _) = listener.accept().unwrap();
-    set_buffer(&client, libc::SO_RCVBUF, 4096);
+    set_buffer(&listener, libc::SO_RCVBUF, 4096);
+    let server = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (client, _) = listener.accept().unwrap();
     set_buffer(&server, libc::SO_SNDBUF, 4096);
     server.set_nonblocking(true).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -148,8 +154,19 @@ fn drain(
     client: &mut TcpStream,
     ready_count: usize,
 ) -> Vec<u8> {
+    drain_after(conn, engine, client, ready_count, Vec::new())
+}
+
+/// Continues `drain` after bytes the client already read, which may end
+/// inside a message; messages are counted from the start of the response.
+fn drain_after(
+    conn: &mut Conn,
+    engine: &mut Engine,
+    client: &mut TcpStream,
+    ready_count: usize,
+    mut received: Vec<u8>,
+) -> Vec<u8> {
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut received = Vec::new();
     loop {
         read_available(client, &mut received);
         if messages(&received).iter().filter(|m| m.0 == b'Z').count() >= ready_count {
@@ -957,8 +974,7 @@ fn stream_rows_wait_for_locks_without_repeating_delivered_rows_or_effects() {
         &mut holder_client,
         "COMMIT",
     );
-    let rest = drain(&mut conn, &mut fixture.engine, &mut client, 1);
-    received.extend_from_slice(&rest);
+    let received = drain_after(&mut conn, &mut fixture.engine, &mut client, 1, received);
     let response = messages(&received);
     let rows: Vec<_> = response
         .iter()

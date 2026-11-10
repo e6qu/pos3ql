@@ -1103,7 +1103,7 @@ mod tests {
     #[test]
     fn parallel_leases_keep_payloads_disjoint_without_callback_locks() {
         let pool = pool(128, 2);
-        let together = std::sync::Barrier::new(2);
+        let together = crate::mem::mutex::Barrier::new(2);
         std::thread::scope(|scope| {
             let worker = |value| {
                 crate::mem::guard::forbid_alloc(|| {
@@ -1420,7 +1420,7 @@ mod tests {
             })
             .unwrap();
         let retained = values.freeze();
-        let together = std::sync::Barrier::new(2);
+        let together = crate::mem::mutex::Barrier::new(2);
         std::thread::scope(|scope| {
             let shared = retained.clone();
             let worker = scope.spawn(|| {

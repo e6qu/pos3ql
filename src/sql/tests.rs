@@ -6202,7 +6202,7 @@ fn cluster_metadata_reload_applies_one_owned_settings_image() {
         SqlName::parse("statement_timeout").unwrap(),
         SqlName::parse("lock_timeout").unwrap(),
     ];
-    let barrier = std::sync::Barrier::new(5);
+    let barrier = crate::mem::mutex::Barrier::new(5);
     let guc = GucState::new();
     std::thread::scope(|scope| {
         for worker in 0..4 {

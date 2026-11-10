@@ -902,7 +902,7 @@ mod tests {
         for rowid in 1..=4 {
             rows.insert(rowid, image(0)).unwrap();
         }
-        let start = std::sync::Barrier::new(4);
+        let start = crate::mem::mutex::Barrier::new(4);
         std::thread::scope(|scope| {
             for _ in 0..3 {
                 let rows = &rows;

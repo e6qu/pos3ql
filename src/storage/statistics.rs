@@ -1360,7 +1360,7 @@ mod tests {
     fn statistics_ownership_copied_readers_observe_postgresql_visibility_during_updates() {
         let (storage, _, table) = fixture();
         let before = storage.table_statistics(table, 0);
-        let start = std::sync::Barrier::new(3);
+        let start = crate::mem::mutex::Barrier::new(3);
         std::thread::scope(|scope| {
             let storage_ref = &storage;
             let start_ref = &start;

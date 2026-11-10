@@ -852,7 +852,7 @@ mod tests {
         let arenas: [Arena; 4] = core::array::from_fn(|_| {
             Arena::new(&mut budget, "concurrent catalog history test", 32 * 1024).unwrap()
         });
-        let rendezvous = Arc::new(std::sync::Barrier::new(5));
+        let rendezvous = Arc::new(crate::mem::mutex::Barrier::new(5));
         let table = relation(DatabaseOid::POSTGRES, 1259);
         let batch = forbid_alloc(|| {
             let mut batch = history.reserve().unwrap();

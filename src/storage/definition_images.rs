@@ -768,7 +768,7 @@ mod tests {
             images.pin_relation(identity).unwrap(),
             images.pin_relation(identity).unwrap(),
         ];
-        let barrier = std::sync::Barrier::new(2);
+        let barrier = crate::mem::mutex::Barrier::new(2);
         drop(images);
         drop(pool);
         std::thread::scope(|threads| {

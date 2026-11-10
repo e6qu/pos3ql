@@ -1486,7 +1486,7 @@ mod tests {
     #[test]
     fn shared_heap_append_parallel_writers_publish_disjoint_complete_ranges() {
         let heap = heap(128 * 8);
-        let start = std::sync::Barrier::new(5);
+        let start = crate::mem::mutex::Barrier::new(5);
         std::thread::scope(|scope| {
             let writers: [_; 4] = core::array::from_fn(|worker| {
                 let heap = &heap;
@@ -1680,7 +1680,7 @@ mod tests {
         bytes.copy_from_slice(b"dead");
         let (old, bytes) = heap.append(4).unwrap();
         bytes.copy_from_slice(b"keep");
-        let start = std::sync::Barrier::new(4);
+        let start = crate::mem::mutex::Barrier::new(4);
         std::thread::scope(|scope| {
             for _ in 0..3 {
                 let heap = &heap;
@@ -1724,7 +1724,7 @@ mod tests {
         let mut heap = heap(8);
         let (location, bytes) = heap.append(8).unwrap();
         bytes.copy_from_slice(&0u64.to_le_bytes());
-        let start = std::sync::Barrier::new(4);
+        let start = crate::mem::mutex::Barrier::new(4);
         std::thread::scope(|scope| {
             for _ in 0..3 {
                 let heap = &heap;
@@ -1901,7 +1901,7 @@ mod tests {
         heap.append_bytes(b"dead").unwrap();
         let location = heap.append_bytes(b"keep").unwrap();
         let old = heap.get(location).unwrap();
-        let start = std::sync::Barrier::new(2);
+        let start = crate::mem::mutex::Barrier::new(2);
         let done = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
             let start_ref = &start;

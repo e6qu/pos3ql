@@ -1045,7 +1045,7 @@ mod tests {
                 storage.observe_lsn(lsn);
                 storage.advance_visible_lsn(lsn).unwrap();
             });
-            let start = std::sync::Barrier::new(2);
+            let start = crate::mem::mutex::Barrier::new(2);
             std::thread::scope(|scope| {
                 let start = &start;
                 scope.spawn(move || {

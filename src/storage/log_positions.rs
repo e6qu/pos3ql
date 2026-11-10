@@ -69,7 +69,7 @@ mod tests {
     fn shared_log_positions_are_unique_under_concurrent_reservations() {
         let mut budget = Budget::new(LogPositions::budget_bytes());
         let positions = LogPositions::new(&mut budget).unwrap();
-        let ready = std::sync::Barrier::new(5);
+        let ready = crate::mem::mutex::Barrier::new(5);
         let positions = &positions;
         let ready = &ready;
         let mut all = [0; 256];

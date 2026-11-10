@@ -445,8 +445,8 @@ mod tests {
     #[test]
     fn transaction_admission_does_not_wait_for_existing_queries_to_finish() {
         let (storage, tables) = fixture(TransactionMode::Mvcc);
-        let captured = std::sync::Barrier::new(5);
-        let published = std::sync::Barrier::new(5);
+        let captured = crate::mem::mutex::Barrier::new(5);
+        let published = crate::mem::mutex::Barrier::new(5);
         std::thread::scope(|scope| {
             let workers: [_; 4] = core::array::from_fn(|index| {
                 let storage = &storage;

@@ -3559,7 +3559,7 @@ mod tests {
         let first = [handle(1), handle(5)];
         let second = [handle(9), handle(13), handle(17)];
         let mut snapshot = SpillGenerationSnapshot::new(3);
-        let barrier = std::sync::Barrier::new(2);
+        let barrier = crate::mem::mutex::Barrier::new(2);
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 barrier.wait();

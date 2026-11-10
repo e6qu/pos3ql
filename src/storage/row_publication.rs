@@ -1921,7 +1921,7 @@ mod tests {
         let second = storage
             .prepare_pending_write(table, 1, 8, 1, Some(location), true)
             .unwrap();
-        let barrier = std::sync::Barrier::new(3);
+        let barrier = crate::mem::mutex::Barrier::new(3);
         std::thread::scope(|scope| {
             let run = |prepared| {
                 barrier.wait();
@@ -2008,7 +2008,7 @@ mod tests {
         let mut config = test_config();
         config.max_connections = 4;
         let (storage, table) = fixture(&config);
-        let barrier = std::sync::Barrier::new(5);
+        let barrier = crate::mem::mutex::Barrier::new(5);
         std::thread::scope(|scope| {
             for worker in 0..4u32 {
                 let storage = &storage;

@@ -58,7 +58,7 @@ mod tests {
         for kind in KINDS {
             for view in [false, true] {
                 let storage = fixture(TransactionMode::Mvcc);
-                let start = std::sync::Barrier::new(2);
+                let start = crate::mem::mutex::Barrier::new(2);
                 let (named, row) = std::thread::scope(|scope| {
                     let named = scope.spawn(|| {
                         start.wait();
@@ -310,7 +310,7 @@ mod tests {
         for left in KINDS {
             for right in KINDS {
                 let storage = fixture(TransactionMode::Mvcc);
-                let start = std::sync::Barrier::new(2);
+                let start = crate::mem::mutex::Barrier::new(2);
                 std::thread::scope(|scope| {
                     let first = scope.spawn(|| {
                         start.wait();

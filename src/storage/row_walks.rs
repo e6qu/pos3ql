@@ -686,7 +686,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let together = std::sync::Barrier::new(2);
+        let together = crate::mem::mutex::Barrier::new(2);
         std::thread::scope(|scope| {
             let worker = |rows: &RowMap, first| {
                 crate::mem::guard::forbid_alloc(|| {

@@ -264,7 +264,7 @@ mod tests {
             let waiting = AtomicBool::new(false);
             let attempts = AtomicUsize::new(0);
             let mutations = AtomicUsize::new(0);
-            let start = std::sync::Barrier::new(2);
+            let start = crate::mem::mutex::Barrier::new(2);
             let mut progressed = false;
             let mut reached_wait = false;
             std::thread::scope(|scope| {

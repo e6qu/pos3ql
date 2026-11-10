@@ -206,6 +206,42 @@ mod macos {
     }
 }
 
+/// A test rendezvous whose waits never allocate. The macOS standard barrier
+/// lazily boxes its pthread mutex and condition variable on first use, which
+/// aborts inside a `forbid_alloc` section.
+#[cfg(test)]
+pub(crate) struct Barrier {
+    parties: usize,
+    arrived: core::sync::atomic::AtomicUsize,
+    generation: core::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl Barrier {
+    pub(crate) const fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            arrived: core::sync::atomic::AtomicUsize::new(0),
+            generation: core::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Blocks until `parties` threads have called `wait` for this generation.
+    pub(crate) fn wait(&self) {
+        use core::sync::atomic::Ordering;
+        let generation = self.generation.load(Ordering::Acquire);
+        if self.arrived.fetch_add(1, Ordering::AcqRel) + 1 == self.parties {
+            // Reset before releasing: a released thread may arrive again.
+            self.arrived.store(0, Ordering::Relaxed);
+            self.generation.fetch_add(1, Ordering::Release);
+            return;
+        }
+        while self.generation.load(Ordering::Acquire) == generation {
+            std::thread::yield_now();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Mutex;

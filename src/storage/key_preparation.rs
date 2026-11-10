@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn key_preparation_competing_rebuilds_keep_a_complete_published_cache() {
         let (storage, table) = fixture(8);
-        let start = std::sync::Barrier::new(4);
+        let start = crate::mem::mutex::Barrier::new(4);
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 let storage = &storage;

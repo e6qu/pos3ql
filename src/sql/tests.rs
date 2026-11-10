@@ -18373,6 +18373,7 @@ impl ConfiguredTransactionSession {
 
     fn execute(&mut self, engine: &mut Engine, sql: &str, fixed_memory: bool) -> Vec<u8> {
         let _ = query::take_arena_full_location();
+        let _ = sequence::take_replay_error_diagnostic();
         let _ = crate::mem::arena::take_last_allocation_failure();
         let status = self.execute_status(engine, sql, fixed_memory);
         assert_eq!(status, ExecutionStatus::Complete, "{sql}");
@@ -18383,10 +18384,11 @@ impl ConfiguredTransactionSession {
         let output = self.execute(engine, sql, fixed_memory);
         assert!(
             !String::from_utf8_lossy(&output).contains("ERROR"),
-            "{sql}: {}; last query allocation error: {:?}; (arena failure, region active): {:?}",
+            "{sql}: {}; last query allocation error: {:?}; (arena failure, region active): {:?}; sequence replay error: {:?}",
             String::from_utf8_lossy(&output),
             query::take_arena_full_location(),
             crate::mem::arena::take_last_allocation_failure(),
+            sequence::take_replay_error_diagnostic(),
         );
         output
     }
@@ -44077,7 +44079,7 @@ fn data_modifying_routine_result_resumes_nested_mutable_scalar_routine() {
 }
 
 #[test]
-fn data_modifying_table_routine_result_resumes_nested_mutable_scalar_routine() {
+fn table_routine_returns_results_after_completed_nested_writes() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
@@ -44087,7 +44089,8 @@ fn data_modifying_table_routine_result_resumes_nested_mutable_scalar_routine() {
          CREATE FUNCTION bump_table_dml_nested(target integer) RETURNS integer LANGUAGE SQL \
            AS 'UPDATE routine_table_dml_nested SET value = value + 1 WHERE id = $1 RETURNING value'; \
          CREATE FUNCTION rows_table_dml_nested() RETURNS SETOF integer LANGUAGE SQL \
-           AS 'UPDATE routine_table_dml_nested SET value = bump_table_dml_nested(id) RETURNING value'",
+           AS 'SELECT bump_table_dml_nested(1); SELECT bump_table_dml_nested(2); \
+               SELECT value FROM routine_table_dml_nested ORDER BY id'",
     );
     let output = run_with(
         &mut engine,
@@ -44163,32 +44166,66 @@ fn mutable_routine_writes_obey_enclosing_savepoint_rollback() {
 }
 
 #[test]
-fn nested_dml_routine_retry_rewinds_writes_before_pending_call() {
-    let (mut engine, mut budget) = test_engine();
-    run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE TABLE routine_retry_rows (id integer PRIMARY KEY, value integer); \
-         INSERT INTO routine_retry_rows VALUES (1, 40), (2, 50); \
-         CREATE FUNCTION bump_retry_row(target integer) RETURNS integer LANGUAGE SQL \
-           AS 'UPDATE routine_retry_rows SET value = value + 1 WHERE id = $1 RETURNING value'; \
-         CREATE FUNCTION update_retry_rows() RETURNS SETOF integer LANGUAGE SQL \
-           AS 'UPDATE routine_retry_rows SET value = CASE WHEN id = 2 THEN bump_retry_row(id) ELSE value + 10 END RETURNING value'",
-    );
-    let output = run_with(
-        &mut engine,
-        &mut budget,
-        "BEGIN; \
-         SELECT value FROM update_retry_rows() AS result(value) ORDER BY value; \
-         SELECT id, value FROM routine_retry_rows ORDER BY id; \
-         ROLLBACK",
-    );
-    assert_eq!(
-        data_rows(&output),
-        ["50", "51", "1|50", "2|51"],
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
+fn nested_sql_writes_reject_unowned_row_restarts_without_partial_changes() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("nested-sql-row-progress-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE TABLE routine_retry_rows(id integer PRIMARY KEY,value integer); \
+             INSERT INTO routine_retry_rows VALUES(1,40),(2,50); \
+             CREATE FUNCTION bump_retry_row(target integer) RETURNS integer LANGUAGE SQL AS $$ \
+                UPDATE routine_retry_rows SET value=value+1 WHERE id=$1 RETURNING value $$; \
+             CREATE FUNCTION read_retry_row(target integer) RETURNS integer LANGUAGE SQL SECURITY DEFINER AS $$ \
+                SELECT value FROM routine_retry_rows WHERE id=$1 $$; \
+             CREATE FUNCTION update_retry_rows() RETURNS SETOF integer LANGUAGE SQL AS $$ \
+                UPDATE routine_retry_rows SET value=CASE WHEN id=2 THEN bump_retry_row(id) ELSE value+10 END RETURNING value $$; \
+             CREATE FUNCTION observe_retry_rows() RETURNS SETOF integer LANGUAGE SQL AS $$ \
+                UPDATE routine_retry_rows SET value=CASE WHEN id=2 THEN read_retry_row(1) ELSE value+10 END RETURNING value $$; \
+             CREATE FUNCTION all_retry_rows() RETURNS SETOF integer LANGUAGE SQL AS $$ \
+                UPDATE routine_retry_rows SET value=bump_retry_row(id) RETURNING value $$", true);
+        for name in ["update_retry_rows", "observe_retry_rows", "all_retry_rows"] {
+            let output = session.execute(
+                &mut engine,
+                &format!("BEGIN; SELECT value FROM {name}() AS result(value) ORDER BY value"),
+                true,
+            );
+            assert_eq!(
+                error_sqlstates(&output),
+                ["0A000"],
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(
+                String::from_utf8_lossy(&output)
+                    .contains("SQL row expression requires retained write progress")
+            );
+            assert!(data_rows(&output).is_empty());
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "ROLLBACK; SELECT id,value FROM routine_retry_rows ORDER BY id",
+                    true
+                )),
+                ["1|40", "2|50"]
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT bump_retry_row(1); SELECT id,value FROM routine_retry_rows ORDER BY id",
+                true
+            )),
+            ["41", "1|41", "2|50"]
+        );
+        drop((session, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
 }
 
 #[test]

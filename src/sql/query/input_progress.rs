@@ -572,6 +572,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                     replay
                         .copied()
                         .unwrap_or(super::super::sequence::StatementReplayCursor::EMPTY),
+                    super::super::sequence::ReplayInputPosition::KeepConsumed,
                 )?;
                 self.next.set(next_input);
                 self.invocation.set(next_invocation);
@@ -1053,6 +1054,10 @@ pub(crate) fn value<'a>(
     // use to its input preparation, and both guards restore nested scopes.
     let attempt = unsafe { &*(active as *const InputAttempt<'_, 'a>) };
     attempt.value(site, arena, evaluate)
+}
+
+pub(crate) fn owns_value() -> bool {
+    ACTIVE_INPUT.with(|active| active.get().is_some())
 }
 
 pub(super) fn definition<'a>(

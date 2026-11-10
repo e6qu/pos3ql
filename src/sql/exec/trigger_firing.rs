@@ -609,7 +609,11 @@ fn resume<'run>(
                 environment: active_environment,
                 owner: metadata.owner,
             };
-            match firing.execute(&mut context) {
+            let result = firing.execute(&mut context);
+            admission
+                .preserve_caller_inputs()
+                .map_err(ResumeError::Executed)?;
+            match result {
                 Ok(accepted) => {
                     capture_values(values, &firing.binding).map_err(ResumeError::Executed)?;
                     environment.complete();

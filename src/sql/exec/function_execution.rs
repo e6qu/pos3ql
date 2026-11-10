@@ -155,7 +155,7 @@ impl ReturnBinding {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FunctionOwner {
+pub(super) struct FunctionOwner {
     identity: super::super::ExecutionIdentity,
     transaction: u32,
     command: u32,
@@ -163,7 +163,7 @@ struct FunctionOwner {
 }
 
 impl FunctionOwner {
-    fn capture(context: &TriggerExecContext<'_, '_, '_>) -> Self {
+    pub(super) fn capture(context: &TriggerExecContext<'_, '_, '_>) -> Self {
         Self {
             identity: super::super::execution_identity(),
             transaction: context.txn.txid,
@@ -191,7 +191,62 @@ struct FunctionBinding {
     type_sources: Option<crate::storage::StatementFileLease>,
 }
 
-pub(crate) struct SuspendedFunction {
+pub(crate) enum SuspendedFunction {
+    Plpgsql(SuspendedPlpgsqlFunction),
+    Sql(super::sql_function_execution::SuspendedSqlFunction),
+}
+
+impl SuspendedFunction {
+    pub(crate) fn oid(&self) -> i32 {
+        match self {
+            Self::Plpgsql(call) => call.oid(),
+            Self::Sql(call) => call.oid(),
+        }
+    }
+    pub(crate) fn is_set_returning(&self) -> bool {
+        match self {
+            Self::Plpgsql(call) => call.is_set_returning(),
+            Self::Sql(call) => call.is_set_returning(),
+        }
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "saved calls resume against their original execution services"
+    )]
+    pub(crate) fn poll<'a>(
+        &mut self,
+        engine: &mut super::super::Engine,
+        transaction: &mut TxnState,
+        prepared: &mut super::super::prep::SqlPreparedPool,
+        cursors: &mut super::super::cursor::CursorPool,
+        settings: &super::super::guc::GucState,
+        arena: &'a Arena,
+        responder: &mut Responder<'_>,
+    ) -> Result<FunctionOutput<'a>, SqlError> {
+        match self {
+            Self::Plpgsql(call) => call.poll(
+                engine,
+                transaction,
+                prepared,
+                cursors,
+                settings,
+                arena,
+                responder,
+            ),
+            Self::Sql(call) => call.poll(
+                engine,
+                transaction,
+                prepared,
+                cursors,
+                settings,
+                arena,
+                responder,
+            ),
+        }
+    }
+}
+
+pub(crate) struct SuspendedPlpgsqlFunction {
     state: MutableSlice<SuspendedFunctionState>,
 }
 
@@ -240,7 +295,7 @@ impl FunctionBinding {
     }
 }
 
-impl SuspendedFunction {
+impl SuspendedPlpgsqlFunction {
     pub(crate) fn oid(&self) -> i32 {
         self.state[0].binding.oid
     }
@@ -374,6 +429,9 @@ impl SuspendedFunctionState {
             seeded,
             Some(self.binding.boundary),
         );
+        if let Err(error) = admission.preserve_caller_inputs() {
+            return Ok(Err(error));
+        }
         match result {
             Ok(flow) => {
                 let output =
@@ -748,7 +806,9 @@ pub(crate) fn execute<'a>(
                     progress,
                 })
                 .map_err(control_flow::execution_full)?;
-            *suspended = Some(SuspendedFunction { state });
+            *suspended = Some(SuspendedFunction::Plpgsql(SuspendedPlpgsqlFunction {
+                state,
+            }));
             Err(error)
         }
         Err(error) => Err(error),

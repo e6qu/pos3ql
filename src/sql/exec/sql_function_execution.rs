@@ -1,0 +1,1071 @@
+//! SQL bodies own their statement position, child calls and unfinished writes.
+
+use super::call_environment::{CallEnvironment, SavedCallEnvironment};
+use super::function_execution::FunctionOwner;
+use super::*;
+use crate::mem::lease_pool::SharedSlice;
+use crate::sql::{query, sequence, type_input_plans, type_inputs};
+
+struct StoredSource {
+    path: crate::storage::PathContext,
+    dependencies: SharedSlice<crate::storage::StoredQueryDependency>,
+    inputs: crate::storage::StoredTypeInputs,
+}
+
+impl StoredSource {
+    fn view(&self) -> crate::storage::StoredQueryDependencyView<'_> {
+        crate::storage::StoredQueryDependencyView::new(&self.dependencies)
+            .with_type_inputs(&self.inputs)
+    }
+}
+
+struct SqlSource {
+    text: SharedSlice<u8>,
+    checked_inputs: SharedSlice<u8>,
+    parameters: SharedSlice<RoutineArgumentDef>,
+    columns: SharedSlice<RoutineArgumentDef>,
+    kind: crate::storage::RoutineKind,
+    return_type: RoutineArgumentDef,
+    body_kind: crate::storage::RoutineBodyKind,
+    name: SqlName,
+    oid: i32,
+    collation: crate::sql::ast::Collation,
+    owner: type_input_plans::Owner,
+    input_source: type_inputs::Source,
+    stored: Option<StoredSource>,
+}
+
+struct ParsedSource<'a> {
+    text: &'a str,
+    inputs: &'a [type_inputs::Binding<'a>],
+    program: query::RoutineFunctionProgram<'a>,
+}
+
+impl SqlSource {
+    fn parse<'a>(
+        &self,
+        storage: &Storage,
+        transaction: u32,
+        arena: &'a Arena,
+    ) -> Result<ParsedSource<'a>, SqlError> {
+        let text = arena
+            .alloc_str(core::str::from_utf8(&self.text).expect("SQL sources copy UTF-8"))
+            .map_err(|_| query::arena_full_pub())?;
+        let bytes = arena
+            .alloc_slice_copy(&self.checked_inputs)
+            .map_err(|_| query::arena_full_pub())?;
+        let inputs = type_inputs::decode(bytes, arena)?;
+        let name = arena
+            .alloc_str(self.name.as_str())
+            .map_err(|_| query::arena_full_pub())?;
+        let program = query::parse_stored_routine_function_program(
+            self.body_kind,
+            text,
+            arena,
+            self.kind.function_result() == Some(ColType::Void),
+            name,
+            &self.parameters,
+            inputs,
+            |parser| match &self.stored {
+                Some(stored) => {
+                    query::validate_stored_type_inputs(parser, storage, transaction, stored.view())
+                }
+                None => type_inputs::validate_restored(parser, storage, transaction),
+            },
+        )?;
+        Ok(ParsedSource {
+            text,
+            inputs,
+            program,
+        })
+    }
+
+    fn bind_statement<'a>(
+        &self,
+        statement: &'a Stmt<'a>,
+        storage: &Storage,
+        transaction: u32,
+        arguments: &[Datum<'a>],
+        arena: &'a Arena,
+    ) -> Result<&'a Stmt<'a>, SqlError> {
+        match &self.stored {
+            Some(stored) => query::bind_routine_statement_source(
+                statement,
+                storage,
+                transaction,
+                stored.path,
+                stored.view(),
+                arena,
+                arguments,
+            ),
+            None => Ok(statement),
+        }
+    }
+}
+
+enum SqlResult {
+    Scalar {
+        value: local_values::SavedValues,
+        present: bool,
+        checked: bool,
+    },
+    Rows(set_rows::SavedRows),
+}
+
+impl SqlResult {
+    fn clear(&mut self) {
+        match self {
+            Self::Scalar {
+                value,
+                present,
+                checked,
+            } => {
+                value.clear();
+                *present = false;
+                *checked = false;
+            }
+            Self::Rows(rows) => rows.clear(),
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "return conversion uses its explicit row, selected contract and evaluation context"
+    )]
+    fn capture(
+        &mut self,
+        source: &SqlSource,
+        shape: query::RoutineResultShape<'_>,
+        values: &[Datum<'_>],
+        storage: &Storage,
+        txid: u32,
+        sequences: &dyn crate::sql::eval::SequenceAccess,
+        write: bool,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        match self {
+            Self::Scalar {
+                value,
+                present,
+                checked,
+            } => {
+                if !*present {
+                    let captured = shape.capture(values, arena)?;
+                    let captured = if write {
+                        coerce_sql_result(captured, source, storage, txid, arena, Some(sequences))?
+                    } else {
+                        captured
+                    };
+                    value.replace(&[captured])?;
+                    *present = true;
+                    *checked = write;
+                }
+                Ok(())
+            }
+            Self::Rows(rows) => {
+                let width =
+                    if matches!(source.kind, crate::storage::RoutineKind::SetFunction { .. }) {
+                        1
+                    } else {
+                        source.columns.len()
+                    };
+                if values.len() != width {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "SQL function query must return {} column{}",
+                        width,
+                        if width == 1 { "" } else { "s" }
+                    ));
+                }
+                let converted = arena
+                    .alloc_slice_with(width, |_| Datum::Null)
+                    .map_err(|_| query::arena_full_pub())?;
+                for (index, value) in values.iter().copied().enumerate() {
+                    let target =
+                        if matches!(source.kind, crate::storage::RoutineKind::SetFunction { .. }) {
+                            source.return_type
+                        } else {
+                            source.columns[index]
+                        };
+                    converted[index] = coerce_routine_argument(
+                        detach_routine_datum(value, arena)?,
+                        target,
+                        storage,
+                        txid,
+                        arena,
+                        Some(sequences),
+                    )?;
+                }
+                rows.append(converted)
+            }
+        }
+    }
+}
+
+pub(crate) struct SuspendedSqlFunction {
+    state: MutableSlice<SqlExecution>,
+}
+
+struct SqlExecution {
+    source: SqlSource,
+    arguments: local_values::SavedValues,
+    result: SqlResult,
+    types: Option<crate::storage::StatementFileLease>,
+    environment: SavedCallEnvironment,
+    owner: FunctionOwner,
+    boundary: super::super::txn::StatementMark,
+    policy: query::RoutineExecution,
+    step: usize,
+    finished_body: bool,
+    pending_query: Option<query::RoutineInvocationState>,
+    pending_write: Option<write_completion::PendingNestedWrite>,
+    command: Option<crate::sql::txn::SuspendedTriggerSql>,
+    step_position: Option<sequence::SavedStatementPosition>,
+    suspended_position: Option<sequence::SavedStatementPosition>,
+}
+
+impl SuspendedSqlFunction {
+    pub(crate) fn oid(&self) -> i32 {
+        self.state[0].source.oid
+    }
+    pub(crate) fn is_set_returning(&self) -> bool {
+        self.state[0].source.kind.is_set_returning()
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "saved SQL calls attach to their original execution services"
+    )]
+    pub(crate) fn poll<'a>(
+        &mut self,
+        engine: &mut super::super::Engine,
+        transaction: &mut TxnState,
+        prepared: &mut super::super::prep::SqlPreparedPool,
+        cursors: &mut super::super::cursor::CursorPool,
+        settings: &super::super::guc::GucState,
+        arena: &'a Arena,
+        responder: &mut Responder<'_>,
+    ) -> Result<FunctionOutput<'a>, SqlError> {
+        if !std::sync::Arc::ptr_eq(self.state.pool(), &engine.storage.execution_control)
+            || !std::sync::Arc::ptr_eq(self.state[0].arguments.pool(), &engine.storage.row_work)
+        {
+            return Err(changed());
+        }
+        let state = &mut self.state[0];
+        let mut context = TriggerExecContext {
+            host: PlpgsqlExecHost::Routine {
+                engine,
+                guc: settings,
+                sqlprep: prepared,
+                cursors,
+                transaction_context: PlpgsqlTransactionContext::Atomic,
+            },
+            txn: transaction,
+            arena,
+            params: crate::sql::eval::NO_PARAMS,
+            responder,
+        };
+        if state.owner != FunctionOwner::capture(&context) {
+            return Err(changed());
+        }
+        let position = state.suspended_position.take().ok_or_else(changed)?;
+        let mut attached = false;
+        let outcome = position.with_resume(
+            (),
+            super::super::lock::AdvisoryPositionTail::Unchanged,
+            |(), admission| {
+                let _types = state
+                    .types
+                    .as_ref()
+                    .map(|types| types.enter())
+                    .transpose()?;
+                let environment = state.environment.enter(context.txn)?;
+                let parsed = state
+                    .source
+                    .parse(context.storage(), context.txn.txid, arena)?;
+                let arguments = state.arguments.decode(arena)?;
+                let _formal = enter_routine_parameter_types(
+                    &state.source.parameters,
+                    Some(&query::storage_catalog(
+                        context.storage(),
+                        arena,
+                        context.txn.txid,
+                    )),
+                    state.source.collation,
+                )?;
+                if let Some(query) = &state.pending_query {
+                    query.require_arena(arena.retention_owner())?;
+                }
+                admission.commit();
+                attached = true;
+                let result = state.execute(&parsed, arguments, &mut context);
+                admission.preserve_caller_inputs()?;
+                if result.as_ref().is_err_and(control_flow::is_execution_wait) {
+                    state.environment = SavedCallEnvironment::capture(
+                        &environment,
+                        &context.storage().execution_control,
+                    )?;
+                    state.suspended_position = Some(sequence::SavedStatementPosition::capture()?);
+                } else if result.is_ok() {
+                    state.environment.complete();
+                }
+                result
+            },
+        );
+        match outcome {
+            Ok(result) => {
+                if !attached
+                    || state.suspended_position.is_none()
+                        && result.as_ref().is_err_and(control_flow::is_execution_wait)
+                {
+                    state.suspended_position = Some(position);
+                }
+                result
+            }
+            Err(((), error)) => {
+                state.suspended_position = Some(position);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl SqlExecution {
+    fn enter_step(&mut self) -> Result<(), SqlError> {
+        if let Some(position) = self.step_position.take() {
+            if let Err(((), error)) = position.with_resume(
+                (),
+                super::super::lock::AdvisoryPositionTail::Appended,
+                |(), admission| admission.commit(),
+            ) {
+                self.step_position = Some(position);
+                return Err(error);
+            }
+            self.step_position = Some(position);
+        } else {
+            self.step_position = Some(sequence::SavedStatementPosition::capture()?);
+        }
+        Ok(())
+    }
+
+    fn execute<'a>(
+        &mut self,
+        parsed: &ParsedSource<'a>,
+        arguments: &'a [Datum<'a>],
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+    ) -> Result<FunctionOutput<'a>, SqlError> {
+        let prior = context.txn.write_completion_boundary;
+        if self.policy == query::RoutineExecution::Retained {
+            context.txn.write_completion_boundary =
+                Some(super::super::txn::WriteCompletionBoundary {
+                    mark: self.boundary,
+                    command: context.txn.command_id(),
+                    depth: context.txn.trigger_depth(),
+                });
+        }
+        let result = type_input_plans::with_owner(self.source.owner, || {
+            type_inputs::with_source(self.source.input_source, parsed.text, parsed.inputs, || {
+                self.execute_body(parsed, arguments, context)
+            })
+        });
+        context.txn.write_completion_boundary = prior;
+        result
+    }
+
+    fn execute_body<'a>(
+        &mut self,
+        parsed: &ParsedSource<'a>,
+        arguments: &'a [Datum<'a>],
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+    ) -> Result<FunctionOutput<'a>, SqlError> {
+        while !self.finished_body {
+            self.enter_step()?;
+            let final_step = self.step == parsed.program.preceding.len();
+            let mut command = if let Some(command) = self.command.take() {
+                match command.resume(context.txn) {
+                    Ok(command) => command,
+                    Err((command, error)) => {
+                        self.command = Some(command);
+                        return Err(error);
+                    }
+                }
+            } else {
+                context.txn.enter_trigger_sql(context.host.storage())?
+            };
+            let result = {
+                let mut statement_context = TriggerExecContext {
+                    host: context.host.reborrow(),
+                    txn: &mut command,
+                    arena: context.arena,
+                    params: context.params,
+                    responder: context.responder,
+                };
+                if final_step {
+                    match parsed.program.result {
+                        query::RoutineFunctionResult::Query(query) => {
+                            self.query(query, arguments, &mut statement_context, true)
+                        }
+                        query::RoutineFunctionResult::DataModification(statement) => {
+                            self.statement(statement, arguments, &mut statement_context, true)
+                        }
+                        query::RoutineFunctionResult::Void(statement) => {
+                            self.statement(statement, arguments, &mut statement_context, false)
+                        }
+                        query::RoutineFunctionResult::Forbidden(statement) => {
+                            Err(query::routine_forbidden_statement_error(statement))
+                        }
+                    }
+                } else {
+                    match parsed
+                        .program
+                        .preceding
+                        .get(self.step)
+                        .ok_or_else(changed)?
+                    {
+                        query::RoutinePrelude::Statement(statement) => {
+                            self.statement(statement, arguments, &mut statement_context, false)
+                        }
+                        query::RoutinePrelude::Forbidden(statement) => {
+                            Err(query::routine_forbidden_statement_error(statement))
+                        }
+                    }
+                }
+            };
+            match result {
+                Err(error) if control_flow::is_execution_wait(&error) => {
+                    self.command = Some(command.suspend());
+                    return Err(error);
+                }
+                result => {
+                    drop(command);
+                    result?;
+                }
+            }
+            self.pending_query = None;
+            self.step_position = None;
+            if final_step {
+                self.finished_body = true;
+            } else {
+                self.step += 1;
+            }
+        }
+        self.enter_step()?;
+        let output = match &mut self.result {
+            SqlResult::Rows(rows) => Ok(FunctionOutput::Rows(rows.rows(context.arena)?)),
+            SqlResult::Scalar {
+                value,
+                present,
+                checked,
+            } => {
+                let arena = context.arena;
+                if !*present {
+                    return Ok(FunctionOutput::Scalar(Datum::Null));
+                }
+                let value = value.read(0, arena)?;
+                if *checked {
+                    return Ok(FunctionOutput::Scalar(value));
+                }
+                let txid = context.txn.txid;
+                execute_procedural_query(
+                    context,
+                    (self.policy == query::RoutineExecution::Retained)
+                        .then_some(&mut self.pending_query),
+                    |storage, sequences| {
+                        coerce_sql_result(
+                            value,
+                            &self.source,
+                            storage,
+                            txid,
+                            arena,
+                            Some(sequences),
+                        )
+                    },
+                )
+                .map(FunctionOutput::Scalar)
+            }
+        };
+        if output.is_ok() {
+            self.step_position = None;
+        }
+        output
+    }
+
+    fn query<'a>(
+        &mut self,
+        query: &query::RoutineQuery<'a>,
+        arguments: &'a [Datum<'a>],
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+        capture: bool,
+    ) -> Result<(), SqlError> {
+        let arena = context.arena;
+        let txid = context.txn.txid;
+        let PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            sqlprep,
+            cursors,
+            ..
+        } = &mut context.host
+        else {
+            return Err(changed());
+        };
+        let snapshot = engine.storage.read_snapshot();
+        engine
+            .execute_retained_expression(
+                arena,
+                (self.policy == query::RoutineExecution::Retained)
+                    .then_some(&mut self.pending_query),
+                snapshot,
+                context.txn,
+                sqlprep,
+                cursors,
+                guc,
+                context.responder,
+                |storage, work, sequences, _calls, _cursors| {
+                    if capture {
+                        self.result.clear();
+                    }
+                    let shape = query::RoutineResultShape::from_contract(
+                        self.source.kind,
+                        &self.source.columns,
+                        storage,
+                        txid,
+                        arena,
+                    )?;
+                    let stored = self
+                        .source
+                        .stored
+                        .as_ref()
+                        .map(|saved| (saved.path, saved.view()));
+                    let scalar = capture && !self.source.kind.is_set_returning();
+                    let mut emit = |values: &[Datum]| {
+                        if capture {
+                            self.result.capture(
+                                &self.source,
+                                shape,
+                                values,
+                                storage,
+                                txid,
+                                sequences,
+                                false,
+                                arena,
+                            )
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    let evaluate =
+                        |emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>| {
+                            query::execute_routine_query_under(
+                                query,
+                                storage,
+                                txid,
+                                work,
+                                arguments,
+                                true,
+                                Some(sequences),
+                                stored,
+                                emit,
+                            )
+                        };
+                    if scalar {
+                        query::consume_query_rows(core::num::NonZeroU64::MIN, evaluate, &mut emit)
+                    } else {
+                        evaluate(&mut emit)
+                    }
+                },
+            )
+            .map_err(response_full)?
+    }
+
+    fn statement<'a>(
+        &mut self,
+        statement: &'a Stmt<'a>,
+        arguments: &'a [Datum<'a>],
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+        capture: bool,
+    ) -> Result<(), SqlError> {
+        match statement {
+            Stmt::Select(select) => {
+                return self.query(
+                    &query::RoutineQuery::Select(select),
+                    arguments,
+                    context,
+                    capture,
+                );
+            }
+            Stmt::SetQuery(query) => {
+                return self.query(
+                    &query::RoutineQuery::Set(query),
+                    arguments,
+                    context,
+                    capture,
+                );
+            }
+            _ => {}
+        }
+        if let Some(pending) = &mut self.pending_write {
+            pending.poll(context)?;
+            self.pending_write = None;
+            context.responder.take_affected_rows();
+            return Ok(());
+        }
+        let statement = self.source.bind_statement(
+            statement,
+            context.storage(),
+            context.txn.txid,
+            arguments,
+            context.arena,
+        )?;
+        self.write(statement, arguments, context, capture)
+    }
+
+    fn write<'a>(
+        &mut self,
+        statement: &'a Stmt<'a>,
+        arguments: &'a [Datum<'a>],
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+        capture: bool,
+    ) -> Result<(), SqlError> {
+        let arena = context.arena;
+        let owner = arena.retention_owner();
+        let calls = self
+            .pending_query
+            .take()
+            .unwrap_or_else(|| query::RoutineInvocationState::new(owner, self.policy));
+        calls.require_arena(owner)?;
+        let replay = sequence::begin_replay_cursor()?;
+        let result = loop {
+            sequence::rewind_replay_cursor(replay)?;
+            calls.begin_attempt();
+            let unfinished = calls.suspended.borrow().is_some();
+            if unfinished {
+                let PlpgsqlExecHost::Routine {
+                    engine,
+                    guc,
+                    sqlprep,
+                    cursors,
+                    ..
+                } = &mut context.host
+                else {
+                    return Err(changed());
+                };
+                if let Err(error) = engine
+                    .resume_pending_function(
+                        &calls,
+                        owner,
+                        arena,
+                        context.txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        context.responder,
+                    )
+                    .map_err(response_full)?
+                {
+                    break Err(error);
+                }
+            }
+            if capture {
+                self.result.clear();
+            }
+            let shape = query::RoutineResultShape::from_contract(
+                self.source.kind,
+                &self.source.columns,
+                context.storage(),
+                context.txn.txid,
+                arena,
+            )?;
+            let mark = {
+                let PlpgsqlExecHost::Routine { engine, .. } = &context.host else {
+                    return Err(changed());
+                };
+                context.txn.statement_mark(
+                    engine.wal.stage_mark(context.txn.txid),
+                    engine.storage.lock_mark(),
+                )
+            };
+            let before = context.txn.transaction_effect_mark();
+            let descriptors = context.txn.statement_large_object_descriptors(arena)?;
+            let advisory = context.storage().advisory_statement_mark();
+            let settings = match &context.host {
+                PlpgsqlExecHost::Routine { guc, .. } => guc.statement_settings(),
+                _ => return Err(changed()),
+            };
+            let outcome = query::with_routine_invocation_scope(
+                Some(query::RoutineInvocationContext::new(&calls, owner)),
+                || {
+                    let mut capture_rows =
+                        |storage: &Storage,
+                         txid: u32,
+                         sequences: &dyn crate::sql::eval::SequenceAccess,
+                         values: &[Datum]| {
+                            if capture {
+                                self.result.capture(
+                                    &self.source,
+                                    shape,
+                                    values,
+                                    storage,
+                                    txid,
+                                    sequences,
+                                    true,
+                                    arena,
+                                )
+                            } else {
+                                Ok(())
+                            }
+                        };
+                    if matches!(
+                        statement,
+                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
+                    ) {
+                        execute_nested_data_modification(
+                            context,
+                            statement,
+                            arguments,
+                            None,
+                            Some(&mut capture_rows),
+                            &mut self.pending_write,
+                        )
+                    } else {
+                        let output_mark = context.responder.buffer.mark();
+                        let PlpgsqlExecHost::Routine {
+                            engine,
+                            guc,
+                            sqlprep,
+                            cursors,
+                            ..
+                        } = &mut context.host
+                        else {
+                            return Err(changed());
+                        };
+                        let result = context
+                            .responder
+                            .without_query_output(|responder| {
+                                engine.execute_routine_stmt(
+                                    statement,
+                                    arena,
+                                    arguments,
+                                    context.txn,
+                                    sqlprep,
+                                    cursors,
+                                    guc,
+                                    responder,
+                                    if capture {
+                                        Some(&mut capture_rows)
+                                    } else {
+                                        None
+                                    },
+                                )
+                            })
+                            .map_err(response_full)?;
+                        context.responder.buffer.truncate_to(output_mark);
+                        result.map(|()| 0)
+                    }
+                },
+            );
+            let changed_effects = context.txn.transaction_effect_mark() != before
+                || !context
+                    .txn
+                    .matches_statement_large_object_descriptors(descriptors)
+                || context.storage().advisory_statement_mark() != advisory
+                || match &context.host {
+                    PlpgsqlExecHost::Routine { guc, .. } => {
+                        !guc.matches_statement_settings(&settings)
+                    }
+                    _ => true,
+                };
+            match outcome {
+                Ok(_) => break Ok(()),
+                Err(error) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION => {
+                    if let Some(write) = &mut self.pending_write {
+                        let result = write.poll(context).map(|_| ());
+                        if result.is_ok() {
+                            self.pending_write = None;
+                            context.responder.take_affected_rows();
+                        }
+                        break result;
+                    }
+                    if changed_effects {
+                        break Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "SQL row expression requires retained write progress"
+                        ));
+                    }
+                    let PlpgsqlExecHost::Routine {
+                        engine,
+                        guc,
+                        sqlprep,
+                        cursors,
+                        ..
+                    } = &mut context.host
+                    else {
+                        return Err(changed());
+                    };
+                    engine.rollback_waiting_statement(context.txn, mark);
+                    let pending = calls.take_pending().ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "SQL write yielded without a pending call"
+                        )
+                    })?;
+                    if let Err(error) = engine
+                        .complete_pending_routine(
+                            pending,
+                            &calls,
+                            owner,
+                            arena,
+                            context.txn,
+                            sqlprep,
+                            cursors,
+                            guc,
+                            context.responder,
+                        )
+                        .map_err(response_full)?
+                    {
+                        break Err(error);
+                    }
+                }
+                Err(error) if changed_effects && control_flow::is_execution_wait(&error) => {
+                    break Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "SQL row expression requires retained write progress"
+                    ));
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        if self.policy == query::RoutineExecution::Retained
+            && result.as_ref().is_err_and(control_flow::is_execution_wait)
+        {
+            self.pending_query = Some(calls);
+        }
+        result
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "SQL calls capture their selected contract and original execution services"
+)]
+pub(in crate::sql) fn execute_sql_function<'a>(
+    engine: &mut super::super::Engine,
+    transaction: &mut TxnState,
+    prepared: &mut super::super::prep::SqlPreparedPool,
+    cursors: &mut super::super::cursor::CursorPool,
+    settings: &super::super::guc::GucState,
+    slot: usize,
+    routine: &crate::storage::RoutineDef,
+    collation: crate::sql::ast::Collation,
+    inputs: &[Datum<'a>],
+    body_inputs: super::super::PreparedTypeInputs<'_>,
+    arena: &'a Arena,
+    responder: &mut Responder<'_>,
+    environment: &CallEnvironment,
+    policy: query::RoutineExecution,
+    suspended: &mut Option<SuspendedFunction>,
+) -> Result<FunctionOutput<'a>, SqlError> {
+    let controls = &engine.storage.execution_control;
+    let rows = &engine.storage.row_work;
+    let mut state = controls.lease(1).map_err(control_flow::execution_full)?;
+    let parameters = controls
+        .copy_slice(routine.arguments())
+        .map_err(control_flow::execution_full)?;
+    let columns = controls
+        .copy_slice(&routine.result_columns[..routine.result_column_count])
+        .map_err(control_flow::execution_full)?;
+    let text = rows
+        .copy_slice(routine.body.as_str().as_bytes())
+        .map_err(control_flow::execution_full)?;
+    let length = type_inputs::encoded_len(body_inputs.bindings)?;
+    let mut checked_inputs = rows.lease(length).map_err(control_flow::execution_full)?;
+    for _ in 0..length {
+        checked_inputs
+            .push_reserved(0)
+            .map_err(control_flow::execution_full)?;
+    }
+    type_inputs::encode_into(body_inputs.bindings, &mut checked_inputs)?;
+    let stored = if routine.body_kind == crate::storage::RoutineBodyKind::String {
+        None
+    } else {
+        let image = engine
+            .storage
+            .routine_dependencies_for(slot, transaction.txid);
+        Some(StoredSource {
+            path: engine.storage.compute_path(
+                routine.creation_path.as_str(),
+                super::super::eval::funcs::system::session_user_owned().as_str(),
+                transaction.txid,
+            ),
+            dependencies: controls
+                .copy_slice(image.entries())
+                .map_err(control_flow::execution_full)?,
+            inputs: image
+                .view()
+                .type_inputs()
+                .expect("stored SQL dependencies own their input image")
+                .clone(),
+        })
+    };
+    let mut arguments = local_values::SavedValues::new(rows)?;
+    arguments.replace(inputs)?;
+    let result = if routine.kind.is_set_returning() {
+        SqlResult::Rows(set_rows::SavedRows::new(rows)?)
+    } else {
+        SqlResult::Scalar {
+            value: local_values::SavedValues::new(rows)?,
+            present: false,
+            checked: false,
+        }
+    };
+    let return_type = RoutineArgumentDef {
+        name: SqlName::EMPTY,
+        ctype: routine.kind.function_result().ok_or_else(changed)?,
+        user_type: routine
+            .function_result_contract()
+            .and_then(|result| result.user_type),
+    };
+    let input_types = arena
+        .alloc_slice_with(body_inputs.bindings.len(), |_| None)
+        .map_err(|_| query::arena_full_pub())?;
+    for (selected, input) in input_types.iter_mut().zip(body_inputs.bindings) {
+        if crate::storage::NamedTypeKind::from_oid(input.type_oid).is_some() {
+            *selected = catalog_column_type(&engine.storage, transaction.txid, input.type_oid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "selected SQL input type is unavailable"
+                    )
+                })?
+                .1;
+        }
+    }
+    let types = engine.storage.select_type_definition_graph(
+        routine
+            .arguments()
+            .iter()
+            .filter_map(|argument| argument.user_type)
+            .chain(columns.iter().filter_map(|column| column.user_type))
+            .chain(return_type.user_type)
+            .chain(input_types.iter().copied().flatten()),
+        transaction.txid,
+        arena,
+    )?;
+    let _types = types.as_ref().map(|types| types.enter()).transpose()?;
+    let saved_environment = SavedCallEnvironment::capture(environment, controls)?;
+    let boundary = transaction.statement_mark(
+        engine.wal.stage_mark(transaction.txid),
+        engine.storage.lock_mark(),
+    );
+    let mut context = TriggerExecContext {
+        host: PlpgsqlExecHost::Routine {
+            engine,
+            guc: settings,
+            sqlprep: prepared,
+            cursors,
+            transaction_context: PlpgsqlTransactionContext::Atomic,
+        },
+        txn: transaction,
+        arena,
+        params: crate::sql::eval::NO_PARAMS,
+        responder,
+    };
+    let owner = FunctionOwner::capture(&context);
+    state
+        .push_reserved(SqlExecution {
+            source: SqlSource {
+                text,
+                checked_inputs: checked_inputs.freeze(),
+                parameters,
+                columns,
+                kind: routine.kind,
+                return_type,
+                body_kind: routine.body_kind,
+                name: routine.name,
+                oid: crate::storage::routine_oid(routine),
+                collation,
+                owner: body_inputs.owner,
+                input_source: body_inputs.source,
+                stored,
+            },
+            arguments,
+            result,
+            types,
+            environment: saved_environment,
+            owner,
+            boundary,
+            policy,
+            step: 0,
+            finished_body: false,
+            pending_query: None,
+            pending_write: None,
+            command: None,
+            step_position: None,
+            suspended_position: None,
+        })
+        .map_err(control_flow::execution_full)?;
+    let parsed = state[0]
+        .source
+        .parse(context.storage(), context.txn.txid, arena)?;
+    let arguments = state[0].arguments.decode(arena)?;
+    let result = state[0].execute(&parsed, arguments, &mut context);
+    if policy == query::RoutineExecution::Retained
+        && result.as_ref().is_err_and(control_flow::is_execution_wait)
+    {
+        state[0].environment =
+            SavedCallEnvironment::capture(environment, &context.storage().execution_control)?;
+        state[0].suspended_position = Some(sequence::SavedStatementPosition::capture()?);
+        *suspended = Some(SuspendedFunction::Sql(SuspendedSqlFunction { state }));
+    }
+    result
+}
+
+fn response_full(_: WireFull) -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "SQL function response exceeds the send buffer"
+    )
+}
+
+fn coerce_sql_result<'a>(
+    value: Datum<'a>,
+    source: &SqlSource,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<Datum<'a>, SqlError> {
+    if matches!(
+        source.kind,
+        crate::storage::RoutineKind::RecordFunction {
+            set_returning: false
+        }
+    ) {
+        let Datum::Record(fields) = value else {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "SQL record result has no declared fields"
+            ));
+        };
+        if fields.len() != source.columns.len() {
+            return Err(changed());
+        }
+        let fields = arena
+            .alloc_slice_copy(fields)
+            .map_err(|_| query::arena_full_pub())?;
+        for (field, column) in fields.iter_mut().zip(source.columns.iter().copied()) {
+            field.value =
+                coerce_routine_argument(field.value, column, storage, txid, arena, sequences)?;
+        }
+        Ok(Datum::Record(fields))
+    } else {
+        coerce_routine_argument(value, source.return_type, storage, txid, arena, sequences)
+    }
+}
+
+fn changed() -> SqlError {
+    sql_err!(
+        sqlstate::SERIALIZATION_FAILURE,
+        "SQL function execution source or owner was replaced"
+    )
+}

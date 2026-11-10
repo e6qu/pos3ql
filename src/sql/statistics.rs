@@ -153,10 +153,9 @@ fn pop_function_timing(depth: usize) -> FunctionTimingFrame {
 pub(crate) fn result_type(name: &str, argument_count: usize) -> Option<(i32, i16)> {
     match (name, argument_count) {
         ("pg_stat_force_next_flush" | "pg_stat_clear_snapshot" | "pg_stat_reset", 0)
+        | ("pg_stat_reset_slru" | "pg_stat_reset_shared", 0 | 1)
         | (
-            "pg_stat_reset_slru"
-            | "pg_stat_reset_shared"
-            | "pg_stat_reset_single_table_counters"
+            "pg_stat_reset_single_table_counters"
             | "pg_stat_reset_single_function_counters"
             | "pg_stat_reset_backend_stats",
             1,

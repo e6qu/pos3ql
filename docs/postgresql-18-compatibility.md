@@ -418,11 +418,25 @@ expressions.
 Outside an owned query, the command's effect journal must approve restarting
 an unfinished call. Checked inputs, caught input errors and issued sequence
 values keep their original receipts; a command with unrecorded effects returns
-`0A000` instead of repeating them. SQL-language bodies and other expression
-positions still need retained progress. A SQL-language call inside retained
-work returns `0A000`, `function wait requires a retained body`, if it would lose
-its unfinished body on a wait. Storage waits remain synchronous on protected
-paths until that work is complete.
+`0A000` instead of repeating them. SQL-language scalar and table functions keep
+their current statement and unfinished calls, including string and `BEGIN ATOMIC`
+bodies. A completed audit INSERT is not repeated when a later SELECT waits.
+Returned rows survive waits in nested AFTER triggers. Scalar SELECT returns only
+its first row; final data modifications complete all their writes. Table output
+checks run before later row effects, and a scalar query's completed result stays
+owned while its return check waits.
+Write-row phases without a saved continuation still return `0A000`,
+`SQL row expression requires retained write progress`, if a callback would require
+restarting a changed row or other unowned effect. This includes a multirow UPDATE
+that changes one row before calling a function for the next row. Undoing the
+first row before that function runs would change what it can read; the statement
+fails explicitly and rolls back its SQL writes instead. A standalone SQL function
+whose UPDATE needs no row callback still works. Protected storage waits remain
+synchronous until those enclosing phases have complete ownership.
+Likewise, repeating an unsaved `random()` or wall-clock value before an unfinished
+callback returns `0A000`, `expression restart requires owned volatile values`.
+Completed arguments and scalar return values keep their owned values; general
+query-row positions still need that ownership before such a query can restart.
 Cancellation and capacity errors roll back SQL writes; sequence numbers already
 issued remain consumed, as in PostgreSQL.
 

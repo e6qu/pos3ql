@@ -47,16 +47,19 @@ The implementation retains ordered AFTER work, nested INSERT/UPDATE/DELETE
 completion, trigger frames and completed calls within unfinished `PERFORM` and
 `SELECT ... INTO`, including unfinished PL/pgSQL scalar and table-function
 bodies inside those owned expressions, declaration initializers and their type
-checks. The [request path](docs/architecture.md#the-request-path)
+checks. SQL-language functions retain their body statement, unfinished child
+calls and completed nested writes, including rows saved before AFTER triggers
+finish. SQL scalar return checks and per-row table checks share the same saved
+call context. The [request path](docs/architecture.md#the-request-path)
 owns their contracts and regression evidence. General function and query
 execution still needs the remaining ownership work below.
 
 Complete these connected execution paths:
 
 - Extend function resumption to callers and expression positions without an
-  owned query. SQL-language functions need their position between body
-  statements. Preserve completed bodies before return conversion that can
-  wait. Scalar and table functions need the same guarantees, including one
+  owned query. Preserve completed PL/pgSQL bodies before return conversion that
+  can wait, and retain write-row phases before a callback can yield. Scalar and
+  table functions need the same guarantees, including one
   timing count per completed call; output width is independent of the
   input-argument limit.
 - Finish write phases before and around AFTER work: BEFORE/INSTEAD triggers,
@@ -64,8 +67,11 @@ Complete these connected execution paths:
   Include combined commands, rules, data-modifying common table expressions,
   COPY, replication apply and deferred triggers. Retain the original command
   and rollback boundary, rather than undoing inserted rows before a constraint
-  can inspect them. Each insert/update/delete operation keeps its own completed
-  transition table and firing order.
+  can inspect them. Replace the explicit row-progress rejection for multirow
+  updates with an owner for completed rows and the current callback; prove that
+  a child reads earlier changed rows before the next row is written. Each
+  insert/update/delete operation keeps its own completed transition table and
+  firing order.
 - Preserve remaining expression values, complex query positions and cursor
   progress. After the first result flush, continue with one header, every row
   once and one completion. `FETCH` must not execute effects for unfetched rows;

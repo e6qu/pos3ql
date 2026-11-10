@@ -812,8 +812,10 @@ mod set_rows;
 mod transition_rows;
 pub(super) use call_environment::CallEnvironment;
 mod function_execution;
+mod sql_function_execution;
 pub(super) use function_execution::execute as execute_plpgsql_function;
 pub(super) use function_execution::{FunctionOutput, SuspendedFunction};
+pub(super) use sql_function_execution::execute_sql_function;
 mod trigger_firing;
 mod write_completion;
 pub(super) use write_completion::SuspendedWriteCompletion;
@@ -23503,247 +23505,265 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     query: BoundPlpgsqlCommand<'a>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
-    capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    capture: Option<&mut super::ReturningCapture<'_>>,
     pending: &mut Option<write_completion::PendingNestedWrite>,
 ) -> Result<u64, SqlError> {
     let input_source = plpgsql_command_source(query.source, context.arena)?;
     super::type_input_plans::with_owner(query.owner, || {
         super::type_inputs::with_source(input_source, query.source, query.inputs, || {
-            let statement = match transition_relations {
-                Some(relations) => super::query::bind_dml_materialized_relations(
-                    query.statement,
-                    context.storage(),
-                    context.txn.txid,
-                    context.arena,
-                    query.arguments,
-                    relations,
-                )?,
-                None => query.statement,
-            };
-            super::query::validate_dml_assignment_casts(
-                statement,
+            execute_nested_data_modification(
+                context,
+                query.statement,
+                query.arguments,
+                transition_relations,
+                capture,
+                pending,
+            )
+        })
+    })
+}
+
+fn execute_nested_data_modification<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    statement: &'a Stmt<'a>,
+    arguments: &'a [Datum<'a>],
+    transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
+    capture: Option<&mut super::ReturningCapture<'_>>,
+    pending: &mut Option<write_completion::PendingNestedWrite>,
+) -> Result<u64, SqlError> {
+    let statement = match transition_relations {
+        Some(relations) => super::query::bind_dml_materialized_relations(
+            statement,
+            context.storage(),
+            context.txn.txid,
+            context.arena,
+            arguments,
+            relations,
+        )?,
+        None => statement,
+    };
+    super::query::validate_dml_assignment_casts(
+        statement,
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+        None,
+    )?;
+    match statement {
+        Stmt::Insert(statement) => {
+            let assignment_casts = prepare_dml_assignment_casts(
+                &Stmt::Insert(*statement),
                 context.storage(),
                 context.txn.txid,
                 context.arena,
                 None,
             )?;
-            match statement {
-                Stmt::Insert(statement) => {
-                    let assignment_casts = prepare_dml_assignment_casts(
-                        &Stmt::Insert(*statement),
-                        context.storage(),
-                        context.txn.txid,
-                        context.arena,
-                        None,
-                    )?;
-                    let source_casts = match statement.select {
-                        Some(select) => Some(prepare_insert_select_casts(
-                            statement,
-                            select,
-                            context.storage(),
-                            context.txn.txid,
-                            context.arena,
-                            None,
-                        )?),
-                        None => None,
-                    };
-                    let prepared_select = match statement.select {
-                        Some(select) => Some(materialize_trigger_insert_source(
-                            context.storage(),
-                            statement,
-                            select,
-                            source_casts.expect("prepared SELECT has a cast plan"),
-                            context.arena,
-                            context.arena,
-                            context.txn.txid,
-                            TriggerQueryExecution {
-                                params: query.arguments,
-                                seq_session: context.seq_session(),
-                            },
-                            None,
-                        )?),
-                        None => None,
-                    };
-                    let arena = context.arena;
-                    let params = query.arguments;
-                    let boundary = context.nested_write_boundary();
-                    let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
+            let source_casts = match statement.select {
+                Some(select) => Some(prepare_insert_select_casts(
+                    statement,
+                    select,
+                    context.storage(),
+                    context.txn.txid,
+                    context.arena,
+                    None,
+                )?),
+                None => None,
+            };
+            let prepared_select = match statement.select {
+                Some(select) => Some(materialize_trigger_insert_source(
+                    context.storage(),
+                    statement,
+                    select,
+                    source_casts.expect("prepared SELECT has a cast plan"),
+                    context.arena,
+                    context.arena,
+                    context.txn.txid,
+                    TriggerQueryExecution {
+                        params: arguments,
+                        seq_session: context.seq_session(),
+                    },
+                    None,
+                )?),
+                None => None,
+            };
+            let arena = context.arena;
+            let params = arguments;
+            let boundary = context.nested_write_boundary();
+            let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
 
-                    let mut command = txn.enter_trigger_sql(storage)?;
-                    let txn = &mut *command;
-                    let parent_boundary = txn.write_completion_boundary;
-                    txn.write_completion_boundary =
-                        boundary.map(|mark| super::txn::WriteCompletionBoundary {
-                            mark,
-                            command: txn.command_id(),
-                            depth: txn.trigger_depth(),
-                        });
-                    responder.clear_affected_rows();
-                    let outcome = responder.without_query_output(|responder| {
-                        insert(
-                            storage,
-                            txn,
-                            statement,
-                            DmlAuthorization::Invoker,
-                            None,
-                            arena,
-                            params,
-                            seq_session,
-                            responder,
-                            capture,
-                            None,
-                            transition_relations,
-                            None,
-                            prepared_select.map_or(InsertSource::Statement, |rows| {
-                                InsertSource::MaterializedSelect {
-                                    rows,
-                                    assignments: assignment_casts,
-                                }
-                            }),
-                        )
-                    });
-                    txn.write_completion_boundary = parent_boundary;
-                    let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
-                    {
-                        txn.pending_write_completion.take()
-                    } else {
-                        None
-                    };
-                    if let Some(completion) = completion {
-                        *pending = Some(write_completion::PendingNestedWrite::new(
-                            command.suspend(),
-                            completion,
-                        ));
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
-                            "nested dynamic write completion is pending"
-                        ));
-                    }
-                    drop(command);
-                    dynamic_dml_outcome(responder, outcome, "INSERT")
-                }
-                Stmt::Update(statement) => {
-                    let arena = context.arena;
-                    let params = query.arguments;
-                    let boundary = context.nested_write_boundary();
-                    let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-                    let mut command = txn.enter_trigger_sql(storage)?;
-                    let txn = &mut *command;
-                    let parent_boundary = txn.write_completion_boundary;
-                    txn.write_completion_boundary =
-                        boundary.map(|mark| super::txn::WriteCompletionBoundary {
-                            mark,
-                            command: txn.command_id(),
-                            depth: txn.trigger_depth(),
-                        });
-                    let mut scratch = storage.row_work.lease(0).map_err(|error| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "nested DML selection: {}",
-                            error
-                        )
-                    })?;
-                    responder.clear_affected_rows();
-                    let outcome = responder.without_query_output(|responder| {
-                        update(
-                            storage,
-                            txn,
-                            &mut scratch,
-                            statement,
-                            DmlAuthorization::Invoker,
-                            None,
-                            arena,
-                            params,
-                            seq_session,
-                            responder,
-                            capture,
-                            None,
-                        )
-                    });
-                    txn.write_completion_boundary = parent_boundary;
-                    let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
-                    {
-                        txn.pending_write_completion.take()
-                    } else {
-                        None
-                    };
-                    if let Some(completion) = completion {
-                        *pending = Some(write_completion::PendingNestedWrite::new(
-                            command.suspend(),
-                            completion,
-                        ));
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
-                            "nested dynamic write completion is pending"
-                        ));
-                    }
-                    drop(command);
-                    dynamic_dml_outcome(responder, outcome, "UPDATE")
-                }
-                Stmt::Delete(statement) => {
-                    let arena = context.arena;
-                    let params = query.arguments;
-                    let boundary = context.nested_write_boundary();
-                    let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-                    let mut command = txn.enter_trigger_sql(storage)?;
-                    let txn = &mut *command;
-                    let parent_boundary = txn.write_completion_boundary;
-                    txn.write_completion_boundary =
-                        boundary.map(|mark| super::txn::WriteCompletionBoundary {
-                            mark,
-                            command: txn.command_id(),
-                            depth: txn.trigger_depth(),
-                        });
-                    let mut scratch = storage.row_work.lease(0).map_err(|error| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "nested DML selection: {}",
-                            error
-                        )
-                    })?;
-                    responder.clear_affected_rows();
-                    let outcome = responder.without_query_output(|responder| {
-                        delete(
-                            storage,
-                            txn,
-                            &mut scratch,
-                            statement,
-                            DmlAuthorization::Invoker,
-                            arena,
-                            params,
-                            seq_session,
-                            responder,
-                            capture,
-                            None,
-                        )
-                    });
-                    txn.write_completion_boundary = parent_boundary;
-                    let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
-                    {
-                        txn.pending_write_completion.take()
-                    } else {
-                        None
-                    };
-                    if let Some(completion) = completion {
-                        *pending = Some(write_completion::PendingNestedWrite::new(
-                            command.suspend(),
-                            completion,
-                        ));
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
-                            "nested dynamic write completion is pending"
-                        ));
-                    }
-                    drop(command);
-                    dynamic_dml_outcome(responder, outcome, "DELETE")
-                }
-                _ => Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "PL/pgSQL dynamic command is not data-modifying"
-                )),
+            let mut command = txn.enter_trigger_sql(storage)?;
+            let txn = &mut *command;
+            let parent_boundary = txn.write_completion_boundary;
+            txn.write_completion_boundary =
+                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    mark,
+                    command: txn.command_id(),
+                    depth: txn.trigger_depth(),
+                });
+            responder.clear_affected_rows();
+            let outcome = responder.without_query_output(|responder| {
+                insert(
+                    storage,
+                    txn,
+                    statement,
+                    DmlAuthorization::Invoker,
+                    None,
+                    arena,
+                    params,
+                    seq_session,
+                    responder,
+                    capture,
+                    None,
+                    transition_relations,
+                    None,
+                    prepared_select.map_or(InsertSource::Statement, |rows| {
+                        InsertSource::MaterializedSelect {
+                            rows,
+                            assignments: assignment_casts,
+                        }
+                    }),
+                )
+            });
+            txn.write_completion_boundary = parent_boundary;
+            let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+            {
+                txn.pending_write_completion.take()
+            } else {
+                None
+            };
+            if let Some(completion) = completion {
+                *pending = Some(write_completion::PendingNestedWrite::new(
+                    command.suspend(),
+                    completion,
+                ));
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                    "nested dynamic write completion is pending"
+                ));
             }
-        })
-    })
+            drop(command);
+            dynamic_dml_outcome(responder, outcome, "INSERT")
+        }
+        Stmt::Update(statement) => {
+            let arena = context.arena;
+            let params = arguments;
+            let boundary = context.nested_write_boundary();
+            let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
+            let mut command = txn.enter_trigger_sql(storage)?;
+            let txn = &mut *command;
+            let parent_boundary = txn.write_completion_boundary;
+            txn.write_completion_boundary =
+                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    mark,
+                    command: txn.command_id(),
+                    depth: txn.trigger_depth(),
+                });
+            let mut scratch = storage.row_work.lease(0).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "nested DML selection: {}",
+                    error
+                )
+            })?;
+            responder.clear_affected_rows();
+            let outcome = responder.without_query_output(|responder| {
+                update(
+                    storage,
+                    txn,
+                    &mut scratch,
+                    statement,
+                    DmlAuthorization::Invoker,
+                    None,
+                    arena,
+                    params,
+                    seq_session,
+                    responder,
+                    capture,
+                    None,
+                )
+            });
+            txn.write_completion_boundary = parent_boundary;
+            let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+            {
+                txn.pending_write_completion.take()
+            } else {
+                None
+            };
+            if let Some(completion) = completion {
+                *pending = Some(write_completion::PendingNestedWrite::new(
+                    command.suspend(),
+                    completion,
+                ));
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                    "nested dynamic write completion is pending"
+                ));
+            }
+            drop(command);
+            dynamic_dml_outcome(responder, outcome, "UPDATE")
+        }
+        Stmt::Delete(statement) => {
+            let arena = context.arena;
+            let params = arguments;
+            let boundary = context.nested_write_boundary();
+            let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
+            let mut command = txn.enter_trigger_sql(storage)?;
+            let txn = &mut *command;
+            let parent_boundary = txn.write_completion_boundary;
+            txn.write_completion_boundary =
+                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    mark,
+                    command: txn.command_id(),
+                    depth: txn.trigger_depth(),
+                });
+            let mut scratch = storage.row_work.lease(0).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "nested DML selection: {}",
+                    error
+                )
+            })?;
+            responder.clear_affected_rows();
+            let outcome = responder.without_query_output(|responder| {
+                delete(
+                    storage,
+                    txn,
+                    &mut scratch,
+                    statement,
+                    DmlAuthorization::Invoker,
+                    arena,
+                    params,
+                    seq_session,
+                    responder,
+                    capture,
+                    None,
+                )
+            });
+            txn.write_completion_boundary = parent_boundary;
+            let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+            {
+                txn.pending_write_completion.take()
+            } else {
+                None
+            };
+            if let Some(completion) = completion {
+                *pending = Some(write_completion::PendingNestedWrite::new(
+                    command.suspend(),
+                    completion,
+                ));
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                    "nested dynamic write completion is pending"
+                ));
+            }
+            drop(command);
+            dynamic_dml_outcome(responder, outcome, "DELETE")
+        }
+        _ => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "nested command is not an INSERT, UPDATE or DELETE"
+        )),
+    }
 }
 
 /// Static and dynamic utility commands use the routine's durable DDL executor. Atomic
@@ -26707,21 +26727,6 @@ fn execute_trigger_step<'a>(
     }
     let retained_parent = context.txn.write_completion_boundary.is_some()
         && matches!(&context.host, PlpgsqlExecHost::Routine { .. });
-    let (statement, input_plan) = {
-        let transition = TriggerTransition {
-            definition,
-            old,
-            new: new.as_deref(),
-        };
-        let row = TriggerLocalScope {
-            locals,
-            values: &local_values[..locals.len()],
-            found: status.found,
-            invocation,
-            transition: &transition,
-        };
-        prepare_static_plpgsql_statement(context, statement, &row)?
-    };
     let position = match status.pending_statement.take() {
         Some(position) => {
             if let Err(((), error)) = position.with_resume(
@@ -26735,6 +26740,29 @@ fn execute_trigger_step<'a>(
             position
         }
         None => super::sequence::SavedStatementPosition::capture()?,
+    };
+    let (statement, input_plan) = {
+        let transition = TriggerTransition {
+            definition,
+            old,
+            new: new.as_deref(),
+        };
+        let row = TriggerLocalScope {
+            locals,
+            values: &local_values[..locals.len()],
+            found: status.found,
+            invocation,
+            transition: &transition,
+        };
+        match prepare_static_plpgsql_statement(context, statement, &row) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if control_flow::is_execution_wait(&error) {
+                    status.pending_statement = Some(position);
+                }
+                return Err(error);
+            }
+        }
     };
     let mut execute = || match statement {
         TriggerStatement::Null => execute_trigger_statement(|| Ok(None)),
@@ -27940,11 +27968,16 @@ fn execute_trigger_step<'a>(
                         execute_bound_plpgsql_dynamic_query(context, query, &mut capture)?;
                     }
                     Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+                        let mut returning =
+                            |_: &Storage,
+                             _: u32,
+                             _: &dyn crate::sql::eval::SequenceAccess,
+                             values: &[Datum]| capture(values);
                         let result = execute_bound_plpgsql_dynamic_dml(
                             context,
                             query,
                             transition_relations,
-                            Some(&mut capture),
+                            Some(&mut returning),
                             &mut status.pending_write,
                         );
                         let result = match result {
@@ -62195,7 +62228,7 @@ pub(crate) fn merge<'a>(
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    mut capture: Option<&mut super::ReturningCapture<'_>>,
 ) -> Outcome {
     let coercion_txid = txn.txid;
     use crate::sql::ast::MergeActionRef as MergeAction;
@@ -64326,7 +64359,7 @@ fn finish_insert_row<'a, 'outer, 'snapshot, Definition0: crate::storage::Definit
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    capture: &mut Option<&mut super::ReturningCapture<'_>>,
     transition_capture: Option<&mut TransitionCapture<'a>>,
     conflict_transition_capture: Option<&mut TransitionCapture<'a>>,
     outer: Option<&'outer TriggerDmlSnapshot<'snapshot>>,
@@ -64806,7 +64839,7 @@ pub(crate) fn instead_of_view_dml<'a>(
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    mut capture: Option<&mut super::ReturningCapture<'_>>,
 ) -> Outcome {
     let coercion_txid = txn.txid;
     let assignment_casts =
@@ -65559,7 +65592,7 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
     values: &mut [Datum<'a>],
     returning: crate::sql::ast::Returning<'a>,
     params: &[Datum<'a>],
-    capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    capture: &mut Option<&mut super::ReturningCapture<'_>>,
 ) -> Result<Result<bool, SqlError>, WireFull> {
     let fired = match fire_view_row_trigger(
         storage,
@@ -65614,7 +65647,7 @@ pub(crate) fn insert<'a, 'scope, 'outer, 'snapshot>(
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    mut capture: Option<&mut super::ReturningCapture<'_>>,
     transition: Option<&'scope dyn ColumnLookup<'a>>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     conflict_outer: Option<&'outer TriggerDmlSnapshot<'snapshot>>,
@@ -66407,7 +66440,7 @@ fn emit_conflict_returning<Definition0: crate::storage::DefinitionBacking>(
     arena: &Arena,
     params: &[Datum],
     responder: &mut Responder,
-    capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    capture: &mut Option<&mut super::ReturningCapture<'_>>,
     seq_session: &crate::sql::guc::SeqSession,
 ) -> Result<Result<(), SqlError>, WireFull> {
     let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -66446,7 +66479,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     arena: &Arena,
     params: &[Datum],
     responder: &mut Responder,
-    capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    capture: &mut Option<&mut super::ReturningCapture<'_>>,
     seq_session: &crate::sql::guc::SeqSession,
 ) -> Result<Result<(), SqlError>, WireFull> {
     let txid = txn.txid;
@@ -66583,7 +66616,12 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     // A data-modifying CTE captures its RETURNING rows in memory instead of
     // streaming them to the client.
     if let Some(sink) = capture.as_deref_mut() {
-        if let Err(e) = sink(&projected[..n]) {
+        if let Err(e) = sink(
+            storage,
+            txid,
+            &super::sequence::SeqEval::new(storage, seq_session, txid),
+            &projected[..n],
+        ) {
             return Ok(Err(e));
         }
     } else {
@@ -66616,7 +66654,7 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     responder: &mut Responder,
-    capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    capture: &mut Option<&mut super::ReturningCapture<'_>>,
     seq_session: &crate::sql::guc::SeqSession,
 ) -> Result<Result<(), SqlError>, WireFull> {
     let lookup = MergeLookup {
@@ -66762,7 +66800,12 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
         }
     }
     if let Some(sink) = capture.as_deref_mut() {
-        match sink(&projected[..n]) {
+        match sink(
+            storage,
+            txid,
+            &super::sequence::SeqEval::new(storage, seq_session, txid),
+            &projected[..n],
+        ) {
             Ok(()) => Ok(Ok(())),
             Err(error) => Ok(Err(error)),
         }
@@ -66914,7 +66957,7 @@ pub(crate) fn update<'a>(
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    mut capture: Option<&mut super::ReturningCapture<'_>>,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Outcome {
     let coercion_txid = txn.txid;
@@ -68105,7 +68148,7 @@ pub(crate) fn delete<'a>(
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    mut capture: Option<&mut super::ReturningCapture<'_>>,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Outcome {
     let coercion_txid = txn.txid;

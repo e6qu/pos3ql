@@ -195,12 +195,13 @@ impl StatementSequenceScope<'_, '_> {
         }
         let replay = session.statement_replay.get();
         let complete = replay.next.is_none() && replay.effects_next.is_none();
-        finish_statement(session);
-        if complete {
+        let result = if complete {
             Ok(())
         } else {
             Err(replay_changed())
-        }
+        };
+        finish_statement(session);
+        result
     }
 
     pub(super) fn discard(&self, session: &SeqSession) {
@@ -263,7 +264,39 @@ pub(crate) fn finish_statement(session: &SeqSession) {
     session.statement_replay.set(StatementSequenceReplay::EMPTY);
 }
 
+#[cfg(test)]
+type ReplayErrorDiagnostic = (
+    &'static core::panic::Location<'static>,
+    Option<(bool, bool)>,
+    Option<(bool, bool)>,
+);
+
+#[cfg(test)]
+thread_local! {
+    static LAST_REPLAY_ERROR: Cell<Option<ReplayErrorDiagnostic>> = const { Cell::new(None) };
+    static LAST_CURSOR_RESTORE: Cell<Option<(bool, bool)>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_replay_error_diagnostic() -> Option<ReplayErrorDiagnostic> {
+    LAST_CURSOR_RESTORE.with(|prefix| prefix.set(None));
+    LAST_REPLAY_ERROR.with(Cell::take)
+}
+
+#[cfg_attr(test, track_caller)]
 fn replay_changed() -> SqlError {
+    #[cfg(test)]
+    {
+        let caller = core::panic::Location::caller();
+        let pending = with_statement_context(|context| {
+            context.map(|(_, session)| {
+                let replay = session.statement_replay.get();
+                (replay.next.is_some(), replay.effects_next.is_some())
+            })
+        });
+        let prefix = LAST_CURSOR_RESTORE.with(Cell::get);
+        LAST_REPLAY_ERROR.with(|location| location.set(Some((caller, pending, prefix))));
+    }
     sql_err!(
         sqlstate::SERIALIZATION_FAILURE,
         "sequence source or call order changed while resuming the statement"
@@ -485,6 +518,44 @@ pub(crate) struct StatementPositionAdmission<'session> {
 }
 
 impl StatementPositionAdmission<'_> {
+    /// An owned child can restore earlier phases while its caller has already
+    /// checked inputs. Keep that completed prefix when control returns, without
+    /// rewinding the child's sequence values or consuming later unchecked work.
+    pub(crate) fn preserve_caller_inputs(&self) -> Result<(), SqlError> {
+        if !self.committed {
+            return Err(replay_changed());
+        }
+        with_statement_context(|context| {
+            let Some((arena, session)) = context else {
+                return if self.session.is_none() {
+                    Ok(())
+                } else {
+                    Err(replay_changed())
+                };
+            };
+            if !self
+                .session
+                .is_some_and(|prior| core::ptr::eq(prior, session))
+            {
+                return Err(replay_changed());
+            }
+            if self.prior.input_attempt.is_none() {
+                return Ok(());
+            }
+            let mut current = session.statement_replay.get();
+            if current.input_attempt != self.prior.input_attempt
+                || current.journal != self.prior.journal
+            {
+                return Err(replay_changed());
+            }
+            let completed =
+                EffectPosition::capture(self.prior.effects_next, self.prior.effects_tail);
+            current.effects_next = completed_input_position(arena, current, completed)?;
+            session.statement_replay.set(current);
+            Ok(())
+        })
+    }
+
     /// Commit only after every part of the invocation has attached, before SQL
     /// can change the journal. Failed attachment restores the caller's cursor.
     pub(crate) fn commit(&mut self) {
@@ -784,7 +855,33 @@ pub(crate) fn rewind_replay_cursor(start: Option<StatementReplayStart>) -> Resul
     })
 }
 
-pub(crate) fn restore_replay_cursor(cursor: StatementReplayCursor) -> Result<(), SqlError> {
+#[derive(Clone, Copy)]
+pub(crate) enum ReplayInputPosition {
+    RecordedEnd,
+    KeepConsumed,
+}
+
+fn completed_input_position(
+    arena: &Arena,
+    replay: StatementSequenceReplay,
+    recorded: EffectPosition,
+) -> Result<Option<EffectHandle>, SqlError> {
+    let end = effect_position(arena, replay, recorded)?;
+    let mut next = replay.effects_next;
+    while next != end {
+        let Some(handle) = next else {
+            return Ok(replay.effects_next);
+        };
+        super::query::check_timeout()?;
+        next = handle.next(arena)?;
+    }
+    Ok(end)
+}
+
+pub(crate) fn restore_replay_cursor(
+    cursor: StatementReplayCursor,
+    input_position: ReplayInputPosition,
+) -> Result<(), SqlError> {
     with_statement_context(|context| {
         let (Some(end), Some((arena, session))) = (cursor.0, context) else {
             return if cursor.0.is_none() && context.is_none() {
@@ -795,8 +892,19 @@ pub(crate) fn restore_replay_cursor(cursor: StatementReplayCursor) -> Result<(),
         };
         let mut replay = session.statement_replay.get();
         validate_cursor(arena, replay, end.boundary)?;
+        #[cfg(test)]
+        let before = replay;
         replay.next = sequence_position(arena, replay, end.boundary.sequences)?;
-        replay.effects_next = effect_position(arena, replay, end.boundary.effects)?;
+        // A caller can admit fresh inputs before it reuses a completed value.
+        // Restoring that value must not make those inputs unread again.
+        replay.effects_next = match input_position {
+            ReplayInputPosition::RecordedEnd => {
+                effect_position(arena, replay, end.boundary.effects)?
+            }
+            ReplayInputPosition::KeepConsumed => {
+                completed_input_position(arena, replay, end.boundary.effects)?
+            }
+        };
         let mut advisory = admit_advisory(
             end.boundary.advisory,
             super::lock::AdvisoryPositionTail::Appended,
@@ -810,6 +918,13 @@ pub(crate) fn restore_replay_cursor(cursor: StatementReplayCursor) -> Result<(),
             }
         }
         session.restore_last_sequence(end.boundary.lastval);
+        #[cfg(test)]
+        LAST_CURSOR_RESTORE.with(|position| {
+            position.set(Some((
+                before.next != replay.next,
+                before.effects_next != replay.effects_next,
+            )));
+        });
         session.statement_replay.set(replay);
         if let Some(advisory) = &mut advisory {
             advisory.commit();
@@ -1605,11 +1720,13 @@ mod tests {
                     .unwrap(),
             );
             assert_eq!(
-                restore_replay_cursor(broken).unwrap_err().sqlstate,
+                restore_replay_cursor(broken, ReplayInputPosition::RecordedEnd)
+                    .unwrap_err()
+                    .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
             assert_eq!(storage.advisory_statement_mark(), before);
-            restore_replay_cursor(completed).unwrap();
+            restore_replay_cursor(completed, ReplayInputPosition::RecordedEnd).unwrap();
             acquire(2);
             for key in [1, 2] {
                 assert!(
@@ -1640,13 +1757,110 @@ mod tests {
             );
             let before = storage.advisory_statement_mark();
             assert_eq!(
-                restore_replay_cursor(completed).unwrap_err().sqlstate,
+                restore_replay_cursor(completed, ReplayInputPosition::RecordedEnd)
+                    .unwrap_err()
+                    .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
             assert_eq!(storage.advisory_statement_mark(), before);
             scope.finish(guc.seq_session()).unwrap();
         });
         crate::sql::publish_execution_identity(prior);
+    }
+
+    #[test]
+    fn completed_call_cursor_keeps_caller_inputs_and_unread_suffix() {
+        let mut budget = Budget::new(64 << 10);
+        let arena = Arena::new(&mut budget, "completed call journal", 48 << 10).unwrap();
+        let output = Arena::new(&mut budget, "completed call output", 16 << 10).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        let calls = Cell::new(0);
+        let plan = |slot| {
+            let mut bytes = [0; 16];
+            bytes[0] = slot;
+            bytes[8] = 1;
+            super::super::type_input_plans::PlanId::from_key_bytes(&bytes).unwrap()
+        };
+        let issue = |value| {
+            statement_call(
+                session,
+                SequenceCall {
+                    operation: SequenceOperation::Next,
+                    source: None,
+                },
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(value)
+                },
+            )
+            .unwrap()
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let scope = enter_statement(&arena, session, false, None);
+            let start = begin_replay_cursor().unwrap();
+            assert_eq!(issue(1), 1);
+            ready_routine_input(plan(1), &output).unwrap();
+            let completed = finish_replay_cursor(start, &output).unwrap();
+            let position = SavedStatementPosition::capture().unwrap();
+            ready_routine_input(plan(2), &output).unwrap();
+            let caller_input = session.statement_replay.get().effects_tail;
+            restore_replay_cursor(completed, ReplayInputPosition::RecordedEnd).unwrap();
+            assert!(session.statement_replay.get().effects_next == caller_input);
+            ready_routine_input(plan(2), &output).unwrap();
+            restore_replay_cursor(completed, ReplayInputPosition::KeepConsumed).unwrap();
+            assert!(session.statement_replay.get().effects_next.is_none());
+            ready_routine_input(plan(3), &output).unwrap();
+            let later_input = session.statement_replay.get().effects_tail;
+            rewind_replay_cursor(start).unwrap();
+            restore_replay_cursor(completed, ReplayInputPosition::KeepConsumed).unwrap();
+            assert!(session.statement_replay.get().effects_next == caller_input);
+            ready_routine_input(plan(2), &output).unwrap();
+            restore_replay_cursor(completed, ReplayInputPosition::KeepConsumed).unwrap();
+            assert!(session.statement_replay.get().effects_next == later_input);
+            position
+                .with_resume(
+                    (),
+                    super::super::lock::AdvisoryPositionTail::Appended,
+                    |(), admission| {
+                        admission.commit();
+                        assert!(session.statement_replay.get().effects_next == caller_input);
+                        admission.preserve_caller_inputs().unwrap();
+                        assert!(session.statement_replay.get().effects_next == later_input);
+                    },
+                )
+                .unwrap();
+            ready_routine_input(plan(3), &output).unwrap();
+            assert_eq!(issue(2), 2);
+            restore_replay_cursor(completed, ReplayInputPosition::KeepConsumed).unwrap();
+            assert_eq!(issue(99), 2);
+            position
+                .with_resume(
+                    (),
+                    super::super::lock::AdvisoryPositionTail::Appended,
+                    |(), admission| {
+                        admission.commit();
+                        assert!(session.statement_replay.get().effects_next == caller_input);
+                        assert_eq!(issue(99), 2);
+                        admission.preserve_caller_inputs().unwrap();
+                        assert!(session.statement_replay.get().effects_next.is_none());
+                    },
+                )
+                .unwrap();
+            assert_eq!(calls.get(), 2);
+            scope.finish(session).unwrap();
+            drop(scope);
+            let scope = enter_statement(&arena, session, false, None);
+            let before = begin_replay_cursor().unwrap();
+            assert_eq!(
+                restore_replay_cursor(completed, ReplayInputPosition::KeepConsumed)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            rewind_replay_cursor(before).unwrap();
+            scope.finish(session).unwrap();
+        });
     }
 
     #[test]
@@ -1904,7 +2118,7 @@ mod tests {
                 assert_eq!(session.currval(0, 1), Some(7));
                 assert_eq!(replayed_input_plan().unwrap(), Some(cold));
                 assert!(ready_routine_input(changed, &arena).is_err());
-                restore_replay_cursor(ready_range).unwrap();
+                restore_replay_cursor(ready_range, ReplayInputPosition::RecordedEnd).unwrap();
                 assert_eq!(replayed_input_plan().unwrap(), Some(rejected));
                 let bytes = rejected.key_bytes();
                 let error = statement_effect(
@@ -1948,7 +2162,9 @@ mod tests {
             {
                 let _scope = enter_statement(&arena, session, false, None);
                 assert!(replayed_input_plan().unwrap().is_none());
-                assert!(restore_replay_cursor(ready_range).is_err());
+                assert!(
+                    restore_replay_cursor(ready_range, ReplayInputPosition::RecordedEnd).is_err()
+                );
                 ready_routine_input(changed, &arena).unwrap();
             }
             {
@@ -1976,32 +2192,36 @@ mod tests {
             }
             for _ in 0..3 {
                 let _statement = enter_statement(&arena, session, true, None);
-                restore_replay_cursor(cursor).unwrap();
+                restore_replay_cursor(cursor, ReplayInputPosition::RecordedEnd).unwrap();
             }
             {
                 let statement = enter_statement(&arena, session, true, None);
-                restore_replay_cursor(cursor).unwrap();
+                restore_replay_cursor(cursor, ReplayInputPosition::RecordedEnd).unwrap();
                 statement.finish(session).unwrap();
                 assert!(!session.statement_replay.get().is_retained());
             }
             {
                 let statement = enter_statement(&arena, session, false, None);
                 assert_eq!(
-                    restore_replay_cursor(cursor).unwrap_err().sqlstate,
+                    restore_replay_cursor(cursor, ReplayInputPosition::RecordedEnd)
+                        .unwrap_err()
+                        .sqlstate,
                     sqlstate::SERIALIZATION_FAILURE
                 );
                 let fresh = finish_replay_cursor(begin_replay_cursor().unwrap(), &arena).unwrap();
-                restore_replay_cursor(fresh).unwrap();
+                restore_replay_cursor(fresh, ReplayInputPosition::RecordedEnd).unwrap();
                 statement.finish(session).unwrap();
             }
             arena.reset();
             let statement = enter_statement(&arena, session, false, None);
             let fresh = finish_replay_cursor(begin_replay_cursor().unwrap(), &arena).unwrap();
             assert_eq!(
-                restore_replay_cursor(cursor).unwrap_err().sqlstate,
+                restore_replay_cursor(cursor, ReplayInputPosition::RecordedEnd)
+                    .unwrap_err()
+                    .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
-            restore_replay_cursor(fresh).unwrap();
+            restore_replay_cursor(fresh, ReplayInputPosition::RecordedEnd).unwrap();
             statement.finish(session).unwrap();
         });
     }
@@ -2019,13 +2239,13 @@ mod tests {
         let calls = Cell::new(0);
         crate::mem::guard::forbid_alloc(|| {
             let absent = finish_replay_cursor(begin_replay_cursor().unwrap(), &arena).unwrap();
-            restore_replay_cursor(absent).unwrap();
+            restore_replay_cursor(absent, ReplayInputPosition::RecordedEnd).unwrap();
             let first;
             let second;
             let start;
             {
                 let scope = enter_statement(&arena, session, false, None);
-                assert!(restore_replay_cursor(absent).is_err());
+                assert!(restore_replay_cursor(absent, ReplayInputPosition::RecordedEnd).is_err());
                 start = begin_replay_cursor().unwrap();
                 let value = statement_call(
                     session,
@@ -2061,7 +2281,9 @@ mod tests {
                     StatementEffectRetry::Restart,
                     &arena,
                     || {
-                        assert!(restore_replay_cursor(first).is_err());
+                        assert!(
+                            restore_replay_cursor(first, ReplayInputPosition::RecordedEnd).is_err()
+                        );
                         let value = statement_call(
                             session,
                             SequenceCall {
@@ -2096,9 +2318,9 @@ mod tests {
                     11
                 );
                 rewind_replay_cursor(start).unwrap();
-                restore_replay_cursor(first).unwrap();
+                restore_replay_cursor(first, ReplayInputPosition::RecordedEnd).unwrap();
                 assert_eq!(session.currval(0, 1), Some(10));
-                restore_replay_cursor(second).unwrap();
+                restore_replay_cursor(second, ReplayInputPosition::RecordedEnd).unwrap();
                 assert_eq!(session.currval(0, 1), Some(11));
                 assert_eq!(session.currval(1, 2), Some(21));
                 assert_eq!(session.last_sequence(), Some((1, 2)));
@@ -2120,14 +2342,14 @@ mod tests {
             {
                 let scope = enter_statement(&wrong, session, false, None);
                 begin_replay_cursor().unwrap();
-                assert!(restore_replay_cursor(first).is_err());
+                assert!(restore_replay_cursor(first, ReplayInputPosition::RecordedEnd).is_err());
                 scope.discard(session);
             }
             arena.reset();
             {
                 let scope = enter_statement(&arena, session, false, None);
                 begin_replay_cursor().unwrap();
-                assert!(restore_replay_cursor(first).is_err());
+                assert!(restore_replay_cursor(first, ReplayInputPosition::RecordedEnd).is_err());
                 scope.finish(session).unwrap();
             }
         });

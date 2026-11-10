@@ -54,7 +54,20 @@ struct Fixture {
     config: Config,
 }
 
-fn fixture(mode: crate::config::TransactionMode, name: &str, spool_bytes: usize) -> Fixture {
+impl Fixture {
+    /// Rebuilds the engine after a configuration change.
+    fn with_config(config: Config) -> Self {
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+        let engine = Engine::new(&config, &mut budget).unwrap();
+        Self {
+            engine,
+            budget,
+            config,
+        }
+    }
+}
+
+fn fixture_config(mode: crate::config::TransactionMode, name: &str, spool_bytes: usize) -> Config {
     let mut config = Config::default_dev();
     config.data_dir = std::env::temp_dir()
         .join(format!(
@@ -67,16 +80,16 @@ fn fixture(mode: crate::config::TransactionMode, name: &str, spool_bytes: usize)
     config.transaction_mode = mode;
     config.max_tables = 4;
     config.max_connections = 3;
-    config.row_overlay_slots = 64;
+    config.row_overlay_slots = 8192;
     config.result_spool_bytes = spool_bytes;
     config.result_spool_leases = 2;
-    let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
-    let engine = Engine::new(&config, &mut budget).unwrap();
-    Fixture {
-        engine,
-        budget,
-        config,
-    }
+    // The table fixtures commit about a megabyte in one transaction.
+    config.wal_buffer_bytes = 8 << 20;
+    config
+}
+
+fn fixture(mode: crate::config::TransactionMode, name: &str, spool_bytes: usize) -> Fixture {
+    Fixture::with_config(fixture_config(mode, name, spool_bytes))
 }
 
 fn connection(fixture: &mut Fixture, id: i32) -> (Conn, TcpStream) {
@@ -514,4 +527,451 @@ fn tls_backpressure_keeps_ciphertext_queued_instead_of_closing() {
     assert_eq!(plaintext.len(), rows * 43);
     assert!(messages(&plaintext).iter().all(|message| message.0 == b'D'));
     drop(conn);
+}
+
+/// Runs `sql` to completion on an idle connection.
+fn run(conn: &mut Conn, engine: &mut Engine, client: &mut TcpStream, sql: &str) -> Vec<u8> {
+    client.write_all(&query(sql)).unwrap();
+    assert_eq!(readable(conn, engine), After::Continue);
+    drain(conn, engine, client, 1)
+}
+
+fn stream_fixture(
+    mode: crate::config::TransactionMode,
+    name: &str,
+) -> (Fixture, Conn, TcpStream, Conn, TcpStream) {
+    let mut config = fixture_config(mode, name, 16 << 20);
+    config.result_stream_bytes = 1 << 20;
+    let mut fixture = Fixture::with_config(config);
+    let (mut reader, mut reader_client) = connection(&mut fixture, 1);
+    let (other, other_client) = connection(&mut fixture, 2);
+    let response = run(
+        &mut reader,
+        &mut fixture.engine,
+        &mut reader_client,
+        "CREATE TABLE big(id int, payload text); \
+         INSERT INTO big SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g",
+    );
+    assert!(
+        messages(&response).iter().all(|message| message.0 != b'E'),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    (fixture, reader, reader_client, other, other_client)
+}
+
+#[test]
+fn retained_selects_resume_as_streams_while_other_sessions_progress() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let (mut fixture, mut stalled, mut stalled_client, mut other, mut other_client) =
+            stream_fixture(mode, "stream");
+        let opened = fixture.engine.result_stream_metrics().opened;
+        let mut input = query("SELECT id, payload FROM big");
+        input.extend_from_slice(&query("SELECT 2"));
+        stalled_client.write_all(&input).unwrap();
+        assert_eq!(readable(&mut stalled, &mut fixture.engine), After::Continue);
+        assert_eq!(
+            stalled.parked_wait(),
+            Some(crate::sql::StatementWait::ClientOutput)
+        );
+        assert!(stalled.result_stream.is_active());
+        // A stream is not an SQL cursor: pg_cursors and max_cursors ignore it.
+        assert_eq!(stalled.cursors.len(), 0);
+        assert_eq!(fixture.engine.result_stream_metrics().opened, opened + 1);
+        // A stream keeps at most one row beyond the send buffer.
+        assert!(stalled.overflow_bytes() < 1024);
+        // Locking mode makes a writer of the streamed table wait for the
+        // reader's transaction, as its readers' locks require.
+        let progress = if mode == crate::config::TransactionMode::Mvcc {
+            "INSERT INTO big VALUES (9001, 'y'); SELECT count(*) FROM big"
+        } else {
+            "CREATE TABLE progress(v int); INSERT INTO progress VALUES (1); \
+             SELECT count(*) FROM progress"
+        };
+        let response = run(&mut other, &mut fixture.engine, &mut other_client, progress);
+        assert!(messages(&response).iter().all(|message| message.0 != b'E'));
+        assert!(stalled.result_stream.is_active());
+
+        let response = drain(&mut stalled, &mut fixture.engine, &mut stalled_client, 2);
+        let response = messages(&response);
+        let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+        let first_ready = kinds.iter().position(|kind| *kind == b'Z').unwrap();
+        assert_eq!(kinds[0], b'T');
+        let rows: Vec<_> = response[..first_ready]
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .collect();
+        assert_rows(&rows, 5000);
+        assert_eq!(&kinds[first_ready - 1..], b"CZTDCZ");
+        assert_eq!(
+            kinds[..first_ready]
+                .iter()
+                .filter(|kind| **kind == b'T')
+                .count(),
+            1
+        );
+        assert_eq!(response[first_ready - 1].1, b"SELECT 5000\0");
+        assert!(!stalled.result_stream.is_active());
+        assert!(stalled.parked_wait().is_none());
+    }
+}
+
+#[test]
+fn result_streams_apply_bounds_and_fail_after_delivered_rows() {
+    let (mut fixture, mut conn, mut client, _, _) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "stream-bounds");
+    client
+        .write_all(&query(
+            "SELECT id, payload FROM big WHERE id > 1000 OFFSET 10 LIMIT 3000",
+        ))
+        .unwrap();
+    assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+    assert!(conn.result_stream.is_active());
+    let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+    let response = messages(&response);
+    let rows: Vec<_> = response
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .collect();
+    assert_eq!(rows.len(), 3000);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(first_text(row.1), (1011 + index).to_string());
+    }
+    assert_eq!(response[response.len() - 2].1, b"SELECT 3000\0");
+
+    client
+        .write_all(&query("SELECT id, 1 / (id - 3001), payload FROM big"))
+        .unwrap();
+    assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+    assert!(conn.result_stream.is_active());
+    let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    let rows: Vec<_> = response
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .collect();
+    // Delivered rows are final: every row before the failure arrives.
+    assert_rows(&rows, 3000);
+    assert_eq!(&kinds[kinds.len() - 2..], b"EZ");
+    assert_eq!(sqlstate_of(response[kinds.len() - 2].1), "22012");
+    assert_eq!(response[kinds.len() - 1].1, b"I");
+    assert!(!conn.result_stream.is_active());
+}
+
+#[test]
+fn result_streams_end_on_cancel_timeout_and_disconnect() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let (mut fixture, mut conn, mut client, mut other, mut other_client) =
+            stream_fixture(mode, "stream-cleanup");
+        // Cancel: rows already queued, then 57014 and ReadyForQuery.
+        client
+            .write_all(&query("SELECT id, payload FROM big"))
+            .unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        assert!(conn.result_stream.is_active());
+        assert!(crate::mem::guard::forbid_alloc(|| {
+            conn.cancel_parked(&mut fixture.engine)
+        }));
+        assert!(!conn.result_stream.is_active());
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+        let response = messages(&response);
+        let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+        assert_eq!(&kinds[kinds.len() - 2..], b"EZ");
+        assert_eq!(sqlstate_of(response[kinds.len() - 2].1), "57014");
+        let rows: Vec<_> = response
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .collect();
+        assert_rows(&rows, rows.len());
+
+        // statement_timeout expires while the stream waits for its client.
+        run(
+            &mut conn,
+            &mut fixture.engine,
+            &mut client,
+            "SET statement_timeout = '150ms'",
+        );
+        client
+            .write_all(&query("SELECT id, payload FROM big"))
+            .unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        assert!(conn.result_stream.is_active());
+        std::thread::sleep(Duration::from_millis(200));
+        let generation = fixture.engine.lock_generation();
+        let pending = crate::mem::guard::forbid_alloc(|| {
+            conn.retry_parked(&mut fixture.engine, KEY, generation, false)
+        })
+        .expect("the deadline wakes the stream");
+        conn.finish_response(pending, None);
+        assert!(!conn.result_stream.is_active());
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+        let response = messages(&response);
+        let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+        assert_eq!(&kinds[kinds.len() - 2..], b"EZ");
+        assert_eq!(sqlstate_of(response[kinds.len() - 2].1), "57014");
+        run(
+            &mut conn,
+            &mut fixture.engine,
+            &mut client,
+            "SET statement_timeout = 0",
+        );
+
+        // Disconnect: closing the connection releases the stream's readers
+        // and, with its transaction, the table lock.
+        client
+            .write_all(&query("SELECT id, payload FROM big"))
+            .unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        assert!(conn.result_stream.is_active());
+        fixture.engine.rollback_txn(&mut conn.txn, &conn.guc);
+        drop(conn.close());
+        assert!(!conn.result_stream.is_active());
+        let response = run(
+            &mut other,
+            &mut fixture.engine,
+            &mut other_client,
+            "DROP TABLE big",
+        );
+        assert!(
+            messages(&response).iter().all(|message| message.0 != b'E'),
+            "{:?}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(other.parked_wait().is_none());
+    }
+}
+
+#[test]
+fn unpaged_extended_execute_resumes_retained_results() {
+    let (mut fixture, mut conn, mut client, _, _) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "stream-extended");
+    for (sql, rows, error) in [
+        ("SELECT id, payload FROM big", 5000usize, None),
+        (
+            "SELECT id, 1 / (id - 4001), payload FROM big",
+            4000,
+            Some("22012"),
+        ),
+    ] {
+        let mut parse = b"\0".to_vec();
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(b"\0\0\0");
+        let mut input = frontend(wire::FMSG_PARSE, &parse);
+        input.extend_from_slice(&frontend(wire::FMSG_BIND, b"\0\0\0\0\0\0\0\0"));
+        input.extend_from_slice(&frontend(wire::FMSG_EXECUTE, b"\0\0\0\0\0"));
+        input.extend_from_slice(&frontend(wire::FMSG_SYNC, b""));
+        client.write_all(&input).unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        assert!(conn.result_stream.is_active());
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+        let response = messages(&response);
+        let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+        assert_eq!(&kinds[..2], b"12");
+        assert!(
+            !kinds.contains(&b'T'),
+            "Execute does not resend RowDescription"
+        );
+        let data: Vec<_> = response
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .collect();
+        assert_rows(&data, rows);
+        match error {
+            None => {
+                assert_eq!(&kinds[kinds.len() - 2..], b"CZ");
+                assert_eq!(response[kinds.len() - 2].1, b"SELECT 5000\0");
+            }
+            Some(code) => {
+                assert_eq!(&kinds[kinds.len() - 2..], b"EZ");
+                assert_eq!(sqlstate_of(response[kinds.len() - 2].1), code);
+            }
+        }
+        assert!(!conn.result_stream.is_active());
+    }
+}
+
+#[test]
+fn spooled_results_record_why_they_did_not_stream() {
+    let (mut fixture, mut conn, mut client, _, _) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "stream-reasons");
+    let before = fixture.engine.result_stream_metrics();
+    run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "CREATE SEQUENCE numbers",
+    );
+    for sql in [
+        "SELECT id, payload FROM big ORDER BY id",
+        "SELECT id, nextval('numbers'), payload FROM big",
+    ] {
+        let response = run(&mut conn, &mut fixture.engine, &mut client, sql);
+        let rows = messages(&response)
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .count();
+        assert_eq!(rows, 5000, "{sql}");
+        assert!(!conn.result_stream.is_active());
+    }
+    let after = fixture.engine.result_stream_metrics();
+    assert_eq!(after.opened, before.opened);
+    assert_eq!(after.spooled_shape, before.spooled_shape + 1);
+    assert_eq!(after.spooled_effects, before.spooled_effects + 1);
+
+    // A capture estimate above result_stream_bytes chooses the spool before
+    // the statement runs.
+    drop((conn, fixture));
+    let mut small = fixture_config(
+        crate::config::TransactionMode::Mvcc,
+        "stream-small",
+        16 << 20,
+    );
+    small.result_stream_bytes = 64 << 10;
+    let mut fixture = Fixture::with_config(small);
+    let (mut small_conn, mut small_client) = connection(&mut fixture, 7);
+    let engine = &mut fixture.engine;
+    run(
+        &mut small_conn,
+        engine,
+        &mut small_client,
+        "CREATE TABLE wide(id int, payload text); \
+         INSERT INTO wide SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g",
+    );
+    let response = run(
+        &mut small_conn,
+        engine,
+        &mut small_client,
+        "SELECT id, payload FROM wide",
+    );
+    assert_eq!(
+        messages(&response)
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .count(),
+        5000
+    );
+    let metrics = engine.result_stream_metrics();
+    assert_eq!(metrics.opened, 0);
+    assert_eq!(metrics.spooled_capacity, 1);
+}
+
+#[test]
+fn stream_rows_take_their_effects_once_across_client_waits() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let (mut fixture, mut conn, mut client, _, _) = stream_fixture(mode, "stream-effects");
+        run(
+            &mut conn,
+            &mut fixture.engine,
+            &mut client,
+            "CREATE SEQUENCE numbers",
+        );
+        // The first rows overflow the send buffer before any row calls
+        // nextval, so the statement promotes; later rows each take a number
+        // while the stream repeatedly waits for its client.
+        client
+            .write_all(&query(
+                "SELECT id, CASE WHEN id > 1000 THEN nextval('numbers') END, payload FROM big",
+            ))
+            .unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        assert!(conn.result_stream.is_active());
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+        let response = messages(&response);
+        let rows: Vec<_> = response
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .collect();
+        assert_rows(&rows, 5000);
+        for (index, row) in rows.iter().enumerate().skip(1000) {
+            let payload = row.1;
+            let first = 6 + i32::from_be_bytes(payload[2..6].try_into().unwrap()) as usize;
+            let length = i32::from_be_bytes(payload[first..first + 4].try_into().unwrap()) as usize;
+            let value = core::str::from_utf8(&payload[first + 4..first + 4 + length]).unwrap();
+            assert_eq!(value, (index - 999).to_string());
+        }
+        let response = run(
+            &mut conn,
+            &mut fixture.engine,
+            &mut client,
+            "SELECT nextval('numbers')",
+        );
+        assert!(
+            messages(&response)
+                .iter()
+                .any(|message| message.0 == b'D' && first_text(message.1) == "4001")
+        );
+    }
+}
+
+#[test]
+fn stream_rows_wait_for_locks_without_repeating_delivered_rows_or_effects() {
+    let (mut fixture, mut conn, mut client, mut holder, mut holder_client) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "stream-lock");
+    run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "CREATE SEQUENCE numbers",
+    );
+    let response = run(
+        &mut holder,
+        &mut fixture.engine,
+        &mut holder_client,
+        "BEGIN; SELECT pg_advisory_xact_lock(7)",
+    );
+    assert!(messages(&response).iter().all(|message| message.0 != b'E'));
+    client
+        .write_all(&query(
+            "SELECT id, CASE WHEN id > 1000 THEN nextval('numbers') END, \
+             CASE WHEN id = 2000 THEN pg_advisory_xact_lock(7)::text END, payload FROM big",
+        ))
+        .unwrap();
+    assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+    assert!(conn.result_stream.is_active());
+    // Read until the stream waits for the lock with rows already delivered.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut received = Vec::new();
+    while conn.parked_wait() != Some(crate::sql::StatementWait::Lock) {
+        assert!(Instant::now() < deadline, "stream did not reach the lock");
+        read_available(&mut client, &mut received);
+        assert_eq!(conn.on_writable(), After::Continue);
+        let generation = fixture.engine.lock_generation();
+        if let Some(pending) = conn.retry_parked(&mut fixture.engine, KEY, generation, false) {
+            conn.finish_response(pending, None);
+        }
+    }
+    assert!(conn.result_stream.is_active());
+    run(
+        &mut holder,
+        &mut fixture.engine,
+        &mut holder_client,
+        "COMMIT",
+    );
+    let rest = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+    received.extend_from_slice(&rest);
+    let response = messages(&received);
+    let rows: Vec<_> = response
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .collect();
+    assert_rows(&rows, 5000);
+    for (index, row) in rows.iter().enumerate().skip(1000) {
+        let payload = row.1;
+        let first = 6 + i32::from_be_bytes(payload[2..6].try_into().unwrap()) as usize;
+        let length = i32::from_be_bytes(payload[first..first + 4].try_into().unwrap()) as usize;
+        let value = core::str::from_utf8(&payload[first + 4..first + 4 + length]).unwrap();
+        assert_eq!(value, (index - 999).to_string(), "row {}", index + 1);
+    }
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert_eq!(&kinds[kinds.len() - 2..], b"CZ");
 }

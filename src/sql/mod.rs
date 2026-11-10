@@ -63,6 +63,8 @@ mod prepared_type_replay;
 pub mod query;
 pub mod range;
 pub mod regex;
+mod result_stream;
+pub(crate) use result_stream::StreamStep;
 mod routine_input_identity;
 pub mod ryu;
 pub mod sequence;
@@ -644,6 +646,12 @@ struct TypeInputPlanSource<'a, 'c> {
 pub struct Engine {
     storage: Storage,
     wal: Wal,
+    /// Per-connection retained-read allocation for resuming large results.
+    result_stream_bytes: usize,
+    /// Saved generations a table scan can retain, bounding a stream's capture.
+    max_spill_generations_per_table: usize,
+    result_streams_opened: u64,
+    result_streams_spooled: [u64; 3],
     ckpt: Option<Checkpointer>,
     temporary_spiller: Option<TemporarySpiller>,
     /// A durable, installed manifest whose heap and journal cleanup remains.
@@ -656,6 +664,9 @@ pub struct Engine {
     /// it, switches into copy-in mode, and feeds data lines back through
     /// [`Engine::copy_row_line`] until CopyDone.
     pending_copy: Option<(exec::CopySetup, i64)>,
+    /// A promoted statement's source range and plan owner, taken by the
+    /// connection to reopen it as a result stream.
+    pending_result_stream: Option<PendingResultStream>,
     wal_upload: bool,
     commit_progress: CommitProgressMode,
     inflight_publication: Option<InflightPublication>,
@@ -912,6 +923,18 @@ pub enum ExecutionStatus {
         output_mark: crate::pg::overflow::OutputMark,
         wait: StatementWait,
     },
+}
+
+/// A statement whose first output overflow requested a result stream. It
+/// reports `Blocked` with [`StatementWait::ClientOutput`]; its partial output
+/// is discarded and it reopens from this source range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingResultStream {
+    pub(crate) source_start: usize,
+    pub(crate) source_end: usize,
+    pub(crate) owner: type_input_plans::Owner,
+    /// The statement's original deadline; the stream keeps it across waits.
+    pub(crate) deadline: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4209,7 +4232,12 @@ impl Engine {
             cache_capacity_generation: 0,
             cache_capacity_failure: None,
             pending_copy: None,
+            pending_result_stream: None,
             wal_upload: config.wal_upload && config.object_store_on,
+            result_stream_bytes: config.result_stream_bytes,
+            max_spill_generations_per_table: config.max_spill_generations_per_table,
+            result_streams_opened: 0,
+            result_streams_spooled: [0; 3],
             commit_progress: CommitProgressMode::Inline,
             inflight_publication: None,
             publication_failed: false,
@@ -10488,6 +10516,10 @@ impl Engine {
         self.pending_copy.take()
     }
 
+    pub(crate) fn take_pending_result_stream(&mut self) -> Option<PendingResultStream> {
+        self.pending_result_stream.take()
+    }
+
     /// True if committed notifications await delivery. The server drains them
     /// after each connection's message (see [`Engine::notifications`]).
     pub fn has_notifications(&self) -> bool {
@@ -11738,8 +11770,20 @@ impl Engine {
                 let plan_owner = sqlprep
                     .transient_owner(statement_index)
                     .and_then(|owner| self.storage.begin_advisory_statement().map(|()| owner));
-                let outcome = match plan_owner {
-                    Ok(owner) => match type_input_plans::with_owner(owner, || {
+                let stream_owner = plan_owner.as_ref().ok().copied();
+                if responder.promotion_allowed() {
+                    match self.result_stream_choice(
+                        statement,
+                        !source_bindings.is_empty(),
+                        txn.txid,
+                        source.len(),
+                    ) {
+                        Ok(()) => responder.arm_promotion(),
+                        Err(reason) => responder.decline_promotion(reason),
+                    }
+                }
+                let executed = match plan_owner {
+                    Ok(owner) => type_input_plans::with_owner(owner, || {
                         type_inputs::with_source(
                             type_inputs::Source::RootCommand {
                                 statement: statement_index,
@@ -11761,24 +11805,46 @@ impl Engine {
                                 )
                             },
                         )
-                    }) {
-                        Ok(outcome) => outcome,
-                        Err(WireFull) => {
-                            // The client output spool is exhausted: the result
-                            // fails like any statement error after its sent rows.
-                            sequence_scope.discard(guc.seq_session());
-                            txn.release_suspended_statement();
-                            if txn.is_explicit() {
-                                txn.failed = true;
-                            } else {
-                                cursors.on_rollback();
-                                self.rollback_txn(txn, guc);
-                            }
-                            responder.replace_with_overflow_error(output_mark)?;
-                            return Ok(ExecutionStatus::Complete);
+                    }),
+                    Err(error) => Ok(Err(error)),
+                };
+                let (promoted, spooled) = responder.finish_promotion();
+                if let Some(reason) = spooled {
+                    self.record_result_spool(reason);
+                }
+                if promoted && let Some(owner) = stream_owner {
+                    // Nothing of this attempt reached the client and it started
+                    // no effect: discard it and reopen as a resumable stream.
+                    sequence_scope.discard(guc.seq_session());
+                    self.rollback_waiting_statement(txn, statement_mark);
+                    self.pending_result_stream = Some(PendingResultStream {
+                        source_start: *source_start,
+                        source_end: *source_end,
+                        owner,
+                        deadline: query::statement_deadline(),
+                    });
+                    return Ok(ExecutionStatus::Blocked {
+                        completed_statements: statement_index,
+                        output_mark,
+                        wait: StatementWait::ClientOutput,
+                    });
+                }
+                let outcome = match executed {
+                    Ok(outcome) => outcome,
+                    Err(WireFull) => {
+                        // The client output spool is exhausted: the result
+                        // fails like any statement error after its sent rows.
+                        sequence_scope.discard(guc.seq_session());
+                        txn.release_suspended_statement();
+                        if txn.is_explicit() {
+                            txn.failed = true;
+                        } else {
+                            cursors.on_rollback();
+                            self.rollback_txn(txn, guc);
                         }
-                    },
-                    Err(error) => Err(error),
+                        responder.replace_with_overflow_error(output_mark)?;
+                        return Ok(ExecutionStatus::Complete);
+                    }
                 };
                 let outcome = outcome
                     .and_then(|()| {
@@ -12323,6 +12389,19 @@ impl Engine {
                         } else {
                             match self.storage.begin_advisory_statement() {
                                 Ok(()) => {
+                                    let streamable =
+                                        immediate.is_none() && index_completion.is_none();
+                                    if streamable && responder.promotion_allowed() {
+                                        match self.result_stream_choice(
+                                            &statement,
+                                            !source_bindings.is_empty(),
+                                            txn.txid,
+                                            text.len(),
+                                        ) {
+                                            Ok(()) => responder.arm_promotion(),
+                                            Err(reason) => responder.decline_promotion(reason),
+                                        }
+                                    }
                                     let mut execute = |responder: &mut Responder<'_>| {
                                         self.execute_stmt(
                                             &statement,
@@ -12337,12 +12416,30 @@ impl Engine {
                                             StatementTimeoutEntry::Nested,
                                         )
                                     };
-                                    let executed =
-                                        if immediate.is_some() || index_completion.is_some() {
-                                            responder.without_command_complete(execute)
-                                        } else {
-                                            execute(responder)
-                                        };
+                                    let executed = if streamable {
+                                        execute(responder)
+                                    } else {
+                                        responder.without_command_complete(execute)
+                                    };
+                                    let (promoted, spooled) = responder.finish_promotion();
+                                    if let Some(reason) = spooled {
+                                        self.record_result_spool(reason);
+                                    }
+                                    if promoted && let Ok(owner) = type_input_plans::owner() {
+                                        // Nothing reached the client and no effect
+                                        // started: reopen as a resumable stream.
+                                        sequence_scope.discard(guc.seq_session());
+                                        self.rollback_waiting_statement(txn, statement_mark);
+                                        self.pending_result_stream = Some(PendingResultStream {
+                                            source_start: 0,
+                                            source_end: text.len(),
+                                            owner,
+                                            deadline: query::statement_deadline(),
+                                        });
+                                        return Ok(ExtendedExecutionStatus::Blocked {
+                                            wait: StatementWait::ClientOutput,
+                                        });
+                                    }
                                     match executed {
                                         Ok(outcome) => outcome,
                                         Err(WireFull) => {

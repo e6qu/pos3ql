@@ -274,6 +274,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | `max_prepared`, `prepared_bytes` | Prepared statements per namespace and bytes per statement, shared with bound portals |
 | `cursor_bytes`, `cursor_query_bytes` | See [cursors](#cursor-capacity) |
 | `conn_send_buffer_bytes`, `result_spool_bytes`, `result_spool_leases` | Result output: the send buffer, then rows queued in the shared spool for a slow client (a private reserve of the send-buffer size holds closing messages). Only a client lagging by more than the spool gets `54000`; the largest single message must fit the send buffer. A paged portal (`Execute` with a row limit) still buffers its result in `portal_result_bytes` |
+| `result_stream_bytes` (256 KiB default) | Per-connection read position of a large single-table `SELECT` that resumes row by row; a larger estimate spools the result instead, and a stream that still outgrows it fails with `54000` naming the setting |
 | `txn_rows`, `copy_transition_bytes` (256 KiB default) | Streamed COPY statement-trigger inputs per connection |
 | `commit_queue_slots` | Commits waiting for durability |
 | `memtable_bytes` (≤ `u32::MAX`) | Two heap buffers are reserved; reclamation returns `54000` while both are retained |

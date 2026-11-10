@@ -17,7 +17,9 @@ use super::types::Datum;
 use crate::mem::arena::Arena;
 
 mod query;
+mod stream;
 pub(crate) use query::{CursorLocal, CursorQuery, CursorStatement};
+pub(crate) use stream::{ResultStream, StreamProtocol, StreamState};
 
 /// One FETCH/MOVE motion, normalized by the parser: positive counts move
 /// forward, negative backward (`NEXT` is `Count(1)`, `PRIOR` is `Count(-1)`,

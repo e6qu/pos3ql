@@ -29,6 +29,7 @@ mod procedural_expression_calls;
 mod procedural_progress;
 mod procedural_subtransactions;
 mod query_execution;
+mod result_streams;
 mod routine_calls;
 mod routine_selection;
 mod row_history;

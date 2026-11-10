@@ -908,6 +908,116 @@ impl<'a> RetainedSelect<'a> {
             && self.scope.slots[..self.scope.n].contains(&table)
     }
 
+    /// The physical table a top-level `SELECT` reads when a cursor-mode open
+    /// would retain it, decided before execution and without capturing rows.
+    /// Literal and `FROM`-less sources are excluded: their output is bounded
+    /// by the statement itself. Scope resolution borrows `arena`; the caller
+    /// rewinds it.
+    pub(crate) fn stream_source_table(
+        storage: &'a Storage,
+        txid: u32,
+        statement: &'a Select<'a>,
+        arena: &'a Arena,
+    ) -> Result<Option<usize>, SqlError> {
+        let Some(from) = statement.from.as_ref() else {
+            return Ok(None);
+        };
+        if !from.joins.is_empty()
+            || from.base.is_function_source()
+            || from.base.subquery.is_some()
+            || from.base.cte.is_some()
+            || from.base.sample.is_some()
+            || !statement.with.is_empty()
+            || statement.set_body.is_some()
+            || statement.distinct
+            || !statement.distinct_on.is_empty()
+            || !statement.group_by.is_empty()
+            || !statement.grouping_sets.is_empty()
+            || statement.having.is_some()
+            || !statement.order_by.is_empty()
+            || !statement.locking.is_empty()
+            || statement.with_ties
+            || !matches!(
+                storage.resolve_relation(from.base.schema, from.base.table, txid),
+                Some(crate::storage::ResolvedRelation::Table(_))
+            )
+        {
+            return Ok(None);
+        }
+        let catalog = storage_catalog(storage, arena, txid);
+        let expression_mode = Some((storage, txid));
+        if !statement.items.iter().all(|item| match item {
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => true,
+            SelectItem::Expr { expression, .. } => {
+                retained_expression(expression, &catalog, expression_mode)
+            }
+            SelectItem::RecordStar(_) => false,
+        }) || statement
+            .where_clause
+            .is_some_and(|predicate| !retained_expression(predicate, &catalog, expression_mode))
+            || [statement.limit, statement.offset]
+                .into_iter()
+                .flatten()
+                .any(|bound| !retained_bound(bound, &catalog))
+        {
+            return Ok(None);
+        }
+        let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+        if scope.n != 1 || scope.derived[0].is_some() || scope.slots[0] == usize::MAX {
+            return Ok(None);
+        }
+        let columns = CatalogScopeCols {
+            scope: &scope,
+            outer_scope: None,
+            storage,
+            txid,
+            arena,
+        };
+        for expression in statement
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::Expr { expression, .. } => Some(*expression),
+                _ => None,
+            })
+            .chain(statement.where_clause)
+        {
+            if !retained_scalar_calls(expression, &columns)? {
+                return Ok(None);
+            }
+        }
+        for bound in [statement.limit, statement.offset].into_iter().flatten() {
+            let (oid, _) = super::super::exec::infer_type_res(bound, &columns)?;
+            if oid != super::super::types::oid::UNKNOWN
+                && !matches!(
+                    catalog
+                        .domain_base_type(oid)
+                        .or_else(|| ColType::from_oid(oid)),
+                    Some(ColType::Int2 | ColType::Int4 | ColType::Int8)
+                )
+            {
+                return Ok(None);
+            }
+        }
+        let table = scope.slots[0];
+        let definition = scope.defs.stored(0).expect("resolved physical source");
+        if definition.kind != crate::storage::TableKind::Local
+            || definition.partition.is_partitioned()
+            || (from.base.inheritance == crate::sql::ast::RelationInheritance::Descendants
+                && storage.relation_has_descendants(table, txid))
+        {
+            return Ok(None);
+        }
+        let Some(role) = storage.current_role_slot(txid) else {
+            return Ok(None);
+        };
+        let role = scope.authorization_roles[0].map_or(role, usize::from);
+        if storage.row_security_applies(table, role, txid) {
+            return Ok(None);
+        }
+        Ok(Some(table))
+    }
+
     pub(crate) fn open(
         storage: &'a Storage,
         txid: u32,

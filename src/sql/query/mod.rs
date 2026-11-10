@@ -1429,6 +1429,14 @@ pub(crate) fn with_active_routine_invocations<R>(
 
 thread_local! {
     static ACTIVE_READ_EFFECTS: Cell<Option<core::ptr::NonNull<crate::checkpoint::AtomicBlockReadScope>>> = const { Cell::new(None) };
+    /// Counts effects in both storage modes, so a caller can tell whether a
+    /// statement attempt may still be discarded and run again.
+    static STATEMENT_EFFECT_EPOCH: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Changes whenever any statement starts an effect.
+pub(crate) fn statement_effect_epoch() -> u64 {
+    STATEMENT_EFFECT_EPOCH.with(Cell::get)
 }
 
 pub(crate) struct StatementReadEffectScope<'a> {
@@ -1461,6 +1469,7 @@ pub(crate) fn enter_statement_read_effect_scope(
 /// A statement can yield before its first effect. After an effect starts,
 /// remaining reads use the atomic client until that whole statement ends.
 pub(crate) fn protect_statement_effects() {
+    STATEMENT_EFFECT_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
     ACTIVE_READ_EFFECTS.with(|active| {
         if let Some(reads) = active.get() {
             // The scope's borrow pins this stack value through every nested

@@ -252,6 +252,10 @@ pub struct Config {
     pub cursor_bytes: usize,
     /// Query, captured parameters and execution positions per SQL cursor.
     pub cursor_query_bytes: usize,
+    /// Per-connection query, parameters and read positions of a large result
+    /// that resumes row by row as its client reads; zero disables resuming
+    /// and such results queue in the result spool instead.
+    pub result_stream_bytes: usize,
     /// Row metadata slots shared by ordinary tables across all databases.
     pub row_overlay_slots: usize,
     /// Shared foreground bytes for retained row identities and DML buffers;
@@ -507,6 +511,7 @@ impl Config {
             max_cursors: 4,
             cursor_bytes: 256 * 1024,
             cursor_query_bytes: 256 * KIB,
+            result_stream_bytes: 256 * KIB,
             row_overlay_slots: 8192,
             row_work_bytes: 8 * MIB,
             row_work_leases: 128,
@@ -1030,6 +1035,10 @@ impl Config {
                 }
                 "cursor_query_bytes" => {
                     config.cursor_query_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "result_stream_bytes" => {
+                    config.result_stream_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
                 }
                 "row_overlay_slots" => {
@@ -2034,6 +2043,7 @@ impl Config {
             // Send buffer plus the equally sized private output reserve.
             self.conn_send_buffer_bytes.saturating_mul(2),
             crate::pg::conn::HELD_NOTIFICATION_BYTES,
+            self.result_stream_bytes,
             self.sql_arena_bytes,
             crate::sql::exec::CopyTransitionRows::budget_bytes(self),
             // The SQL pool also owns the active request's type-input record.
@@ -3375,6 +3385,28 @@ sql_arena_bytes = 4096
     }
 
     #[test]
+    fn result_stream_capacity_is_per_connection_and_may_be_disabled() {
+        let required = "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nindex_statistics_slots = 4096\n";
+        assert_eq!(
+            Config::parse(required).unwrap().result_stream_bytes,
+            256 * KIB
+        );
+        for (value, bytes) in [("64KiB", 64 * KIB), ("0", 0)] {
+            let config =
+                Config::parse(&format!("{required}result_stream_bytes = {value}\n")).unwrap();
+            assert_eq!(config.result_stream_bytes, bytes);
+        }
+        let mut small = Config::default_dev();
+        small.result_stream_bytes = 0;
+        let mut large = small.clone();
+        large.result_stream_bytes = 1 << 20;
+        assert_eq!(
+            large.memory_plan(0, 0).connections - small.memory_plan(0, 0).connections,
+            (1 << 20) * large.max_connections as usize
+        );
+    }
+
+    #[test]
     fn memory_plan_math() {
         let mut c = Config::default_dev();
         c.max_connections = 10;
@@ -3406,6 +3438,7 @@ sql_arena_bytes = 4096
         // Includes the private output reserve sized like the send buffer.
         let per_connection = 1030
             + crate::pg::conn::HELD_NOTIFICATION_BYTES
+            + c.result_stream_bytes
             + crate::sql::prep::SqlPreparedPool::budget_bytes(&c)
             + copy_transition
             + publication_selection

@@ -160,10 +160,12 @@ For example, reading a cached invoice continues while another connection's
 commit uploads, and while cleanup lists or deletes old files. Two behaviors are
 worth knowing:
 
-- Once the first bytes of a large result have reached the client, its
-  remaining reads finish synchronously, because a sent prefix cannot be
-  withdrawn. Rows the client has not yet read queue in the result spool and
-  never hold the worker; resumable output is
+- A large single-table `SELECT` (no sorting, grouping, joins or subqueries)
+  resumes row by row: a cold block after delivered rows yields like any other
+  download. Other large results, once their first bytes have reached the
+  client, finish their remaining reads synchronously, because a sent prefix
+  cannot be withdrawn. Rows the client has not yet read never hold the worker;
+  resuming more result shapes is
   [planned work](../PLAN.md#pause-and-resume-every-query-path).
 - Setting both caches to zero does not evict rows already in memory: an
   `INSERT` followed by `SELECT` can return the row without a download. To test

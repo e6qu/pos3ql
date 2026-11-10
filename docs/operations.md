@@ -37,6 +37,7 @@ example; physical limits are in
 | `index_statistics_slots` | yes | Index lifetimes sharing activity counters, including retained readers. |
 | `result_spool_bytes` | yes | Shared bytes queuing result rows for clients that read slower than statements produce them; a multiple of 64 (e.g. `16MiB`). A client further behind gets `54000` naming this setting after the rows already queued. |
 | `result_spool_leases` | yes | Connections that can hold queued result rows at once (e.g. `max_connections`). |
+| `result_stream_bytes` | no (default `256KiB`) | Per-connection query, parameters and read positions of a large result that resumes row by row as its client reads; `0` disables resuming. |
 | `large_object_pages` | no (default `8192`, must be nonzero) | Resident 2 KiB large-object pages. |
 
 ## Operational listener
@@ -67,7 +68,7 @@ curl --fail http://127.0.0.1:9187/capacity
 | `/livez`, `/healthz` | 200 | The event loop answered. |
 | `/readyz` | 200 | Startup finished, durable progress is healthy, and this process still owns the writer fence. |
 | `/readyz` | 503 | Journal (WAL) publication or remote checkpoint work failed, object storage is unavailable, or another process owns the writer fence. |
-| `/metrics` | 200 | Prometheus text: readiness, connections, query workspaces, active leases and waiters, WAL, row memory, checkpoint pressure, cache traffic, immutable-block object requests. |
+| `/metrics` | 200 | Prometheus text: readiness, connections, query workspaces, active leases and waiters, WAL, row memory, checkpoint pressure, cache traffic, immutable-block object requests, result streams and spooled results by reason. |
 | `/capacity` | 200 | JSON: current use, waiting work, and startup limits for memory, connections, query workspaces, WAL, row heap, caches, catalogs, prepared transactions, replication, and whether credential rotation is configured. |
 
 Only `GET` over HTTP/1.0 or HTTP/1.1 is accepted; other methods and unknown
@@ -154,6 +155,7 @@ Scrape `/metrics` from the private network. Suggested first alerts:
 | Connections near `pos3ql_postgres_connection_capacity` | Raise the startup limit or reduce client concurrency. |
 | WAL or row-heap use near capacity | Check checkpoint progress and object-store latency. |
 | Sustained object read latency, cache misses, or prefetch saturation | Compare the working set with cache and object-read slot capacities. |
+| `pos3ql_result_stream_spooled_total{reason="capacity"}` grows | Large simple results queue in the spool because their read position exceeds `result_stream_bytes`; raise it or checkpoint more often. |
 
 Counters reset at process start. Block-object request counters cover
 immutable SST traffic through the cache stack only, not root, commit-batch,

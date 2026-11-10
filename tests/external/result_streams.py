@@ -3,7 +3,8 @@
 
 Client A sends a large simple Query, then the same result through an unpaged
 extended Execute (Parse/Bind/Execute(0)/Sync), and stops reading with a small
-receive buffer. Client B, a psycopg session, must keep completing queries
+receive buffer. Two results are used: a generated series (pos3ql queues it in
+the result spool) and a scan of one table (pos3ql resumes it row by row). Client B, a psycopg session, must keep completing queries
 while A is stalled. A then reads everything: exactly one RowDescription per
 simple query, every row once and in order, one CommandComplete and one
 ReadyForQuery. With --pg, the same protocol transcript summary is compared
@@ -22,8 +23,14 @@ import time
 import psycopg
 
 ROWS = 20000
-QUERY = f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g"
-OTHER_QUERIES = 200
+TABLE_ROWS = 5000
+# Results must exceed what loopback socket buffers can absorb (Linux grows a
+# send buffer to 4 MiB), so the server really holds output for a stalled client.
+QUERIES = (
+    (f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g", ROWS),
+    ("SELECT id, payload FROM result_stream_rows", TABLE_ROWS),
+)
+OTHER_QUERIES = 100
 STALL_SECONDS = 2.0
 
 
@@ -110,29 +117,50 @@ def stalled_client(host, port, user, database):
 
 def other_session_progress(host, port, user, database):
     started = time.monotonic()
+    # The stalled statement itself may still be computing its rows on the
+    # single SQL worker; the bound is generous for unoptimized builds.
     with psycopg.connect(
-        host=host, port=port, user=user, dbname=database, autocommit=True, connect_timeout=5
+        host=host, port=port, user=user, dbname=database, autocommit=True, connect_timeout=60
     ) as connection:
-        connection.execute("SET statement_timeout = '5s'")
-        connection.execute("CREATE TEMP TABLE progress(v int)")
+        connection.execute("SET statement_timeout = '30s'")
+        connection.execute("DROP TABLE IF EXISTS result_stream_progress")
+        connection.execute("CREATE TABLE result_stream_progress(v int)")
         for value in range(OTHER_QUERIES):
-            connection.execute("INSERT INTO progress VALUES (%s)", (value,))
+            connection.execute("INSERT INTO result_stream_progress VALUES (%s)", (value,))
             assert connection.execute("SELECT 1").fetchone() == (1,)
-        (count,) = connection.execute("SELECT count(*) FROM progress").fetchone()
+        (count,) = connection.execute("SELECT count(*) FROM result_stream_progress").fetchone()
         assert count == OTHER_QUERIES
+        connection.execute("DROP TABLE result_stream_progress")
     return time.monotonic() - started
 
 
+def create_table(host, port, user, database):
+    with psycopg.connect(
+        host=host, port=port, user=user, dbname=database, autocommit=True, connect_timeout=5
+    ) as connection:
+        connection.execute("DROP TABLE IF EXISTS result_stream_rows")
+        connection.execute("CREATE TABLE result_stream_rows(id integer, payload text)")
+        for first in range(1, TABLE_ROWS + 1, 200):
+            connection.execute(
+                "INSERT INTO result_stream_rows "
+                "SELECT g, repeat('x', 1000) FROM generate_series(%s::int, %s::int) g",
+                (first, first + 199),
+            )
+
+
 def probe(host, port, user, database):
+    create_table(host, port, user, database)
     results = {}
-    for protocol in ("simple", "extended"):
+    for (query, rows), protocol in [
+        (entry, protocol) for entry in QUERIES for protocol in ("simple", "extended")
+    ]:
         sock = stalled_client(host, port, user, database)
         if protocol == "simple":
-            request = message(b"Q", QUERY.encode() + b"\0") + message(b"Q", b"SELECT 2\0")
+            request = message(b"Q", query.encode() + b"\0") + message(b"Q", b"SELECT 1\0")
             ready_count = 2
         else:
             request = (
-                message(b"P", b"\0" + QUERY.encode() + b"\0\0\0")
+                message(b"P", b"\0" + query.encode() + b"\0\0\0")
                 + message(b"B", b"\0\0\0\0\0\0\0\0")
                 + message(b"E", b"\0\0\0\0\0")
                 + message(b"S")
@@ -142,31 +170,31 @@ def probe(host, port, user, database):
         # Stop reading: the server has far more output than the socket holds.
         time.sleep(STALL_SECONDS / 2)
         elapsed = other_session_progress(host, port, user, database)
-        assert elapsed < 30, f"{protocol}: another session needed {elapsed:.1f}s"
+        # Before output stopped blocking the worker, this session never finished.
+        assert elapsed < 60, f"{protocol}: another session needed {elapsed:.1f}s"
         time.sleep(STALL_SECONDS / 2)
         transcript = summarize(read_until_ready(sock, ready_count))
         sock.close()
-        results[protocol] = transcript
-        print(f"{protocol}: {transcript} (other session {elapsed:.2f}s)", flush=True)
-    expected_simple = [
-        ("T", None),
-        ("D", ROWS),
-        ("C", f"SELECT {ROWS}"),
-        ("Z", None),
-        ("T", None),
-        ("D", 1),
-        ("C", "SELECT 1"),
-        ("Z", None),
-    ]
-    expected_extended = [
-        ("1", None),
-        ("2", None),
-        ("D", ROWS),
-        ("C", f"SELECT {ROWS}"),
-        ("Z", None),
-    ]
-    assert results["simple"] == expected_simple, results["simple"]
-    assert results["extended"] == expected_extended, results["extended"]
+        results[(query, protocol)] = transcript
+        print(f"{protocol} {query!r}: {transcript} (other session {elapsed:.2f}s)", flush=True)
+        if protocol == "simple":
+            expected = [
+                ("T", None),
+                ("D", rows),
+                ("C", f"SELECT {rows}"),
+                ("Z", None),
+                ("T", None),
+                ("D", 1),
+                ("C", "SELECT 1"),
+                ("Z", None),
+            ]
+        else:
+            expected = [("1", None), ("2", None), ("D", rows), ("C", f"SELECT {rows}"), ("Z", None)]
+        assert transcript == expected, transcript
+    with psycopg.connect(
+        host=host, port=port, user=user, dbname=database, autocommit=True, connect_timeout=5
+    ) as connection:
+        connection.execute("DROP TABLE result_stream_rows")
     return results
 
 

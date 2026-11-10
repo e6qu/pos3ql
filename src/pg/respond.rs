@@ -97,6 +97,39 @@ pub(crate) struct OutputSink<'b> {
     failed: bool,
     /// Overflow length that triggers the next write attempt.
     next_write_at: usize,
+    promotion: Promotion,
+    /// Why the current statement's overflow queued instead of streaming.
+    spooled: Option<SpoolReason>,
+    /// A result stream keeps at most one row beyond `send` and parks; that
+    /// row may use the private reserve instead of the shared spool.
+    rows_use_reserve: bool,
+}
+
+/// Why a result that outgrew the send buffer queued in the result spool
+/// instead of resuming as a result stream. The engine decides before the
+/// statement runs, except for effects, which only execution reveals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpoolReason {
+    /// The query shape cannot resume from a retained read position.
+    Shape,
+    /// Its retained read position would exceed `result_stream_bytes`.
+    Capacity,
+    /// The statement started an effect before its output overflowed.
+    Effects,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Promotion {
+    /// This output never resumes as a stream.
+    Disabled,
+    /// The protocol allows a stream; the current statement did not arm one.
+    Allowed,
+    /// The first overflow of a restartable statement requests a stream.
+    Armed { mark: OutputMark, epoch: u64 },
+    /// The statement's overflow queues; `spooled` records why.
+    Declined(SpoolReason),
+    /// The statement stopped at its first overflow and must reopen as a stream.
+    Requested,
 }
 
 impl<'b> OutputSink<'b> {
@@ -111,7 +144,23 @@ impl<'b> OutputSink<'b> {
             writer,
             failed: false,
             next_write_at: 0,
+            promotion: Promotion::Disabled,
+            spooled: None,
+            rows_use_reserve: false,
         }
+    }
+
+    /// Lets a top-level `SELECT` in this output resume as a result stream.
+    pub(crate) fn allow_promotion(mut self) -> Self {
+        self.promotion = Promotion::Allowed;
+        self
+    }
+
+    /// Output of a result stream: rows never need the shared spool.
+    pub(crate) fn for_stream(mut self) -> Self {
+        self.rows_use_reserve = true;
+        self.spool = None;
+        self
     }
 
     /// Writes queued output until the transport would block, refilling `send`
@@ -824,8 +873,31 @@ impl<'b> Responder<'b> {
         let Some(sink) = self.output.as_mut() else {
             return Self::append_message(self.buffer, &build);
         };
+        if sink.promotion == Promotion::Requested {
+            // The attempt is being discarded; nothing more of it may queue.
+            return Err(WireFull);
+        }
         if sink.overflow.is_empty() && Self::append_message(self.buffer, &build).is_ok() {
             return Ok(());
+        }
+        if class == OutputClass::Bulk
+            && let Promotion::Armed { mark, epoch } = sink.promotion
+        {
+            // Before any byte of this statement leaves and before any effect,
+            // the statement can stop and reopen as a resumable stream.
+            let restartable = mark
+                .excess(
+                    self.buffer.len() + sink.overflow.len(),
+                    sink.overflow.written(),
+                )
+                .is_some()
+                && epoch == crate::sql::query::statement_effect_epoch()
+                && crate::sql::sequence::ensure_statement_effects_replayable().is_ok();
+            if restartable {
+                sink.promotion = Promotion::Requested;
+                return Err(WireFull);
+            }
+            sink.promotion = Promotion::Declined(SpoolReason::Effects);
         }
         // Retry a full send buffer at once; with output already queued, retry
         // once half a send buffer more has accumulated.
@@ -835,7 +907,67 @@ impl<'b> Responder<'b> {
                 return Ok(());
             }
         }
+        if class == OutputClass::Bulk
+            && sink.spooled.is_none()
+            && let Promotion::Declined(reason) = sink.promotion
+        {
+            sink.spooled = Some(reason);
+        }
+        let class = if sink.rows_use_reserve {
+            OutputClass::Control
+        } else {
+            class
+        };
         sink.overflow.push(sink.spool.as_ref(), class, &build)
+    }
+
+    /// Whether this output may resume a `SELECT` as a result stream.
+    pub(crate) fn promotion_allowed(&self) -> bool {
+        self.output
+            .as_ref()
+            .is_some_and(|sink| sink.promotion == Promotion::Allowed)
+    }
+
+    /// Starts a statement whose first overflow may request a result stream.
+    pub(crate) fn arm_promotion(&mut self) {
+        let mark = self.mark();
+        if let Some(sink) = self.output.as_mut() {
+            sink.promotion = Promotion::Armed {
+                mark,
+                epoch: crate::sql::query::statement_effect_epoch(),
+            };
+        }
+    }
+
+    /// Starts a statement whose overflow queues for `reason`.
+    pub(crate) fn decline_promotion(&mut self, reason: SpoolReason) {
+        if let Some(sink) = self.output.as_mut() {
+            sink.promotion = Promotion::Declined(reason);
+        }
+    }
+
+    /// Ends a statement's promotion decision: whether it requested a stream,
+    /// and why its overflow queued instead.
+    pub(crate) fn finish_promotion(&mut self) -> (bool, Option<SpoolReason>) {
+        let Some(sink) = self.output.as_mut() else {
+            return (false, None);
+        };
+        if sink.promotion == Promotion::Disabled {
+            return (false, None);
+        }
+        let requested = sink.promotion == Promotion::Requested;
+        sink.promotion = Promotion::Allowed;
+        (requested, sink.spooled.take())
+    }
+
+    /// Writes what the client accepts, then reports whether a result stream
+    /// should wait for its client before evaluating another row.
+    pub(crate) fn output_backlogged(&mut self) -> bool {
+        let Some(sink) = self.output.as_mut() else {
+            return false;
+        };
+        sink.write_available(self.buffer);
+        !sink.overflow.is_empty() || self.buffer.writable().len() < self.buffer.capacity() / 2
     }
 
     fn append_message(
@@ -1198,6 +1330,14 @@ impl<'b> Responder<'b> {
             responder: self,
             previous,
         }
+    }
+
+    /// Reinstalls a resumed result's column types without resending its
+    /// RowDescription.
+    pub(crate) fn restore_result_types(&mut self, type_oids: &[i32]) {
+        self.result_columns = type_oids.len().min(MAX_RESULT_COLS);
+        self.result_type_oids[..self.result_columns]
+            .copy_from_slice(&type_oids[..self.result_columns]);
     }
 
     pub(crate) fn result_type_oid(&self, index: usize) -> Option<i32> {
@@ -2164,6 +2304,61 @@ mod tests {
         );
         assert!(kinds[10..count - 2].iter().all(|kind| *kind == b'D'));
         assert!(overflow.is_empty());
+    }
+
+    #[test]
+    fn promotion_requests_a_stream_only_before_effects_and_sent_bytes() {
+        use crate::mem::lease_pool::{LeasePool, Purpose};
+        use crate::pg::overflow::ResultOverflow;
+        let mut budget = crate::mem::Budget::new(1 << 20);
+        let spool = LeasePool::new(&mut budget, Purpose::RESULT_SPOOL, 4096, 1).unwrap();
+        let mut overflow = ResultOverflow::new(&mut budget, 256).unwrap();
+        let mut send = super::FixedBuf::new(&mut budget, "send", 256).unwrap();
+        let row = crate::sql::types::Datum::Text("abcdefghijklmnopqrstuvwx");
+        crate::mem::guard::forbid_alloc(|| {
+            let mut responder = super::Responder::new(&mut send).with_output(
+                super::OutputSink::new(
+                    &mut overflow,
+                    Some(spool.clone()),
+                    super::ClientWriter::None,
+                )
+                .allow_promotion(),
+            );
+            responder.arm_promotion();
+            let mark = responder.mark();
+            let full = loop {
+                if let Err(full) = responder.data_row(core::slice::from_ref(&row)) {
+                    break full;
+                }
+            };
+            assert_eq!(full, WireFull);
+            // A discarded attempt queues nothing more, not even errors.
+            assert!(responder.error("XX000", "after the request").is_err());
+            assert_eq!(responder.finish_promotion(), (true, None));
+            responder.truncate_to(mark);
+
+            // An effect before the first overflow keeps the statement on the spool.
+            responder.arm_promotion();
+            crate::sql::query::protect_statement_effects();
+            for _ in 0..12 {
+                responder.data_row(core::slice::from_ref(&row)).unwrap();
+            }
+            assert_eq!(
+                responder.finish_promotion(),
+                (false, Some(super::SpoolReason::Effects))
+            );
+            responder.truncate_to(mark);
+
+            responder.decline_promotion(super::SpoolReason::Shape);
+            for _ in 0..12 {
+                responder.data_row(core::slice::from_ref(&row)).unwrap();
+            }
+            assert_eq!(
+                responder.finish_promotion(),
+                (false, Some(super::SpoolReason::Shape))
+            );
+            assert!(responder.promotion_allowed());
+        });
     }
 
     #[test]

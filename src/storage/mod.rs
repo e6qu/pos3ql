@@ -51875,6 +51875,12 @@ impl Storage {
             })
     }
 
+    /// Resident row entries of a table: an upper bound on the rows a scan
+    /// captures before reading saved generations.
+    pub(crate) fn resident_row_entries(&self, table_slot: usize) -> usize {
+        self.tables[table_slot].rows.len()
+    }
+
     pub(crate) fn result_spool(&self) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
         &self.result_spool
     }

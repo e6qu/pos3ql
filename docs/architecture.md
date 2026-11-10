@@ -88,6 +88,28 @@ publication can follow: in local mode, and for a lone `SELECT`, `SHOW`,
 `VALUES` or `TABLE` in object-store mode; other output waits for durable
 publication before any byte is written.
 
+**Large results resume row by row.** Before a top-level `SELECT` runs (simple
+Query, or an unpaged extended `Execute`), the engine decides whether it can
+become a **result stream**: a single ordinary table without joins, grouping,
+sorting, `DISTINCT`, set operations, subqueries, CTEs, row locking or row
+security, whose read position (one record per resident row plus the query
+text) fits `result_stream_bytes`. If such a statement's output first outgrows
+the send buffer before any byte left and before any effect, that attempt is
+discarded and the statement reopens from a retained read position in the
+connection's `result_stream_bytes` allocation. It then delivers rows while the
+client reads and yields when the client is behind (`Client`/`ClientWrite` in
+`pg_stat_activity`), when a row waits for an object download, and when a row
+waits for a lock. Delivered rows are final: a wait inside a row rolls back and
+re-evaluates only that row, and an effect makes only the rest of that row read
+synchronously. Every other large result uses the spool above, decided before
+any of its rows reach the client; `pos3ql_result_stream_spooled_total` counts
+those by reason (`shape`, `capacity`, `effects`).
+
+**Example:** `SELECT id, payload FROM orders` sent by a client on a slow link
+delivers rows as the client reads them; while it waits for the client or for a
+cold block of `orders`, other connections run. `SELECT ... FROM orders ORDER
+BY id` sorts first, so its output queues in the spool instead.
+
 | Path | Cold storage read |
 |---|---|
 | Queries before their first effect, including reads inside explicit transactions | Yields |
@@ -95,6 +117,7 @@ publication before any byte is written.
 | Maintenance: checkpoint capture, merges, index builds, journal and saved-file cleanup | Yields, using a separate maintenance read owner and fixed clients |
 | A statement after its first effect (volatile function, routine body, sequence change, first output byte reaching the client) | Blocks until the statement ends |
 | Output queued for a slow client | Never blocks; the connection waits for the client between messages |
+| Result streams (see above): each row before its first effect | Yields; delivered rows are kept |
 | Writing statements: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, DDL, `CALL`, `DO`, `COPY FROM` | Blocks for the whole statement |
 | Commit processing, deferred constraint triggers, `SET CONSTRAINTS`, `PREPARE TRANSACTION`, `COMMIT PREPARED`/`ROLLBACK PREPARED` | Blocks |
 | `COPY` rows and completion; logical-replication apply and initial copy | Blocks |
@@ -126,6 +149,7 @@ replays instead of running the effect again.
 | Checked literal inputs saved with routines and stored definitions | `table_metadata_bytes` / `table_metadata_leases`, with `routine_input_slots` control records |
 | Execution schemas | `definition_image_slots` |
 | Result output queued for a slow client | Rows: `result_spool_bytes` / `result_spool_leases`, released as soon as the client drains them. Closing messages: a private reserve of `conn_send_buffer_bytes` per connection |
+| A result stream's query text, parameters, row positions and saved-file readers | `result_stream_bytes` per connection; released at completion, error, cancel, timeout or disconnect. Not visible in `pg_cursors` and not counted in `max_cursors` |
 
 Further rules that apply to every saved owner:
 
@@ -426,6 +450,7 @@ row-work memory.
 | `max_ddl_per_transaction` | DDL event controls per transaction; actual-length records use `table_metadata_bytes` |
 | `cursor_query_bytes` | Per-cursor query state, including the declared type IDs a `WITH HOLD` cursor keeps after commit |
 | `conn_send_buffer_bytes` | Reserved twice per connection: the send buffer and the private output reserve that holds a result's closing messages. The largest single backend message must fit it |
+| `result_stream_bytes` | One result stream per connection (starter: 256 KiB); zero disables streams. The estimate counts every resident row of the table, so a table with many uncheckpointed rows spools instead |
 | Held notifications | 64 KiB per connection for notifications that arrive while a result is in progress; a listener further behind is closed rather than sent a truncated stream |
 
 Tables store their actual columns, not a maximum-width array; dropped columns

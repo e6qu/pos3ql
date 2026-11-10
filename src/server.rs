@@ -3656,6 +3656,22 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
             io.object_read_micros as f64 / 1_000_000.0,
             io.object_prefetch_saturated,
         );
+        let streams = self.engine.result_stream_metrics();
+        let _ = write!(
+            out,
+            "# HELP pos3ql_result_streams_total Large results that resumed row by row as their client read.\n\
+# TYPE pos3ql_result_streams_total counter\n\
+pos3ql_result_streams_total {}\n\
+# HELP pos3ql_result_stream_spooled_total Large results queued in the result spool instead, by reason.\n\
+# TYPE pos3ql_result_stream_spooled_total counter\n\
+pos3ql_result_stream_spooled_total{{reason=\"shape\"}} {}\n\
+pos3ql_result_stream_spooled_total{{reason=\"capacity\"}} {}\n\
+pos3ql_result_stream_spooled_total{{reason=\"effects\"}} {}\n",
+            streams.opened,
+            streams.spooled_shape,
+            streams.spooled_capacity,
+            streams.spooled_effects,
+        );
     }
 
     fn render_capacity(&self, out: &mut crate::util::StackStr<4096>) {

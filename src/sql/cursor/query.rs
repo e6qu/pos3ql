@@ -74,6 +74,10 @@ impl CursorQuery {
         self.owner = crate::sql::type_input_plans::Owner::Unlocated;
     }
 
+    pub(crate) fn owner(&self) -> crate::sql::type_input_plans::Owner {
+        self.owner
+    }
+
     pub(crate) fn is_bound(&self) -> bool {
         self.bound.is_some()
     }

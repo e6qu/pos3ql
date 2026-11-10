@@ -198,6 +198,9 @@ impl Prepared {
 enum PortalExecution {
     Fresh,
     Paging,
+    /// An unpaged result resuming as a result stream; the Execute stays at
+    /// the front of `recv` until it completes.
+    Streaming,
     Complete,
 }
 
@@ -424,6 +427,8 @@ pub struct Conn {
     held_notifications: FixedBuf,
     /// Output after this mark waits for the reactor's publication barrier.
     publication_hold: Option<OutputMark>,
+    /// A large result resuming row by row for the message at the front of `recv`.
+    result_stream: crate::sql::cursor::ResultStream,
     pub arena: Arena,
     pub txn: TxnState,
     pub sqlprep: SqlPreparedPool,
@@ -602,6 +607,7 @@ impl Conn {
                 HELD_NOTIFICATION_BYTES,
             )?,
             publication_hold: None,
+            result_stream: crate::sql::cursor::ResultStream::new(config, budget)?,
             arena: Arena::new(budget, "conn_sql_arena", config.sql_arena_bytes)?,
             txn: TxnState::new_with_config(budget, config)?,
             sqlprep: SqlPreparedPool::new(config, budget)?,
@@ -666,6 +672,7 @@ impl Conn {
         self.overflow.reset();
         self.held_notifications.clear();
         self.publication_hold = None;
+        self.result_stream.release();
         self.arena.reset();
         self.txn.clear();
         self.sqlprep.clear();
@@ -715,8 +722,9 @@ impl Conn {
     }
 
     pub fn close(&mut self) -> Option<TcpStream> {
-        // Return any spool lease to other connections immediately.
+        // Return any spool lease and stream readers immediately.
         self.overflow.clear();
+        self.result_stream.release();
         self.held_notifications.clear();
         self.publication_hold = None;
         self.copy = None;
@@ -761,13 +769,7 @@ impl Conn {
 
     /// Discards unsent output after `mark`; false if some of it already left.
     fn truncate_output(&mut self, mark: OutputMark) -> bool {
-        let queued = self.send.len() + self.overflow.len();
-        match mark.excess(queued, self.overflow.written()) {
-            Some(excess) => {
-                super::overflow::truncate_output(&mut self.send, Some(&mut self.overflow), excess)
-            }
-            None => false,
-        }
+        truncate_connection_output(&mut self.send, &mut self.overflow, mark)
     }
 
     /// Output queued behind this connection's send buffer, for tests.
@@ -779,6 +781,18 @@ impl Conn {
     #[cfg(test)]
     pub(crate) fn parked_wait(&self) -> Option<crate::sql::StatementWait> {
         self.parked.then_some(self.parked_wait)
+    }
+
+    /// Skips startup for engine tests that drive a connection directly.
+    #[cfg(test)]
+    pub(crate) fn enter_ready_for_tests(&mut self, engine: &Engine) {
+        self.auth_database = engine.database_login("postgres");
+        self.phase = Phase::Ready;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn result_stream_active(&self) -> bool {
+        self.result_stream.is_active()
     }
 
     pub(crate) fn owns_pending_object_reads(&self) -> bool {
@@ -848,6 +862,7 @@ impl Conn {
         self.overflow.clear();
         self.held_notifications.clear();
         self.publication_hold = None;
+        self.result_stream.release();
         self.finish_lock_wait();
         self.replication_completion_pending = false;
         self.start_termination();
@@ -865,8 +880,12 @@ impl Conn {
 
     pub(crate) fn cancel_parked(&mut self, engine: &mut Engine) -> bool {
         // A connection waiting only for its client to read finished output
-        // has no running statement; PostgreSQL ignores such a cancel.
-        if !self.parked || self.parked_wait == crate::sql::StatementWait::ClientOutput {
+        // has no running statement; PostgreSQL ignores such a cancel. A
+        // result stream waiting for its client is a running statement.
+        if !self.parked
+            || (self.parked_wait == crate::sql::StatementWait::ClientOutput
+                && !self.result_stream.is_active())
+        {
             return false;
         }
         self.abort_parked(
@@ -883,6 +902,16 @@ impl Conn {
             self.txn.defer_concurrent_index_cancel();
             return false;
         }
+        if let Some(crate::sql::cursor::StreamProtocol::Extended { portal }) =
+            self.result_stream.protocol()
+        {
+            // The interrupted portal cannot be resumed.
+            self.portals[portal].active = false;
+            self.portals[portal].execution = PortalExecution::Fresh;
+        }
+        self.result_stream.release();
+        // The next Query starts at its first statement.
+        self.resume_statement = 0;
         let extended = self.copy.as_ref().map_or_else(
             || {
                 !matches!(
@@ -3964,6 +3993,9 @@ impl Conn {
             };
         }
 
+        if self.portals[portal_slot].execution == PortalExecution::Streaming {
+            return self.continue_portal_stream(engine, portal_slot);
+        }
         let need_run = self.portals[portal_slot].execution == PortalExecution::Fresh;
         let mut paged =
             max_rows > 0 || self.portals[portal_slot].execution == PortalExecution::Paging;
@@ -4036,7 +4068,8 @@ impl Conn {
                         (true, None, Some(socket)) => ClientWriter::Fd(socket.as_raw_fd()),
                     };
                     let mut responder = Responder::for_execute(&mut self.send, rfmt).with_output(
-                        OutputSink::new(&mut self.overflow, Some(engine.result_spool()), writer),
+                        OutputSink::new(&mut self.overflow, Some(engine.result_spool()), writer)
+                            .allow_promotion(),
                     );
                     let result = engine.execute_extended_selected(
                         text,
@@ -4063,6 +4096,60 @@ impl Conn {
                     engine.copy_abort(&mut self.txn, &self.guc);
                 }
                 return Step::Close;
+            }
+            if let Ok(crate::sql::ExtendedExecutionStatus::Blocked {
+                wait: crate::sql::StatementWait::ClientOutput,
+            }) = result
+            {
+                // The first overflow of a restartable result: reopen it as a
+                // stream while its parameters are still in statement memory.
+                let pending = engine
+                    .take_pending_result_stream()
+                    .expect("a promoted statement records its source");
+                assert!(
+                    truncate_connection_output(&mut self.send, &mut self.overflow, send_mark),
+                    "a promoted statement sent no output"
+                );
+                let opened = {
+                    let mut responder = Responder::for_execute(&mut self.send, rfmt).with_output(
+                        OutputSink::new(&mut self.overflow, None, ClientWriter::None).for_stream(),
+                    );
+                    match engine.open_result_stream(
+                        &mut self.result_stream,
+                        crate::sql::cursor::StreamProtocol::Extended {
+                            portal: portal_slot,
+                        },
+                        text,
+                        params,
+                        param_oids,
+                        pending.owner,
+                        pending.deadline,
+                        &mut self.txn,
+                        &self.guc,
+                        &mut responder,
+                        self.id,
+                    ) {
+                        Ok(()) => Ok(true),
+                        Err(error) => engine
+                            .fail_result_stream(
+                                &mut self.result_stream,
+                                error,
+                                &mut self.txn,
+                                &mut self.cursors,
+                                &self.guc,
+                                &mut responder,
+                            )
+                            .map(|_| false),
+                    }
+                };
+                return match opened {
+                    Ok(true) => {
+                        self.portals[portal_slot].execution = PortalExecution::Streaming;
+                        self.continue_portal_stream(engine, portal_slot)
+                    }
+                    Ok(false) => self.finish_failed_portal_stream(engine, portal_slot),
+                    Err(WireFull) => Step::Close,
+                };
             }
             let pending_copy = engine.take_pending_copy();
             if !matches!(
@@ -4304,45 +4391,79 @@ impl Conn {
         }
         if self.sqlprep.request_input_waiting()
             || self.guc.seq_session().retains_statement_effects()
+            || self.result_stream.is_active()
         {
             self.arena.recycle_front();
         } else {
             self.arena.reset();
         }
         let mark = self.output_mark();
-        // A full send buffer spills into the overflow area; the worker never
-        // waits for this client. Bytes may leave during the statement only
-        // when they cannot precede an object-store publication.
-        let stream_early = !engine.publication_required() || simple_query_can_stream(text);
-        let (result, transport_failed) = {
-            let lock_timeout_expired = self.lock_timeout_expired();
-            let writer = match (stream_early, self.tls.as_mut(), self.stream.as_mut()) {
-                (false, _, _) | (true, _, None) => ClientWriter::None,
-                (true, Some(session), Some(socket)) => ClientWriter::Tls { session, socket },
-                (true, None, Some(socket)) => ClientWriter::Fd(socket.as_raw_fd()),
+        loop {
+            // A promoted statement resumes as a result stream; statements
+            // after it then run as usual.
+            if let Some(crate::sql::cursor::StreamProtocol::Simple { statement }) =
+                self.result_stream.protocol()
+                && let Some(step) = self.continue_query_stream(engine, total, statement)
+            {
+                return step;
+            }
+            let text = query_text(&self.recv, total);
+            // A full send buffer spills into the overflow area; the worker never
+            // waits for this client. Bytes may leave during the statement only
+            // when they cannot precede an object-store publication.
+            let stream_early = !engine.publication_required() || simple_query_can_stream(text);
+            let (result, transport_failed) = {
+                let lock_timeout_expired = self.lock_timeout_expired();
+                let writer = match (stream_early, self.tls.as_mut(), self.stream.as_mut()) {
+                    (false, _, _) | (true, _, None) => ClientWriter::None,
+                    (true, Some(session), Some(socket)) => ClientWriter::Tls { session, socket },
+                    (true, None, Some(socket)) => ClientWriter::Fd(socket.as_raw_fd()),
+                };
+                let mut responder = Responder::new(&mut self.send).with_output(
+                    OutputSink::new(&mut self.overflow, Some(engine.result_spool()), writer)
+                        .allow_promotion(),
+                );
+                let result = engine.execute_simple_from_selected(
+                    text,
+                    self.resume_statement,
+                    &self.arena,
+                    &mut self.txn,
+                    &mut self.sqlprep,
+                    &mut self.cursors,
+                    &self.guc,
+                    &mut responder,
+                    self.id,
+                    lock_timeout_expired,
+                );
+                (result, responder.transport_failed())
             };
-            let mut responder = Responder::new(&mut self.send).with_output(OutputSink::new(
-                &mut self.overflow,
-                Some(engine.result_spool()),
-                writer,
-            ));
-            let result = engine.execute_simple_from_selected(
-                text,
-                self.resume_statement,
-                &self.arena,
-                &mut self.txn,
-                &mut self.sqlprep,
-                &mut self.cursors,
-                &self.guc,
-                &mut responder,
-                self.id,
-                lock_timeout_expired,
-            );
-            (result, responder.transport_failed())
-        };
-        if transport_failed {
-            return Step::Close;
+            if transport_failed {
+                return Step::Close;
+            }
+            if let Ok(crate::sql::ExecutionStatus::Blocked {
+                completed_statements,
+                output_mark,
+                wait: crate::sql::StatementWait::ClientOutput,
+            }) = result
+            {
+                if let Some(step) =
+                    self.open_query_stream(engine, total, completed_statements, output_mark)
+                {
+                    return step;
+                }
+                continue;
+            }
+            break self.finish_query(engine, total, mark, result);
         }
+    }
+
+    fn finish_query(
+        &mut self,
+        engine: &mut Engine,
+        total: usize,
+        mark: OutputMark,
+        result: Result<crate::sql::ExecutionStatus, WireFull>,
+    ) -> Step {
         let status = self.txn.status_byte();
         let step = match result {
             Ok(crate::sql::ExecutionStatus::Complete) => {
@@ -4436,6 +4557,206 @@ impl Conn {
         if matches!(result, Ok(crate::sql::ExecutionStatus::Complete))
             && self.txn.mode == crate::sql::txn::TxnMode::Idle
         {
+            for portal in &mut self.portals {
+                portal.active = false;
+            }
+            self.release_closed_statement_plans();
+        }
+        self.apply_protocol_reset(engine);
+        self.arena.reset();
+        self.recv.consume(total);
+        step
+    }
+
+    /// Delivers rows of an unpaged portal's result stream.
+    fn continue_portal_stream(&mut self, engine: &mut Engine, slot: usize) -> Step {
+        let formats = self.portals[slot].result_formats;
+        let text = self.prepared[self.portals[slot].statement].query();
+        let stream_early = !engine.publication_required() || simple_query_can_stream(text);
+        let lock_timeout_expired = self.lock_timeout_expired();
+        let (step, transport_failed, completion) = {
+            let writer = match (stream_early, self.tls.as_mut(), self.stream.as_mut()) {
+                (false, _, _) | (true, _, None) => ClientWriter::None,
+                (true, Some(session), Some(socket)) => ClientWriter::Tls { session, socket },
+                (true, None, Some(socket)) => ClientWriter::Fd(socket.as_raw_fd()),
+            };
+            let mut responder = Responder::for_execute(&mut self.send, formats)
+                .with_output(OutputSink::new(&mut self.overflow, None, writer).for_stream());
+            let step = engine.continue_result_stream(
+                &mut self.result_stream,
+                &self.arena,
+                &mut self.txn,
+                &mut self.sqlprep,
+                &mut self.cursors,
+                &self.guc,
+                &mut responder,
+                self.id,
+                lock_timeout_expired,
+            );
+            (
+                step,
+                responder.transport_failed(),
+                responder.completion_tag(),
+            )
+        };
+        if transport_failed {
+            return Step::Close;
+        }
+        match step {
+            Err(WireFull) => Step::Close,
+            Ok(crate::sql::StreamStep::Complete) => {
+                self.finish_lock_wait();
+                engine.finish_backend_statement(&self.txn, self.id);
+                self.sqlprep.clear_request_type_inputs();
+                self.arena.reset();
+                let portal = &mut self.portals[slot];
+                portal.completion = completion.unwrap_or_default();
+                portal.execution = PortalExecution::Complete;
+                self.apply_protocol_reset(engine);
+                Step::Continue
+            }
+            Ok(crate::sql::StreamStep::Wait(wait)) => {
+                self.park(wait, engine.statement_wait_generation(wait, self.id));
+                engine.park_backend_statement(self.id, wait);
+                self.arena.recycle_front();
+                Step::Parked
+            }
+            Ok(crate::sql::StreamStep::Failed) => self.finish_failed_portal_stream(engine, slot),
+        }
+    }
+
+    /// Ends an Execute whose result stream failed after its delivered rows;
+    /// input is skipped until Sync.
+    fn finish_failed_portal_stream(&mut self, engine: &mut Engine, slot: usize) -> Step {
+        self.finish_lock_wait();
+        engine.finish_backend_statement(&self.txn, self.id);
+        self.sqlprep.clear_request_type_inputs();
+        self.arena.reset();
+        let portal = &mut self.portals[slot];
+        portal.active = false;
+        portal.execution = PortalExecution::Fresh;
+        self.phase = Phase::SkipToSync;
+        Step::Continue
+    }
+
+    /// Reopens the promoted statement of the Query at the front of `recv` as
+    /// a result stream. Returns the step when opening failed.
+    fn open_query_stream(
+        &mut self,
+        engine: &mut Engine,
+        total: usize,
+        statement: usize,
+        output_mark: OutputMark,
+    ) -> Option<Step> {
+        let pending = engine
+            .take_pending_result_stream()
+            .expect("a promoted statement records its source");
+        assert!(
+            self.truncate_output(output_mark),
+            "a promoted statement sent no output"
+        );
+        let text = query_text(&self.recv, total);
+        let source = &text[pending.source_start..pending.source_end];
+        let failed = {
+            let mut responder = Responder::new(&mut self.send).with_output(
+                OutputSink::new(&mut self.overflow, None, ClientWriter::None).for_stream(),
+            );
+            match engine.open_result_stream(
+                &mut self.result_stream,
+                crate::sql::cursor::StreamProtocol::Simple { statement },
+                source,
+                &[],
+                &[],
+                pending.owner,
+                pending.deadline,
+                &mut self.txn,
+                &self.guc,
+                &mut responder,
+                self.id,
+            ) {
+                Ok(()) => return None,
+                Err(error) => engine.fail_result_stream(
+                    &mut self.result_stream,
+                    error,
+                    &mut self.txn,
+                    &mut self.cursors,
+                    &self.guc,
+                    &mut responder,
+                ),
+            }
+        };
+        Some(match failed {
+            Ok(_) => self.finish_failed_query_stream(engine, total),
+            Err(WireFull) => Step::Close,
+        })
+    }
+
+    /// Delivers rows of the Query's result stream. Returns the step when the
+    /// stream parked or failed, or `None` once its CommandComplete is queued.
+    fn continue_query_stream(
+        &mut self,
+        engine: &mut Engine,
+        total: usize,
+        statement: usize,
+    ) -> Option<Step> {
+        let text = query_text(&self.recv, total);
+        let stream_early = !engine.publication_required() || simple_query_can_stream(text);
+        let lock_timeout_expired = self.lock_timeout_expired();
+        let (step, transport_failed) = {
+            let writer = match (stream_early, self.tls.as_mut(), self.stream.as_mut()) {
+                (false, _, _) | (true, _, None) => ClientWriter::None,
+                (true, Some(session), Some(socket)) => ClientWriter::Tls { session, socket },
+                (true, None, Some(socket)) => ClientWriter::Fd(socket.as_raw_fd()),
+            };
+            let mut responder = Responder::new(&mut self.send)
+                .with_output(OutputSink::new(&mut self.overflow, None, writer).for_stream());
+            let step = engine.continue_result_stream(
+                &mut self.result_stream,
+                &self.arena,
+                &mut self.txn,
+                &mut self.sqlprep,
+                &mut self.cursors,
+                &self.guc,
+                &mut responder,
+                self.id,
+                lock_timeout_expired,
+            );
+            (step, responder.transport_failed())
+        };
+        if transport_failed {
+            return Some(Step::Close);
+        }
+        match step {
+            Err(WireFull) => Some(Step::Close),
+            Ok(crate::sql::StreamStep::Complete) => {
+                self.resume_statement = statement + 1;
+                None
+            }
+            Ok(crate::sql::StreamStep::Wait(wait)) => {
+                self.resume_statement = statement;
+                self.park(wait, engine.statement_wait_generation(wait, self.id));
+                engine.park_backend_statement(self.id, wait);
+                self.arena.recycle_front();
+                Some(Step::Parked)
+            }
+            Ok(crate::sql::StreamStep::Failed) => {
+                Some(self.finish_failed_query_stream(engine, total))
+            }
+        }
+    }
+
+    /// Ends a Query whose result stream failed after its delivered rows.
+    fn finish_failed_query_stream(&mut self, engine: &mut Engine, total: usize) -> Step {
+        self.sqlprep.clear_request_type_inputs();
+        self.finish_lock_wait();
+        self.resume_statement = 0;
+        engine.finish_backend_statement(&self.txn, self.id);
+        let status = self.txn.status_byte();
+        let step = match output(&mut self.send, &mut self.overflow).ready_for_query(status) {
+            Ok(()) => Step::Continue,
+            Err(WireFull) => Step::Close,
+        };
+        if self.txn.mode == crate::sql::txn::TxnMode::Idle {
             for portal in &mut self.portals {
                 portal.active = false;
             }
@@ -4769,6 +5090,27 @@ impl Conn {
         }
         Ok(())
     }
+}
+
+/// Discards a connection's unsent output after `mark`; false if some of it
+/// already left.
+fn truncate_connection_output(
+    send: &mut FixedBuf,
+    overflow: &mut ResultOverflow,
+    mark: OutputMark,
+) -> bool {
+    match mark.excess(send.len() + overflow.len(), overflow.written()) {
+        Some(excess) => super::overflow::truncate_output(send, Some(overflow), excess),
+        None => false,
+    }
+}
+
+/// The SQL text of the Query message of `total` bytes at the front of `recv`,
+/// already validated by its handler.
+fn query_text(recv: &FixedBuf, total: usize) -> &str {
+    MsgIn::new(&recv.readable()[5..total])
+        .cstr()
+        .expect("validated Query text")
 }
 
 fn is_identify_system(text: &str) -> bool {

@@ -67,7 +67,8 @@ number.
 trigger frames; PL/pgSQL calls inside `PERFORM`, `SELECT ... INTO` and
 declaration initializers; SQL-language function bodies, child calls and return
 checks; SQL cursors executing from retained query state; client output that
-never blocks the worker on a slow reader. The
+never blocks the worker on a slow reader; large single-table results resuming
+row by row across client, storage and lock waits. The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
 
@@ -82,11 +83,16 @@ is owned.
   of row progress in multirow updates with saved progress: a child statement must
   see earlier changed rows before the next row is written, and each operation
   keeps its own transition table and firing order.
-- **Results and cursors:** a slow client no longer stalls the worker (output
-  queues in the result spool), but once a large result's first byte reaches
-  the client its remaining storage reads block; resume it row by row instead.
-  Saving a held cursor at commit yields during storage waits. Cursors keep
-  declared record and domain types after their source query ends.
+- **Results and cursors:** resume more large results row by row; only
+  single-table `SELECT` from a simple Query or an unpaged `Execute` does today.
+  Remaining: paged and named portals (`Execute` with a row limit still
+  buffers into `portal_result_bytes`), `FETCH` output, `COPY TO`, and more
+  retained shapes (joins, sorting, grouping, subqueries, set operations). SQL
+  cursors over function sources such as `generate_series` still run their
+  projection at `DECLARE`; PostgreSQL runs it per `FETCH`
+  (`tests/external/cursor_execution.py` checks the reference and must also pass
+  against pos3ql). Saving a held cursor at commit yields during storage waits. Cursors keep declared
+  record and domain types after their source query ends.
 
 **Done when:**
 

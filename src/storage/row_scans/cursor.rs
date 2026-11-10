@@ -91,7 +91,8 @@ fn cursor_capacity(error: crate::mem::arena::ArenaFull) -> SqlError {
 }
 
 impl RowCursor {
-    #[cfg(test)]
+    /// Retained bytes a capture of `rows` resident rows and `members` saved
+    /// generations needs.
     pub(crate) fn position_bytes(rows: usize, members: usize) -> Option<usize> {
         Arena::retained_slice_capacity::<CapturedRowRecord>(rows)?
             .checked_add(Arena::retained_slice_capacity::<MemberCursor>(members)?)

@@ -239,9 +239,24 @@ statement deadline. A failed reattachment restores the caller's environment.
 The actual argument and local widths determine the reservations; paused bodies
 use `execution_control_bytes`/`execution_control_leases` and
 `row_work_bytes`/`row_work_leases`, without a new per-table allocation.
-General SQL-language bodies, return checks that can wait, other expression
-positions and the enclosing write still need complete ownership before their
-synchronous storage protection can be removed.
+SQL-language scalar and table functions retain their current body statement,
+selected source and dependencies, arguments, checked inputs and result work in
+the same fixed pools. A completed statement is skipped after a wait. An unfinished
+child call resumes before its statement is evaluated again, with its original
+effect receipts. Nested INSERT/UPDATE/DELETE completion retains returned rows
+while its AFTER triggers finish. For example, an order function can write an audit
+entry, wait in a child function, then return the original order without writing
+that audit entry again.
+Scalar SELECT functions stop after their first result; final data modifications
+run to completion, following the [PostgreSQL SQL-function contract](https://www.postgresql.org/docs/18/xfunc-sql.html).
+Table results are checked in row order before later row
+effects, using the DML emitter's explicit storage and sequence context. Completed
+scalar query values stay owned if their return conversion waits. Original call
+settings, clocks, identity and declared types cover those conversions too.
+Remaining PL/pgSQL return checks, unowned expression positions and unfinished
+write-row phases still need ownership before synchronous storage protection can
+be removed. A callback requiring a restart after an unowned write effect returns
+`0A000`, `SQL row expression requires retained write progress`.
 Completed scalar values and table-source rows keep their encoded bytes in
 checked arena allocations too. Their result directory stores handles and effect
 receipts, rather than references to returned values or row slices. For example,
@@ -675,8 +690,9 @@ conversion scratch after each row. Output-variable bindings reserve their actual
 count before local initialization, rather than a maximum-width array for every
 invocation. At function completion, exported rows receive independent statement
 storage before the collector releases its leases. A suspended PL/pgSQL body
-keeps this collector with its lexical frame; general SQL-language functions
-still need their own unfinished-query positions.
+keeps this collector with its lexical frame. SQL functions use the same encoded
+row storage with their statement owner; their declared output contract remains
+separate from the input-argument limit.
 Input admission also releases parser/dependency scratch when no checked values
 or planner candidates need retaining. Expressions and static statements with no
 input substitutions reuse their compiled source while keeping the normal

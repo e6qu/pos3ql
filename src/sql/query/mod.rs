@@ -1206,7 +1206,23 @@ impl<'a> RoutineResultShape<'a> {
         txid: u32,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
-        if let Some(ColType::Composite(Some(creation))) = routine.kind.function_result() {
+        Self::from_contract(
+            routine.kind,
+            &routine.result_columns[..routine.result_column_count],
+            storage,
+            txid,
+            arena,
+        )
+    }
+
+    pub(crate) fn from_contract(
+        kind: crate::storage::RoutineKind,
+        columns: &[crate::storage::RoutineArgumentDef],
+        storage: &Storage,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        if let Some(ColType::Composite(Some(creation))) = kind.function_result() {
             let target = crate::storage::TypeDefinitionTarget::by_creation(
                 storage,
                 crate::storage::NamedTypeKind::Composite,
@@ -1226,13 +1242,12 @@ impl<'a> RoutineResultShape<'a> {
             });
         }
         if !matches!(
-            routine.kind,
+            kind,
             crate::storage::RoutineKind::RecordFunction { .. }
                 | crate::storage::RoutineKind::TableFunction
         ) {
             return Ok(Self::Scalar);
         }
-        let columns = &routine.result_columns[..routine.result_column_count];
         let fields = arena
             .alloc_slice_with(columns.len(), |_| super::types::RecordField {
                 name: "",
@@ -1997,13 +2012,37 @@ pub(crate) fn bind_stored_routine_statement<'a>(
     let user = super::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(routine.creation_path.as_str(), user.as_str(), txid);
     let dependencies = storage.snapshot_routine_dependencies_for(routine_slot, txid, arena)?;
+    bind_routine_statement_source(
+        statement,
+        storage,
+        txid,
+        path,
+        dependencies.view(),
+        arena,
+        params,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored SQL retains its original namespace and dependency image"
+)]
+pub(crate) fn bind_routine_statement_source<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<&'a Stmt<'a>, SqlError> {
     let rebound = match statement {
         Stmt::Select(select) => Stmt::Select(*expand_stored_query_exec(
             select,
             storage,
             txid,
             path,
-            dependencies.view(),
+            dependencies,
             arena,
             params,
             None,
@@ -2014,7 +2053,7 @@ pub(crate) fn bind_stored_routine_statement<'a>(
                 query.body,
                 storage,
                 txid,
-                cte::StoredExecutionContext::new(path, dependencies.view(), params, None),
+                cte::StoredExecutionContext::new(path, dependencies, params, None),
                 arena,
             )?;
             Stmt::SetQuery(SetQuery {
@@ -2033,7 +2072,7 @@ pub(crate) fn bind_stored_routine_statement<'a>(
                 storage,
                 txid,
                 path,
-                dependencies.view(),
+                dependencies,
                 arena,
                 params,
                 None,
@@ -2051,7 +2090,7 @@ pub(crate) fn bind_stored_routine_statement<'a>(
     clippy::too_many_arguments,
     reason = "routine query execution carries its optional creation-time binding"
 )]
-fn execute_routine_query_under<'a>(
+pub(crate) fn execute_routine_query_under<'a>(
     query: &RoutineQuery<'a>,
     storage: &'a Storage,
     txid: u32,

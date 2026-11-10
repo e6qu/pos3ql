@@ -1,5 +1,288 @@
 use super::*;
 
+fn resume_function_progress_wait(
+    engine: &mut Engine,
+    writer: &mut ConfiguredTransactionSession,
+    sql: &str,
+    status: ExecutionStatus,
+) -> ExecutionStatus {
+    let ExecutionStatus::Blocked {
+        completed_statements,
+        output_mark,
+        wait,
+    } = status
+    else {
+        panic!(
+            "function stopped waiting: {status:?}: {}",
+            String::from_utf8_lossy(writer.send.readable())
+        );
+    };
+    assert_eq!(wait, StatementWait::Lock);
+    writer.send.truncate_to(output_mark);
+    writer.arena.recycle_front();
+    crate::mem::guard::forbid_alloc(|| {
+        engine.execute_simple_from(
+            sql,
+            completed_statements,
+            &writer.arena,
+            &mut writer.transaction,
+            &mut writer.pool,
+            &mut writer.cursors,
+            &writer.guc,
+            &mut Responder::new(&mut writer.send),
+            writer.connection_id,
+            false,
+        )
+    })
+    .unwrap()
+}
+
+#[test]
+fn sql_function_statements_keep_writes_child_calls_settings_and_selected_source() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for (rows, atomic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut config =
+                test_config(&format!("sql-function-progress-{mode:?}-{rows}-{atomic}"));
+            config.transaction_mode = mode;
+            config.execution_control_bytes = 64 << 10;
+            config.execution_control_leases = 64;
+            config.row_work_bytes = 128 << 10;
+            config.row_work_leases = 64;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer =
+                ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            writer.success(&mut engine,"SET track_functions='all'; CREATE SEQUENCE sql_numbers; \
+                CREATE TABLE sql_root(id integer); CREATE TABLE sql_audit(stage text,n bigint,note text); \
+                CREATE FUNCTION sql_child(p text,k integer) RETURNS text LANGUAGE plpgsql AS $$ \
+                DECLARE n bigint:=nextval('sql_numbers'); BEGIN INSERT INTO sql_audit VALUES('child',n,p); \
+                PERFORM pg_advisory_xact_lock(k); RETURN p||':'||n::text; END$$",true);
+            let signature = if rows {
+                "RETURNS TABLE(payload text)"
+            } else {
+                "RETURNS text"
+            };
+            let body = format!(
+                "INSERT INTO sql_audit VALUES('prelude',0,p); SELECT sql_child(p,201); \
+                INSERT INTO sql_audit VALUES('middle',0,current_setting('application_name')); \
+                SELECT sql_child(p,202){}",
+                if rows { " UNION ALL SELECT p" } else { "" }
+            );
+            let source = if atomic {
+                format!("BEGIN ATOMIC {body}; END")
+            } else {
+                format!("AS $${body}$$")
+            };
+            writer.success(&mut engine,&format!("CREATE FUNCTION sql_parent(p text) {signature} LANGUAGE SQL \
+                SECURITY DEFINER SET application_name='saved-sql-call' {source}; \
+                CREATE FUNCTION sql_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                DECLARE answer text; BEGIN {}; INSERT INTO sql_audit VALUES('caller',NEW.id,answer); RETURN NEW; END$$; \
+                CREATE TRIGGER sql_trigger AFTER INSERT ON sql_root FOR EACH ROW EXECUTE FUNCTION sql_trigger()",
+                if rows { "SELECT string_agg(payload,',') INTO answer FROM sql_parent(repeat('x',8192))" } else { "SELECT sql_parent(repeat('x',8192)) INTO answer" }),true);
+            holder.success(
+                &mut engine,
+                "BEGIN; SELECT pg_advisory_lock(201),pg_advisory_lock(202)",
+                true,
+            );
+            let sql = "INSERT INTO sql_root VALUES(1) RETURNING id";
+            let mut status = writer.execute_status(&mut engine, sql, true);
+            for (key, issued) in [(201, "1"), (202, "2")] {
+                for release in [false, true] {
+                    assert!(
+                        matches!(status, ExecutionStatus::Blocked { .. }),
+                        "{mode:?} rows={rows} atomic={atomic}: {status:?}: {}",
+                        String::from_utf8_lossy(writer.send.readable())
+                    );
+                    assert_eq!(
+                        data_rows(&holder.success(
+                            &mut engine,
+                            "SELECT 40+2; SELECT last_value FROM sql_numbers",
+                            true
+                        )),
+                        ["42", issued]
+                    );
+                    if release {
+                        if key == 202 {
+                            holder.success(&mut engine,&format!("CREATE OR REPLACE FUNCTION sql_parent(p text) {signature} LANGUAGE SQL SECURITY DEFINER SET application_name='replacement-call' AS $$SELECT 'replacement'$$"),true);
+                        }
+                        holder.success(
+                            &mut engine,
+                            &format!("SELECT pg_advisory_unlock({key})"),
+                            true,
+                        );
+                    }
+                    status = resume_function_progress_wait(&mut engine, &mut writer, sql, status);
+                }
+            }
+            assert_eq!(status, ExecutionStatus::Complete);
+            assert!(
+                error_sqlstates(writer.send.readable()).is_empty(),
+                "{}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            assert_eq!(data_rows(writer.send.readable()), ["1"]);
+            assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
+            holder.success(&mut engine, "COMMIT", true);
+            assert_eq!(data_rows(&writer.success(&mut engine,"SELECT stage,n,length(note) FROM sql_audit ORDER BY stage,n; \
+                SELECT note FROM sql_audit WHERE stage='middle'; SELECT calls FROM pg_stat_user_functions WHERE funcname='sql_parent'",true)),
+                [format!("caller|1|{}",if rows { 16387 } else { 8194 }),"child|1|8192".into(),"child|2|8192".into(),"middle|0|14".into(),"prelude|0|8192".into(),"saved-sql-call".into(),"1".into()]);
+            writer.success(&mut engine, "INSERT INTO sql_root VALUES(2)", true);
+            assert_eq!(data_rows(&writer.success(&mut engine,"SELECT count(*) FROM sql_audit; SELECT last_value FROM sql_numbers; \
+                SELECT calls FROM pg_stat_user_functions WHERE funcname='sql_parent'; SELECT length(note) FROM sql_audit WHERE stage='caller' AND n=2",true)),["6","2","2","11"]);
+            drop((holder, writer, engine));
+            std::fs::remove_dir_all(config.data_dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn sql_final_writes_keep_returned_rows_while_after_triggers_wait() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for rows in [false, true] {
+            let mut config = test_config(&format!("sql-write-result-progress-{mode:?}-{rows}"));
+            config.transaction_mode = mode;
+            config.execution_control_bytes = 64 << 10;
+            config.execution_control_leases = 64;
+            config.row_work_bytes = 128 << 10;
+            config.row_work_leases = 64;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer =
+                ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            writer.success(&mut engine,&format!("CREATE SEQUENCE sql_write_numbers; CREATE TABLE sql_write_root(id integer); \
+                CREATE TABLE sql_write_target(id integer); CREATE TABLE sql_write_audit(stage text,n bigint); \
+                CREATE FUNCTION sql_write_after() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                DECLARE n bigint:=nextval('sql_write_numbers'); found_rows bigint; BEGIN \
+                SELECT count(*) INTO found_rows FROM sql_write_target; \
+                INSERT INTO sql_write_audit VALUES('visible',found_rows); \
+                INSERT INTO sql_write_audit VALUES('after',n); PERFORM pg_advisory_xact_lock(203); RETURN NEW; END$$; \
+                CREATE TRIGGER sql_write_after AFTER INSERT ON sql_write_target FOR EACH ROW EXECUTE FUNCTION sql_write_after(); \
+                CREATE FUNCTION sql_write_parent(p integer) {} LANGUAGE SQL AS $$ \
+                INSERT INTO sql_write_audit VALUES('prelude',nextval('sql_write_numbers')); \
+                INSERT INTO sql_write_target VALUES(p) RETURNING id $$; \
+                CREATE FUNCTION sql_write_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE answer integer; \
+                BEGIN {}; INSERT INTO sql_write_audit VALUES('caller',answer); RETURN NEW; END$$; \
+                CREATE TRIGGER sql_write_trigger AFTER INSERT ON sql_write_root FOR EACH ROW EXECUTE FUNCTION sql_write_trigger()",
+                if rows { "RETURNS TABLE(id integer)" } else { "RETURNS integer" },
+                if rows { "SELECT id INTO answer FROM sql_write_parent(NEW.id)" } else { "SELECT sql_write_parent(NEW.id) INTO answer" }),true);
+            holder.success(&mut engine, "BEGIN; SELECT pg_advisory_lock(203)", true);
+            let sql = "INSERT INTO sql_write_root VALUES(1)";
+            let mut status = writer.execute_status(&mut engine, sql, true);
+            for _ in 0..3 {
+                assert!(
+                    matches!(status, ExecutionStatus::Blocked { .. }),
+                    "{mode:?} rows={rows}: {status:?}: {}",
+                    String::from_utf8_lossy(writer.send.readable())
+                );
+                assert_eq!(
+                    data_rows(&holder.success(
+                        &mut engine,
+                        "SELECT last_value FROM sql_write_numbers",
+                        true
+                    )),
+                    ["2"]
+                );
+                status = resume_function_progress_wait(&mut engine, &mut writer, sql, status);
+            }
+            holder.success(&mut engine, "SELECT pg_advisory_unlock(203)", true);
+            status = resume_function_progress_wait(&mut engine, &mut writer, sql, status);
+            assert_eq!(status, ExecutionStatus::Complete);
+            assert!(
+                error_sqlstates(writer.send.readable()).is_empty(),
+                "{}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            holder.success(&mut engine, "COMMIT", true);
+            assert_eq!(data_rows(&writer.success(&mut engine,"SELECT id FROM sql_write_target; SELECT stage,n FROM sql_write_audit ORDER BY stage; \
+                SELECT last_value FROM sql_write_numbers",true)),["1","after|2","caller|1","prelude|1","visible|1","2"]);
+            writer.success(&mut engine, "INSERT INTO sql_write_root VALUES(2)", true);
+            assert_eq!(data_rows(&writer.success(&mut engine,"SELECT count(*) FROM sql_write_target; SELECT count(*) FROM sql_write_audit; SELECT last_value FROM sql_write_numbers",true)),["2","8","4"]);
+            drop((holder, writer, engine));
+            std::fs::remove_dir_all(config.data_dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn sql_return_checks_resume_after_the_body_without_reissuing_values() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("sql-return-check-progress-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let mut holder =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine,"CREATE SEQUENCE sql_return_numbers; CREATE TABLE sql_return_root(id integer); CREATE TABLE sql_return_audit(stage text,n bigint); \
+            CREATE FUNCTION sql_return_check(n bigint) RETURNS boolean LANGUAGE plpgsql STRICT AS $$ \
+            BEGIN INSERT INTO sql_return_audit VALUES('check',n); PERFORM pg_advisory_xact_lock(204); RETURN n>0; END$$; \
+            CREATE DOMAIN sql_return_domain AS bigint CHECK(sql_return_check(VALUE)); \
+            CREATE FUNCTION sql_return_parent() RETURNS sql_return_domain LANGUAGE SQL AS $$ \
+            INSERT INTO sql_return_audit VALUES('body',1); SELECT nextval('sql_return_numbers') $$; \
+            CREATE FUNCTION sql_return_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
+            DECLARE answer bigint; BEGIN SELECT sql_return_parent() INTO answer; INSERT INTO sql_return_audit VALUES('caller',answer); RETURN NEW; END$$; \
+            CREATE TRIGGER sql_return_trigger AFTER INSERT ON sql_return_root FOR EACH ROW EXECUTE FUNCTION sql_return_trigger()",true);
+        holder.success(&mut engine, "BEGIN; SELECT pg_advisory_lock(204)", true);
+        let sql = "INSERT INTO sql_return_root VALUES(1)";
+        let mut status = writer.execute_status(&mut engine, sql, true);
+        for _ in 0..3 {
+            assert!(
+                matches!(status, ExecutionStatus::Blocked { .. }),
+                "{mode:?}: {status:?}: {}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            assert_eq!(
+                data_rows(&holder.success(
+                    &mut engine,
+                    "SELECT last_value FROM sql_return_numbers",
+                    true
+                )),
+                ["1"]
+            );
+            status = resume_function_progress_wait(&mut engine, &mut writer, sql, status);
+        }
+        holder.success(&mut engine, "SELECT pg_advisory_unlock(204)", true);
+        status = resume_function_progress_wait(&mut engine, &mut writer, sql, status);
+        assert_eq!(status, ExecutionStatus::Complete);
+        assert!(
+            error_sqlstates(writer.send.readable()).is_empty(),
+            "{}",
+            String::from_utf8_lossy(writer.send.readable())
+        );
+        holder.success(&mut engine, "COMMIT", true);
+        assert_eq!(data_rows(&writer.success(&mut engine,"SELECT stage,n FROM sql_return_audit ORDER BY stage; SELECT last_value FROM sql_return_numbers",true)),["body|1","caller|1","check|1","1"]);
+        writer.success(&mut engine, "INSERT INTO sql_return_root VALUES(2)", true);
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT count(*) FROM sql_return_audit; SELECT last_value FROM sql_return_numbers",
+                true
+            )),
+            ["6", "2"]
+        );
+        drop((holder, writer, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
 #[test]
 fn function_bodies_keep_arguments_locals_writes_and_sequences_through_repeated_waits() {
     for mode in [
@@ -638,11 +921,6 @@ fn unowned_expression_waits_roll_back_instead_of_repeating_completed_child_write
                 "plpgsql",
                 "BEGIN RAISE NOTICE '%',expression_child(); RETURN 1; END",
             ),
-            (
-                "sql_body",
-                "sql",
-                "INSERT INTO expression_audit VALUES(-1); SELECT expression_child()",
-            ),
         ] {
             let mut config = test_config(&format!("function-expression-wait-{mode:?}-{site}"));
             config.transaction_mode = mode;
@@ -678,20 +956,13 @@ fn unowned_expression_waits_roll_back_instead_of_repeating_completed_child_write
                 String::from_utf8_lossy(&error)
             );
             assert!(
-                String::from_utf8_lossy(&error).contains(if language == "sql" {
-                    "function wait requires a retained body"
-                } else {
-                    "expression wait requires an owned invocation log"
-                })
+                String::from_utf8_lossy(&error)
+                    .contains("expression wait requires an owned invocation log")
             );
             holder.success(&mut engine, "COMMIT", true);
             assert_eq!(data_rows(&writer.success(&mut engine,"SELECT count(*) FROM expression_root; SELECT count(*) FROM expression_audit; SELECT last_value FROM expression_numbers",true)),["0","0","1"]);
             writer.success(&mut engine, "INSERT INTO expression_root VALUES(2)", true);
-            let expected = if language == "sql" {
-                vec!["2", "-1", "2", "2"]
-            } else {
-                vec!["2", "2", "2"]
-            };
+            let expected = ["2", "2", "2"];
             assert_eq!(data_rows(&writer.success(&mut engine,"SELECT id FROM expression_root; SELECT n FROM expression_audit ORDER BY n; SELECT last_value FROM expression_numbers",true)), expected);
             drop((holder, writer, engine));
             std::fs::remove_dir_all(config.data_dir).unwrap();

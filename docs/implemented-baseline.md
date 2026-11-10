@@ -370,8 +370,11 @@ an explicit limit; use `COPY (SELECT ...)`.
 State-changing functions and commands use a separate synchronous block client
 when restarting their call stack could repeat effects. They can still block
 the SQL CPU worker on an uncached read. Retained AFTER work and its owned
-procedural queries can preserve an unfinished PL/pgSQL scalar or table-function
-body across a lock wait, without repeating completed writes or sequence calls.
+procedural queries can preserve unfinished PL/pgSQL and SQL-language scalar or
+table-function calls across lock waits. SQL functions keep their completed body
+statements, returned rows waiting for AFTER triggers, and unfinished return
+checks. For example, a completed audit INSERT runs once even when the function's
+following SELECT waits repeatedly for a lock.
 Other function/query paths and storage waits still need the remaining work in
 [PLAN.md](../PLAN.md). Eligible pure reads retain completed
 columns and navigation across asynchronous waits. Sequence calls retain their

@@ -418,11 +418,17 @@ expressions.
 Outside an owned query, the command's effect journal must approve restarting
 an unfinished call. Checked inputs, caught input errors and issued sequence
 values keep their original receipts; a command with unrecorded effects returns
-`0A000` instead of repeating them. SQL-language bodies and other expression
-positions still need retained progress. A SQL-language call inside retained
-work returns `0A000`, `function wait requires a retained body`, if it would lose
-its unfinished body on a wait. Storage waits remain synchronous on protected
-paths until that work is complete.
+`0A000` instead of repeating them. SQL-language scalar and table functions keep
+their current statement and unfinished calls, including string and `BEGIN ATOMIC`
+bodies. A completed audit INSERT is not repeated when a later SELECT waits.
+Returned rows survive waits in nested AFTER triggers. Scalar SELECT returns only
+its first row; final data modifications complete all their writes. Table output
+checks run before later row effects, and a scalar query's completed result stays
+owned while its return check waits.
+Write-row phases without a saved continuation still return `0A000`,
+`SQL row expression requires retained write progress`, if a callback would require
+restarting a changed row or other unowned effect. Protected storage waits remain
+synchronous until those enclosing phases have complete ownership.
 Cancellation and capacity errors roll back SQL writes; sequence numbers already
 issued remain consumed, as in PostgreSQL.
 

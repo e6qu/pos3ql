@@ -14,8 +14,7 @@ fn saved_rows_keep_prefix_after_errors_and_overwrite_unpublished_bytes() {
                 ctype: ColType::Int4,
                 user_type: None,
             }),
-            bytes: pool.lease(0).unwrap(),
-            ends: pool.lease(0).unwrap(),
+            rows: SavedRows::new(&pool).unwrap(),
         };
         result.append(&[Datum::Int4(1)], &scratch).unwrap();
         assert_eq!(scratch.used(), 0);
@@ -25,7 +24,7 @@ fn saved_rows_keep_prefix_after_errors_and_overwrite_unpublished_bytes() {
         assert_eq!(error.sqlstate, "22P02");
         assert_eq!(scratch.used(), 0);
         // A cancelled writer can have initialized, but not published, bytes.
-        result.bytes.extend_from_slice(&[0xde; 32]).unwrap();
+        result.rows.bytes.extend_from_slice(&[0xde; 32]).unwrap();
         result.append(&[Datum::Int4(9)], &scratch).unwrap();
         let rows = result.rows(&output).unwrap();
         assert_eq!(rows.len(), 2);
@@ -54,8 +53,7 @@ fn set_result_exhaustion_preserves_rows_and_admits_a_later_small_append() {
     crate::mem::guard::forbid_alloc(|| {
         let mut result = PlpgsqlSetResult {
             contract: Contract::Scalar(crate::storage::RoutineResult::TEXT),
-            bytes: pool.lease(0).unwrap(),
-            ends: pool.lease(0).unwrap(),
+            rows: SavedRows::new(&pool).unwrap(),
         };
         result.append(&[Datum::Text("first")], &scratch).unwrap();
         let error = result.append(&[Datum::Text(

@@ -1093,14 +1093,71 @@ fn routine_replays_never_repeat_or_panic_after_rows_reach_the_client() {
         "CREATE TABLE audit(v int); CREATE FUNCTION audit_row(v int) RETURNS int \
          LANGUAGE sql VOLATILE AS 'INSERT INTO audit VALUES ($1) RETURNING $1'",
     );
-    // A first call after rows already left cannot replay the statement:
-    // it fails loudly instead of repeating rows.
+    let count = |conn: &mut Conn, engine: &mut Engine, client: &mut TcpStream| {
+        let response = run(conn, engine, client, "SELECT count(*) FROM audit");
+        messages(&response)
+            .iter()
+            .find(|message| message.0 == b'D')
+            .map(|message| first_text(message.1).to_string())
+            .unwrap()
+    };
+    // Function-source rows hand each routine call off on its own row, so
+    // calls from row 1 onward never restart the statement: no row repeats
+    // and the work stays linear in the row count.
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "SELECT g, repeat('x', 200), CASE WHEN g <= 300 THEN audit_row(g) END \
+         FROM generate_series(1, 5000) g",
+    );
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert_eq!(&kinds[kinds.len() - 2..], b"CZ");
+    let rows: Vec<_> = response
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .collect();
+    assert_rows(&rows, 5000);
+    assert_eq!(count(&mut conn, &mut fixture.engine, &mut client), "300");
+    // A call after rows already reached the client is equally safe there.
     let response = run(
         &mut conn,
         &mut fixture.engine,
         &mut client,
         "SELECT g, repeat('x', 200), CASE WHEN g = 4000 THEN audit_row(g) END \
          FROM generate_series(1, 5000) g",
+    );
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert_eq!(&kinds[kinds.len() - 2..], b"CZ");
+    assert_eq!(count(&mut conn, &mut fixture.engine, &mut client), "301");
+    // A join still restarts the statement for a routine's first call. Before
+    // any row leaves, the restart completes without repeating rows.
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "SELECT g, repeat('x', 200), CASE WHEN g = 1 THEN audit_row(g) END \
+         FROM generate_series(1, 5000) g CROSS JOIN (VALUES (1)) v",
+    );
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert_eq!(&kinds[kinds.len() - 2..], b"CZ");
+    let rows: Vec<_> = response
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .collect();
+    assert_rows(&rows, 5000);
+    assert_eq!(count(&mut conn, &mut fixture.engine, &mut client), "302");
+    // After rows already left it cannot restart: it fails loudly instead of
+    // repeating rows, and its call rolls back.
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "SELECT g, repeat('x', 200), CASE WHEN g = 4000 THEN audit_row(g) END \
+         FROM generate_series(1, 5000) g CROSS JOIN (VALUES (1)) v",
     );
     let response = messages(&response);
     let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
@@ -1111,15 +1168,5 @@ fn routine_replays_never_repeat_or_panic_after_rows_reach_the_client() {
         .filter(|message| message.0 == b'D')
         .collect();
     assert_rows(&rows, rows.len());
-    let response = run(
-        &mut conn,
-        &mut fixture.engine,
-        &mut client,
-        "SELECT count(*) FROM audit",
-    );
-    assert!(
-        messages(&response)
-            .iter()
-            .any(|message| message.0 == b'D' && first_text(message.1) == "0")
-    );
+    assert_eq!(count(&mut conn, &mut fixture.engine, &mut client), "302");
 }

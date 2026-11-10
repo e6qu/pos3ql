@@ -962,6 +962,47 @@ fn literal_source_scrollable(tree: &crate::sql::ast::SetTree<'_>) -> bool {
 }
 
 impl<'a> RetainedSelect<'a> {
+    /// PostgreSQL evaluates a function scan's arguments when execution
+    /// starts. They are constants, kept in the reader's own memory.
+    fn start_generator(
+        &mut self,
+        storage: &Storage,
+        txid: u32,
+        state_arena: &'a Arena,
+        params: &[Datum<'a>],
+    ) -> Result<(), SqlError> {
+        let RetainedSource::Generated {
+            function,
+            kind,
+            generator: generator @ None,
+        } = &mut self.source
+        else {
+            return Ok(());
+        };
+        let args = function.func_args.expect("retained function arguments");
+        let catalog = storage_catalog(storage, state_arena, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..super::super::eval::NO_HOOKS
+        };
+        let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (value, argument) in values.iter_mut().zip(args) {
+            *value = eval_full(
+                argument,
+                state_arena,
+                params,
+                &super::super::eval::NoColumns,
+                &hooks,
+            )?;
+        }
+        *generator = Some(super::generator::RowGenerator::start(
+            *kind,
+            &values[..args.len()],
+            state_arena,
+        )?);
+        Ok(())
+    }
+
     pub(crate) fn default_scrollable(&self) -> bool {
         matches!(
             self.source,
@@ -1125,15 +1166,19 @@ impl<'a> RetainedSelect<'a> {
             responder,
             RetainedMode::Statement,
         )?;
-        // SAFETY: only a physical local table without derived sources, policies,
-        // inheritance or joins reaches this point. Scope arrays, names and ASTs
-        // borrow the supplied arena/statement; definition images and row roots
-        // have owned leases. No retained field borrows Storage. Its conservative
-        // schema-resolution lifetime can therefore be extended to the arena.
-        Ok(
-            reader
-                .map(|reader| unsafe { core::mem::transmute::<RetainedSelect<'_>, Self>(reader) }),
-        )
+        // SAFETY: only one physical local table without policies, inheritance
+        // or joins, a literal VALUES list, or a builtin function source reaches
+        // this point. Scope arrays, names, ASTs, literal rows and generator
+        // state borrow the supplied arena/statement; definition images and row
+        // roots have owned leases. No retained field borrows Storage. Its
+        // conservative schema-resolution lifetime can therefore be extended to
+        // the arena.
+        let mut reader = reader
+            .map(|reader| unsafe { core::mem::transmute::<RetainedSelect<'_>, Self>(reader) });
+        if let Some(reader) = reader.as_mut() {
+            reader.start_generator(storage, txid, arena, params)?;
+        }
+        Ok(reader)
     }
 
     fn open_mode(
@@ -1146,22 +1191,16 @@ impl<'a> RetainedSelect<'a> {
         mode: RetainedMode,
     ) -> Result<Option<Self>, SqlError> {
         let from = statement.from.as_ref();
-        let literal_count = (mode == RetainedMode::Cursor)
-            .then(|| {
-                from.and_then(|from| from.base.subquery)
-                    .and_then(literal_source)
-            })
-            .flatten();
+        let literal_count = from
+            .and_then(|from| from.base.subquery)
+            .and_then(literal_source);
         let literals = literal_count.is_some();
         if from.is_none() && mode == RetainedMode::Statement {
             return Ok(None);
         }
-        let generated = (mode == RetainedMode::Cursor)
-            .then(|| {
-                from.filter(|from| from.joins.is_empty() && from.base.is_function_source())
-                    .and_then(|from| retained_function_source(&from.base, storage, txid, arena))
-            })
-            .flatten();
+        let generated = from
+            .filter(|from| from.joins.is_empty() && from.base.is_function_source())
+            .and_then(|from| retained_function_source(&from.base, storage, txid, arena));
         if from.is_some_and(|from| {
             !from.joins.is_empty()
                 || from.base.is_function_source() && generated.is_none()
@@ -1785,36 +1824,7 @@ impl<'a> RetainedSelect<'a> {
     where
         'a: 'work,
     {
-        if let RetainedSource::Generated {
-            function,
-            kind,
-            generator: generator @ None,
-        } = &mut self.source
-        {
-            // PostgreSQL evaluates a function scan's arguments when execution
-            // starts. They are constants, kept in the cursor's own memory.
-            let args = function.func_args.expect("retained function arguments");
-            let catalog = storage_catalog(storage, state_arena, txid);
-            let hooks = EvalHooks {
-                catalog: Some(&catalog),
-                ..super::super::eval::NO_HOOKS
-            };
-            let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-            for (value, argument) in values.iter_mut().zip(args) {
-                *value = eval_full(
-                    argument,
-                    state_arena,
-                    params,
-                    &super::super::eval::NoColumns,
-                    &hooks,
-                )?;
-            }
-            *generator = Some(super::generator::RowGenerator::start(
-                *kind,
-                &values[..args.len()],
-                state_arena,
-            )?);
-        }
+        self.start_generator(storage, txid, state_arena, params)?;
         if let RowBounds::Unstarted { limit, offset } = self.bounds {
             self.bounds = RowBounds::Active {
                 skip: super::super::exec::eval_offset_pub(

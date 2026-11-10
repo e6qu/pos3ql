@@ -295,7 +295,9 @@ PL/pgSQL `CALL`, written directly or run with `EXECUTE`, fails with `0A000`
 (`CALL is not supported in PL/pgSQL`); supporting it needs output parameters
 assigned to the caller's variables, PostgreSQL's transaction-control rules for
 the calling chain, and a saved call position so the called procedure can pause
-and resume like other nested routines. The
+and resume like other nested routines. A table's or view's row type cannot
+appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
+where PostgreSQL accepts it. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

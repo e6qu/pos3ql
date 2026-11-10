@@ -2223,7 +2223,18 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                // PostgreSQL's deprecated text overloads name the view the
+                // way `regclass` input does.
+                let view = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Text(name) => super::super::regobject_cast(
+                        Datum::Text(name),
+                        ColType::Regclass,
+                        hooks.catalog,
+                        arena,
+                    )?,
+                    value => value,
+                };
+                let oid = match CatalogOid::parse(view)? {
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };

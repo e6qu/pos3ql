@@ -31927,6 +31927,14 @@ pub(crate) fn resolve_routine_type(
             },
             identity,
         )
+    } else if relation_row_type_exists(storage, txid, base) {
+        // PostgreSQL accepts a table's or view's row type here; routine
+        // signatures store only declared types, domains, enums and composites.
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "relation row type \"{}\" cannot be used as a routine argument or result type",
+            written
+        ));
     } else {
         return Err(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -31940,6 +31948,24 @@ pub(crate) fn resolve_routine_type(
         txid,
     )?;
     storage.bind_routine_result(result, txid)
+}
+
+/// Whether `written` names a table or view whose row type would resolve here.
+fn relation_row_type_exists(storage: &Storage, txid: u32, written: &str) -> bool {
+    let visible = |schema: &str, name: &str| {
+        storage.find_visible(schema, name, txid).is_some()
+            || storage.find_view(schema, name, txid).is_some()
+    };
+    match written.split_once('.') {
+        Some((schema, name)) => visible(schema, name),
+        None => storage.path().entries().iter().any(|entry| match entry {
+            crate::storage::PathEntry::Schema(slot) => visible(
+                storage.schema_def_for(*slot as usize, txid).name.as_str(),
+                written,
+            ),
+            _ => false,
+        }),
+    }
 }
 
 fn qualified_catalog_name(name: crate::sql::ast::QualName<'_>) -> crate::util::StackStr<130> {

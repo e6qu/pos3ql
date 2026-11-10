@@ -485,8 +485,9 @@ fn sql_final_writes_keep_returned_rows_while_after_triggers_wait() {
             assert_eq!(status, ExecutionStatus::Complete);
             assert!(
                 error_sqlstates(writer.send.readable()).is_empty(),
-                "{}",
-                String::from_utf8_lossy(writer.send.readable())
+                "{}; sequence replay error: {:?}",
+                String::from_utf8_lossy(writer.send.readable()),
+                sequence::take_replay_error_diagnostic(),
             );
             holder.success(&mut engine, "COMMIT", true);
             assert_eq!(data_rows(&writer.success(&mut engine,"SELECT id FROM sql_write_target; SELECT stage,n FROM sql_write_audit ORDER BY stage; \
@@ -550,8 +551,9 @@ fn sql_return_checks_resume_after_the_body_without_reissuing_values() {
         assert_eq!(status, ExecutionStatus::Complete);
         assert!(
             error_sqlstates(writer.send.readable()).is_empty(),
-            "{}",
-            String::from_utf8_lossy(writer.send.readable())
+            "{}; sequence replay error: {:?}",
+            String::from_utf8_lossy(writer.send.readable()),
+            sequence::take_replay_error_diagnostic(),
         );
         holder.success(&mut engine, "COMMIT", true);
         assert_eq!(data_rows(&writer.success(&mut engine,"SELECT stage,n FROM sql_return_audit ORDER BY stage; SELECT last_value FROM sql_return_numbers",true)),["body|1","caller|1","check|1","1"]);

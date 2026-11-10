@@ -53,3 +53,26 @@ jobs:
         env:
           RUSTFLAGS: -Dwarnings
         run: cargo clippy --locked --all-targets --keep-going --jobs 1 -- -Dwarnings
+
+  function-progress-diagnostic:
+    name: SQL wait diagnostics
+    needs: compile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      RUST_BACKTRACE: "1"
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-source-check-dependencies-${{ hashFiles('Cargo.lock') }}
+      - name: Diagnose retained SQL function phases
+        run: cargo test --locked --lib --profile native-ci --jobs 1 sql::tests::function_progress::sql_ -- --test-threads=1 --nocapture

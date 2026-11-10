@@ -195,12 +195,13 @@ impl StatementSequenceScope<'_, '_> {
         }
         let replay = session.statement_replay.get();
         let complete = replay.next.is_none() && replay.effects_next.is_none();
-        finish_statement(session);
-        if complete {
+        let result = if complete {
             Ok(())
         } else {
             Err(replay_changed())
-        }
+        };
+        finish_statement(session);
+        result
     }
 
     pub(super) fn discard(&self, session: &SeqSession) {
@@ -263,7 +264,35 @@ pub(crate) fn finish_statement(session: &SeqSession) {
     session.statement_replay.set(StatementSequenceReplay::EMPTY);
 }
 
+#[cfg(test)]
+type ReplayErrorDiagnostic = (
+    &'static core::panic::Location<'static>,
+    Option<(bool, bool)>,
+);
+
+#[cfg(test)]
+thread_local! {
+    static LAST_REPLAY_ERROR: Cell<Option<ReplayErrorDiagnostic>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_replay_error_diagnostic() -> Option<ReplayErrorDiagnostic> {
+    LAST_REPLAY_ERROR.with(Cell::take)
+}
+
+#[cfg_attr(test, track_caller)]
 fn replay_changed() -> SqlError {
+    #[cfg(test)]
+    {
+        let caller = core::panic::Location::caller();
+        let pending = with_statement_context(|context| {
+            context.map(|(_, session)| {
+                let replay = session.statement_replay.get();
+                (replay.next.is_some(), replay.effects_next.is_some())
+            })
+        });
+        LAST_REPLAY_ERROR.with(|location| location.set(Some((caller, pending))));
+    }
     sql_err!(
         sqlstate::SERIALIZATION_FAILURE,
         "sequence source or call order changed while resuming the statement"

@@ -18373,6 +18373,7 @@ impl ConfiguredTransactionSession {
 
     fn execute(&mut self, engine: &mut Engine, sql: &str, fixed_memory: bool) -> Vec<u8> {
         let _ = query::take_arena_full_location();
+        let _ = sequence::take_replay_error_diagnostic();
         let _ = crate::mem::arena::take_last_allocation_failure();
         let status = self.execute_status(engine, sql, fixed_memory);
         assert_eq!(status, ExecutionStatus::Complete, "{sql}");
@@ -18383,10 +18384,11 @@ impl ConfiguredTransactionSession {
         let output = self.execute(engine, sql, fixed_memory);
         assert!(
             !String::from_utf8_lossy(&output).contains("ERROR"),
-            "{sql}: {}; last query allocation error: {:?}; (arena failure, region active): {:?}",
+            "{sql}: {}; last query allocation error: {:?}; (arena failure, region active): {:?}; sequence replay error: {:?}",
             String::from_utf8_lossy(&output),
             query::take_arena_full_location(),
             crate::mem::arena::take_last_allocation_failure(),
+            sequence::take_replay_error_diagnostic(),
         );
         output
     }
@@ -44077,7 +44079,7 @@ fn data_modifying_routine_result_resumes_nested_mutable_scalar_routine() {
 }
 
 #[test]
-fn data_modifying_table_routine_result_resumes_nested_mutable_scalar_routine() {
+fn table_routine_returns_results_after_completed_nested_writes() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
@@ -44087,7 +44089,8 @@ fn data_modifying_table_routine_result_resumes_nested_mutable_scalar_routine() {
          CREATE FUNCTION bump_table_dml_nested(target integer) RETURNS integer LANGUAGE SQL \
            AS 'UPDATE routine_table_dml_nested SET value = value + 1 WHERE id = $1 RETURNING value'; \
          CREATE FUNCTION rows_table_dml_nested() RETURNS SETOF integer LANGUAGE SQL \
-           AS 'UPDATE routine_table_dml_nested SET value = bump_table_dml_nested(id) RETURNING value'",
+           AS 'SELECT bump_table_dml_nested(1); SELECT bump_table_dml_nested(2); \
+               SELECT value FROM routine_table_dml_nested ORDER BY id'",
     );
     let output = run_with(
         &mut engine,
@@ -44183,8 +44186,10 @@ fn nested_sql_writes_reject_unowned_row_restarts_without_partial_changes() {
              CREATE FUNCTION update_retry_rows() RETURNS SETOF integer LANGUAGE SQL AS $$ \
                 UPDATE routine_retry_rows SET value=CASE WHEN id=2 THEN bump_retry_row(id) ELSE value+10 END RETURNING value $$; \
              CREATE FUNCTION observe_retry_rows() RETURNS SETOF integer LANGUAGE SQL AS $$ \
-                UPDATE routine_retry_rows SET value=CASE WHEN id=2 THEN read_retry_row(1) ELSE value+10 END RETURNING value $$", true);
-        for name in ["update_retry_rows", "observe_retry_rows"] {
+                UPDATE routine_retry_rows SET value=CASE WHEN id=2 THEN read_retry_row(1) ELSE value+10 END RETURNING value $$; \
+             CREATE FUNCTION all_retry_rows() RETURNS SETOF integer LANGUAGE SQL AS $$ \
+                UPDATE routine_retry_rows SET value=bump_retry_row(id) RETURNING value $$", true);
+        for name in ["update_retry_rows", "observe_retry_rows", "all_retry_rows"] {
             let output = session.execute(
                 &mut engine,
                 &format!("BEGIN; SELECT value FROM {name}() AS result(value) ORDER BY value"),

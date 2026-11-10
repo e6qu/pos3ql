@@ -2544,3 +2544,110 @@ fn cursor_motion_counts_match_postgresql_integer_grammar() {
     assert_eq!(rows, ["1", "2", "1", "2", "3", "3", "2", "1"]);
     assert_eq!(errors, ["42601"; 5]);
 }
+
+#[test]
+fn function_source_cursors_generate_rows_as_fetch_reaches_them() {
+    let config = test_config("function-source-cursor-generators");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE calls; BEGIN; \
+         DECLARE lazy NO SCROLL CURSOR FOR SELECT nextval('calls') FROM generate_series(1,3)",
+        true,
+    );
+    // PostgreSQL evaluates the projection per FETCH, not at DECLARE.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT last_value,is_called FROM calls; FETCH 0 FROM lazy; \
+             SELECT last_value,is_called FROM calls; FETCH NEXT FROM lazy; \
+             SELECT last_value,is_called FROM calls; FETCH NEXT FROM lazy; CLOSE lazy; \
+             SELECT last_value,is_called FROM calls; COMMIT",
+            true
+        )),
+        ["1|f", "1|f", "1", "1|t", "2", "2|t"]
+    );
+    // A row-dependent error surfaces on the FETCH that reaches it.
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE later_error NO SCROLL CURSOR FOR \
+         SELECT 1/(g-2) FROM generate_series(1,3) AS g",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM later_error", true)),
+        ["-1"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM later_error", true)),
+        ["22012"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+    // Each supported overload keeps only its next value: bounds of bigint,
+    // numeric and timestamp steps, and array elements.
+    for (source, expected) in [
+        (
+            "generate_series(9223372036854775806, 9223372036854775807)",
+            &["9223372036854775806", "9223372036854775807"][..],
+        ),
+        ("generate_series(1.5, 2.5, 0.5)", &["1.5", "2.0", "2.5"][..]),
+        (
+            "generate_series(timestamp '2024-01-31', timestamp '2024-03-31', interval '1 month')",
+            &[
+                "2024-01-31 00:00:00",
+                "2024-02-29 00:00:00",
+                "2024-03-29 00:00:00",
+            ][..],
+        ),
+        ("unnest(ARRAY['a','b',NULL])", &["a", "b", "NULL"][..]),
+        ("generate_series(3, 1)", &[][..]),
+    ] {
+        let rows = data_rows(&session.success(
+            &mut engine,
+            &format!(
+                "BEGIN; DECLARE generated NO SCROLL CURSOR FOR SELECT * FROM {source} AS v; \
+                 FETCH ALL FROM generated; CLOSE generated; COMMIT"
+            ),
+            true,
+        ));
+        assert_eq!(rows, expected, "{source}");
+    }
+    // A zero step is reported by the first fetch, as PostgreSQL starts the
+    // function scan there.
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE zero NO SCROLL CURSOR FOR SELECT * FROM generate_series(1, 3, 0)",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM zero", true)),
+        ["22023"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+    // Function scans read backward, so a default cursor is scrollable.
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE automatic CURSOR FOR SELECT * FROM generate_series(1,2)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT is_scrollable FROM pg_cursors WHERE name='automatic'; CLOSE automatic; COMMIT",
+            true
+        )),
+        ["t"]
+    );
+    // The materialized path shares the series arithmetic, including at the
+    // bigint bound where the next value would overflow.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM generate_series(9223372036854775806, 9223372036854775807)",
+            true
+        )),
+        ["2"]
+    );
+}

@@ -212,8 +212,10 @@ change the cursor. Dynamic SQL sees only the explicit `USING` arguments.
 
 ### Cursors that read as you fetch
 
-A cursor over one table, or over constant `VALUES` rows, reads input only as
-rows are fetched when its query uses only columns, constants, parameters,
+A cursor over one table, over constant `VALUES` rows, or over
+`generate_series` (integer, bigint, numeric or timestamp) or a one-array
+`unnest` with constant arguments, reads input only as rows are fetched when
+its query uses only columns, constants, parameters,
 built-in operators and casts, boolean logic, `CASE`, `BETWEEN`, null tests,
 array construction, subscripts, slices, scalar function calls, `LIMIT` and
 `OFFSET`. Other cursor queries, including those with ordering, user-defined
@@ -231,7 +233,12 @@ FETCH 2 FROM c;  -- reads two rows
 - `SELECT 100/id FROM orders WHERE id<>0` divides only fetched rows.
   `CASE WHEN id<>0 THEN 100/id END` evaluates only the chosen branch.
 - `DECLARE c NO SCROLL CURSOR FOR SELECT nextval('order_numbers')` issues no
-  number until the first nonzero fetch.
+  number until the first nonzero fetch; the same holds for
+  `SELECT nextval('order_numbers') FROM generate_series(1, 3)`. A series keeps
+  only its next value, so `generate_series(1, 70000)` costs no row memory
+  until rows are fetched, and its arguments (a zero step, for example) are
+  checked by the first fetch, as in PostgreSQL. Other functions in `FROM`
+  still run when the cursor is declared.
 - Type errors and constant errors such as `1/0` are reported at `DECLARE`, even
   for empty input. Operator choices are fixed then; later `search_path` changes
   do not affect the open cursor.
@@ -248,8 +255,8 @@ FETCH 2 FROM c;  -- reads two rows
 `SCROLL` cursors save visited rows so `FETCH PRIOR` and jumps backward need no
 new reads; `FETCH LAST` reads the rest. Their history must fit `cursor_bytes`;
 exhaustion returns `54000` and leaves the cursor failed until closed. Without a
-scroll option, a table scan and a list of two or more `VALUES` rows allow
-scrolling; one row, `UNION ALL` and a provably empty result are forward-only. `pg_cursors.is_scrollable`
+scroll option, a table scan, a retained set-returning function and a list of
+two or more `VALUES` rows allow scrolling; one row, `UNION ALL` and a provably empty result are forward-only. `pg_cursors.is_scrollable`
 reports the choice made at declaration.
 
 `WITH HOLD` saves the unread rows at commit, including when declared outside

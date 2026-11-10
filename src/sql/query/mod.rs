@@ -39,6 +39,7 @@ mod setops;
 pub use setops::set_query;
 pub(crate) use setops::set_query_into_rows;
 
+pub(crate) mod generator;
 mod materialize;
 pub(crate) use materialize::ScopeSchema;
 use materialize::{external_materialized_into, materialized_rows, materialized_select};

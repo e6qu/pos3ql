@@ -8345,7 +8345,7 @@ impl SeriesKind {
 
 /// Whether a `generate_series` interval step advances toward larger timestamps.
 /// Uses PostgreSQL's canonical interval ordering (30-day months, 24-hour days).
-fn interval_is_positive(step: super::types::Interval) -> bool {
+pub(crate) fn interval_is_positive(step: super::types::Interval) -> bool {
     let canonical = step.months as i128 * 2_592_000_000_000
         + step.days as i128 * 86_400_000_000
         + step.micros as i128;

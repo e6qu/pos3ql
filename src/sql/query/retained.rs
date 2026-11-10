@@ -38,6 +38,13 @@ enum RetainedSource<'a> {
     Singleton {
         available: bool,
     },
+    /// A builtin set-returning function advanced one row at a time. Its
+    /// constant arguments are evaluated when fetching starts.
+    Generated {
+        function: &'a TableRef<'a>,
+        kind: super::generator::GeneratorKind,
+        generator: Option<super::generator::RowGenerator<'a>>,
+    },
 }
 
 impl RetainedSource<'_> {
@@ -46,6 +53,9 @@ impl RetainedSource<'_> {
             Self::Physical(cursor) => cursor.close(),
             Self::Literals { rows, next, .. } => *next = rows.len(),
             Self::Singleton { available } => *available = false,
+            Self::Generated { generator, .. } => {
+                *generator = Some(super::generator::RowGenerator::Elements(None));
+            }
         }
     }
 }
@@ -862,6 +872,66 @@ fn literal_source(select: &Select<'_>) -> Option<usize> {
         .then_some(1)
 }
 
+/// Arguments a cursor evaluates once when fetching starts: literals,
+/// parameters and casts of them. Calls, column references and subqueries are
+/// excluded.
+fn constant_function_argument(expression: &Expr<'_>) -> bool {
+    match expression {
+        Expr::Param(_)
+        | Expr::RoutineParam { .. }
+        | Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_)
+        | Expr::BoundLiteral { .. }
+        | Expr::BitLit(_) => true,
+        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } => {
+            constant_function_argument(operand)
+        }
+        Expr::Array(items) => items.iter().all(|item| constant_function_argument(item)),
+        _ => false,
+    }
+}
+
+/// A table function a cursor can advance from fixed generator state: a
+/// non-volatile builtin with a generator implementation and constant
+/// arguments, alone in FROM. Other function sources run when declared.
+fn retained_function_source(
+    tref: &TableRef<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Option<super::generator::GeneratorKind> {
+    let args = tref.func_args?;
+    if tref.rows_from.is_some()
+        || tref.lateral
+        || tref.with_ordinality
+        || super::srf::sql_table_constructor(tref)
+        || !args
+            .iter()
+            .all(|argument| constant_function_argument(argument))
+    {
+        return None;
+    }
+    let (selection, _) = super::srf::select_table_func_routine(
+        tref,
+        storage,
+        txid,
+        arena,
+        &super::super::eval::NoColumns,
+        None,
+    )
+    .ok()?;
+    let crate::storage::RoutineCallSelection::Builtin { oid, .. } = selection else {
+        return None;
+    };
+    crate::sql::catalog::builtin_callable_by_oid(oid)
+        .filter(|signature| signature.catalog.volatility != "v")?;
+    super::generator::GeneratorKind::for_builtin(oid, args.len())
+}
+
 fn literal_source_tree(tree: &crate::sql::ast::SetTree<'_>) -> Option<usize> {
     match tree {
         crate::sql::ast::SetTree::Select(select) => literal_source(select),
@@ -896,6 +966,7 @@ impl<'a> RetainedSelect<'a> {
         matches!(
             self.source,
             RetainedSource::Physical(_)
+                | RetainedSource::Generated { .. }
                 | RetainedSource::Literals {
                     scrollable: true,
                     ..
@@ -1085,9 +1156,15 @@ impl<'a> RetainedSelect<'a> {
         if from.is_none() && mode == RetainedMode::Statement {
             return Ok(None);
         }
+        let generated = (mode == RetainedMode::Cursor)
+            .then(|| {
+                from.filter(|from| from.joins.is_empty() && from.base.is_function_source())
+                    .and_then(|from| retained_function_source(&from.base, storage, txid, arena))
+            })
+            .flatten();
         if from.is_some_and(|from| {
             !from.joins.is_empty()
-                || from.base.is_function_source()
+                || from.base.is_function_source() && generated.is_none()
                 || from.base.subquery.is_some() && !literals
                 || from.base.cte.is_some()
                 || from.base.sample.is_some()
@@ -1166,7 +1243,9 @@ impl<'a> RetainedSelect<'a> {
                     scope.derived[0] = Some(rows);
                 }
                 if scope.n != 1
-                    || !literals && (scope.derived[0].is_some() || scope.slots[0] == usize::MAX)
+                    || !literals
+                        && generated.is_none()
+                        && (scope.derived[0].is_some() || scope.slots[0] == usize::MAX)
                 {
                     return Ok(None);
                 }
@@ -1225,7 +1304,7 @@ impl<'a> RetainedSelect<'a> {
             }
         }
         let binding_columns = Some(&columns);
-        let table = if let Some(from) = from.filter(|_| !literals) {
+        let table = if let Some(from) = from.filter(|_| !literals && generated.is_none()) {
             let table = scope.slots[0];
             let definition = scope.defs.stored(0).expect("resolved physical source");
             if definition.kind != crate::storage::TableKind::Local
@@ -1399,6 +1478,12 @@ impl<'a> RetainedSelect<'a> {
                 source.open(storage, table, txid, arena)?;
             }
             RetainedSource::Physical(source)
+        } else if let (Some(kind), Some(from)) = (generated, from) {
+            RetainedSource::Generated {
+                function: &from.base,
+                kind,
+                generator: eliminated.then_some(super::generator::RowGenerator::Elements(None)),
+            }
         } else if literals {
             let rows = scope.derived[0].expect("literal derived source owns encoded rows");
             let scrollable = from
@@ -1504,6 +1589,18 @@ impl<'a> RetainedSelect<'a> {
                     }
                     Ok(row.map(RetainedRow::Literal))
                 }
+                RetainedSource::Generated { generator, .. } => generator
+                    .as_mut()
+                    .expect("generator starts with the cursor's first fetch")
+                    .next(state_arena)
+                    .and_then(|value| {
+                        value
+                            .map(|value| {
+                                crate::sql::exec::encode_projected_pub(&[value], state_arena)
+                                    .map(RetainedRow::Literal)
+                            })
+                            .transpose()
+                    }),
             };
             let row = match next {
                 Ok(row) => row,
@@ -1683,8 +1780,41 @@ impl<'a> RetainedSelect<'a> {
         state_arena: &'a Arena,
         buffers: &mut RowCursorBuffers,
         work: &'work Arena,
-        params: &[Datum<'work>],
-    ) -> Result<bool, SqlError> {
+        params: &[Datum<'a>],
+    ) -> Result<bool, SqlError>
+    where
+        'a: 'work,
+    {
+        if let RetainedSource::Generated {
+            function,
+            kind,
+            generator: generator @ None,
+        } = &mut self.source
+        {
+            // PostgreSQL evaluates a function scan's arguments when execution
+            // starts. They are constants, kept in the cursor's own memory.
+            let args = function.func_args.expect("retained function arguments");
+            let catalog = storage_catalog(storage, state_arena, txid);
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..super::super::eval::NO_HOOKS
+            };
+            let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            for (value, argument) in values.iter_mut().zip(args) {
+                *value = eval_full(
+                    argument,
+                    state_arena,
+                    params,
+                    &super::super::eval::NoColumns,
+                    &hooks,
+                )?;
+            }
+            *generator = Some(super::generator::RowGenerator::start(
+                *kind,
+                &values[..args.len()],
+                state_arena,
+            )?);
+        }
         if let RowBounds::Unstarted { limit, offset } = self.bounds {
             self.bounds = RowBounds::Active {
                 skip: super::super::exec::eval_offset_pub(

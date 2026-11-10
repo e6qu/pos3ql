@@ -6239,39 +6239,19 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         } else {
             1
         };
-        if step == 0 {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "step size cannot equal zero"
-            ));
-        }
-        let count = if step > 0 {
-            if stop < start {
-                0
-            } else {
-                ((stop - start) / step) as usize + 1
-            }
-        } else if stop > start {
-            0
-        } else {
-            ((start - stop) / (-step)) as usize + 1
-        };
+        let wide = matches!(start_val, Datum::Int8(_))
+            || matches!(stop_raw, Datum::Int8(_))
+            || matches!(step_raw, Datum::Int8(_));
+        let mut series = super::generator::RowGenerator::integer(start, stop, step, wide)?;
+        let count = usize::try_from(series.known_remaining().expect("integer series count"))
+            .map_err(|_| arena_full())?;
         const EMPTY: &[u8] = &[];
         let rows = arena
             .alloc_slice_with(count, |_| EMPTY)
             .map_err(|_| arena_full())?;
-        let wide = matches!(start_val, Datum::Int8(_))
-            || matches!(stop_raw, Datum::Int8(_))
-            || matches!(step_raw, Datum::Int8(_));
-        let mut v = start;
         for slot in rows.iter_mut() {
-            let value = if wide {
-                Datum::Int8(v)
-            } else {
-                Datum::Int4(v as i32)
-            };
+            let value = series.next(arena)?.expect("integer series count");
             *slot = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-            v += step;
         }
         Ok(&*rows)
     })?;

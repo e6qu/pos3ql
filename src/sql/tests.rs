@@ -31,6 +31,7 @@ mod procedural_subtransactions;
 mod query_execution;
 mod result_streams;
 mod routine_calls;
+mod routine_identity_diagnostics;
 mod routine_selection;
 mod row_history;
 mod row_layout;
@@ -44431,7 +44432,10 @@ fn typed_routine_owner_changes_preserve_kind_and_overload_identity() {
         &mut budget,
         "ALTER FUNCTION routine_lifecycle(text) OWNER TO postgres",
     );
-    assert!(String::from_utf8_lossy(&mismatch).contains("42883"));
+    assert_eq!(error_sqlstates(&mismatch), ["42809"]);
+    assert!(
+        String::from_utf8_lossy(&mismatch).contains("routine_lifecycle(text) is not a function")
+    );
 }
 
 #[test]
@@ -47826,7 +47830,8 @@ fn sql_procedure_call_is_typed_durable_and_catalogued() {
         ["40", "41", "42", "42", "43"]
     );
     let wrong_drop = run_with(&mut engine, &mut budget, "DROP FUNCTION log_value(integer)");
-    assert!(String::from_utf8_lossy(&wrong_drop).contains("42883"));
+    assert_eq!(error_sqlstates(&wrong_drop), ["42809"]);
+    assert!(String::from_utf8_lossy(&wrong_drop).contains("log_value(integer) is not a function"));
     let dropped = run_with(
         &mut engine,
         &mut budget,

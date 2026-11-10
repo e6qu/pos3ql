@@ -23077,6 +23077,13 @@ impl Storage {
             })
     }
 
+    /// Whether `name` is a namespace `txid` sees, including the built-in
+    /// `pg_catalog`, `information_schema` and `pg_toast`.
+    pub(crate) fn namespace_exists(&self, name: &str, txid: u32) -> bool {
+        matches!(name, "pg_catalog" | "information_schema" | "pg_toast")
+            || self.find_schema_visible(name, txid).is_some()
+    }
+
     pub fn schema_def(&self, slot: usize) -> SchemaDef {
         self.schemas.lock().expect("schema catalog lock poisoned")[slot]
     }
@@ -46719,6 +46726,22 @@ impl Storage {
             }
         }
         Ok(found)
+    }
+
+    /// Visible routines with this schema and name, in catalog order.
+    pub(crate) fn routine_slots_named<'s>(
+        &'s self,
+        schema: &'s str,
+        name: &'s str,
+        txid: u32,
+    ) -> impl Iterator<Item = usize> + 's {
+        self.routine_entries().filter_map(move |(slot, routine)| {
+            (routine.database == current_database()
+                && routine.visible_to(txid)
+                && routine.schema_for(txid).as_str() == schema
+                && routine.name_for(txid).as_str() == name)
+                .then_some(slot)
+        })
     }
 
     pub(crate) const fn routine_access_object(slot: usize) -> AccessObject {

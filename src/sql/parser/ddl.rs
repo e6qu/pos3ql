@@ -30,15 +30,16 @@ use crate::sql::ast::{
     PartitionBound, PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression,
     PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationDescendants,
     PublicationOperations, PublicationTarget, RelationPersistence, RelationStorageOptionNames,
-    RelationStorageOptions, RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineCreateKind,
-    RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind, RuleAction,
-    RuleEvent, RuleMode, SchemaAuthorization, SchemaName, StatisticsExpression, StatisticsKey,
-    StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget, SubscriptionBehavior,
-    SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName,
-    SubscriptionSlotPlan, SubscriptionStreaming, SubscriptionSynchronousCommit, TableAccessMethod,
-    TableMembership, TablespaceOptionNames, TablespaceOptions, TextSearchConfigurationSource,
-    TextSearchObjectKind, TextSearchOption, TransformFunction, TriggerEvent, TriggerIdentity,
-    TriggerKind, TriggerTiming, TriggerTransitionTables, ViewSecurity, ViewSecurityBarrier,
+    RelationStorageOptions, RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineArgumentType,
+    RoutineCreateKind, RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind,
+    RuleAction, RuleEvent, RuleMode, SchemaAuthorization, SchemaName, StatisticsExpression,
+    StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget,
+    SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin,
+    SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
+    SubscriptionSynchronousCommit, TableAccessMethod, TableMembership, TablespaceOptionNames,
+    TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption,
+    TransformFunction, TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming,
+    TriggerTransitionTables, ViewSecurity, ViewSecurityBarrier,
 };
 use crate::sql::eval::sqlstate;
 
@@ -2371,7 +2372,8 @@ impl<'a> Parser<'a> {
 
     pub(super) fn routine_identity(&mut self) -> Result<RoutineIdentity<'a>, ParseError> {
         let name = self.qual_name("routine name")?;
-        let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut argument_types =
+            [RoutineArgumentType::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut count = 0usize;
         let signature_is_explicit = self.eat_op("(")?;
         if signature_is_explicit && !self.eat_op(")")? {
@@ -2410,7 +2412,9 @@ impl<'a> Parser<'a> {
     /// Parses the identity-bearing portion of one routine argument. OUT-only
     /// arguments are consumed but excluded from the declared signature; the
     /// returned type has already crossed the ordinary typed-name boundary.
-    pub(super) fn routine_identity_argument(&mut self) -> Result<(&'a str, bool), ParseError> {
+    pub(super) fn routine_identity_argument(
+        &mut self,
+    ) -> Result<(RoutineArgumentType<'a>, bool), ParseError> {
         let input = match self.peeked {
             Tok::Ident("out") | Tok::Ident("table") => {
                 self.advance()?;
@@ -2424,8 +2428,8 @@ impl<'a> Parser<'a> {
         };
         let mark = self.lexer.mark();
         let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
-        let candidate_type = self.type_name()?;
-        let argument_type = if matches!(
+        let candidate_type = self.routine_identity_type()?;
+        let (name, _, written) = if matches!(
             self.peeked,
             Tok::Op(",") | Tok::Op(")") | Tok::Ident("order")
         ) {
@@ -2435,9 +2439,52 @@ impl<'a> Parser<'a> {
             self.peeked = saved_peeked;
             self.peek_at = saved_peek_at;
             let _ = self.type_function_ident("routine argument name")?;
-            self.type_name()?
+            self.routine_identity_type()?
         };
-        Ok((argument_type, input))
+        let spelled = if written.schema.is_none() && !written.array {
+            written.name
+        } else {
+            let text = stack_format!(
+                264,
+                "{}{}{}{}",
+                written.schema.unwrap_or(""),
+                if written.schema.is_some() { "." } else { "" },
+                written.name,
+                if written.array { "[]" } else { "" }
+            );
+            self.arena
+                .alloc_str(text.as_str())
+                .map_err(|_| self.err_here("type name too long"))?
+        };
+        Ok((
+            RoutineArgumentType {
+                name,
+                schema: written.schema,
+                written: spelled,
+            },
+            input,
+        ))
+    }
+
+    /// A routine identity argument type. PostgreSQL accepts and ignores
+    /// `SETOF` here.
+    fn routine_identity_type(
+        &mut self,
+    ) -> Result<(&'a str, i32, super::WrittenTypeName<'a>), ParseError> {
+        if self.peeked == Tok::Ident("setof") {
+            let mark = self.lexer.mark();
+            let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
+            self.advance()?;
+            if matches!(
+                self.peeked,
+                Tok::Op(",") | Tok::Op(")") | Tok::Ident("order")
+            ) {
+                self.lexer.reset(mark);
+                self.peeked = saved_peeked;
+                self.peek_at = saved_peek_at;
+            }
+        }
+        self.type_name_written()
     }
 
     fn extension_member(&mut self) -> Result<ExtensionMemberIdentity<'a>, ParseError> {
@@ -7236,7 +7283,8 @@ impl<'a> Parser<'a> {
         let mut routines = ArenaList::new(self.arena);
         loop {
             let name = self.qual_name("function name")?;
-            let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            let mut argument_types =
+                [RoutineArgumentType::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
             let mut argument_count = 0;
             let signature_is_explicit = self.eat_op("(")?;
             if signature_is_explicit && !self.eat_op(")")? {
@@ -7299,16 +7347,14 @@ impl<'a> Parser<'a> {
     pub(super) fn aggregate_identity(&mut self) -> Result<AggregateIdentity<'a>, ParseError> {
         let name = self.qual_name("aggregate name")?;
         self.expect_op("(")?;
-        let mut direct = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut aggregated = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut direct_count = 0usize;
-        let mut aggregated_count = 0usize;
+        let mut arguments = [RoutineArgumentType::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut count = 0usize;
         let mut ordered_set = false;
         if self.eat_op("*")? {
             self.expect_op(")")?;
         } else if !self.eat_op(")")? {
             loop {
-                if self.eat_ident("order")? {
+                if !ordered_set && self.eat_ident("order")? {
                     self.expect_ident("by")?;
                     ordered_set = true;
                     if self.eat_op(")")? {
@@ -7317,22 +7363,12 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 let (argument_type, input) = self.routine_identity_argument()?;
-                let target = if ordered_set {
-                    &mut aggregated
-                } else {
-                    &mut direct
-                };
-                let count = if ordered_set {
-                    &mut aggregated_count
-                } else {
-                    &mut direct_count
-                };
                 if input {
-                    if *count == target.len() {
-                        return Err(self.limit("aggregate arguments", target.len()));
+                    if count == arguments.len() {
+                        return Err(self.limit("aggregate arguments", arguments.len()));
                     }
-                    target[*count] = argument_type;
-                    *count += 1;
+                    arguments[count] = argument_type;
+                    count += 1;
                 }
                 if self.eat_op(")")? {
                     break;
@@ -7348,20 +7384,9 @@ impl<'a> Parser<'a> {
                 self.expect_op(",")?;
             }
         }
-        Ok(if ordered_set {
-            AggregateIdentity {
-                name,
-                direct_argument_types: self.arena_slice(&direct[..direct_count])?,
-                aggregated_argument_types: self.arena_slice(&aggregated[..aggregated_count])?,
-                ordered_set: true,
-            }
-        } else {
-            AggregateIdentity {
-                name,
-                direct_argument_types: &[],
-                aggregated_argument_types: self.arena_slice(&direct[..direct_count])?,
-                ordered_set: false,
-            }
+        Ok(AggregateIdentity {
+            name,
+            argument_types: self.arena_slice(&arguments[..count])?,
         })
     }
 
@@ -7464,7 +7489,8 @@ impl<'a> Parser<'a> {
         kind: RoutineTargetKind,
     ) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("routine name")?;
-        let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut argument_types =
+            [RoutineArgumentType::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut count = 0;
         let signature_is_explicit = self.eat_op("(")?;
         if signature_is_explicit && !self.eat_op(")")? {

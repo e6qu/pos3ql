@@ -264,11 +264,12 @@ order and startup limits hold throughout. The
 **Work:** audit PostgreSQL 18 built-in functions by signature and executed
 behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
-unsupported case into an explicit error. Known gaps: `DROP FUNCTION`,
-`PROCEDURE`, `ROUTINE` and `AGGREGATE ... IF EXISTS` on a missing routine send
-no `... does not exist, skipping` notice, and the error without `IF EXISTS`
-quotes the bare name where PostgreSQL prints the signature (`function f(integer,
-text) does not exist`). The
+unsupported case into an explicit error. Known gaps: `ALTER`, `COMMENT ON`
+and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
+with `0A000` where PostgreSQL changes the catalog entry; `array_replace` takes
+the replacement's runtime type, so `array_replace('{a}'::refcursor[], 'a',
+'b')` fails with `42804` where PostgreSQL returns `{b}`; `information_schema`
+domains such as `cardinal_number` do not exist. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

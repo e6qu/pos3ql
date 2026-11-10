@@ -4304,12 +4304,24 @@ pub struct CreateAggregate<'a> {
     pub definition: AggregateDefinition<'a>,
 }
 
+/// An aggregate named by its argument types. PostgreSQL identifies it by the
+/// full input list; `ORDER BY` placement does not select a different aggregate.
+/// An empty list is the `(*)` form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AggregateIdentity<'a> {
     pub name: QualName<'a>,
-    pub direct_argument_types: &'a [&'a str],
-    pub aggregated_argument_types: &'a [&'a str],
-    pub ordered_set: bool,
+    /// Direct arguments first, then aggregated arguments.
+    pub argument_types: &'a [RoutineArgumentType<'a>],
+}
+
+impl<'a> AggregateIdentity<'a> {
+    pub fn routine(self) -> RoutineIdentity<'a> {
+        RoutineIdentity {
+            name: self.name,
+            argument_types: self.argument_types,
+            signature_is_explicit: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4504,10 +4516,33 @@ pub enum AlterExtensionAction<'a> {
     },
 }
 
+/// One input argument type in a routine identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutineArgumentType<'a> {
+    /// The normalized type name the resolver reads.
+    pub name: &'a str,
+    /// The schema written before the type name, if any.
+    pub schema: Option<&'a str>,
+    /// PostgreSQL's spelling of the written type name in skip notices and
+    /// missing-type errors: keyword types become `pg_catalog.int4` and the
+    /// like, other names keep their written qualification, and modifiers are
+    /// dropped.
+    pub written: &'a str,
+}
+
+impl RoutineArgumentType<'_> {
+    /// Fills fixed parse buffers before arguments are written.
+    pub const EMPTY: Self = Self {
+        name: "",
+        schema: None,
+        written: "",
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutineIdentity<'a> {
     pub name: QualName<'a>,
-    pub argument_types: &'a [&'a str],
+    pub argument_types: &'a [RoutineArgumentType<'a>],
     /// `false` only for the PostgreSQL shorthand `DROP FUNCTION name`.
     pub signature_is_explicit: bool,
 }

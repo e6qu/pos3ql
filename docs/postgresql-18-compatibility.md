@@ -86,7 +86,13 @@ Functions and expressions:
 - A built-in function cannot implement `CREATE CAST` or `CREATE OPERATOR`
   (`0A000`). Aggregate support functions can name supported built-ins.
 - A missing-function message that does not fit the fixed 192-byte error
-  message returns `54000`.
+  message returns `54000`. This includes the signature that `DROP`, `ALTER`,
+  `COMMENT ON` and `GRANT` quote for a routine they cannot find, such as
+  `function f(integer) does not exist`.
+- Built-in functions cannot be changed: `ALTER FUNCTION lower(text) STABLE`,
+  `COMMENT ON FUNCTION lower(text)` and `GRANT EXECUTE ON FUNCTION
+  lower(text)` fail with `0A000`. Dropping one fails with `2BP01`, as in
+  PostgreSQL.
 - Array and `CASE` result types follow declarations, including subqueries and
   nulls: `ARRAY[(SELECT NULL::date)]` is `date[]`; mixing integer and bigint
   gives `bigint[]`; an empty constructor needs a type (`ARRAY[]::integer[]`).

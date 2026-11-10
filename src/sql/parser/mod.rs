@@ -317,6 +317,14 @@ pub(crate) struct NamedParameter<'a> {
     pub index: u32,
 }
 
+/// The parts of PostgreSQL's `TypeNameToString` for a parsed type name.
+#[derive(Clone, Copy)]
+struct WrittenTypeName<'a> {
+    schema: Option<&'a str>,
+    name: &'a str,
+    array: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NamespaceSource {
     pub(crate) start: usize,
@@ -5129,7 +5137,8 @@ impl<'a> Parser<'a> {
         loop {
             let name = self.qual_name("routine name")?;
             self.expect_op("(")?;
-            let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            let mut argument_types = [crate::sql::ast::RoutineArgumentType::EMPTY;
+                crate::storage::MAX_ROUTINE_ARGUMENTS];
             let mut argument_count = 0usize;
             if !self.eat_op(")")? {
                 loop {
@@ -8306,12 +8315,51 @@ impl<'a> Parser<'a> {
     /// `(...)`). varchar/char carry a length; numeric/decimal carry
     /// (precision[, scale]); any other type with a modifier is a loud error.
     fn type_name_mod(&mut self) -> Result<(&'a str, i32), ParseError> {
+        let (name, type_mod, _) = self.type_name_written()?;
+        Ok((name, type_mod))
+    }
+
+    /// Parses a type name and also returns the parts of PostgreSQL's written
+    /// form (its `TypeNameToString`) for routine identity diagnostics.
+    fn type_name_written(&mut self) -> Result<(&'a str, i32, WrittenTypeName<'a>), ParseError> {
         let source = NamespaceSource {
             start: self.peek_at,
             end: self.lexer.token_end(),
         };
         let mut quoted = matches!(self.peeked, Tok::QuotedIdent(_));
         let mut name = self.any_ident("type name")?;
+        let mut written = WrittenTypeName {
+            schema: None,
+            name,
+            array: false,
+        };
+        // PostgreSQL's grammar turns these unquoted keywords into
+        // `pg_catalog`-qualified internal names.
+        let keyword = !quoted
+            && matches!(
+                name,
+                "int"
+                    | "integer"
+                    | "smallint"
+                    | "bigint"
+                    | "real"
+                    | "float"
+                    | "double"
+                    | "decimal"
+                    | "dec"
+                    | "numeric"
+                    | "boolean"
+                    | "bit"
+                    | "character"
+                    | "char"
+                    | "varchar"
+                    | "timestamp"
+                    | "time"
+                    | "interval"
+                    | "json"
+                    | "national"
+                    | "nchar"
+            );
         // System-qualified built-ins normalize to their bare spelling. A user
         // schema is part of the type identity and must survive parsing; dropping
         // it aliases same-named domains/enums in different schemas.
@@ -8321,6 +8369,11 @@ impl<'a> Parser<'a> {
             self.advance()?;
             let base_quoted = matches!(self.peeked, Tok::QuotedIdent(_));
             let base = self.any_ident("type name")?;
+            written = WrittenTypeName {
+                schema: Some(schema),
+                name: base,
+                array: false,
+            };
             name = if schema == "pg_catalog" || schema == "information_schema" {
                 quoted = base_quoted;
                 base
@@ -8335,6 +8388,16 @@ impl<'a> Parser<'a> {
         // catalog spelling names PostgreSQL's distinct one-byte OID 18 type.
         if quoted && name == "char" {
             name = "\"char\"";
+        }
+        // `NATIONAL CHARACTER`, `NATIONAL CHAR` and `NCHAR` are SQL's
+        // spellings of `character`, with or without `VARYING`.
+        if keyword && name == "national" {
+            if !self.eat_ident("character")? {
+                self.expect_ident("char")?;
+            }
+            name = "character";
+        } else if keyword && name == "nchar" {
+            name = "character";
         }
         if name == "double" {
             self.expect_ident("precision")?;
@@ -8387,21 +8450,58 @@ impl<'a> Parser<'a> {
         } else {
             -1
         };
-        // Repeated `[]` spell the same scalar-element array type.
-        if self.peeked == Tok::Op("[") {
-            self.advance()?;
-            self.expect_op("]")?;
-            while self.peeked == Tok::Op("[") {
-                self.advance()?;
-                self.expect_op("]")?;
+        if keyword && written.schema.is_none() {
+            written = WrittenTypeName {
+                schema: Some("pg_catalog"),
+                name: match name {
+                    "int" | "integer" => "int4",
+                    "smallint" => "int2",
+                    "bigint" => "int8",
+                    "real" => "float4",
+                    "float" => "float8",
+                    "decimal" | "dec" => "numeric",
+                    "boolean" => "bool",
+                    "character" | "char" => "bpchar",
+                    other => other,
+                },
+                array: false,
+            };
+        }
+        // `[]`, `[n]` and `ARRAY [n]` all spell the same array type:
+        // PostgreSQL ignores array bounds and dimension counts in type names.
+        let mut array = false;
+        if self.eat_ident("array")? {
+            array = true;
+            if self.eat_op("[")? {
+                self.array_bound()?;
             }
+        } else {
+            while self.eat_op("[")? {
+                array = true;
+                self.array_bound()?;
+            }
+        }
+        if array {
             let array = self
                 .arena
                 .alloc_str(stack_format!(132, "{}[]", name).as_str())
                 .map_err(|_| self.err_here("type name too long"))?;
-            return Ok((array, type_mod));
+            written.array = true;
+            return Ok((array, type_mod, written));
         }
-        Ok((name, type_mod))
+        Ok((name, type_mod, written))
+    }
+
+    /// The rest of a type name's array bound after `[`: an optional integer
+    /// and `]`.
+    fn array_bound(&mut self) -> Result<(), ParseError> {
+        if let Tok::Num(text) = self.peeked {
+            if text.parse::<i32>().is_err() {
+                return Err(self.unexpected("expected an integer array bound"));
+            }
+            self.advance()?;
+        }
+        self.expect_op("]")
     }
 
     /// SQL `float(p)` chooses one of two concrete PostgreSQL types; `p` is not
@@ -11980,8 +12080,13 @@ mod tests {
                     panic!("ordered aggregate security label did not parse")
                 };
                 assert_eq!(identity.name.name, "percentile");
-                assert_eq!(identity.direct_argument_types, ["float8"]);
-                assert_eq!(identity.aggregated_argument_types, ["float8"]);
+                assert_eq!(identity.argument_types.len(), 2);
+                assert!(
+                    identity
+                        .argument_types
+                        .iter()
+                        .all(|argument| argument.name == "float8" && argument.written == "float8")
+                );
             },
         );
         with_parser("SECURITY LABEL ON INDEX items_index IS 'label'", |parser| {

@@ -41288,7 +41288,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
                  FROM pg_proc WHERE proname = 'routine_values_from'",
             )),
             [
-                "t|CREATE OR REPLACE FUNCTION public.routine_values_from(integer) RETURNS SETOF integer LANGUAGE sql AS 'SELECT value FROM routine_lookup WHERE id >= $1'"
+                "t|CREATE OR REPLACE FUNCTION public.routine_values_from(integer)\n RETURNS SETOF integer\n LANGUAGE sql\nAS $function$SELECT value FROM routine_lookup WHERE id >= $1$function$\n"
             ],
         );
         let changed_set_contract = run_with(
@@ -41310,7 +41310,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
                  FROM pg_proc WHERE proname = 'routine_pairs_from'",
             )),
             [
-                "t|2249|CREATE OR REPLACE FUNCTION public.routine_pairs_from(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE sql AS 'SELECT id, value FROM routine_lookup WHERE id >= $1'"
+                "t|2249|CREATE OR REPLACE FUNCTION public.routine_pairs_from(integer)\n RETURNS TABLE(routine_id integer, routine_value integer)\n LANGUAGE sql\nAS $function$SELECT id, value FROM routine_lookup WHERE id >= $1$function$\n"
             ]
         );
         assert_eq!(
@@ -41418,7 +41418,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
         assert_eq!(
             definition,
             [
-                "CREATE OR REPLACE FUNCTION public.answer() RETURNS integer LANGUAGE sql AS 'SELECT 42'"
+                "CREATE OR REPLACE FUNCTION public.answer()\n RETURNS integer\n LANGUAGE sql\nAS $function$SELECT 42$function$\n"
             ]
         );
 
@@ -48813,7 +48813,7 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
             "1|4",
             "2|5",
             "6|9",
-            "CREATE OR REPLACE FUNCTION public.checkpoint_pairs() RETURNS TABLE (\"position\" integer, value integer) LANGUAGE sql AS 'SELECT value - 3, value FROM checkpoint_procedure_log ORDER BY value'",
+            "CREATE OR REPLACE FUNCTION public.checkpoint_pairs()\n RETURNS TABLE(\"position\" integer, value integer)\n LANGUAGE sql\nAS $function$SELECT value - 3, value FROM checkpoint_procedure_log ORDER BY value$function$\n",
         ]
     );
 }

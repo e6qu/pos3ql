@@ -13904,9 +13904,10 @@ fn write_routine_type_name(
     match user_type {
         Some(identity) => {
             if qualified {
-                write!(output, "{}.", identity.schema.as_str())?;
+                write_identifier(output, identity.schema.as_str());
+                output.write_char('.')?;
             }
-            write!(output, "{}", identity.name.as_str())?;
+            write_identifier(output, identity.name.as_str());
             if matches!(ctype, ColType::Array(_)) {
                 write!(output, "[]")?;
             }
@@ -13914,36 +13915,6 @@ fn write_routine_type_name(
         None => write!(output, "{}", ctype.name())?,
     }
     Ok(())
-}
-
-fn write_routine_type<const N: usize>(
-    output: &mut StackStr<N>,
-    argument: &crate::storage::RoutineArgumentDef,
-) -> Result<(), core::fmt::Error> {
-    use core::fmt::Write;
-    if let Some(identity) = argument.user_type {
-        write_identifier(output, identity.schema.as_str());
-        output.write_char('.')?;
-        write_identifier(output, identity.name.as_str());
-        if matches!(argument.ctype, ColType::Array(_)) {
-            output.write_str("[]")?;
-        }
-        Ok(())
-    } else {
-        output.write_str(argument.ctype.name())
-    }
-}
-
-fn write_routine_result_type<const N: usize>(
-    output: &mut StackStr<N>,
-    result: &crate::storage::RoutineResult,
-) -> Result<(), super::eval::SqlError> {
-    let argument = crate::storage::RoutineArgumentDef {
-        name: crate::storage::SqlName::EMPTY,
-        ctype: result.ctype,
-        user_type: result.user_type,
-    };
-    write_routine_type(output, &argument).map_err(|_| super::eval::arena_full())
 }
 
 /// Resolves the function catalog object types. `regproc` names a routine by
@@ -14513,6 +14484,10 @@ pub(crate) fn operator_name_by_oid<'a>(
         .map_err(|_| super::eval::arena_full())
 }
 
+/// PostgreSQL's `pg_get_functiondef`: one header line, `RETURNS`, `LANGUAGE`,
+/// one line of non-default attributes, one `SET` line per setting, then the
+/// body. A string body is dollar-quoted with `$function$`/`$procedure$`,
+/// extended with `x` until the body does not contain the delimiter.
 pub fn function_def_text<'a>(
     storage: &Storage,
     txid: u32,
@@ -14526,110 +14501,30 @@ pub fn function_def_text<'a>(
     if matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_)) {
         return Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
-            "{} is an aggregate function",
+            "\"{}\" is an aggregate function",
             routine.name_for(txid).as_str()
         ));
     }
     use core::fmt::Write;
+    let procedure = matches!(routine.kind, crate::storage::RoutineKind::Procedure);
     let mut definition = crate::util::StackStr::<{ crate::storage::ROUTINE_SQL_MAX * 2 }>::new();
-    write!(
+    let _ = write!(
         definition,
         "CREATE OR REPLACE {} ",
-        if matches!(routine.kind, crate::storage::RoutineKind::Procedure) {
-            "PROCEDURE"
-        } else {
-            "FUNCTION"
-        }
-    )
-    .map_err(|_| super::eval::arena_full())?;
+        if procedure { "PROCEDURE" } else { "FUNCTION" }
+    );
     write_identifier(&mut definition, routine.schema_for(txid).as_str());
-    definition
-        .write_char('.')
-        .map_err(|_| super::eval::arena_full())?;
+    let _ = definition.write_char('.');
     write_identifier(&mut definition, routine.name_for(txid).as_str());
-    definition
-        .write_char('(')
-        .map_err(|_| super::eval::arena_full())?;
-    for (index, parameter) in routine.parameters().iter().enumerate() {
-        if index != 0 {
-            write!(definition, ", ").map_err(|_| super::eval::arena_full())?;
-        }
-        match parameter.mode {
-            crate::storage::RoutineParameterMode::In { .. }
-                if !matches!(routine.kind, crate::storage::RoutineKind::Procedure) => {}
-            crate::storage::RoutineParameterMode::In { .. } => {
-                write!(definition, "IN ").map_err(|_| super::eval::arena_full())?;
-            }
-            crate::storage::RoutineParameterMode::Out => {
-                write!(definition, "OUT ").map_err(|_| super::eval::arena_full())?;
-            }
-            crate::storage::RoutineParameterMode::InOut { .. } => {
-                write!(definition, "INOUT ").map_err(|_| super::eval::arena_full())?;
-            }
-            crate::storage::RoutineParameterMode::Variadic { .. } => {
-                write!(definition, "VARIADIC ").map_err(|_| super::eval::arena_full())?;
-            }
-        }
-        if !parameter.name.as_str().is_empty() {
-            write_identifier(&mut definition, parameter.name.as_str());
-            definition
-                .write_char(' ')
-                .map_err(|_| super::eval::arena_full())?;
-        }
-        write_routine_type_name(&mut definition, parameter.ctype, parameter.user_type, true)
-            .map_err(|_| super::eval::arena_full())?;
-        if let Some(default) = parameter.mode.default() {
-            write!(definition, " DEFAULT {}", default.as_str())
-                .map_err(|_| super::eval::arena_full())?;
-        }
+    let _ = definition.write_char('(');
+    write_routine_arguments(&mut definition, storage, txid, &routine, false, arena)?;
+    let _ = definition.write_str(")\n");
+    if !procedure {
+        let _ = definition.write_str(" RETURNS ");
+        write_routine_result(&mut definition, storage, txid, &routine);
+        let _ = definition.write_char('\n');
     }
-    match routine.kind {
-        crate::storage::RoutineKind::Function { result } => {
-            write!(definition, ") RETURNS ").map_err(|_| super::eval::arena_full())?;
-            write_routine_result_type(&mut definition, &result)?;
-            Ok(())
-        }
-        crate::storage::RoutineKind::SetFunction { result } => {
-            write!(definition, ") RETURNS SETOF ").map_err(|_| super::eval::arena_full())?;
-            write_routine_result_type(&mut definition, &result)?;
-            Ok(())
-        }
-        crate::storage::RoutineKind::TableFunction => {
-            write!(definition, ") RETURNS TABLE (").map_err(|_| super::eval::arena_full())?;
-            for (index, column) in routine
-                .table_columns()
-                .expect("table routine columns")
-                .iter()
-                .enumerate()
-            {
-                if index != 0 {
-                    write!(definition, ", ").map_err(|_| super::eval::arena_full())?;
-                }
-                write_identifier(&mut definition, column.name.as_str());
-                definition
-                    .write_char(' ')
-                    .map_err(|_| super::eval::arena_full())?;
-                write_routine_type_name(&mut definition, column.ctype, column.user_type, true)
-                    .map_err(|_| super::eval::arena_full())?;
-            }
-            write!(definition, ")")
-        }
-        crate::storage::RoutineKind::RecordFunction { set_returning } => {
-            write!(
-                definition,
-                ") RETURNS {}record",
-                if set_returning { "SETOF " } else { "" }
-            )
-        }
-        crate::storage::RoutineKind::Trigger => write!(definition, ") RETURNS trigger"),
-        crate::storage::RoutineKind::EventTrigger => {
-            write!(definition, ") RETURNS event_trigger")
-        }
-        crate::storage::RoutineKind::Procedure => write!(definition, ")"),
-        crate::storage::RoutineKind::Aggregate(_) => unreachable!("rejected above"),
-    }
-    .map_err(|_| super::eval::arena_full())?;
-    write!(
+    let _ = writeln!(
         definition,
         " LANGUAGE {}",
         match routine.language {
@@ -14639,85 +14534,194 @@ pub fn function_def_text<'a>(
                 unreachable!("non-aggregate stored routine has an executable language")
             }
         }
-    )
-    .map_err(|_| super::eval::arena_full())?;
-    match routine.attributes.volatility {
-        crate::storage::RoutineVolatility::Immutable => write!(definition, " IMMUTABLE"),
-        crate::storage::RoutineVolatility::Stable => write!(definition, " STABLE"),
-        crate::storage::RoutineVolatility::Volatile => Ok(()),
-    }
-    .map_err(|_| super::eval::arena_full())?;
+    );
+    let attributes_start = definition.len();
+    let _ = definition.write_str(match routine.attributes.volatility {
+        crate::storage::RoutineVolatility::Immutable => " IMMUTABLE",
+        crate::storage::RoutineVolatility::Stable => " STABLE",
+        crate::storage::RoutineVolatility::Volatile => "",
+    });
+    let _ = definition.write_str(match routine.attributes.parallel {
+        crate::storage::RoutineParallel::Safe => " PARALLEL SAFE",
+        crate::storage::RoutineParallel::Restricted => " PARALLEL RESTRICTED",
+        crate::storage::RoutineParallel::Unsafe => "",
+    });
     if routine.attributes.strict {
-        write!(definition, " STRICT").map_err(|_| super::eval::arena_full())?;
+        let _ = definition.write_str(" STRICT");
     }
-    match routine.attributes.parallel {
-        crate::storage::RoutineParallel::Safe => write!(definition, " PARALLEL SAFE"),
-        crate::storage::RoutineParallel::Restricted => {
-            write!(definition, " PARALLEL RESTRICTED")
-        }
-        crate::storage::RoutineParallel::Unsafe => Ok(()),
-    }
-    .map_err(|_| super::eval::arena_full())?;
     if routine.attributes.security_definer {
-        write!(definition, " SECURITY DEFINER").map_err(|_| super::eval::arena_full())?;
+        let _ = definition.write_str(" SECURITY DEFINER");
     }
     if routine.attributes.leakproof {
-        write!(definition, " LEAKPROOF").map_err(|_| super::eval::arena_full())?;
+        let _ = definition.write_str(" LEAKPROOF");
     }
-    if let Some(bits) = routine.attributes.cost_bits {
-        write!(definition, " COST {}", f64::from_bits(bits))
-            .map_err(|_| super::eval::arena_full())?;
+    // Stored SQL and PL/pgSQL routines default to cost 100 and, when they
+    // return a set, to 1000 rows; PostgreSQL prints only other values.
+    if let Some(cost) = routine.attributes.cost_bits.map(f64::from_bits)
+        && cost != 100.0
+    {
+        let _ = definition.write_str(" COST ");
+        write_c_general_float(&mut definition, cost);
     }
-    if let Some(bits) = routine.attributes.rows_bits {
-        write!(definition, " ROWS {}", f64::from_bits(bits))
-            .map_err(|_| super::eval::arena_full())?;
+    if let Some(rows) = routine.attributes.rows_bits.map(f64::from_bits)
+        && rows > 0.0
+        && rows != 1000.0
+    {
+        let _ = definition.write_str(" ROWS ");
+        write_c_general_float(&mut definition, rows);
+    }
+    if definition.len() != attributes_start {
+        let _ = definition.write_char('\n');
     }
     for config in routine.configs() {
-        write!(definition, " SET ").map_err(|_| super::eval::arena_full())?;
+        let _ = definition.write_str(" SET ");
         write_identifier(&mut definition, config.name.as_str());
-        write!(definition, " TO '").map_err(|_| super::eval::arena_full())?;
-        for character in config.value.as_str().chars() {
-            write!(definition, "{character}").map_err(|_| super::eval::arena_full())?;
-            if character == '\'' {
-                write!(definition, "'").map_err(|_| super::eval::arena_full())?;
-            }
-        }
-        write!(definition, "'").map_err(|_| super::eval::arena_full())?;
+        let _ = definition.write_str(" TO ");
+        write_routine_config_value(&mut definition, config.name.as_str(), config.value.as_str());
+        let _ = definition.write_char('\n');
     }
     match routine.body_kind {
         crate::storage::RoutineBodyKind::String => {
-            write!(definition, " AS '").map_err(|_| super::eval::arena_full())?;
-            for character in routine.body.as_str().chars() {
-                write!(definition, "{character}").map_err(|_| super::eval::arena_full())?;
-                if character == '\'' {
-                    write!(definition, "'").map_err(|_| super::eval::arena_full())?;
-                }
+            let body = routine.body.as_str();
+            let mut delimiter = StackStr::<{ crate::storage::ROUTINE_SQL_MAX + 16 }>::new();
+            let _ = write!(
+                delimiter,
+                "${}",
+                if procedure { "procedure" } else { "function" }
+            );
+            while body.contains(delimiter.as_str()) {
+                let _ = delimiter.write_char('x');
             }
-            write!(definition, "'").map_err(|_| super::eval::arena_full())?;
+            let _ = delimiter.write_char('$');
+            if delimiter.is_truncated() {
+                return Err(routine_definition_too_large());
+            }
+            let _ = write!(definition, "AS {0}{body}{0}", delimiter.as_str());
         }
         crate::storage::RoutineBodyKind::Return => {
-            write!(definition, " RETURN {}", routine.body.as_str())
-                .map_err(|_| super::eval::arena_full())?;
-        }
-        crate::storage::RoutineBodyKind::Atomic if routine.body.as_str().trim().is_empty() => {
-            write!(definition, " BEGIN ATOMIC\nEND").map_err(|_| super::eval::arena_full())?;
+            let _ = write!(definition, "RETURN {}", routine.body.as_str());
         }
         crate::storage::RoutineBodyKind::Atomic => {
-            write!(definition, " BEGIN ATOMIC\n{};\nEND", routine.body.as_str())
-                .map_err(|_| super::eval::arena_full())?;
+            let _ = definition.write_str("BEGIN ATOMIC\n");
+            if !routine.body.as_str().trim().is_empty() {
+                let _ = writeln!(definition, " {};", routine.body.as_str());
+            }
+            let _ = definition.write_str("END");
         }
     }
+    let _ = definition.write_char('\n');
     if definition.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "routine definition exceeds catalog rendering capacity"
-        ));
+        return Err(routine_definition_too_large());
     }
     Ok(Some(
         arena
             .alloc_str(definition.as_str())
             .map_err(|_| super::eval::arena_full())?,
     ))
+}
+
+fn routine_definition_too_large() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "routine definition exceeds catalog rendering capacity"
+    )
+}
+
+/// C's `%g` with its default six significant digits, which PostgreSQL uses
+/// for `COST` and `ROWS`.
+fn write_c_general_float(output: &mut impl core::fmt::Write, value: f64) {
+    use core::fmt::Write;
+    if value == 0.0 {
+        let _ = output.write_char('0');
+        return;
+    }
+    let mut scientific = StackStr::<48>::new();
+    let _ = write!(scientific, "{value:.5e}");
+    let (mantissa, exponent) = scientific
+        .as_str()
+        .split_once('e')
+        .expect("Rust scientific formatting has an exponent");
+    let exponent: i32 = exponent.parse().expect("Rust exponent is an integer");
+    let trimmed = |digits: &str| -> usize {
+        if digits.contains('.') {
+            digits.trim_end_matches('0').trim_end_matches('.').len()
+        } else {
+            digits.len()
+        }
+    };
+    if !(-4..6).contains(&exponent) {
+        let _ = write!(
+            output,
+            "{}e{}{:02}",
+            &mantissa[..trimmed(mantissa)],
+            if exponent < 0 { '-' } else { '+' },
+            exponent.unsigned_abs()
+        );
+    } else {
+        let decimals = usize::try_from(5 - exponent).expect("exponent below six");
+        let mut fixed = StackStr::<48>::new();
+        let _ = write!(fixed, "{value:.decimals$}");
+        let _ = output.write_str(&fixed.as_str()[..trimmed(fixed.as_str())]);
+    }
+}
+
+/// A `SET` value as `pg_get_functiondef` prints it: list-valued settings
+/// whose elements PostgreSQL quotes are split into one literal per element.
+fn write_routine_config_value(output: &mut impl core::fmt::Write, name: &str, value: &str) {
+    let literal = |output: &mut dyn core::fmt::Write, text: &str| {
+        let _ = output.write_char('\'');
+        for character in text.chars() {
+            if character == '\'' {
+                let _ = output.write_char(character);
+            }
+            let _ = output.write_char(character);
+        }
+        let _ = output.write_char('\'');
+    };
+    if !["search_path", "temp_tablespaces"]
+        .iter()
+        .any(|list| list.eq_ignore_ascii_case(name))
+    {
+        literal(output, value);
+        return;
+    }
+    let mut rest = value.trim_start();
+    if rest.is_empty() {
+        let _ = output.write_str("NULL");
+        return;
+    }
+    let mut first = true;
+    while !rest.is_empty() {
+        let mut element = StackStr::<{ crate::storage::ROUTINE_SQL_MAX }>::new();
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let mut characters = quoted.char_indices();
+            rest = "";
+            while let Some((index, character)) = characters.next() {
+                if character == '"' {
+                    if quoted[index + 1..].starts_with('"') {
+                        characters.next();
+                    } else {
+                        rest = &quoted[index + 1..];
+                        break;
+                    }
+                }
+                let _ = element.write_char(character);
+            }
+        } else {
+            let end = rest
+                .find(|character: char| character == ',' || character.is_whitespace())
+                .unwrap_or(rest.len());
+            let _ = element.write_str(&rest[..end]);
+            rest = &rest[end..];
+        }
+        rest = rest.trim_start();
+        rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+        if !first {
+            let _ = output.write_str(", ");
+        }
+        first = false;
+        literal(output, element.as_str());
+    }
 }
 
 pub fn trigger_def_text<'a>(
@@ -15035,44 +15039,8 @@ pub fn function_arguments_text<'a>(
         return Ok(None);
     };
     let routine = storage.routine_for(slot, txid);
-    let mut output = StackStr::<256>::new();
-    use core::fmt::Write;
-    for (index, parameter) in routine.parameters().iter().enumerate() {
-        if index != 0 {
-            write!(output, ", ").map_err(|_| super::eval::arena_full())?;
-        }
-        let mode = match parameter.mode {
-            crate::storage::RoutineParameterMode::In { .. }
-                if !matches!(routine.kind, crate::storage::RoutineKind::Procedure) =>
-            {
-                None
-            }
-            crate::storage::RoutineParameterMode::In { .. } => Some("IN"),
-            crate::storage::RoutineParameterMode::Out => Some("OUT"),
-            crate::storage::RoutineParameterMode::InOut { .. } => Some("INOUT"),
-            crate::storage::RoutineParameterMode::Variadic { .. } => Some("VARIADIC"),
-        };
-        if let Some(mode) = mode {
-            write!(output, "{} ", mode).map_err(|_| super::eval::arena_full())?;
-        }
-        if !parameter.name.as_str().is_empty() {
-            write!(output, "{} ", parameter.name.as_str())
-                .map_err(|_| super::eval::arena_full())?;
-        }
-        write_routine_type_name(
-            &mut output,
-            parameter.ctype,
-            parameter.user_type,
-            parameter.user_type.is_some_and(|type_identity| {
-                !storage.schema_is_on_path(type_identity.schema, txid)
-            }),
-        )
-        .map_err(|_| super::eval::arena_full())?;
-        if !identity && let Some(default) = parameter.mode.default() {
-            write!(output, " DEFAULT {}", default.as_str())
-                .map_err(|_| super::eval::arena_full())?;
-        }
-    }
+    let mut output = StackStr::<{ crate::storage::ROUTINE_SQL_MAX }>::new();
+    write_routine_arguments(&mut output, storage, txid, &routine, identity, arena)?;
     if output.is_truncated() {
         return Err(super::eval::arena_full());
     }
@@ -15080,6 +15048,117 @@ pub fn function_arguments_text<'a>(
         .alloc_str(output.as_str())
         .map(Some)
         .map_err(|_| super::eval::arena_full())
+}
+
+/// PostgreSQL's `print_function_arguments`: modes, quoted names, types named
+/// as `format_type_be` names them, and canonical default expressions.
+fn write_routine_arguments(
+    output: &mut impl core::fmt::Write,
+    storage: &Storage,
+    txid: u32,
+    routine: &crate::storage::RoutineDef,
+    identity: bool,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for (index, parameter) in routine.parameters().iter().enumerate() {
+        if index != 0 {
+            let _ = output.write_str(", ");
+        }
+        let _ = output.write_str(match parameter.mode {
+            crate::storage::RoutineParameterMode::In { .. }
+                if !matches!(routine.kind, crate::storage::RoutineKind::Procedure) =>
+            {
+                ""
+            }
+            crate::storage::RoutineParameterMode::In { .. } => "IN ",
+            crate::storage::RoutineParameterMode::Out => "OUT ",
+            crate::storage::RoutineParameterMode::InOut { .. } => "INOUT ",
+            crate::storage::RoutineParameterMode::Variadic { .. } => "VARIADIC ",
+        });
+        if !parameter.name.as_str().is_empty() {
+            write_identifier(output, parameter.name.as_str());
+            let _ = output.write_char(' ');
+        }
+        write_visible_routine_type(output, storage, txid, parameter.ctype, parameter.user_type);
+        if !identity && let Some(default) = parameter.mode.default() {
+            let _ = output.write_str(" DEFAULT ");
+            let _ = output.write_str(super::enum_values::checks::canonical_display(
+                default.as_str(),
+                arena,
+            )?);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_visible_routine_type(
+    output: &mut impl core::fmt::Write,
+    storage: &Storage,
+    txid: u32,
+    ctype: ColType,
+    user_type: Option<crate::storage::UserTypeName>,
+) {
+    let qualified =
+        user_type.is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
+    let _ = write_routine_type_name(output, ctype, user_type, qualified);
+}
+
+/// PostgreSQL's `print_function_rettype` for a routine that has a result.
+fn write_routine_result(
+    output: &mut impl core::fmt::Write,
+    storage: &Storage,
+    txid: u32,
+    routine: &crate::storage::RoutineDef,
+) {
+    match &routine.kind {
+        crate::storage::RoutineKind::Function { result } => {
+            write_visible_routine_type(output, storage, txid, result.ctype, result.user_type);
+        }
+        crate::storage::RoutineKind::SetFunction { result } => {
+            let _ = output.write_str("SETOF ");
+            write_visible_routine_type(output, storage, txid, result.ctype, result.user_type);
+        }
+        crate::storage::RoutineKind::TableFunction => {
+            let _ = output.write_str("TABLE(");
+            for (index, column) in routine
+                .table_columns()
+                .expect("table routine columns")
+                .iter()
+                .enumerate()
+            {
+                if index != 0 {
+                    let _ = output.write_str(", ");
+                }
+                write_identifier(output, column.name.as_str());
+                let _ = output.write_char(' ');
+                write_visible_routine_type(output, storage, txid, column.ctype, column.user_type);
+            }
+            let _ = output.write_char(')');
+        }
+        crate::storage::RoutineKind::RecordFunction { set_returning } => {
+            let _ = output.write_str(if *set_returning {
+                "SETOF record"
+            } else {
+                "record"
+            });
+        }
+        crate::storage::RoutineKind::Trigger => {
+            let _ = output.write_str("trigger");
+        }
+        crate::storage::RoutineKind::EventTrigger => {
+            let _ = output.write_str("event_trigger");
+        }
+        crate::storage::RoutineKind::Aggregate(aggregate) => write_visible_routine_type(
+            output,
+            storage,
+            txid,
+            aggregate.result_type.ctype,
+            aggregate.result_type.user_type,
+        ),
+        crate::storage::RoutineKind::Procedure => {
+            unreachable!("procedures have no result")
+        }
+    }
 }
 
 pub fn function_result_text<'a>(
@@ -15097,84 +15176,14 @@ pub fn function_result_text<'a>(
         return Ok(None);
     };
     let routine = storage.routine_for(slot, txid);
-    let mut output = StackStr::<256>::new();
-    use core::fmt::Write;
-    match &routine.kind {
-        crate::storage::RoutineKind::Function { result } => {
-            write_routine_type_name(
-                &mut output,
-                result.ctype,
-                result.user_type,
-                result
-                    .user_type
-                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid)),
-            )
-            .map_err(|_| super::eval::arena_full())?;
-        }
-        crate::storage::RoutineKind::SetFunction { result } => {
-            write!(output, "SETOF ").map_err(|_| super::eval::arena_full())?;
-            write_routine_type_name(
-                &mut output,
-                result.ctype,
-                result.user_type,
-                result
-                    .user_type
-                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid)),
-            )
-            .map_err(|_| super::eval::arena_full())?;
-        }
-        crate::storage::RoutineKind::TableFunction => {
-            write!(output, "TABLE(").map_err(|_| super::eval::arena_full())?;
-            for (index, column) in routine
-                .table_columns()
-                .expect("table routine columns")
-                .iter()
-                .enumerate()
-            {
-                if index != 0 {
-                    write!(output, ", ").map_err(|_| super::eval::arena_full())?;
-                }
-                write!(output, "{} ", column.name.as_str())
-                    .map_err(|_| super::eval::arena_full())?;
-                write_routine_type_name(
-                    &mut output,
-                    column.ctype,
-                    column.user_type,
-                    column
-                        .user_type
-                        .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid)),
-                )
-                .map_err(|_| super::eval::arena_full())?;
-            }
-            write!(output, ")").map_err(|_| super::eval::arena_full())?;
-        }
-        crate::storage::RoutineKind::RecordFunction { set_returning } => {
-            if *set_returning {
-                write!(output, "SETOF ").map_err(|_| super::eval::arena_full())?;
-            }
-            write!(output, "record").map_err(|_| super::eval::arena_full())?;
-        }
-        crate::storage::RoutineKind::Trigger => {
-            write!(output, "trigger").map_err(|_| super::eval::arena_full())?;
-        }
-        crate::storage::RoutineKind::EventTrigger => {
-            write!(output, "event_trigger").map_err(|_| super::eval::arena_full())?;
-        }
-        crate::storage::RoutineKind::Procedure => {
-            write!(output, "void").map_err(|_| super::eval::arena_full())?;
-        }
-        crate::storage::RoutineKind::Aggregate(aggregate) => {
-            write_routine_type_name(
-                &mut output,
-                aggregate.result_type.ctype,
-                aggregate.result_type.user_type,
-                aggregate
-                    .result_type
-                    .user_type
-                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid)),
-            )
-            .map_err(|_| super::eval::arena_full())?;
-        }
+    // PostgreSQL returns NULL for a procedure.
+    if matches!(routine.kind, crate::storage::RoutineKind::Procedure) {
+        return Ok(None);
+    }
+    let mut output = StackStr::<{ crate::storage::ROUTINE_SQL_MAX }>::new();
+    write_routine_result(&mut output, storage, txid, &routine);
+    if output.is_truncated() {
+        return Err(super::eval::arena_full());
     }
     arena
         .alloc_str(output.as_str())

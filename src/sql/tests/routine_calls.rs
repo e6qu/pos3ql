@@ -3691,7 +3691,7 @@ fn empty_sql_bodies_are_void_routines_that_do_nothing() {
     assert_eq!(
         data_rows(&output),
         [
-            "CREATE OR REPLACE FUNCTION public.empty_atomic() RETURNS void LANGUAGE sql BEGIN ATOMIC\nEND|t"
+            "CREATE OR REPLACE FUNCTION public.empty_atomic()\n RETURNS void\n LANGUAGE sql\nBEGIN ATOMIC\nEND\n|t"
         ]
     );
 }
@@ -4007,5 +4007,68 @@ fn sql_bodies_reject_transaction_control_when_reached() {
         output
             .windows(b"START TRANSACTION\0".len())
             .any(|window| window == b"START TRANSACTION\0")
+    );
+}
+
+/// `pg_get_functiondef` output captured from PostgreSQL 18.6.
+#[test]
+fn function_definitions_use_postgresql_layout() {
+    let config = test_config("function-definition-layout");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(
+        &mut engine,
+        r#"CREATE SCHEMA layout; CREATE TYPE layout."My Type" AS (a integer);
+        CREATE FUNCTION layout.a(a int, b int DEFAULT 1 + 2, OUT c int)
+            LANGUAGE sql IMMUTABLE STRICT AS 'SELECT a';
+        CREATE FUNCTION layout.b() RETURNS SETOF int LANGUAGE sql STABLE LEAKPROOF
+            SECURITY DEFINER PARALLEL SAFE COST 5 ROWS 7
+            SET search_path = public, "My Schema", pg_temp SET datestyle = 'iso, mdy'
+            AS 'SELECT 1';
+        CREATE FUNCTION layout.c() RETURNS int LANGUAGE sql COST 1000000
+            AS $q$SELECT 1 /* $function$ $functionx$ */$q$;
+        CREATE FUNCTION layout.d() RETURNS setof int LANGUAGE sql COST 0.00001 ROWS 1000
+            AS 'SELECT 1';
+        CREATE PROCEDURE layout."Pr oc"("A b" int, INOUT "c" layout."My Type"[])
+            LANGUAGE sql SET search_path = '' AS 'SELECT c';
+        SELECT pg_get_functiondef(p.oid) FROM pg_proc p
+          JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE nspname = 'layout' ORDER BY proname;
+        SELECT pg_get_function_result('layout."Pr oc"'::regproc) IS NULL,
+               pg_get_function_arguments('layout."Pr oc"'::regproc)"#,
+        true,
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "CREATE OR REPLACE PROCEDURE layout.\"Pr oc\"(IN \"A b\" integer, INOUT c layout.\"My Type\"[])\n \
+             LANGUAGE sql\n \
+             SET search_path TO ''\n\
+             AS $procedure$SELECT c$procedure$\n",
+            "CREATE OR REPLACE FUNCTION layout.a(a integer, b integer DEFAULT (1 + 2), OUT c integer)\n \
+             RETURNS integer\n \
+             LANGUAGE sql\n \
+             IMMUTABLE STRICT\n\
+             AS $function$SELECT a$function$\n",
+            "CREATE OR REPLACE FUNCTION layout.b()\n \
+             RETURNS SETOF integer\n \
+             LANGUAGE sql\n \
+             STABLE PARALLEL SAFE SECURITY DEFINER LEAKPROOF COST 5 ROWS 7\n \
+             SET search_path TO 'public', 'My Schema', 'pg_temp'\n \
+             SET \"DateStyle\" TO 'iso, mdy'\n\
+             AS $function$SELECT 1$function$\n",
+            "CREATE OR REPLACE FUNCTION layout.c()\n \
+             RETURNS integer\n \
+             LANGUAGE sql\n \
+             COST 1e+06\n\
+             AS $functionxx$SELECT 1 /* $function$ $functionx$ */$functionxx$\n",
+            "CREATE OR REPLACE FUNCTION layout.d()\n \
+             RETURNS SETOF integer\n \
+             LANGUAGE sql\n \
+             COST 1e-05\n\
+             AS $function$SELECT 1$function$\n",
+            "t|IN \"A b\" integer, INOUT c layout.\"My Type\"[]",
+        ]
     );
 }

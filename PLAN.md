@@ -276,7 +276,11 @@ statement must return exactly one column.`) and `RETURNS integer AS 'SELECT
 ''a''::text'` converts at the call where PostgreSQL rejects the definition
 (`Actual return type is text.`). A polymorphic SQL function's runtime result
 mismatch names the declared type (`anyelement`) where PostgreSQL names the
-resolved one. The
+resolved one. Expressions are shown as stored, not deparsed: `pg_get_expr`,
+`pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
+`text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
+the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
+than one deparsed statement per line. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

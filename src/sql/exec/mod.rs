@@ -14144,12 +14144,8 @@ pub(crate) fn drop_schema(
             }
             SchemaObject::Routine(slot) => {
                 let routine = storage.routine_for(*slot, txn.txid);
-                let noun = match routine.kind {
-                    crate::storage::RoutineKind::Procedure => "procedure",
-                    crate::storage::RoutineKind::Aggregate(_) => "aggregate",
-                    _ => "function",
-                };
-                let _ = write!(out, "{} ", noun);
+                // PostgreSQL's getObjectDescription names every routine a function.
+                let _ = write!(out, "function ");
                 write_rel(
                     out,
                     &routine.schema_for(txn.txid),
@@ -36531,6 +36527,10 @@ pub(crate) fn validate_routine_body(
         });
     }
     let formal_scope = enter_routine_parameter_types(
+        &arguments[..argument_count],
+        Some(&super::query::storage_catalog(storage, arena, txn.txid)),
+        crate::sql::ast::Collation::None,
+    )?;
     // PostgreSQL's validator checks the final statement only when
     // `check_function_bodies` is on and no argument is polymorphic.
     let sql_result = if check_string_body
@@ -36551,10 +36551,6 @@ pub(crate) fn validate_routine_body(
     } else {
         super::query::RoutineResultContract::Deferred
     };
-        &arguments[..argument_count],
-        Some(&super::query::storage_catalog(storage, arena, txn.txid)),
-        crate::sql::ast::Collation::None,
-    )?;
     match kind {
         crate::storage::RoutineKind::Function { result } => {
             if routine.language == RoutineLanguage::PlPgSql {
@@ -48527,22 +48523,13 @@ fn dependency_signature_suffix(
             suffix.write_str("NONE").map_err(|_| too_long())?;
             continue;
         };
-        match argument.user_type {
-            Some(identity) if storage.schema_is_on_path(identity.schema, txid) => {
-                suffix.write_str(identity.name.as_str())
-            }
-            Some(identity) => write!(
-                suffix,
-                "{}.{}",
-                identity.schema.as_str(),
-                identity.name.as_str()
-            ),
-            None => suffix.write_str(argument.ctype.name()),
-        }
-        .map_err(|_| too_long())?;
-        if argument.user_type.is_some() && matches!(argument.ctype, ColType::Array(_)) {
-            suffix.write_str("[]").map_err(|_| too_long())?;
-        }
+        super::catalog::write_visible_routine_type(
+            &mut suffix,
+            storage,
+            txid,
+            argument.ctype,
+            argument.user_type,
+        );
     }
     suffix.write_char(')').map_err(|_| too_long())?;
     Ok(suffix)
@@ -48793,12 +48780,8 @@ fn report_stored_query_dependents(
     let describe_routine =
         |slot: usize, out: &mut crate::util::StackStr<192>| -> Result<(), SqlError> {
             let routine = storage.routine_for(slot, txid);
-            let noun = match routine.kind {
-                crate::storage::RoutineKind::Procedure => "procedure",
-                crate::storage::RoutineKind::Aggregate(_) => "aggregate",
-                _ => "function",
-            };
-            let _ = write!(out, "{} ", noun);
+            // PostgreSQL's getObjectDescription names every routine a function.
+            let _ = write!(out, "function ");
             write_name(out, &routine.schema_for(txid), &routine.name_for(txid));
             let suffix = routine_dependency_suffix(storage, txid, &routine)?;
             let _ = write!(out, "{}", suffix.as_str());

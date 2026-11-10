@@ -2248,3 +2248,37 @@ fn unhandled_diagnostic_details_preserve_original_errors_at_small_control_capaci
         }
     }
 }
+
+#[test]
+fn procedural_bound_cursor_declarations_are_rejected_as_unsupported() {
+    let config = test_config("procedural-bound-cursor");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for declaration in [
+        "c CURSOR FOR SELECT 1",
+        "c SCROLL CURSOR FOR SELECT 1",
+        "c NO SCROLL CURSOR (n integer) FOR SELECT n",
+    ] {
+        let response = session.execute(
+            &mut engine,
+            &format!(
+                "CREATE FUNCTION bound_cursor() RETURNS integer LANGUAGE plpgsql AS \
+                 $$DECLARE {declaration}; BEGIN RETURN 1; END$$"
+            ),
+            true,
+        );
+        assert_eq!(error_sqlstates(&response), ["0A000"], "{declaration}");
+    }
+    // Locals merely named like the keywords keep their declared types.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE FUNCTION keyword_locals() RETURNS integer LANGUAGE plpgsql AS \
+             $$DECLARE scroll integer := 2; cursor integer := 3; BEGIN RETURN scroll * cursor; END$$; \
+             SELECT keyword_locals()",
+            true
+        )),
+        ["6"]
+    );
+}

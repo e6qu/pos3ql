@@ -18932,6 +18932,19 @@ fn parse_trigger_local<'a>(
     if declaration.is_empty() {
         return Err(unsupported_trigger_body());
     }
+    // `name [NO] [SCROLL] CURSOR ... FOR query` declares a bound cursor.
+    let cursor = strip_trigger_keyword(declaration, "no")
+        .map(str::trim_start)
+        .unwrap_or(declaration);
+    let cursor = strip_trigger_keyword(cursor, "scroll")
+        .map(str::trim_start)
+        .unwrap_or(cursor);
+    if strip_trigger_keyword(cursor, "cursor").is_some() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "PL/pgSQL bound cursor declarations are not supported; declare a refcursor and use OPEN ... FOR"
+        ));
+    }
     let ty = if declaration.eq_ignore_ascii_case("record") {
         ParsedPlpgsqlLocalType::Record
     } else if let Some(reference) = strip_plpgsql_type_suffix(declaration, "%type") {

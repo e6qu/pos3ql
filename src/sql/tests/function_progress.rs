@@ -38,6 +38,44 @@ fn resume_function_progress_wait(
 }
 
 #[test]
+fn saved_advisory_unlock_results_survive_later_function_calls() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("advisory-result-progress-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        writer.success(
+            &mut engine,
+            "CREATE SEQUENCE advisory_result_numbers; \
+            CREATE FUNCTION advisory_result_child() RETURNS bigint LANGUAGE plpgsql AS $$ \
+                BEGIN RETURN nextval('advisory_result_numbers'); END$$; \
+            SELECT pg_advisory_lock(301),pg_advisory_lock_shared(302), \
+                pg_advisory_lock(303,1),pg_advisory_lock_shared(304,1)",
+            true,
+        );
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT pg_advisory_unlock(301),pg_advisory_unlock_shared(302), \
+                pg_advisory_unlock(303,1),pg_advisory_unlock_shared(304,1),advisory_result_child()",
+                true
+            )),
+            ["t|t|t|t|1"]
+        );
+        writer.success(&mut engine, "SELECT pg_advisory_lock(305)", true);
+        assert_eq!(data_rows(&writer.success(&mut engine,
+            "SELECT pg_advisory_unlock_all(),advisory_result_child(); SELECT last_value FROM advisory_result_numbers", true)), ["|2","2"]);
+        drop((writer, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+#[test]
 fn sql_result_checks_stop_before_later_row_effects_and_finish_all_final_writes() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

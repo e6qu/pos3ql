@@ -3563,7 +3563,7 @@ pub fn eval_full<'a>(
         } else {
             expression
         };
-        if !super::query::input_progress::owns_value()
+        let unowned_value = if !super::query::input_progress::owns_value()
             && super::query::with_active_routine_invocations(|context| context.is_some())
             && let Expr::Call {
                 name,
@@ -3604,13 +3604,12 @@ pub fn eval_full<'a>(
                         | "pg_advisory_xact_lock_shared"
                         | "pg_try_advisory_xact_lock"
                         | "pg_try_advisory_xact_lock_shared"
+                        | "pg_advisory_unlock_all"
                 ) || super::engine_intrinsic_result_type(base.as_str(), args.len()).is_some());
-            if !journaled {
-                // An enclosing argument journal owns completed values. A bare
-                // query projection still needs its own position before replay.
-                super::query::record_unowned_value();
-            }
-        }
+            !journaled
+        } else {
+            false
+        };
         let run = || {
             let _query_inputs = matches!(
                 expression,
@@ -3633,7 +3632,7 @@ pub fn eval_full<'a>(
             if hooks.srf_index.is_some()
                 && super::query::is_builtin_set_routine(name)
                 && args.iter().all(|argument| matches!(argument, Expr::Param(_))));
-        if matches!(expression, Expr::Call { .. })
+        let result = if matches!(expression, Expr::Call { .. })
             && !bound_set_row
             && routine_input_handoff(expression, hooks.catalog)
         {
@@ -3643,7 +3642,13 @@ pub fn eval_full<'a>(
             })
         } else {
             run()
+        };
+        if unowned_value && result.is_ok() {
+            // Deferred engine calls have no value yet. Only a completed,
+            // unsaved value makes a later expression restart unsafe.
+            super::query::record_unowned_value();
         }
+        result
     };
     super::query::input_progress::value(
         super::query::input_progress::expression_site(expression),

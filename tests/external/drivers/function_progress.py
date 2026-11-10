@@ -189,8 +189,19 @@ def result_order(host, port, user, protocol):
                 SELECT NULL::bigint WHERE false $$""")
             empty = connection.execute("SELECT empty_value() IS NULL").fetchone()[0]
             assert empty is True
+            connection.execute("""CREATE FUNCTION lock_receipt() RETURNS integer LANGUAGE plpgsql AS $$
+                BEGIN RETURN 42; END$$""")
+            connection.execute("""SELECT pg_advisory_lock(301),pg_advisory_lock_shared(302),
+                pg_advisory_lock(303,1),pg_advisory_lock_shared(304,1)""")
+            unlocked = connection.execute("""SELECT pg_advisory_unlock(301),pg_advisory_unlock_shared(302),
+                pg_advisory_unlock(303,1),pg_advisory_unlock_shared(304,1),lock_receipt()""").fetchone()
+            assert unlocked == (True, True, True, True, 42), unlocked
+            connection.execute("SELECT pg_advisory_lock(305)")
+            unlocked_all = connection.execute("SELECT pg_advisory_unlock_all(),lock_receipt()").fetchone()
+            assert unlocked_all == ("", 42), unlocked_all
             print(json.dumps(dict(protocol=protocol, shape="result_order", first=1,
-                                  failed_row_sequence=2, written=[3,4], record_error="22003", empty=empty), sort_keys=True))
+                                  failed_row_sequence=2, written=[3,4], record_error="22003", empty=empty,
+                                  unlocked=unlocked, unlocked_all=unlocked_all), sort_keys=True))
         finally:
             connection.execute("DROP SCHEMA sql_result_order_driver CASCADE")
 

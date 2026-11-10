@@ -23523,10 +23523,6 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
     })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "nested writes preserve arguments, transitions, output and unfinished AFTER work"
-)]
 fn execute_nested_data_modification<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     statement: &'a Stmt<'a>,

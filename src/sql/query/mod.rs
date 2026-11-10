@@ -2045,10 +2045,6 @@ pub(crate) fn bind_stored_routine_statement<'a>(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "stored SQL retains its original namespace and dependency image"
-)]
 pub(crate) fn bind_routine_statement_source<'a>(
     statement: &'a Stmt<'a>,
     storage: &Storage,

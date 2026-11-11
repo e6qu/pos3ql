@@ -139,12 +139,12 @@ pub(super) fn build_column(
     txid: u32,
     arena: &Arena,
 ) -> Result<ColumnMeta, SqlError> {
-    if matches!(c.type_name, "record" | "record[]") {
+    if let Some(pseudo) = crate::sql::types::pseudo_type_column_name(c.type_name) {
         return Err(sql_err!(
             sqlstate::INVALID_TABLE_DEFINITION,
             "column \"{}\" has pseudo-type {}",
             c.name,
-            c.type_name
+            pseudo
         ));
     }
     // A base type resolves statically; an unknown name falls back to the

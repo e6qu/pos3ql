@@ -48451,6 +48451,14 @@ fn build_composite_spec(
                 field.name
             ));
         }
+        if let Some(pseudo) = crate::sql::types::pseudo_type_column_name(field.type_name) {
+            return Err(sql_err!(
+                sqlstate::INVALID_TABLE_DEFINITION,
+                "column \"{}\" has pseudo-type {}",
+                field.name,
+                pseudo
+            ));
+        }
         let (base_name, array) = field
             .type_name
             .strip_suffix("[]")

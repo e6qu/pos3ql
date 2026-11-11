@@ -100692,3 +100692,65 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
 }
 
 mod relation_input_granularity;
+
+#[test]
+fn pseudo_type_columns_fail_like_postgresql() {
+    let config = test_config("pseudo-type-columns");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // PostgreSQL 18.6 reports each pseudo-type by its formatted name.
+    for (sql, message) in [
+        (
+            "CREATE TABLE p(c cstring)",
+            "column \"c\" has pseudo-type cstring",
+        ),
+        (
+            "CREATE TABLE p(c cstring[])",
+            "column \"c\" has pseudo-type cstring",
+        ),
+        (
+            "CREATE TABLE p(c pg_catalog.cstring)",
+            "column \"c\" has pseudo-type cstring",
+        ),
+        (
+            "CREATE TABLE p(c anyelement)",
+            "column \"c\" has pseudo-type anyelement",
+        ),
+        (
+            "CREATE TABLE p(c \"any\")",
+            "column \"c\" has pseudo-type \"any\"",
+        ),
+        (
+            "CREATE TABLE p(c trigger)",
+            "column \"c\" has pseudo-type trigger",
+        ),
+        (
+            "CREATE TABLE p(c unknown)",
+            "column \"c\" has pseudo-type unknown",
+        ),
+        (
+            "CREATE TABLE p(c fdw_handler)",
+            "column \"c\" has pseudo-type fdw_handler",
+        ),
+        (
+            "CREATE TABLE p(c record[])",
+            "column \"c\" has pseudo-type record[]",
+        ),
+        (
+            "CREATE TYPE p AS (f event_trigger)",
+            "column \"f\" has pseudo-type event_trigger",
+        ),
+        (
+            "CREATE TABLE p(c int); ALTER TABLE p ADD COLUMN d anycompatible",
+            "column \"d\" has pseudo-type anycompatible",
+        ),
+    ] {
+        let output = session.execute(&mut engine, sql, false);
+        assert_eq!(error_sqlstates(&output), ["42P16"], "{sql}");
+        assert!(String::from_utf8_lossy(&output).contains(message), "{sql}");
+        session.execute(&mut engine, "DROP TABLE IF EXISTS p", false);
+    }
+    let output = session.execute(&mut engine, "CREATE TABLE p(c anyelement[])", false);
+    assert_eq!(error_sqlstates(&output), ["42704"]);
+}

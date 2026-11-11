@@ -23,6 +23,7 @@ mod composite_parameter_fields;
 mod constraint_index_identity;
 mod cursor_execution;
 mod deparsed_expressions;
+mod dependency_rows;
 mod drop_dependency_reports;
 mod error_report_fields;
 mod evaluation_timing;
@@ -50,6 +51,7 @@ mod procedural_expression_calls;
 mod procedural_progress;
 mod procedural_subtransactions;
 mod procedure_progress;
+mod pseudo_type_identities;
 mod query_execution;
 mod record_comparisons;
 mod relation_row_types;
@@ -16123,7 +16125,8 @@ fn cast_operator_dependencies_enforce_restrict_and_transactional_cascade() {
         &mut budget,
         "DROP OPERATOR public.%%(integer, integer)",
     );
-    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
+    let restricted = String::from_utf8_lossy(&restricted);
+    assert!(restricted.contains("2BP01"), "{restricted}");
     let dropped = run_with(
         &mut engine,
         &mut budget,

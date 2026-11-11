@@ -9396,6 +9396,12 @@ impl<'a> Parser<'a> {
             end: self.lexer.token_end(),
         };
         let mut quoted = matches!(self.peeked, Tok::QuotedIdent(_));
+        // A fully reserved word never names a type (`f(x any)`); `"any"` does.
+        if let Tok::Ident(word) = self.peeked
+            && keyword_category(word) == Some(Keyword::Reserved)
+        {
+            return Err(self.syntax_error_here());
+        }
         let mut name = self.any_ident("type name")?;
         let mut written = WrittenTypeName {
             schema: None,
@@ -10742,17 +10748,6 @@ impl<'a> Parser<'a> {
 
     fn err_here(&self, message: &'static str) -> ParseError {
         ParseError::new(self.peek_at, message)
-    }
-
-    /// [`Self::invalid_function_definition`] with formatted text.
-    fn invalid_function_definition_owned(
-        &self,
-        message: StackStr<PARSE_MESSAGE_BYTES>,
-    ) -> ParseError {
-        ParseError {
-            message,
-            ..self.invalid_function_definition("")
-        }
     }
 
     /// A CREATE FUNCTION definition error that PostgreSQL raises after

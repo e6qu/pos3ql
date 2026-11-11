@@ -269,6 +269,9 @@ impl Walker<'_> {
         for edge in self.edges {
             if !same_object(edge.dependent, object)
                 || (object.sub != 0 && edge.dependent.sub != object.sub)
+                // A sub-object's dependency on its own object (a partition
+                // key column on its table) never redirects the whole object.
+                || (object.sub == 0 && same_object(edge.referenced, object))
             {
                 continue;
             }

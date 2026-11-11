@@ -475,7 +475,8 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::PgDependencies
         | ColType::PgMcvList
         | ColType::PgStatisticArray
-        | ColType::Record => {
+        | ColType::Record
+        | ColType::Pseudo(_) => {
             return Err(corrupt());
         }
         ColType::Composite(_) => {
@@ -520,7 +521,9 @@ pub(crate) fn decode<'a>(
         // int2/float4/varchar/bpchar share the byte layout of their storage
         // type (int4/float8/text), so they decode through the same arm.
         match schema[i] {
-            ColType::Void | ColType::Internal | ColType::PgDdlCommand => return Err(corrupt()),
+            ColType::Void | ColType::Internal | ColType::PgDdlCommand | ColType::Pseudo(_) => {
+                return Err(corrupt());
+            }
             ColType::Int2Vector | ColType::OidVector => {
                 let length = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let len = u32::from_le_bytes(length.try_into().unwrap()) as usize;

@@ -61,7 +61,8 @@ Schemas and catalogs:
   send routine, an array's `array_subscript_handler`). Of `information_schema`'s
   types only its domains and their arrays are listed, not its views' row types.
 - `DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`, `FOREIGN TABLE`, `SEQUENCE`,
-  `FUNCTION`, `PROCEDURE`, `ROUTINE`, `TYPE`, `DOMAIN` and `SCHEMA` report
+  `FUNCTION`, `PROCEDURE`, `ROUTINE`, `TYPE`, `DOMAIN`, `SCHEMA`, `OPERATOR`
+  and `TEXT SEARCH` objects report
   dependent objects as PostgreSQL does, from the rows `pg_depend` lists:
   without `CASCADE`, one `2BP01` error whose `DETAIL` names every dependent
   (`column b of table orders depends on type amount`, `view totals depends on
@@ -73,6 +74,12 @@ Schemas and catalogs:
   and the hint naming its own `DROP` (`Use DROP VIEW to remove a view.`). The
   walk copies every `pg_depend` row into the statement arena; a catalog whose
   rows do not fit in `sql_arena_bytes` fails the `DROP` with `54000`.
+  `pg_depend` has PostgreSQL's rows for partition key columns, PL/pgSQL
+  routines' language, index and extended statistics key columns, and the
+  parsers, templates and dictionaries text search objects use, so dropping a
+  dictionary with `CASCADE` drops the configurations that map it
+  (`drop cascades to text search configuration tc`). A partition key column
+  or an inherited column cannot be dropped alone (`42P16`).
 - `information_schema` views can be queried, but their relation OIDs cannot:
   `'information_schema.columns'::regclass` and `to_regclass(...)` fail with
   `0A000` (`relation OIDs for information_schema views are not supported`).
@@ -436,10 +443,16 @@ Functions and expressions:
   the current database. Changes survive restart and
   are copied by `CREATE DATABASE ... TEMPLATE`. Each changed routine uses one
   of the `max_builtin_routine_entries` rows (default 64); running out fails
-  with `54000`. Limits: renaming or moving a built-in fails with `0A000`; a signature naming `cstring` or `"any"`
-  (`'int4in(cstring)'::regprocedure`, `GRANT ... ON FUNCTION
-  int4in(cstring)`) is not recognized (`42883`). Dropping a built-in fails
-  with `2BP01`, as in PostgreSQL.
+  with `54000`. A signature may name a pseudo-type, as in PostgreSQL:
+  `'int4in(cstring)'::regprocedure`, `GRANT EXECUTE ON FUNCTION
+  int4in(cstring) TO r` and `pg_identify_object` of `json_in(cstring)` work,
+  and `'"any"'::regtype` or `'_cstring'::regtype` name their catalog types.
+  A user-defined routine refuses pseudo-type arguments and results with
+  PostgreSQL's messages (`SQL functions cannot have arguments of type
+  cstring`). Limits: renaming or moving a built-in fails with `0A000`; values
+  of `cstring`, `"any"` and `unknown` (`SELECT 'abc'::cstring`) fail with
+  `0A000`, and a PL/pgSQL routine with a `record` argument fails with `0A000`.
+  Dropping a built-in fails with `2BP01`, as in PostgreSQL.
 - PostgreSQL 18.6's predefined roles exist from the start, with their
   OIDs, and initdb's memberships of `pg_monitor` in `pg_read_all_settings`,
   `pg_read_all_stats` and `pg_stat_scan_tables`. Like PostgreSQL, pos3ql

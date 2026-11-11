@@ -884,8 +884,25 @@ impl ColTypeResolver for CatalogCols<'_> {
         let result = routine
             .and_then(|routine| routine.function_result_contract())
             .or_else(|| {
-                if bound_oid.is_some() {
-                    return None;
+                // A stored query binds an aggregate call to its OID.
+                if let Some(oid) = bound_oid {
+                    // Its declared result is exact unless polymorphic.
+                    let slot = self.storage.routine_slot_by_oid(oid, self.txid)?;
+                    let crate::storage::RoutineKind::Aggregate(declared) =
+                        self.storage.routine_for(slot, self.txid).kind
+                    else {
+                        return None;
+                    };
+                    if declared.result_type.polymorphic_type().is_none() {
+                        return Some(declared.result_type);
+                    }
+                    let routine = self
+                        .storage
+                        .routine_for_bound_call(slot, arguments, self.txid)?;
+                    let crate::storage::RoutineKind::Aggregate(aggregate) = routine.kind else {
+                        return None;
+                    };
+                    return Some(aggregate.result_type);
                 }
                 self.storage
                     .aggregate_for_call_oids(name, arguments, self.txid)

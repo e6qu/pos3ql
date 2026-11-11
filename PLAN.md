@@ -355,9 +355,10 @@ behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: renaming or moving a
 built-in function fails with `0A000` where PostgreSQL changes the catalog
-entry (every built-in name lookup must consult a renamed or moved row); a routine signature naming `cstring` or `"any"` cannot be written
-(`GRANT ... ON FUNCTION int4in(cstring)` fails with `42883`) because those
-pseudo-types are not pos3ql column types, and `pg_type` lists all 473
+entry (every built-in name lookup must consult a renamed or moved row); values
+of the pseudo-types `cstring`, `"any"` and `unknown` (`SELECT 'abc'::cstring`)
+fail with `0A000` where PostgreSQL accepts them, and PL/pgSQL routines with
+`record` arguments fail with `0A000`; `pg_type` lists all 473
 `pg_catalog` types but of `information_schema`'s 148 only its domains and their
 arrays (the row types of its views, whose OIDs initdb assigns after importing
 the platform's collations, need the pinned reference image); a
@@ -448,17 +449,22 @@ changes and nested `CALL`, but rejects DDL and other utility statements with
 Relation row types: values and columns of a
 view's row type, and dropping a relation through `DROP SCHEMA`, `DROP
 MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
-column uses its row type, fail with `0A000`. `DROP` of casts, operators,
-operator classes and families, collations, text search objects, extensions,
-servers, policies, triggers, rules, indexes and `DROP OWNED` still describe
-their dependents with their own code instead of the `pg_depend` walk that
-`DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`, `SEQUENCE`, `FUNCTION`, `TYPE`,
-`DOMAIN` and `SCHEMA` share, and `pg_depend` still lacks PostgreSQL's rows for
-languages, column collations, index columns, TOAST tables, partition keys,
-`NOT NULL` constraints, the key columns of extended statistics, the parsers
-and templates of text search objects, types named only inside
+column uses its row type, fail with `0A000`. `DROP` of casts, operator
+classes and families, collations, extensions, servers, policies, triggers,
+rules, indexes and `DROP OWNED` still describe their dependents with their own
+code instead of the `pg_depend` walk that `DROP TABLE`, `VIEW`, `MATERIALIZED
+VIEW`, `SEQUENCE`, `FUNCTION`, `TYPE`, `DOMAIN`, `SCHEMA`, `OPERATOR` and text
+search objects share (`DROP SERVER` names neither the server nor its
+dependents); `pg_depend` has no rows
+for foreign servers, foreign tables and user mappings, and still lacks
+PostgreSQL's rows for
+columns using a user-defined collation, TOAST tables, types named only inside
 expressions (a cast in a default or routine body), and the column-level rows
-of rules and of views that read a sequence.
+of rules and of views that read a sequence. A partition key that is an
+expression (`PARTITION BY LIST ((k + v))`) fails with `42601`. A view that
+passes a function-alias column to an aggregate (`CREATE VIEW v AS SELECT
+agg(x) FROM generate_series(1, 3) x`) fails with `42704` because its column
+types are derived from its query on each use.
 Values and columns of a view's row type need the view's column types,
 which pos3ql derives from the view's query on each use instead of storing them
 as PostgreSQL's `pg_attribute` rows do. The

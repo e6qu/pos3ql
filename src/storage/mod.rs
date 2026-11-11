@@ -56318,7 +56318,8 @@ impl Storage {
         }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_FUNCTION,
-                "operator already exists with the same argument types"
+                "operator {} already exists",
+                definition.name.as_str()
             ));
         }
         if let Some(owner) = catalog.operators.iter().find_map(|candidate| {
@@ -56399,7 +56400,8 @@ impl Storage {
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_FUNCTION,
-                "operator already exists with the same argument types"
+                "operator {} already exists",
+                definition.name.as_str()
             ));
         }
         let slot = identity.slot();
@@ -56468,7 +56470,8 @@ impl Storage {
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_FUNCTION,
-                "operator already exists with the same argument types"
+                "operator {} already exists",
+                definition.name.as_str()
             ));
         }
         if let Some(owner) = catalog

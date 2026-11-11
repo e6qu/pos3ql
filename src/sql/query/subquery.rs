@@ -2616,7 +2616,7 @@ pub(super) fn correlated_where_passes<'a>(
 /// (no spurious error), matching that these accept an unknown literal as-is.
 pub(crate) fn type_witness(ct: ColType) -> Result<Datum<'static>, SqlError> {
     Ok(match ct {
-        ColType::Void | ColType::Internal => Datum::Null,
+        ColType::Void | ColType::Internal | ColType::Pseudo(_) => Datum::Null,
         ColType::PgDdlCommand => Datum::PgDdlCommand,
         ColType::AnyArray => Datum::Null,
         // An empty record: enough for coerce_unknown to leave values alone.

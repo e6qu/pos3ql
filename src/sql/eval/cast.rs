@@ -202,7 +202,29 @@ pub(crate) fn validate_catalog_reference_cast(
     Ok(())
 }
 
+/// A value of a routine-contract pseudo-type. PostgreSQL's input functions
+/// for triggers and handlers refuse every value, NULL included; `cstring`,
+/// `"any"` and `unknown` values are not modeled.
+pub(crate) fn pseudo_type_value(kind: crate::sql::types::PseudoType) -> SqlError {
+    use crate::sql::types::PseudoType;
+    match kind {
+        PseudoType::Cstring | PseudoType::Any | PseudoType::Unknown => sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "values of type {} are not supported",
+            kind.display_name()
+        ),
+        _ => sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot accept a value of type {}",
+            kind.display_name()
+        ),
+    }
+}
+
 pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    if let ColType::Pseudo(kind) = target {
+        return Err(pseudo_type_value(kind));
+    }
     if v.is_null() {
         return Ok(Datum::Null);
     }
@@ -225,6 +247,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             _ => return Err(cast_unsupported(&v, "pg_ddl_command")),
         },
         ColType::AnyArray => return Err(cast_unsupported(&v, "anyarray")),
+        ColType::Pseudo(kind) => return Err(pseudo_type_value(kind)),
         ColType::Refcursor => match v {
             Datum::Text(_) => v,
             _ => return Err(cast_unsupported(&v, "refcursor")),
@@ -318,7 +341,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         },
         ColType::Regtype => match v {
             Datum::Regtype { .. } => v,
-            Datum::Text(name) => super::regtype_of_name(name)?,
+            Datum::Text(name) => super::regtype_of_name(name, arena)?,
             Datum::Oid(oid) => super::regtype_of_oid(i64::from(oid), arena)?,
             Datum::Int4(oid) => super::regtype_of_oid(i64::from(oid), arena)?,
             Datum::Int8(oid) => super::regtype_of_oid(oid, arena)?,

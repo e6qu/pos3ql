@@ -159,6 +159,15 @@ const INTERNAL_LANGUAGE_OID: i32 = 12;
 const C_LANGUAGE_OID: i32 = 13;
 const SQL_LANGUAGE_OID: i32 = 14;
 const PLPGSQL_LANGUAGE_OID: i32 = 13_563;
+/// `pg_proc.prolang` of a stored routine.
+pub(crate) const fn routine_language_oid(language: crate::storage::RoutineLanguage) -> i32 {
+    match language {
+        crate::storage::RoutineLanguage::Sql => SQL_LANGUAGE_OID,
+        crate::storage::RoutineLanguage::PlPgSql => PLPGSQL_LANGUAGE_OID,
+        crate::storage::RoutineLanguage::Internal => INTERNAL_LANGUAGE_OID,
+    }
+}
+
 const PROCEDURAL_LANGUAGES: [(&str, i32); 4] = [
     ("internal", INTERNAL_LANGUAGE_OID),
     ("c", C_LANGUAGE_OID),
@@ -1589,7 +1598,9 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     ),
     intrinsic!(3403, "pg_statistics_obj_is_visible", 16, "26", 1, "s"),
     intrinsic!(3537, "pg_describe_object", 25, "26 26 23", 3, "s"),
+    intrinsic!(3756, "pg_ts_parser_is_visible", 16, "26", 1, "s"),
     intrinsic!(3757, "pg_ts_dict_is_visible", 16, "26", 1, "s"),
+    intrinsic!(3768, "pg_ts_template_is_visible", 16, "26", 1, "s"),
     intrinsic!(3758, "pg_ts_config_is_visible", 16, "26", 1, "s"),
     intrinsic!(3829, "pg_opfamily_is_visible", 16, "26", 1, "s"),
     intrinsic!(3839, "pg_identify_object", 2249, "26 26 23", 3, "s"),
@@ -13831,20 +13842,6 @@ pub(crate) fn text_search_oid_visibility(
     Some(storage.text_search_slot_on_path(kind, None, object.name().as_str(), txid) == Some(slot))
 }
 
-pub(crate) fn intrinsic_routine_event_identity(
-    oid: i32,
-) -> Option<(&'static str, &'static str, &'static str)> {
-    let routine = INTRINSIC_ROUTINES
-        .iter()
-        .find(|routine| routine.oid == oid)?;
-    let object_type = if intrinsic_routine_kind(*routine) == "a" {
-        "aggregate"
-    } else {
-        "function"
-    };
-    Some((routine.name, routine.argument_types, object_type))
-}
-
 fn identifier_spelling_matches(written: &str, name: &str) -> bool {
     let written = written.trim();
     if let Some(inner) = written
@@ -14058,9 +14055,8 @@ fn parse_routine_signature<'a>(
             if written_type.is_empty() || count == arguments.len() {
                 return None;
             }
-            let written_type = written_type
-                .strip_prefix("pg_catalog.")
-                .unwrap_or(written_type);
+            let normalized = crate::sql::eval::normalize_written_type_name(written_type).ok()?;
+            let written_type = normalized.as_str();
             let resolved = if let Some(ctype) = routine_builtin_type(written_type) {
                 crate::storage::RoutineResult::builtin(ctype)
             } else {
@@ -27708,11 +27704,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(storage.role_oid(routine.ownership.owner_to(txid) as usize)),
                 Datum::Bool(routine.attributes.security_definer),
                 acl(storage, Storage::routine_access_object(slot), txid, arena)?,
-                Datum::Int4(match routine.language {
-                    crate::storage::RoutineLanguage::Sql => 14,
-                    crate::storage::RoutineLanguage::PlPgSql => 13563,
-                    crate::storage::RoutineLanguage::Internal => 12,
-                }),
+                Datum::Int4(routine_language_oid(routine.language)),
                 text(
                     if matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_)) {
                         "aggregate_dummy"

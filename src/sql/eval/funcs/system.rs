@@ -10,7 +10,7 @@
 //! `format_type`, `pg_encoding_to_char`, and `pg_typeof`.
 
 use crate::sql::array;
-use crate::sql::ast::Expr;
+use crate::sql::ast::{Expr, TextSearchObjectKind};
 use crate::sql::exec;
 use crate::sql::types::{ArrElem, ColType, Datum, TypeMod};
 use crate::sql_err;
@@ -826,8 +826,10 @@ fn schema_object_description<'a>(
         3456 => catalog.collation_is_visible(object_id),
         2607 => catalog.conversion_is_visible(object_id),
         3381 => catalog.statistics_object_is_visible(object_id),
-        3600 => catalog.text_search_dictionary_is_visible(object_id),
-        3602 => catalog.text_search_configuration_is_visible(object_id),
+        3601 => catalog.text_search_is_visible(object_id, TextSearchObjectKind::Parser),
+        3764 => catalog.text_search_is_visible(object_id, TextSearchObjectKind::Template),
+        3600 => catalog.text_search_is_visible(object_id, TextSearchObjectKind::Dictionary),
+        3602 => catalog.text_search_is_visible(object_id, TextSearchObjectKind::Configuration),
         _ => return Ok(None),
     };
     let (Some(visible), 2) = (visible, object.address_name_count) else {
@@ -1084,6 +1086,8 @@ pub(crate) const CATALOG_PREDICATES: &[(&str, CatalogPredicateKind)] = &[
     ("pg_opfamily_is_visible", CatalogPredicateKind::Object),
     ("pg_conversion_is_visible", CatalogPredicateKind::Object),
     ("pg_statistics_obj_is_visible", CatalogPredicateKind::Object),
+    ("pg_ts_parser_is_visible", CatalogPredicateKind::Object),
+    ("pg_ts_template_is_visible", CatalogPredicateKind::Object),
     ("pg_ts_dict_is_visible", CatalogPredicateKind::Object),
     ("pg_ts_config_is_visible", CatalogPredicateKind::Object),
     ("pg_relation_is_publishable", CatalogPredicateKind::Object),
@@ -2238,8 +2242,18 @@ pub(crate) fn dispatch<'a>(
                     "pg_opfamily_is_visible" => cat.operator_family_is_visible(oid.0),
                     "pg_conversion_is_visible" => cat.conversion_is_visible(oid.0),
                     "pg_statistics_obj_is_visible" => cat.statistics_object_is_visible(oid.0),
-                    "pg_ts_dict_is_visible" => cat.text_search_dictionary_is_visible(oid.0),
-                    "pg_ts_config_is_visible" => cat.text_search_configuration_is_visible(oid.0),
+                    "pg_ts_parser_is_visible" => {
+                        cat.text_search_is_visible(oid.0, TextSearchObjectKind::Parser)
+                    }
+                    "pg_ts_template_is_visible" => {
+                        cat.text_search_is_visible(oid.0, TextSearchObjectKind::Template)
+                    }
+                    "pg_ts_dict_is_visible" => {
+                        cat.text_search_is_visible(oid.0, TextSearchObjectKind::Dictionary)
+                    }
+                    "pg_ts_config_is_visible" => {
+                        cat.text_search_is_visible(oid.0, TextSearchObjectKind::Configuration)
+                    }
                     "pg_relation_is_publishable" => cat.relation_is_publishable(oid.0),
                     _ => unreachable!(),
                 }
@@ -3019,7 +3033,9 @@ pub(crate) fn dispatch<'a>(
                             name: rendered,
                         });
                     }
-                    return match super::super::regtype_of_name(type_name) {
+                    return match super::super::regtype_of_normalized_name(
+                        type_name, type_name, arena,
+                    ) {
                         Ok(value) => Ok(value),
                         Err(error) if error.sqlstate == sqlstate::UNDEFINED_OBJECT => {
                             Ok(Datum::Null)

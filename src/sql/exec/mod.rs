@@ -2236,6 +2236,54 @@ pub fn create_foreign_server(
     sql_ok()
 }
 
+/// `format_type_be` of a type OID, without the statement arena.
+fn type_display_fixed(
+    storage: &Storage,
+    txid: u32,
+    type_oid: i32,
+) -> Result<StackStr<260>, SqlError> {
+    super::catalog::user_type_name_fixed(storage, txid, type_oid)?
+        .or_else(|| describe::builtin_type_name_fixed(type_oid))
+        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "type {} has no name", type_oid))
+}
+
+/// PostgreSQL's `cast from type X to type Y does not exist`.
+fn missing_cast_message(
+    storage: &Storage,
+    txid: u32,
+    source: crate::storage::RoutineResult,
+    target: crate::storage::RoutineResult,
+) -> Result<StackStr<600>, SqlError> {
+    let name = |result: crate::storage::RoutineResult| {
+        let oid = storage
+            .routine_type_oid(result.ctype, result.user_type, txid)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "cast type has no identity"))?;
+        type_display_fixed(storage, txid, oid)
+    };
+    Ok(stack_format!(
+        600,
+        "cast from type {} to type {} does not exist",
+        name(source)?.as_str(),
+        name(target)?.as_str()
+    ))
+}
+
+/// PostgreSQL's `MappingUserName`: `public` or the role's name.
+fn mapping_user_name(
+    storage: &Storage,
+    user: crate::storage::foreign::ForeignMappingUser,
+    txid: u32,
+) -> SqlName {
+    match user {
+        crate::storage::foreign::ForeignMappingUser::Public => {
+            SqlName::parse("public").expect("public fits an identifier")
+        }
+        crate::storage::foreign::ForeignMappingUser::Role(role) => {
+            storage.role_name(usize::from(role), txid)
+        }
+    }
+}
+
 fn resolve_foreign_mapping_user(
     storage: &Storage,
     user: super::ast::ForeignUser<'_>,
@@ -2815,7 +2863,8 @@ pub fn alter_user_mapping(
     else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
-            "user mapping does not exist for server \"{}\"",
+            "user mapping for \"{}\" does not exist for server \"{}\"",
+            mapping_user_name(storage, user, txn.txid).as_str(),
             command.server
         ));
     };
@@ -2885,6 +2934,19 @@ pub fn drop_user_mapping(
     responder: &mut Responder,
 ) -> Outcome {
     let Some((server_slot, _)) = storage.foreign_server(command.server, txn.txid) else {
+        if command.if_exists {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(
+                    128,
+                    "server \"{}\" does not exist, skipping",
+                    command.server
+                )
+                .as_str(),
+            )?;
+            responder.command_complete("DROP USER MAPPING")?;
+            return sql_ok();
+        }
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
             "server \"{}\" does not exist",
@@ -2899,17 +2961,25 @@ pub fn drop_user_mapping(
         return sql_fail(error);
     }
     let Some((slot, _)) = storage.foreign_user_mapping(server_slot as u16, user, txn.txid) else {
+        let user_name = mapping_user_name(storage, user, txn.txid);
         if command.if_exists {
             responder.notice(
-                sqlstate::UNDEFINED_OBJECT,
-                "user mapping does not exist for server, skipping",
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(
+                    200,
+                    "user mapping for \"{}\" does not exist for server \"{}\", skipping",
+                    user_name.as_str(),
+                    command.server
+                )
+                .as_str(),
             )?;
             responder.command_complete("DROP USER MAPPING")?;
             return sql_ok();
         }
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
-            "user mapping does not exist for server \"{}\"",
+            "user mapping for \"{}\" does not exist for server \"{}\"",
+            user_name.as_str(),
             command.server
         ));
     };
@@ -3061,7 +3131,7 @@ pub fn drop_foreign_server(
         let Some((slot, _)) = storage.foreign_server(name, txn.txid) else {
             if if_exists {
                 responder.notice(
-                    sqlstate::UNDEFINED_OBJECT,
+                    sqlstate::SUCCESSFUL_COMPLETION,
                     stack_format!(128, "server \"{}\" does not exist, skipping", name).as_str(),
                 )?;
                 continue;
@@ -3104,7 +3174,7 @@ pub fn drop_foreign_data_wrapper(
         let Some((slot, _)) = storage.foreign_wrapper(name, txn.txid) else {
             if if_exists {
                 responder.notice(
-                    sqlstate::UNDEFINED_OBJECT,
+                    sqlstate::SUCCESSFUL_COMPLETION,
                     stack_format!(
                         128,
                         "foreign-data wrapper \"{}\" does not exist, skipping",
@@ -9908,7 +9978,7 @@ pub fn drop_role(
         let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
             if if_exists {
                 responder.notice(
-                    sqlstate::UNDEFINED_OBJECT,
+                    sqlstate::SUCCESSFUL_COMPLETION,
                     stack_format!(
                         128,
                         "role \"{}\" does not exist, skipping",
@@ -15930,6 +16000,18 @@ pub(crate) fn drop_schema(
                     }
                 }
                 SchemaObject::Domain(domain) => {
+                    // Casts, operators and routines on the domain go with it.
+                    let selected = match arena
+                        .alloc_slice_with(storage.domain_count(), |slot| slot == *domain)
+                    {
+                        Ok(selected) => selected,
+                        Err(_) => return sql_fail(arena_full()),
+                    };
+                    if let Err(error) = drop_type_dependent_routines(
+                        storage, wal, txn, selected, None, None, true, arena, responder,
+                    ) {
+                        return sql_fail(error);
+                    }
                     let domain = storage.domain_for(*domain, txn.txid);
                     let (schema, name) = (domain.schema, domain.name);
                     let lsn = storage.bump_lsn();
@@ -15965,6 +16047,20 @@ pub(crate) fn drop_schema(
                     }
                 }
                 SchemaObject::Enum(enumeration) => {
+                    // Casts, operators and routines on the type go with it.
+                    if let Err(error) = drop_type_dependent_routines(
+                        storage,
+                        wal,
+                        txn,
+                        &[],
+                        Some(*enumeration),
+                        None,
+                        true,
+                        arena,
+                        responder,
+                    ) {
+                        return sql_fail(error);
+                    }
                     let enumeration = storage.enum_for(*enumeration, txn.txid);
                     let (schema, name) = (enumeration.schema, enumeration.name);
                     let lsn = storage.bump_lsn();
@@ -37174,7 +37270,7 @@ pub fn drop_event_trigger(
     let Some(slot) = storage.event_trigger_slot(name, txn.txid) else {
         if if_exists {
             responder.notice(
-                sqlstate::UNDEFINED_OBJECT,
+                sqlstate::SUCCESSFUL_COMPLETION,
                 stack_format!(128, "event trigger \"{}\" does not exist, skipping", name).as_str(),
             )?;
             responder.command_complete("DROP EVENT TRIGGER")?;
@@ -39048,12 +39144,12 @@ pub(crate) fn create_cast(
     };
     if result_is_domain(storage, source, txn.txid) {
         responder.warning(
-            sqlstate::WARNING,
+            sqlstate::WRONG_OBJECT_TYPE,
             "cast will be ignored because the source data type is a domain",
         )?;
     } else if result_is_domain(storage, target, txn.txid) {
         responder.warning(
-            sqlstate::WARNING,
+            sqlstate::WRONG_OBJECT_TYPE,
             "cast will be ignored because the target data type is a domain",
         )?;
     }
@@ -39138,10 +39234,25 @@ pub(crate) fn drop_cast(
     };
     let Some(slot) = storage.cast_slot(source, target, txn.txid) else {
         if cast.if_exists {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(
+                    600,
+                    "cast from type {} to type {} does not exist, skipping",
+                    cast.source_written,
+                    cast.target_written
+                )
+                .as_str(),
+            )?;
             responder.command_complete("DROP CAST")?;
             return sql_ok();
         }
-        return sql_fail(sql_err!(sqlstate::UNDEFINED_OBJECT, "cast does not exist"));
+        return sql_fail(
+            match missing_cast_message(storage, txn.txid, source, target) {
+                Ok(message) => sql_err!(sqlstate::UNDEFINED_OBJECT, "{}", message.as_str()),
+                Err(error) => error,
+            },
+        );
     };
     if !current_role_owns_type(storage, txn.txid, source)
         && !current_role_owns_type(storage, txn.txid, target)
@@ -39407,7 +39518,8 @@ pub(crate) fn create_operator(
             Some(_) => {
                 return sql_fail(sql_err!(
                     sqlstate::DUPLICATE_FUNCTION,
-                    "operator already exists with the same argument types"
+                    "operator {} already exists",
+                    operator.name.name
                 ));
             }
             None => match storage.create_operator(definition, txn.txid) {
@@ -40722,37 +40834,18 @@ fn drop_text_search_slot(
         let Some(dependent) = dependent else { break };
         drop_text_search_slot(storage, wal, txn, dependent, true, arena)?;
     }
-    if let crate::storage::TextSearchDefinition::Dictionary { oid, .. } = root {
-        loop {
-            let config_slot = storage.text_search_objects_visible_to(txn.txid).find_map(
-                |(candidate_slot, candidate)| {
-                    mapped_dependent(candidate_slot, candidate).then_some(candidate_slot)
-                },
-            );
-            let Some(config_slot) = config_slot else {
-                break;
-            };
-            let mut config = storage
-                .text_search_object(config_slot)
-                .definition_for(txn.txid);
-            let crate::storage::TextSearchDefinition::Configuration { mappings, .. } = &mut config
-            else {
-                unreachable!("mapped configuration invariant")
-            };
-            for token in 0..crate::storage::TEXT_SEARCH_TOKEN_TYPES {
-                let count = mappings.counts[token] as usize;
-                let mut write = 0usize;
-                for read in 0..count {
-                    if mappings.dictionaries[token][read] != oid {
-                        mappings.dictionaries[token][write] = mappings.dictionaries[token][read];
-                        write += 1;
-                    }
-                }
-                mappings.dictionaries[token][write..].fill(0);
-                mappings.counts[token] = write as u8;
-            }
-            stage_text_search_alter(storage, wal, txn, config_slot, config)?;
-        }
+    // A configuration depends on every dictionary its mappings name, so it
+    // goes with the dictionary, as PostgreSQL's dependency walk drops it.
+    loop {
+        let config_slot = storage.text_search_objects_visible_to(txn.txid).find_map(
+            |(candidate_slot, candidate)| {
+                mapped_dependent(candidate_slot, candidate).then_some(candidate_slot)
+            },
+        );
+        let Some(config_slot) = config_slot else {
+            break;
+        };
+        drop_text_search_slot(storage, wal, txn, config_slot, true, arena)?;
     }
     stage_text_search_drop(storage, wal, txn, slot)
 }
@@ -40773,7 +40866,7 @@ pub fn drop_text_search(
     else {
         if if_exists {
             responder.notice(
-                sqlstate::UNDEFINED_OBJECT,
+                sqlstate::SUCCESSFUL_COMPLETION,
                 stack_format!(
                     128,
                     "{} \"{}\" does not exist, skipping",
@@ -40807,16 +40900,34 @@ pub fn drop_text_search(
     if let Err(error) = authority {
         return sql_fail(error);
     }
-    if let Err(error) = drop_text_search_slot(storage, wal, txn, slot, cascade, arena) {
-        return sql_fail(error);
-    }
-    responder.command_complete(match kind {
-        crate::sql::ast::TextSearchObjectKind::Parser => "DROP TEXT SEARCH PARSER",
-        crate::sql::ast::TextSearchObjectKind::Template => "DROP TEXT SEARCH TEMPLATE",
-        crate::sql::ast::TextSearchObjectKind::Dictionary => "DROP TEXT SEARCH DICTIONARY",
-        crate::sql::ast::TextSearchObjectKind::Configuration => "DROP TEXT SEARCH CONFIGURATION",
-    })?;
-    sql_ok()
+    let class = match kind {
+        crate::sql::ast::TextSearchObjectKind::Parser => super::catalog::PG_TS_PARSER_OID,
+        crate::sql::ast::TextSearchObjectKind::Template => super::catalog::PG_TS_TEMPLATE_OID,
+        crate::sql::ast::TextSearchObjectKind::Dictionary => super::catalog::PG_TS_DICT_OID,
+        crate::sql::ast::TextSearchObjectKind::Configuration => super::catalog::PG_TS_CONFIG_OID,
+    };
+    let report = dependency_report::report_drop(
+        storage,
+        txn.txid,
+        &[ObjectAddress::new(class, definition.oid(), 0)],
+        cascade,
+        arena,
+        responder,
+    );
+    run_reported_drop(report, responder, |responder| {
+        if let Err(error) = drop_text_search_slot(storage, wal, txn, slot, cascade, arena) {
+            return sql_fail(error);
+        }
+        responder.command_complete(match kind {
+            crate::sql::ast::TextSearchObjectKind::Parser => "DROP TEXT SEARCH PARSER",
+            crate::sql::ast::TextSearchObjectKind::Template => "DROP TEXT SEARCH TEMPLATE",
+            crate::sql::ast::TextSearchObjectKind::Dictionary => "DROP TEXT SEARCH DICTIONARY",
+            crate::sql::ast::TextSearchObjectKind::Configuration => {
+                "DROP TEXT SEARCH CONFIGURATION"
+            }
+        })?;
+        sql_ok()
+    })
 }
 
 pub fn alter_collation(
@@ -40994,7 +41105,7 @@ pub(crate) fn drop_collation(
     let Some(slot) = storage.collation_slot_on_path(name.schema, name.name, txn.txid) else {
         if if_exists {
             responder.notice(
-                sqlstate::UNDEFINED_OBJECT,
+                sqlstate::SUCCESSFUL_COMPLETION,
                 stack_format!(128, "collation \"{}\" does not exist, skipping", name.name).as_str(),
             )?;
             responder.command_complete("DROP COLLATION")?;
@@ -41297,7 +41408,7 @@ pub fn drop_conversion(
     let Some(slot) = storage.conversion_slot_on_path(name.schema, name.name, txn.txid) else {
         if if_exists {
             responder.notice(
-                sqlstate::UNDEFINED_OBJECT,
+                sqlstate::SUCCESSFUL_COMPLETION,
                 stack_format!(128, "conversion \"{}\" does not exist, skipping", name.name)
                     .as_str(),
             )?;
@@ -41600,68 +41711,148 @@ pub(crate) fn drop_operators(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    for identity in identities {
-        let (slot, _) = match resolve_operator_identity(storage, txn.txid, *identity) {
-            Ok(found) => found,
-            Err(error) if if_exists && error.sqlstate == sqlstate::UNDEFINED_FUNCTION => {
-                responder.notice(
-                    sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(
-                        160,
-                        "operator {} does not exist, skipping",
-                        identity.name.name
-                    )
-                    .as_str(),
-                )?;
-                continue;
-            }
-            Err(error) => return sql_fail(error),
-        };
-        let definition = storage.operator_for(slot, txn.txid);
-        if let Err(error) = storage.require_catalog_owner(
-            definition.owner,
-            txn.txid,
-            "operator",
-            definition.name.as_str(),
-        ) {
-            return sql_fail(error);
-        }
-        let operator_oid = storage.operator(slot).oid();
-        let StoredDependencyClosure {
-            views: dependent_views,
-            matviews: dependent_matviews,
-            routines: dependent_routines,
-            rules: dependent_rules,
-        } = match stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
-            dependency.class == crate::storage::DependencyClass::Operator
-                && matches!(
-                    dependency.identity,
-                    crate::storage::StoredDependencyIdentity::OperatorOid(oid)
-                        if oid == operator_oid
+    let report = (|| {
+        let originals = arena
+            .alloc_slice_with(identities.len(), |_| DROPPED_NOTHING)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for identity in identities {
+            let slot = match resolve_operator_identity(storage, txn.txid, *identity) {
+                Ok((slot, _)) => slot,
+                Err(error) if if_exists && error.sqlstate == sqlstate::UNDEFINED_FUNCTION => {
+                    responder
+                        .notice(
+                            sqlstate::SUCCESSFUL_COMPLETION,
+                            stack_format!(
+                                160,
+                                "operator {} does not exist, skipping",
+                                identity.name.name
+                            )
+                            .as_str(),
+                        )
+                        .map_err(|_| {
+                            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "response buffer full")
+                        })?;
+                    continue;
+                }
+                // The executor below reports the missing operator.
+                Err(_) => return Ok(None),
+            };
+            let definition = storage.operator_for(slot, txn.txid);
+            if storage
+                .require_catalog_owner(
+                    definition.owner,
+                    txn.txid,
+                    "operator",
+                    definition.name.as_str(),
                 )
-        }) {
-            Ok(dependents) => dependents,
-            Err(error) => return sql_fail(error),
-        };
-        let policy_root = PolicyDependencySelection::Catalog {
-            class: crate::storage::DependencyClass::Operator,
-            slot,
-        };
-        let has_stored_dependents = dependent_views.iter().any(|selected| *selected)
-            || dependent_matviews.iter().any(|selected| *selected)
-            || dependent_routines.iter().any(|selected| *selected)
-            || dependent_rules.iter().any(|selected| *selected)
-            || policy_dependents_exist(
-                storage,
-                txn.txid,
-                policy_root,
-                dependent_views,
-                dependent_matviews,
-                dependent_routines,
+                .is_err()
+            {
+                return Ok(None);
+            }
+            originals[count] = ObjectAddress::new(
+                super::catalog::PG_OPERATOR_OID,
+                storage.operator(slot).oid(),
+                0,
             );
-        if (operator_has_dependents(storage, txn.txid, operator_oid) || has_stored_dependents)
-            && !cascade
-        {
+            count += 1;
+        }
+        dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &originals[..count],
+            cascade,
+            arena,
+            responder,
+        )
+    })();
+    run_reported_drop(report, responder, |responder| {
+        for identity in identities {
+            let (slot, _) = match resolve_operator_identity(storage, txn.txid, *identity) {
+                Ok(found) => found,
+                // The dependency report sent the skip notice.
+                Err(error) if if_exists && error.sqlstate == sqlstate::UNDEFINED_FUNCTION => {
+                    continue;
+                }
+                Err(error) => return sql_fail(error),
+            };
+            let definition = storage.operator_for(slot, txn.txid);
+            if let Err(error) = storage.require_catalog_owner(
+                definition.owner,
+                txn.txid,
+                "operator",
+                definition.name.as_str(),
+            ) {
+                return sql_fail(error);
+            }
+            let operator_oid = storage.operator(slot).oid();
+            let StoredDependencyClosure {
+                views: dependent_views,
+                matviews: dependent_matviews,
+                routines: dependent_routines,
+                rules: dependent_rules,
+            } = match stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
+                dependency.class == crate::storage::DependencyClass::Operator
+                    && matches!(
+                        dependency.identity,
+                        crate::storage::StoredDependencyIdentity::OperatorOid(oid)
+                            if oid == operator_oid
+                    )
+            }) {
+                Ok(dependents) => dependents,
+                Err(error) => return sql_fail(error),
+            };
+            let policy_root = PolicyDependencySelection::Catalog {
+                class: crate::storage::DependencyClass::Operator,
+                slot,
+            };
+            let has_stored_dependents = dependent_views.iter().any(|selected| *selected)
+                || dependent_matviews.iter().any(|selected| *selected)
+                || dependent_routines.iter().any(|selected| *selected)
+                || dependent_rules.iter().any(|selected| *selected)
+                || policy_dependents_exist(
+                    storage,
+                    txn.txid,
+                    policy_root,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
+                );
+            if (operator_has_dependents(storage, txn.txid, operator_oid) || has_stored_dependents)
+                && !cascade
+            {
+                if has_stored_dependents
+                    && let Err(error) = report_stored_query_dependents(
+                        storage,
+                        txn.txid,
+                        StoredQueryRoot {
+                            class: crate::storage::DependencyClass::Operator,
+                            slot,
+                            kind: "operator",
+                            schema: definition.schema,
+                            name: definition.name,
+                            suffix: crate::util::StackStr::new(),
+                        },
+                        StoredQuerySelection {
+                            views: dependent_views,
+                            matviews: dependent_matviews,
+                            routines: dependent_routines,
+                            rules: dependent_rules,
+                            policy_root: Some(policy_root),
+                        },
+                        false,
+                        arena,
+                        responder,
+                    )
+                {
+                    return sql_fail(error);
+                }
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop operator {} because other objects depend on it",
+                    definition.name.as_str()
+                ));
+            }
             if has_stored_dependents
                 && let Err(error) = report_stored_query_dependents(
                     storage,
@@ -41681,54 +41872,25 @@ pub(crate) fn drop_operators(
                         rules: dependent_rules,
                         policy_root: Some(policy_root),
                     },
-                    false,
+                    true,
                     arena,
                     responder,
                 )
             {
                 return sql_fail(error);
             }
-            return sql_fail(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop operator {} because other objects depend on it",
-                definition.name.as_str()
-            ));
+            if let Err(error) =
+                cascade_operator_dependencies(storage, wal, txn, operator_oid, arena)
+            {
+                return sql_fail(error);
+            }
+            if let Err(error) = stage_operator_drop(storage, wal, txn, slot) {
+                return sql_fail(error);
+            }
         }
-        if has_stored_dependents
-            && let Err(error) = report_stored_query_dependents(
-                storage,
-                txn.txid,
-                StoredQueryRoot {
-                    class: crate::storage::DependencyClass::Operator,
-                    slot,
-                    kind: "operator",
-                    schema: definition.schema,
-                    name: definition.name,
-                    suffix: crate::util::StackStr::new(),
-                },
-                StoredQuerySelection {
-                    views: dependent_views,
-                    matviews: dependent_matviews,
-                    routines: dependent_routines,
-                    rules: dependent_rules,
-                    policy_root: Some(policy_root),
-                },
-                true,
-                arena,
-                responder,
-            )
-        {
-            return sql_fail(error);
-        }
-        if let Err(error) = cascade_operator_dependencies(storage, wal, txn, operator_oid, arena) {
-            return sql_fail(error);
-        }
-        if let Err(error) = stage_operator_drop(storage, wal, txn, slot) {
-            return sql_fail(error);
-        }
-    }
-    responder.command_complete("DROP OPERATOR")?;
-    sql_ok()
+        responder.command_complete("DROP OPERATOR")?;
+        sql_ok()
+    })
 }
 
 fn empty_operator_family(
@@ -42866,6 +43028,54 @@ pub(crate) struct ResolvedRoutineDeclaration {
     replaced: Option<usize>,
 }
 
+/// PostgreSQL's language validators accept a pseudo-type result only for
+/// `record`, `void` and polymorphic types (`trigger` and `event_trigger`
+/// results are their own routine kinds).
+fn check_routine_result_type(
+    language: RoutineLanguage,
+    result: crate::storage::RoutineResult,
+) -> Result<(), SqlError> {
+    if !result.ctype.is_pseudo() || matches!(result.ctype, ColType::Record | ColType::Void) {
+        return Ok(());
+    }
+    Err(match language {
+        RoutineLanguage::Sql => sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "SQL functions cannot return type {}",
+            result.ctype.name()
+        ),
+        RoutineLanguage::PlPgSql => sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "PL/pgSQL functions cannot return type {}",
+            result.ctype.name()
+        ),
+    })
+}
+
+/// SQL functions accept no pseudo-type argument; PL/pgSQL accepts `record`.
+/// Polymorphic arguments are not pseudo [`ColType`]s.
+fn check_routine_argument_type(
+    language: RoutineLanguage,
+    argument: crate::storage::RoutineResult,
+) -> Result<(), SqlError> {
+    if !argument.ctype.is_pseudo() {
+        return Ok(());
+    }
+    match language {
+        RoutineLanguage::Sql => Err(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "SQL functions cannot have arguments of type {}",
+            argument.ctype.name()
+        )),
+        RoutineLanguage::PlPgSql if argument.ctype == ColType::Record => Ok(()),
+        RoutineLanguage::PlPgSql => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "PL/pgSQL functions cannot accept type {}",
+            argument.ctype.name()
+        )),
+    }
+}
+
 pub(crate) fn resolve_routine_declaration(
     storage: &Storage,
     txn: &TxnState,
@@ -42886,13 +43096,19 @@ pub(crate) fn resolve_routine_declaration(
         RoutineLanguage::PlPgSql => "plpgsql",
     };
     storage.require_language_usage(language_name, txn.txid)?;
-    if matches!(routine.kind, super::ast::RoutineCreateKind::Trigger)
-        && routine.language != RoutineLanguage::PlPgSql
-    {
-        return Err(sql_err!(
-            sqlstate::INVALID_FUNCTION_DEFINITION,
-            "trigger functions require LANGUAGE plpgsql"
-        ));
+    if routine.language == RoutineLanguage::Sql {
+        let result = match routine.kind {
+            super::ast::RoutineCreateKind::Trigger => Some("trigger"),
+            super::ast::RoutineCreateKind::EventTrigger => Some("event_trigger"),
+            _ => None,
+        };
+        if let Some(result) = result {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "SQL functions cannot return type {}",
+                result
+            ));
+        }
     }
     let schema = storage.creation_schema(
         routine.name.schema,
@@ -42909,12 +43125,24 @@ pub(crate) fn resolve_routine_declaration(
             set_returning,
         } => {
             let result = resolve_routine_type(storage, txn.txid, result_type)?;
-            if result.ctype == ColType::Internal {
-                return Err(sql_err!(
-                    sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "SQL functions cannot return type internal"
+            if result.ctype == ColType::Internal
+                && !routine.arguments.iter().any(|argument| {
+                    !argument.mode.is_output()
+                        && resolve_routine_type(storage, txn.txid, argument.type_name)
+                            .is_ok_and(|argument| argument.ctype == ColType::Internal)
+                })
+            {
+                return Err(crate::sql::eval::with_detail(
+                    sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "unsafe use of pseudo-type \"internal\""
+                    ),
+                    format_args!(
+                        "A result of type internal requires at least one input of type internal."
+                    ),
                 ));
             }
+            check_routine_result_type(routine.language, result)?;
             if set_returning {
                 crate::storage::RoutineKind::SetFunction { result }
             } else {
@@ -42933,10 +43161,21 @@ pub(crate) fn resolve_routine_declaration(
                 let name = SqlName::parse(parameter.name.unwrap_or(""))?;
                 let resolved = resolve_routine_type(storage, txn.txid, parameter.type_name)?;
                 if resolved.ctype.is_pseudo() {
+                    // One OUT parameter is the routine's result type.
+                    if routine
+                        .arguments
+                        .iter()
+                        .filter(|parameter| parameter.mode.is_output())
+                        .count()
+                        == 1
+                    {
+                        check_routine_result_type(routine.language, resolved)?;
+                    }
+                    check_routine_argument_type(routine.language, resolved)?;
                     return Err(sql_err!(
-                        sqlstate::INVALID_FUNCTION_DEFINITION,
-                        "OUT parameter has pseudo-type {}",
-                        parameter.type_name
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "OUT parameter of pseudo-type {} is not supported",
+                        resolved.ctype.name()
                     ));
                 }
                 result_columns[result_column_count] = RoutineArgumentDef {
@@ -42980,11 +43219,14 @@ pub(crate) fn resolve_routine_declaration(
                 let resolved = resolve_routine_type(storage, txn.txid, column.type_name)?;
                 let ctype = resolved.ctype;
                 if ctype.is_pseudo() {
+                    if columns.len() == 1 {
+                        check_routine_result_type(routine.language, resolved)?;
+                    }
                     return Err(sql_err!(
-                        sqlstate::INVALID_FUNCTION_DEFINITION,
-                        "TABLE function column \"{}\" has pseudo-type {}",
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "TABLE function column \"{}\" of pseudo-type {} is not supported",
                         column.name,
-                        column.type_name
+                        ctype.name()
                     ));
                 }
                 output[slot] = RoutineArgumentDef {
@@ -43025,11 +43267,11 @@ pub(crate) fn resolve_routine_declaration(
         let resolved = resolve_routine_type(storage, txn.txid, argument.type_name)?;
         let ctype = resolved.ctype;
         if ctype.is_pseudo() {
+            check_routine_argument_type(routine.language, resolved)?;
             return Err(sql_err!(
-                sqlstate::INVALID_FUNCTION_DEFINITION,
-                "function argument \"{}\" has pseudo-type {}",
-                argument.name.unwrap_or(""),
-                argument.type_name
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "PL/pgSQL functions with arguments of type {} are not supported",
+                ctype.name()
             ));
         }
         let default = match argument.mode.default_text() {
@@ -44285,11 +44527,22 @@ fn aggregate_support_function(
             ));
         }
         crate::storage::RoutineCallSelection::Absent => {
+            // PostgreSQL's `lookup_agg_function` names the signature it sought.
+            use core::fmt::Write as _;
+            let mut signature = StackStr::<512>::new();
+            let _ = write!(signature, "{}(", qualified.as_str());
+            for (index, oid) in argument_oids[..arguments.len()].iter().enumerate() {
+                if index != 0 {
+                    let _ = signature.write_str(", ");
+                }
+                let name = type_display_fixed(storage, txid, *oid)?;
+                let _ = signature.write_str(name.as_str());
+            }
+            let _ = signature.write_char(')');
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
-                "{} function {} does not exist with the required argument types",
-                purpose,
-                qualified.as_str()
+                "function {} does not exist",
+                signature.as_str()
             ));
         }
     };
@@ -44465,6 +44718,9 @@ pub fn create_aggregate(
     let mut parameters = [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
     let mut argument_types = [crate::storage::RoutineResult::TEXT; MAX_ROUTINE_ARGUMENTS];
     let mut variadic_argument = None;
+    // PostgreSQL reports a pseudo-type argument through the failed support
+    // function lookup; one that resolves is still not a modeled aggregate.
+    let mut pseudo_argument = None;
     for (index, argument) in direct_ast.iter().chain(aggregated_ast).enumerate() {
         if argument.variadic {
             if variadic_argument.is_some() || index + 1 != total_arguments {
@@ -44479,12 +44735,8 @@ pub fn create_aggregate(
             Ok(resolved) => resolved,
             Err(error) => return sql_fail(error),
         };
-        if resolved.ctype.is_pseudo() {
-            return sql_fail(sql_err!(
-                sqlstate::INVALID_FUNCTION_DEFINITION,
-                "aggregate argument has pseudo-type {}",
-                argument.type_name
-            ));
+        if resolved.ctype.is_pseudo() && pseudo_argument.is_none() {
+            pseudo_argument = Some(resolved.ctype);
         }
         let argument_name = match SqlName::parse(argument.name) {
             Ok(name) => name,
@@ -44540,6 +44792,13 @@ pub fn create_aggregate(
         Ok(function) => function,
         Err(error) => return sql_fail(error),
     };
+    if let Some(pseudo) = pseudo_argument {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "aggregates with arguments of type {} are not supported",
+            pseudo.name()
+        ));
+    }
     if transition.result != state_type {
         return sql_fail(sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
@@ -49139,7 +49398,7 @@ pub fn drop_rule(
     let Some(slot) = storage.rule_slot(target, name, txn.txid) else {
         if if_exists {
             responder.notice(
-                sqlstate::UNDEFINED_OBJECT,
+                sqlstate::SUCCESSFUL_COMPLETION,
                 stack_format!(
                     128,
                     "rule \"{}\" for relation \"{}\" does not exist, skipping",
@@ -49838,7 +50097,10 @@ pub fn comment(
                 Err(error) => return sql_fail(error),
             };
             let Some(slot) = storage.cast_slot(source, target, txid) else {
-                return sql_fail(sql_err!(sqlstate::UNDEFINED_OBJECT, "cast does not exist"));
+                return sql_fail(match missing_cast_message(storage, txid, source, target) {
+                    Ok(message) => sql_err!(sqlstate::UNDEFINED_OBJECT, "{}", message.as_str()),
+                    Err(error) => error,
+                });
             };
             if !current_role_owns_type(storage, txid, source)
                 && !current_role_owns_type(storage, txid, target)
@@ -57739,10 +58001,10 @@ fn alter_composite_type(
             let Some(index) = altered.active_field_index(name) else {
                 if *if_exists {
                     responder.notice(
-                        sqlstate::UNDEFINED_COLUMN,
+                        sqlstate::SUCCESSFUL_COMPLETION,
                         stack_format!(
                             128,
-                            "column \"{}\" of type \"{}\" does not exist, skipping",
+                            "column \"{}\" of relation \"{}\" does not exist, skipping",
                             name,
                             altered.name.as_str()
                         )
@@ -63271,7 +63533,7 @@ pub fn drop_access_method(
         let Some(slot) = storage.access_method_slot(name, txn.txid) else {
             if if_exists {
                 responder.notice(
-                    sqlstate::UNDEFINED_OBJECT,
+                    sqlstate::SUCCESSFUL_COMPLETION,
                     stack_format!(128, "access method \"{}\" does not exist, skipping", name)
                         .as_str(),
                 )?;
@@ -63858,10 +64120,9 @@ pub fn drop_index(
                     txn.txid,
                 ) == Some(slot)
             {
-                return sql_fail(sql_err!(
-                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                    "cannot drop index \"{}\" because constraint requires it",
-                    name.name
+                return sql_fail(constraint_requires_index(
+                    name.name,
+                    storage.table_def(table, txn.txid).name.as_str(),
                 ));
             }
             if definition.mutable_for(txn.txid).parent.is_some() {
@@ -63931,6 +64192,11 @@ pub fn drop_index(
             if let Err(error) = stage_index_drop(storage, wal, txn, slot) {
                 return sql_fail(error);
             }
+        } else if let Some(table) = constraint_index_table(storage, *name, txn.txid) {
+            return sql_fail(constraint_requires_index(
+                name.name,
+                storage.table_def(table, txn.txid).name.as_str(),
+            ));
         } else if if_exists {
             responder.notice(
                 crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
@@ -67526,7 +67792,8 @@ pub(crate) fn decode_text_input<'a>(
         )
     })?;
     if oid == crate::sql::types::oid::REGTYPE {
-        return crate::sql::eval::regtype_of_name(text);
+        let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+        return crate::sql::eval::regtype_cast(Datum::Text(text), Some(&catalog), arena);
     }
     let decode_builtin = |ctype| match ctype {
         ColType::PgNdistinct
@@ -67629,6 +67896,7 @@ fn decode_binary_field_with_context<'a>(
         | ColType::Internal
         | ColType::PgDdlCommand
         | ColType::AnyArray
+        | ColType::Pseudo(_)
         | ColType::AclItem => Err(bad()),
         ColType::Bool => via(oids::BOOL),
         ColType::Int2 => {
@@ -78496,6 +78764,64 @@ fn named_key_columns<Definition0: crate::storage::DefinitionBacking>(
 /// An attached constraint and its backing relation share the constraint
 /// name and exact key positions. This is the durable dependency proof: it
 /// survives WAL and checkpoint replay without a parallel mutable flag.
+/// PostgreSQL's refusal to drop the index a constraint owns.
+fn constraint_requires_index(index: &str, table: &str) -> SqlError {
+    crate::sql::eval::stash_diagnostic(
+        None,
+        Some(stack_format!(
+            128,
+            "You can drop constraint {} on table {} instead.",
+            index,
+            table
+        )),
+    );
+    sql_err!(
+        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+        "cannot drop index {} because constraint {} on table {} requires it",
+        index,
+        index,
+        table
+    )
+}
+
+/// The table whose unique, primary key or exclusion constraint owns the
+/// index `name` names, found through the written schema or the search path.
+fn constraint_index_table(storage: &Storage, name: QualName<'_>, txid: u32) -> Option<usize> {
+    let mut found: Option<(usize, usize)> = None;
+    for table in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table, txid) {
+            continue;
+        }
+        let definition = storage.table_def(table, txid);
+        let rank = match name.schema {
+            Some(schema) if definition.schema.as_str() == schema => 0,
+            Some(_) => continue,
+            None => match storage.path_namespace_rank(definition.schema.as_str(), txid) {
+                Some(rank) => rank,
+                None => continue,
+            },
+        };
+        let owns = definition
+            .uniques()
+            .iter()
+            .any(|key| key.name.as_str() == name.name)
+            || definition
+                .exclusions()
+                .iter()
+                .any(|key| key.name.as_str() == name.name)
+            || (0..definition.n_columns).any(|column| {
+                (definition.columns()[column].primary || definition.columns()[column].unique)
+                    && definition
+                        .column_key_name(column)
+                        .is_some_and(|key| key.as_str() == name.name)
+            });
+        if owns && found.is_none_or(|(_, best)| rank < best) {
+            found = Some((table, rank));
+        }
+    }
+    found.map(|(table, _)| table)
+}
+
 fn attached_constraint_index<Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     definition: &crate::storage::TableDefinition<Definition0>,
@@ -82396,6 +82722,45 @@ fn alter_table_relation(
                     }
                     ColSource::FillDefault(_) => (new_def.columns()[i].name, None),
                 };
+                // PostgreSQL's `ATExecDropColumn`: a column a parent supplies
+                // goes only with the parent's, and a partition key column
+                // cannot go at all.
+                if let Some(original_index) = original_index {
+                    let inherited = inheritance_scope == AlterInheritanceScope::Direct
+                        && def
+                            .inheritance
+                            .parents_ref()
+                            .iter()
+                            .map(|parent| usize::from(*parent))
+                            .chain(
+                                def.partition
+                                    .attachment
+                                    .map(|attachment| usize::from(attachment.parent)),
+                            )
+                            .any(|parent| {
+                                storage
+                                    .table_def(parent, txn.txid)
+                                    .column_index(original_column.as_str())
+                                    .is_some()
+                            });
+                    if inherited {
+                        return sql_fail(sql_err!(
+                            sqlstate::INVALID_TABLE_DEFINITION,
+                            "cannot drop inherited column \"{}\"",
+                            name
+                        ));
+                    }
+                    if def.partition.scheme.is_some_and(|scheme| {
+                        scheme.keys[..usize::from(scheme.n_keys)].contains(&(original_index as u16))
+                    }) {
+                        return sql_fail(sql_err!(
+                            sqlstate::INVALID_TABLE_DEFINITION,
+                            "cannot drop column \"{}\" because it is part of the partition key of relation \"{}\"",
+                            name,
+                            def.name.as_str()
+                        ));
+                    }
+                }
                 if let Some(original_index) = original_index
                     && let Err(error) = apply_column_drop_dependencies(
                         storage,
@@ -86506,6 +86871,10 @@ fn coerce_column_value<'a>(
         let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
         let value = crate::sql::eval::regobject_cast(v, col.ctype, Some(&catalog), arena)?;
         return apply_typmod(value, col.ctype, col.type_mod, arena);
+    }
+    if col.ctype == ColType::Regtype && matches!(v, Datum::Text(_) | Datum::Bpchar(_)) {
+        let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+        return crate::sql::eval::regtype_cast(v, Some(&catalog), arena);
     }
     if matches!(v, Datum::Geometry { .. } | Datum::Array { .. }) {
         crate::sql::eval::validate_geometry_cast(

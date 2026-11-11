@@ -6,6 +6,10 @@
 
 use super::*;
 
+/// PostgreSQL's `FirstUnpinnedObjectId`: initdb's objects below it are
+/// pinned and never appear in `pg_depend`.
+const FIRST_UNPINNED_OBJECT_ID: i32 = 12_000;
+
 /// One catalog object, as PostgreSQL's `ObjectAddress` names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ObjectAddress {
@@ -123,26 +127,107 @@ pub(crate) fn for_each_dependency(
             crate::sql::ast::TextSearchObjectKind::Dictionary => PG_TS_DICT_OID,
             crate::sql::ast::TextSearchObjectKind::Configuration => PG_TS_CONFIG_OID,
         };
-        namespace_edge(
-            storage,
-            txid,
-            ObjectAddress::new(class, object.oid(), 0),
-            object.schema().as_str(),
-            visit,
-        )?;
+        let dependent = ObjectAddress::new(class, object.oid(), 0);
+        namespace_edge(storage, txid, dependent, object.schema().as_str(), visit)?;
+        // Objects below PostgreSQL's `FirstUnpinnedObjectId` are pinned and
+        // record no dependency; initdb's snowball dictionaries are not.
+        let mut depend = |referenced_class: i32, referenced: i32| {
+            if referenced < FIRST_UNPINNED_OBJECT_ID {
+                return Ok(());
+            }
+            visit(DependencyEdge {
+                dependent,
+                referenced: ObjectAddress::new(referenced_class, referenced, 0),
+                kind: b'n',
+            })
+        };
+        match object {
+            crate::storage::TextSearchDefinition::Parser {
+                start,
+                gettoken,
+                end,
+                headline,
+                lextypes,
+                ..
+            } => {
+                for function in [start, gettoken, end, lextypes, headline] {
+                    if function != 0 {
+                        depend(PG_PROC_OID, function)?;
+                    }
+                }
+            }
+            crate::storage::TextSearchDefinition::Template { init, lexize, .. } => {
+                for function in [init, lexize] {
+                    if function != 0 {
+                        depend(PG_PROC_OID, function)?;
+                    }
+                }
+            }
+            crate::storage::TextSearchDefinition::Dictionary { template, .. } => {
+                depend(PG_TS_TEMPLATE_OID, template)?;
+            }
+            crate::storage::TextSearchDefinition::Configuration {
+                parser, mappings, ..
+            } => {
+                depend(PG_TS_PARSER_OID, parser)?;
+                let mut seen = [0; crate::storage::TEXT_SEARCH_TOKEN_TYPES
+                    * crate::storage::TEXT_SEARCH_DICTIONARIES_PER_TOKEN];
+                let mut count = 0;
+                for dictionary in mappings.dictionaries.iter().flatten().copied() {
+                    if dictionary != 0 && !seen[..count].contains(&dictionary) {
+                        seen[count] = dictionary;
+                        count += 1;
+                        depend(PG_TS_DICT_OID, dictionary)?;
+                    }
+                }
+            }
+        }
     }
-    // Extended statistics belong to their table, as PostgreSQL records.
+    // PostgreSQL's `CreateStatistics`: an automatic dependency on each key
+    // column and on each column a key expression uses, and on the whole table
+    // only when no key is a plain column.
     for (_, statistics) in storage.extended_statistics_visible(txid) {
         let dependent = ObjectAddress::new(PG_STATISTIC_EXT_OID, statistics.oid(), 0);
-        visit(DependencyEdge {
-            dependent,
-            referenced: ObjectAddress::new(
-                PG_CLASS_OID,
-                user_table_oid(storage, usize::from(statistics.table)),
-                0,
-            ),
-            kind: b'a',
-        })?;
+        let table_slot = usize::from(statistics.table);
+        let table_oid = user_table_oid(storage, table_slot);
+        let table = storage.table_def(table_slot, txid);
+        let mut columns = crate::storage::ColumnSet::EMPTY;
+        let mut simple = false;
+        for key in statistics.keys_for(txid) {
+            match key {
+                crate::storage::ExtendedStatisticsKey::Column(name) => {
+                    let column = table.column_index(name.as_str()).ok_or_else(|| {
+                        sql_err!(sqlstate::INTERNAL_ERROR, "statistics key column is absent")
+                    })?;
+                    columns.insert(column);
+                    simple = true;
+                }
+                crate::storage::ExtendedStatisticsKey::Expression(source) => {
+                    let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+                    columns |= crate::sql::exec::check_referenced_columns(expression, &table)?;
+                }
+            }
+        }
+        if !simple {
+            visit(DependencyEdge {
+                dependent,
+                referenced: ObjectAddress::new(PG_CLASS_OID, table_oid, 0),
+                kind: b'a',
+            })?;
+        }
+        for column in 0..table.n_columns {
+            if columns.contains(column) {
+                visit(DependencyEdge {
+                    dependent,
+                    referenced: ObjectAddress::new(
+                        PG_CLASS_OID,
+                        table_oid,
+                        i32::from(table.attribute_number(column)),
+                    ),
+                    kind: b'a',
+                })?;
+            }
+        }
         namespace_edge(
             storage,
             txid,
@@ -888,6 +973,24 @@ fn relation_dependencies(
                 kind: b'n',
             })?;
         }
+        // PostgreSQL's `StorePartitionKey` makes each key column an internal
+        // part of its partitioned table, so the column cannot be dropped alone.
+        if let Some(scheme) = definition.partition.scheme {
+            for (position, key) in scheme.keys[..usize::from(scheme.n_keys)].iter().enumerate() {
+                if scheme.keys[..position].contains(key) {
+                    continue;
+                }
+                visit(DependencyEdge {
+                    dependent: ObjectAddress::new(
+                        PG_CLASS_OID,
+                        relation,
+                        i32::from(definition.attribute_number(usize::from(*key))),
+                    ),
+                    referenced: ObjectAddress::new(PG_CLASS_OID, relation, 0),
+                    kind: b'i',
+                })?;
+            }
+        }
         if let Some(attachment) = definition.partition.attachment {
             visit(DependencyEdge {
                 dependent: ObjectAddress::new(PG_CLASS_OID, relation, 0),
@@ -1086,6 +1189,19 @@ fn type_dependencies(
             routine.schema_for(txid).as_str(),
             visit,
         )?;
+        // `internal`, `c` and `sql` are pinned; `plpgsql` is an ordinary
+        // catalog object every PL/pgSQL routine depends on.
+        if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+            visit(DependencyEdge {
+                dependent: ObjectAddress::new(PG_PROC_OID, routine_oid, 0),
+                referenced: ObjectAddress::new(
+                    PG_LANGUAGE_OID,
+                    routine_language_oid(routine.language),
+                    0,
+                ),
+                kind: b'n',
+            })?;
+        }
         let mut types = [0; 2 * crate::storage::MAX_ROUTINE_ARGUMENTS + 3];
         let mut count = 0;
         let mut note = |ctype, user_type| {

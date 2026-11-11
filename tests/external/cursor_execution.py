@@ -115,6 +115,27 @@ def probe(args, trace):
             error(owner, "error.waits_for_affected_fetch", "FETCH NEXT FROM later_error", "22012")
             owner.execute("ROLLBACK")
 
+            # Regex, JSON and ROWS FROM sources produce each row at its FETCH.
+            owner.execute("SELECT setval('calls',500,false)")
+            owner.execute("BEGIN")
+            owner.execute(
+                "DECLARE pieces NO SCROLL CURSOR FOR SELECT *, nextval('calls') FROM ROWS FROM "
+                "(regexp_split_to_table('a-b-c', '-'), json_each_text('{\"k\": \"v\"}')) "
+                "WITH ORDINALITY"
+            )
+            rows(owner, "functions.declare", "SELECT last_value,is_called FROM calls", [(500, False)])
+            rows(owner, "functions.first", "FETCH NEXT FROM pieces", [("a", "k", "v", 1, 500)])
+            rows(owner, "functions.first_only", "SELECT last_value,is_called FROM calls", [(500, True)])
+            rows(
+                owner,
+                "functions.rest",
+                "FETCH ALL FROM pieces",
+                [("b", None, None, 2, 501), ("c", None, None, 3, 502)],
+            )
+            owner.execute("DECLARE broken NO SCROLL CURSOR FOR SELECT * FROM jsonb_each('[1]')")
+            error(owner, "functions.argument_error_at_fetch", "FETCH NEXT FROM broken", "22023")
+            owner.execute("ROLLBACK")
+
             # A forward FETCH larger than pos3ql's cursor_bytes streams its
             # rows; each is projected when it is fetched.
             owner.execute("SELECT setval('calls',1000,false)")

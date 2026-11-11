@@ -217,9 +217,9 @@ change the cursor. Dynamic SQL sees only the explicit `USING` arguments.
 
 ### Cursors that read as you fetch
 
-A cursor over one table, over constant `VALUES` rows, or over
-`generate_series` (integer, bigint, numeric or timestamp),
-`generate_subscripts` or a one-array `unnest` with constant arguments, reads input only as rows are fetched when
+A cursor over one table, over constant `VALUES` rows, or over a builtin
+set-returning function with constant arguments (literals, parameters and
+casts of them) reads input only as rows are fetched when
 its query uses only columns, constants, parameters,
 built-in operators and casts, boolean logic, `CASE`, `BETWEEN`, null tests,
 array construction, subscripts, slices, scalar function calls, `LIMIT` and
@@ -227,11 +227,23 @@ array construction, subscripts, slices, scalar function calls, `LIMIT` and
 UPDATE`, `FOR SHARE` and their variants), may also order by its columns. Other
 cursor queries, including orderings by other expressions, user-defined
 operators or row-level security, run when declared; see
-[the plan](../PLAN.md#pause-and-resume-every-query-path).
+[the plan](../PLAN.md#pause-and-resume-every-query-path). The functions are
+`generate_series` (integer, bigint, numeric or timestamp),
+`generate_subscripts`, a one-array `unnest`, `regexp_matches`,
+`regexp_split_to_table`, and the `json`/`jsonb` `_each`, `_each_text`,
+`_array_elements`, `_array_elements_text` and `_object_keys` functions, alone
+or combined in `ROWS FROM (...)` (which `FROM unnest(a, b)` expands to), with
+or without `WITH ORDINALITY`. Such a cursor keeps only the arguments and the
+next position; argument errors, such as `jsonb_each('[1]')`, are raised by the
+first `FETCH`. Other function sources, including column definition lists such
+as `jsonb_to_recordset(...) AS t(a int)`, run when declared.
 
 ```sql
 DECLARE c NO SCROLL CURSOR FOR SELECT id, label FROM orders;
 FETCH 2 FROM c;  -- reads two rows
+DECLARE parts NO SCROLL CURSOR FOR
+  SELECT key, value FROM jsonb_each('{"a": 1, "b": 2}');
+FETCH 1 FROM parts;  -- produces only the "a" row
 ```
 
 - `FETCH 0` before the first row reads nothing; `MOVE` skips without saving

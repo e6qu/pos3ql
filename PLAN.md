@@ -93,14 +93,18 @@ is owned.
   see earlier changed rows before the next row is written, and each operation
   keeps its own transition table and firing order.
 - **Results and cursors:** large results resume row by row for `SELECT`
-  from one table or one generated series, including paged portals, forward
-  `FETCH` from `NO SCROLL` cursors and `COPY ... TO STDOUT` of such a query or
-  one table. Remaining:
+  from one table or builtin set-returning functions with constant arguments,
+  including paged portals, forward `FETCH` from `NO SCROLL` cursors and
+  `COPY ... TO STDOUT` of such a query or one table. Remaining:
   - More retained shapes: joins, grouping, subqueries, set operations, sorts
     of results (a large ordered `SELECT` still spools, because its sort input
     has no size estimate to choose a stream before it runs), and more
-    set-returning functions than `generate_series`, `generate_subscripts` and
-    one-array `unnest`.
+    set-returning functions than the generator builtins (series, subscripts,
+    one-array `unnest`, regex, and the `json`/`jsonb` `_each`,
+    `_array_elements` and `_object_keys` families, alone or in `ROWS FROM`):
+    function arguments that are not constants, user-defined and other builtin
+    set-returning functions, and column definition lists such as
+    `jsonb_to_recordset(...) AS t(a int)`.
     Cursors over those shapes run at `DECLARE`: a scrollable cursor ordered by
     an expression that is not a source column returns saved values where
     PostgreSQL evaluates a volatile output list again, and a row-locking cursor

@@ -95,9 +95,12 @@ repeating them.
 **Large results resume row by row.** Before a top-level `SELECT` or
 `COPY ... TO STDOUT` runs (simple Query or extended `Execute`), the engine
 decides whether it (or the query a COPY reads: its own, or `SELECT columns
-FROM ONLY table` for a table) can become a **result stream**: one ordinary table, or one builtin set-returning function
-with constant arguments (`generate_series`, `generate_subscripts`, a
-one-array `unnest`), without
+FROM ONLY table` for a table) can become a **result stream**: one ordinary table, or
+builtin set-returning functions with constant arguments (`generate_series`,
+`generate_subscripts`, a one-array `unnest`, `regexp_matches`,
+`regexp_split_to_table`, the `json`/`jsonb` `_each`, `_array_elements` and
+`_object_keys` families; alone or in `ROWS FROM`, with or without `WITH
+ORDINALITY`), without
 joins, grouping, sorting, `DISTINCT`, set operations, subqueries, CTEs, row
 locking or row security, whose read position (one record per resident row
 plus the query text) fits `result_stream_bytes`. If such a statement's output first outgrows

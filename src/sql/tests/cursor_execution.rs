@@ -3080,3 +3080,136 @@ fn generate_subscripts_cursors_produce_rows_as_they_are_fetched() {
         ["50|f", "5|50", "4|51", "3|52", "1", "2", "2", "t"]
     );
 }
+
+#[test]
+fn regex_json_and_multi_array_cursors_produce_rows_as_they_are_fetched() {
+    let config = test_config("multi-value-cursor-generator");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // Expected rows come from PostgreSQL 18.6: each nextval runs when its row
+    // is fetched, after the sequence was read untouched.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE SEQUENCE gen_calls START 70; BEGIN; \
+             DECLARE u NO SCROLL CURSOR FOR SELECT a, b, nextval('gen_calls') \
+             FROM unnest(ARRAY[1,2,3], ARRAY['x','y']) AS t(a, b); \
+             SELECT last_value, is_called FROM gen_calls; FETCH 2 u; FETCH ALL u; \
+             DECLARE m NO SCROLL CURSOR FOR SELECT m, nextval('gen_calls') \
+             FROM regexp_matches('a1b22c333', '([a-z])(\\d+)', 'g') m; \
+             FETCH 1 m; FETCH ALL m; \
+             DECLARE sp CURSOR FOR SELECT * FROM regexp_split_to_table('one, two,,three', ',\\s*'); \
+             FETCH ALL sp; FETCH PRIOR sp; \
+             DECLARE je NO SCROLL CURSOR FOR SELECT key, value, nextval('gen_calls') \
+             FROM json_each('{\"b\": [1, 2], \"a\": \"x\", \"b\": null}'); \
+             FETCH ALL je; CLOSE u; CLOSE m; CLOSE sp; CLOSE je; \
+             DECLARE jbe CURSOR FOR SELECT * FROM jsonb_each_text('{\"b\": [1,  2], \"a\": \"x\\ty\", \"c\": null, \"b\": 3}'); \
+             FETCH ALL jbe; \
+             DECLARE ae CURSOR FOR SELECT * FROM json_array_elements_text('[1, \"two\", null, {\"k\" :  1}]'); \
+             FETCH ALL ae; \
+             DECLARE ab CURSOR FOR SELECT * FROM jsonb_array_elements('[1.50, \"two\", null, {\"k\" :  1}]'); \
+             FETCH ALL ab; CLOSE jbe; CLOSE ae; \
+             DECLARE k CURSOR FOR SELECT * FROM jsonb_object_keys('{\"bb\": 1, \"a\": 2, \"bb\": 3}'); \
+             FETCH ALL k; \
+             DECLARE k2 CURSOR FOR SELECT * FROM json_object_keys('{\"bb\": 1, \"a\": 2, \"bb\": 3}'); \
+             FETCH ALL k2; COMMIT",
+            true
+        )),
+        [
+            "70|f",
+            "1|x|70",
+            "2|y|71",
+            "3|NULL|72",
+            "{a,1}|73",
+            "{b,22}|74",
+            "{c,333}|75",
+            "one",
+            "two",
+            "",
+            "three",
+            "three",
+            "b|[1, 2]|76",
+            "a|\"x\"|77",
+            "b|null|78",
+            "a|x\ty",
+            "b|3",
+            "c|NULL",
+            "1",
+            "two",
+            "NULL",
+            "{\"k\" :  1}",
+            "1.50",
+            "\"two\"",
+            "null",
+            "{\"k\": 1}",
+            "a",
+            "bb",
+            "bb",
+            "a",
+            "bb",
+        ]
+    );
+}
+
+#[test]
+fn rows_from_and_ordinality_cursors_advance_their_calls_in_lockstep() {
+    let config = test_config("rows-from-cursor-generator");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // Expected rows come from PostgreSQL 18.6.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE SEQUENCE ord_calls START 5; BEGIN; \
+             DECLARE r NO SCROLL CURSOR FOR SELECT *, nextval('ord_calls') FROM ROWS FROM \
+             (json_each('{\"a\":1,\"b\":2}'), regexp_split_to_table('x-y-z', '-'), \
+             generate_series(1, 2)) WITH ORDINALITY AS t(k, v, piece, n, ord); \
+             SELECT last_value, is_called FROM ord_calls; FETCH 1 r; FETCH ALL r; \
+             DECLARE o SCROLL CURSOR FOR \
+             SELECT * FROM jsonb_array_elements_text('[\"p\", \"q\"]') WITH ORDINALITY; \
+             FETCH ALL o; FETCH PRIOR o; FETCH FIRST o; COMMIT",
+            true
+        )),
+        [
+            "5|f",
+            "a|1|x|1|1|5",
+            "b|2|y|2|2|6",
+            "NULL|NULL|z|NULL|3|7",
+            "p|1",
+            "q|2",
+            "q|2",
+            "p|1",
+        ]
+    );
+    // Argument errors surface at the first FETCH, before any row.
+    for (query, code) in [
+        ("json_each('[1]')", sqlstate::INVALID_PARAMETER_VALUE),
+        (
+            "regexp_matches('abc', '(', 'g')",
+            sqlstate::INVALID_REGULAR_EXPRESSION,
+        ),
+        (
+            "regexp_split_to_table('abc', 'b', 'g')",
+            sqlstate::INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "jsonb_object_keys('[1]')",
+            sqlstate::INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "json_array_elements('{\"a\":1}')",
+            sqlstate::INVALID_PARAMETER_VALUE,
+        ),
+    ] {
+        session.success(
+            &mut engine,
+            &format!("BEGIN; DECLARE failing CURSOR FOR SELECT * FROM {query}"),
+            true,
+        );
+        let reply = session.execute(&mut engine, "FETCH 1 failing", true);
+        assert_eq!(error_sqlstates(&reply), [code], "{query}");
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+}

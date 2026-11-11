@@ -2077,8 +2077,6 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
         }
         let jsonb =
             name.eq_ignore_ascii_case("jsonb_each") || name.eq_ignore_ascii_case("jsonb_each_text");
-        let as_text = name.eq_ignore_ascii_case("json_each_text")
-            || name.eq_ignore_ascii_case("jsonb_each_text");
         let document = eval_full(args[0], arena, params, row, hooks)?;
         crate::sql::eval::funcs::json::check_json_family(name, &document)?;
         let text = match crate::sql::eval::text_view(document) {
@@ -2086,13 +2084,14 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             Datum::Text(s) => s,
             Datum::Null => return Ok(0),
             _ => {
-                return Err(sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "cannot deconstruct a scalar"
+                return Err(crate::sql::json::each_error(
+                    name,
+                    jsonb,
+                    crate::sql::json::Kind::Scalar,
                 ));
             }
         };
-        Ok(crate::sql::eval::json_each_pairs(text, jsonb, as_text, arena)?.len())
+        Ok(crate::sql::eval::json_each_pairs(name, text, arena)?.len())
     } else if name.eq_ignore_ascii_case("regexp_split_to_table") {
         if !(2..=3).contains(&args.len()) {
             return Err(sql_err!(
@@ -5276,8 +5275,6 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             if is_json_each_name(tref.table) {
                 let jsonb = tref.table.eq_ignore_ascii_case("jsonb_each")
                     || tref.table.eq_ignore_ascii_case("jsonb_each_text");
-                let as_text = tref.table.eq_ignore_ascii_case("json_each_text")
-                    || tref.table.eq_ignore_ascii_case("jsonb_each_text");
                 let document = eval_argument(args[0])?;
                 crate::sql::eval::funcs::json::check_json_family(tref.table, &document)?;
                 let text = match crate::sql::eval::text_view(document) {
@@ -5285,13 +5282,14 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     Datum::Text(s) => s,
                     Datum::Null => return Ok(&[]),
                     _ => {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "cannot deconstruct a scalar"
+                        return Err(crate::sql::json::each_error(
+                            tref.table,
+                            jsonb,
+                            crate::sql::json::Kind::Scalar,
                         ));
                     }
                 };
-                let pairs = crate::sql::eval::json_each_pairs(text, jsonb, as_text, arena)?;
+                let pairs = crate::sql::eval::json_each_pairs(tref.table, text, arena)?;
                 const EMPTY: &[u8] = &[];
                 let rows = arena
                     .alloc_slice_with(pairs.len(), |_| EMPTY)
@@ -5489,24 +5487,12 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         &mut spans,
                     )?
                 {
-                    let mut elems = [Datum::Null; crate::sql::regex::MAX_GROUPS];
-                    let count = if ng == 0 {
-                        elems[0] = Datum::Text(&string[mstart..mend]);
-                        1
-                    } else {
-                        for (i, span) in spans[..ng].iter().enumerate() {
-                            elems[i] = if span.0 < 0 {
-                                Datum::Null
-                            } else {
-                                Datum::Text(&string[span.0 as usize..span.1 as usize])
-                            };
-                        }
-                        ng
-                    };
-                    let arr = Datum::Array {
-                        element: crate::sql::types::ArrElem::Text,
-                        raw: crate::sql::array::build(&elems[..count], arena)?,
-                    };
+                    let arr = crate::sql::eval::regexp_match_array(
+                        string,
+                        (mstart, mend),
+                        &spans[..ng],
+                        arena,
+                    )?;
                     rows.push(crate::sql::exec::encode_projected_pub(&[arr], arena)?)
                         .map_err(|_| arena_full())?;
                     if !parsed.global {
@@ -6252,8 +6238,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             .alloc_slice_with(count, |_| EMPTY)
             .map_err(|_| arena_full())?;
         for slot in rows.iter_mut() {
-            let value = series.next(arena)?.expect("integer series count");
-            *slot = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+            let mut value = [Datum::Null];
+            assert!(series.next_row(arena, &mut value)?, "integer series count");
+            *slot = crate::sql::exec::encode_projected_pub(&value, arena)?;
         }
         Ok(&*rows)
     })?;

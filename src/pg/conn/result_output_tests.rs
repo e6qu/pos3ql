@@ -655,6 +655,58 @@ fn retained_selects_resume_as_streams_while_other_sessions_progress() {
     }
 }
 
+/// Writes a request larger than the loopback buffers, letting the
+/// connection read as the socket fills; the caller processes the rest.
+fn send_large(conn: &mut Conn, engine: &mut Engine, client: &mut TcpStream, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        match client.write(bytes) {
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert_eq!(readable(conn, engine), After::Continue);
+            }
+            Err(error) => panic!("client write: {error}"),
+        }
+    }
+}
+
+#[test]
+fn function_sources_stream_rows_as_the_client_reads() {
+    let (mut fixture, mut conn, mut client, _, _) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "stream-functions");
+    // Short rows from a constant that fits the receive buffer still outgrow
+    // the send buffer several times over.
+    let pieces: Vec<String> = (0..12_000).map(|row| (row % 10).to_string()).collect();
+    let split = pieces.join(",");
+    let elements = format!("[\"{}\"]", pieces.join("\",\""));
+    for sql in [
+        format!("SELECT piece FROM regexp_split_to_table('{split}', ',') piece"),
+        format!("SELECT value FROM json_array_elements_text('{elements}')"),
+        format!(
+            "SELECT * FROM ROWS FROM (regexp_split_to_table('{split}', ','), \
+             generate_series(1, 2)) WITH ORDINALITY"
+        ),
+    ] {
+        let opened = fixture.engine.result_stream_metrics().opened;
+        send_large(&mut conn, &mut fixture.engine, &mut client, &query(&sql));
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        assert!(conn.result_stream.is_active(), "{sql:.80}");
+        // The stream holds the call's position, not its rows.
+        assert!(conn.overflow_bytes() < 1024);
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+        let response = messages(&response);
+        let rows: Vec<_> = response
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .collect();
+        assert_eq!(rows.len(), pieces.len(), "{sql:.80}");
+        for (row, expected) in rows.iter().zip(&pieces) {
+            assert_eq!(first_text(row.1), expected);
+        }
+        assert_eq!(response[response.len() - 2].1, b"SELECT 12000\0");
+        assert_eq!(fixture.engine.result_stream_metrics().opened, opened + 1);
+    }
+}
+
 #[test]
 fn result_streams_apply_bounds_and_fail_after_delivered_rows() {
     let (mut fixture, mut conn, mut client, _, _) =

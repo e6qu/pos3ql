@@ -544,23 +544,12 @@ pub(crate) fn dispatch<'a>(
                 else {
                     return Ok(Datum::Null);
                 };
-                let mut elements = [Datum::Null; regex::MAX_GROUPS];
-                let count = if groups == 0 {
-                    elements[0] = Datum::Text(&src[start..end]);
-                    1
-                } else {
-                    for (index, (group_start, group_end)) in spans[..groups].iter().enumerate() {
-                        if *group_start >= 0 {
-                            elements[index] =
-                                Datum::Text(&src[*group_start as usize..*group_end as usize]);
-                        }
-                    }
-                    groups
-                };
-                Ok(Datum::Array {
-                    element: ArrElem::Text,
-                    raw: array::build(&elements[..count], arena)?,
-                })
+                super::super::pattern::regexp_match_array(
+                    src,
+                    (start, end),
+                    &spans[..groups],
+                    arena,
+                )
             }
             // `regexp_split_to_array(source, pattern [, flags])`: split on matches.
             "regexp_split_to_array" => {

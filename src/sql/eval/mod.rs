@@ -35,7 +35,7 @@ mod operators;
 pub(crate) use args::*;
 
 mod pattern;
-pub(crate) use pattern::for_each_regex_split;
+pub(crate) use pattern::{RegexSplit, for_each_regex_split, regexp_match_array};
 pub use pattern::{like_match, regex_split_count_pub, regex_split_piece_at_pub, regexp_options};
 pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring};
 
@@ -7357,25 +7357,12 @@ fn call<'a>(
                 };
                 count += 1;
                 if count == k {
-                    // No capture groups: the whole match is the single element.
-                    let mut elems = [Datum::Null; super::regex::MAX_GROUPS];
-                    let n = if ng == 0 {
-                        elems[0] = Datum::Text(&string[mstart..mend]);
-                        1
-                    } else {
-                        for (i, span) in spans[..ng].iter().enumerate() {
-                            elems[i] = if span.0 < 0 {
-                                Datum::Null
-                            } else {
-                                Datum::Text(&string[span.0 as usize..span.1 as usize])
-                            };
-                        }
-                        ng
-                    };
-                    return Ok(Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(&elems[..n], arena)?,
-                    });
+                    return pattern::regexp_match_array(
+                        string,
+                        (mstart, mend),
+                        &spans[..ng],
+                        arena,
+                    );
                 }
                 if !parsed.global {
                     return Ok(Datum::Null);
@@ -7720,8 +7707,7 @@ fn call<'a>(
         "json_each" | "jsonb_each" | "json_each_text" | "jsonb_each_text" => {
             arity(1)?;
             let jsonb = name.starts_with("jsonb");
-            let as_text = name.ends_with("_text");
-            let value_oid = if as_text {
+            let value_oid = if name.ends_with("_text") {
                 super::types::oid::TEXT
             } else if jsonb {
                 super::types::oid::JSONB
@@ -7733,13 +7719,14 @@ fn call<'a>(
                 Datum::Text(s) => s,
                 Datum::Null => return Ok(Datum::Null),
                 _ => {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "cannot deconstruct a scalar"
+                    return Err(super::json::each_error(
+                        name,
+                        jsonb,
+                        super::json::Kind::Scalar,
                     ));
                 }
             };
-            let pairs = json_each_pairs(text, jsonb, as_text, arena)?;
+            let pairs = json_each_pairs(name, text, arena)?;
             let k = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -8711,31 +8698,25 @@ pub(crate) fn materialize_composite_text_output<'a>(
     }
 }
 
-/// The `(key, value)` members a `json_each` / `jsonb_each` family call yields
-/// for the object `text`. `jsonb` selects normalized (sorted, deduplicated,
-/// re-rendered) members over the `json` variants' source-order/verbatim members;
-/// `as_text` makes each value the `_text` form (a decoded string, else the
-/// value's json text). Errors match PostgreSQL's `cannot deconstruct ...`.
+/// The `(key, value)` members the `json_each` / `jsonb_each` family call
+/// `name` yields for the object `text`. The `jsonb` variants yield normalized
+/// (sorted, deduplicated, re-rendered) members, the `json` variants
+/// source-order verbatim members; the `_text` variants make each value a
+/// decoded string, else the value's json text. Errors match PostgreSQL's.
 pub fn json_each_pairs<'a>(
+    name: &str,
     text: &'a str,
-    jsonb: bool,
-    as_text: bool,
     arena: &'a Arena,
 ) -> Result<&'a [(&'a str, Datum<'a>)], SqlError> {
-    match super::json::kind_of(text) {
-        super::json::Kind::Object => {}
-        super::json::Kind::Array => {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "cannot deconstruct an array as an object"
-            ));
-        }
-        super::json::Kind::Scalar => {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "cannot deconstruct a scalar"
-            ));
-        }
+    let jsonb = name
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("jsonb"));
+    let as_text = name
+        .get(name.len().saturating_sub(5)..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case("_text"));
+    let kind = super::json::kind_of(text);
+    if kind != super::json::Kind::Object {
+        return Err(super::json::each_error(name, jsonb, kind));
     }
     if jsonb {
         let super::json::Json::Object(members) = super::json::parse(text, arena)? else {

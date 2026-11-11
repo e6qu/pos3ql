@@ -93,8 +93,8 @@ enum RetainedSource<'a> {
     /// constant arguments are evaluated when fetching starts.
     Generated {
         function: &'a TableRef<'a>,
-        kind: super::generator::GeneratorKind,
-        generator: Option<super::generator::RowGenerator<'a>>,
+        kinds: &'a [super::generator::GeneratorKind],
+        generator: Option<super::generator::FunctionRows<'a>>,
     },
 }
 
@@ -105,7 +105,7 @@ impl RetainedSource<'_> {
             Self::Literals { rows, next, .. } => *next = rows.len(),
             Self::Singleton { available } => *available = false,
             Self::Generated { generator, .. } => {
-                *generator = Some(super::generator::RowGenerator::Elements(None));
+                *generator = Some(super::generator::FunctionRows::finished());
             }
         }
     }
@@ -963,41 +963,52 @@ fn constant_function_argument(expression: &Expr<'_>) -> bool {
     }
 }
 
-/// A table function a cursor can advance from fixed generator state: a
+/// A table function a cursor can advance from fixed generator state: one
 /// non-volatile builtin with a generator implementation and constant
-/// arguments, alone in FROM. Other function sources run when declared.
-fn retained_function_source(
-    tref: &TableRef<'_>,
-    storage: &Storage,
+/// arguments, or `ROWS FROM` of such calls, alone in FROM. Returns each
+/// call's generator. Other function sources run when declared.
+fn retained_function_source<'a>(
+    tref: &'a TableRef<'a>,
+    storage: &'a Storage,
     txid: u32,
-    arena: &Arena,
-) -> Option<super::generator::GeneratorKind> {
-    let args = tref.func_args?;
-    if tref.rows_from.is_some()
-        || tref.lateral
-        || tref.with_ordinality
-        || super::srf::sql_table_constructor(tref)
-        || !args
-            .iter()
-            .all(|argument| constant_function_argument(argument))
-    {
+    arena: &'a Arena,
+) -> Option<&'a [super::generator::GeneratorKind]> {
+    if tref.lateral || super::srf::sql_table_constructor(tref) {
         return None;
     }
-    let (selection, _) = super::srf::select_table_func_routine(
-        tref,
-        storage,
-        txid,
-        arena,
-        &super::super::eval::NoColumns,
-        None,
-    )
-    .ok()?;
-    let crate::storage::RoutineCallSelection::Builtin { oid, .. } = selection else {
-        return None;
+    let calls = match tref.rows_from {
+        Some(calls) => calls,
+        None => core::slice::from_ref(tref),
     };
-    crate::sql::catalog::builtin_callable_by_oid(oid)
-        .filter(|signature| signature.catalog.volatility != "v")?;
-    super::generator::GeneratorKind::for_builtin(oid, args.len())
+    let kinds = arena
+        .alloc_slice_with(calls.len(), |_| super::generator::GeneratorKind::Numeric)
+        .ok()?;
+    for (kind, call) in kinds.iter_mut().zip(calls) {
+        let args = call.func_args?;
+        if call.rows_from.is_some()
+            || !args
+                .iter()
+                .all(|argument| constant_function_argument(argument))
+        {
+            return None;
+        }
+        let (selection, _) = super::srf::select_table_func_routine(
+            call,
+            storage,
+            txid,
+            arena,
+            &super::super::eval::NoColumns,
+            None,
+        )
+        .ok()?;
+        let crate::storage::RoutineCallSelection::Builtin { oid, .. } = selection else {
+            return None;
+        };
+        crate::sql::catalog::builtin_callable_by_oid(oid)
+            .filter(|signature| signature.catalog.volatility != "v")?;
+        *kind = super::generator::GeneratorKind::for_builtin(oid, args.len())?;
+    }
+    Some(kinds)
 }
 
 fn literal_source_tree(tree: &crate::sql::ast::SetTree<'_>) -> Option<usize> {
@@ -1184,32 +1195,45 @@ impl<'a> RetainedSelect<'a> {
     ) -> Result<(), SqlError> {
         let RetainedSource::Generated {
             function,
-            kind,
+            kinds,
             generator: generator @ None,
         } = &mut self.source
         else {
             return Ok(());
         };
-        let args = function.func_args.expect("retained function arguments");
         let catalog = storage_catalog(storage, state_arena, txid);
         let hooks = EvalHooks {
             catalog: Some(&catalog),
             ..super::super::eval::NO_HOOKS
         };
-        let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        for (value, argument) in values.iter_mut().zip(args) {
-            *value = eval_full(
-                argument,
-                state_arena,
-                params,
-                &super::super::eval::NoColumns,
-                &hooks,
-            )?;
+        let calls_source = match function.rows_from {
+            Some(calls) => calls,
+            None => core::slice::from_ref(*function),
+        };
+        let calls = state_arena
+            .alloc_slice_with(calls_source.len(), |_| {
+                super::generator::RowGenerator::Elements(None)
+            })
+            .map_err(|_| arena_full())?;
+        for ((call, source), kind) in calls.iter_mut().zip(calls_source).zip(kinds.iter()) {
+            let args = source.func_args.expect("retained function arguments");
+            let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            for (value, argument) in values.iter_mut().zip(args) {
+                *value = eval_full(
+                    argument,
+                    state_arena,
+                    params,
+                    &super::super::eval::NoColumns,
+                    &hooks,
+                )?;
+            }
+            *call =
+                super::generator::RowGenerator::start(*kind, &values[..args.len()], state_arena)?;
         }
-        *generator = Some(super::generator::RowGenerator::start(
-            *kind,
-            &values[..args.len()],
+        *generator = Some(super::generator::FunctionRows::new(
+            calls,
             state_arena,
+            function.with_ordinality,
         )?);
         Ok(())
     }
@@ -2068,11 +2092,11 @@ impl<'a> RetainedSelect<'a> {
                 source.open(storage, table, txid, arena)?;
             }
             RetainedSource::Physical(source)
-        } else if let (Some(kind), Some(from)) = (generated, from) {
+        } else if let (Some(generated), Some(from)) = (generated, from) {
             RetainedSource::Generated {
                 function: &from.base,
-                kind,
-                generator: eliminated.then_some(super::generator::RowGenerator::Elements(None)),
+                kinds: generated,
+                generator: eliminated.then(super::generator::FunctionRows::finished),
             }
         } else if literals {
             let rows = scope.derived[0].expect("literal derived source owns encoded rows");
@@ -2210,15 +2234,8 @@ impl<'a> RetainedSelect<'a> {
                 RetainedSource::Generated { generator, .. } => generator
                     .as_mut()
                     .expect("generator starts with the cursor's first fetch")
-                    .next(state_arena)
-                    .and_then(|value| {
-                        value
-                            .map(|value| {
-                                crate::sql::exec::encode_projected_pub(&[value], state_arena)
-                                    .map(RetainedRow::Literal)
-                            })
-                            .transpose()
-                    }),
+                    .next_encoded(state_arena)
+                    .map(|row| row.map(RetainedRow::Literal)),
             };
             let row = match next {
                 Ok(row) => row,

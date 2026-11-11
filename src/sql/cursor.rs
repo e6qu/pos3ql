@@ -21,7 +21,9 @@ mod scroll;
 mod stream;
 pub(crate) use query::{CursorLocal, CursorQuery, CursorStatement};
 pub(crate) use scroll::{Revisit, ScrollAction, ScrollInput, ScrollScan, VisitOutcome};
-pub(crate) use stream::{FetchStream, ResultStream, ResultStreams, StreamProtocol, StreamState};
+pub(crate) use stream::{
+    FetchStream, ResultStream, ResultStreams, STREAM_HEADER_BYTES, StreamProtocol, StreamState,
+};
 
 /// One FETCH/MOVE motion, normalized by the parser: positive counts move
 /// forward, negative backward (`NEXT` is `Count(1)`, `PRIOR` is `Count(-1)`,

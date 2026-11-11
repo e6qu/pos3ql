@@ -4,11 +4,9 @@
 Client A sends a large simple Query, then the same result through an unpaged
 extended Execute (Parse/Bind/Execute(0)/Sync) and through a paged portal
 (Execute with a row limit, repeated, then Execute(0)), and stops reading with
-a small receive buffer. Three results are used: a generated series and a scan
-of one table (pos3ql resumes both row by row, and evaluates a paged portal's
-rows as each Execute asks for them), and a join (pos3ql queues it in the
-result spool; a paged join buffers in portal_result_bytes, so it is not paged
-here).
+a small receive buffer. The results are a generated series, a scan
+of one table, joins and sorts (pos3ql resumes them row by row, and evaluates
+a paged portal's rows as each Execute asks for them).
 Client B, a psycopg session, must keep completing queries while A is stalled.
 A `COPY ... TO STDOUT` of the table is stalled the same way. A then reads
 everything: exactly one RowDescription per simple query, every row once and
@@ -49,9 +47,20 @@ QUERIES = (
         TABLE_ROWS,
         ALL_PROTOCOLS,
     ),
-    # A sorted result still spools; it delivers the same messages.
+    # Local-mode sorts and hash joins resume row by row after their build;
+    # rows must still arrive as 1..n, so the sort key reverses a descending
+    # expression.
     (
-        "SELECT id, payload FROM result_stream_rows ORDER BY id DESC",
+        "SELECT id, payload FROM result_stream_rows ORDER BY -id DESC",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+    ),
+    # Two tables' read positions exceed the starter result_stream_bytes, so
+    # this hash join spools; a paged portal would buffer more than
+    # portal_result_bytes, so it is not paged here.
+    (
+        "SELECT r.id, r.payload, s.id FROM result_stream_rows r "
+        "JOIN result_stream_rows s ON s.id = r.id ORDER BY r.id",
         TABLE_ROWS,
         ("simple", "extended"),
     ),

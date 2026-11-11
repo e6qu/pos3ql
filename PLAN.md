@@ -119,12 +119,6 @@ is owned.
     over a join, or ordered by such an expression, locks its rows at `DECLARE`.
     Cursors over retained joins already read as they fetch; declared cursors
     do not yet use the retained sort.
-  - A promoted stream whose sort or hash table outgrows the free
-    `plan_build_bytes` fails with `54000` after its RowDescription, where the
-    spooled result would have succeeded. Fix: when the build fails before
-    the stream's first row, re-run the statement with promotion declined for
-    `capacity`, which needs the connection to replay a statement whose
-    RowDescription it already queued.
   - Scrollable cursors whose revisited rows are evaluated again (volatile
     output or filter), ordered scrollable cursors and held cursors still save
     their history in `cursor_bytes`. A scrollable cursor moving back rereads

@@ -256,6 +256,42 @@ pub(crate) struct RetainedSelect<'a> {
     saves_scroll_output: bool,
     /// An ORDER BY the reader sorts itself in `plan_build_bytes`.
     sort: Option<sort::SortState<'a>>,
+    /// A statement's RowDescription, sent once its first row is prepared:
+    /// a sort or hash table that does not fit leaves nothing queued, and the
+    /// statement runs in the general executor instead.
+    description: Option<&'a [ColDesc<'a>]>,
+}
+
+fn description_too_large(mode: RetainedMode) -> SqlError {
+    match mode {
+        RetainedMode::Cursor => super::super::cursor_description_too_large(),
+        RetainedMode::Statement => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "retained statement row description exceeds output capacity"
+        ),
+    }
+}
+
+/// Sends a cursor's description now; a statement keeps it to send once its
+/// first row is prepared.
+fn describe<'a>(
+    columns: &[ColDesc<'a>],
+    mode: RetainedMode,
+    arena: &'a Arena,
+    responder: &mut Responder<'_>,
+) -> Result<Option<&'a [ColDesc<'a>]>, SqlError> {
+    match mode {
+        RetainedMode::Cursor => {
+            responder
+                .row_description(columns)
+                .map_err(|_| description_too_large(mode))?;
+            Ok(None)
+        }
+        RetainedMode::Statement => arena
+            .alloc_slice_copy(columns)
+            .map(|columns| Some(&*columns))
+            .map_err(|_| arena_full()),
+    }
 }
 
 fn retained_expression(
@@ -2525,15 +2561,7 @@ impl<'a> RetainedSelect<'a> {
             Some(storage),
             txid,
         )?;
-        responder
-            .row_description(&columns[..width])
-            .map_err(|_| match mode {
-                RetainedMode::Cursor => super::super::cursor_description_too_large(),
-                RetainedMode::Statement => sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "retained statement row description exceeds output capacity"
-                ),
-            })?;
+        let description = describe(&columns[..width], mode, arena, responder)?;
         Ok(Some(Self {
             items,
             predicate,
@@ -2550,6 +2578,7 @@ impl<'a> RetainedSelect<'a> {
             joins: None,
             saves_scroll_output: false,
             sort,
+            description,
             state: if eliminated {
                 ReaderState::Eliminated
             } else {
@@ -2789,15 +2818,7 @@ impl<'a> RetainedSelect<'a> {
             Some(storage),
             txid,
         )?;
-        responder
-            .row_description(&description[..width])
-            .map_err(|_| match mode {
-                RetainedMode::Cursor => super::super::cursor_description_too_large(),
-                RetainedMode::Statement => sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "retained statement row description exceeds output capacity"
-                ),
-            })?;
+        let description = describe(&description[..width], mode, arena, responder)?;
         Ok(Some(Self {
             items,
             predicate,
@@ -2814,6 +2835,7 @@ impl<'a> RetainedSelect<'a> {
             joins: Some(joins),
             saves_scroll_output,
             sort,
+            description,
             state: if eliminated {
                 ReaderState::Eliminated
             } else {
@@ -3287,6 +3309,53 @@ impl<'a> RetainedSelect<'a> {
         // The caller has emitted/dropped all scoped evaluation values. Taking
         // pending first releases its owned bytes before reclaiming row scratch.
         unsafe { state_arena.rewind_to(mark) };
+    }
+
+    /// Whether the statement's RowDescription still waits for its first
+    /// row.
+    pub(crate) fn description_pending(&self) -> bool {
+        self.description.is_some()
+    }
+
+    /// Sends the statement's RowDescription once, before its first row or
+    /// error.
+    pub(crate) fn send_description(
+        &mut self,
+        responder: &mut Responder<'_>,
+    ) -> Result<(), SqlError> {
+        match self.description.take() {
+            Some(columns) => responder
+                .row_description(columns)
+                .map_err(|_| description_too_large(RetainedMode::Statement)),
+            None => Ok(()),
+        }
+    }
+
+    /// Builds a join's hash tables before the first row. A declared cursor
+    /// does this at `DECLARE`, where a build that does not fit
+    /// `plan_build_bytes` still leaves the cursor to save its rows instead.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_tables(
+        &mut self,
+        storage: &Storage,
+        txid: u32,
+        observed_at: i64,
+        state_arena: &'a Arena,
+        buffers: &mut RowCursorBuffers,
+        work: &Arena,
+    ) -> Result<(), SqlError> {
+        match &mut self.joins {
+            Some(joins) if !matches!(self.state, ReaderState::Eliminated) => joins.build_hashes(
+                &self.scope,
+                storage,
+                txid,
+                observed_at,
+                state_arena,
+                buffers,
+                work,
+            ),
+            _ => Ok(()),
+        }
     }
 
     #[expect(

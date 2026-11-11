@@ -48,6 +48,7 @@ fn sort_full(error: LeaseError) -> SqlError {
         "retained sort exceeds plan_build_bytes: {}",
         error
     )
+    .plan_build_exhausted()
 }
 
 /// Output values one item produces; a qualified `table.*` is not admitted.
@@ -299,7 +300,8 @@ impl<'a> SortState<'a> {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "retained sort exceeds 4 GiB of rows"
-            ));
+            )
+            .plan_build_exhausted());
         };
         if end > self.bytes.capacity_entries() {
             // Grow geometrically: each move copies the rows saved so far.

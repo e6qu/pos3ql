@@ -91,6 +91,7 @@ fn build_full(error: LeaseError) -> SqlError {
         "retained hash join build exceeds plan_build_bytes: {}",
         error
     )
+    .plan_build_exhausted()
 }
 
 impl HashTable {
@@ -106,6 +107,7 @@ impl HashTable {
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "retained hash join build estimate overflows"
                 )
+                .plan_build_exhausted()
             })?
             .max(16);
         let mut buckets = pool.lease::<u32>(buckets_len).map_err(build_full)?;
@@ -169,6 +171,7 @@ impl HashTable {
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "retained hash join build exceeds 4 GiB of rows"
                 )
+                .plan_build_exhausted()
             })
         };
         let (start32, len32) = (offset(start)?, offset(length)?);
@@ -653,6 +656,7 @@ impl<'a> JoinState<'a> {
             if self.levels[depth].restart {
                 if self.levels[depth].hash.is_some() {
                     self.build_hash(
+                        depth,
                         scope,
                         storage,
                         txid,
@@ -772,10 +776,12 @@ impl<'a> JoinState<'a> {
         }
     }
 
-    /// Reads the current level's whole source into its hash table once. A
-    /// wait keeps the rows inserted so far and the source position.
+    /// Builds every hash table before the first row, so a declared cursor
+    /// learns at `DECLARE` whether its build fits `plan_build_bytes`. A
+    /// build reads only its table: it runs no expression and has no effect.
+    /// A wait keeps the rows inserted so far.
     #[allow(clippy::too_many_arguments)]
-    fn build_hash(
+    pub(super) fn build_hashes(
         &mut self,
         scope: &QueryScope<'a>,
         storage: &Storage,
@@ -785,7 +791,38 @@ impl<'a> JoinState<'a> {
         buffers: &mut RowCursorBuffers,
         work: &Arena,
     ) -> Result<(), SqlError> {
-        let level = &mut self.levels[self.depth];
+        for depth in 0..self.levels.len() {
+            if self.levels[depth].hash.is_some() {
+                self.build_hash(
+                    depth,
+                    scope,
+                    storage,
+                    txid,
+                    observed_at,
+                    state_arena,
+                    buffers,
+                    work,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads level `depth`'s whole source into its hash table once. A wait
+    /// keeps the rows inserted so far and the source position.
+    #[allow(clippy::too_many_arguments)]
+    fn build_hash(
+        &mut self,
+        depth: usize,
+        scope: &QueryScope<'a>,
+        storage: &Storage,
+        txid: u32,
+        observed_at: i64,
+        state_arena: &'a Arena,
+        buffers: &mut RowCursorBuffers,
+        work: &Arena,
+    ) -> Result<(), SqlError> {
+        let level = &mut self.levels[depth];
         let table = level.hash.as_mut().expect("hash level");
         if table.built {
             return Ok(());

@@ -302,7 +302,8 @@ reports the choice made at declaration.
 A cursor over a join of tables, `VALUES` lists and retained set-returning
 functions (inner, cross or `LEFT`, with a non-volatile condition) also reads
 as it fetches, as a nested loop or, for a two-table equality join, a hash
-join whose build table is held in `plan_build_bytes`:
+join whose build table is read into `plan_build_bytes` at `DECLARE` (a table
+that does not fit makes the cursor save its rows at `DECLARE` instead):
 
 ```sql
 DECLARE c CURSOR FOR SELECT nextval('s'), o.id, c.name

@@ -227,17 +227,16 @@ executor would hash is read as a hash join that builds the same side, and a
 join it would probe through an index per outer row is not retained.
 
 **Built: hash joins.** The build level reads its whole table once, at the
-join's first row, into three `plan_build_bytes` leases owned by the level:
+join's first row (a declared cursor's at `DECLARE`), into three `plan_build_bytes` leases owned by the level:
 bucket heads sized from the planner's row estimate, one entry per row, and
 the rows' columns in projected encoding. A wait during the build keeps the
 rows inserted so far and the table position. Each outer row hashes its keys
 and walks its bucket; equal keys are compared, then the `ON` condition runs,
 and a `LEFT JOIN` returns a NULL-extended row when nothing matched. A cursor
-moving back rereads only its outer table: the build stays. Exhaustion fails
-the statement with `54000` naming `plan_build_bytes`. The general executor
-builds the same table in statement memory (`sql_arena_bytes`), where the
-encoded rows take at least as much room, so a build that fits there fits a
-`plan_build_bytes` of the same size while no other retained build holds it.
+moving back rereads only its outer table: the build stays. A build that does
+not fit the free `plan_build_bytes` runs the statement the general executor's
+way instead (below), which builds the same table in statement memory
+(`sql_arena_bytes`).
 
 **Nodes.** Each node implements one step: `next(row slot) -> Row | End |
 Wait(kind)`. A wait returns up the tree without discarding state; the
@@ -259,15 +258,26 @@ delivered, as streams do now.
 | Derived table, CTE read once | Child tree in place | Its nodes |
 
 **Choosing a stream before execution.** Eligibility is decided from the
-query's shape before it runs, never after a failure: a statement either opens
-as a tree (all its nodes supported) or takes today's path, and the stream's
-eligibility and its reader share one admission function, so they cannot
-disagree. A built hash table or sort that outgrows the free
-`plan_build_bytes` fails with `54000` naming it, before the stream's first
-row but after its RowDescription. The general executor builds the same rows
-in statement memory, so such a promoted result can fail where its spooled
-form would have succeeded; [PLAN.md](../PLAN.md#pause-and-resume-every-query-path)
-tracks re-running it as a spooled result instead.
+query's shape before it runs: a statement either opens as a tree (all its
+nodes supported) or takes today's path, and the stream's eligibility and its
+reader share one admission function, so they cannot disagree. Promotion never
+makes a result fail that would have spooled. A stream keeps its opening
+messages (RowDescription, or CopyOutResponse and a COPY header) in a 16 KiB
+part of its `result_stream_bytes` until its first row is prepared, which is
+when its sort or hash table is complete. If opening the stream or building
+its table fails for capacity (`54000`: `result_stream_bytes`, the opening
+messages, or `plan_build_bytes`), nothing of it has been queued and no row or
+effect exists, so the connection releases the stream and runs the statement
+again with its output spooled, counted in
+`pos3ql_result_stream_spooled_total{reason="capacity"}`. This holds for a
+simple Query, an unpaged or paged Execute and `COPY ... TO STDOUT`; a re-run
+that waits for storage spools again rather than promoting. Any other error
+during the build follows the opening messages, as PostgreSQL sends them first.
+A top-level `SELECT` that a retained reader runs in place (one whose routine
+calls hand off on their row) holds its RowDescription the same way and runs
+in the general executor when its build does not fit. A declared cursor builds
+its hash table at `DECLARE`; one that does not fit saves its rows in
+`cursor_bytes` instead, so a streamed `FETCH` never builds.
 
 **Built: sorts in local mode.** At its first row a sort reads its whole input
 (yielding on storage waits with the rows saved so far kept), filters it, and
@@ -590,7 +600,7 @@ explicitly.
 | `index_statistics_slots` | Index activity counters | Starter: 4,096. Reserved at index creation; a table without indexes owns none |
 | `definition_image_slots` | Retained execution-schema identities | A paused trigger pins its completion's existing image rather than reserving another |
 | `result_spool_bytes` / `result_spool_leases` | Result rows queued behind clients that read slower than statements produce them | A connection holds at most one lease, growing geometrically and returned once its queue drains. Exhaustion fails only the lagging statement with `54000` after the rows already queued |
-| `plan_build_bytes` / `plan_build_leases` | Build sides of retained plan nodes: a retained hash join's buckets, entries and encoded build rows | Starter: 16 MiB and 64 leases; a hash join holds three leases from its first row until its stream or cursor ends. Exhaustion fails that statement with `54000` naming `plan_build_bytes` |
+| `plan_build_bytes` / `plan_build_leases` | Build sides of retained plan nodes: a retained hash join's buckets, entries and encoded build rows | Starter: 16 MiB and 64 leases; a hash join holds three leases and a sort two, from opening (a cursor's from `DECLARE`) until the stream or cursor ends. A build that does not fit runs its statement as it ran without streaming: the result spools, a cursor saves its rows |
 | `memtable_bytes` | Resident row heap | At most 4,294,967,295 bytes per buffer, two buffers reserved; a cache limit, not total table size |
 
 **Example:** a function with 128 declared locals and one named input stages

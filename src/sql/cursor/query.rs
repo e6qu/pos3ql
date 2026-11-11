@@ -21,6 +21,8 @@ pub(crate) struct CursorQuery {
     // bound value before resetting or freeing that allocation.
     bound: Option<BoundQuery<'static>>,
     pub(crate) retained: Option<crate::sql::query::RetainedSelect<'static>>,
+    /// Where the retained source's bytes start in `arena`.
+    retained_mark: Option<crate::mem::arena::ArenaMark>,
     result_type_oids: Option<crate::mem::arena::FrozenArenaSliceHandle<i32>>,
     arena: Arena,
     owner: crate::sql::type_input_plans::Owner,
@@ -60,6 +62,7 @@ impl CursorQuery {
         Ok(Self {
             bound: None,
             retained: None,
+            retained_mark: None,
             result_type_oids: None,
             arena: Arena::new(budget, "cursor_query_bytes", bytes)?,
             owner: crate::sql::type_input_plans::Owner::Unlocated,
@@ -68,6 +71,7 @@ impl CursorQuery {
 
     pub(crate) fn clear(&mut self) {
         self.retained = None;
+        self.retained_mark = None;
         self.result_type_oids = None;
         self.bound = None;
         self.arena.reset();
@@ -97,6 +101,7 @@ impl CursorQuery {
 
     pub(crate) fn finish_source(&mut self) {
         self.retained = None;
+        self.retained_mark = None;
         self.bound = None;
         // Held rows keep their declared types after the query and its readers
         // end. Their checked tail storage survives front reclamation.
@@ -324,6 +329,7 @@ impl CursorQuery {
                         crate::sql::query::RetainedSelect<'static>,
                     >(source)
                 });
+                self.retained_mark = Some(mark);
                 Ok(true)
             }
             None => {
@@ -359,6 +365,32 @@ impl CursorQuery {
                 )
             })
         })
+    }
+
+    /// Builds the retained source's hash tables; see
+    /// [`crate::sql::query::RetainedSelect::build_tables`].
+    pub(crate) fn build_tables(
+        &mut self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+        observed_at: i64,
+        work: &Arena,
+        buffers: &mut crate::storage::RowCursorBuffers,
+    ) -> Result<(), SqlError> {
+        let source = self.retained.as_mut().expect("retained cursor input");
+        // Retention stores bytes in this allocation, never the movable Arena object.
+        let arena: &'static Arena = unsafe { &*(&self.arena as *const Arena) };
+        source.build_tables(storage, txid, observed_at, arena, buffers, work)
+    }
+
+    /// Drops a retained source whose builds did not fit, with its leases,
+    /// so the cursor saves its rows instead.
+    pub(crate) fn discard_source(&mut self) {
+        self.retained = None;
+        if let Some(mark) = self.retained_mark.take() {
+            // SAFETY: the dropped source was the last user of its bytes.
+            unsafe { self.arena.rewind_to(mark) };
+        }
     }
 
     /// Returns the retained source to its first row; see

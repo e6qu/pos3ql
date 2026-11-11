@@ -210,6 +210,9 @@ enum PortalExecution {
     /// An unpaged result resuming as a result stream; the Execute stays at
     /// the front of `recv` until it completes.
     Streaming,
+    /// Not run yet: its result stream's sort or hash table did not fit
+    /// before anything of it was queued, so it runs with output spooled.
+    Respool,
     Complete,
 }
 
@@ -494,6 +497,9 @@ pub struct Conn {
     /// server and retry the retained frontend message as a timeout error.
     parked_deadline: Option<Instant>,
     resume_statement: usize,
+    /// The statement of the Query at the front of `recv` that runs again
+    /// spooled because its result stream's sort or hash table did not fit.
+    respool_statement: Option<usize>,
     /// The live TLS session, once the handshake starts. All socket bytes for
     /// `recv`/`send` tunnel through it.
     tls: Option<crate::pg::tls::ServerSession>,
@@ -666,6 +672,7 @@ impl Conn {
             parked_wait: crate::sql::StatementWait::Lock,
             parked_deadline: None,
             resume_statement: 0,
+            respool_statement: None,
             tls: None,
             pending_tls: None,
             cancel_request: None,
@@ -724,6 +731,7 @@ impl Conn {
         self.parked_deadline = None;
         self.command_deadline = None;
         self.resume_statement = 0;
+        self.respool_statement = None;
         self.tls = None;
         self.pending_tls = None;
         self.cancel_request = None;
@@ -926,6 +934,7 @@ impl Conn {
         self.result_streams.release_active(&mut self.cursors);
         // The next Query starts at its first statement.
         self.resume_statement = 0;
+        self.respool_statement = None;
         let extended = self.copy.as_ref().map_or_else(
             || {
                 !matches!(
@@ -4033,9 +4042,10 @@ impl Conn {
         }
 
         if self.portals[portal_slot].execution == PortalExecution::Streaming {
-            return self.continue_portal_stream(engine, portal_slot, max_rows);
+            return self.continue_portal_stream(engine, total, portal_slot, max_rows);
         }
-        let need_run = self.portals[portal_slot].execution == PortalExecution::Fresh;
+        let respool = self.portals[portal_slot].execution == PortalExecution::Respool;
+        let need_run = respool || self.portals[portal_slot].execution == PortalExecution::Fresh;
         let mut paged =
             max_rows > 0 || self.portals[portal_slot].execution == PortalExecution::Paging;
 
@@ -4084,7 +4094,8 @@ impl Conn {
                 if paged {
                     portal.result.clear();
                     let mut responder = Responder::for_execute(&mut portal.result, rfmt)
-                        .for_portal_page(stream_available);
+                        .for_portal_page(stream_available)
+                        .respool(respool);
                     engine.execute_extended_selected(
                         text,
                         &self.arena,
@@ -4117,7 +4128,8 @@ impl Conn {
                             )
                             .guard_publication(engine.publication_required()),
                         )
-                        .allow_promotion(stream_available);
+                        .allow_promotion(stream_available)
+                        .respool(respool);
                     let result = engine.execute_extended_selected(
                         text,
                         &self.arena,
@@ -4194,7 +4206,17 @@ impl Conn {
                                 self.id,
                             )
                         }) {
-                        Ok(()) => Ok(true),
+                        Ok(()) => Ok(Some(true)),
+                        // Nothing of the stream was queued: run the Execute
+                        // again with its output spooled.
+                        Err(error) if crate::sql::stream_open_respools(&error) => {
+                            if let Some(index) = index {
+                                self.result_streams
+                                    .get_mut(index)
+                                    .release(&mut self.cursors);
+                            }
+                            Ok(None)
+                        }
                         Err(error) => engine
                             .fail_result_stream(
                                 index.map(|index| self.result_streams.get_mut(index)),
@@ -4204,15 +4226,19 @@ impl Conn {
                                 &self.guc,
                                 &mut responder,
                             )
-                            .map(|_| false),
+                            .map(|_| Some(false)),
                     }
                 };
                 return match opened {
-                    Ok(true) => {
+                    Ok(Some(true)) => {
                         self.portals[portal_slot].execution = PortalExecution::Streaming;
-                        self.continue_portal_stream(engine, portal_slot, max_rows)
+                        self.continue_portal_stream(engine, total, portal_slot, max_rows)
                     }
-                    Ok(false) => self.finish_failed_portal_stream(engine, portal_slot),
+                    Ok(Some(false)) => self.finish_failed_portal_stream(engine, portal_slot),
+                    Ok(None) => {
+                        self.portals[portal_slot].execution = PortalExecution::Respool;
+                        self.handle_execute(engine, total)
+                    }
                     Err(WireFull) => Step::Close,
                 };
             }
@@ -4503,7 +4529,8 @@ impl Conn {
                         OutputSink::new(&mut self.overflow, Some(engine.result_spool()), writer)
                             .guard_publication(engine.publication_required()),
                     )
-                    .allow_promotion(stream_available);
+                    .allow_promotion(stream_available)
+                    .respool(self.respool_statement == Some(self.resume_statement));
                 let result = engine.execute_simple_from_selected(
                     text,
                     self.resume_statement,
@@ -4551,6 +4578,7 @@ impl Conn {
                 self.sqlprep.clear_request_type_inputs();
                 self.finish_lock_wait();
                 self.resume_statement = 0;
+                self.respool_statement = None;
                 // A COPY FROM STDIN holds its query cycle open: the
                 // connection enters copy-in mode and ReadyForQuery waits
                 // for CopyDone.
@@ -4615,6 +4643,7 @@ impl Conn {
                 crate::sql::sequence::finish_statement(self.guc.seq_session());
                 self.finish_lock_wait();
                 self.resume_statement = 0;
+                self.respool_statement = None;
                 if self.txn.is_explicit() {
                     self.txn.failed = true;
                 } else if self.txn.is_active() {
@@ -4652,7 +4681,13 @@ impl Conn {
     /// Delivers rows of a portal's result stream: a running one resumes
     /// after its wait, and a suspended paged portal starts its next Execute
     /// with `max_rows` as the new row limit.
-    fn continue_portal_stream(&mut self, engine: &mut Engine, slot: usize, max_rows: i32) -> Step {
+    fn continue_portal_stream(
+        &mut self,
+        engine: &mut Engine,
+        total: usize,
+        slot: usize,
+        max_rows: i32,
+    ) -> Step {
         let formats = self.portals[slot].result_formats;
         let text = self.prepared[self.portals[slot].statement].query();
         let Some(index) = self.result_streams.portal(slot) else {
@@ -4748,6 +4783,10 @@ impl Conn {
                 Step::Parked
             }
             Ok(crate::sql::StreamStep::Failed) => self.finish_failed_portal_stream(engine, slot),
+            Ok(crate::sql::StreamStep::Respool) => {
+                self.portals[slot].execution = PortalExecution::Respool;
+                self.handle_execute(engine, total)
+            }
         }
     }
 
@@ -4811,6 +4850,18 @@ impl Conn {
             };
             match opened {
                 Ok(()) => return None,
+                // Nothing of the stream was queued: run the statement again
+                // with its output spooled.
+                Err(error) if crate::sql::stream_open_respools(&error) => {
+                    if let Some(index) = index {
+                        self.result_streams
+                            .get_mut(index)
+                            .release(&mut self.cursors);
+                    }
+                    self.resume_statement = statement;
+                    self.respool_statement = Some(statement);
+                    return None;
+                }
                 Err(error) => engine.fail_result_stream(
                     index.map(|index| self.result_streams.get_mut(index)),
                     error,
@@ -4877,6 +4928,11 @@ impl Conn {
             Ok(crate::sql::StreamStep::Suspended) => {
                 unreachable!("a simple Query stream has no row limit")
             }
+            Ok(crate::sql::StreamStep::Respool) => {
+                self.resume_statement = statement;
+                self.respool_statement = Some(statement);
+                None
+            }
             Ok(crate::sql::StreamStep::Wait(wait)) => {
                 self.resume_statement = statement;
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
@@ -4895,6 +4951,7 @@ impl Conn {
         self.sqlprep.clear_request_type_inputs();
         self.finish_lock_wait();
         self.resume_statement = 0;
+        self.respool_statement = None;
         engine.finish_backend_statement(&self.txn, self.id);
         let status = self.txn.status_byte();
         let step = match output(&mut self.send, &mut self.overflow).ready_for_query(status) {

@@ -829,34 +829,178 @@ fn sorted_results_stream_rows_as_the_client_reads() {
             .collect();
         assert!(streamed == general, "{sql}");
     }
-    // A stream's sort holds its rows in plan_build_bytes; one that does not
-    // fit fails by name before any row is sent.
-    drop((conn, other, fixture));
+}
+
+/// Rows of a response as text values, in order.
+fn data_rows(response: &[(u8, &[u8])]) -> Vec<Vec<Option<Vec<u8>>>> {
+    response
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .map(|message| row_values(message.1))
+        .collect()
+}
+
+#[test]
+fn builds_that_outgrow_plan_build_bytes_spool_instead() {
+    // A stream's sort or hash table lives in plan_build_bytes; the general
+    // executor builds the same rows in statement memory. A promoted result
+    // whose build does not fit runs again spooled, before anything of the
+    // stream is sent, so promotion never fails a result that spools.
     let mut config = fixture_config(
         crate::config::TransactionMode::Mvcc,
-        "stream-sort-capacity",
+        "stream-build-capacity",
         16 << 20,
     );
     config.result_stream_bytes = 1 << 20;
     config.plan_build_bytes = 64 << 10;
+    config.portal_result_bytes = 2 << 20;
     let mut fixture = Fixture::with_config(config);
     let (mut conn, mut client) = connection(&mut fixture, 1);
+    let (mut other, mut other_client) = connection(&mut fixture, 2);
+    let setup = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "CREATE TABLE big(id int, payload text); \
+         INSERT INTO big SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g; \
+         CREATE FUNCTION same(int) RETURNS int LANGUAGE sql AS 'SELECT $1'",
+    );
+    assert!(messages(&setup).iter().all(|message| message.0 != b'E'));
+    let sorted = "SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g ORDER BY g DESC";
+    let joined = "SELECT b.id, b.payload, c.id FROM big b JOIN big c ON c.id = b.id";
+    // A routine call in the output runs the promotion attempt itself through
+    // a retained reader, which also falls back before describing its result.
+    // The general executor restarts at each first call, so keep it short.
+    let handed_off = "SELECT same(b.id), repeat(b.payload, 10), c.id FROM big b \
+                      JOIN big c ON c.id = b.id WHERE b.id <= 100";
+    for (sql, count) in [(sorted, 5000), (joined, 5000), (handed_off, 100)] {
+        let before = fixture.engine.result_stream_metrics();
+        let response = run(&mut conn, &mut fixture.engine, &mut client, sql);
+        let response = messages(&response);
+        let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+        assert_eq!(
+            kinds[0],
+            b'T',
+            "{sql}: {}",
+            String::from_utf8_lossy(response[0].1)
+        );
+        assert_eq!(&kinds[kinds.len() - 2..], b"CZ", "{sql}");
+        assert_eq!(
+            response[kinds.len() - 2].1,
+            format!("SELECT {count}\0").as_bytes(),
+            "{sql}"
+        );
+        let mut rows = data_rows(&response);
+        let general = run(
+            &mut other,
+            &mut fixture.engine,
+            &mut other_client,
+            &format!("SELECT * FROM ({sql}) q"),
+        );
+        let mut general = data_rows(&messages(&general));
+        if sql != sorted {
+            rows.sort();
+            general.sort();
+        }
+        assert_eq!(rows.len(), count, "{sql}");
+        assert!(rows == general, "{sql}");
+        let after = fixture.engine.result_stream_metrics();
+        assert_eq!(after.opened, before.opened, "{sql}");
+        if sql == handed_off {
+            // Its routine call starts an effect before the output overflows.
+            assert_eq!(after.spooled_effects, before.spooled_effects + 1, "{sql}");
+        } else {
+            assert_eq!(after.spooled_capacity, before.spooled_capacity + 1, "{sql}");
+        }
+        assert!(!conn.result_streams.is_held());
+    }
+
+    // An unpaged Execute, a paged Execute and COPY run again spooled too.
+    let before = fixture.engine.result_stream_metrics();
+    let mut input = parse("", sorted);
+    input.extend_from_slice(&bind("", ""));
+    input.extend_from_slice(&execute("", 0));
+    input.extend_from_slice(&parse("", joined));
+    input.extend_from_slice(&bind("", ""));
+    input.extend_from_slice(&execute("", 10));
+    input.extend_from_slice(&execute("", 0));
+    input.extend_from_slice(&sync());
+    client.write_all(&input).unwrap();
+    assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+    let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert!(!kinds.contains(&b'E'), "{kinds:?}");
+    let tags: Vec<&[u8]> = response
+        .iter()
+        .filter(|message| message.0 == b'C')
+        .map(|message| message.1)
+        .collect();
+    assert_eq!(tags, [&b"SELECT 5000\0"[..], b"SELECT 4990\0"]);
+    assert_eq!(kinds.iter().filter(|kind| **kind == b's').count(), 1);
+    let rows = data_rows(&response);
+    assert_eq!(rows.len(), 10000);
+    assert_eq!(rows[0][0].as_deref(), Some(&b"5000"[..]));
+    assert_eq!(rows[4999][0].as_deref(), Some(&b"1"[..]));
+    let after = fixture.engine.result_stream_metrics();
+    assert_eq!(after.opened, before.opened);
+    assert_eq!(after.spooled_capacity, before.spooled_capacity + 2);
+
+    let before = fixture.engine.result_stream_metrics();
     let response = run(
         &mut conn,
         &mut fixture.engine,
         &mut client,
-        "SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g ORDER BY g DESC",
+        &format!("COPY ({sorted}) TO STDOUT"),
     );
     let response = messages(&response);
     let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
-    assert_eq!(kinds, b"TEZ");
-    let error = response[1].1;
-    assert_eq!(sqlstate_of(error), "54000");
-    assert!(
-        error
-            .windows(b"plan_build_bytes".len())
-            .any(|part| part == b"plan_build_bytes")
+    assert_eq!(kinds[0], b'H');
+    assert_eq!(&kinds[kinds.len() - 3..], b"cCZ");
+    assert_eq!(response[kinds.len() - 2].1, b"COPY 5000\0");
+    assert_eq!(kinds.iter().filter(|kind| **kind == b'd').count(), 5000);
+    assert!(response[1].1.starts_with(b"5000\t"));
+    let after = fixture.engine.result_stream_metrics();
+    assert_eq!(after.opened, before.opened);
+    assert_eq!(after.spooled_capacity, before.spooled_capacity + 1);
+
+    // A declared cursor builds its hash table at DECLARE; one that does not
+    // fit saves its rows there instead, as it did before joins streamed.
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "BEGIN; DECLARE c CURSOR FOR SELECT b.id, c.id FROM big b JOIN big c \
+         ON c.id = b.id WHERE b.id <= 100; FETCH 10 c; FETCH ALL c; COMMIT",
     );
+    let response = messages(&response);
+    assert!(response.iter().all(|message| message.0 != b'E'));
+    let tags: Vec<&[u8]> = response
+        .iter()
+        .filter(|message| message.0 == b'C')
+        .map(|message| message.1)
+        .collect();
+    assert_eq!(
+        tags,
+        [
+            &b"BEGIN\0"[..],
+            b"DECLARE CURSOR\0",
+            b"FETCH 10\0",
+            b"FETCH 90\0",
+            b"COMMIT\0"
+        ]
+    );
+    let mut ids: Vec<i64> = data_rows(&response)
+        .iter()
+        .map(|row| {
+            core::str::from_utf8(row[0].as_deref().unwrap())
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (1..=100).collect::<Vec<i64>>());
 }
 
 /// Writes a request larger than the loopback buffers, letting the
@@ -1616,7 +1760,7 @@ fn tls_result_streams_resume_while_the_client_reads_ciphertext() {
 }
 
 #[test]
-fn a_stream_whose_open_outgrows_its_estimate_fails_by_name() {
+fn a_stream_whose_open_outgrows_its_estimate_spools_instead() {
     let mut config = fixture_config(
         crate::config::TransactionMode::Mvcc,
         "stream-open-full",
@@ -1645,16 +1789,17 @@ fn a_stream_whose_open_outgrows_its_estimate_fails_by_name() {
     let response = run(&mut conn, &mut fixture.engine, &mut client, &sql);
     let response = messages(&response);
     let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    // Promotion discarded the first attempt and opening queued nothing, so
+    // the statement runs again spooled and succeeds.
     assert_eq!(
         fixture.engine.result_stream_metrics().spooled_capacity,
-        before.spooled_capacity
+        before.spooled_capacity + 1
     );
-    // Promotion discarded the first attempt before any byte left, so the
-    // client sees only the named error.
-    assert_eq!(kinds, b"EZ", "{kinds:?}");
-    assert_eq!(sqlstate_of(response[0].1), "54000");
-    let message = String::from_utf8_lossy(response[0].1);
-    assert!(message.contains("result_stream_bytes"), "{message}");
+    assert_eq!(fixture.engine.result_stream_metrics().opened, before.opened);
+    assert!(!kinds.contains(&b'E'), "{kinds:?}");
+    assert_eq!(kinds[0], b'T');
+    assert_eq!(kinds.iter().filter(|kind| **kind == b'D').count(), 400);
+    assert_eq!(response[kinds.len() - 2].1, b"SELECT 400\0");
     assert!(!conn.result_streams.is_active());
     let response = run(&mut conn, &mut fixture.engine, &mut client, "SELECT 5");
     assert!(

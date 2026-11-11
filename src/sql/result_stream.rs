@@ -38,6 +38,10 @@ pub(crate) enum StreamStep {
     /// An ErrorResponse follows the delivered rows; the stream is released
     /// and the transaction rolled back (implicit) or failed (explicit).
     Failed,
+    /// The stream's sort or hash table did not fit before anything of it
+    /// was queued: the stream is released and the statement must run again
+    /// with its output spooled for `Capacity`.
+    Respool,
 }
 
 /// Counters for the operations metrics endpoint.
@@ -61,11 +65,21 @@ fn stream_capacity(error: SqlError) -> SqlError {
     }
 }
 
+/// Whether a stream that failed to open may run its statement spooled
+/// instead: it queued nothing, and only a capacity of the stream itself
+/// (`result_stream_bytes`, its opening messages, or a build in
+/// `plan_build_bytes`) stopped it, which the spooled result does not need.
+pub(crate) fn stream_open_respools(error: &SqlError) -> bool {
+    error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED
+}
+
 /// Why row delivery stopped without an error.
 enum DeliveryStop {
     End,
     PageFull,
     Wait(StatementWait),
+    /// See [`StreamStep::Respool`].
+    Respool,
 }
 
 fn wait_kind(error: &SqlError) -> Option<StatementWait> {
@@ -81,7 +95,7 @@ fn wait_kind(error: &SqlError) -> Option<StatementWait> {
 impl Engine {
     /// Decides before a top-level statement runs whether its output may
     /// resume as a result stream.
-    pub(super) fn result_stream_choice(
+    fn result_stream_choice(
         &self,
         statement: &Stmt<'_>,
         typed_inputs: bool,
@@ -164,8 +178,43 @@ impl Engine {
             .and_then(|positions| positions.checked_add(source_len.saturating_mul(16)))
             .and_then(|bytes| bytes.checked_add(STREAM_PLAN_HEADROOM));
         match estimate {
-            Some(bytes) if bytes <= self.result_stream_bytes => Ok(StreamChoice::Promote),
+            Some(bytes) if bytes <= ResultStream::query_bytes(self.result_stream_bytes) => {
+                Ok(StreamChoice::Promote)
+            }
             _ => Err(SpoolReason::Capacity),
+        }
+    }
+
+    /// Arms the statement about to run for promotion, requests its FETCH
+    /// stream, or declines with the reason its output would spool. A
+    /// statement re-run because its stream could not build spools for
+    /// `Capacity`.
+    pub(super) fn arm_result_stream(
+        &self,
+        statement: &Stmt<'_>,
+        typed_inputs: bool,
+        txid: u32,
+        source_len: usize,
+        cursors: &cursor::CursorPool,
+        responder: &mut Responder,
+    ) -> Option<FetchStream> {
+        if !responder.promotion_allowed() {
+            return None;
+        }
+        if responder.take_respool() {
+            responder.decline_promotion(SpoolReason::Capacity);
+            return None;
+        }
+        match self.result_stream_choice(statement, typed_inputs, txid, source_len, cursors) {
+            Ok(StreamChoice::Promote) => {
+                responder.arm_promotion();
+                None
+            }
+            Ok(StreamChoice::Fetch(fetch)) => responder.request_stream().then_some(fetch),
+            Err(reason) => {
+                responder.decline_promotion(reason);
+                None
+            }
         }
     }
 
@@ -236,6 +285,9 @@ impl Engine {
         let source_snapshot = txn.command_id().saturating_add(1);
         let _guc_eval_scope = guc::enter_eval_scope(guc, txn);
         let work_mark = self.work.mark();
+        let query = &mut stream.query;
+        let header = &mut stream.header;
+        header.clear();
         let opened = exec::with_bound_parameter_types(parameter_types, || {
             // A COPY streams the query it reads, formatted as COPY data.
             let mut copy_format = None;
@@ -266,38 +318,42 @@ impl Engine {
             } else {
                 sql
             };
-            stream
-                .query
+            query
                 .bind(query_text, params, &[], &[], owner, |parser| {
                     type_inputs::validate_restored(parser, &self.storage, txid)
                 })
                 .map_err(stream_capacity)?;
             self.storage.set_read_snapshot(source_snapshot);
             responder.set_render(guc.render());
-            let Some((format, names, count)) = copy_format else {
-                return stream
-                    .query
-                    .prepare_source(&self.storage, txid, responder, query::RetainedUse::Stream)
-                    .map(|ready| (ready, None))
-                    .map_err(stream_capacity);
-            };
-            let ready = responder
-                .without_row_description(|responder| {
-                    stream.query.prepare_source(
-                        &self.storage,
-                        txid,
-                        responder,
-                        query::RetainedUse::Stream,
+            // The opening messages wait in the header until the first row is
+            // ready, so a sort or hash table that cannot be built leaves
+            // nothing queued and the statement can still spool.
+            responder.capture(header, |capture| {
+                let Some((format, names, count)) = copy_format else {
+                    return query
+                        .prepare_source(&self.storage, txid, capture, query::RetainedUse::Stream)
+                        .map(|ready| (ready, None))
+                        .map_err(stream_capacity);
+                };
+                let ready = capture
+                    .without_row_description(|capture| {
+                        query.prepare_source(
+                            &self.storage,
+                            txid,
+                            capture,
+                            query::RetainedUse::Stream,
+                        )
+                    })
+                    .map_err(stream_capacity)?;
+                exec::begin_copy_out(&format, &names[..count], capture).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "result stream opening messages exceed {} bytes",
+                        cursor::STREAM_HEADER_BYTES
                     )
-                })
-                .map_err(stream_capacity)?;
-            exec::begin_copy_out(&format, &names[..count], responder).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "a result message exceeds conn_send_buffer_bytes"
-                )
-            })?;
-            Ok((ready, Some(format)))
+                })?;
+                Ok((ready, Some(format)))
+            })
         });
         // The COPY statement and its query text were scratch.
         unsafe { self.work.rewind_to(work_mark) };
@@ -328,9 +384,9 @@ impl Engine {
             fetch: None,
             copy: copy_format,
             resumed: false,
+            header_pending: true,
         });
         cursors.hold_stream_tables(stream.index(), stream.source_tables());
-        self.result_streams_opened = self.result_streams_opened.saturating_add(1);
         Ok(())
     }
 
@@ -403,6 +459,7 @@ impl Engine {
             fetch: Some(fetch),
             copy: None,
             resumed: false,
+            header_pending: false,
         });
         self.result_streams_opened = self.result_streams_opened.saturating_add(1);
         Ok(())
@@ -605,6 +662,12 @@ impl Engine {
                 responder.portal_suspended()?;
                 Ok(StreamStep::Suspended)
             }
+            Ok(DeliveryStop::Respool) => {
+                stream.release(cursors);
+                txn.release_suspended_statement();
+                sequence::finish_statement(guc.seq_session());
+                Ok(StreamStep::Respool)
+            }
             Ok(DeliveryStop::Wait(wait)) => {
                 state.resumed = true;
                 stream.state = Some(state);
@@ -763,6 +826,8 @@ impl Engine {
                 )?,
                 None => self.advance_stream_row(
                     &mut stream.query,
+                    &stream.header,
+                    &mut state.header_pending,
                     state.copy.as_ref(),
                     state.source_snapshot,
                     arena,
@@ -790,6 +855,17 @@ impl Engine {
                 Err(error) => {
                     let Some(wait) = wait_kind(&error) else {
                         sequence_scope.discard(guc.seq_session());
+                        if state.header_pending {
+                            // Only the source's builds ran: no row, effect or
+                            // byte of this stream exists yet.
+                            if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED {
+                                self.rollback_waiting_statement(txn, row_mark);
+                                return Ok(Ok(DeliveryStop::Respool));
+                            }
+                            // PostgreSQL describes the result before its error.
+                            responder.raw(stream.header.readable())?;
+                            state.header_pending = false;
+                        }
                         return Ok(Err(error));
                     };
                     if wait == StatementWait::Lock && lock_timeout_expired {
@@ -884,6 +960,8 @@ impl Engine {
     fn advance_stream_row(
         &mut self,
         stream: &mut cursor::CursorQuery,
+        header: &crate::mem::buffer::FixedBuf,
+        header_pending: &mut bool,
         copy: Option<&exec::CopyFmt>,
         source_snapshot: u32,
         arena: &Arena,
@@ -904,10 +982,19 @@ impl Engine {
                 buffers,
             )
         };
-        match ready {
-            Ok(true) => {}
-            Ok(false) => return Ok(Ok(None)),
+        let ready = match ready {
+            Ok(ready) => ready,
             Err(error) => return Ok(Err(error)),
+        };
+        if *header_pending {
+            // The source's sort and hash table are built: nothing can make
+            // this result spool any more.
+            responder.raw(header.readable())?;
+            *header_pending = false;
+            self.result_streams_opened = self.result_streams_opened.saturating_add(1);
+        }
+        if !ready {
+            return Ok(Ok(None));
         }
         let txid = txn.txid;
         let row = arena.with_remaining_region(|frame| {

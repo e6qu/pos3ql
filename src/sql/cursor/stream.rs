@@ -17,6 +17,12 @@
 //! time, and every other may hold a suspended portal.
 
 use super::*;
+use crate::mem::buffer::FixedBuf;
+
+/// Bytes of each stream's `result_stream_bytes` that hold its opening
+/// messages (RowDescription, or CopyOutResponse and a COPY header) until
+/// its first row is ready. A larger opening spools the result instead.
+pub(crate) const STREAM_HEADER_BYTES: usize = 16 * 1024;
 
 /// Which protocol message owns the stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,10 +62,16 @@ pub(crate) struct StreamState {
     pub(crate) copy: Option<crate::sql::exec::CopyFmt>,
     /// Whether a previous turn already entered the statement's effect scope.
     pub(crate) resumed: bool,
+    /// The opening messages in [`ResultStream::header`] still wait for the
+    /// first row: the stream's sort or hash table is not built yet, so a
+    /// build that does not fit can still re-run the statement spooled.
+    pub(crate) header_pending: bool,
 }
 
 pub(crate) struct ResultStream {
     pub(crate) query: CursorQuery,
+    /// Opening messages held back until the first row is ready.
+    pub(crate) header: FixedBuf,
     pub(crate) state: Option<StreamState>,
     /// This stream's slot among its connection's streams.
     index: usize,
@@ -68,10 +80,21 @@ pub(crate) struct ResultStream {
 impl ResultStream {
     fn new(config: &Config, budget: &mut Budget, index: usize) -> Result<Self, BudgetError> {
         Ok(Self {
-            query: CursorQuery::new(budget, config.result_stream_bytes)?,
+            header: FixedBuf::new(
+                budget,
+                "result_stream_bytes",
+                STREAM_HEADER_BYTES.min(config.result_stream_bytes),
+            )?,
+            query: CursorQuery::new(budget, Self::query_bytes(config.result_stream_bytes))?,
             state: None,
             index,
         })
+    }
+
+    /// The part of `result_stream_bytes` that holds the query, parameters
+    /// and read positions.
+    pub(crate) fn query_bytes(result_stream_bytes: usize) -> usize {
+        result_stream_bytes.saturating_sub(STREAM_HEADER_BYTES)
     }
 
     pub(crate) fn index(&self) -> usize {
@@ -119,6 +142,7 @@ impl ResultStream {
     pub(crate) fn release(&mut self, cursors: &mut CursorPool) {
         self.state = None;
         self.query.clear();
+        self.header.clear();
         cursors.hold_stream_tables(self.index, NO_STREAM_TABLES);
     }
 }

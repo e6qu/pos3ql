@@ -89,6 +89,9 @@ enum ErrorOrigin {
     Sql,
     InputExpression,
     Control(InternalControl),
+    /// A retained plan node's build did not fit `plan_build_bytes`; the
+    /// statement can still run the general executor's way.
+    PlanBuild,
 }
 
 impl PartialEq for SqlState {
@@ -156,7 +159,7 @@ impl SqlState {
     pub(crate) fn internal_control(self) -> Option<InternalControl> {
         match self.1 {
             ErrorOrigin::Control(control) => Some(control),
-            ErrorOrigin::Sql | ErrorOrigin::InputExpression => None,
+            ErrorOrigin::Sql | ErrorOrigin::InputExpression | ErrorOrigin::PlanBuild => None,
         }
     }
 
@@ -247,6 +250,19 @@ impl SqlError {
             self.sqlstate.1 = ErrorOrigin::InputExpression;
         }
         self
+    }
+
+    /// Marks a `54000` raised because a retained sort or hash table did not
+    /// fit `plan_build_bytes`.
+    pub(crate) fn plan_build_exhausted(mut self) -> Self {
+        self.sqlstate.1 = ErrorOrigin::PlanBuild;
+        self
+    }
+
+    /// Whether only a retained build's capacity stopped the statement, so
+    /// the general executor can run it instead.
+    pub(crate) fn is_plan_build_exhausted(&self) -> bool {
+        self.sqlstate.1 == ErrorOrigin::PlanBuild
     }
 }
 

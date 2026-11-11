@@ -64,7 +64,7 @@ pub mod query;
 pub mod range;
 pub mod regex;
 mod result_stream;
-pub(crate) use result_stream::{StreamChoice, StreamStep};
+pub(crate) use result_stream::{StreamStep, stream_open_respools};
 mod routine_input_identity;
 pub mod ryu;
 pub mod sequence;
@@ -11864,22 +11864,14 @@ impl Engine {
                     .transient_owner(statement_index)
                     .and_then(|owner| self.storage.begin_advisory_statement().map(|()| owner));
                 let stream_owner = plan_owner.as_ref().ok().copied();
-                let mut fetch_stream = None;
-                if responder.promotion_allowed() {
-                    match self.result_stream_choice(
-                        statement,
-                        !source_bindings.is_empty(),
-                        txn.txid,
-                        source.len(),
-                        cursors,
-                    ) {
-                        Ok(StreamChoice::Promote) => responder.arm_promotion(),
-                        Ok(StreamChoice::Fetch(fetch)) => {
-                            fetch_stream = responder.request_stream().then_some(fetch);
-                        }
-                        Err(reason) => responder.decline_promotion(reason),
-                    }
-                }
+                let fetch_stream = self.arm_result_stream(
+                    statement,
+                    !source_bindings.is_empty(),
+                    txn.txid,
+                    source.len(),
+                    cursors,
+                    responder,
+                );
                 let executed = match plan_owner {
                     // A streamed FETCH evaluates its rows only in the stream.
                     Ok(_) if fetch_stream.is_some() => Err(WireFull),
@@ -12494,23 +12486,18 @@ impl Engine {
                                 Ok(()) => {
                                     let streamable =
                                         immediate.is_none() && index_completion.is_none();
-                                    let mut fetch_stream = None;
-                                    if streamable && responder.promotion_allowed() {
-                                        match self.result_stream_choice(
+                                    let fetch_stream = if streamable {
+                                        self.arm_result_stream(
                                             &statement,
                                             !source_bindings.is_empty(),
                                             txn.txid,
                                             text.len(),
                                             cursors,
-                                        ) {
-                                            Ok(StreamChoice::Promote) => responder.arm_promotion(),
-                                            Ok(StreamChoice::Fetch(fetch)) => {
-                                                fetch_stream =
-                                                    responder.request_stream().then_some(fetch);
-                                            }
-                                            Err(reason) => responder.decline_promotion(reason),
-                                        }
-                                    }
+                                            responder,
+                                        )
+                                    } else {
+                                        None
+                                    };
                                     let mut execute = |responder: &mut Responder<'_>| {
                                         self.execute_stmt(
                                             &statement,
@@ -15450,10 +15437,13 @@ impl Engine {
                 responder,
             ) {
                 Ok(source) => source,
+                // A sort or hash table that does not fit: the general
+                // executor builds in statement memory instead.
+                Err(error) if error.is_plan_build_exhausted() => None,
                 Err(error) => return Ok(Err(error)),
             };
             if let Some(mut source) = retained {
-                return self.execute_retained_select(
+                match self.execute_retained_select(
                     &mut source,
                     arena,
                     params,
@@ -15463,7 +15453,13 @@ impl Engine {
                     cursors,
                     guc,
                     responder,
-                );
+                )? {
+                    Ok(true) => return Ok(Ok(())),
+                    Err(error) => return Ok(Err(error)),
+                    // Its sort or hash table did not fit before anything was
+                    // sent: the general executor builds in statement memory.
+                    Ok(false) => drop(source),
+                }
             }
             // A rejected shape owns no retained reader or arena description.
             unsafe { arena.rewind_to(mark) };
@@ -15687,7 +15683,7 @@ impl Engine {
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
         responder: &mut Responder,
-    ) -> Result<Result<(), SqlError>, WireFull> {
+    ) -> Result<Result<bool, SqlError>, WireFull> {
         let mut emitted = 0u64;
         loop {
             self.storage.set_read_snapshot(source_snapshot);
@@ -15703,10 +15699,26 @@ impl Engine {
                     params,
                 )
             };
-            match next {
-                Ok(true) => {}
-                Ok(false) => break,
+            let next = match next {
+                Ok(next) => next,
+                Err(error) if source.description_pending() && !cursor_input_wait(&error) => {
+                    if error.is_plan_build_exhausted() {
+                        return Ok(Ok(false));
+                    }
+                    // PostgreSQL describes the result before its error.
+                    if let Err(error) = source.send_description(responder) {
+                        return Ok(Err(error));
+                    }
+                    return Ok(Err(error));
+                }
                 Err(error) => return Ok(Err(error)),
+            };
+            // Its sort and hash table are built: the result is described.
+            if let Err(error) = source.send_description(responder) {
+                return Ok(Err(error));
+            }
+            if !next {
+                break;
             }
             let row = arena.with_remaining_region(|frame| {
                 let txid = txn.txid;
@@ -15813,7 +15825,7 @@ impl Engine {
         }
         let tag = stack_format!(48, "SELECT {}", emitted);
         responder.command_complete(tag.as_str())?;
-        Ok(Ok(()))
+        Ok(Ok(true))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -22961,148 +22973,186 @@ impl Engine {
         let txid = txn.txid;
         let snapshot = self.storage.read_snapshot();
         let owner = cursors.plan_owner(at)?;
-        let out = arena.with_remaining_region(|frame| {
-            let captured = cursors
-                .execution_parts(at)
-                .0
-                .with_query(|parsed, params, _| {
-                    let statement = match parsed {
-                        cursor::CursorStatement::Select(select) => Stmt::Select(*select),
-                        cursor::CursorStatement::SetQuery(query) => Stmt::SetQuery(*query),
-                    };
-                    planner_inputs::with_parameters(Some(params), || {
-                        planner_inputs::capture_planner_inputs(
-                            &statement,
-                            None,
-                            &self.storage,
-                            txid,
-                            frame,
-                        )
-                    })
-                });
-            let captured = match captured {
-                Ok(Ok(captured)) => captured,
-                Ok(Err(error)) | Err(error) => return Ok(Err(error)),
-            };
-            let planned = type_input_plans::with_owner(owner, || {
-                self.prepare_captured_planner_inputs(
-                    captured, frame, txn, sqlprep, cursors, guc, responder,
-                )
-            })?;
-            if planned.is_err() {
-                return Ok(planned);
-            }
-            self.execute_retained_expression(
-                frame,
-                None,
-                snapshot,
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                responder,
-                |storage, work, _sequence, _invocations, cursors| {
-                    cursors.restart_opening_output(attempt)?;
-                    let prepared = {
-                        let (query, description, rows) = cursors.execution_parts(at);
-                        let mut capture = Responder::for_cursor(
-                            description,
-                            crate::pg::respond::CursorRowOutput::Save(rows),
-                        );
-                        query.prepare_source(
-                            storage,
-                            txid,
-                            &mut capture,
-                            query::RetainedUse::Cursor,
-                        )
-                    };
-                    match prepared {
-                        Ok(true) => return Ok(()),
-                        Ok(false) => {}
-                        Err(error) => return Err(error),
-                    }
-                    let out = {
-                        let (query, description, rows) = cursors.execution_parts(at);
-                        let mut capture = Responder::for_cursor(
-                            description,
-                            crate::pg::respond::CursorRowOutput::Save(rows),
-                        );
-                        capture.set_render(guc.render());
-                        query.with_query(|parsed, params, _| {
-                            let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txid);
-                            match parsed {
-                                cursor::CursorStatement::Select(select) => {
-                                    let select = match query::expand_ctes_exec(
-                                        select,
-                                        storage,
-                                        txid,
-                                        work,
-                                        params,
-                                        &[],
-                                        Some(&sequence),
-                                    ) {
-                                        Ok(select) => select,
-                                        Err(error) => {
+        // A retained join builds its hash tables now: one that does not fit
+        // `plan_build_bytes` leaves the cursor to save its rows instead, as
+        // it did before reading as it fetches.
+        let mut materialize = false;
+        loop {
+            let out = arena.with_remaining_region(|frame| {
+                let captured = cursors
+                    .execution_parts(at)
+                    .0
+                    .with_query(|parsed, params, _| {
+                        let statement = match parsed {
+                            cursor::CursorStatement::Select(select) => Stmt::Select(*select),
+                            cursor::CursorStatement::SetQuery(query) => Stmt::SetQuery(*query),
+                        };
+                        planner_inputs::with_parameters(Some(params), || {
+                            planner_inputs::capture_planner_inputs(
+                                &statement,
+                                None,
+                                &self.storage,
+                                txid,
+                                frame,
+                            )
+                        })
+                    });
+                let captured = match captured {
+                    Ok(Ok(captured)) => captured,
+                    Ok(Err(error)) | Err(error) => return Ok(Err(error)),
+                };
+                let planned = type_input_plans::with_owner(owner, || {
+                    self.prepare_captured_planner_inputs(
+                        captured, frame, txn, sqlprep, cursors, guc, responder,
+                    )
+                })?;
+                if planned.is_err() {
+                    return Ok(planned);
+                }
+                self.execute_retained_expression(
+                    frame,
+                    None,
+                    snapshot,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                    |storage, work, _sequence, _invocations, cursors| {
+                        cursors.restart_opening_output(attempt)?;
+                        let prepared = if materialize {
+                            Ok(false)
+                        } else {
+                            let (query, description, rows) = cursors.execution_parts(at);
+                            let mut capture = Responder::for_cursor(
+                                description,
+                                crate::pg::respond::CursorRowOutput::Save(rows),
+                            );
+                            query.prepare_source(
+                                storage,
+                                txid,
+                                &mut capture,
+                                query::RetainedUse::Cursor,
+                            )
+                        };
+                        match prepared {
+                            Ok(true) => return Ok(()),
+                            Ok(false) => {}
+                            // A hash table that does not fit: save rows.
+                            Err(error) if error.is_plan_build_exhausted() => {}
+                            Err(error) => return Err(error),
+                        }
+                        let out = {
+                            let (query, description, rows) = cursors.execution_parts(at);
+                            let mut capture = Responder::for_cursor(
+                                description,
+                                crate::pg::respond::CursorRowOutput::Save(rows),
+                            );
+                            capture.set_render(guc.render());
+                            query.with_query(|parsed, params, _| {
+                                let sequence =
+                                    sequence::SeqEval::new(storage, guc.seq_session(), txid);
+                                match parsed {
+                                    cursor::CursorStatement::Select(select) => {
+                                        let select = match query::expand_ctes_exec(
+                                            select,
+                                            storage,
+                                            txid,
+                                            work,
+                                            params,
+                                            &[],
+                                            Some(&sequence),
+                                        ) {
+                                            Ok(select) => select,
+                                            Err(error) => {
+                                                return Ok(Err(error));
+                                            }
+                                        };
+                                        if let Err(error) =
+                                            query::validate_locking(select, storage, txid, work)
+                                        {
                                             return Ok(Err(error));
                                         }
-                                    };
-                                    if let Err(error) =
-                                        query::validate_locking(select, storage, txid, work)
-                                    {
-                                        return Ok(Err(error));
+                                        if select.from.is_none() {
+                                            query::constant_select(
+                                                storage,
+                                                txid,
+                                                select,
+                                                work,
+                                                params,
+                                                Some(&sequence),
+                                                &mut capture,
+                                            )
+                                        } else {
+                                            query::select_query(
+                                                storage,
+                                                txid,
+                                                select,
+                                                work,
+                                                params,
+                                                Some(&sequence),
+                                                &mut capture,
+                                            )
+                                        }
                                     }
-                                    if select.from.is_none() {
-                                        query::constant_select(
-                                            storage,
-                                            txid,
-                                            select,
-                                            work,
-                                            params,
-                                            Some(&sequence),
-                                            &mut capture,
-                                        )
-                                    } else {
-                                        query::select_query(
-                                            storage,
-                                            txid,
-                                            select,
-                                            work,
-                                            params,
-                                            Some(&sequence),
-                                            &mut capture,
-                                        )
-                                    }
+                                    cursor::CursorStatement::SetQuery(query) => query::set_query(
+                                        storage,
+                                        txid,
+                                        query,
+                                        work,
+                                        params,
+                                        Some(&sequence),
+                                        &mut capture,
+                                    ),
                                 }
-                                cursor::CursorStatement::SetQuery(query) => query::set_query(
-                                    storage,
-                                    txid,
-                                    query,
-                                    work,
-                                    params,
-                                    Some(&sequence),
-                                    &mut capture,
-                                ),
-                            }
-                        })?
-                    };
-                    out.map_err(|_| cursor_description_too_large())?
-                },
-            )
-        });
-        let out = match out {
-            Ok(Ok(out)) => out,
-            Ok(Err(WireFull)) => Err(cursor_description_too_large()),
-            Err(error) => Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "cursor opening exceeds statement memory: {}",
-                error
-            )),
-        };
-        if let Err(error) = out {
-            if !cursor_input_wait(&error) {
-                cursors.abandon_attempt(attempt)?;
+                            })?
+                        };
+                        out.map_err(|_| cursor_description_too_large())?
+                    },
+                )
+            });
+            let out = match out {
+                Ok(Ok(out)) => out,
+                Ok(Err(WireFull)) => Err(cursor_description_too_large()),
+                Err(error) => Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "cursor opening exceeds statement memory: {}",
+                    error
+                )),
+            };
+            if let Err(error) = out {
+                if !cursor_input_wait(&error) {
+                    cursors.abandon_attempt(attempt)?;
+                }
+                return Err(error);
             }
-            return Err(error);
+            if materialize || cursors.execution_parts(at).0.source().is_none() {
+                break;
+            }
+            self.storage.set_read_snapshot(snapshot);
+            let built = {
+                let (work, buffers) = self.work.cursor_parts();
+                cursors.execution_parts(at).0.build_tables(
+                    &self.storage,
+                    txid,
+                    datetime::now_micros(),
+                    work,
+                    buffers,
+                )
+            };
+            match built {
+                Ok(()) => break,
+                Err(error) if error.is_plan_build_exhausted() => {
+                    cursors.execution_parts(at).0.discard_source();
+                    materialize = true;
+                }
+                Err(error) => {
+                    if !cursor_input_wait(&error) {
+                        cursors.abandon_attempt(attempt)?;
+                    }
+                    return Err(error);
+                }
+            }
         }
         if let Err(error) = cursors.seal(at) {
             cursors.abandon_attempt(attempt)?;

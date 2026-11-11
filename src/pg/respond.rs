@@ -316,6 +316,9 @@ pub struct Responder<'b> {
     promotion_trigger: PromotionTrigger,
     /// Why the current statement's output queued instead of streaming.
     spooled: Option<SpoolReason>,
+    /// The first statement re-runs after its result stream could not build
+    /// its sort or hash table: its output queues for `Capacity`.
+    respool: bool,
     /// The setting that bounds `buffer` when there is no output sink.
     buffer_setting: &'static str,
 }
@@ -764,6 +767,7 @@ impl<'b> Responder<'b> {
             promotion: Promotion::Disabled,
             promotion_trigger: PromotionTrigger::Overflow,
             spooled: None,
+            respool: false,
             buffer_setting: "conn_send_buffer_bytes",
         }
     }
@@ -789,6 +793,7 @@ impl<'b> Responder<'b> {
             promotion: Promotion::Disabled,
             promotion_trigger: PromotionTrigger::Overflow,
             spooled: None,
+            respool: false,
             buffer_setting: "conn_send_buffer_bytes",
         }
     }
@@ -815,6 +820,7 @@ impl<'b> Responder<'b> {
             promotion: Promotion::Disabled,
             promotion_trigger: PromotionTrigger::Overflow,
             spooled: None,
+            respool: false,
             buffer_setting: "conn_send_buffer_bytes",
         }
     }
@@ -842,6 +848,7 @@ impl<'b> Responder<'b> {
             promotion: Promotion::Disabled,
             promotion_trigger: PromotionTrigger::Overflow,
             spooled: None,
+            respool: false,
             buffer_setting: "conn_send_buffer_bytes",
         }
     }
@@ -875,6 +882,37 @@ impl<'b> Responder<'b> {
         self.promotion_trigger = PromotionTrigger::FirstRow;
         self.buffer_setting = "portal_result_bytes";
         self
+    }
+
+    /// Re-runs a statement whose result stream outgrew its capacity before
+    /// sending anything: that statement's output queues in the result spool.
+    pub(crate) fn respool(mut self, respool: bool) -> Self {
+        self.respool = respool;
+        self
+    }
+
+    /// Whether the statement about to run is a re-run that must spool;
+    /// consumed by that statement.
+    pub(crate) fn take_respool(&mut self) -> bool {
+        core::mem::take(&mut self.respool)
+    }
+
+    /// Runs `operation` with its output captured in `header` instead of
+    /// queued, with this responder's formats, rendering and description
+    /// suppression. A result stream keeps its opening messages there until
+    /// its first row is ready. Without room, a message fails with `WireFull`.
+    pub(crate) fn capture<T>(
+        &mut self,
+        header: &mut FixedBuf,
+        operation: impl FnOnce(&mut Responder<'_>) -> T,
+    ) -> T {
+        let mut capture = Responder::for_execute(header, self.formats);
+        capture.suppress_row_description = self.suppress_row_description;
+        capture.render = self.render;
+        let result = operation(&mut capture);
+        self.result_type_oids = capture.result_type_oids;
+        self.result_columns = capture.result_columns;
+        result
     }
 
     /// Whether the client transport failed during this statement.

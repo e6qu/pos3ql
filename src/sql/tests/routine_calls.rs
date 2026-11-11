@@ -2200,26 +2200,33 @@ fn search_path_sql_capacity_errors_preserve_the_selected_value() {
         "SELECT set_config('search_path','GUC_RAW,public',false)",
         true,
     );
-    for name in [
-        "a".repeat(64),
-        "a".repeat(65),
-        "é".repeat(32),
-        format!("{}a", "é".repeat(32)),
+    // PostgreSQL's scanner truncates a long identifier to 63 bytes, at a
+    // character boundary, with a NOTICE; the setting takes the truncated name.
+    for (name, truncated) in [
+        ("a".repeat(64), "a".repeat(63)),
+        ("a".repeat(65), "a".repeat(63)),
+        ("é".repeat(32), format!("\"{}\"", "é".repeat(31))),
+        (
+            format!("{}a", "é".repeat(32)),
+            format!("\"{}\"", "é".repeat(31)),
+        ),
     ] {
         for sql in [
             format!("SET search_path TO {name}"),
             format!("SET search_path TO \"{name}\""),
         ] {
-            assert_eq!(
-                error_sqlstates(&session.execute(&mut engine, &sql, true)),
-                ["42622"]
-            );
+            assert!(error_sqlstates(&session.execute(&mut engine, &sql, true)).is_empty());
             assert_eq!(
                 data_rows(&session.success(&mut engine, "SHOW search_path", true)),
-                ["GUC_RAW,public"]
+                core::slice::from_ref(&truncated)
             );
         }
     }
+    session.success(
+        &mut engine,
+        "SELECT set_config('search_path','GUC_RAW,public',false)",
+        true,
+    );
     for value in ["a".repeat(129), "é".repeat(64), "é".repeat(65)] {
         assert_eq!(
             error_sqlstates(&session.execute(

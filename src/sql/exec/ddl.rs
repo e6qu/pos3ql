@@ -180,10 +180,13 @@ pub(super) fn build_column(
                         None,
                     )
                 } else {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "type \"{}\" does not exist",
-                        c.type_name
+                    return Err(crate::sql::error_position::at_subject(
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "type \"{}\" does not exist",
+                            c.type_name
+                        ),
+                        c.type_name,
                     ));
                 }
             } else {
@@ -221,10 +224,13 @@ pub(super) fn build_column(
                                 )
                             }
                             None => {
-                                return Err(sql_err!(
-                                    sqlstate::UNDEFINED_OBJECT,
-                                    "type \"{}\" does not exist",
-                                    c.type_name
+                                return Err(crate::sql::error_position::at_subject(
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_OBJECT,
+                                        "type \"{}\" does not exist",
+                                        c.type_name
+                                    ),
+                                    c.type_name,
                                 ));
                             }
                         },

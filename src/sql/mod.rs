@@ -20,6 +20,7 @@ pub mod cursor;
 pub mod datetime;
 pub mod encoding;
 pub(crate) mod enum_values;
+pub(crate) mod error_position;
 pub mod eval;
 pub(crate) mod event_trigger;
 pub mod exec;
@@ -9148,11 +9149,14 @@ impl Engine {
                         .iter()
                         .any(|metadata| metadata.name.as_str() == *column)
                     {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column \"{}\" of relation \"{}\" does not exist",
+                        return Err(crate::sql::error_position::at_reference(
+                            sql_err!(
+                                sqlstate::UNDEFINED_COLUMN,
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                column,
+                                target.table.name
+                            ),
                             column,
-                            target.table.name
                         ));
                     }
                 }
@@ -11674,6 +11678,7 @@ impl Engine {
             if resume_statement == 0 {
                 emit_parse_warnings(&mut parser, responder)?;
             }
+            let source_copies = parser.source_copies();
             let routine_transaction_context = if !txn.is_transaction_block() && statement_count == 1
             {
                 exec::PlpgsqlTransactionContext::NonAtomic
@@ -11891,17 +11896,29 @@ impl Engine {
                             source,
                             source_bindings,
                             || {
-                                self.execute_stmt(
-                                    statement,
-                                    arena,
-                                    NO_PARAMS,
-                                    txn,
-                                    sqlprep,
-                                    cursors,
-                                    guc,
-                                    routine_transaction_context,
-                                    responder,
-                                    StatementTimeoutEntry::Nested,
+                                error_position::with_statement_source(
+                                    text,
+                                    source_copies,
+                                    statement.is_analyzed_query(),
+                                    if source_bindings.is_empty() {
+                                        0
+                                    } else {
+                                        *source_start
+                                    },
+                                    || {
+                                        self.execute_stmt(
+                                            statement,
+                                            arena,
+                                            NO_PARAMS,
+                                            txn,
+                                            sqlprep,
+                                            cursors,
+                                            guc,
+                                            routine_transaction_context,
+                                            responder,
+                                            StatementTimeoutEntry::Nested,
+                                        )
+                                    },
                                 )
                             },
                         )
@@ -12513,18 +12530,27 @@ impl Engine {
                                             Err(reason) => responder.decline_promotion(reason),
                                         }
                                     }
+                                    let source_copies = parser.source_copies();
                                     let mut execute = |responder: &mut Responder<'_>| {
-                                        self.execute_stmt(
-                                            &statement,
-                                            arena,
-                                            params,
-                                            txn,
-                                            sqlprep,
-                                            cursors,
-                                            guc,
-                                            routine_transaction_context,
-                                            responder,
-                                            StatementTimeoutEntry::Nested,
+                                        error_position::with_statement_source(
+                                            text,
+                                            source_copies,
+                                            statement.is_analyzed_query(),
+                                            0,
+                                            || {
+                                                self.execute_stmt(
+                                                    &statement,
+                                                    arena,
+                                                    params,
+                                                    txn,
+                                                    sqlprep,
+                                                    cursors,
+                                                    guc,
+                                                    routine_transaction_context,
+                                                    responder,
+                                                    StatementTimeoutEntry::Nested,
+                                                )
+                                            },
                                         )
                                     };
                                     let executed = if streamable {
@@ -13060,12 +13086,20 @@ impl Engine {
                 loop {
                     match parser.next_stmt() {
                         Ok(Some(statement)) => {
-                            if let Err(error) = query::capture_contextual_type_inputs(
-                                &parser,
-                                &statement,
-                                &self.storage,
-                                txn.txid,
-                                arena,
+                            if let Err(error) = error_position::with_statement_source(
+                                text,
+                                parser.source_copies(),
+                                statement.is_analyzed_query(),
+                                0,
+                                || {
+                                    query::capture_contextual_type_inputs(
+                                        &parser,
+                                        &statement,
+                                        &self.storage,
+                                        txn.txid,
+                                        arena,
+                                    )
+                                },
                             ) {
                                 return Ok(Err(error));
                             }
@@ -13436,9 +13470,17 @@ impl Engine {
                             planner_inputs::with_parameters(
                                 (!params.is_empty()).then_some(params),
                                 || {
-                                    self.prepare_planner_inputs(
-                                        &statement, None, arena, txn, sqlprep, cursors, guc,
-                                        responder,
+                                    error_position::with_statement_source(
+                                        text,
+                                        parser.source_copies(),
+                                        statement.is_analyzed_query(),
+                                        0,
+                                        || {
+                                            self.prepare_planner_inputs(
+                                                &statement, None, arena, txn, sqlprep, cursors,
+                                                guc, responder,
+                                            )
+                                        },
                                     )
                                 },
                             )
@@ -24002,8 +24044,11 @@ pub(crate) fn report_parse_error(
     e: &ParseError,
     text: &str,
 ) -> Result<(), WireFull> {
-    if let Some(hint) = e.hint {
-        eval::stash_diagnostic(None, Some(crate::util::StackStr::from_str(hint)));
+    if e.hint.is_some() || e.detail.is_some() {
+        eval::stash_diagnostic(
+            e.detail.map(crate::util::StackStr::from_str),
+            e.hint.map(crate::util::StackStr::from_str),
+        );
     }
     let message = e.render(text);
     responder.error_display(

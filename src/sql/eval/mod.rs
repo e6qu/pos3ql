@@ -455,7 +455,7 @@ pub trait ColumnLookup<'a> {
                     .flatten()
             })
             .ok_or_else(|| {
-                if let Some(qualifier) = qualifier
+                let error = if let Some(qualifier) = qualifier
                     && self.whole_row_type(qualifier).is_some()
                 {
                     sql_err!(
@@ -472,7 +472,8 @@ pub trait ColumnLookup<'a> {
                         "column \"{}\" does not exist",
                         name
                     )
-                }
+                };
+                crate::sql::error_position::column_reference(error, qualifier, name)
             })
     }
 
@@ -3496,6 +3497,17 @@ pub fn eval_full<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    eval_full_unpositioned(expression, arena, params, row, hooks)
+        .map_err(|error| crate::sql::error_position::expression_error(error, expression))
+}
+
+fn eval_full_unpositioned<'a>(
+    expression: &Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
     let evaluate = || {
         // Grouped/window results belong to the original plan node. Consume
         // them before a scalar continuation can rebind or execute that call.
@@ -3828,10 +3840,14 @@ fn eval_full_inner<'a>(
                     }
                     Ok(Some(fields)) => Ok(Datum::Record(fields)),
                     Ok(None) => Ok(Datum::Null),
-                    Err(_) => Err(e),
+                    Err(_) => Err(crate::sql::error_position::column_reference(
+                        e, qualifier, name,
+                    )),
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => Err(crate::sql::error_position::column_reference(
+                e, qualifier, name,
+            )),
         },
         Expr::RoutineParam {
             qualifier,

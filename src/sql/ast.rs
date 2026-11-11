@@ -1383,6 +1383,25 @@ pub enum Stmt<'a> {
     },
 }
 
+impl Stmt<'_> {
+    /// Whether PostgreSQL runs parse analysis on this statement as a query
+    /// or query-bearing command, positioning relation and column errors.
+    pub(crate) fn is_analyzed_query(&self) -> bool {
+        matches!(
+            self,
+            Stmt::Select(_)
+                | Stmt::Insert(_)
+                | Stmt::Update(_)
+                | Stmt::Delete(_)
+                | Stmt::Merge(_)
+                | Stmt::Explain { .. }
+                | Stmt::CreateView { .. }
+                | Stmt::CreateTableAs { .. }
+                | Stmt::DeclareCursor { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleEvent {
     Select,
@@ -4793,8 +4812,12 @@ pub struct CopyOptions<'a> {
     /// CSV input: columns whose empty unquoted field is the empty string, not
     /// NULL, even when it matches the NULL string.
     pub force_not_null: &'a [&'a str],
+    /// CSV input: `FORCE_NOT_NULL *`, every column.
+    pub force_not_null_all: bool,
     /// CSV input: columns whose quoted value matching the NULL string is NULL.
     pub force_null: &'a [&'a str],
+    /// CSV input: `FORCE_NULL *`, every column.
+    pub force_null_all: bool,
 }
 
 impl CopyOptions<'_> {
@@ -4813,7 +4836,9 @@ impl CopyOptions<'_> {
         force_quote_all: false,
         force_quote: &[],
         force_not_null: &[],
+        force_not_null_all: false,
         force_null: &[],
+        force_null_all: false,
     };
 
     /// The effective field delimiter (text/CSV; unused for binary).

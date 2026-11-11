@@ -118,6 +118,7 @@ impl<'a> Parser<'a> {
             cursor: None,
             hint: None,
             near: None,
+            detail: None,
         })
     }
 
@@ -152,6 +153,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
+                    detail: None,
                 });
             }
             self.expect_ident("as")?;
@@ -303,6 +305,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         if !base.order_by.is_empty() && !order_by.is_empty() {
@@ -317,6 +320,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         if base.frame.is_some() {
@@ -331,6 +335,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         Ok(WindowSpec {

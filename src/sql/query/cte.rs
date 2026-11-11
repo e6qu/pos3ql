@@ -2378,11 +2378,14 @@ fn require_view_column(
     if exposed_columns.contains(&column) {
         return Ok(());
     }
-    Err(sql_err!(
-        sqlstate::UNDEFINED_COLUMN,
-        "column \"{}\" of relation \"{}\" does not exist",
+    Err(crate::sql::error_position::at_reference(
+        sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" of relation \"{}\" does not exist",
+            column,
+            view_name
+        ),
         column,
-        view_name
     ))
 }
 

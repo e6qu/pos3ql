@@ -280,27 +280,35 @@ resolved one. Expressions are shown as stored, not deparsed: `pg_get_expr`,
 `pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
 `text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
 the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
-than one deparsed statement per line. Syntax and scanner errors in a client's
-query report PostgreSQL's wording and cursor position (the `P` field that psql shows as `LINE 1:` and a caret), but
-other errors do not yet: PostgreSQL also points at the unknown relation, column,
-type, function or failed constant (`SELECT * FROM missing_table` reports
-position 15), maps a syntax error inside a SQL function body to its place in the
-`CREATE FUNCTION` text, and reports dynamic SQL failures (`EXECUTE 'SELEC 1'`)
-with an internal query and position (`q`, `p`) plus a `CONTEXT` line, which
-pos3ql does not send. Assigning to an
+than one deparsed statement per line. Errors in a client's query report
+PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
+caret) for syntax errors and for unknown relations, columns, types, functions
+and operators and failed constant input, except where the AST keeps no
+position: an operand of `WHERE` that is not boolean (`SELECT 1 WHERE 1`), an
+integer constant, and a folded or quoted identifier in a statement that waited
+for typed inputs. pos3ql also does not map a syntax error inside a SQL function
+body to its place in the `CREATE FUNCTION` text or report dynamic SQL failures
+(`EXECUTE 'SELEC 1'`) with an internal query and position (`q`, `p`) plus a
+`CONTEXT` line. A constant compared with a column is checked only when a row is
+compared, so `SELECT a FROM t WHERE a = 'abc'` on an empty integer column
+returns no rows where PostgreSQL rejects `'abc'`, and a `WITH` query no
+statement references is not analysed (`WITH x AS (SELECT * FROM missing)
+SELECT 1` succeeds). A not-null violation lacks PostgreSQL's `DETAIL` (`Failing
+row contains ...`) and schema, table and column fields. Assigning to an
 array element or slice (`UPDATE t SET a[1] = 9`) fails with `0A000`. A slice
 followed by an index (`a[1:1][1]`) indexes the slice where PostgreSQL treats the
 whole list as a slice, and a subscripted scalar subquery is named `?column?`
 where PostgreSQL names it after the subquery's column. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
-Checks the parser makes where PostgreSQL checks later
-still fail with `42601` and `syntax error: <description>`: COPY targets and
-options, storage parameters, sequence, role and large-object values, and
-SQL/JSON result types. A type modifier error is reported when its statement
-would run, but before analysis errors PostgreSQL finds first in the same
-statement (`SELECT 1::numeric(5000) FROM missing` reports the modifier, not the
-missing relation), and a modifier on an unknown type reports `type modifier is
-not allowed` rather than `type ... does not exist`.
+Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
+options, storage parameters, sequence, database and large-object values,
+SQL/JSON result types) are reported when the statement would run, but before
+analysis errors PostgreSQL finds first in the same statement (`SELECT
+1::numeric(5000) FROM missing` reports the modifier, not the missing relation),
+and a modifier on an unknown type reports `type modifier is not allowed` rather
+than `type ... does not exist`. COPY to or from a server file or program,
+`COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
+RETURNING` a non-JSON, non-string type are rejected with `0A000`.
 PL/pgSQL `CALL`, written directly or run with `EXECUTE`, fails with `0A000`
 (`CALL is not supported in PL/pgSQL`); supporting it needs output parameters
 assigned to the caller's variables, PostgreSQL's transaction-control rules for

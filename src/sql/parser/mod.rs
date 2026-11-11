@@ -253,6 +253,8 @@ pub struct ParseError {
     pub cursor: Option<usize>,
     /// PostgreSQL's HINT for this error, if it sends one.
     pub hint: Option<&'static str>,
+    /// PostgreSQL's DETAIL for this error, if it sends one.
+    pub detail: Option<&'static str>,
 }
 
 impl ParseError {
@@ -260,6 +262,7 @@ impl ParseError {
         Self {
             at,
             near: None,
+            detail: None,
             message: stack_format!(PARSE_MESSAGE_BYTES, "{}", text),
             sqlstate: sqlstate::SYNTAX_ERROR,
             cursor: None,
@@ -275,6 +278,7 @@ impl ParseError {
             at: error.at,
             message: error.render(text),
             near: error.echo(text),
+            detail: None,
             sqlstate: error.kind.sqlstate(),
             cursor: error.cursor(),
             hint: error.hint,
@@ -303,6 +307,7 @@ impl ParseError {
     }
 }
 
+mod copy_options;
 mod expr;
 mod typmod;
 mod window;
@@ -346,6 +351,9 @@ pub struct Parser<'a> {
     /// statement's own output, so the engine drains them after each
     /// `next_stmt` and emits them ahead of executing it.
     warnings: ArenaList<'a, ParseNotice<'a>>,
+    /// Tokens whose text does not start at their token (strings, quoted and
+    /// copied identifiers), for positioning analysis errors.
+    source_copies: ArenaList<'a, crate::sql::error_position::SourceCopy>,
     /// End of the furthest identifier whose truncation NOTICE was recorded,
     /// so a token scanned again after lookahead is reported once.
     truncation_reported_to: usize,
@@ -940,6 +948,7 @@ impl<'a> Parser<'a> {
             type_inputs: &[],
             windows: ArenaList::new(arena),
             warnings: ArenaList::new(arena),
+            source_copies: ArenaList::new(arena),
             truncation_reported_to: 0,
             defer_analysis_errors: false,
             analysis_error: None,
@@ -952,8 +961,52 @@ impl<'a> Parser<'a> {
             routine_name: None,
             named_parameters: &[],
         };
-        parser.note_truncated_identifier()?;
+        parser.note_token_source()?;
         Ok(parser)
+    }
+
+    /// Tokens copied or offset from their token start, recorded while
+    /// parsing, which [`crate::sql::error_position`] maps back to the text.
+    pub(crate) fn source_copies(&self) -> &'a [crate::sql::error_position::SourceCopy] {
+        self.source_copies.as_slice()
+    }
+
+    /// Records that `composed`, a name the parser built from several tokens,
+    /// is written starting at byte `at`.
+    fn note_composed_source(&mut self, composed: &'a str, at: usize) -> Result<(), ParseError> {
+        let copy = crate::sql::error_position::SourceCopy {
+            address: composed.as_ptr() as usize,
+            len: composed.len(),
+            at,
+        };
+        self.source_copies
+            .push(copy)
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))
+    }
+
+    /// Records where the current token's text came from, and PostgreSQL's
+    /// NOTICE when the lexer truncated it.
+    fn note_token_source(&mut self) -> Result<(), ParseError> {
+        let text = match self.peeked {
+            Tok::Str(text) | Tok::QuotedIdent(text) => Some(text),
+            Tok::Ident(text) => {
+                let start = self.text.as_ptr() as usize;
+                let address = text.as_ptr() as usize;
+                (address < start || address > start + self.text.len()).then_some(text)
+            }
+            _ => None,
+        };
+        if let Some(text) = text {
+            let copy = crate::sql::error_position::SourceCopy {
+                address: text.as_ptr() as usize,
+                len: text.len(),
+                at: self.peek_at,
+            };
+            self.source_copies
+                .push(copy)
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        }
+        self.note_truncated_identifier()
     }
 
     /// Records PostgreSQL's scanner NOTICE for an identifier the lexer cut
@@ -1367,17 +1420,39 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A large-object OID: PostgreSQL's `NumericOnly`, converted with `oidin`
+    /// and looked up when the statement runs, so a bad value is an analysis
+    /// error.
     fn large_object_id(&mut self) -> Result<crate::sql::ast::LargeObjectId, ParseError> {
-        let Tok::Num(text) = self.peeked else {
-            return Err(self.unexpected("large-object OID must be an unsigned integer"));
+        let at = self.peek_at;
+        let (text, _) = self.numeric_only()?;
+        let failure = match crate::sql::eval::parse_oid(text) {
+            Ok(oid) => match crate::sql::ast::LargeObjectId::parse(oid) {
+                Some(id) => return Ok(id),
+                None => (
+                    sqlstate::UNDEFINED_OBJECT,
+                    stack_format!(PARSE_MESSAGE_BYTES, "large object {oid} does not exist"),
+                ),
+            },
+            Err(error) => (
+                if error.sqlstate == sqlstate::NUMERIC_OUT_OF_RANGE {
+                    sqlstate::NUMERIC_OUT_OF_RANGE
+                } else {
+                    sqlstate::INVALID_TEXT_REPRESENTATION
+                },
+                stack_format!(PARSE_MESSAGE_BYTES, "{}", error.message),
+            ),
         };
-        let value = text
-            .parse::<u32>()
-            .ok()
-            .and_then(crate::sql::ast::LargeObjectId::parse)
-            .ok_or_else(|| self.unexpected("large-object OID must be between 1 and 4294967295"))?;
-        self.advance()?;
-        Ok(value)
+        self.analysis_error(ParseError {
+            at,
+            message: failure.1,
+            sqlstate: failure.0,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        })?;
+        Ok(crate::sql::ast::LargeObjectId::parse(1).expect("one is a valid large-object OID"))
     }
 
     /// DECLARE name [BINARY] [INSENSITIVE|ASENSITIVE] [[NO] SCROLL] CURSOR
@@ -1406,6 +1481,7 @@ impl<'a> Parser<'a> {
                         cursor: None,
                         hint: None,
                         near: None,
+                        detail: None,
                     });
                 }
                 scroll = crate::sql::cursor::CursorScroll::Scroll;
@@ -1419,6 +1495,7 @@ impl<'a> Parser<'a> {
                         cursor: None,
                         hint: None,
                         near: None,
+                        detail: None,
                     });
                 }
                 scroll = crate::sql::cursor::CursorScroll::NoScroll;
@@ -1434,6 +1511,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         self.expect_ident("cursor")?;
@@ -1460,6 +1538,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         if let Some(clause) = query.locking.first() {
@@ -1502,6 +1581,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
+                    detail: None,
                 });
             }
         }
@@ -1827,6 +1907,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         if options.wal && !options.analyze {
@@ -1837,6 +1918,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         if timing_enabled_explicitly && !options.analyze {
@@ -1850,6 +1932,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         if options.serialize != ExplainSerialize::None && !options.analyze {
@@ -1863,6 +1946,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         if options.plan_mode == ExplainPlanMode::Generic && options.analyze {
@@ -1876,6 +1960,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         let statement = self.statement()?;
@@ -2363,6 +2448,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         Ok(Stmt::Do { body })
@@ -2845,6 +2931,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
+                    detail: None,
                 });
             }
             match operator {
@@ -2861,6 +2948,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
+                    detail: None,
                 }),
             }
         } else if self.eat_ident("desc")? {
@@ -3879,6 +3967,7 @@ impl<'a> Parser<'a> {
                         cursor: None,
                         hint: None,
                         near: None,
+                        detail: None,
                     });
                 }
                 let uri = self.expression(0)?;
@@ -4196,6 +4285,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
+                    detail: None,
                 });
             }
         };
@@ -4223,6 +4313,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         self.expect_op(")")?;
@@ -4361,6 +4452,48 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// PostgreSQL's `opt_program copy_file_name copy_delimiter` after `TO` or
+    /// `FROM`. `STDIN` and `STDOUT` both name the client in either direction;
+    /// a server file or program is rejected when the statement would run.
+    fn copy_client_target(&mut self, from: bool) -> Result<Option<(&'a str, usize)>, ParseError> {
+        let at = self.peek_at;
+        let program = self.eat_ident("program")?;
+        let server_side = match self.peeked {
+            Tok::Ident("stdin" | "stdout") if !program => false,
+            Tok::Str(_) => true,
+            _ => return Err(self.syntax_error_here()),
+        };
+        self.advance()?;
+        if server_side {
+            self.analysis_error(ParseError {
+                at,
+                message: stack_format!(
+                    PARSE_MESSAGE_BYTES,
+                    "COPY {} a server {} is not supported",
+                    if from { "from" } else { "to" },
+                    if program { "program" } else { "file" }
+                ),
+                near: None,
+                detail: None,
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
+                hint: Some("Anyone can COPY to stdout or from stdin. psql's \\copy command also works for anyone."),
+            })?;
+        }
+        // The pre-7.3 `[USING] DELIMITERS 'x'` clause, a DELIMITER option.
+        let using = self.eat_ident("using")?;
+        if !using && self.peeked != Tok::Ident("delimiters") {
+            return Ok(None);
+        }
+        let at = self.peek_at;
+        self.expect_ident("delimiters")?;
+        let Tok::Str(delimiter) = self.peeked else {
+            return Err(self.syntax_error_here());
+        };
+        self.advance()?;
+        Ok(Some((delimiter, at)))
+    }
+
     /// `COPY table [(col, ...)] FROM STDIN | TO STDOUT [[WITH] (options)]`.
     /// The resolved option state is typed before execution so streaming COPY
     /// cannot accept an option then lose it between protocol messages.
@@ -4375,13 +4508,9 @@ impl<'a> Parser<'a> {
             let end = self.peek_at;
             self.expect_op(")")?;
             let query = self.text[start..end].trim();
-            if !self.eat_ident("to")? {
-                return Err(self.unexpected("COPY (query) supports only TO STDOUT"));
-            }
-            self.expect_ident("stdout")
-                .map_err(|_| self.unexpected("COPY (query) TO supports only STDOUT"))?;
-            let options = self.copy_options()?;
-            self.validate_copy_options(&options)?;
+            self.expect_ident("to")?;
+            let delimiters = self.copy_client_target(false)?;
+            let options = self.copy_options(false, delimiters)?;
             return Ok(Stmt::Copy(crate::sql::ast::CopyStmt {
                 table: QualName {
                     schema: None,
@@ -4402,7 +4531,7 @@ impl<'a> Parser<'a> {
             self.advance()?;
             loop {
                 if n_columns == columns.len() {
-                    return Err(self.unexpected("too many COPY columns"));
+                    return Err(self.limit("COPY column list", columns.len()));
                 }
                 columns[n_columns] = self.col_ident("column name")?;
                 n_columns += 1;
@@ -4418,18 +4547,14 @@ impl<'a> Parser<'a> {
             self.advance()?;
         }
         let to = if self.eat_ident("to")? {
-            self.expect_ident("stdout")
-                .map_err(|_| self.unexpected("COPY TO supports only STDOUT"))?;
             true
         } else if self.eat_ident("from")? {
-            self.expect_ident("stdin")
-                .map_err(|_| self.unexpected("COPY FROM supports only STDIN"))?;
             false
         } else {
             return Err(self.syntax_error_here());
         };
-        let options = self.copy_options()?;
-        self.validate_copy_options(&options)?;
+        let delimiters = self.copy_client_target(!to)?;
+        let options = self.copy_options(!to, delimiters)?;
         let (where_clause, where_text) = if self.eat_ident("where")? {
             let start = self.peek_at;
             let predicate = self.expression(0)?;
@@ -4452,248 +4577,6 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    /// The COPY option list: both the modern `WITH (FORMAT csv, HEADER, ...)`
-    /// list and the legacy bare `[WITH] CSV HEADER DELIMITER 'x' ...` shorthand
-    /// real tools still emit. Binary format and unknown options fail loudly
-    /// rather than mis-read data.
-    fn copy_options(&mut self) -> Result<CopyOptions<'a>, ParseError> {
-        let mut options = CopyOptions::TEXT;
-        let _ = self.eat_ident("with")?;
-        if self.peeked == Tok::Op("(") {
-            self.advance()?;
-            loop {
-                self.copy_modern_option(&mut options)?;
-                if self.peeked == Tok::Op(",") {
-                    self.advance()?;
-                    continue;
-                }
-                break;
-            }
-            if self.peeked != Tok::Op(")") {
-                return Err(self.syntax_error_here());
-            }
-            self.advance()?;
-        } else {
-            while self.copy_legacy_option(&mut options)? {}
-        }
-        Ok(options)
-    }
-
-    /// One option inside `COPY ... WITH ( ... )`.
-    fn copy_modern_option(&mut self, options: &mut CopyOptions<'a>) -> Result<(), ParseError> {
-        let option = self.any_ident("COPY option")?;
-        match option {
-            "format" => {
-                let format = self.any_ident("COPY format")?;
-                options.format = match format {
-                    "text" => CopyFormat::Text,
-                    "csv" => CopyFormat::Csv,
-                    "binary" => CopyFormat::Binary,
-                    other => {
-                        return Err(ParseError {
-                            at: self.peek_at,
-                            message: stack_format!(
-                                PARSE_MESSAGE_BYTES,
-                                "COPY format \"{}\" does not exist",
-                                other
-                            ),
-                            sqlstate: sqlstate::UNDEFINED_OBJECT,
-                            cursor: None,
-                            hint: None,
-                            near: None,
-                        });
-                    }
-                };
-            }
-            "delimiter" => options.delimiter = Some(self.copy_char("DELIMITER")?),
-            "null" => options.null_string = Some(self.copy_string("NULL")?),
-            "quote" => options.quote = Some(self.copy_char("QUOTE")?),
-            "escape" => options.escape = Some(self.copy_char("ESCAPE")?),
-            "header" => options.header = self.copy_header()?,
-            "encoding" => self.copy_encoding()?,
-            "force_quote" => {
-                if self.eat_op("*")? {
-                    options.force_quote_all = true;
-                } else {
-                    options.force_quote = self.copy_column_list()?;
-                }
-            }
-            "force_not_null" => options.force_not_null = self.copy_column_list()?,
-            "force_null" => options.force_null = self.copy_column_list()?,
-            "on_error" => {
-                options.on_error = match self.any_ident("COPY ON_ERROR action")? {
-                    "stop" => crate::sql::ast::CopyErrorAction::Stop,
-                    "ignore" => crate::sql::ast::CopyErrorAction::Ignore,
-                    action => return Err(self.copy_unsupported_option(action)),
-                };
-            }
-            "reject_limit" => {
-                let Tok::Num(text) = self.peeked else {
-                    return Err(self.unexpected("expected positive COPY REJECT_LIMIT"));
-                };
-                self.advance()?;
-                options.reject_limit = text.parse::<u64>().ok().filter(|limit| *limit > 0);
-                if options.reject_limit.is_none() {
-                    return Err(self.unexpected("COPY REJECT_LIMIT must be a positive bigint"));
-                }
-            }
-            "log_verbosity" => {
-                options.log_verbosity = match self.any_ident("COPY LOG_VERBOSITY")? {
-                    "default" => crate::sql::ast::CopyLogVerbosity::Default,
-                    "verbose" => crate::sql::ast::CopyLogVerbosity::Verbose,
-                    "silent" => crate::sql::ast::CopyLogVerbosity::Silent,
-                    value => return Err(self.copy_unsupported_option(value)),
-                };
-            }
-            "default" => options.default_string = Some(self.copy_string("DEFAULT")?),
-            "freeze" | "oids" => {
-                return Err(self.copy_unsupported_option(option));
-            }
-            _ => return Err(self.copy_unsupported_option(option)),
-        }
-        Ok(())
-    }
-
-    /// One legacy bare option; returns whether one was consumed.
-    fn copy_legacy_option(&mut self, options: &mut CopyOptions<'a>) -> Result<bool, ParseError> {
-        if self.eat_ident("binary")? {
-            options.format = CopyFormat::Binary;
-        } else if self.eat_ident("csv")? {
-            options.format = CopyFormat::Csv;
-        } else if self.eat_ident("header")? {
-            options.header = crate::sql::ast::CopyHeader::Skip;
-        } else if self.eat_ident("delimiter")? {
-            let _ = self.eat_ident("as")?;
-            options.delimiter = Some(self.copy_char("DELIMITER")?);
-        } else if self.eat_ident("null")? {
-            let _ = self.eat_ident("as")?;
-            options.null_string = Some(self.copy_string("NULL")?);
-        } else if self.eat_ident("quote")? {
-            let _ = self.eat_ident("as")?;
-            options.quote = Some(self.copy_char("QUOTE")?);
-        } else if self.eat_ident("escape")? {
-            let _ = self.eat_ident("as")?;
-            options.escape = Some(self.copy_char("ESCAPE")?);
-        } else if self.eat_ident("encoding")? {
-            let _ = self.eat_ident("as")?;
-            self.copy_encoding()?;
-        } else if self.eat_ident("force")? {
-            if self.eat_ident("quote")? {
-                if self.eat_op("*")? {
-                    options.force_quote_all = true;
-                } else {
-                    options.force_quote = self.copy_column_list()?;
-                }
-            } else if self.eat_ident("not")? {
-                self.expect_ident("null")?;
-                options.force_not_null = self.copy_column_list()?;
-            } else {
-                self.expect_ident("null")?;
-                options.force_null = self.copy_column_list()?;
-            }
-        } else {
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    /// The CSV-only options are meaningless in text format, exactly as
-    /// PostgreSQL rejects them.
-    fn validate_copy_options(&self, options: &CopyOptions) -> Result<(), ParseError> {
-        // Binary format takes none of the text/CSV field options.
-        if options.is_binary() {
-            let text_only = if options.delimiter.is_some() {
-                Some("DELIMITER")
-            } else if options.null_string.is_some() {
-                Some("NULL")
-            } else if !matches!(options.header, crate::sql::ast::CopyHeader::None) {
-                Some("HEADER")
-            } else if options.default_string.is_some() {
-                Some("DEFAULT")
-            } else {
-                None
-            };
-            if let Some(name) = text_only {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(
-                        PARSE_MESSAGE_BYTES,
-                        "cannot specify {} in BINARY mode",
-                        name
-                    ),
-                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                    cursor: None,
-                    hint: None,
-                    near: None,
-                });
-            }
-        }
-        if !options.is_csv() {
-            let csv_only = if options.quote.is_some() {
-                Some("QUOTE")
-            } else if options.escape.is_some() {
-                Some("ESCAPE")
-            } else if options.force_quote_all || !options.force_quote.is_empty() {
-                Some("FORCE_QUOTE")
-            } else if !options.force_not_null.is_empty() {
-                Some("FORCE_NOT_NULL")
-            } else if !options.force_null.is_empty() {
-                Some("FORCE_NULL")
-            } else {
-                None
-            };
-            if let Some(name) = csv_only {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(PARSE_MESSAGE_BYTES, "COPY {} requires CSV mode", name),
-                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                    cursor: None,
-                    hint: None,
-                    near: None,
-                });
-            }
-        }
-        if matches!(options.on_error, crate::sql::ast::CopyErrorAction::Ignore)
-            && options.is_binary()
-        {
-            return Err(self.copy_unsupported("COPY ON_ERROR ignore in BINARY mode"));
-        }
-        if options.reject_limit.is_some()
-            && !matches!(options.on_error, crate::sql::ast::CopyErrorAction::Ignore)
-        {
-            return Err(self.unexpected("COPY REJECT_LIMIT requires ON_ERROR ignore"));
-        }
-        if !matches!(
-            options.log_verbosity,
-            crate::sql::ast::CopyLogVerbosity::Default
-        ) && !matches!(options.on_error, crate::sql::ast::CopyErrorAction::Ignore)
-        {
-            return Err(self.unexpected("COPY LOG_VERBOSITY requires ON_ERROR ignore"));
-        }
-        Ok(())
-    }
-
-    /// A single-byte character option (`DELIMITER`, `QUOTE`, `ESCAPE`).
-    fn copy_char(&mut self, what: &'static str) -> Result<u8, ParseError> {
-        let s = self.copy_string(what)?;
-        let bytes = s.as_bytes();
-        if bytes.len() != 1 {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(
-                    PARSE_MESSAGE_BYTES,
-                    "COPY {} must be a single one-byte character",
-                    what
-                ),
-                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                cursor: None,
-                hint: None,
-                near: None,
-            });
-        }
-        Ok(bytes[0])
-    }
-
     /// A required single-quoted string literal (e.g. an enum label).
     /// `_what` names the expected item for readers; PostgreSQL's error names
     /// only the token found.
@@ -4704,126 +4587,6 @@ impl<'a> Parser<'a> {
                 Ok(s)
             }
             _ => Err(self.syntax_error_here()),
-        }
-    }
-
-    /// A string-literal option value.
-    fn copy_string(&mut self, what: &'static str) -> Result<&'a str, ParseError> {
-        match self.peeked {
-            Tok::Str(s) => {
-                self.advance()?;
-                Ok(s)
-            }
-            _ => Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(
-                    PARSE_MESSAGE_BYTES,
-                    "COPY {} requires a quoted string",
-                    what
-                ),
-                sqlstate: sqlstate::SYNTAX_ERROR,
-                cursor: None,
-                hint: None,
-                near: None,
-            }),
-        }
-    }
-
-    /// `HEADER` with an optional boolean (`true`/`false`/`on`/`off`); bare = true.
-    fn copy_header(&mut self) -> Result<crate::sql::ast::CopyHeader, ParseError> {
-        if self.eat_ident("match")? {
-            return Ok(crate::sql::ast::CopyHeader::Match);
-        }
-        if self.eat_ident("true")? || self.eat_ident("on")? {
-            Ok(crate::sql::ast::CopyHeader::Skip)
-        } else if self.eat_ident("false")? || self.eat_ident("off")? {
-            Ok(crate::sql::ast::CopyHeader::None)
-        } else if let Tok::Str(s) = self.peeked {
-            self.advance()?;
-            match s {
-                "true" | "on" | "1" => Ok(crate::sql::ast::CopyHeader::Skip),
-                "false" | "off" | "0" => Ok(crate::sql::ast::CopyHeader::None),
-                "match" => Ok(crate::sql::ast::CopyHeader::Match),
-                _ => Err(self.unexpected("COPY HEADER requires a boolean or MATCH")),
-            }
-        } else {
-            Ok(crate::sql::ast::CopyHeader::Skip)
-        }
-    }
-
-    /// `ENCODING 'utf8'` — only UTF-8 is supported; anything else is loud.
-    /// Compared case-insensitively, ignoring `-`/`_`, without allocating.
-    fn copy_encoding(&mut self) -> Result<(), ParseError> {
-        let encoding = self.copy_string("ENCODING")?;
-        let mut norm = [0u8; 12];
-        let mut n = 0usize;
-        for &b in encoding.as_bytes() {
-            if b == b'-' || b == b'_' {
-                continue;
-            }
-            if n == norm.len() {
-                return Err(self.copy_unsupported("a COPY ENCODING other than UTF8"));
-            }
-            norm[n] = b.to_ascii_lowercase();
-            n += 1;
-        }
-        if matches!(&norm[..n], b"utf8" | b"unicode") {
-            Ok(())
-        } else {
-            Err(self.copy_unsupported("a COPY ENCODING other than UTF8"))
-        }
-    }
-
-    /// A parenthesized column-name list `( a, b, ... )` for a FORCE option.
-    fn copy_column_list(&mut self) -> Result<&'a [&'a str], ParseError> {
-        if self.peeked != Tok::Op("(") {
-            return Err(self.syntax_error_here());
-        }
-        self.advance()?;
-        let mut names = [""; crate::storage::MAX_COLUMNS];
-        let mut n = 0usize;
-        loop {
-            if n == names.len() {
-                return Err(self.unexpected("too many COPY columns"));
-            }
-            names[n] = self.col_ident("column name")?;
-            n += 1;
-            if self.peeked == Tok::Op(",") {
-                self.advance()?;
-                continue;
-            }
-            break;
-        }
-        if self.peeked != Tok::Op(")") {
-            return Err(self.syntax_error_here());
-        }
-        self.advance()?;
-        self.arena_slice(&names[..n])
-    }
-
-    fn copy_unsupported_option(&self, option: &str) -> ParseError {
-        ParseError {
-            at: self.peek_at,
-            message: stack_format!(
-                PARSE_MESSAGE_BYTES,
-                "COPY option \"{}\" is not supported",
-                option
-            ),
-            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-            cursor: None,
-            hint: None,
-            near: None,
-        }
-    }
-
-    fn copy_unsupported(&self, what: &str) -> ParseError {
-        ParseError {
-            at: self.peek_at,
-            message: stack_format!(PARSE_MESSAGE_BYTES, "{} is not supported", what),
-            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-            cursor: None,
-            hint: None,
-            near: None,
         }
     }
 
@@ -4894,6 +4657,7 @@ impl<'a> Parser<'a> {
                         cursor: None,
                         hint: None,
                         near: None,
+                        detail: None,
                     });
                 }
                 if self.eat_op(")")? {
@@ -4922,6 +4686,7 @@ impl<'a> Parser<'a> {
                             cursor: None,
                             hint: None,
                             near: None,
+                            detail: None,
                         });
                     }
                     if core::mem::replace(&mut saw_analyze, true) {
@@ -4961,6 +4726,7 @@ impl<'a> Parser<'a> {
                         cursor: None,
                         hint: None,
                         near: None,
+                        detail: None,
                     });
                 }
                 break;
@@ -4977,7 +4743,7 @@ impl<'a> Parser<'a> {
         if !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
             loop {
                 if target_count == targets.len() {
-                    return Err(self.unexpected("too many maintenance targets"));
+                    return Err(self.limit("maintenance target list", targets.len()));
                 }
                 let inheritance = if self.eat_ident("only")? {
                     crate::sql::ast::RelationInheritance::Only
@@ -4993,7 +4759,7 @@ impl<'a> Parser<'a> {
                 if self.eat_op("(")? {
                     loop {
                         if column_count == column_names.len() {
-                            return Err(self.unexpected("too many maintenance columns"));
+                            return Err(self.limit("maintenance column list", column_names.len()));
                         }
                         column_names[column_count] = self.col_ident("column name")?;
                         column_count += 1;
@@ -5613,6 +5379,7 @@ impl<'a> Parser<'a> {
                         cursor: None,
                         hint: None,
                         near: None,
+                        detail: None,
                     });
                 }
                 if !self.eat_op(",")? {
@@ -6881,6 +6648,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         if grant {
@@ -7481,6 +7249,7 @@ impl<'a> Parser<'a> {
             cursor: None,
             hint: None,
             near: None,
+            detail: None,
         })
     }
 
@@ -7512,6 +7281,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
+                    detail: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -7542,6 +7312,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
+                    detail: None,
                 });
             };
             if core::mem::replace(selected, true) {
@@ -7652,6 +7423,7 @@ impl<'a> Parser<'a> {
             cursor: None,
             hint: None,
             near: None,
+            detail: None,
         })
     }
 
@@ -7872,6 +7644,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
+                    detail: None,
                 });
             }
             for (name, value) in names.as_slice().iter().zip(values.as_slice()) {
@@ -8704,9 +8477,12 @@ impl<'a> Parser<'a> {
                 base
             } else {
                 quoted = false;
-                self.arena
+                let composed = self
+                    .arena
                     .alloc_str(stack_format!(128, "{}.{}", schema, base).as_str())
-                    .map_err(|_| self.err_here("type name too long"))?
+                    .map_err(|_| self.err_here("type name too long"))?;
+                self.note_composed_source(composed, source.start)?;
+                composed
             };
         }
         // SQL `char` is the blank-padded character type. Only the quoted
@@ -8841,6 +8617,7 @@ impl<'a> Parser<'a> {
                 .arena
                 .alloc_str(stack_format!(132, "{}[]", name).as_str())
                 .map_err(|_| self.err_here("type name too long"))?;
+            self.note_composed_source(array, source.start)?;
             return Ok((array, type_mod, written));
         }
         Ok((name, type_mod, written))
@@ -8880,6 +8657,7 @@ impl<'a> Parser<'a> {
             cursor: Some(precision_at),
             hint: None,
             near: None,
+            detail: None,
         };
         if precision < 1 {
             return Err(error("precision for type float must be at least 1 bit"));
@@ -8902,11 +8680,21 @@ impl<'a> Parser<'a> {
             return Ok(None);
         };
         self.advance()?;
+        // PostgreSQL's grammar has a production for each valid field range,
+        // so any other pair, or a precision after a field other than SECOND,
+        // is a syntax error at the token where it stops.
+        if self.peeked == Tok::Ident("to")
+            && matches!(first, IntervalField::Month | IntervalField::Second)
+        {
+            return Err(self.syntax_error_here());
+        }
         let last = if self.eat_ident("to")? {
             let Tok::Ident(last_name) = self.peeked else {
                 return Err(self.syntax_error_here());
             };
-            let Some(last) = IntervalField::parse(last_name) else {
+            let Some(last) = IntervalField::parse(last_name).filter(|last| {
+                IntervalRange::from_bounds(first, *last).is_some() && *last != first
+            }) else {
                 return Err(self.syntax_error_here());
             };
             self.advance()?;
@@ -8914,14 +8702,10 @@ impl<'a> Parser<'a> {
         } else {
             first
         };
-        let Some(range) = IntervalRange::from_bounds(first, last) else {
-            return Err(self.unexpected("invalid interval field range"));
-        };
+        let range = IntervalRange::from_bounds(first, last).expect("checked above");
         let precision = if self.peeked == Tok::Op("(") {
             if last != IntervalField::Second {
-                return Err(self.unexpected(
-                    "interval precision is allowed only when SECOND is the trailing field",
-                ));
+                return Err(self.syntax_error_here());
             }
             match TypeMod::decode(
                 super::types::ColType::Interval,
@@ -9090,6 +8874,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
+                    detail: None,
                 });
             }
             if count != 0 {
@@ -9146,6 +8931,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
+                    detail: None,
                 });
             }
         }
@@ -9245,7 +9031,7 @@ impl<'a> Parser<'a> {
             .next_token()
             .map_err(|error| ParseError::lexical(error, self.text))?;
         self.peek_at = self.lexer.token_start();
-        self.note_truncated_identifier()
+        self.note_token_source()
     }
 
     /// Looks past the current token without consuming it.  The only caller
@@ -9356,6 +9142,7 @@ impl<'a> Parser<'a> {
             cursor: None,
             hint: None,
             near: None,
+            detail: None,
         })
     }
 
@@ -9605,6 +9392,7 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
                 near: None,
+                detail: None,
             });
         }
         let index = flat.len();
@@ -9669,6 +9457,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
+                    detail: None,
                 });
             }
             for subset in 0usize..(1usize << terms.len()) {
@@ -9725,6 +9514,7 @@ impl<'a> Parser<'a> {
             cursor: None,
             hint: None,
             near: None,
+            detail: None,
         }
     }
 
@@ -9795,17 +9585,6 @@ impl<'a> Parser<'a> {
             .map_err(|_| self.arena_full("statement too large for SQL arena"))
     }
 
-    fn unexpected(&self, expected: &str) -> ParseError {
-        ParseError {
-            at: self.peek_at,
-            message: stack_format!(PARSE_MESSAGE_BYTES, "syntax error: {}", expected),
-            sqlstate: sqlstate::SYNTAX_ERROR,
-            cursor: None,
-            hint: None,
-            near: None,
-        }
-    }
-
     /// PostgreSQL's generic grammar failure, naming the token where parsing
     /// stopped. Every failed expectation reports this form.
     fn syntax_error_here(&self) -> ParseError {
@@ -9816,6 +9595,7 @@ impl<'a> Parser<'a> {
                 hint: None,
                 message: StackStr::from_str("syntax error at end of input"),
                 near: None,
+                detail: None,
                 sqlstate: sqlstate::SYNTAX_ERROR,
             }
         } else {
@@ -9836,6 +9616,7 @@ impl<'a> Parser<'a> {
                 &self.text[start..end]
             ),
             near: Some((start, end)),
+            detail: None,
             sqlstate: sqlstate::SYNTAX_ERROR,
         }
     }
@@ -9854,6 +9635,7 @@ impl<'a> Parser<'a> {
             ),
             sqlstate: sqlstate::SYNTAX_ERROR,
             near: None,
+            detail: None,
         }
     }
 
@@ -9866,11 +9648,23 @@ impl<'a> Parser<'a> {
             message: StackStr::from_str("conflicting NULL/NOT NULL constraints"),
             sqlstate: sqlstate::SYNTAX_ERROR,
             near: None,
+            detail: None,
         }
     }
 
     fn err_here(&self, message: &'static str) -> ParseError {
         ParseError::new(self.peek_at, message)
+    }
+
+    /// [`Self::invalid_function_definition`] with formatted text.
+    fn invalid_function_definition_owned(
+        &self,
+        message: StackStr<PARSE_MESSAGE_BYTES>,
+    ) -> ParseError {
+        ParseError {
+            message,
+            ..self.invalid_function_definition("")
+        }
     }
 
     /// A CREATE FUNCTION definition error that PostgreSQL raises after
@@ -9883,6 +9677,7 @@ impl<'a> Parser<'a> {
             cursor: None,
             hint: None,
             near: None,
+            detail: None,
         }
     }
 
@@ -9895,6 +9690,7 @@ impl<'a> Parser<'a> {
             cursor: None,
             hint: None,
             near: None,
+            detail: None,
         }
     }
 
@@ -9911,6 +9707,7 @@ impl<'a> Parser<'a> {
             cursor: None,
             hint: None,
             near: None,
+            detail: None,
         }
     }
 }

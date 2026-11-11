@@ -342,3 +342,259 @@ fn unsupported_casts_name_both_types_as_postgresql_does() {
         }
     });
 }
+
+#[test]
+fn statement_option_checks_report_postgresql_errors_when_they_run() {
+    with_engine("statement-option-checks", |engine, budget| {
+        let setup = run_with(engine, budget, "CREATE TABLE ct(a int, b text)");
+        assert!(error_sqlstates(&setup).is_empty());
+        // Results from PostgreSQL 18.6.
+        for (sql, expected) in [
+            (
+                "COPY (SELECT 1) FROM STDIN",
+                "ERROR 42601 syntax error at or near \"FROM\" @17",
+            ),
+            (
+                "COPY ct TO '/tmp/x'",
+                "ERROR 0A000 COPY to a server file is not supported hint: Anyone can COPY to stdout or from stdin. psql's \\copy command also works for anyone.",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (FORMAT csv, FORMAT csv)",
+                "ERROR 42601 conflicting or redundant options @38",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (FORMAT foo)",
+                "ERROR 22023 COPY format \"foo\" not recognized @26",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (foo 1)",
+                "ERROR 42601 option \"foo\" not recognized @26",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (ON_ERROR foo)",
+                "ERROR 22023 COPY ON_ERROR \"foo\" not recognized @26",
+            ),
+            (
+                "COPY ct TO STDOUT WITH (ON_ERROR ignore)",
+                "ERROR 22023 COPY ON_ERROR cannot be used with COPY TO @25",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (REJECT_LIMIT 0)",
+                "ERROR 22023 REJECT_LIMIT (0) must be greater than zero",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (REJECT_LIMIT 'x')",
+                "ERROR 22P02 invalid input syntax for type bigint: \"x\"",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (REJECT_LIMIT 5)",
+                "ERROR 22023 COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (HEADER 2)",
+                "ERROR 42601 header requires a Boolean value or \"match\"",
+            ),
+            (
+                "COPY ct TO STDOUT WITH (HEADER match)",
+                "ERROR 0A000 cannot use \"match\" with HEADER in COPY TO",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (FORMAT binary, DELIMITER ',')",
+                "ERROR 42601 cannot specify DELIMITER in BINARY mode",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (ON_ERROR ignore, FORMAT binary)",
+                "ERROR 42601 only ON_ERROR STOP is allowed in BINARY mode",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (DELIMITER '\\')",
+                "ERROR 22023 COPY delimiter cannot be \"\\\"",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (NULL '\\N', DEFAULT '\\N')",
+                "ERROR 0A000 NULL specification and DEFAULT specification cannot be the same",
+            ),
+            (
+                "COPY ct TO STDOUT WITH (FORMAT csv, FORCE_NULL (a))",
+                "ERROR 22023 COPY FORCE_NULL cannot be used with COPY TO",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (ENCODING 'foo')",
+                "ERROR 22023 argument to option \"encoding\" must be a valid encoding name @26",
+            ),
+            (
+                "COPY ct FROM STDIN WITH (ON_ERROR)",
+                "ERROR 42601 on_error requires a parameter",
+            ),
+            (
+                "COPY ct (a, a) TO STDOUT",
+                "ERROR 42701 column \"a\" specified more than once",
+            ),
+            (
+                "CREATE TABLE ff(a int) WITH (fillfactor = 5)",
+                "ERROR 22023 value 5 out of bounds for option \"fillfactor\" detail: Valid values are between \"10\" and \"100\".",
+            ),
+            (
+                "CREATE TABLE ff(a int) WITH (fillfactor = 1.5)",
+                "ERROR 22023 value 1.5 out of bounds for option \"fillfactor\" detail: Valid values are between \"10\" and \"100\".",
+            ),
+            (
+                "CREATE TABLE ff(a int) WITH (fillfactor = 'x')",
+                "ERROR 22023 invalid value for integer option \"fillfactor\": x",
+            ),
+            (
+                "CREATE INDEX ON ct USING brin (a) WITH (pages_per_range = 0)",
+                "ERROR 22023 value 0 out of bounds for option \"pages_per_range\" detail: Valid values are between \"1\" and \"131072\".",
+            ),
+            (
+                "CREATE ROLE r1 CONNECTION LIMIT 99999999999",
+                "ERROR 42601 syntax error at or near \"99999999999\" @33",
+            ),
+            (
+                "CREATE SEQUENCE s1 START 99999999999999999999",
+                "ERROR 22003 value \"99999999999999999999\" is out of range for type bigint",
+            ),
+            (
+                "CREATE SEQUENCE s1 INCREMENT 1.5",
+                "ERROR 22P02 invalid input syntax for type bigint: \"1.5\"",
+            ),
+            (
+                "CREATE DATABASE dd CONNECTION LIMIT 1.5",
+                "ERROR 42601 connection_limit requires an integer value",
+            ),
+            (
+                "CREATE DATABASE dd CONNECTION LIMIT -5",
+                "ERROR 22023 invalid connection limit: -5",
+            ),
+            (
+                "COMMENT ON LARGE OBJECT -1 IS 'x'",
+                "ERROR 42704 large object 4294967295 does not exist",
+            ),
+            (
+                "COMMENT ON LARGE OBJECT 1.5 IS 'x'",
+                "ERROR 22P02 invalid input syntax for type oid: \"1.5\"",
+            ),
+            (
+                "SELECT JSON_SERIALIZE('{}' RETURNING int)",
+                "ERROR 42804 cannot use type integer in RETURNING clause of JSON_SERIALIZE() hint: Try returning a string type or bytea.",
+            ),
+            (
+                "SELECT JSON_ARRAY(1 RETURNING int[])",
+                "ERROR 42846 cannot cast type json to integer[]",
+            ),
+            (
+                "CREATE FUNCTION tf() RETURNS trigger LANGUAGE sql AS 'SELECT 1'",
+                "ERROR 42P13 SQL functions cannot return type trigger",
+            ),
+            (
+                "SELECT '1'::interval month to year",
+                "ERROR 42601 syntax error at or near \"to\" @28",
+            ),
+            (
+                "SELECT '1'::interval hour(2)",
+                "ERROR 42601 syntax error at or near \"(\" @26",
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [expected],
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            data_rows(&run_with(
+                engine,
+                budget,
+                "SELECT '-1'::oid, '-2147483648'::oid"
+            )),
+            ["4294967295|2147483648"]
+        );
+    });
+}
+
+#[test]
+fn analysis_errors_point_at_their_subject() {
+    with_engine("analysis-error-positions", |engine, budget| {
+        let setup = run_with(engine, budget, "CREATE TABLE pt(a int, b text)");
+        assert!(error_sqlstates(&setup).is_empty());
+        let function_hint = " hint: No function matches the given name and argument types. You might need to add explicit type casts.";
+        let binary_hint = " hint: No operator matches the given name and argument types. You might need to add explicit type casts.";
+        let unary_hint = " hint: No operator matches the given name and argument type. You might need to add an explicit type cast.";
+        // Positions from PostgreSQL 18.6.
+        for (sql, expected) in [
+            (
+                "SELECT * FROM missing_table",
+                "ERROR 42P01 relation \"missing_table\" does not exist @15".to_owned(),
+            ),
+            (
+                "SELECT 1; SELECT * FROM public.Nope",
+                "ERROR 42P01 relation \"public.nope\" does not exist @25".to_owned(),
+            ),
+            (
+                "SELECT pt.missing_col FROM pt",
+                "ERROR 42703 column pt.missing_col does not exist @8".to_owned(),
+            ),
+            (
+                "SELECT nosuch",
+                "ERROR 42703 column \"nosuch\" does not exist @8".to_owned(),
+            ),
+            (
+                "SELECT a FROM pt, pt p2",
+                "ERROR 42702 column reference \"a\" is ambiguous @8".to_owned(),
+            ),
+            (
+                "INSERT INTO pt (nosuch) VALUES (1)",
+                "ERROR 42703 column \"nosuch\" of relation \"pt\" does not exist @17".to_owned(),
+            ),
+            (
+                "UPDATE pt SET nosuch = 1",
+                "ERROR 42703 column \"nosuch\" of relation \"pt\" does not exist @15".to_owned(),
+            ),
+            (
+                "SELECT count(*), a FROM pt",
+                "ERROR 42803 column \"pt.a\" must appear in the GROUP BY clause or be used in an aggregate function @18".to_owned(),
+            ),
+            (
+                "SELECT 1::public.missingtype",
+                "ERROR 42704 type \"public.missingtype\" does not exist @11".to_owned(),
+            ),
+            (
+                "SELECT 1::missingtype[]",
+                "ERROR 42704 type \"missingtype[]\" does not exist @11".to_owned(),
+            ),
+            (
+                "CREATE TABLE pt2 (a missingtype)",
+                "ERROR 42704 type \"missingtype\" does not exist @21".to_owned(),
+            ),
+            (
+                "SELECT public.missingfn(1)",
+                format!("ERROR 42883 function public.missingfn(integer) does not exist @8{function_hint}"),
+            ),
+            (
+                "SELECT int4 'zap'",
+                "ERROR 22P02 invalid input syntax for type integer: \"zap\" @13".to_owned(),
+            ),
+            (
+                "SELECT 1 + 'x'::text",
+                format!("ERROR 42883 operator does not exist: integer + text @10{binary_hint}"),
+            ),
+            (
+                "SELECT - 'x'::text",
+                format!("ERROR 42883 operator does not exist: - text @8{unary_hint}"),
+            ),
+            // Utility commands look names up without a position.
+            (
+                "DROP TABLE missing",
+                "ERROR 42P01 table \"missing\" does not exist".to_owned(),
+            ),
+            (
+                "COPY missing TO STDOUT",
+                "ERROR 42P01 relation \"missing\" does not exist".to_owned(),
+            ),
+        ] {
+            let output = run_with(engine, budget, sql);
+            let reported = diagnostics(&output);
+            assert_eq!(reported.last(), Some(&expected), "{sql}");
+        }
+    });
+}

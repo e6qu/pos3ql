@@ -1387,9 +1387,15 @@ pub(crate) fn parse_int_bounded(
 
 /// Parses PostgreSQL's unsigned four-byte object identifier. Keeping this
 /// separate from `int4` preserves the valid upper half of the OID domain.
+/// Like PostgreSQL's `uint32in_subr`, a negative value down to `-2^31` wraps
+/// (`'-1'::oid` is 4294967295).
 pub(crate) fn parse_oid(s: &str) -> Result<u32, SqlError> {
     match classify_int_literal(s) {
-        IntLiteral::Value(value) if (0..=i64::from(u32::MAX)).contains(&value) => Ok(value as u32),
+        IntLiteral::Value(value)
+            if (i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&value) =>
+        {
+            Ok(value as u32)
+        }
         IntLiteral::Value(_) | IntLiteral::Overflow => Err(out_of_range(s.trim(), "oid")),
         IntLiteral::Malformed => Err(bad_text(s, "oid")),
     }

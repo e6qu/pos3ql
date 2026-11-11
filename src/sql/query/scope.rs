@@ -1475,7 +1475,7 @@ impl<'d> QueryScope<'d> {
                 })
         });
         let Some(slot) = slot else {
-            return Err(match tref.schema {
+            let error = match tref.schema {
                 Some(s) => sql_err!(
                     sqlstate::UNDEFINED_TABLE,
                     "relation \"{}.{}\" does not exist",
@@ -1487,7 +1487,11 @@ impl<'d> QueryScope<'d> {
                     "relation \"{}\" does not exist",
                     tref.table
                 ),
-            });
+            };
+            return Err(crate::sql::error_position::at_reference(
+                error,
+                tref.schema.unwrap_or(tref.table),
+            ));
         };
         let stored_def = self.defs.retain(storage, slot)?;
         let source_scope = self
@@ -2082,6 +2086,15 @@ impl<'d> QueryScope<'d> {
     }
 
     pub fn find_column(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_column_unpositioned(qualifier, name)
+            .map_err(|error| crate::sql::error_position::column_reference(error, qualifier, name))
+    }
+
+    fn find_column_unpositioned(
         &self,
         qualifier: Option<&str>,
         name: &str,

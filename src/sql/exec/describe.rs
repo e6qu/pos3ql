@@ -4884,6 +4884,14 @@ pub fn infer_type_res(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
+    infer_type_unpositioned(expression, columns)
+        .map_err(|error| crate::sql::error_position::expression_error(error, expression))
+}
+
+fn infer_type_unpositioned(
+    expression: &Expr,
+    columns: &dyn ColTypeResolver,
+) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
     let selected = selected_call(expression, columns)?;
     if let Expr::Call {

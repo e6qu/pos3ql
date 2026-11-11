@@ -204,6 +204,7 @@ impl<'a> Parser<'a> {
             cursor: type_at,
             hint: None,
             near: None,
+            detail: None,
         };
         let Some(input) = TypmodInput::for_type(base) else {
             let error = at_type(

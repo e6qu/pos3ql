@@ -1234,11 +1234,14 @@ pub(crate) fn validate_dml_assignment_casts(
         };
         let assign = |name: &str, expression: &Expr<'_>| -> Result<(), SqlError> {
             let index = target.column_index(name).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" of relation \"{}\" does not exist",
+                crate::sql::error_position::at_reference(
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        target_name
+                    ),
                     name,
-                    target_name
                 )
             })?;
             validate_assignment_expression(
@@ -1704,11 +1707,14 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
             let ordinal = index;
             let index = match name {
                 Some(name) => target.column_index(name).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
+                    crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            name,
+                            target_name
+                        ),
                         name,
-                        target_name
                     )
                 })?,
                 None => index,

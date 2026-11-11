@@ -40,6 +40,11 @@ impl CursorPosition {
     pub fn get(self) -> usize {
         self.0.get()
     }
+
+    /// A one-based character position.
+    pub fn from_position(position: usize) -> Option<Self> {
+        core::num::NonZeroUsize::new(position).map(Self)
+    }
 }
 
 /// Per-column result wire format requested by Bind: text (`false`) or binary
@@ -2299,6 +2304,12 @@ impl<'b> Responder<'b> {
         cursor: Option<CursorPosition>,
     ) -> Result<(), WireFull> {
         let diagnostic = crate::sql::eval::take_diagnostic();
+        // An analysis error positions its subject in the statement text.
+        let annotation = crate::sql::error_position::take_annotation(sqlstate, message);
+        let cursor = cursor.or_else(|| annotation.position.and_then(CursorPosition::from_position));
+        let analysis_hint = annotation
+            .hint
+            .filter(|_| diagnostic.as_ref().is_none_or(|d| d.hint.is_none()));
         self.control(|buffer| {
             let mut m = MsgOut::begin(buffer, wire::MSG_ERROR_RESPONSE);
             m.u8(b'S');
@@ -2318,6 +2329,10 @@ impl<'b> Responder<'b> {
                     m.u8(b'H');
                     m.cstr(h.as_str());
                 }
+            }
+            if let Some(hint) = analysis_hint {
+                m.u8(b'H');
+                m.cstr(hint);
             }
             // PostgreSQL sends the cursor after detail and hint.
             if let Some(cursor) = cursor {

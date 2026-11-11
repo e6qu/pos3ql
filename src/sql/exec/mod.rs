@@ -6217,11 +6217,14 @@ where
         new_values[..def.n_columns].copy_from_slice(&existing[..def.n_columns]);
         for (name, expression) in assigns {
             let Some(target) = def.column_index(name) else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" of relation \"{}\" does not exist",
+                return Err(crate::sql::error_position::at_reference(
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        def.name.as_str()
+                    ),
                     name,
-                    def.name.as_str()
                 ));
             };
             let v = if matches!(expression, Expr::DefaultMarker) {
@@ -12113,11 +12116,14 @@ fn column_privilege_target(
                 .iter()
                 .position(|description| description.name == name)
                 .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
+                    crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            name,
+                            view.name_for(txid).as_str()
+                        ),
                         name,
-                        view.name_for(txid).as_str()
                     )
                 })?;
             return crate::storage::ColumnPrivilegeTarget::new(relation, column as u16);
@@ -12131,11 +12137,14 @@ fn column_privilege_target(
     };
     let definition = storage.table_def(column, txid);
     let column = definition.column_index(name).ok_or_else(|| {
-        sql_err!(
-            sqlstate::UNDEFINED_COLUMN,
-            "column \"{}\" of relation \"{}\" does not exist",
+        crate::sql::error_position::at_reference(
+            sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" of relation \"{}\" does not exist",
+                name,
+                definition.name.as_str()
+            ),
             name,
-            definition.name.as_str()
         )
     })?;
     crate::storage::ColumnPrivilegeTarget::new(relation, column as u16)
@@ -16758,11 +16767,14 @@ fn publication_members(
         let mut mask = ColumnSet::EMPTY;
         for (column_index, column_name) in table.columns.iter().enumerate() {
             let Some(column) = definition.column_index(column_name) else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" of relation \"{}\" does not exist",
+                return Err(crate::sql::error_position::at_reference(
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        column_name,
+                        table.relation.name
+                    ),
                     column_name,
-                    table.relation.name
                 ));
             };
             if mask.contains(column) {
@@ -21169,11 +21181,14 @@ fn resolve_plpgsql_column_type(
         };
         let definition = storage.table_def(slot, txid);
         let column = definition.column_index(column).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "column \"{}\" of relation \"{}\" does not exist",
+            crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    column,
+                    relation
+                ),
                 column,
-                relation
             )
         })?;
         let field = definition.columns()[column];
@@ -30705,11 +30720,14 @@ pub fn create_trigger(
     let mut update_columns = ColumnSet::EMPTY;
     for name in trigger.update_columns {
         let Some(column) = target_definition.column_index(name) else {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "column \"{}\" of relation \"{}\" does not exist",
+            return sql_fail(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    name,
+                    trigger.table.name
+                ),
                 name,
-                trigger.table.name
             ));
         };
         update_columns.insert(column);
@@ -41930,11 +41948,14 @@ pub fn comment(
                     .iter()
                     .position(|description| description.name == column)
                 else {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
+                    return sql_fail(crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            column,
+                            relation.name
+                        ),
                         column,
-                        relation.name
                     ));
                 };
                 index as u32 + 1
@@ -41943,11 +41964,14 @@ pub fn comment(
                     .find_visible(schema.as_str(), relation.name, txid)
                     .expect("classified relation resolves to a table slot");
                 let Some(attnum) = storage.column_number(slot, column, txid) else {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
+                    return sql_fail(crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            column,
+                            relation.name
+                        ),
                         column,
-                        relation.name
                     ));
                 };
                 attnum
@@ -57542,11 +57566,14 @@ impl CopyFmt {
             let mut columns = ColumnSet::EMPTY;
             for name in names {
                 let Some(index) = def.column_index(name) else {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
+                    return Err(crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            name,
+                            table_name
+                        ),
                         name,
-                        table_name
                     ));
                 };
                 columns.insert(index);
@@ -57555,12 +57582,6 @@ impl CopyFmt {
         };
         let delimiter = options.delimiter_byte();
         let quote = options.quote_byte();
-        if options.is_csv() && delimiter == quote {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "COPY delimiter and quote must be different"
-            ));
-        }
         Ok(CopyFmt {
             csv: options.is_csv(),
             binary: options.is_binary(),
@@ -57572,8 +57593,16 @@ impl CopyFmt {
             default,
             force_quote_all: options.force_quote_all,
             force_quote: mask(options.force_quote)?,
-            force_not_null: mask(options.force_not_null)?,
-            force_null: mask(options.force_null)?,
+            force_not_null: if options.force_not_null_all {
+                ColumnSet::all(def.n_columns)
+            } else {
+                mask(options.force_not_null)?
+            },
+            force_null: if options.force_null_all {
+                ColumnSet::all(def.n_columns)
+            } else {
+                mask(options.force_null)?
+            },
         })
     }
 
@@ -57616,13 +57645,23 @@ pub fn copy_begin(
     } else {
         for (i, name) in statement.columns.iter().enumerate() {
             let Some(col) = def.column_index(name) else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" of relation \"{}\" does not exist",
+                return Err(crate::sql::error_position::at_reference(
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        statement.table.name
+                    ),
                     name,
-                    statement.table.name
                 ));
             };
+            if targets[..i].contains(&col) {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_COLUMN,
+                    "column \"{}\" specified more than once",
+                    name
+                ));
+            }
             targets[i] = col;
         }
         statement.columns.len()
@@ -57676,45 +57715,8 @@ pub fn copy_begin(
             ));
         }
     }
-    // Direction-only options are refused as PostgreSQL does.
     let opts = &statement.options;
-    if !statement.to && (opts.force_quote_all || !opts.force_quote.is_empty()) {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "COPY FORCE_QUOTE cannot be used with COPY FROM"
-        ));
-    }
-    if statement.to && matches!(opts.header, crate::sql::ast::CopyHeader::Match) {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "COPY HEADER MATCH cannot be used with COPY TO"
-        ));
-    }
-    if statement.to && !matches!(opts.on_error, crate::sql::ast::CopyErrorAction::Stop) {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "COPY ON_ERROR cannot be used with COPY TO"
-        ));
-    }
-    if statement.to && opts.default_string.is_some() {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "COPY DEFAULT cannot be used with COPY TO"
-        ));
-    }
-    if statement.to && !opts.force_not_null.is_empty() {
-        return Err(sql_err!(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "COPY FORCE_NOT_NULL cannot be used with COPY TO"
-        ));
-    }
-    if statement.to && !opts.force_null.is_empty() {
-        return Err(sql_err!(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "COPY FORCE_NULL cannot be used with COPY TO"
-        ));
-    }
-    let fmt = CopyFmt::resolve(def, statement.table.name, &statement.options)?;
+    let fmt = CopyFmt::resolve(def, statement.table.name, opts)?;
     let filter = CopyFilter::resolve(statement, def)?;
     if !statement.to {
         for &target in &targets[..n_targets] {
@@ -57794,11 +57796,14 @@ fn copy_export_table(
                     .iter()
                     .position(|candidate| candidate.as_str() == *name_column)
                     .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column \"{}\" of relation \"{}\" does not exist",
+                        crate::sql::error_position::at_reference(
+                            sql_err!(
+                                sqlstate::UNDEFINED_COLUMN,
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                name_column,
+                                name.name
+                            ),
                             name_column,
-                            name.name
                         )
                     })?;
                 requested.insert(column);
@@ -60751,31 +60756,7 @@ fn copy_fmt_for_columns(
     options: &crate::sql::ast::CopyOptions,
 ) -> Result<CopyFmt, SqlError> {
     use core::fmt::Write as _;
-    if !matches!(options.on_error, crate::sql::ast::CopyErrorAction::Stop) {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "COPY ON_ERROR cannot be used with COPY TO"
-        ));
-    }
-    if options.default_string.is_some() {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "COPY DEFAULT cannot be used with COPY TO"
-        ));
-    }
-    if matches!(options.header, crate::sql::ast::CopyHeader::Match) {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "COPY HEADER MATCH cannot be used with COPY TO"
-        ));
-    }
-    // FORCE_NOT_NULL / FORCE_NULL are COPY FROM-only, as for a table source.
-    if !options.force_not_null.is_empty() || !options.force_null.is_empty() {
-        return Err(sql_err!(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "COPY FORCE_NOT_NULL/FORCE_NULL cannot be used with COPY TO"
-        ));
-    }
+    // The parser has already refused the COPY FROM-only options.
     let mut null = StackStr::<64>::new();
     let _ = null.write_str(options.null_str());
     if null.is_truncated() {
@@ -60800,12 +60781,6 @@ fn copy_fmt_for_columns(
     };
     let delimiter = options.delimiter_byte();
     let quote = options.quote_byte();
-    if options.is_csv() && delimiter == quote {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "COPY delimiter and quote must be different"
-        ));
-    }
     Ok(CopyFmt {
         csv: options.is_csv(),
         binary: options.is_binary(),
@@ -65509,11 +65484,14 @@ where
     } else {
         for (i, name) in statement.columns.iter().enumerate() {
             let Some(column) = def.column_index(name) else {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" of relation \"{}\" does not exist",
+                return sql_fail(crate::sql::error_position::at_reference(
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        statement.table.name
+                    ),
                     name,
-                    statement.table.name
                 ));
             };
             targets[i] = column;
@@ -65568,11 +65546,14 @@ where
             let mut columns = ColumnSet::EMPTY;
             for (name, _) in assignments {
                 let Some(column) = def.column_index(name) else {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
+                    return sql_fail(crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            name,
+                            def.name.as_str()
+                        ),
                         name,
-                        def.name.as_str()
                     ));
                 };
                 columns.insert(column);
@@ -66793,11 +66774,14 @@ pub(crate) fn update<'a>(
     let mut updated_columns = ColumnSet::EMPTY;
     for (i, (name, _)) in statement.assignments.iter().enumerate() {
         let Some(column) = def.column_index(name) else {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "column \"{}\" of relation \"{}\" does not exist",
+            return sql_fail(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    name,
+                    statement.table.name
+                ),
                 name,
-                statement.table.name
             ));
         };
         if targets[..i].contains(&column) {
@@ -78136,7 +78120,7 @@ fn undefined_table(name: &str) -> SqlError {
 /// PostgreSQL's 42P01 echoes the spelling used: a qualified reference names
 /// its qualifier, a bare one does not.
 fn undefined_qual(name: &QualName) -> SqlError {
-    match name.schema {
+    let error = match name.schema {
         Some(schema) => sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "relation \"{}.{}\" does not exist",
@@ -78144,7 +78128,8 @@ fn undefined_qual(name: &QualName) -> SqlError {
             name.name
         ),
         None => undefined_table(name.name),
-    }
+    };
+    crate::sql::error_position::at_reference(error, name.schema.unwrap_or(name.name))
 }
 
 pub(crate) fn require_rewrite_input_privileges(
@@ -78224,11 +78209,14 @@ pub(crate) fn require_rewrite_input_privileges(
             } else {
                 for name in insert.columns {
                     let column = definition.column_index(name).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column \"{}\" of relation \"{}\" does not exist",
+                        crate::sql::error_position::at_reference(
+                            sql_err!(
+                                sqlstate::UNDEFINED_COLUMN,
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                name,
+                                insert.table.name
+                            ),
                             name,
-                            insert.table.name
                         )
                     })?;
                     insert_columns.insert(column);
@@ -78268,11 +78256,14 @@ pub(crate) fn require_rewrite_input_privileges(
             let mut read_columns = ColumnSet::EMPTY;
             for (name, expression) in update.assignments {
                 let column = definition.column_index(name).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
+                    crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            name,
+                            update.table.name
+                        ),
                         name,
-                        update.table.name
                     )
                 })?;
                 updated_columns.insert(column);
@@ -78733,11 +78724,14 @@ pub(crate) fn require_view_dml_privileges(
         names.iter().try_fold(ColumnSet::EMPTY, |mut mask, name| {
             definition.column_index(name).map_or_else(
                 || {
-                    Err(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
+                    Err(crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            name,
+                            definition.name.as_str()
+                        ),
                         name,
-                        definition.name.as_str()
                     ))
                 },
                 |column| {

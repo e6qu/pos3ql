@@ -30,7 +30,9 @@ mod suspended_invocations;
 pub(crate) use invocation_results::OwnedRoutineResult;
 use invocation_results::{RoutineInvocationResult, RoutineResults};
 mod retained;
-pub(crate) use retained::{LockedRow, RetainedSelect};
+pub(crate) use retained::{
+    LockedRow, MAX_RETAINED_SOURCES, RetainedSelect, RetainedUse, StreamSource,
+};
 
 #[cfg(test)]
 mod routine_contract_tests;
@@ -73,6 +75,10 @@ pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 mod cte;
 pub(crate) use cte::captured_type_oid;
 mod dependencies;
+mod procedural_names;
+pub(crate) use procedural_names::{
+    check_expression as check_procedural_expression, check_statement as check_procedural_statement,
+};
 mod type_inputs;
 pub(crate) use type_inputs::capture_contextual_expression_type_inputs;
 pub(crate) use type_inputs::capture_procedural_statement_type_inputs;
@@ -280,6 +286,7 @@ pub(crate) fn parse_stored_rule_statement<'a>(
 
 pub(crate) use dependencies::collect as collect_query_dependencies;
 pub(crate) use dependencies::collect_routine_parameter_defaults;
+pub(crate) use dependencies::collect_routine_signature_row_types;
 pub(crate) use dependencies::collect_runtime_expression;
 pub(crate) use dependencies::collect_runtime_statement;
 pub(crate) use dependencies::{
@@ -1224,13 +1231,8 @@ impl<'a> RoutineResultShape<'a> {
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         if let Some(ColType::Composite(Some(creation))) = kind.function_result() {
-            let target = crate::storage::TypeDefinitionTarget::by_creation(
-                storage,
-                crate::storage::NamedTypeKind::Composite,
-                creation,
-            )?;
             let definition = storage
-                .read_composite_definition(target, txid)?
+                .row_type_definition(creation, txid)?
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -1866,7 +1868,7 @@ pub(crate) fn parse_routine_function_program<'a>(
 ) -> Result<RoutineFunctionProgram<'a>, SqlError> {
     let mut parser = super::parser::Parser::new(body, arena)
         .and_then(|parser| parser.with_routine_parameters(routine_name, parameters))
-        .map_err(|error| super::parse_error_to_sql(&error))?;
+        .map_err(|error| super::error_position::body_parse_error(&error, body))?;
     parser.set_type_inputs(inputs);
     let parsed = arena
         .alloc_slice_with(super::parser::statement_capacity(body), |_| None)
@@ -1875,7 +1877,7 @@ pub(crate) fn parse_routine_function_program<'a>(
     loop {
         let statement = parser
             .next_stmt()
-            .map_err(|error| super::parse_error_to_sql(&error))?;
+            .map_err(|error| super::error_position::body_parse_error(&error, body))?;
         let Some(statement) = statement else { break };
         let step = if let Some(name) = routine_statement_forbidden(&statement) {
             RoutinePrelude::Forbidden(name)
@@ -3005,7 +3007,6 @@ impl StorageCatalog<'_, '_, '_, '_> {
         type_oid: i32,
         arena: &'a Arena,
     ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
-        use super::types::oid;
         let field_type_oid = |ctype: ColType,
                               user_type: Option<crate::storage::UserTypeName>|
          -> Result<i32, SqlError> {
@@ -3023,16 +3024,9 @@ impl StorageCatalog<'_, '_, '_, '_> {
             }
         };
         let mut columns = ArenaList::new(arena);
-        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid) {
-            let slot = super::catalog::table_slot_by_row_type_oid(
-                self.storage,
-                self.txid,
-                type_oid,
-                false,
-            )
-            .ok_or_else(|| {
-                sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
-            })?;
+        if let Some(slot) =
+            super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
+        {
             for column in self.storage.table_def(slot, self.txid).columns() {
                 let name = arena
                     .alloc_str(column.name.as_str())
@@ -3581,6 +3575,25 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 validate_stored_type_inputs(parser, self.storage, self.txid, dependencies.view())
             },
         )?;
+        super::exec::check_called_sql_routine_result(
+            self.storage,
+            self.txid,
+            &function_program,
+            routine.kind,
+            super::exec::record_columns(
+                routine.table_columns().unwrap_or(&[]),
+                routine.parameters(),
+                self.routine_workspace,
+            )?,
+            routine.arguments(),
+            RoutineResultContract::stored(
+                self.storage,
+                self.txid,
+                routine,
+                self.routine_workspace,
+            )?,
+            self.routine_workspace,
+        )?;
         let program_access = routine_program_access(&function_program);
         if program_access == RoutineProgramAccess::Engine {
             return Err(sql_err!(
@@ -3732,11 +3745,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if let Some((total, own)) = timed.finish()
             && output.is_ok()
         {
-            self.storage.record_function_call(
+            super::statistics::record_completed_call(
+                self.storage,
                 self.txid,
                 crate::storage::routine_oid(routine),
-                total,
-                own,
+                (total, own),
+                self.routine_workspace,
             )?;
         }
         output
@@ -3794,6 +3808,40 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn require_builtin_routine_execute(&self, oid: i32) -> Result<(), SqlError> {
+        let Some(routine) = crate::storage::BuiltinRoutineOid::parse(oid) else {
+            return Ok(());
+        };
+        let Some(slot) = self.storage.builtin_routine_slot(routine) else {
+            return Ok(());
+        };
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::BuiltinRoutine,
+            slot: slot as u16,
+        };
+        if self.txid != 0 {
+            let role = self.storage.current_role_slot(self.txid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role is not present in the role catalog"
+                )
+            })?;
+            if !self.storage.has_object_privilege(
+                object,
+                role,
+                crate::storage::PrivilegeSet::EXECUTE,
+                self.txid,
+            ) {
+                return Err(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for function {}",
+                    routine.signature().name
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
         crate::sql::catalog::validate_enum_input_literal(
             self.storage,
@@ -4351,8 +4399,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         type_oid: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
-        use super::types::oid;
-        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_TABLE_COMPOSITE_ARRAY).contains(&type_oid) {
+        if super::catalog::view_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
+            .is_some()
+        {
             return self.rowtype_fields(type_oid, arena).map(Some);
         }
         let Some((crate::storage::NamedTypeKind::Composite, creation, false)) =
@@ -4360,12 +4409,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         else {
             return Ok(None);
         };
-        let target = crate::storage::TypeDefinitionTarget::by_creation(
-            self.storage,
-            crate::storage::NamedTypeKind::Composite,
-            creation,
-        )?;
-        let Some(definition) = self.storage.read_composite_definition(target, self.txid)? else {
+
+        let Some(definition) = self.storage.row_type_definition(creation, self.txid)? else {
             return Ok(None);
         };
         let fields = arena
@@ -4513,12 +4558,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         else {
             return Ok(None);
         };
-        let target = crate::storage::TypeDefinitionTarget::by_creation(
-            self.storage,
-            crate::storage::NamedTypeKind::Composite,
-            creation,
-        )?;
-        let Some(definition) = self.storage.read_composite_definition(target, self.txid)? else {
+
+        let Some(definition) = self.storage.row_type_definition(creation, self.txid)? else {
             return Ok(None);
         };
         let modifiers = arena
@@ -5468,8 +5509,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::function_def_text(self.storage, self.txid, oid, arena)
     }
 
-    fn trigger_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::trigger_def_text(self.storage, self.txid, oid, arena)
+    fn trigger_def<'a>(
+        &self,
+        oid: i32,
+        pretty: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::trigger_def_text(self.storage, self.txid, oid, pretty, arena)
     }
 
     fn function_arguments<'a>(
@@ -5513,7 +5559,22 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::index_def_text(self.storage, self.txid, oid, col, pretty, arena)
     }
     fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::constraint_def_text(self.storage, self.txid, oid, arena)
+        super::catalog::constraint_def_text(self.storage, self.txid, oid, false, arena)
+    }
+    fn constraint_def_pretty<'a>(
+        &self,
+        oid: i32,
+        pretty: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::constraint_def_text(self.storage, self.txid, oid, pretty, arena)
+    }
+    fn partition_ancestors<'a>(
+        &self,
+        relation: i32,
+        arena: &'a Arena,
+    ) -> Result<&'a [Datum<'a>], SqlError> {
+        super::catalog::partition_ancestors(self.storage, self.txid, relation, arena)
     }
     fn expression_def<'a>(
         &self,
@@ -6126,18 +6187,28 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         if self.storage.role(role).attributes_to(self.txid).superuser {
             return Ok(Some(true));
         }
-        if let Some(public) = super::catalog::intrinsic_routine_public_execute(oid) {
-            let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
-            return Ok(Some(requested.allows(
-                PrivilegeSet::NONE,
-                |_| owner || public,
-                |_| owner,
-            )));
-        }
-        let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
-            return Ok(None);
+        let builtin = crate::storage::BuiltinRoutineOid::parse(oid)
+            .filter(|_| self.storage.routine_slot_by_oid(oid, self.txid).is_none());
+        let object = match builtin.and_then(|routine| self.storage.builtin_routine_slot(routine)) {
+            Some(slot) => crate::storage::AccessObject {
+                class: crate::storage::AccessClass::BuiltinRoutine,
+                slot: slot as u16,
+            },
+            None => {
+                if let Some(public) = super::catalog::intrinsic_routine_public_execute(oid) {
+                    let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
+                    return Ok(Some(requested.allows(
+                        PrivilegeSet::NONE,
+                        |_| owner || public,
+                        |_| owner,
+                    )));
+                }
+                let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
+                    return Ok(None);
+                };
+                crate::storage::Storage::routine_access_object(slot)
+            }
         };
-        let object = crate::storage::Storage::routine_access_object(slot);
         Ok(Some(requested.allows(
             crate::storage::PrivilegeSet::NONE,
             |privilege| {
@@ -6285,6 +6356,25 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::view_def_text(self.storage, self.txid, oid, arena)
     }
 
+    fn view_def_pretty<'a>(
+        &self,
+        oid: i32,
+        pretty: bool,
+        wrap_column: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::view_def_text_pretty(
+            self.storage,
+            self.txid,
+            oid,
+            super::catalog::deparse::ViewLayout {
+                pretty,
+                wrap_column,
+            },
+            arena,
+        )
+    }
+
     fn rule_def<'a>(
         &self,
         oid: i32,
@@ -6415,6 +6505,57 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         arena: &'a Arena,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Option<Datum<'a>>, SqlError> {
+        if let Some((domain, array)) =
+            super::information_schema_domains::InformationSchemaDomain::from_name(
+                type_name,
+                self.storage.information_schema_on_path(),
+            )
+            .filter(|_| {
+                type_name.starts_with("information_schema.")
+                    || super::catalog::user_type_oid(self.storage, self.txid, type_name)
+                        .is_some_and(|oid| {
+                            super::information_schema_domains::InformationSchemaDomain::from_oid(
+                                oid,
+                            )
+                            .is_some()
+                        })
+            })
+        {
+            if array {
+                let element = super::types::ArrElem::from_coltype(domain.base())
+                    .expect("information_schema domains have array element bases");
+                // Array text is element input, which rejects an overlong value
+                // where a cast from another array truncates it.
+                let input = matches!(value, Datum::Text(_));
+                let array = super::eval::cast_to(value, ColType::Array(element), arena)?;
+                let array = if input {
+                    super::exec::apply_typmod(
+                        array,
+                        ColType::Array(element),
+                        domain.base_type_mod(),
+                        arena,
+                    )?
+                } else {
+                    super::exec::apply_cast_typmod(
+                        array,
+                        ColType::Array(element),
+                        domain.base_type_mod(),
+                        arena,
+                    )?
+                };
+                if let Datum::Array { raw, .. } = array {
+                    for item in super::array::elements(raw, element) {
+                        domain.validate(&item)?;
+                    }
+                }
+                return Ok(Some(array));
+            }
+            let base = super::eval::cast_to(value, domain.base(), arena)?;
+            let base =
+                super::exec::apply_cast_typmod(base, domain.base(), domain.base_type_mod(), arena)?;
+            domain.validate(&base)?;
+            return Ok(Some(base));
+        }
         if let Some(element_name) = type_name.strip_suffix("[]") {
             if let Some(slot) = self.storage.resolve_enum_slot(element_name, self.txid) {
                 return super::exec::coerce_user_type_array(
@@ -6462,6 +6603,22 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 )
                 .map(Some);
             }
+            if let Some(relation) = self
+                .storage
+                .resolve_relation_row_type(element_name, self.txid)
+            {
+                return super::exec::coerce_user_type_array(
+                    value,
+                    super::types::ArrElem::Composite(Some(
+                        self.storage.relation_row_type_creation(relation),
+                    )),
+                    self.storage,
+                    self.txid,
+                    arena,
+                    sequences,
+                )
+                .map(Some);
+            }
             return Ok(None);
         }
         if let Some(slot) = self.storage.resolve_domain_slot(type_name, self.txid) {
@@ -6500,27 +6657,32 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .map(Some);
         }
         let Some(slot) = self.storage.resolve_enum_slot(type_name, self.txid) else {
-            // A table/view rowtype name: NULL casts populate nothing; other
-            // values report PostgreSQL's cannot-coerce error until rowtype
-            // value decoding exists.
-            let (qualifier, bare) = type_name
-                .split_once('.')
-                .map_or((None, type_name), |(schema, name)| (Some(schema), name));
-            if self
-                .storage
-                .resolve_relation(qualifier, bare, self.txid)
-                .is_some()
-            {
-                if value.is_null() {
-                    return Ok(Some(Datum::Null));
-                }
-                return Err(sql_err!(
-                    sqlstate::CANNOT_COERCE,
-                    "cannot cast type record to {}",
-                    type_name
-                ));
+            // A table's or view's own row type.
+            let Some(relation) = self.storage.resolve_relation_row_type(type_name, self.txid)
+            else {
+                return Ok(None);
+            };
+            let creation = self.storage.relation_row_type_creation(relation);
+            return match value {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Text(text) => super::exec::decode_composite_text(
+                    text,
+                    creation,
+                    self.storage,
+                    self.txid,
+                    arena,
+                    sequences,
+                ),
+                value => super::exec::coerce_composite_value(
+                    value,
+                    Some(creation),
+                    self.storage,
+                    self.txid,
+                    arena,
+                    sequences,
+                ),
             }
-            return Ok(None);
+            .map(Some);
         };
         super::exec::coerce_enum_value(
             value,
@@ -6557,6 +6719,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
+    }
+
+    fn compatible_element_oid(&self, inputs: &[(bool, i32)]) -> Option<i32> {
+        self.storage.compatible_element_oid(inputs, self.txid)
     }
 
     fn user_type_identity_oid(
@@ -7034,13 +7200,17 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
     let states = arena
         .alloc_slice_with(agg_nodes.len(), |_| AggState::default())
         .map_err(|_| arena_full())?;
-    let columns = super::exec::CatalogCols {
-        definition: None,
-        alias: None,
-        output_aliases: &[],
-        storage,
-        txid,
-        arena,
+    let columns = subquery::SubqueryColumns {
+        scope: None,
+        outer: Some(row),
+        catalog: super::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
     };
     for (i, (_, node)) in agg_nodes.iter().enumerate() {
         states[i].init(node, storage, txid, &columns, arena)?;
@@ -7241,6 +7411,196 @@ fn correlated_row_hooks<'scratch, 'a>(
 /// three sort and deduplicate by the projected encoding and so never consult
 /// it, which is why each has to be checked where its keys are known rather than
 /// where they are compared. `cid` and `cid[]` have equality but no ordering.
+/// Checks a SQL-language routine body statement as PostgreSQL's parse
+/// analysis does at `CREATE FUNCTION`: a query's relations, columns,
+/// functions and types, and a data-changing statement's target relation.
+/// Nothing is read or written.
+pub(crate) fn analyse_routine_statement<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let target = match statement {
+        Stmt::Select(select) => {
+            let mark = arena.mark();
+            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let described = expand_ctes(select, storage, txid, arena).and_then(|select| {
+                describe_select(
+                    select,
+                    storage,
+                    txid,
+                    arena,
+                    &mut columns,
+                    crate::sql::exec::DescriptionTarget::Sql,
+                    None,
+                )
+            });
+            // Only the verdict leaves; the description is discarded.
+            unsafe { arena.rewind_to(mark) };
+            return described.map(|_| ());
+        }
+        Stmt::Insert(statement) => statement.table,
+        Stmt::Update(statement) => statement.table,
+        Stmt::Delete(statement) => statement.table,
+        _ => return Ok(()),
+    };
+    if storage
+        .resolve_relation(target.schema, target.name, txid)
+        .is_some()
+    {
+        return Ok(());
+    }
+    let error = match target.schema {
+        Some(schema) => sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "relation \"{}.{}\" does not exist",
+            schema,
+            target.name
+        ),
+        None => sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "relation \"{}\" does not exist",
+            target.name
+        ),
+    };
+    Err(crate::sql::error_position::at_reference(
+        error,
+        target.schema.unwrap_or(target.name),
+    ))
+}
+
+/// [`analyse_routine_statement`] for every statement of a parsed body.
+pub(crate) fn analyse_routine_program<'a>(
+    program: &RoutineFunctionProgram<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    for prelude in program.preceding {
+        if let RoutinePrelude::Statement(statement) = prelude {
+            analyse_routine_statement(statement, storage, txid, arena)?;
+        }
+    }
+    match program.result {
+        RoutineFunctionResult::Query(RoutineQuery::Select(select)) => {
+            let statement = arena
+                .alloc(Stmt::Select(**select))
+                .map_err(|_| arena_full())?;
+            analyse_routine_statement(statement, storage, txid, arena)
+        }
+        RoutineFunctionResult::DataModification(statement)
+        | RoutineFunctionResult::Void(statement) => {
+            analyse_routine_statement(statement, storage, txid, arena)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// PostgreSQL resolves an operator between a typed value and an
+/// unknown-type literal by converting the literal to the value's type while
+/// analysing the query, so `WHERE a = 'abc'` on an integer column fails
+/// before any row is read, pointing at the literal.
+fn check_literal_operands<'a>(
+    expression: &'a Expr<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    check_literal_operands_typed(
+        expression,
+        &|other| {
+            infer_scope_type(other, scope)
+                .ok()
+                .and_then(|(oid, _)| ColType::from_oid(oid))
+        },
+        arena,
+    )
+}
+
+/// [`check_literal_operands`] with `infer` naming each operand's type.
+pub(crate) fn check_literal_operands_typed<'a>(
+    expression: &'a Expr<'a>,
+    infer: &dyn Fn(&'a Expr<'a>) -> Option<ColType>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    use crate::sql::ast::BinaryOp;
+    let convert = |literal: &'a str, other: &'a Expr<'a>, arithmetic: bool| {
+        let Some(ctype) = infer(other) else {
+            return Ok(());
+        };
+        let numeric = matches!(
+            ctype,
+            ColType::Int2
+                | ColType::Int4
+                | ColType::Int8
+                | ColType::Float4
+                | ColType::Float8
+                | ColType::Numeric
+        );
+        let comparable = numeric
+            || matches!(
+                ctype,
+                ColType::Bool
+                    | ColType::Date
+                    | ColType::Timestamp
+                    | ColType::Timestamptz
+                    | ColType::Uuid
+            );
+        if !(if arithmetic { numeric } else { comparable }) {
+            return Ok(());
+        }
+        crate::sql::eval::cast_to(Datum::Text(literal), ctype, arena)
+            .map(|_| ())
+            .map_err(|error| crate::sql::error_position::at_subject(error, literal))
+    };
+    match expression {
+        Expr::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } => {
+            check_literal_operands_typed(left, infer, arena)?;
+            check_literal_operands_typed(right, infer, arena)?;
+            let arithmetic = match operator {
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq => false,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                    true
+                }
+                _ => return Ok(()),
+            };
+            match (left, right) {
+                (Expr::Str(_), Expr::Str(_)) => Ok(()),
+                (Expr::Str(literal), other) | (other, Expr::Str(literal)) => {
+                    convert(literal, other, arithmetic)
+                }
+                _ => Ok(()),
+            }
+        }
+        Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
+            check_literal_operands_typed(operand, infer, arena)
+        }
+        Expr::InList { operand, list, .. } => {
+            check_literal_operands_typed(operand, infer, arena)?;
+            for item in *list {
+                match item {
+                    Expr::Str(literal) if !matches!(operand, Expr::Str(_)) => {
+                        convert(literal, operand, false)?
+                    }
+                    item => check_literal_operands_typed(item, infer, arena)?,
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn check_key_types<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
@@ -7248,19 +7608,51 @@ fn check_key_types<'a>(
     storage: &Storage,
     txid: u32,
 ) -> Result<(), SqlError> {
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item {
+            check_literal_operands(expression, scope, arena)?;
+        }
+    }
+    for expression in statement
+        .where_clause
+        .into_iter()
+        .chain(statement.having)
+        .chain(
+            statement
+                .from
+                .iter()
+                .flat_map(|from| from.joins.iter().filter_map(|join| join.on)),
+        )
+    {
+        check_literal_operands(expression, scope, arena)?;
+    }
     let noncomparable = |e: &Expr<'a>| {
         infer_scope_type(e, scope)
             .ok()
             .and_then(|(oid, _)| ColType::from_oid(oid))
-            .filter(|ctype| !ctype.has_builtin_equality())
+            .filter(|ctype| !ctype.has_default_equality())
     };
     let unordered_cid = |e: &Expr<'a>| {
         infer_scope_type(e, scope)
             .ok()
             .and_then(|(oid, _)| ColType::from_oid(oid))
-            .is_some_and(|ctype| ctype.has_builtin_equality() && !ctype.has_builtin_ordering())
+            .is_some_and(|ctype| ctype.has_default_equality() && !ctype.has_builtin_ordering())
     };
-    for key in statement.group_by.iter().chain(statement.distinct_on) {
+    let distinct_items = statement
+        .items
+        .iter()
+        .filter(|_| statement.distinct && statement.distinct_on.is_empty())
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        });
+    for key in statement
+        .group_by
+        .iter()
+        .copied()
+        .chain(statement.distinct_on.iter().copied())
+        .chain(distinct_items)
+    {
         if let Some(ctype) = noncomparable(key) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
@@ -8670,15 +9062,13 @@ fn rewrite_grouped_expr<'a>(
             Ok(e)
         }
         Expr::Column { qualifier, name } => {
-            // An unknown column errors as such; a known one is ungrouped.
+            // A name outside the query's sources is an outer reference, such as
+            // a PL/pgSQL variable, and stays constant in every group; evaluation
+            // reports it if nothing defines it. A known one is ungrouped.
             if let Some(scope) = context.scope
                 && scope.find_column(*qualifier, name).is_err()
             {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
-                ));
+                return Ok(e);
             }
             Err(sql_err!(
                 sqlstate::GROUPING_ERROR,
@@ -8942,25 +9332,7 @@ fn check_select_types<'a>(
     }
     if let Some(w) = statement.where_clause {
         check(w)?;
-        let (oid, _) = super::exec::infer_type_res(w, columns)?;
-        let catalog = storage_catalog(storage, arena, txid);
-        let boolean = oid == super::types::oid::BOOL
-            || oid == super::types::oid::UNKNOWN
-            || catalog.domain_base_type(oid) == Some(ColType::Bool);
-        if !boolean {
-            let type_name = match ColType::from_oid(oid) {
-                Some(ctype) => ctype.name(),
-                None => catalog.type_name(oid, arena)?.unwrap_or("unknown"),
-            };
-            return Err(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
-                "argument of WHERE must be type boolean, not type {}",
-                type_name
-            ));
-        }
-        if let Expr::Str(text) = w {
-            super::eval::parse_bool(text)?;
-        }
+        check_where_type(w, columns, storage, txid, arena)?;
     }
     for g in statement.group_by {
         check(g)?;
@@ -9918,6 +10290,40 @@ fn over_one_row<'a>(
         .map_err(|_| arena_full())?)
 }
 
+/// A WHERE condition must be boolean (or a literal that reads as one); its
+/// type is checked before any row is read.
+fn check_where_type<'a>(
+    w: &'a Expr<'a>,
+    columns: &dyn super::exec::ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let (oid, _) = super::exec::infer_type_res(w, columns)?;
+    let catalog = storage_catalog(storage, arena, txid);
+    let boolean = oid == super::types::oid::BOOL
+        || oid == super::types::oid::UNKNOWN
+        || catalog.domain_base_type(oid) == Some(ColType::Bool);
+    if !boolean {
+        let type_name = match ColType::from_oid(oid) {
+            Some(ctype) => ctype.name(),
+            None => catalog.type_name(oid, arena)?.unwrap_or("unknown"),
+        };
+        return Err(crate::sql::error_position::at_expression(
+            sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "argument of WHERE must be type boolean, not type {}",
+                type_name
+            ),
+            w,
+        ));
+    }
+    if let Expr::Str(text) = w {
+        super::eval::parse_bool(text)?;
+    }
+    Ok(())
+}
+
 /// Admit the virtual input row once before scalar projection or set expansion.
 /// Both wire results and INSERT/function row sources use this boundary.
 fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
@@ -10001,8 +10407,27 @@ pub(crate) fn constant_select_resumable<'a>(
         txid,
         arena,
     };
+    if let Some(w) = statement.where_clause
+        && let Err(error) = check_where_type(w, &resolved_columns, storage, txid, arena)
+    {
+        return sql_fail(error);
+    }
     if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
+    }
+    // DISTINCT compares whole rows with each type's default equality.
+    if statement.distinct
+        && statement.distinct_on.is_empty()
+        && let Some(ctype) = columns[..n]
+            .iter()
+            .filter_map(|column| ColType::from_oid(column.type_oid))
+            .find(|ctype| !ctype.has_default_equality())
+    {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "could not identify an equality operator for type {}",
+            ctype.name()
+        ));
     }
     // A window function needs rows to compute over, and this path has no scan
     // to give it. A FROM-less SELECT is exactly one row, though, so it can be
@@ -10850,6 +11275,11 @@ fn select_into_rows_mode<'a>(
                 project_sets: None,
                 merge_action: None,
             };
+            // PL/pgSQL variables are outer references of the virtual row.
+            let row = Chained {
+                inner: &super::eval::NoColumns,
+                outer,
+            };
             let Some((ptrs, values)) = fromless_aggregate_hooks(
                 statement,
                 agg_nodes.as_slice(),
@@ -10857,7 +11287,7 @@ fn select_into_rows_mode<'a>(
                 txid,
                 arena,
                 params,
-                &super::eval::NoColumns,
+                &row,
                 &hooks,
             )?
             else {
@@ -10878,23 +11308,13 @@ fn select_into_rows_mode<'a>(
             for item in statement.items {
                 match item {
                     SelectItem::Expr { expression, .. } => {
-                        vals[n] = eval_full(
-                            expression,
-                            arena,
-                            params,
-                            &super::eval::NoColumns,
-                            &agg_hooks,
-                        )?;
+                        vals[n] = eval_full(expression, arena, params, &row, &agg_hooks)?;
                         n += 1;
                     }
                     SelectItem::RecordStar(base) => {
-                        for field in super::eval::record_star_expand(
-                            base,
-                            arena,
-                            params,
-                            &super::eval::NoColumns,
-                            &agg_hooks,
-                        )? {
+                        for field in
+                            super::eval::record_star_expand(base, arena, params, &row, &agg_hooks)?
+                        {
                             vals[n] = field.value;
                             n += 1;
                         }
@@ -11497,7 +11917,18 @@ pub(super) fn streaming_pax_columns<'a>(
     items: &'a [SelectItem<'a>],
     where_clause: Option<&'a Expr<'a>>,
 ) -> PaxReadDemand {
-    let mut expressions: [&Expr; MAX_PROJ + 1] = [&Expr::Null; MAX_PROJ + 1];
+    streaming_pax_columns_ordered(scope, from, items, where_clause, &[])
+}
+
+/// [`streaming_pax_columns`] plus the columns an `ORDER BY` reads.
+pub(super) fn streaming_pax_columns_ordered<'a>(
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    items: &'a [SelectItem<'a>],
+    where_clause: Option<&'a Expr<'a>>,
+    order_by: &'a [crate::sql::ast::OrderBy<'a>],
+) -> PaxReadDemand {
+    let mut expressions: [&Expr; 2 * MAX_PROJ + 1] = [&Expr::Null; 2 * MAX_PROJ + 1];
     let mut count = 0usize;
     for item in items {
         let expression = match item {
@@ -11511,6 +11942,10 @@ pub(super) fn streaming_pax_columns<'a>(
     }
     if let Some(where_clause) = where_clause {
         expressions[count] = where_clause;
+        count += 1;
+    }
+    for order in order_by.iter().take(MAX_PROJ) {
+        expressions[count] = order.expression;
         count += 1;
     }
     pax_column_demand(scope, from, &expressions[..count])
@@ -12154,13 +12589,9 @@ fn array_subquery_field_type_inner<'q>(
     else {
         return Ok(None);
     };
-    let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage,
-        crate::storage::NamedTypeKind::Composite,
-        creation,
-    )?;
+
     let composite = storage
-        .read_composite_definition(target, txid)?
+        .row_type_definition(creation, txid)?
         .ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -12588,13 +13019,7 @@ fn user_type_expression_description<'q>(
                 && let Some((ColType::Composite(Some(creation)), _)) =
                     super::exec::catalog_column_type(storage, txid, base.type_oid)
             {
-                let target = crate::storage::TypeDefinitionTarget::by_creation(
-                    storage,
-                    crate::storage::NamedTypeKind::Composite,
-                    creation,
-                )
-                .ok()?;
-                let definition = storage.read_composite_definition(target, txid).ok()??;
+                let definition = storage.row_type_definition(creation, txid).ok()??;
                 let field = definition
                     .active_fields()
                     .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))?;
@@ -12926,10 +13351,7 @@ fn describe_scope_record_star<'q>(
                 index += 1;
             }
             if index == 0 {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
+                return Err(super::exec::row_expansion_error(base, &resolver));
             }
         }
         _ => {
@@ -12952,19 +13374,12 @@ fn describe_scope_record_star<'q>(
                 _ => None,
             };
             if let Some(slot) = slot {
-                let target = crate::storage::TypeDefinitionTarget::by_creation(
-                    storage,
-                    crate::storage::NamedTypeKind::Composite,
-                    slot,
-                )?;
-                let definition = storage
-                    .read_composite_definition(target, txid)?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "composite type no longer exists"
-                        )
-                    })?;
+                let definition = storage.row_type_definition(slot, txid)?.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "composite type no longer exists"
+                    )
+                })?;
                 for field in definition.active_fields() {
                     let type_oid = storage
                         .routine_type_oid(field.ctype, field.user_type, txid)
@@ -12984,10 +13399,7 @@ fn describe_scope_record_star<'q>(
                 return Ok(n);
             }
             let Some(handle) = super::exec::expr_record_handle_pub(base, &resolver) else {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
+                return Err(super::exec::row_expansion_error(base, &resolver));
             };
             let mut push_err = None;
             super::exec::visit_record_shape_metadata_pub(handle, |field_name, meta| {
@@ -13013,10 +13425,42 @@ fn describe_scope_record_star<'q>(
 }
 
 /// Resolves column types across all tables in a join scope.
+/// Aggregate argument types inside a query that has outer references, such
+/// as PL/pgSQL variables: the query's own columns first, then the outer ones.
+/// Without outer references the query's columns alone resolve them.
+fn aggregate_outer_columns<'s, 'd, 'o, 'r, 'c>(
+    scope: Option<&'s QueryScope<'d>>,
+    outer: Option<&'o dyn ColumnLookup<'r>>,
+    storage: &'c Storage,
+    txid: u32,
+    arena: &'c Arena,
+) -> Option<subquery::SubqueryColumns<'s, 'd, 'o, 'r, 'c>> {
+    outer.map(|outer| subquery::SubqueryColumns {
+        scope,
+        outer: Some(outer),
+        catalog: super::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+    })
+}
+
 pub(super) struct ScopeCols<'s, 'd>(pub(super) &'s QueryScope<'d>);
 impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     fn is_empty_scope(&self) -> bool {
         self.0.n == 0
+    }
+
+    fn named_type_oid(&self, type_name: &str) -> Option<i32> {
+        self.0.named_type_oid(type_name)
+    }
+
+    fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
+        self.0.domain_base_type(type_oid)
     }
 
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
@@ -13051,6 +13495,12 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
         self.0.func_scalar_type(name)
+    }
+
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        self.0
+            .whole_row_type(name)
+            .filter(|ctype| matches!(ctype, ColType::Composite(_)))
     }
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
@@ -13514,6 +13964,18 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
         })
     }
 
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        let composite = |scope: &QueryScope<'_>| {
+            scope
+                .whole_row_type(name)
+                .filter(|ctype| matches!(ctype, ColType::Composite(_)))
+        };
+        if self.scope.qualified_star_columns(name).is_ok() {
+            return composite(self.scope);
+        }
+        self.outer_scope.and_then(composite)
+    }
+
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
         if let Ok(table) = self.scope.table_index(name) {
             return Some(self.scope.defs.get(table)?.columns());
@@ -13692,12 +14154,8 @@ pub(super) fn record_star_width(
             &fromless
         }
     };
-    super::exec::record_shape_metadata(base, columns, |_, _| {})?.ok_or_else(|| {
-        sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "row expansion is not supported on this expression"
-        )
-    })
+    super::exec::record_shape_metadata(base, columns, |_, _| {})?
+        .ok_or_else(|| super::exec::row_expansion_error(base, columns))
 }
 
 fn infer_scope_type(expression: &Expr, scope: &QueryScope) -> Result<(i32, i16), SqlError> {

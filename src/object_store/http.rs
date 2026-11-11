@@ -2605,7 +2605,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(crate::test_wait::HANG))
                 .unwrap();
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {
@@ -2616,7 +2616,7 @@ mod tests {
             for (index, segment) in segments.iter().enumerate() {
                 stream.write_all(segment).unwrap();
                 sent.send(index).unwrap();
-                held.recv_timeout(Duration::from_secs(5)).unwrap();
+                held.recv_timeout(crate::test_wait::HANG).unwrap();
             }
         });
         let config = test_config(port);
@@ -2627,7 +2627,7 @@ mod tests {
             client.get("chunked", None),
             Err(S3Error::WouldBlock)
         ));
-        let send_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let send_deadline = crate::test_wait::deadline();
         while client.pending_wants_write() {
             assert!(
                 std::time::Instant::now() < send_deadline,
@@ -2642,7 +2642,7 @@ mod tests {
             .unwrap();
         for index in 0..8 {
             assert_eq!(
-                received.recv_timeout(Duration::from_secs(5)).unwrap(),
+                received.recv_timeout(crate::test_wait::HANG).unwrap(),
                 index
             );
             let mut result = crate::mem::guard::forbid_alloc(|| client.advance_pending());
@@ -2690,7 +2690,7 @@ mod tests {
             let mut client = S3Client::new(&config, &mut budget).unwrap();
             client.enable_async_gets();
             let mut result = client.get("broken", None);
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             while matches!(result, Err(S3Error::WouldBlock)) {
                 assert!(
                     std::time::Instant::now() < deadline,

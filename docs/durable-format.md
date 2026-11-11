@@ -25,8 +25,8 @@ schema changes follow a different procedure; see
 
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v38` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
-| Journal record | Version `26` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v39` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
+| Journal record | Version `27` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process's writer token. |
@@ -82,7 +82,7 @@ Do not keep a decoder or add a conversion solely for an older pos3ql version.
 ### Journal records
 
 Framing is 24 bytes: CRC32C, payload length and LSN in bytes 0–15; byte 16 is
-the operation kind; byte 17 is the version (`26`); bytes 18–23 are zero.
+the operation kind; byte 17 is the version (`27`); bytes 18–23 are zero.
 Field-width changes use new kind bytes. Kinds with special rules:
 
 | Kind | Meaning | Rule |
@@ -104,6 +104,7 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 156 | Index-presence hint | Ten-byte table position, then a strict 0/1 flag. |
 | 157 | Catalog reservation | Eight-byte nonzero creation-counter reservation, kept even when a transaction creates and removes all its images. |
 | 158 | Inherited trigger change | Flags byte, then expected/replacement images: four-byte clone stamp, ten-byte trigger position, ten-byte table position, one-byte enabled mode. |
+| 159 | Built-in routine attributes | Four-byte database identifier, four-byte built-in routine OID, then strict, volatility, parallel, security-definer and leakproof bytes and cost and rows as IEEE-754 bits. Strictness and security must equal PostgreSQL's initial values. Owner and privileges use the object owner and ACL kinds with the routine OID. |
 
 Other payload rules:
 
@@ -160,6 +161,7 @@ inserts a missing writer.
 | `nsp` | Creation stamp, database-owner flag (`0`/`1`), hexadecimal name. Stamp zero is an initial public schema. |
 | `pub` | Creation stamp after the owner, before the flags. |
 | `pacl` | Parameter permissions; an empty row differs from removal. |
+| `brtn` | Built-in routine attributes in the preceding `dbctx` database: OID, five attribute codes, cost and rows bits. `own` and `acl` records for class 20 name the routine OID. |
 | `ptx` | Prepared transaction; owner as decimal role identifier. |
 | `rol` | Role identifier, catalog slot, encoded name and attributes. |
 | `rmem` | Position, stamp, role/member/grantor identifiers, option flags. |
@@ -250,10 +252,9 @@ rather than collections that grow with catalog churn.
 | Routines | 100,000 + stamp |
 | Row-security policies | 180,000 + stamp |
 | Custom tablespaces | 210,000 + stamp (bounded by the largest signed 32-bit OID) |
-| Table / view row types | 130,000,000 / 140,000,000 + stamp |
-| Table / view row-type arrays | 150,000,000 / 160,000,000 + stamp |
 | Domains / enums / composites | 180,000,000 / 200,000,000 / 220,000,000 + stamp |
 | Their arrays | 240,000,000 / 260,000,000 / 280,000,000 + stamp |
+| Table, materialized-view and view row types (and arrays) | The composite bands above + the relation's stamp |
 | Tables, views, sequences, composite backing relations, indexes | 300,000,000 + shared relation stamp |
 | TOAST relations | 320,000,000 + owner's stamp |
 | TOAST indexes | 340,000,000 + own stamp (rebuilding changes it) |
@@ -380,6 +381,7 @@ Every stored user-type name has a prefix; manifests hex-encode these fields.
 | `r:<kind>:<slot>:<creation>:<name>` | Bound type; kind `d` domain, `e` enum, `c` composite |
 | `n:<name>` | Declaration requiring binding |
 | `p:<name>` | Validated PostgreSQL polymorphic type |
+| `t:<creation>:<name>` | Row type of the table, materialized view or view created at that stamp; the relation, not the type catalog, owns it |
 
 Typed tables save their composite as `c:<slot>:<creation>`. Database copies bind
 it to the copied type. At `types_end`, recovery resolves domain chains and

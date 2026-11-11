@@ -269,7 +269,23 @@ pub(super) fn conjunct_passes<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<bool, SqlError> {
-    match crate::sql::eval::boolean_argument(eval_full(e, arena, params, row, hooks)?, "WHERE")? {
+    filter_passes(e, "WHERE", arena, params, row, hooks)
+}
+
+/// [`conjunct_passes`] for an operand of the `AND` chain `context` names:
+/// PostgreSQL rejects a non-boolean operand as an argument of AND, not of
+/// the WHERE clause the chain forms.
+fn filter_passes<'a>(
+    e: &Expr<'a>,
+    context: &str,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<bool, SqlError> {
+    match crate::sql::eval::boolean_argument(eval_full(e, arena, params, row, hooks)?, context)
+        .map_err(|error| crate::sql::error_position::at_expression(error, e))?
+    {
         Datum::Bool(true) => Ok(true),
         Datum::Bool(false) | Datum::Null => Ok(false),
         _ => Err(sql_err!(
@@ -374,7 +390,7 @@ pub(super) fn where_passes<'e, 'a>(
         return conjunct_passes(predicate, arena, params, row, hooks);
     }
     for &c in &conjuncts[..n] {
-        if !conjunct_passes(c, arena, params, row, hooks)? {
+        if !filter_passes(c, "AND", arena, params, row, hooks)? {
             return Ok(false);
         }
     }

@@ -343,7 +343,7 @@ fn identity_defaults_cannot_be_replaced_or_dropped() {
 fn sequence_advances_from_another_transaction_survive_cold_commit_retries() {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let name = format!("sequence-publish-cold-{}", std::process::id());
     let mut config = test_config(&name);
     config.object_store_on = true;
@@ -455,7 +455,7 @@ fn sequence_advances_from_another_transaction_survive_cold_commit_retries() {
         assert_eq!(engine.wal.stage_stats(session.transaction.txid).0, 2);
         assert!(session.transaction.staged_commit().is_none());
         if attempt == 0 {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::test_wait::deadline();
             while server.requests.load(Ordering::Acquire) == requests_before {
                 let _ = engine.advance_pending_block_read(0).unwrap();
                 assert!(Instant::now() < deadline, "cold old-row GET was not issued");
@@ -475,7 +475,7 @@ fn sequence_advances_from_another_transaction_survive_cold_commit_retries() {
     }
     assert!(server.requests.load(Ordering::Acquire) > requests_before);
     server.hold_response.store(false, Ordering::Release);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     loop {
         engine.bind_query_connection(session.connection_id);
         let _ = engine.advance_pending_block_read(0).unwrap();
@@ -502,7 +502,7 @@ fn sequence_advances_from_another_transaction_survive_cold_commit_retries() {
     assert!(!engine.block_reads_pending());
     let query = "SELECT id FROM cold_commit_rows";
     let mut status = session.execute_status(&mut engine, query, true);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     while let ExecutionStatus::Blocked {
         completed_statements,
         output_mark,

@@ -92,6 +92,16 @@ pub(crate) fn wire_column_description<'a>(
     storage: &crate::storage::Storage,
     txid: u32,
 ) -> Result<ColDesc<'a>, SqlError> {
+    if let Some((domain, false)) =
+        crate::sql::information_schema_domains::InformationSchemaDomain::from_oid(
+            description.type_oid,
+        )
+    {
+        description.type_oid = domain.base().oid();
+        description.typlen = domain.base().typlen();
+        description.type_mod = domain.base_type_mod();
+        return Ok(description);
+    }
     let Some((crate::storage::NamedTypeKind::Domain, creation, false)) =
         crate::storage::NamedTypeKind::from_oid(description.type_oid)
     else {
@@ -1194,12 +1204,7 @@ fn describe_record_star<'q>(
             if let Some(error) = error {
                 return Err(error);
             }
-            width.ok_or_else(|| {
-                sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                )
-            })?;
+            width.ok_or_else(|| row_expansion_error(base, &resolver))?;
             Ok(())
         }
         Expr::WholeRow(table)
@@ -1283,19 +1288,13 @@ fn describe_record_star<'q>(
             };
             if let Some(slot) = slot {
                 let storage = storage.expect("checked");
-                let target = crate::storage::TypeDefinitionTarget::by_creation(
-                    storage,
-                    crate::storage::NamedTypeKind::Composite,
-                    slot,
-                )?;
-                let composite = storage
-                    .read_composite_definition(target, txid)?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "composite type no longer exists"
-                        )
-                    })?;
+
+                let composite = storage.row_type_definition(slot, txid)?.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "composite type no longer exists"
+                    )
+                })?;
                 for field in composite.active_fields_for(txid) {
                     let name = arena.alloc_str(field.name.as_str()).map_err(|_| {
                         sql_err!(
@@ -1323,10 +1322,16 @@ fn describe_record_star<'q>(
                 return Ok(());
             }
             let Some(handle) = expr_record_handle(base, resolver) else {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
+                // Name the value's type through the catalog, as PostgreSQL does.
+                let catalog = CatalogCols {
+                    definition: def,
+                    alias: table_alias,
+                    output_aliases,
+                    storage: storage.expect("checked"),
+                    txid,
+                    arena,
+                };
+                return Err(row_expansion_error(base, &catalog));
             };
             let mut push_err = None;
             visit_record_shape_metadata(handle, |field_name, meta| {
@@ -1371,10 +1376,7 @@ fn describe_record_star<'q>(
                 None => &NoCols,
             };
             let Some(handle) = expr_record_handle(base, resolver) else {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
+                return Err(row_expansion_error(base, resolver));
             };
             let mut push_err = None;
             visit_record_shape_metadata(handle, |field_name, meta| {
@@ -1697,6 +1699,18 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
         Expr::WholeRow(t) => t,
         Expr::Exists(_) => "exists",
         Expr::ArraySubquery(_) | Expr::Array(_) => "array",
+        // A subscripted scalar subquery keeps the subquery's name, as
+        // PostgreSQL names any indirection after its argument.
+        Expr::Subscript { .. } | Expr::Slice { .. } => {
+            let mut base = expression;
+            while let Expr::Subscript { base: inner, .. } | Expr::Slice { base: inner, .. } = base {
+                base = inner;
+            }
+            match base {
+                Expr::Subquery(_) => derived_name(base),
+                _ => "?column?",
+            }
+        }
         // A scalar subquery is named by its single output column.
         Expr::Subquery(select) => {
             let mut select = *select;
@@ -1857,10 +1871,12 @@ pub(crate) fn builtin_type_name_fixed(type_oid: i32) -> Option<crate::util::Stac
     Some(crate::util::StackStr::from_str(name))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FunctionLookupFailure {
     Missing,
     Ambiguous,
+    /// `CALL` selected a function: `f(integer) is not a procedure`.
+    NotProcedure,
 }
 
 pub(crate) fn function_lookup_error(
@@ -1870,16 +1886,56 @@ pub(crate) fn function_lookup_error(
     failure: FunctionLookupFailure,
     columns: &dyn ColTypeResolver,
 ) -> SqlError {
-    let format = || -> Result<crate::util::StackStr<192>, SqlError> {
-        use core::fmt::Write;
-        if argument_names.len() > argument_oids.len() {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "function diagnostic argument mapping changed"
-            ));
-        }
-        let mut message = crate::util::StackStr::<192>::new();
-        let _ = write!(message, "function {}(", name);
+    routine_lookup_error(
+        "function ",
+        name,
+        argument_oids,
+        argument_names,
+        failure,
+        columns,
+    )
+}
+
+/// `CALL` lookup failures name the procedure and its argument types, as
+/// PostgreSQL's `ParseFuncOrColumn` does.
+pub(crate) fn procedure_lookup_error(
+    name: &str,
+    argument_oids: &[i32],
+    argument_names: &[Option<&str>],
+    failure: FunctionLookupFailure,
+    columns: &dyn ColTypeResolver,
+) -> SqlError {
+    routine_lookup_error(
+        "procedure ",
+        name,
+        argument_oids,
+        argument_names,
+        failure,
+        columns,
+    )
+}
+
+fn routine_lookup_error(
+    noun: &str,
+    name: &str,
+    argument_oids: &[i32],
+    argument_names: &[Option<&str>],
+    failure: FunctionLookupFailure,
+    columns: &dyn ColTypeResolver,
+) -> SqlError {
+    if argument_names.len() > argument_oids.len() {
+        return sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "function diagnostic argument mapping changed"
+        );
+    }
+    let (state, noun) = match failure {
+        FunctionLookupFailure::Missing => (sqlstate::UNDEFINED_FUNCTION, noun),
+        FunctionLookupFailure::Ambiguous => (sqlstate::AMBIGUOUS_FUNCTION, noun),
+        FunctionLookupFailure::NotProcedure => (sqlstate::WRONG_OBJECT_TYPE, ""),
+    };
+    crate::sql::error_position::full_message_error(state, |message| {
+        let _ = write!(message, "{}{}(", noun, name);
         for (index, type_oid) in argument_oids.iter().copied().enumerate() {
             if index != 0 {
                 let _ = message.write_str(", ");
@@ -1899,25 +1955,10 @@ pub(crate) fn function_lookup_error(
         let _ = message.write_str(match failure {
             FunctionLookupFailure::Missing => ") does not exist",
             FunctionLookupFailure::Ambiguous => ") is not unique",
+            FunctionLookupFailure::NotProcedure => ") is not a procedure",
         });
-        if message.is_truncated() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "function diagnostic exceeds SQL error message capacity (192 bytes)"
-            ));
-        }
-        Ok(message)
-    };
-    match format() {
-        Ok(message) => SqlError {
-            message,
-            sqlstate: crate::sql::eval::SqlState::known(match failure {
-                FunctionLookupFailure::Missing => sqlstate::UNDEFINED_FUNCTION,
-                FunctionLookupFailure::Ambiguous => sqlstate::AMBIGUOUS_FUNCTION,
-            }),
-        },
-        Err(error) => error,
-    }
+        Ok(())
+    })
 }
 
 pub trait ColTypeResolver {
@@ -2061,6 +2102,12 @@ pub trait ColTypeResolver {
     /// set-returning-function scan's single output column), that column's type.
     /// Defaults to None, meaning the whole-row reference is an anonymous record.
     fn whole_row_scalar_type(&self, _name: &str) -> Option<ColType> {
+        None
+    }
+
+    /// The declared row type of a whole-row reference that is neither a scalar
+    /// nor an anonymous record: a relation source's own row type.
+    fn whole_row_composite_type(&self, _name: &str) -> Option<ColType> {
         None
     }
 
@@ -2527,17 +2574,11 @@ pub(crate) fn catalog_composite_field(
     slot: Option<crate::storage::TypeCreation>,
     name: &str,
 ) -> Option<StaticTypeMeta> {
-    let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage,
-        crate::storage::NamedTypeKind::Composite,
-        slot?,
-    )
-    .ok()?;
-    let definition = storage.read_composite_definition(target, txid).ok()??;
+    let definition = storage.row_type_definition(slot?, txid).ok()??;
     let field = definition
         .active_fields()
         .find(|field| field.name.as_str().eq_ignore_ascii_case(name))?;
-    composite_field_metadata(storage, txid, field)
+    composite_field_metadata(storage, txid, &field)
 }
 
 pub(crate) fn visit_catalog_composite_fields(
@@ -2546,18 +2587,12 @@ pub(crate) fn visit_catalog_composite_fields(
     slot: Option<crate::storage::TypeCreation>,
     visit: &mut dyn FnMut(&str, StaticTypeMeta),
 ) -> Option<usize> {
-    let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage,
-        crate::storage::NamedTypeKind::Composite,
-        slot?,
-    )
-    .ok()?;
-    let definition = storage.read_composite_definition(target, txid).ok()??;
+    let definition = storage.row_type_definition(slot?, txid).ok()??;
     let mut count = 0;
     for field in definition.active_fields() {
         visit(
             field.name.as_str(),
-            composite_field_metadata(storage, txid, field)?,
+            composite_field_metadata(storage, txid, &field)?,
         );
         count += 1;
     }
@@ -3455,10 +3490,7 @@ pub(crate) fn expand_record_call_items<'a>(
             return Err(error);
         }
         if width.is_none() {
-            return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "row expansion is not supported on this expression"
-            ));
+            return Err(row_expansion_error(base, columns));
         }
     }
     Ok(expanded.as_slice())
@@ -3971,6 +4003,39 @@ pub fn could_not_identify(field: &str) -> SqlError {
         "could not identify column \"{}\" in record data type",
         field
     )
+}
+
+/// PostgreSQL's 42809 for `(value).*`: a value of a known non-row type names
+/// that type; a row whose fields pos3ql cannot list says so instead.
+pub(crate) fn row_expansion_error(base: &Expr, columns: &dyn ColTypeResolver) -> SqlError {
+    let scalar = |ctype: ColType| !matches!(ctype, ColType::Record | ColType::Composite(_));
+    let type_oid = match base {
+        Expr::Null | Expr::Str(_) => Some(oid::UNKNOWN),
+        // A domain names itself; one over a row type expands elsewhere.
+        Expr::Cast { type_name, .. }
+            if let Some(named) = columns.named_type_oid(type_name)
+                && let Some(base_type) = columns.domain_base_type(named) =>
+        {
+            scalar(base_type).then_some(named)
+        }
+        _ => infer_type_res(base, columns)
+            .ok()
+            .map(|(type_oid, _)| type_oid)
+            .filter(|type_oid| ColType::from_oid(*type_oid).is_some_and(scalar)),
+    };
+    let scalar_name =
+        type_oid.and_then(|type_oid| columns.type_name_fixed(type_oid).ok().flatten());
+    match scalar_name {
+        Some(name) => sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "type {} is not composite",
+            name.as_str()
+        ),
+        None => sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "row expansion is not supported on this expression"
+        ),
+    }
 }
 
 /// PostgreSQL's 42809 for column notation on a non-composite value.
@@ -4711,6 +4776,40 @@ pub(crate) fn builtin_binary_type(
             }
         }
         Add | Sub | Mul | Div | Mod => {
+            // An untyped operand takes the other operand's type, except that
+            // `+` beside a timestamp or time can only add an interval.
+            let resolve = |unknown: i32, known: i32| {
+                if unknown != oid::UNKNOWN || known == oid::UNKNOWN {
+                    unknown
+                } else if *operator == Add
+                    && matches!(known, oid::TIMESTAMP | oid::TIMESTAMPTZ | oid::TIME)
+                {
+                    oid::INTERVAL
+                } else {
+                    known
+                }
+            };
+            if *operator == Add {
+                for (left, unknown, known) in [(true, lo, ro), (false, ro, lo)] {
+                    let name = match known {
+                        oid::DATE => "date",
+                        oid::TIMETZ => "time with time zone",
+                        _ => continue,
+                    };
+                    if unknown == oid::UNKNOWN {
+                        return Err(sql_err!(
+                            sqlstate::AMBIGUOUS_FUNCTION,
+                            "operator is not unique: {}",
+                            if left {
+                                crate::stack_format!(64, "unknown + {}", name)
+                            } else {
+                                crate::stack_format!(64, "{} + unknown", name)
+                            }
+                        ));
+                    }
+                }
+            }
+            let (lo, ro) = (resolve(lo, ro), resolve(ro, lo));
             if matches!(operator, Add | Sub) && lo == oid::ACLITEM_ARRAY && ro == oid::ACLITEM {
                 return Ok((oid::ACLITEM_ARRAY, -1));
             }
@@ -4884,6 +4983,14 @@ pub fn infer_type_res(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
+    infer_type_unpositioned(expression, columns)
+        .map_err(|error| crate::sql::error_position::expression_error(error, expression))
+}
+
+fn infer_type_unpositioned(
+    expression: &Expr,
+    columns: &dyn ColTypeResolver,
+) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
     let selected = selected_call(expression, columns)?;
     if let Expr::Call {
@@ -5027,7 +5134,10 @@ pub fn infer_type_res(
         },
         // A whole-row reference is an anonymous record — unless it is a function
         // scan's whole row, which is its single scalar column.
-        Expr::WholeRow(t) => match columns.whole_row_scalar_type(t) {
+        Expr::WholeRow(t) => match columns
+            .whole_row_scalar_type(t)
+            .or_else(|| columns.whole_row_composite_type(t))
+        {
             Some(ty) => of(ty),
             None => (oid::RECORD, -1),
         },
@@ -5069,7 +5179,10 @@ pub fn infer_type_res(
             // which is its single scalar column.
             Err(e) if qualifier.is_none() && columns.is_whole_row(name) => {
                 let _ = e;
-                match columns.whole_row_scalar_type(name) {
+                match columns
+                    .whole_row_scalar_type(name)
+                    .or_else(|| columns.whole_row_composite_type(name))
+                {
                     Some(t) => of(t),
                     None => (oid::RECORD, -1),
                 }
@@ -5082,6 +5195,11 @@ pub fn infer_type_res(
             crate::sql::ast::UnaryOp::Not => of(ColType::Bool),
             crate::sql::ast::UnaryOp::Neg => {
                 let inferred = infer_type_res(operand, columns)?;
+                // A domain operand uses its base type's operator.
+                let inferred = match columns.domain_base_type(inferred.0) {
+                    Some(base) => (base.oid(), base.typlen()),
+                    None => inferred,
+                };
                 let ctype = coltype_of_oid(inferred.0).unwrap_or(ColType::Text);
                 if !matches!(
                     ctype,
@@ -5278,9 +5396,15 @@ pub fn infer_type_res(
                 for (condition, _) in *whens {
                     let condition_oid = infer_type_res(condition, columns)?.0;
                     if !matches!(condition_oid, oid::BOOL | oid::UNKNOWN) {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "argument of CASE/WHEN must be type boolean"
+                        let type_name = ColType::from_oid(condition_oid)
+                            .map_or("unknown", |ctype| ctype.name());
+                        return Err(crate::sql::error_position::at_expression(
+                            sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "argument of CASE/WHEN must be type boolean, not type {}",
+                                type_name
+                            ),
+                            condition,
                         ));
                     }
                 }
@@ -5431,6 +5555,24 @@ pub fn infer_type_res(
             )?
             .element,
         )),
+        Expr::Subscript { base, .. }
+            if {
+                // A subscript list holding a slice is a slice throughout.
+                let mut node = &**base;
+                let mut sliced = false;
+                while let Expr::Subscript { base, .. } | Expr::Slice { base, .. } = node {
+                    sliced |= matches!(node, Expr::Slice { .. });
+                    node = base;
+                }
+                sliced
+            } =>
+        {
+            let mut node = &**base;
+            while let Expr::Subscript { base, .. } | Expr::Slice { base, .. } = node {
+                node = base;
+            }
+            infer_type_res(node, columns)?
+        }
         Expr::Subscript { base, .. } => {
             // A catalog-backed column retains its array element identity here:
             // a domain element has a structural base `ColType`, but its Result
@@ -5476,7 +5618,13 @@ pub fn infer_type_res(
         }
         // An array slice keeps the array type (unlike a subscript, which yields
         // the element type).
-        Expr::Slice { base, .. } => infer_type_res(base, columns)?,
+        Expr::Slice { base, .. } => {
+            let mut node = &**base;
+            while let Expr::Subscript { base, .. } | Expr::Slice { base, .. } = node {
+                node = base;
+            }
+            infer_type_res(node, columns)?
+        }
         // `(record).field`: the field's type from the record's shape.
         Expr::Field { base, field } => match record_field_metadata(base, field, columns) {
             Ok(meta) => (meta.type_oid, meta.ctype.typlen()),
@@ -5714,17 +5862,33 @@ pub fn infer_type_res(
             "__json_serialize_bytea" => of(ColType::Bytea),
             name if name.starts_with("__json_exists_") => of(ColType::Bool),
             "__json_value" => of(ColType::Text),
-            "__jsonb_subscript_set" => {
+            "__jsonb_subscript_set" | "__array_subscript_set" => {
                 let base = args
                     .first()
                     .map(|base| infer_type_res(base, columns))
                     .transpose()?;
-                if base.is_some_and(|(oid, _)| {
-                    matches!(ColType::from_oid(oid), Some(ColType::Array(_)))
-                }) {
-                    return Err(crate::sql::eval::array_element_assignment_unsupported());
+                // An INSERT target starts from NULL: the array of the
+                // assigned element, or the assigned slice's array type.
+                if matches!(args.first(), Some(Expr::Null)) {
+                    let (value_oid, value_length) = args
+                        .get(1)
+                        .map(|value| infer_type_res(value, columns))
+                        .transpose()?
+                        .unwrap_or_else(|| of(ColType::Text));
+                    let value_type = ColType::from_oid(value_oid);
+                    if *name == "__array_subscript_set"
+                        || matches!(value_type, Some(ColType::Array(_)))
+                    {
+                        (value_oid, value_length)
+                    } else {
+                        let element = value_type
+                            .and_then(crate::sql::types::ArrElem::from_coltype)
+                            .unwrap_or(crate::sql::types::ArrElem::Text);
+                        (element.array_oid(), -1)
+                    }
+                } else {
+                    base.unwrap_or_else(|| of(ColType::Jsonb))
                 }
-                base.unwrap_or_else(|| of(ColType::Jsonb))
             }
             name if name.starts_with("__json_query_") => {
                 if name.ends_with("_jsonb") {
@@ -5834,11 +5998,7 @@ pub fn infer_type_res(
                 .map(|a| infer_type_res(a, columns))
                 .transpose()?
                 .unwrap_or((oid::TEXT, -1)),
-            "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => args
-                .first()
-                .map(|a| infer_type_res(a, columns))
-                .transpose()?
-                .unwrap_or((oid::INT4, 4)),
+            "pg_partition_ancestors" | "pg_partition_root" => of(ColType::Regclass),
             // Window-only functions.
             "row_number" | "rank" | "dense_rank" | "ntile" => of(ColType::Int8),
             "percent_rank" | "cume_dist" => of(ColType::Float8),

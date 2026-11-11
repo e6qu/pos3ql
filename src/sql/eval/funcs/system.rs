@@ -18,7 +18,6 @@ use crate::stack_format;
 
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, cast_to, eval_full, sqlstate, text_arg,
-    type_mismatch,
 };
 
 /// A catalog OID accepted by identity predicates.  Keeping conversion at the
@@ -98,7 +97,7 @@ fn advisory_key<'a>(
             Datum::Int2(value) => Ok(Some(i64::from(value))),
             Datum::Int4(value) => Ok(Some(i64::from(value))),
             Datum::Int8(value) => Ok(Some(value)),
-            other => Err(type_mismatch(name, &other)),
+            other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
         }
     };
     match args {
@@ -765,6 +764,9 @@ pub(crate) fn dispatch<'a>(
         && !matches!(
             name,
             "version"
+                | "pg_sleep"
+                | "pg_sleep_for"
+                | "pg_sleep_until"
                 | "pg_backend_pid"
                 | "pg_blocking_pids"
                 | "pg_cancel_backend"
@@ -909,7 +911,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int4(value) => i64::from(value),
                     Datum::Int8(value) => value,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let block = u64::try_from(block).map_err(|_| {
                     sql_err!(
@@ -954,7 +958,9 @@ pub(crate) fn dispatch<'a>(
                         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
                     })?,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let catalog = hooks.catalog.ok_or_else(|| {
                     sql_err!(
@@ -999,7 +1005,9 @@ pub(crate) fn dispatch<'a>(
                         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
                     })?,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 if args.len() == 2 {
                     let timeout = match eval_full(args[1], arena, params, row, hooks)? {
@@ -1007,7 +1015,9 @@ pub(crate) fn dispatch<'a>(
                         Datum::Int4(value) => i64::from(value),
                         Datum::Int8(value) => value,
                         Datum::Null => return Ok(Datum::Null),
-                        other => return Err(type_mismatch(name, &other)),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
                     };
                     if timeout < 0 {
                         return Err(sql_err!(
@@ -1128,6 +1138,51 @@ pub(crate) fn dispatch<'a>(
                     )
                 })
             }
+            // `pg_sleep_for` and `pg_sleep_until` are SQL functions over
+            // `pg_sleep` in PostgreSQL; each computes its delay from
+            // `clock_timestamp()` when the sleep starts.
+            "pg_sleep" | "pg_sleep_for" | "pg_sleep_until" => {
+                arity(1)?;
+                let value = eval_full(args[0], arena, params, row, hooks)?;
+                if value.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let value = match name {
+                    "pg_sleep" => cast_to(value, ColType::Float8, arena)?,
+                    "pg_sleep_for" => cast_to(value, ColType::Interval, arena)?,
+                    _ => cast_to(value, ColType::Timestamptz, arena)?,
+                };
+                // The journal identifies a sleep by its position: a volatile
+                // argument such as clock_timestamp() changes when the
+                // statement resumes, but the sleep's end time does not.
+                crate::sql::sequence::sleep(
+                    &[Datum::Text(name)],
+                    || {
+                        let now = crate::sql::datetime::now_micros();
+                        let epoch = |micros: i64| micros as f64 / 1_000_000.0;
+                        Ok(match value {
+                            Datum::Float8(seconds) => seconds,
+                            Datum::Interval(interval) => {
+                                let end =
+                                    crate::sql::datetime::checked_add_timestamptz(now, interval)
+                                        .ok_or_else(|| {
+                                            sql_err!(
+                                                sqlstate::DATETIME_FIELD_OVERFLOW,
+                                                "timestamp out of range"
+                                            )
+                                        })?;
+                                epoch(end) - epoch(crate::sql::datetime::now_micros())
+                            }
+                            Datum::Timestamptz(end) => {
+                                epoch(end) - epoch(crate::sql::datetime::now_micros())
+                            }
+                            _ => unreachable!("sleep input was converted"),
+                        })
+                    },
+                    arena,
+                )?;
+                Ok(Datum::Text(""))
+            }
             "pg_advisory_unlock_all" => {
                 arity(0)?;
                 hooks
@@ -1190,7 +1245,9 @@ pub(crate) fn dispatch<'a>(
                 let snapshot = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Snapshot { value, legacy } if legacy == expected_legacy => value,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let value = if name.ends_with("xmin") {
                     snapshot.xmin()
@@ -1227,12 +1284,16 @@ pub(crate) fn dispatch<'a>(
                         })?
                     }
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let snapshot = match eval_full(args[1], arena, params, row, hooks)? {
                     Datum::Snapshot { value, legacy } if legacy == expected_legacy => value,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 Ok(Datum::Bool(snapshot.visible(transaction_id)))
             }
@@ -1254,7 +1315,9 @@ pub(crate) fn dispatch<'a>(
                         )
                     })?,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 Ok(hooks
                     .catalog
@@ -1274,7 +1337,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int4(oid) => Some(oid),
                     Datum::RegObject { referenced_oid, .. } => Some(referenced_oid),
                     Datum::Null => return Ok(Datum::Null),
-                    value => return Err(type_mismatch(name, &value)),
+                    value => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &value));
+                    }
                 };
                 let Some(catalog) = hooks.catalog else {
                     return Ok(Datum::Null);
@@ -1351,7 +1416,10 @@ pub(crate) fn dispatch<'a>(
                         Datum::Int4(value) => Ok(Some(value as u32)),
                         Datum::RegObject { referenced_oid, .. } => Ok(Some(referenced_oid as u32)),
                         Datum::Null => Ok(None),
-                        other => Err(type_mismatch("pg_get_acl", &other)),
+                        other => Err(crate::sql::eval::function_argument_mismatch(
+                            "pg_get_acl",
+                            &other,
+                        )),
                     }
                 };
                 let Some(classid) = oid(eval_full(args[0], arena, params, row, hooks)?)? else {
@@ -1363,7 +1431,12 @@ pub(crate) fn dispatch<'a>(
                 let objsubid = match eval_full(args[2], arena, params, row, hooks)? {
                     Datum::Int4(value) => value,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch("pg_get_acl", &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "pg_get_acl",
+                            &other,
+                        ));
+                    }
                 };
                 let catalog = hooks.catalog.ok_or_else(|| {
                     sql_err!(
@@ -1549,7 +1622,9 @@ pub(crate) fn dispatch<'a>(
                         _ => unreachable!("boolean cast returns its declared type"),
                     },
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let schemas = session_schemas();
                 let mut elems = [Datum::Null; crate::storage::MAX_PATH_ENTRIES];
@@ -1599,10 +1674,33 @@ pub(crate) fn dispatch<'a>(
                     cat, oid, arena,
                 )?))
             }
-            "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => {
+            "pg_partition_root" => {
                 arity(1)?;
-                eval_full(args[0], arena, params, row, hooks)
+                let Some(cat) = hooks.catalog else {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "pg_partition_root requires catalog access"
+                    ));
+                };
+                let relation = super::super::regobject_cast(
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    ColType::Regclass,
+                    Some(cat),
+                    arena,
+                )?;
+                let Some(oid) = relation.catalog_oid() else {
+                    return Ok(Datum::Null);
+                };
+                Ok(cat
+                    .partition_ancestors(oid as i32, arena)?
+                    .last()
+                    .copied()
+                    .unwrap_or(Datum::Null))
             }
+            "pg_partition_ancestors" | "pg_partition_tree" => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "set-valued function called in context that cannot accept a set"
+            )),
             _ if predicate == Some(CatalogPredicateKind::Privilege) => {
                 let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
                 let Some(cat) = hooks.catalog else {
@@ -1991,8 +2089,16 @@ pub(crate) fn dispatch<'a>(
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                let pretty = match args.get(1) {
+                    Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Bool(pretty) => pretty,
+                        _ => false,
+                    },
+                    None => false,
+                };
                 Ok(cat
-                    .constraint_def(oid, arena)?
+                    .constraint_def_pretty(oid, pretty, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2041,8 +2147,21 @@ pub(crate) fn dispatch<'a>(
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                let pretty = match args.get(1) {
+                    Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
+                        Datum::Bool(pretty) => pretty,
+                        Datum::Null => return Ok(Datum::Null),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(
+                                "pg_get_triggerdef",
+                                &other,
+                            ));
+                        }
+                    },
+                    None => false,
+                };
                 Ok(cat
-                    .trigger_def(oid, arena)?
+                    .trigger_def(oid, pretty, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2238,8 +2357,25 @@ pub(crate) fn dispatch<'a>(
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                // `pretty` is a boolean, or a wrap column that implies it.
+                let (pretty, wrap_column) = match args.get(1) {
+                    Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Bool(pretty) => (pretty, 0),
+                        value => match super::super::cast_to(value, ColType::Int4, arena)? {
+                            Datum::Int4(wrap_column) => (true, wrap_column),
+                            other => {
+                                return Err(crate::sql::eval::function_argument_mismatch(
+                                    "pg_get_viewdef",
+                                    &other,
+                                ));
+                            }
+                        },
+                    },
+                    None => (false, 0),
+                };
                 Ok(cat
-                    .view_def(oid, arena)?
+                    .view_def_pretty(oid, pretty, wrap_column, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2257,7 +2393,9 @@ pub(crate) fn dispatch<'a>(
                             match CatalogOid::parse(value)? {
                                 Some(oid) => Ok(Datum::Oid(oid.0 as u32)),
                                 None if value.is_null() => Ok(Datum::Null),
-                                None => Err(type_mismatch("rule identity must be oid", &value)),
+                                None => {
+                                    Err(crate::sql::eval::function_argument_mismatch(name, &value))
+                                }
                             }
                         } else {
                             super::super::cast_to(value, ColType::Bool, arena)
@@ -2400,10 +2538,14 @@ pub(crate) fn dispatch<'a>(
                         None => -1,
                     },
                 };
-                let type_mod = match eval_full(args[1], arena, params, row, hooks)? {
+                let modifier = eval_full(args[1], arena, params, row, hooks)?;
+                // A NULL modifier means "no modifier", not a NULL result. An
+                // explicit -1 still marks the modifier as given, which makes
+                // PostgreSQL spell unconstrained `character` as `bpchar`.
+                let modifier_given = !modifier.is_null();
+                let type_mod = match modifier {
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
-                    // A NULL modifier means "no modifier", not a NULL result.
                     _ => -1,
                 };
                 if let Some(cat) = hooks.catalog
@@ -2421,7 +2563,11 @@ pub(crate) fn dispatch<'a>(
                     ColType::Array(element) => (element.to_coltype(), true),
                     scalar => (scalar, false),
                 };
-                let name = base.name();
+                let name = if base == ColType::Bpchar && modifier_given && type_mod < 0 {
+                    "bpchar"
+                } else {
+                    base.name()
+                };
                 // Array typmods describe their elements. Render the base under
                 // that modifier, then attach [] as PostgreSQL does.
                 let mut text = match TypeMod::decode(base, type_mod) {
@@ -2472,7 +2618,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Text(written) => written,
                     Datum::Bpchar(written) => written.trim_end_matches(' '),
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 if matches!(name, "to_regtype" | "to_regtypemod")
                     && let Some(identity) =
@@ -2572,7 +2720,10 @@ pub(crate) fn dispatch<'a>(
                             .map_or("", crate::storage::PgEncoding::name),
                     )),
                     Datum::Null => Ok(Datum::Null),
-                    other => Err(type_mismatch("pg_encoding_to_char", &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(
+                        "pg_encoding_to_char",
+                        &other,
+                    )),
                 }
             }
             "pg_char_to_encoding" => {

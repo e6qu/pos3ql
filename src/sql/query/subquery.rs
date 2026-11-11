@@ -231,19 +231,12 @@ fn composite_slot_witness<'a>(
     slot: crate::storage::TypeCreation,
     arena: &'a Arena,
 ) -> Result<(Datum<'a>, &'a [Collation]), SqlError> {
-    let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage,
-        crate::storage::NamedTypeKind::Composite,
-        slot,
-    )?;
-    let definition = storage
-        .read_composite_definition(target, txid)?
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "composite type no longer exists"
-            )
-        })?;
+    let definition = storage.row_type_definition(slot, txid)?.ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "composite type no longer exists"
+        )
+    })?;
     let mut fields = [RecordField {
         name: "",
         type_oid: 0,
@@ -983,10 +976,7 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         self.scope
-            .and_then(|scope| {
-                scope.qualified_star_columns(table).ok()?;
-                Some(scope.func_scalar_type(table).unwrap_or(ColType::Record))
-            })
+            .and_then(|scope| scope.whole_row_type(table))
             .or_else(|| self.outer.and_then(|outer| outer.whole_row_type(table)))
     }
 
@@ -2710,6 +2700,12 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
         self.scope?.func_scalar_type(name)
+    }
+
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        self.scope?
+            .whole_row_type(name)
+            .filter(|ctype| matches!(ctype, ColType::Composite(_)))
     }
 
     fn table_columns(&self, name: &str) -> Option<&[crate::storage::ColumnMeta]> {

@@ -641,7 +641,7 @@ mod tests {
     use super::super::{CatalogDdlState, RuleTarget, comment_stackstr};
     use super::*;
     use crate::mem::budget::Budget;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     fn fixture() -> (Storage, usize, usize) {
         let config = test_config();
@@ -689,7 +689,7 @@ mod tests {
                 });
                 send.send(result).unwrap();
             });
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             let waiting = loop {
                 if storage
                     .definition_publication
@@ -738,7 +738,7 @@ mod tests {
                     other_send.send(()).unwrap();
                 });
             }
-            let progress = other_receive.recv_timeout(Duration::from_secs(5));
+            let progress = other_receive.recv_timeout(crate::test_wait::HANG);
             // Release before assertions and joins so a blocked regression can
             // finish without leaving either worker stranded.
             drop(held);
@@ -751,7 +751,7 @@ mod tests {
                 "the selected edit reserved unrelated metadata"
             );
             receive
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(crate::test_wait::HANG)
                 .unwrap()
                 .unwrap()
         });
@@ -1262,7 +1262,7 @@ mod tests {
                     )
                 })
             });
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             let waiting = loop {
                 if storage
                     .definition_publication

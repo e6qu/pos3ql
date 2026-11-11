@@ -288,8 +288,7 @@ fn with_schema_context<'a, 's, R>(
         {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
-                "WITH query \"{}\" is not recursive",
-                cte.name
+                "WITH query is not recursive"
             ));
         }
         if let Some(dml) = cte.dml {
@@ -476,6 +475,7 @@ pub fn expand_ctes_exec<'a>(
     if !select_contains_with(sel) && !storage.has_any_view() {
         return Ok(sel);
     }
+    analyze_unreferenced_ctes(sel, storage, txid, arena)?;
     with_exec_context(
         sel.with,
         storage,
@@ -494,6 +494,82 @@ pub fn expand_ctes_exec<'a>(
         |name| select_references(sel, name),
         |context| subst_select_body(sel, context, arena),
     )
+}
+
+/// PostgreSQL analyses every query in a WITH clause, including one no part
+/// of the statement reads, which it then never runs: `WITH x AS (SELECT *
+/// FROM missing) SELECT 1` fails. Each such query is described, with the
+/// queries before it in scope, without reading a row.
+fn analyze_unreferenced_ctes<'a>(
+    sel: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    for (index, cte) in sel.with.iter().enumerate() {
+        if cte.dml.is_some() || select_references(sel, cte.name) != 0 {
+            continue;
+        }
+        let probe = arena
+            .alloc(Select {
+                items: &[SelectItem::Wildcard],
+                distinct: false,
+                distinct_on: &[],
+                from: Some(FromClause {
+                    base: TableRef {
+                        schema: None,
+                        table: cte.name,
+                        alias: None,
+                        subquery: None,
+                        func_args: None,
+                        func_argument_names: &[],
+                        func_variadic: false,
+                        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                        rows_from: None,
+                        col_alias: None,
+                        inheritance: crate::sql::ast::RelationInheritance::Descendants,
+                        sample: None,
+                        cte: None,
+                        with_ordinality: false,
+                        lateral: false,
+                        authorization_role: None,
+                        bound_table: None,
+                        view_access: None,
+                    },
+                    joins: &[],
+                }),
+                where_clause: None,
+                group_by: &[],
+                grouping_sets: &[],
+                having: None,
+                order_by: &[],
+                limit: None,
+                offset: None,
+                with_ties: false,
+                with: &sel.with[..=index],
+                set_body: None,
+                locking: &[],
+                ..*sel
+            })
+            .map_err(|_| arena_full())?;
+        let mark = arena.mark();
+        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let described = expand_ctes(probe, storage, txid, arena).and_then(|probe| {
+            super::describe_select(
+                probe,
+                storage,
+                txid,
+                arena,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Sql,
+                None,
+            )
+        });
+        // Only the verdict leaves; the description is discarded.
+        unsafe { arena.rewind_to(mark) };
+        described?;
+    }
+    Ok(())
 }
 
 /// Binds executor-owned relations into a query as typed materialized sources.
@@ -2378,11 +2454,14 @@ fn require_view_column(
     if exposed_columns.contains(&column) {
         return Ok(());
     }
-    Err(sql_err!(
-        sqlstate::UNDEFINED_COLUMN,
-        "column \"{}\" of relation \"{}\" does not exist",
+    Err(crate::sql::error_position::at_reference(
+        sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" of relation \"{}\" does not exist",
+            column,
+            view_name
+        ),
         column,
-        view_name
     ))
 }
 
@@ -3557,10 +3636,23 @@ fn recursive_parts<'a>(
             name
         ));
     };
-    if !q.order_by.is_empty() || q.limit.is_some() || q.offset.is_some() {
+    // PostgreSQL names the first such clause, in this order.
+    let unsupported = if !q.order_by.is_empty() {
+        Some("ORDER BY")
+    } else if q.offset.is_some() {
+        Some("OFFSET")
+    } else if q.limit.is_some() {
+        Some("LIMIT")
+    } else if !q.locking.is_empty() {
+        Some("FOR UPDATE/SHARE")
+    } else {
+        None
+    };
+    if let Some(clause) = unsupported {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "ORDER BY/LIMIT in a recursive query is not implemented"
+            "{} in a recursive query is not implemented",
+            clause
         ));
     }
     if set_tree_references(left, name) > 0 {
@@ -5214,7 +5306,7 @@ fn subst_select_items<'a>(
             if (old && !transition.old_available) || (!old && !transition.new_available) {
                 return Err(sql_err!(
                     sqlstate::INVALID_OBJECT_DEFINITION,
-                    "ON {} rule cannot reference {}",
+                    "ON {} rule cannot use {}",
                     if old { "INSERT" } else { "DELETE" },
                     if old { "OLD" } else { "NEW" }
                 ));
@@ -6731,7 +6823,7 @@ fn subst_expr<'a>(
                 if (old && !transition.old_available) || (!old && !transition.new_available) {
                     return Err(sql_err!(
                         sqlstate::INVALID_OBJECT_DEFINITION,
-                        "ON {} rule cannot reference {}",
+                        "ON {} rule cannot use {}",
                         if old { "INSERT" } else { "DELETE" },
                         if old { "OLD" } else { "NEW" }
                     ));

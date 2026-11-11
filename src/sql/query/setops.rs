@@ -364,7 +364,7 @@ fn resolve_set_order(
 }
 
 fn missing_equality(ctype: ColType) -> bool {
-    !ctype.has_builtin_equality()
+    !ctype.has_default_equality()
 }
 
 fn reject_missing_ordering(type_oid: i32) -> Result<(), SqlError> {

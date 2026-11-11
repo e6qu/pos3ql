@@ -4,7 +4,7 @@ use crate::sql::cursor::CursorScroll;
 use crate::storage::{RowCursor, RowCursorBuffers, SpilledRowRepresentation};
 use crate::store::{BlockStore, StoreError};
 use std::net::TcpListener;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Clone, Copy)]
 enum SavedRows {
@@ -221,7 +221,7 @@ fn cold_cursor_fetch(
     let mut waited_inside_fetch = false;
     let mut wait_positions = Vec::new();
     let fetch = format!("FETCH FORWARD {batch} FROM cold");
-    let mut deadline = Instant::now() + Duration::from_secs(2);
+    let mut deadline = crate::test_wait::deadline();
     session.send.clear();
     session.arena.reset();
     loop {
@@ -269,13 +269,10 @@ fn cold_cursor_fetch(
                     count += 1;
                 }
                 assert_eq!(session.cursors.produced_rows(slot), count as usize);
-                assert_eq!(
-                    session.cursors.buffered_rows(slot),
-                    if scrollable { count } else { rows } as usize
-                );
+                assert_eq!(session.cursors.buffered_rows(slot), rows as usize);
                 session.send.clear();
                 session.arena.reset();
-                deadline = Instant::now() + Duration::from_secs(2);
+                deadline = crate::test_wait::deadline();
             }
             ExecutionStatus::Blocked {
                 output_mark, wait, ..
@@ -307,7 +304,7 @@ fn cold_cursor_fetch(
                             .unwrap()
                             .to_vec();
                         reply(&mut stream, &request, &body);
-                        deadline = Instant::now() + Duration::from_secs(2);
+                        deadline = crate::test_wait::deadline();
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(Instant::now() < deadline, "retained FETCH did not advance");
@@ -345,10 +342,17 @@ fn cold_cursor_fetch(
         "SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='cold_orders'",
         true,
     );
-    assert_eq!(
-        data_rows(&statistics),
-        [format!("1|{}", (skip + take) * stride)]
-    );
+    // One scan; a scrollable cursor moving back reads rows again from the
+    // first row, and those reads count too.
+    let statistics = data_rows(&statistics);
+    let (scans, read) = statistics[0].split_once('|').unwrap();
+    assert_eq!(scans, "1");
+    let read: i32 = read.parse().unwrap();
+    if scrollable {
+        assert!(read > (skip + take) * stride, "{read}");
+    } else {
+        assert_eq!(read, (skip + take) * stride);
+    }
     session.success(&mut engine, "CLOSE cold; ROLLBACK", true);
 }
 
@@ -472,7 +476,7 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
     let mut count = 0;
     let mut tested_wait = false;
     let mut cold_read_before_first_row = false;
-    let mut deadline = Instant::now() + Duration::from_secs(2);
+    let mut deadline = crate::test_wait::deadline();
     loop {
         advance(&mut engine);
         let prior = engine.replace_read_owner(Some(query_owner));
@@ -504,7 +508,7 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
                 assert_eq!(checksum(code.as_bytes()), expected[count]);
                 count += 1;
                 output.reset();
-                deadline = Instant::now() + Duration::from_secs(2);
+                deadline = crate::test_wait::deadline();
             }
             Ok(None) => break,
             Err(error) => {
@@ -609,7 +613,7 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
                         &foreground_request,
                         namespace.borrow().object_bytes(&foreground_key).unwrap(),
                     );
-                    let foreground_deadline = Instant::now() + Duration::from_secs(2);
+                    let foreground_deadline = crate::test_wait::deadline();
                     loop {
                         advance(&mut engine);
                         let prior = engine.replace_read_owner(Some(other_owner));
@@ -640,7 +644,7 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
                 } else {
                     reply(&mut stream, &request, &body);
                 }
-                deadline = Instant::now() + Duration::from_secs(2);
+                deadline = crate::test_wait::deadline();
             }
         }
     }
@@ -729,5 +733,47 @@ fn query_reads_held_locking_cancel() {
         crate::config::TransactionMode::Locking,
         SavedRows::Overflow,
         true,
+    );
+}
+
+#[test]
+fn sorted_statements_postpone_volatile_output_and_hand_off_routines_per_row() {
+    let config = test_config("sorted-statement-handoff");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // PostgreSQL 18.6 returns these rows: volatile output runs after the
+    // sort, in output order.
+    session.success(
+        &mut engine,
+        "CREATE TABLE ja(id int, v text); INSERT INTO ja VALUES (1,'a'),(2,'b'),(3,'c'); \
+         CREATE TABLE jb(k int, w text); INSERT INTO jb VALUES (1,'x'),(3,'y'); \
+         CREATE SEQUENCE s2; \
+         CREATE FUNCTION tagf(i int) RETURNS text LANGUAGE sql AS $$ SELECT 'r' || i $$",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, nextval('s2') FROM ja ORDER BY id DESC; \
+             SELECT ja.id, tagf(ja.id), jb.w FROM ja LEFT JOIN jb ON jb.k = ja.id \
+             ORDER BY ja.id DESC; \
+             SELECT id FROM ja ORDER BY id DESC LIMIT 2 OFFSET 1; \
+             SELECT tagf(id) FROM ja ORDER BY v DESC",
+            true
+        )),
+        [
+            "3|1",
+            "2|2",
+            "1|3",
+            "3|r3|y",
+            "2|r2|NULL",
+            "1|r1|x",
+            "2",
+            "1",
+            "r3",
+            "r2",
+            "r1"
+        ]
     );
 }

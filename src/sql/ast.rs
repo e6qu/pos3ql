@@ -1383,6 +1383,25 @@ pub enum Stmt<'a> {
     },
 }
 
+impl Stmt<'_> {
+    /// Whether PostgreSQL runs parse analysis on this statement as a query
+    /// or query-bearing command, positioning relation and column errors.
+    pub(crate) fn is_analyzed_query(&self) -> bool {
+        matches!(
+            self,
+            Stmt::Select(_)
+                | Stmt::Insert(_)
+                | Stmt::Update(_)
+                | Stmt::Delete(_)
+                | Stmt::Merge(_)
+                | Stmt::Explain { .. }
+                | Stmt::CreateView { .. }
+                | Stmt::CreateTableAs { .. }
+                | Stmt::DeclareCursor { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleEvent {
     Select,
@@ -3308,6 +3327,10 @@ pub enum CteCycleMark<'a> {
     },
 }
 
+/// The derived-table alias of the query `INSERT INTO t (a[1]) SELECT ...`
+/// assigns subscripted targets from; it cannot be written in SQL.
+pub const INSERT_SUBSCRIPT_SOURCE: &str = "*INSERT source*";
+
 /// One `WITH name [(col, ...)] AS (SELECT ...)` common table expression.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cte<'a> {
@@ -4793,8 +4816,12 @@ pub struct CopyOptions<'a> {
     /// CSV input: columns whose empty unquoted field is the empty string, not
     /// NULL, even when it matches the NULL string.
     pub force_not_null: &'a [&'a str],
+    /// CSV input: `FORCE_NOT_NULL *`, every column.
+    pub force_not_null_all: bool,
     /// CSV input: columns whose quoted value matching the NULL string is NULL.
     pub force_null: &'a [&'a str],
+    /// CSV input: `FORCE_NULL *`, every column.
+    pub force_null_all: bool,
 }
 
 impl CopyOptions<'_> {
@@ -4813,7 +4840,9 @@ impl CopyOptions<'_> {
         force_quote_all: false,
         force_quote: &[],
         force_not_null: &[],
+        force_not_null_all: false,
         force_null: &[],
+        force_null_all: false,
     };
 
     /// The effective field delimiter (text/CSV; unused for binary).
@@ -5871,6 +5900,13 @@ pub enum Expr<'a> {
 }
 
 pub(crate) fn is_volatile_function(name: &str) -> bool {
+    // Every PostgreSQL 18.6 built-in declared volatile (`provolatile = 'v'`),
+    // whichever overload a call selects, plus extension routines below.
+    if super::catalog::builtin_callable_signatures(name.strip_prefix("pg_catalog.").unwrap_or(name))
+        .any(|signature| signature.catalog.volatility == "v")
+    {
+        return true;
+    }
     const NAMES: &[&str] = &[
         "clock_timestamp",
         "timeofday",
@@ -6337,15 +6373,24 @@ impl Expr<'_> {
     /// (PostgreSQL requires immutability, 42P17). Every other function is treated
     /// as immutable.
     pub fn contains_nonimmutable_function(&self) -> Option<&str> {
-        self.find_function(is_nonimmutable_function)
+        self.find_function(&is_nonimmutable_function)
+    }
+
+    /// As [`Self::contains_nonimmutable_function`], also treating a function
+    /// as non-immutable when `changed` reports that the database altered it.
+    pub fn contains_nonimmutable_function_with(
+        &self,
+        changed: &dyn Fn(&str) -> bool,
+    ) -> Option<&str> {
+        self.find_function(&|name| is_nonimmutable_function(name) || changed(name))
     }
 
     /// The volatile subset relevant to PostgreSQL's CTE inlining rule.
     pub fn contains_volatile_function(&self) -> Option<&str> {
-        self.find_function(is_volatile_function)
+        self.find_function(&is_volatile_function)
     }
 
-    fn find_function(&self, matches: fn(&str) -> bool) -> Option<&str> {
+    fn find_function(&self, matches: &dyn Fn(&str) -> bool) -> Option<&str> {
         match self {
             Expr::Call { name, args, .. } => {
                 if matches(name) {

@@ -69,6 +69,12 @@ pub(crate) enum CommonTypeError {
     Conversion { from: ColType, to: ColType },
 }
 
+/// PostgreSQL 18.6 `pg_type.typispreferred`: bool, text, oid, float8, inet,
+/// timestamptz, interval and varbit.
+pub(crate) fn preferred_type_oid(type_oid: i32) -> bool {
+    matches!(type_oid, 16 | 25 | 26 | 701 | 869 | 1184 | 1186 | 1562)
+}
+
 pub(crate) fn type_category(ctype: ColType) -> &'static str {
     use ColType::*;
     match ctype {
@@ -292,17 +298,15 @@ pub mod oid {
     pub const REGCOLLATION_ARRAY: i32 = 4192;
     /// Base OIDs for user-defined domains, enums, composites, and the array types PostgreSQL
     /// creates alongside each of them. Each identifier adds a checked creation
-    /// stamp; the bands are independent of configured catalog positions.
+    /// stamp; the bands are independent of configured catalog positions. A
+    /// relation's row type is a composite identified by the relation's stamp,
+    /// which shares the same creation sequence.
     pub const FIRST_DOMAIN: i32 = 180_000_000;
     pub const FIRST_ENUM: i32 = 200_000_000;
-    pub const FIRST_TABLE_COMPOSITE: i32 = 130_000_000;
-    pub const FIRST_VIEW_COMPOSITE: i32 = 140_000_000;
     pub const FIRST_COMPOSITE: i32 = 220_000_000;
     pub const FIRST_DOMAIN_ARRAY: i32 = 240_000_000;
     pub const FIRST_ENUM_ARRAY: i32 = 260_000_000;
     pub const FIRST_COMPOSITE_ARRAY: i32 = 280_000_000;
-    pub const FIRST_TABLE_COMPOSITE_ARRAY: i32 = 150_000_000;
-    pub const FIRST_VIEW_COMPOSITE_ARRAY: i32 = 160_000_000;
     pub fn domain_oid(creation: crate::storage::TypeCreation) -> i32 {
         FIRST_DOMAIN + creation.created_at() as i32
     }
@@ -2510,10 +2514,29 @@ impl ColType {
         )
     }
 
+    /// Whether PostgreSQL finds a default btree or hash equality for the type
+    /// (`lookup_type_cache` with `TYPECACHE_EQ_OPR`), as DISTINCT, grouping,
+    /// set operations, array comparison and array search require. Geometric
+    /// types keep their `=` operators (box area equality, for example) but
+    /// have no such operator class, like `xml` and the snapshot types. An
+    /// array has one exactly when its element does.
+    pub fn has_default_equality(self) -> bool {
+        match self {
+            Self::Array(element) => element.to_coltype().has_default_equality(),
+            _ => {
+                self.has_builtin_equality()
+                    && !matches!(
+                        self,
+                        Self::Xml | Self::Geometry(_) | Self::PgSnapshot | Self::TxidSnapshot
+                    )
+            }
+        }
+    }
+
     /// Whether PostgreSQL exposes the ordering operators needed by SQL sort
     /// keys. Command IDs have equality but deliberately have no ordering.
-    pub const fn has_builtin_ordering(self) -> bool {
-        self.has_builtin_equality() && !matches!(self, Self::Cid | Self::Array(ArrElem::Cid))
+    pub fn has_builtin_ordering(self) -> bool {
+        self.has_default_equality() && !matches!(self, Self::Cid | Self::Array(ArrElem::Cid))
     }
 
     /// Whether values of this type carry a PostgreSQL collation.
@@ -4382,8 +4405,9 @@ pub enum TypeMod {
     Length(usize),
     /// `bit(n)` / `varbit(n)`: a bit count without a header.
     BitLength(usize),
-    /// `numeric(p, s)`.
-    NumericPS { precision: u16, scale: u16 },
+    /// `numeric(p, s)`: PostgreSQL allows a scale from -1000 to 1000, so it
+    /// may be negative (round to tens) or exceed the precision.
+    NumericPS { precision: u16, scale: i16 },
     /// `timestamp(p)` / `timestamptz(p)` / `time(p)` / `timetz(p)`:
     /// fractional-second digits, 0..=6.
     TemporalPrecision(u8),
@@ -4424,9 +4448,10 @@ impl TypeMod {
             ColType::Numeric => {
                 if atttypmod >= 4 {
                     let packed = atttypmod - 4;
+                    // PostgreSQL's NUMERIC_TYPMOD_SCALE: an 11-bit signed field.
                     TypeMod::NumericPS {
                         precision: ((packed >> 16) & 0xFFFF) as u16,
-                        scale: (packed & 0xFFFF) as u16,
+                        scale: (((packed & 0x7FF) ^ 1024) - 1024) as i16,
                     }
                 } else {
                     TypeMod::None
@@ -4464,7 +4489,7 @@ impl TypeMod {
             TypeMod::Length(n) => n as i32 + 4,
             TypeMod::BitLength(n) => n as i32,
             TypeMod::NumericPS { precision, scale } => {
-                (((precision as i32) << 16) | (scale as i32)) + 4
+                (((precision as i32) << 16) | (i32::from(scale) & 0x7FF)) + 4
             }
             TypeMod::TemporalPrecision(p) => i32::from(p),
             TypeMod::IntervalMod { range, precision } => {
@@ -5551,6 +5576,20 @@ mod tests {
                 TypeMod::NumericPS {
                     precision: 6,
                     scale: 2,
+                },
+            ),
+            (
+                ColType::Numeric,
+                TypeMod::NumericPS {
+                    precision: 5,
+                    scale: -2,
+                },
+            ),
+            (
+                ColType::Numeric,
+                TypeMod::NumericPS {
+                    precision: 3,
+                    scale: 1000,
                 },
             ),
             (ColType::Timestamp, TypeMod::TemporalPrecision(3)),

@@ -112,6 +112,25 @@ fn empty_meta() -> ColumnMeta {
     }
 }
 
+/// A stored column of a relation's row type. Values of a view's row type are
+/// described from its query rather than a stored layout, so such columns are
+/// rejected explicitly.
+fn column_row_type(
+    storage: &Storage,
+    relation: crate::storage::RowTypeRelation,
+    array: bool,
+    txid: u32,
+) -> Result<crate::storage::RoutineResult, SqlError> {
+    if let crate::storage::RowTypeRelation::View(slot) = relation {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "columns of the row type of view \"{}\" are not supported",
+            storage.view(slot).name_for(txid).as_str()
+        ));
+    }
+    storage.relation_row_type_result(relation, array, txid)
+}
+
 /// Resolves one column definition, evaluating its DEFAULT (which must be a
 /// constant) and coercing it to the column type.
 pub(super) fn build_column(
@@ -133,8 +152,33 @@ pub(super) fn build_column(
     // `ColType::Enum` plus its durable identity, so the column's
     // type persists as a name that reloads to the right slot). User-defined
     // array types follow the same path while keeping their element identity.
+    let builtin_domain = crate::sql::catalog::user_type_oid(storage, txid, c.type_name)
+        .and_then(crate::sql::information_schema_domains::InformationSchemaDomain::from_oid);
     let (ctype, type_mod, user_type, domain_default) = match ColType::from_sql_name(c.type_name) {
         Some(ct) => (ct, c.type_mod, None, None),
+        None if let Some((domain, array)) = builtin_domain => {
+            let identity = crate::storage::UserTypeName::information_schema_domain(domain);
+            if array {
+                (
+                    ColType::Array(
+                        crate::sql::types::ArrElem::from_coltype(domain.base())
+                            .expect("information_schema domain base has an array type"),
+                    ),
+                    -1,
+                    Some(identity),
+                    None,
+                )
+            } else {
+                (
+                    domain.base(),
+                    domain.base_type_mod(),
+                    Some(identity),
+                    domain.default_text().map(
+                        crate::util::StackStr::<{ crate::storage::DEFAULT_EXPR_MAX }>::from_str,
+                    ),
+                )
+            }
+        }
         None => {
             if let Some(element_name) = c.type_name.strip_suffix("[]") {
                 if let Some(slot) = storage.resolve_domain_slot(element_name, txid) {
@@ -179,11 +223,18 @@ pub(super) fn build_column(
                         )),
                         None,
                     )
+                } else if let Some(relation) = storage.resolve_relation_row_type(element_name, txid)
+                {
+                    let result = column_row_type(storage, relation, true, txid)?;
+                    (result.ctype, -1, result.user_type, None)
                 } else {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "type \"{}\" does not exist",
-                        c.type_name
+                    return Err(crate::sql::error_position::at_subject(
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "type \"{}\" does not exist",
+                            c.type_name
+                        ),
+                        c.type_name,
                     ));
                 }
             } else {
@@ -220,13 +271,22 @@ pub(super) fn build_column(
                                     None,
                                 )
                             }
-                            None => {
-                                return Err(sql_err!(
-                                    sqlstate::UNDEFINED_OBJECT,
-                                    "type \"{}\" does not exist",
-                                    c.type_name
-                                ));
-                            }
+                            None => match storage.resolve_relation_row_type(c.type_name, txid) {
+                                Some(relation) => {
+                                    let result = column_row_type(storage, relation, false, txid)?;
+                                    (result.ctype, -1, result.user_type, None)
+                                }
+                                None => {
+                                    return Err(crate::sql::error_position::at_subject(
+                                        sql_err!(
+                                            sqlstate::UNDEFINED_OBJECT,
+                                            "type \"{}\" does not exist",
+                                            c.type_name
+                                        ),
+                                        c.type_name,
+                                    ));
+                                }
+                            },
                         },
                     },
                 }
@@ -244,7 +304,10 @@ pub(super) fn build_column(
     let bound =
         storage.bind_routine_result(crate::storage::RoutineResult { ctype, user_type }, txid)?;
     let (ctype, user_type) = (bound.ctype, bound.user_type);
-    if let Some(identity) = user_type {
+    if let Some(identity) = user_type
+        && identity.relation_row_type_creation().is_none()
+        && identity.information_schema_domain_binding().is_none()
+    {
         storage.require_type_usage(identity.schema.as_str(), identity.name.as_str(), txid)?;
     }
     let default = if let Some(gtext) = c.generated_text {
@@ -255,7 +318,7 @@ pub(super) fn build_column(
                 c.name
             ));
         }
-        ColumnDefault::Generated(resolve_generated(gtext, arena)?)
+        ColumnDefault::Generated(resolve_generated(gtext, storage, txid, arena)?)
     } else {
         let column_default = resolve_default(
             c.default,
@@ -268,12 +331,17 @@ pub(super) fn build_column(
         )?;
         // A domain-typed column with no column-level DEFAULT inherits the
         // domain's DEFAULT (baked in at creation, re-evaluated per insert).
-        if matches!(column_default, ColumnDefault::None) {
-            domain_default
+        match column_default {
+            ColumnDefault::None => domain_default
                 .map(ColumnDefault::Expression)
-                .unwrap_or(ColumnDefault::None)
-        } else {
-            column_default
+                .unwrap_or(ColumnDefault::None),
+            // PostgreSQL stores no default for a NULL constant unless it
+            // must override a domain's own default.
+            ColumnDefault::Constant {
+                value: crate::storage::OwnedDatum::Null,
+                ..
+            } if domain_default.is_none() => ColumnDefault::None,
+            column_default => column_default,
         }
     };
     // SERIAL requests a bound nextval default during table creation.
@@ -395,6 +463,8 @@ pub(super) fn resolve_parsed_collation(
 /// column list and is checked once the table is assembled.
 pub(super) fn resolve_generated(
     text: &str,
+    storage: &Storage,
+    txid: u32,
     arena: &Arena,
 ) -> Result<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>, SqlError> {
     let expression = crate::sql::parser::parse_expr(text, arena)?;
@@ -404,11 +474,15 @@ pub(super) fn resolve_generated(
             "cannot use subquery in column generation expression"
         ));
     }
-    if let Some(name) = expression.contains_nonimmutable_function() {
+    if expression
+        .contains_nonimmutable_function_with(&|name| {
+            storage.builtin_routine_name_is_nonimmutable(name, txid)
+        })
+        .is_some()
+    {
         return Err(sql_err!(
             sqlstate::INVALID_OBJECT_DEFINITION,
-            "generation expression is not immutable (uses {}())",
-            name
+            "generation expression is not immutable"
         ));
     }
     let stored = StackStr::from_str(text);

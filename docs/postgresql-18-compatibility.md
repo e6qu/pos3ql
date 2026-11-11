@@ -45,6 +45,15 @@ Schemas and catalogs:
   `0A000` and is never redirected to `public`. Tables, views, sequences, and
   composite types in `pg_catalog` or `pg_toast` keep PostgreSQL's `42501`;
   missing CREATE permission is also `42501`.
+- `information_schema`'s domains (`cardinal_number`, `character_data`,
+  `sql_identifier`, `time_stamp`, `yes_or_no`) exist as in PostgreSQL: its view
+  columns have those types (`pg_typeof(table_name)` is
+  `information_schema.sql_identifier`; the wire type is the base type), casts
+  and table columns check them (`(-1)::information_schema.cardinal_number`
+  fails with `23514`), and `pg_type`, `pg_constraint` and the domain views list
+  them. Arrays of these domains work the same way:
+  `'{-1}'::information_schema.cardinal_number[]` fails with `23514`, and an
+  element of such an array has the domain's type.
 - `information_schema` views can be queried, but their relation OIDs cannot:
   `'information_schema.columns'::regclass` and `to_regclass(...)` fail with
   `0A000` (`relation OIDs for information_schema views are not supported`).
@@ -72,7 +81,116 @@ Identity, inheritance, and partitions:
   parent's sequence, but `pg_get_serial_sequence` returns NULL for a child.
   Detaching a partition clears its inherited identity; rolling back restores it.
 
+Syntax and errors:
+
+- `U&'d\0061t\+000061'` and `U&"d!0061t" UESCAPE '!'` read Unicode escapes
+  as PostgreSQL does, with its errors (`invalid Unicode escape`, `invalid
+  Unicode surrogate pair`, `invalid Unicode escape character`). The
+  `standard_conforming_strings` setting is always on, so these forms are always
+  allowed.
+- An identifier longer than 63 bytes is cut to 63 bytes at a character
+  boundary, and the server sends `NOTICE: identifier "..." will be truncated
+  to "..."` before running the query, as PostgreSQL does.
+- Errors point at their cause, as psql's `LINE 1:` and caret show: syntax
+  errors, unknown relations, columns, types, functions and operators (with
+  PostgreSQL's hints), failed constant input (`SELECT 'zap'::int`) and syntax
+  errors inside a SQL function body given to `CREATE FUNCTION`. An error
+  about a whole expression points at its start, as in PostgreSQL: the `1` of
+  `SELECT 1 WHERE 1` (`argument of WHERE must be type boolean, not type
+  integer`), a `CASE WHEN`, `AND`, `OR` or `NOT` operand.
+- Errors and notices raised inside PL/pgSQL and SQL-language functions carry
+  PostgreSQL's `CONTEXT` lines, innermost first: `PL/pgSQL function
+  f(integer) line 3 at RAISE`, `SQL statement "INSERT INTO t VALUES (1)"`,
+  `PL/pgSQL assignment "x := 1/0"` and `SQL function "f" statement 2`. An
+  error analysing a query a function runs, such as an unknown column in
+  `EXECUTE 'SELECT nocol FROM t'`, reports that query and the error's place in
+  it as psql's `QUERY:` and `LINE` lines instead of the client's statement.
+  `GET DIAGNOSTICS ... PG_CONTEXT` and `GET STACKED DIAGNOSTICS ...
+  PG_EXCEPTION_CONTEXT` return the same text, and `RAISE;` re-raises the
+  caught error with its original context. A call PostgreSQL inlines into its
+  caller's query (a SQL function whose body is one `SELECT expression`) adds
+  no line; when PostgreSQL would fail while inlining it (`SELECT f(0)` for a
+  body `SELECT 1/$1`), pos3ql reports no `SQL function "f" during inlining`
+  line. A longer context than 64 KiB is reported as a `54000` error.
+- Constraint violations carry PostgreSQL's `DETAIL` and object fields:
+  `Failing row contains (null, x).` with the schema, table and column of a
+  not-null violation; `Key (id)=(1) already exists.` with the constraint of a
+  unique, foreign-key or exclusion violation; and the schema, data type and
+  constraint of a domain violation. `RAISE ... USING COLUMN`, `CONSTRAINT`,
+  `DATATYPE`, `TABLE` and `SCHEMA` set those fields (up to 1,024 bytes each)
+  and `GET STACKED DIAGNOSTICS` reads them.
+- Checks PostgreSQL makes after parsing are reported when the statement would
+  run, with PostgreSQL's code and message: type modifiers (`numeric(2000)` is
+  `22023`, `NUMERIC precision 2000 must be between 1 and 1000`; `numeric(5,-2)`
+  and `numeric(3,5)` are accepted), COPY options, storage parameters and
+  sequence, database and large-object values. An earlier statement in the same
+  query string still runs, and a syntax error anywhere in the string is
+  reported first. In a `SELECT`, errors PostgreSQL's analysis finds earlier
+  come first: `SELECT 1::numeric(5000) FROM missing` reports the missing
+  relation, and `1::nosuch(5)` reports `type "nosuch" does not exist`.
+- Statements are analysed before they read a row, as in PostgreSQL: a `WITH`
+  query nothing reads must still be valid (`WITH x AS (SELECT * FROM missing)
+  SELECT 1` fails), a constant compared with or added to a column must convert
+  to its type (`WHERE id = 'abc'` fails even on an empty table), and
+  `CREATE FUNCTION` checks a SQL body's queries and target relations unless
+  `check_function_bodies` is off (always for a `BEGIN ATOMIC` body).
+- A name in a PL/pgSQL statement that is both a variable and a column is
+  ambiguous, as in PostgreSQL: with parameter `a`, `UPDATE t SET b = 1/(a-15)`
+  fails with `42702` (`column reference "a" is ambiguous`, detail `It could
+  refer to either a PL/pgSQL variable or a table column.`) before any row is
+  read, at any query level. `#variable_conflict use_column` at the start of
+  the body, or the superuser setting `plpgsql.variable_conflict =
+  use_column`, reads the column instead. The setting is read when a backend
+  first runs the function, and a body's option overrides it. `use_variable`
+  works for names that are not columns; a name that is also a column fails
+  with `0A000` instead of reading the variable. The setting exists from
+  startup, as if PL/pgSQL were preloaded.
+- Each query of a volatile PL/pgSQL function, procedure, trigger or `DO` block
+  sees the rows its earlier statements changed; a stable or immutable
+  function reads its caller's snapshot.
+- A PL/pgSQL condition of another type converts through its text form as in
+  PostgreSQL: `IF 1` is true and `IF 5` fails with `invalid input syntax for
+  type boolean`.
+- An unsupported cast reports `42846` with both types as `format_type` names
+  them (`cannot cast type integer to timestamp without time zone`).
+- Array elements and slices can be assigned (`UPDATE t SET a[2] = 9`,
+  `a[1:2] = '{1,2}'`, `INSERT INTO t (a[1]) VALUES (5)`, `INSERT INTO t (a[1])
+  SELECT 5`): a one-dimensional array grows with NULLs, other arrays stay
+  within their bounds, and a slice anywhere in a subscript list makes the whole
+  list a slice (`a[1:1][1]`). A subscripted jsonb target in an `INSERT` starts
+  from a jsonb NULL (`INSERT INTO t (j['x']) VALUES ('1')` stores
+  `{"x": 1}`).
+
+Row types:
+
+- Every table, partitioned table, foreign table, materialized view and view has
+  a row type named like the relation. `ROW(1, 'a')::orders`, `'(1,a)'::orders`,
+  `orders[]`, whole-row references (`SELECT o FROM orders o` has type
+  `orders`), routine parameters and results (`RETURNS SETOF orders`) and table
+  columns (`CREATE TABLE archive(o orders)`) behave as in PostgreSQL. A routine
+  or column using the row type blocks `DROP TABLE orders`; `CASCADE` drops the
+  routine or column. Comparing two composite values uses PostgreSQL's record
+  ordering, so `ROW(1, NULL)::orders = ROW(1, NULL)::orders` is true.
+- While a column uses the row type, `ALTER TABLE orders ADD COLUMN ... DEFAULT`
+  and `ALTER COLUMN ... TYPE` fail with `0A000` as in PostgreSQL. Dropping the
+  relation through `DROP SCHEMA ... CASCADE` or `DROP MATERIALIZED VIEW`, or a
+  `DROP FOREIGN TABLE ... CASCADE`, while another schema's column uses its row
+  type fails with `0A000` instead of dropping that column.
+- Values and columns of a view's row type are rejected with `0A000`; routine
+  signatures may name it.
+
 Functions and expressions:
+
+- `pg_get_expr`, `pg_get_constraintdef`, `pg_get_function_arguments` and
+  `pg_get_functiondef` print column defaults, CHECK constraints, parameter
+  defaults and `RETURN` bodies as PostgreSQL does: `DEFAULT 'x'` on a `text`
+  column is shown as `'x'::text`, and `CHECK (v <> '')` on a `varchar` column as
+  `CHECK (((v)::text <> ''::text))`. `pg_get_viewdef` uses PostgreSQL's
+  indented layout for views over plain tables joined with `ON`. Pretty output
+  (`pg_get_constraintdef(oid, true)`, as psql's `\d` uses) drops redundant
+  parentheses as PostgreSQL does. Expressions outside the deparser's typed
+  coverage and other views keep their stored spelling
+  (see [PLAN](../PLAN.md#close-application-compatibility-gaps)).
 
 - Named arguments and omitted defaults run in declared input order and share
   the caller's session, so a default calling `nextval('order_numbers')` updates
@@ -84,30 +202,93 @@ Functions and expressions:
   renames, schema moves, or new overloads; `nextval('order_numbers'::text)`
   looks the name up at each call.
 - A SQL function or procedure with a result must end with a `SELECT` or a
-  data-modifying statement with `RETURNING`. Otherwise `CREATE` fails with
-  `42P13` (`return type mismatch in function declared to return integer`);
-  with `check_function_bodies = off` the error comes from the first call.
+  data-modifying statement with `RETURNING` whose columns fit the declared
+  result. Otherwise `CREATE` fails with `42P13` (`return type mismatch in
+  function declared to return integer`) and PostgreSQL's detail, such as
+  `Final statement must return exactly one column.` for `RETURNS integer AS
+  'SELECT 1, 2'` or `Actual return type is text.` for `AS 'SELECT ''a''::text'`.
+  Conversions allowed in assignment pass (`SELECT 1::bigint` for `integer`).
+  With `check_function_bodies = off`, or with polymorphic arguments, the check
+  runs at the call and names the resolved type (`declared to return boolean`).
   Procedure output parameters take the final statement's first row.
   Transaction control in a quoted SQL body (`AS 'COMMIT'`) is stored, and a
   call that reaches it fails with `0A000`, as in PostgreSQL. A `BEGIN ATOMIC`
-  body accepts only queries, data changes and `CALL`; anything else fails at
-  `CREATE` (`0A000`, `COMMIT is not yet supported in unquoted SQL function
-  body`).
+  body accepts only queries and data changes; anything else, `CALL` included,
+  fails at `CREATE` (`0A000`, `COMMIT is not yet supported in unquoted SQL
+  function body`). A quoted SQL body cannot `CALL` a procedure with output
+  parameters (`0A000`, `calling procedures with output arguments is not
+  supported in SQL functions`).
+- PL/pgSQL `CALL` assigns output parameters to the variables written as
+  their arguments: `CALL doubled(x, y)` updates `x` and `y`, and a constant in
+  an output position fails with `42601` (`procedure parameter "b" is an output
+  parameter but corresponding argument is not writable`). `EXECUTE 'CALL ...'`
+  returns the outputs only through `INTO`. A called procedure may `COMMIT`
+  when every caller up to the top-level `CALL` or `DO` could; from a function,
+  an explicit transaction block, an exception block, or a `SECURITY DEFINER`
+  or `SET` procedure it fails with `2D000` (`invalid transaction
+  termination`). A trigger function may `CALL` a procedure; the call is
+  atomic, so its `COMMIT` fails with `2D000`. A trigger fired inside a write
+  (a BEFORE row trigger, or a deferred constraint trigger at `COMMIT`) can
+  call PL/pgSQL and SQL-language procedures. A SQL procedure called there
+  runs its queries, `INSERT`, `UPDATE`, `DELETE` and nested `CALL`
+  statements; any other statement in its body, such as `CREATE TABLE`, fails
+  with `0A000` (`a SQL procedure called during a write cannot run CREATE
+  TABLE`) where PostgreSQL runs it.
+- A procedure or `DO` block that waits for a lock or storage, before or after
+  its own `COMMIT`, continues at the waiting statement as in PostgreSQL. A
+  PL/pgSQL statement whose function call waits continues at that call,
+  including statements with several expressions (`FOR` bounds, `CASE`,
+  `RAISE` arguments and `USING` options, `IF ... ELSIF`, `ASSERT`, `CALL`
+  arguments, `EXECUTE` command and `USING` values): expressions that finished
+  before the wait are not evaluated again. For example, in
+  `FOR i IN next_batch()..last_batch() LOOP`, `next_batch()` runs once even
+  when `last_batch()` waits for a lock. A dynamic `EXECUTE` that writes rolls
+  back to its own start and evaluates its expressions again.
 - A built-in function cannot implement `CREATE CAST` or `CREATE OPERATOR`
   (`0A000`). Aggregate support functions can name supported built-ins.
-- A missing-function message that does not fit the fixed 192-byte error
-  message returns `54000`. This includes the signature that `DROP`, `ALTER`,
+- A missing-function message names the whole signature however long it is,
+  as PostgreSQL does, including the signature that `DROP`, `ALTER`,
   `COMMENT ON` and `GRANT` quote for a routine they cannot find, such as
-  `function f(integer) does not exist`.
-- Built-in functions cannot be changed: `ALTER FUNCTION lower(text) STABLE`,
-  `COMMENT ON FUNCTION lower(text)` and `GRANT EXECUTE ON FUNCTION
-  lower(text)` fail with `0A000`. Dropping one fails with `2BP01`, as in
-  PostgreSQL.
+  `function f(integer) does not exist`. Messages up to 100 arguments of
+  schema-qualified type names fit; a longer one fails with `54000`.
+- Each database has its own copy of a built-in function's catalog row, as in
+  PostgreSQL. `ALTER FUNCTION lower(text) STABLE` changes volatility,
+  `PARALLEL`, `LEAKPROOF`, `COST`, `ROWS` and `OWNER TO` in the current
+  database only; `pg_proc` shows the change, and a generated column or
+  publication row filter then rejects a function marked stable or volatile. `REVOKE EXECUTE ON FUNCTION md5(text) FROM PUBLIC` makes a
+  later `SELECT md5('a')` fail with `42501` for roles without a grant, and
+  `GRANT`, `has_function_privilege`, `proacl` and psql's `\df+` follow
+  PostgreSQL. Changes survive restart and are copied by `CREATE DATABASE ...
+  TEMPLATE`. Each changed routine uses one of the `max_builtin_routine_entries`
+  rows (default 64); running out fails with `54000`. Limits: changing
+  `STRICT`, `SECURITY` or `SET`/`RESET` settings of a built-in, and renaming
+  or moving one, fail with `0A000`, because pos3ql runs built-ins through
+  fixed implementations; a revoked `EXECUTE` is checked for function calls
+  but not for the function behind an operator (`1 + 1` still runs after
+  `REVOKE EXECUTE ON FUNCTION int4pl(integer, integer) FROM PUBLIC`).
+  Dropping a built-in fails with `2BP01`, as in PostgreSQL.
 - Array and `CASE` result types follow declarations, including subqueries and
   nulls: `ARRAY[(SELECT NULL::date)]` is `date[]`; mixing integer and bigint
   gives `bigint[]`; an empty constructor needs a type (`ARRAY[]::integer[]`).
   `pg_typeof(nextval('order_numbers'))` still issues one number. `OFFSET` is
   evaluated before `LIMIT`.
+- Polymorphic built-ins choose their argument types before running, as
+  PostgreSQL's parse analysis does. An untyped literal takes the type of the
+  other arguments: `array_append(ARRAY['2020-01-01'::date], '2020-01-02')`,
+  `greatest(1, '2')` and `int4range(1,5) @> '[2,3)'` work, and typed inputs
+  of `anycompatible` functions convert to one common type
+  (`array_replace(ARRAY[1], 1, 2.5)` is `numeric[]`). `timestamp + '1 day'`
+  adds an interval; `date + '1'` fails with `42725` (`operator is not unique`).
+- `DISTINCT`, `GROUP BY`, set operations and array search need a type's
+  default equality: `SELECT DISTINCT '(1,2)'::point` fails with `42883`
+  (`could not identify an equality operator for type point`), as for `xml`
+  and `json`, even though `box = box` (area equality) works.
+- `pg_sleep`, `pg_sleep_for` and `pg_sleep_until` do not hold the SQL worker:
+  the statement waits on a timer (`pg_stat_activity` shows `Timeout` /
+  `PgSleep`) while other connections run, and resumes without repeating work
+  it already did, so `SELECT nextval('s'), pg_sleep(1), nextval('s')` returns
+  consecutive numbers. `statement_timeout` and a cancel request end the wait
+  with `57014`.
 - Enum literals are checked before rows are chosen: `'missing'::order_status`
   raises `22P02` even in an unused `CASE` arm, while
   `'missing'::text::order_status` converts only when run.
@@ -117,6 +298,13 @@ Functions and expressions:
   fails with `22023`.
 - An unmatched PL/pgSQL `CASE` without `ELSE` raises `20000` (`case not found`,
   hint `CASE statement is missing ELSE part.`).
+- PL/pgSQL bound cursors (`c [NO] [SCROLL] CURSOR [(lo int, hi int)] FOR
+  query` in `DECLARE`) open with `OPEN c` or `OPEN c(2, hi := 3)`; arguments
+  convert to their declared types and the query reads them by name. As in
+  PostgreSQL 18 the variable stays NULL until `OPEN` names the portal, and
+  argument mistakes fail with `42601` when the routine is created.
+  `FOR rec IN c LOOP` over a bound cursor is rejected with `0A000`; open the
+  cursor and `FETCH` in a `LOOP` instead.
 - User error codes such as `PZ001` behave as ordinary errors: `WHEN SQLSTATE
   'PZ001'`, `'PZ000'` (category match), or `WHEN OTHERS` catch them.
 - `pg_input_is_valid` and `pg_input_error_info` report invalid values, but an
@@ -141,6 +329,19 @@ Domains and checked inputs:
   integer parameter fails at Bind. `PREPARE saved AS SELECT
   '{paid}'::checked_status[]` checks the literal once at `PREPARE`;
   `ARRAY['paid']::checked_status[]` checks when executed.
+- `PREPARE` types every parameter as PostgreSQL does: declared types first,
+  then the type its use selects. `PREPARE q AS SELECT round($1)` records
+  `double precision` in `pg_prepared_statements`, so `EXECUTE q(2.5)` returns
+  2. A parameter that is never used (`SELECT $2::int` leaves `$1` unused) or
+  only passed where any type is accepted (`pg_typeof($1)`) fails with `42P18`;
+  an otherwise untyped one is `text`. User-defined types are recorded exactly:
+  `PREPARE q(positive)` and `PREPARE q AS SELECT $1::mood` list `positive`
+  and `mood`. `EXECUTE` converts each argument with PostgreSQL's assignment
+  rules, so `EXECUTE q(2.7)` passes 3 to an integer domain and
+  `EXECUTE q('happy'::text)` fails with `42804` (`parameter $1 of type text
+  cannot be coerced to the expected type mood`). A protocol Parse fixes its
+  parameter types and reports an undeterminable one with `42P18` at Parse;
+  later Bind and Describe messages reuse those types.
 - SQL functions are validated at `CREATE`, then each backend checks and keeps
   the first call's inputs for that definition and argument types. PL/pgSQL keeps
   one instance per resolved argument types and collation. Views, rules,
@@ -173,7 +374,7 @@ PostgreSQL). Current `0A000` messages:
 
 | Message | Example cause |
 |---|---|
-| `expression wait requires an owned invocation log` | A wait inside an assignment, `RETURN`, loop bound, or message expression of a PL/pgSQL function running in retained AFTER-trigger work |
+| `expression wait requires an owned invocation log` | A routine call that waits inside an expression that no saved statement owns, such as a SQL-language function body replayed by its caller in retained AFTER-trigger work |
 | `SQL row expression requires retained write progress` | A multirow UPDATE that changes one row, then calls a function for the next row that must wait |
 | `expression restart requires owned volatile values` | Restarting would repeat an unsaved `random()` or clock value |
 
@@ -254,13 +455,14 @@ why none of these numbers is a throughput rate.
 | LIST partition bounds, inheritance parents, trigger arguments, routine configuration entries | 64 each | named error |
 | Constraint and other catalog creation numbers (statistics, extensions, FDW objects, publications, subscriptions) | 1–9,999,999 | `54000` |
 | Stored default expression, including saved display text | 120 bytes | `54000` |
-| Identifier length | 63 bytes | `42622` (PostgreSQL truncates with a notice instead) |
+| Identifier length | 63 bytes | Truncated at a character boundary with PostgreSQL's `NOTICE` (`42622`) |
 | `search_path` | 128 bytes | `22023` |
 | `application_name` after PostgreSQL's [ASCII cleaning](https://github.com/postgres/postgres/blob/REL_18_6/src/common/string.c#L81) (`\xhh` escapes) | 64 bytes | `22023`, prior value kept |
 | Connection startup option word | 256 bytes | `54000` |
 | Timeout settings | 2,147,483,647 ms | `22023`; enabling a disabled-only timeout is `0A000` |
 | Simultaneously tracked function calls (`track_functions`) per SQL worker | 1,024 | `54000` |
-| Missing-function error text | 192 bytes | `54000` |
+| Error message text, including a `RAISE` message | 27,824 bytes | `54000` |
+| `RAISE ... USING DETAIL` or `HINT` text | 12,288 bytes each | `54000` |
 | Transaction identities and command counters | 32-bit, checked | `54000` before reuse |
 | JSON nesting / jsonpath depth | 1,000 / 128 | see [SQL/JSON](sql-json.md) |
 | XML nesting, XPath work, constructor output | see [SQL/XML](sql-xml.md) | program-limit error |
@@ -274,7 +476,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 
 | Setting(s) | Bounds |
 |---|---|
-| `sql_arena_bytes` (per-connection statement memory), `work_arena_bytes` (per query workspace, like PostgreSQL's `work_mem`) | Row images, joins, lists, programs, JSON/XML work, table-function rows, sorts and aggregates, retained scan/COPY/validation records (32 bytes per resident row) |
+| `sql_arena_bytes` (per-connection statement memory), `work_arena_bytes` (per query workspace; see [`work_mem`](#work_mem)) | Row images, joins, lists, programs, JSON/XML work, table-function rows, sorts and aggregates, retained scan/COPY/validation records (32 bytes per resident row) |
 | `max_tables`, `max_extended_statistics`, other catalog `max_*` | One capacity per catalog family; omitting `max_extended_statistics` derives it from `max_tables`, so set it explicitly |
 | `max_connections`, `max_prepared_transactions`, `max_subscriptions` | Transaction identity registry has `max_connections + max_prepared_transactions` entries |
 | `max_catalog_versions_per_object`, `max_ddl_per_transaction` | Retained definition/undo versions. Enum label images use `max_enums + P` slots, `P = min(max_enums * max_catalog_versions_per_object, (max_connections + max_prepared_transactions + max_subscriptions) * max_ddl_per_transaction)`, each holding `max_enum_labels_per_type` labels |
@@ -289,8 +491,10 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | `routine_input_slots` | Per-backend routine plan instances |
 | `max_prepared`, `prepared_bytes` | Prepared statements per namespace and bytes per statement, shared with bound portals |
 | `cursor_bytes`, `cursor_query_bytes` | See [cursors](#cursor-capacity) |
-| `conn_send_buffer_bytes`, `result_spool_bytes`, `result_spool_leases` | Result output: the send buffer, then rows queued in the shared spool for a slow client (a private reserve of the send-buffer size holds closing messages). Only a client lagging by more than the spool gets `54000`; the largest single message must fit the send buffer. A paged portal (`Execute` with a row limit) still buffers its result in `portal_result_bytes` |
-| `result_stream_bytes` (required; starter 256 KiB, minimum 64 KiB) | Per-connection read position of a large single-table `SELECT` that resumes row by row; a larger estimate spools the result instead, and a stream that still outgrows it fails with `54000` naming the setting |
+| `conn_send_buffer_bytes`, `result_spool_bytes`, `result_spool_leases` | Result output: the send buffer, then rows queued in the shared spool for a slow client (a private reserve of the send-buffer size holds closing messages). Only a client lagging by more than the spool gets `54000`; the largest single message must fit the send buffer. A paged portal (`Execute` with a row limit) that cannot stream (another shape, or suspended portals hold every `result_stream_slots` stream) buffers its result in `portal_result_bytes` and fails with `54000` naming it when full |
+| `plan_build_bytes`, `plan_build_leases` (required; starter 16 MiB and 64) | Shared build sides of streamed sorts and streamed or cursor-read hash joins; a build that does not fit runs the statement as it ran without streaming (the result spools; a cursor saves its rows at `DECLARE`) |
+| `result_stream_bytes` (required; starter 256 KiB, minimum 64 KiB) | Read position of each large `SELECT` from one table, builtin set-returning functions or a join of them that resumes row by row, including a paged portal between its `Execute` messages; a larger estimate, or a stream that outgrows it while opening, spools the result instead; a stream that outgrows it after its first row fails with `54000` naming the setting |
+| `result_stream_slots` (required; starter 2, at least 1) | Result streams per connection: one running statement plus suspended paged portals. A paged portal opened while every slot is held buffers in `portal_result_bytes` |
 | `txn_rows`, `copy_transition_bytes` (256 KiB default) | Streamed COPY statement-trigger inputs per connection |
 | `commit_queue_slots` | Commits waiting for durability |
 | `memtable_bytes` (≤ `u32::MAX`) | Two heap buffers are reserved; reclamation returns `54000` while both are retained |
@@ -302,6 +506,22 @@ sources, 64 point-read sources, and 64 copied point reads. At 85% heap use,
 writing commands wait for cache reclamation before taking effect; reads,
 commits, and cancellation proceed.
 
+### `work_mem`
+
+PostgreSQL's `work_mem` is a per-session hint: how much memory a sort or hash
+may use before it spills to temporary files. It never changes query results.
+pos3ql accepts and reports it exactly like PostgreSQL 18, with the same units
+(`B`, `kB`, `MB`, `GB`, `TB`), rounding, range (64 kB to 2,147,483,647 kB),
+default (`4MB`), errors, `SHOW`, `pg_settings` row and routine `SET` clause.
+For example, `CREATE PROCEDURE nightly() ... SET work_mem = '256MB'` works,
+and `SHOW work_mem` inside it reports `256MB`.
+
+The value does not size memory in pos3ql. Each query runs in a workspace of
+`work_arena_bytes`, fixed at startup, and pos3ql never spills to temporary
+files: a sort, grouping or hash table that outgrows the workspace fails with
+`54000` whatever `work_mem` says. Raise `work_arena_bytes` in the configuration
+file and restart to let larger sorts run.
+
 ### Cursor capacity
 
 Each cursor reserves `cursor_bytes` for rows, `cursor_query_bytes` for its query,
@@ -310,13 +530,21 @@ description, and `floor(cursor_bytes / 6)` row positions. Each saved row costs
 its data plus six bytes. Long column names can fill the description even when
 rows fit; raising `cursor_bytes` does not help there.
 
-- `NO SCROLL`: `cursor_bytes` bounds one fetched batch and is reused.
-- `SCROLL`: every visited row stays in `cursor_bytes`, so history can exhaust it.
-  When revisited rows are evaluated again, the history holds each row's input
+- `NO SCROLL` (and forward-only by shape): a top-level forward `FETCH n` or
+  `FETCH ALL` from a cursor that reads as you fetch streams its rows to the
+  client without saving them, so any count works; other fetches, such as a
+  `FETCH` inside a routine, `RELATIVE`/`ABSOLUTE` or one over a row-locking
+  cursor, buffer one batch in `cursor_bytes`, which is reused.
+- `SCROLL` without volatile functions, unordered and not locking: only the
+  current fetch's rows stay in `cursor_bytes`; a top-level forward fetch
+  streams, and moving back reads the input again from its first row.
+- Other `SCROLL` cursors keep every visited row in `cursor_bytes`, so history
+  can exhaust it. When revisited rows are evaluated again, the history holds each row's input
   columns plus 17 bytes of row identity, and a volatile filter adds the rows it
   rejected; the current fetch's output shares the same bytes.
-- Ordered row-locking cursors save every qualifying row's input columns (plus
-  17 bytes) at the first `FETCH`.
+- Ordered cursors save every qualifying row's input columns (plus 17 bytes)
+  at the first `FETCH`: the columns the query reads, or every column of a
+  row-locking cursor.
 - `WITH HOLD`: the unread suffix (plus history when scrolling) must fit; a
   scrollable cursor whose rows are evaluated again saves its whole result.
 

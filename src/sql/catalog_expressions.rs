@@ -21,8 +21,13 @@ struct Site {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum Kind {
+pub(crate) enum Kind<'t> {
     Expression,
+    /// An expression whose value is assigned to the given type: a column
+    /// default. PostgreSQL prints its literals in that type.
+    Assignment(i32),
+    /// Routine parameter defaults, each assigned to its parameter's type.
+    AssignmentList(&'t [i32]),
     List,
     Partition,
     Query,
@@ -73,7 +78,10 @@ pub(super) fn current<'a>(
             let source = super::view_rows::string(row[position])?;
             let (relation, kind) = match (table.def.name.as_str(), column.name.as_str()) {
                 ("pg_constraint", "conbin") => (Some("conrelid"), Kind::Expression),
-                ("pg_attrdef", "adbin") => (Some("adrelid"), Kind::Expression),
+                ("pg_attrdef", "adbin") => (
+                    Some("adrelid"),
+                    default_destination(storage, transaction, &table, row, arena)?,
+                ),
                 ("pg_index", "indpred") => (Some("indrelid"), Kind::Expression),
                 ("pg_index", "indexprs") => (Some("indrelid"), Kind::List),
                 ("pg_statistic_ext", "stxexprs") => (Some("stxrelid"), Kind::List),
@@ -82,8 +90,11 @@ pub(super) fn current<'a>(
                 ("pg_trigger", "tgqual") => (Some("tgrelid"), Kind::Expression),
                 ("pg_partitioned_table", "partexprs") => (Some("partrelid"), Kind::List),
                 ("pg_class", "relpartbound") => (None, Kind::Partition),
-                ("pg_type", "typdefaultbin") => (None, Kind::Expression),
-                ("pg_proc", "proargdefaults") => (None, Kind::List),
+                ("pg_type", "typdefaultbin") => (None, domain_default_destination(&table, row)?),
+                ("pg_proc", "proargdefaults") => (
+                    None,
+                    parameter_default_destinations(storage, transaction, &table, row, arena)?,
+                ),
                 ("pg_proc", "prosqlbody") => (None, Kind::Query),
                 _ => {
                     return Err(sql_err!(
@@ -214,11 +225,11 @@ pub(crate) fn bind<'a>(
     }
     let source = arena.alloc_str(source).map_err(|_| arena_full())?;
     let (parsed_source, columns, prefix) = match kind {
-        Kind::Expression => {
+        Kind::Expression | Kind::Assignment(_) => {
             let (_, columns) = parser::parse_expr_with_column_sources(source, arena)?;
             (source, columns, 0)
         }
-        Kind::List => {
+        Kind::List | Kind::AssignmentList(_) => {
             let query = arena
                 .alloc_str_display(format_args!("SELECT {source}"))
                 .map_err(|_| arena_full())?;
@@ -329,15 +340,22 @@ fn encode<'a>(
             ));
         }
     }
-    writeln!(
-        output,
-        "{}\n{count}",
-        if matches!(kind, Kind::List) {
-            "list"
-        } else {
-            "expression"
+    match kind {
+        Kind::List => writeln!(output, "list\n{count}"),
+        Kind::AssignmentList(types) => {
+            let mut result = write!(output, "list");
+            for (index, type_oid) in types.iter().enumerate() {
+                result = result.and_then(|()| {
+                    write!(output, "{}{type_oid}", if index == 0 { " " } else { "," })
+                });
+            }
+            result.and_then(|()| writeln!(output, "\n{count}"))
         }
-    )
+        Kind::Assignment(type_oid) => writeln!(output, "assignment {type_oid}\n{count}"),
+        Kind::Expression | Kind::Partition | Kind::Query => {
+            writeln!(output, "expression\n{count}")
+        }
+    }
     .map_err(|_| arena_full())?;
     for site in &sites[..count] {
         writeln!(output, "{},{},{}", site.start, site.end, site.column)
@@ -374,9 +392,24 @@ pub(super) fn deparse<'a>(
         )
     })?;
     let (kind, rest) = body.split_once('\n').ok_or_else(corrupt)?;
-    if !matches!(kind, "expression" | "list" | "partition" | "query") {
-        return Err(corrupt());
-    }
+    let destination = match kind.strip_prefix("assignment ") {
+        Some(type_oid) => Some(type_oid.parse::<i32>().map_err(|_| corrupt())?),
+        None if matches!(kind, "expression" | "list" | "partition" | "query")
+            || kind.starts_with("list ") =>
+        {
+            None
+        }
+        None => return Err(corrupt()),
+    };
+    let list_destinations = kind.strip_prefix("list ");
+    let kind = if destination.is_some() {
+        "expression"
+    } else if list_destinations.is_some() {
+        "list"
+    } else {
+        kind
+    };
+    let mut list_destinations = list_destinations.map(|types| types.split(','));
     let (count, mut rest) = rest.split_once('\n').ok_or_else(corrupt)?;
     let count = count.parse::<usize>().map_err(|_| corrupt())?;
     if count > rest.len() {
@@ -494,11 +527,40 @@ pub(super) fn deparse<'a>(
                 if start != 0 {
                     display.write_str(", ").map_err(|_| arena_full())?;
                 }
-                display
-                    .write_str(super::super::enum_values::checks::canonical_display(
-                        &source[start..lexer.token_start()],
+                let element = &source[start..lexer.token_start()];
+                let destination = match list_destinations.as_mut() {
+                    Some(types) => Some(
+                        types
+                            .next()
+                            .ok_or_else(corrupt)?
+                            .parse::<i32>()
+                            .map_err(|_| corrupt())?,
+                    ),
+                    None => None,
+                };
+                let deparsed = match destination {
+                    Some(type_oid) if !pretty => super::deparse::deparse(
+                        &super::deparse::Context {
+                            storage,
+                            txid: transaction,
+                            table: None,
+                            parameters: &[],
+                            joined: &[],
+                            pretty: false,
+                        },
+                        element,
+                        super::deparse::Destination::Assignment(type_oid),
                         arena,
-                    )?)
+                    )?,
+                    _ => None,
+                };
+                display
+                    .write_str(match deparsed {
+                        Some(deparsed) => deparsed,
+                        None => {
+                            super::super::enum_values::checks::canonical_display(element, arena)?
+                        }
+                    })
                     .map_err(|_| arena_full())?;
                 start = lexer.token_end();
             }
@@ -507,6 +569,24 @@ pub(super) fn deparse<'a>(
             }
         }
         return Ok(Some(display.as_str()));
+    }
+    {
+        let table = slot.map(|slot| storage.table_def(slot, transaction));
+        let context = super::deparse::Context {
+            storage,
+            txid: transaction,
+            table: table.as_deref(),
+            parameters: &[],
+            joined: &[],
+            pretty,
+        };
+        let destination = match destination {
+            Some(type_oid) => super::deparse::Destination::Assignment(type_oid),
+            None => super::deparse::Destination::Condition,
+        };
+        if let Some(deparsed) = super::deparse::deparse(&context, source, destination, arena)? {
+            return Ok(Some(deparsed));
+        }
     }
     let display = super::super::enum_values::checks::canonical_display(source, arena)?;
     let expression = parser::parse_expr(source, arena)?;
@@ -517,4 +597,107 @@ pub(super) fn deparse<'a>(
             display
         },
     ))
+}
+
+/// A column default is assigned to its column's declared type: a table
+/// column's stored type, or a view column's described output type.
+fn default_destination(
+    storage: &Storage,
+    transaction: u32,
+    table: &SynthTable<'_>,
+    row: &[Datum<'_>],
+    arena: &Arena,
+) -> Result<Kind<'static>, SqlError> {
+    let field = |name: &str| {
+        table
+            .def
+            .column_index(name)
+            .map(|index| super::view_rows::integer(row[index]))
+            .transpose()
+    };
+    let (Some(relation), Some(number)) = (field("adrelid")?, field("adnum")?) else {
+        return Err(unresolved_default());
+    };
+    let attribute = usize::try_from(number)
+        .ok()
+        .and_then(|number| number.checked_sub(1))
+        .ok_or_else(unresolved_default)?;
+    if let Some(slot) = (0..storage.table_count()).find(|&slot| {
+        storage.table_slot_visible_to(slot, transaction)
+            && super::user_table_oid(storage, slot) == relation
+    }) {
+        let definition = storage.table_def(slot, transaction);
+        let column = u16::try_from(number)
+            .ok()
+            .and_then(|number| definition.attribute_column(number))
+            .ok_or_else(unresolved_default)?;
+        return Ok(Kind::Assignment(super::catalog_column_type_oid(
+            storage,
+            &definition.columns()[column],
+            transaction,
+        )?));
+    }
+    let view = storage
+        .views_visible_to(transaction)
+        .find_map(|(slot, view)| (super::view_oid(storage, slot) == relation).then_some(view))
+        .ok_or_else(unresolved_default)?;
+    let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
+    let count = super::describe_view(storage, transaction, &view, arena, &mut columns)?;
+    columns[..count]
+        .get(attribute)
+        .map(|column| Kind::Assignment(column.type_oid))
+        .ok_or_else(unresolved_default)
+}
+
+/// A domain default is assigned to the domain's base type.
+fn domain_default_destination(
+    table: &SynthTable<'_>,
+    row: &[Datum<'_>],
+) -> Result<Kind<'static>, SqlError> {
+    let base = table
+        .def
+        .column_index("typbasetype")
+        .map(|index| super::view_rows::integer(row[index]))
+        .transpose()?
+        .filter(|base| *base != 0)
+        .ok_or_else(unresolved_default)?;
+    Ok(Kind::Assignment(base))
+}
+
+fn unresolved_default() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "catalog default does not name a visible column"
+    )
+}
+
+/// The types of a stored routine's defaulted parameters, in order.
+fn parameter_default_destinations<'a>(
+    storage: &Storage,
+    transaction: u32,
+    table: &SynthTable<'_>,
+    row: &[Datum<'_>],
+    arena: &'a Arena,
+) -> Result<Kind<'a>, SqlError> {
+    let Some(index) = table.def.column_index("oid") else {
+        return Ok(Kind::List);
+    };
+    let oid = super::view_rows::integer(row[index])?;
+    let Some(slot) = storage.routine_slot_by_oid(oid, transaction) else {
+        return Ok(Kind::List);
+    };
+    let routine = storage.routine_for(slot, transaction);
+    let mut types = crate::mem::arena::ArenaList::new(arena);
+    for parameter in routine.parameters() {
+        if parameter.mode.default().is_none() {
+            continue;
+        }
+        let Some(type_oid) =
+            storage.routine_type_oid(parameter.ctype, parameter.user_type, transaction)
+        else {
+            return Ok(Kind::List);
+        };
+        types.push(type_oid).map_err(|_| arena_full())?;
+    }
+    Ok(Kind::AssignmentList(types.as_slice()))
 }

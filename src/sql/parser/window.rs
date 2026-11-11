@@ -109,10 +109,16 @@ impl<'a> Parser<'a> {
         }
         Err(ParseError {
             at: self.peek_at,
-            message: stack_format!(96, "window \"{}\" does not exist", name),
+            message: stack_format!(
+                super::PARSE_MESSAGE_BYTES,
+                "window \"{}\" does not exist",
+                name
+            ),
             sqlstate: sqlstate::UNDEFINED_OBJECT,
             cursor: None,
             hint: None,
+            near: None,
+            detail: None,
         })
     }
 
@@ -138,10 +144,16 @@ impl<'a> Parser<'a> {
             if self.named_window(name).is_ok() {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "window \"{}\" is already defined", name),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "window \"{}\" is already defined",
+                        name
+                    ),
                     sqlstate: sqlstate::WINDOWING_ERROR,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
             self.expect_ident("as")?;
@@ -161,22 +173,20 @@ impl<'a> Parser<'a> {
     /// existing window name to copy, then PARTITION BY / ORDER BY / frame.
     pub(super) fn window_spec_body(&mut self) -> Result<WindowSpec<'a>, ParseError> {
         // A leading identifier that is not one of the clause keywords names an
-        // existing window to copy, as in `OVER (w ORDER BY x)`.
+        // existing window to copy, as in `OVER (w ORDER BY x)`. PostgreSQL
+        // resolves the name only after parsing, so `OVER (exclude current
+        // row)` is a syntax error at `current`, while a well-formed body
+        // naming no window reports the missing window.
         let copied = match self.peeked {
-            // `exclude` is not a window name either: it only follows a frame,
-            // so a leading one is the syntax error PostgreSQL reports.
             Tok::Ident(name)
-                if !matches!(
-                    name,
-                    "partition" | "order" | "rows" | "range" | "groups" | "exclude"
-                ) =>
+                if !matches!(name, "partition" | "order" | "rows" | "range" | "groups") =>
             {
                 self.advance()?;
-                Some((name, *self.named_window(name)?))
+                Some((name, self.named_window(name).copied()))
             }
             Tok::QuotedIdent(name) => {
                 self.advance()?;
-                Some((name, *self.named_window(name)?))
+                Some((name, self.named_window(name).copied()))
             }
             _ => None,
         };
@@ -272,6 +282,10 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect_op(")")?;
+        let copied = match copied {
+            Some((name, base)) => Some((name, base?)),
+            None => None,
+        };
         let Some((name, base)) = copied else {
             return Ok(WindowSpec {
                 partition_by,
@@ -285,39 +299,45 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "cannot override PARTITION BY clause of window \"{}\"",
                     name
                 ),
                 sqlstate: sqlstate::WINDOWING_ERROR,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         if !base.order_by.is_empty() && !order_by.is_empty() {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "cannot override ORDER BY clause of window \"{}\"",
                     name
                 ),
                 sqlstate: sqlstate::WINDOWING_ERROR,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         if base.frame.is_some() {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "cannot copy window \"{}\" because it has a frame clause",
                     name
                 ),
                 sqlstate: sqlstate::WINDOWING_ERROR,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         Ok(WindowSpec {

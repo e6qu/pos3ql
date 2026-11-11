@@ -336,10 +336,10 @@ pub(super) fn rule_definition<'a>(
     let mut body = crate::sql::array::elements(raw, element);
     let condition = body.next().expect("body condition was counted");
     let actions = crate::sql::array::len(raw) - 1;
-    if pretty && (condition != Datum::Null || actions != 0) {
+    if pretty && actions != 0 {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "pretty formatting of rewrite rule conditions or actions is not supported"
+            "pretty formatting of rewrite rule actions is not supported"
         ));
     }
     let mut output = StackStr::<{ crate::storage::RULE_SQL_MAX + 512 }>::new();
@@ -354,7 +354,51 @@ pub(super) fn rule_definition<'a>(
     match condition {
         Datum::Null => {}
         value => {
-            let _ = write!(output, " WHERE ({})", string(value)?);
+            // `NEW` and `OLD` name the rule relation's row in the condition.
+            let source = string(value)?;
+            let table = match crate::sql::query::privilege_relation(
+                storage,
+                transaction,
+                PrivilegeRelation::Oid(relation_oid),
+            )? {
+                Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                    Some(storage.table_def(slot, transaction))
+                }
+                _ => None,
+            };
+            let deparsed = match table.as_deref() {
+                Some(definition) => {
+                    let joined = [("new", definition), ("old", definition)];
+                    super::deparse::deparse(
+                        &super::deparse::Context {
+                            storage,
+                            txid: transaction,
+                            table: Some(definition),
+                            parameters: &[],
+                            joined: &joined,
+                            pretty,
+                        },
+                        source,
+                        super::deparse::Destination::Condition,
+                        arena,
+                    )?
+                }
+                None => None,
+            };
+            match deparsed {
+                Some(condition) => {
+                    let _ = write!(output, "\n   WHERE {condition}");
+                }
+                None if pretty => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "pretty formatting of this rewrite rule condition is not supported"
+                    ));
+                }
+                None => {
+                    let _ = write!(output, "\n   WHERE ({source})");
+                }
+            }
         }
     }
     let _ = write!(

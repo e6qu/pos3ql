@@ -16,7 +16,7 @@ use crate::sql_err;
 
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, cast_to, compare_datums, eval_full,
-    load_array, sqlstate, text_arg, text_view, type_mismatch, unify_arr_elem,
+    load_array, sqlstate, text_arg, text_view,
 };
 
 /// Compatible-array declarations promote PostgreSQL's catalog vectors to
@@ -30,6 +30,179 @@ fn compatible_array_input<'a>(
         Datum::OidVector { .. } => cast_to(value, ColType::Array(ArrElem::Oid), arena),
         _ => Ok(value),
     }
+}
+
+/// How one argument takes part in an `anycompatible` call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompatibleRole {
+    Array,
+    Element,
+}
+
+/// The `anycompatible` roles of the array built-ins' inputs, as declared in
+/// PostgreSQL 18.6 `pg_proc`.
+fn compatible_roles(name: &str) -> Option<&'static [CompatibleRole]> {
+    use CompatibleRole::{Array, Element};
+    Some(match name {
+        "array_append" | "array_remove" | "array_position" | "array_positions" => &[Array, Element],
+        "array_prepend" => &[Element, Array],
+        "array_cat" => &[Array, Array],
+        "array_replace" => &[Array, Element, Element],
+        _ => return None,
+    })
+}
+
+/// Resolves an `anycompatible` call as PostgreSQL's parse analysis does: the
+/// common element type comes from the inputs' declared types, untyped literals
+/// read their text as that type, and typed inputs convert implicitly. The
+/// values in `values` are replaced by their coerced forms; the common element
+/// is returned.
+pub(crate) fn coerce_compatible_arguments<'a>(
+    name: &str,
+    roles: &[CompatibleRole],
+    args: &[&Expr<'a>],
+    values: &mut [Datum<'a>],
+    arena: &'a crate::mem::arena::Arena,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<ArrElem, SqlError> {
+    let mut inputs = [(false, 0); 3];
+    for (index, role) in roles.iter().enumerate() {
+        inputs[index] = (
+            *role == CompatibleRole::Array,
+            super::super::expression_type_identity(args[index], row, hooks)?.routine_argument_oid(),
+        );
+    }
+    let inputs = &inputs[..roles.len()];
+    let element_oid = if inputs
+        .iter()
+        .all(|(_, oid)| *oid == crate::sql::types::oid::UNKNOWN)
+    {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "could not determine polymorphic type anycompatible because input has type unknown"
+        ));
+    } else {
+        match hooks.catalog {
+            Some(catalog) => catalog.compatible_element_oid(inputs),
+            None => crate::storage::builtin_compatible_element_oid(inputs),
+        }
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function {} does not exist",
+                name
+            )
+        })?
+    };
+    let element = hooks
+        .catalog
+        .and_then(|catalog| catalog.domain_base_type(element_oid))
+        .or_else(|| ColType::from_oid(element_oid))
+        .and_then(ArrElem::from_coltype)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{} does not support element type {}",
+                name,
+                element_oid
+            )
+        })?;
+    for (index, (array, input_oid)) in inputs.iter().enumerate() {
+        let value = values[index];
+        if value.is_null() {
+            continue;
+        }
+        let target = if *array {
+            ColType::Array(element)
+        } else {
+            element.to_coltype()
+        };
+        values[index] = if *input_oid == crate::sql::types::oid::UNKNOWN && element.is_named() {
+            let catalog = hooks.catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "{} named argument types require a catalog",
+                    name
+                )
+            })?;
+            let element_name = catalog.type_name(element_oid, arena)?.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "{} argument type no longer exists",
+                    name
+                )
+            })?;
+            let type_name = if *array {
+                let mut written = crate::util::StackStr::<264>::new();
+                use core::fmt::Write as _;
+                write!(written, "{element_name}[]").map_err(|_| arena_full())?;
+                arena
+                    .alloc_str(written.as_str())
+                    .map_err(|_| arena_full())?
+            } else {
+                element_name
+            };
+            catalog
+                .cast_user_type(type_name, value, arena, hooks.sequences)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "{} argument type no longer exists",
+                        name
+                    )
+                })?
+        } else {
+            let value = compatible_array_input(value, arena)?;
+            match value {
+                Datum::Array {
+                    element: actual, ..
+                } if *array && actual == element => value,
+                _ if !*array && ArrElem::from_datum(&value) == Some(element) => value,
+                _ => cast_to(value, target, arena)?,
+            }
+        };
+    }
+    Ok(element)
+}
+
+/// The common type that PostgreSQL's `select_common_type` gives the inputs of
+/// `COALESCE`, `GREATEST` and `LEAST`, or `None` when it is a catalog-defined
+/// type or the typed inputs have none (their comparison reports the mismatch).
+/// Untyped literals alone resolve to `text`. Returns each input's declared
+/// type alongside, so callers convert exactly the untyped ones.
+pub(crate) fn common_argument_type<'a>(
+    args: &[&Expr<'a>],
+    arena: &'a crate::mem::arena::Arena,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(Option<ColType>, &'a [i32]), SqlError> {
+    let inputs = arena
+        .alloc_slice_with(args.len(), |_| (false, crate::sql::types::oid::UNKNOWN))
+        .map_err(|_| arena_full())?;
+    for (input, argument) in inputs.iter_mut().zip(args) {
+        input.1 =
+            super::super::expression_type_identity(argument, row, hooks)?.routine_argument_oid();
+    }
+    let declared = arena
+        .alloc_slice_with(args.len(), |index| inputs[index].1)
+        .map_err(|_| arena_full())?;
+    if declared
+        .iter()
+        .all(|oid| *oid == crate::sql::types::oid::UNKNOWN)
+    {
+        return Ok((Some(ColType::Text), declared));
+    }
+    let common = match hooks.catalog {
+        Some(catalog) => catalog.compatible_element_oid(inputs),
+        None => crate::storage::builtin_compatible_element_oid(inputs),
+    };
+    Ok((
+        common
+            .filter(|oid| crate::storage::NamedTypeKind::from_oid(*oid).is_none())
+            .and_then(ColType::from_oid),
+        declared,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -165,7 +338,7 @@ fn vector_bounds<'a>(
         Datum::Int4(value) => value as i64,
         Datum::Int8(value) => value,
         Datum::Null => return Ok(Datum::Null),
-        value => return Err(type_mismatch("array dimension must be an integer", &value)),
+        value => return Err(crate::sql::eval::function_argument_mismatch(name, &value)),
     };
     if dimension != 1 {
         return Ok(Datum::Null);
@@ -210,6 +383,10 @@ pub(crate) fn dispatch<'a>(
                 | "array_to_string"
                 | "array_fill"
                 | "string_to_array"
+                | "array_reverse"
+                | "array_sort"
+                | "array_sample"
+                | "array_shuffle"
         )
     {
         return None;
@@ -280,10 +457,7 @@ pub(crate) fn dispatch<'a>(
                 let (Datum::Array { element: left, .. }, Datum::Array { element: right, .. }) =
                     (values[0], values[1])
                 else {
-                    return Err(type_mismatch(
-                        "array comparison requires arrays",
-                        &values[0],
-                    ));
+                    return Err(crate::sql::eval::operand_type_mismatch(&values[0]));
                 };
                 if left != right {
                     return Err(arity_err(name, args.len()));
@@ -319,9 +493,8 @@ pub(crate) fn dispatch<'a>(
                             Datum::Int8(value) => value,
                             Datum::Null => return Ok(Datum::Null),
                             value => {
-                                return Err(type_mismatch(
-                                    "array dimension must be an integer",
-                                    &value,
+                                return Err(crate::sql::eval::function_argument_mismatch(
+                                    name, &value,
                                 ));
                             }
                         };
@@ -357,7 +530,10 @@ pub(crate) fn dispatch<'a>(
                         hooks,
                     ),
                     Datum::Null => Ok(Datum::Null),
-                    _ => Err(type_mismatch("array_length requires an array", &a)),
+                    _ => Err(crate::sql::eval::function_argument_mismatch(
+                        "array_length",
+                        &a,
+                    )),
                 }
             }
             "array_position" => {
@@ -370,13 +546,29 @@ pub(crate) fn dispatch<'a>(
                         if star { 1 } else { args.len() }
                     ));
                 }
-                let a =
-                    compatible_array_input(eval_full(args[0], arena, params, row, hooks)?, arena)?;
-                let target = eval_full(args[1], arena, params, row, hooks)?;
+                let mut values = [
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    eval_full(args[1], arena, params, row, hooks)?,
+                ];
+                coerce_compatible_arguments(
+                    name,
+                    compatible_roles(name).expect("compatible array function"),
+                    args,
+                    &mut values,
+                    arena,
+                    row,
+                    hooks,
+                )?;
+                let [a, target] = values;
                 let (element, raw) = match a {
                     Datum::Array { element, raw } => (element, raw),
                     Datum::Null => return Ok(Datum::Null),
-                    _ => return Err(type_mismatch("array_position requires an array", &a)),
+                    _ => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "array_position",
+                            &a,
+                        ));
+                    }
                 };
                 let shape = array::shape(raw).expect("array datum invariant");
                 if shape.dimension_count() > 1 {
@@ -399,8 +591,8 @@ pub(crate) fn dispatch<'a>(
                             ));
                         }
                         value => {
-                            return Err(type_mismatch(
-                                "array_position initial position must be an integer",
+                            return Err(crate::sql::eval::function_argument_mismatch(
+                                "array_position",
                                 &value,
                             ));
                         }
@@ -437,13 +629,29 @@ pub(crate) fn dispatch<'a>(
                 // 1-based indices of every element equal to the target (NULL-safe),
                 // as an int[] (`{}` when none); NULL only for a NULL array argument.
                 arity(2)?;
-                let a =
-                    compatible_array_input(eval_full(args[0], arena, params, row, hooks)?, arena)?;
-                let target = eval_full(args[1], arena, params, row, hooks)?;
+                let mut values = [
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    eval_full(args[1], arena, params, row, hooks)?,
+                ];
+                coerce_compatible_arguments(
+                    name,
+                    compatible_roles(name).expect("compatible array function"),
+                    args,
+                    &mut values,
+                    arena,
+                    row,
+                    hooks,
+                )?;
+                let [a, target] = values;
                 let (element, raw) = match a {
                     Datum::Array { element, raw } => (element, raw),
                     Datum::Null => return Ok(Datum::Null),
-                    _ => return Err(type_mismatch("array_positions requires an array", &a)),
+                    _ => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "array_positions",
+                            &a,
+                        ));
+                    }
                 };
                 let shape = array::shape(raw).expect("array datum invariant");
                 if shape.dimension_count() > 1 {
@@ -501,26 +709,26 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     (1, 0)
                 };
-                let arr = compatible_array_input(
-                    eval_full(args[array_index], arena, params, row, hooks)?,
+                let mut values = [
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    eval_full(args[1], arena, params, row, hooks)?,
+                ];
+                let element = coerce_compatible_arguments(
+                    name,
+                    compatible_roles(name).expect("compatible array function"),
+                    args,
+                    &mut values,
                     arena,
+                    row,
+                    hooks,
                 )?;
-                let elem = eval_full(args[elem_index], arena, params, row, hooks)?;
+                let (arr, elem) = (values[array_index], values[elem_index]);
                 let (source, raw) = match arr {
                     Datum::Array { element, raw } => (element, Some(raw)),
-                    Datum::Null => (ArrElem::from_datum(&elem).unwrap_or(ArrElem::Text), None),
+                    Datum::Null => (element, None),
                     _ => {
-                        return Err(type_mismatch(
-                            "array_append/prepend requires an array",
-                            &arr,
-                        ));
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &arr));
                     }
-                };
-                // The result element type promotes to hold both the array's elements
-                // and the new one (PostgreSQL's polymorphic anyarray/anyelement).
-                let element = match ArrElem::from_datum(&elem) {
-                    Some(e) => unify_arr_elem(source, e)?,
-                    None => source,
                 };
                 let source_count = raw.map_or(0, array::len);
                 let items = array::alloc_items(arena, source_count + 1)?;
@@ -573,10 +781,20 @@ pub(crate) fn dispatch<'a>(
             // `array_cat(a, b)`: concatenate two arrays of the same element type.
             "array_cat" => {
                 arity(2)?;
-                let a =
-                    compatible_array_input(eval_full(args[0], arena, params, row, hooks)?, arena)?;
-                let b =
-                    compatible_array_input(eval_full(args[1], arena, params, row, hooks)?, arena)?;
+                let mut values = [
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    eval_full(args[1], arena, params, row, hooks)?,
+                ];
+                coerce_compatible_arguments(
+                    name,
+                    compatible_roles(name).expect("compatible array function"),
+                    args,
+                    &mut values,
+                    arena,
+                    row,
+                    hooks,
+                )?;
+                let [a, b] = values;
                 match (a, b) {
                     (Datum::Array { .. }, Datum::Array { .. }) => {
                         super::super::array_concat(a, b, arena)
@@ -586,7 +804,10 @@ pub(crate) fn dispatch<'a>(
                         Ok(Datum::Array { element, raw })
                     }
                     (Datum::Null, Datum::Null) => Ok(Datum::Null),
-                    _ => Err(type_mismatch("array_cat requires arrays", &a)),
+                    _ => Err(crate::sql::eval::function_argument_mismatch(
+                        "array_cat",
+                        &a,
+                    )),
                 }
             }
             // `array_remove(arr, elem)`: drop every element equal to `elem`
@@ -594,13 +815,24 @@ pub(crate) fn dispatch<'a>(
             "array_remove" | "array_replace" => {
                 let is_replace = name == "array_replace";
                 arity(if is_replace { 3 } else { 2 })?;
-                let arr =
-                    compatible_array_input(eval_full(args[0], arena, params, row, hooks)?, arena)?;
-                let target = eval_full(args[1], arena, params, row, hooks)?;
+                let mut values = [Datum::Null; 3];
+                for (value, argument) in values.iter_mut().zip(args) {
+                    *value = eval_full(argument, arena, params, row, hooks)?;
+                }
+                let element = coerce_compatible_arguments(
+                    name,
+                    compatible_roles(name).expect("compatible array function"),
+                    args,
+                    &mut values[..args.len()],
+                    arena,
+                    row,
+                    hooks,
+                )?;
+                let [arr, target, to] = values;
                 let (source, raw) = match arr {
                     Datum::Array { element, raw } => (element, raw),
                     Datum::Null => return Ok(Datum::Null),
-                    _ => return Err(type_mismatch(name, &arr)),
+                    _ => return Err(crate::sql::eval::function_argument_mismatch(name, &arr)),
                 };
                 let shape = array::shape(raw).expect("array datum invariant");
                 if !is_replace && shape.dimension_count() > 1 {
@@ -611,27 +843,13 @@ pub(crate) fn dispatch<'a>(
                 }
                 // PostgreSQL needs the element equality for any non-empty
                 // array, even to remove or replace NULLs.
-                if shape.dimension_count() > 0 && !source.to_coltype().has_builtin_equality() {
+                if shape.dimension_count() > 0 && !source.to_coltype().has_default_equality() {
                     return Err(crate::sql::eval::operators::could_not_identify_equality(
                         source.to_coltype(),
                     ));
                 }
-                let (element, replacement) = if is_replace {
-                    let to = eval_full(args[2], arena, params, row, hooks)?;
-                    // The result promotes to hold both the kept and replaced values.
-                    let element = match ArrElem::from_datum(&to) {
-                        Some(e) => unify_arr_elem(source, e)?,
-                        None => source,
-                    };
-                    let replacement = if to.is_null() {
-                        Datum::Null
-                    } else {
-                        cast_to(to, element.to_coltype(), arena)?
-                    };
-                    (element, replacement)
-                } else {
-                    (source, Datum::Null)
-                };
+                debug_assert_eq!(source, element);
+                let replacement = to;
                 let to_coltype = element.to_coltype();
                 let items = array::alloc_items(arena, shape.element_count())?;
                 let mut n = 0usize;
@@ -678,7 +896,12 @@ pub(crate) fn dispatch<'a>(
                 let (element, raw) = match arr {
                     Datum::Array { element, raw } => (element, raw),
                     Datum::Null => return Ok(Datum::Null),
-                    _ => return Err(type_mismatch("trim_array requires an array", &arr)),
+                    _ => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "trim_array",
+                            &arr,
+                        ));
+                    }
                 };
                 if array::shape(raw)
                     .expect("array datum invariant")
@@ -698,7 +921,12 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int2(v) => v as i64,
                     Datum::Int4(v) => v as i64,
                     Datum::Int8(v) => v,
-                    _ => return Err(type_mismatch("trim_array count must be an integer", &count)),
+                    _ => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "trim_array",
+                            &count,
+                        ));
+                    }
                 };
                 if trim < 0 || trim as usize > total {
                     return Err(sql_err!(
@@ -751,7 +979,7 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                     Datum::Null => return Ok(Datum::Null),
-                    _ => return Err(type_mismatch(name, &arr)),
+                    _ => return Err(crate::sql::eval::function_argument_mismatch(name, &arr)),
                 };
                 let shape = array::shape(raw).expect("array datum invariant");
                 if shape.dimension_count() == 0 {
@@ -791,7 +1019,12 @@ pub(crate) fn dispatch<'a>(
                     match text_view(eval_full(args[2], arena, params, row, hooks)?) {
                         Datum::Null => None,
                         Datum::Text(s) => Some(s),
-                        other => return Err(type_mismatch("array_to_string null string", &other)),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(
+                                "array_to_string",
+                                &other,
+                            ));
+                        }
                     }
                 } else {
                     None
@@ -799,12 +1032,22 @@ pub(crate) fn dispatch<'a>(
                 let (element, raw) = match a {
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Array { element, raw } => (element, raw),
-                    other => return Err(type_mismatch("array_to_string", &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "array_to_string",
+                            &other,
+                        ));
+                    }
                 };
                 let delim = match text_view(delim) {
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Text(s) => s,
-                    other => return Err(type_mismatch("array_to_string delimiter", &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "array_to_string",
+                            &other,
+                        ));
+                    }
                 };
                 // Renders the i-th element as text, or `None` to omit it (a NULL
                 // element with no null-string replacement).
@@ -814,7 +1057,10 @@ pub(crate) fn dispatch<'a>(
                         v => match cast_to(v, ColType::Text, arena)? {
                             Datum::Text(s) => Ok(Some(s)),
                             Datum::Null => Ok(nullrep),
-                            other => Err(type_mismatch("array_to_string element", &other)),
+                            other => Err(crate::sql::eval::function_argument_mismatch(
+                                "array_to_string",
+                                &other,
+                            )),
                         },
                     }
                 };
@@ -848,12 +1094,198 @@ pub(crate) fn dispatch<'a>(
                 }
                 Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(out) }))
             }
+            // PostgreSQL 18's first-dimension reorderings: each item along the
+            // first dimension (a sub-array of a multidimensional array) moves
+            // as one block.
+            "array_reverse" | "array_sort" | "array_sample" | "array_shuffle" => {
+                let (minimum, maximum) = match name {
+                    "array_sort" => (1, 3),
+                    "array_sample" => (2, 2),
+                    _ => (1, 1),
+                };
+                if star || !(minimum..=maximum).contains(&args.len()) {
+                    return Err(arity_err(name, args.len()));
+                }
+                let mut values = [Datum::Null; 3];
+                for (value, argument) in values.iter_mut().zip(args) {
+                    *value = eval_full(argument, arena, params, row, hooks)?;
+                }
+                if values[..args.len()].iter().any(Datum::is_null) {
+                    return Ok(Datum::Null);
+                }
+                let (element, raw) = match compatible_array_input(values[0], arena)? {
+                    Datum::Array { element, raw } => (element, raw),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
+                };
+                let shape = array::shape(raw).expect("array datum invariant");
+                let count = shape.dimension(0).unwrap_or(0);
+                if shape.dimension_count() == 0 || count == 0 {
+                    if name == "array_sample" {
+                        let Datum::Int4(size) = cast_to(values[1], ColType::Int4, arena)? else {
+                            unreachable!("integer cast")
+                        };
+                        if size != 0 {
+                            return Err(sample_size_error(0));
+                        }
+                    }
+                    return Ok(values[0]);
+                }
+                let block = shape.element_count() / count;
+                let items = array::alloc_items(arena, shape.element_count())?;
+                for (item, value) in items.iter_mut().zip(array::elements(raw, element)) {
+                    *item = value;
+                }
+                let order = arena
+                    .alloc_slice_with(count, |index| index)
+                    .map_err(|_| arena_full())?;
+                let mut kept = count;
+                match name {
+                    "array_reverse" => order.reverse(),
+                    "array_shuffle" | "array_sample" => {
+                        if name == "array_sample" {
+                            let Datum::Int4(size) = cast_to(values[1], ColType::Int4, arena)?
+                            else {
+                                unreachable!("integer cast")
+                            };
+                            kept = usize::try_from(size)
+                                .ok()
+                                .filter(|size| *size <= count)
+                                .ok_or_else(|| sample_size_error(count))?;
+                        }
+                        // PostgreSQL's partial Fisher-Yates over the session
+                        // random sequence (`setseed` repeats it).
+                        for index in 0..kept {
+                            let draw = crate::sql::guc::active_random()?;
+                            let span = (count - index) as f64;
+                            let pick = index + ((draw * span) as usize).min(count - index - 1);
+                            order.swap(index, pick);
+                        }
+                    }
+                    _ => {
+                        let descending = matches!(values[1], Datum::Bool(true));
+                        let nulls_first = match args.len() {
+                            3 => matches!(values[2], Datum::Bool(true)),
+                            _ => descending,
+                        };
+                        // PostgreSQL looks up the ordering only to compare two items.
+                        if count > 1 && !element.to_coltype().has_builtin_ordering() {
+                            return Err(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "could not identify a comparison function for type {}",
+                                element.to_coltype().name()
+                            ));
+                        }
+                        let collation = super::super::resolve_comparison_collation(
+                            args[0],
+                            args[0],
+                            row,
+                            hooks.catalog,
+                        )?;
+                        let compare =
+                            |left: usize, right: usize| -> Result<core::cmp::Ordering, SqlError> {
+                                for offset in 0..block {
+                                    let (a, b) = (
+                                        items[left * block + offset],
+                                        items[right * block + offset],
+                                    );
+                                    let order = match (a.is_null(), b.is_null()) {
+                                        (true, true) => core::cmp::Ordering::Equal,
+                                        (true, false) if block == 1 => {
+                                            return Ok(if nulls_first {
+                                                core::cmp::Ordering::Less
+                                            } else {
+                                                core::cmp::Ordering::Greater
+                                            });
+                                        }
+                                        (false, true) if block == 1 => {
+                                            return Ok(if nulls_first {
+                                                core::cmp::Ordering::Greater
+                                            } else {
+                                                core::cmp::Ordering::Less
+                                            });
+                                        }
+                                        // Inside sub-arrays NULL sorts last, as in array comparison.
+                                        (true, false) => core::cmp::Ordering::Greater,
+                                        (false, true) => core::cmp::Ordering::Less,
+                                        (false, false) => {
+                                            super::super::operators::compare_datums_with_catalog(
+                                                collation,
+                                                hooks.catalog,
+                                                &a,
+                                                &b,
+                                            )?
+                                        }
+                                    };
+                                    if order.is_ne() {
+                                        return Ok(if descending {
+                                            order.reverse()
+                                        } else {
+                                            order
+                                        });
+                                    }
+                                }
+                                Ok(core::cmp::Ordering::Equal)
+                            };
+                        // Insertion sort keeps memory fixed and stops at the first error.
+                        for next in 1..count {
+                            let mut at = next;
+                            while at > 0 && compare(order[at - 1], order[at])?.is_gt() {
+                                order.swap(at - 1, at);
+                                at -= 1;
+                            }
+                        }
+                    }
+                }
+                let output = array::alloc_items(arena, kept * block)?;
+                for (slot, index) in order[..kept].iter().enumerate() {
+                    output[slot * block..(slot + 1) * block]
+                        .copy_from_slice(&items[index * block..(index + 1) * block]);
+                }
+                let mut dimensions = [0usize; array::MAX_DIMENSIONS];
+                let mut lower_bounds = [1i32; array::MAX_DIMENSIONS];
+                for index in 0..shape.dimension_count() {
+                    dimensions[index] = shape.dimension(index).unwrap_or(0);
+                    lower_bounds[index] = shape.lower_bound(index).unwrap_or(1);
+                }
+                dimensions[0] = kept;
+                if name == "array_sample" {
+                    lower_bounds[0] = 1;
+                }
+                let dimension_count = shape.dimension_count();
+                Ok(Datum::Array {
+                    element,
+                    raw: array::build_shaped(
+                        output,
+                        array::Shape::new(
+                            &dimensions[..dimension_count],
+                            &lower_bounds[..dimension_count],
+                        )?,
+                        arena,
+                    )?,
+                })
+            }
             "array_fill" => {
                 if args.len() != 2 && args.len() != 3 || star {
                     return Err(arity_err(name, args.len()));
                 }
+                // The dimension and bound inputs are declared integer[]; an
+                // untyped literal is read as that type.
+                let integer_array = |index: usize| -> Result<Datum<'a>, SqlError> {
+                    let value = eval_full(args[index], arena, params, row, hooks)?;
+                    if !value.is_null()
+                        && super::super::expression_type_identity(args[index], row, hooks)?
+                            .routine_argument_oid()
+                            == crate::sql::types::oid::UNKNOWN
+                    {
+                        cast_to(value, ColType::Array(ArrElem::Int4), arena)
+                    } else {
+                        Ok(value)
+                    }
+                };
                 let value = eval_full(args[0], arena, params, row, hooks)?;
-                let dims = eval_full(args[1], arena, params, row, hooks)?;
+                let dims = integer_array(1)?;
                 if dims.is_null() {
                     return Err(sql_err!(
                         sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -861,12 +1293,12 @@ pub(crate) fn dispatch<'a>(
                     ));
                 }
                 let Datum::Array { element, raw } = dims else {
-                    return Err(type_mismatch(name, &dims));
+                    return Err(crate::sql::eval::function_argument_mismatch(name, &dims));
                 };
                 let dims_shape = array::shape(raw).expect("array datum invariant");
                 if dims_shape.dimension_count() > 1 || element != ArrElem::Int4 {
-                    return Err(type_mismatch(
-                        "array_fill dimensions must be an integer array",
+                    return Err(crate::sql::eval::function_argument_mismatch(
+                        "array_fill",
                         &dims,
                     ));
                 }
@@ -896,14 +1328,14 @@ pub(crate) fn dispatch<'a>(
                 }
                 let mut lower_bounds = [1i32; array::MAX_DIMENSIONS];
                 if args.len() == 3 {
-                    let lows = eval_full(args[2], arena, params, row, hooks)?;
+                    let lows = integer_array(2)?;
                     let Datum::Array {
                         element: low_element,
                         raw: low_raw,
                     } = lows
                     else {
-                        return Err(type_mismatch(
-                            "array_fill lower bounds must be an integer array",
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "array_fill",
                             &lows,
                         ));
                     };
@@ -982,10 +1414,18 @@ fn require_search_equality(
     dimensions: usize,
     target: &Datum<'_>,
 ) -> Result<(), SqlError> {
-    if dimensions > 0 && !target.is_null() && !element.to_coltype().has_builtin_equality() {
+    if dimensions > 0 && !target.is_null() && !element.to_coltype().has_default_equality() {
         return Err(crate::sql::eval::operators::could_not_identify_equality(
             element.to_coltype(),
         ));
     }
     Ok(())
+}
+
+fn sample_size_error(count: usize) -> SqlError {
+    sql_err!(
+        sqlstate::INVALID_PARAMETER_VALUE,
+        "sample size must be between 0 and {}",
+        count
+    )
 }

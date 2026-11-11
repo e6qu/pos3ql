@@ -17,8 +17,7 @@ use super::{
     SqlError, arena_full, as_f64, as_i64, bad_text, cast_to_text, concat, datum_f64, datum_numeric,
     division_by_zero, interval_cmp_value, json_exists, json_get, json_path, jsonb_concat,
     jsonb_delete, jsonb_delete_path, jsonpath_operator, like_match, num_factor, out_of_range,
-    overflow, parse_bool, parse_uuid, sqlstate, to_numeric, type_mismatch, type_name_of,
-    validate_bits,
+    overflow, parse_bool, parse_uuid, sqlstate, to_numeric, type_name_of, validate_bits,
 };
 
 /// Only ordering and equality can enter the collated comparator. Quantified
@@ -135,13 +134,13 @@ fn acl_contains(left: Datum<'_>, right: Datum<'_>) -> Result<Datum<'static>, Sql
         raw,
     } = left
     else {
-        return Err(type_mismatch("aclcontains", &left));
+        return Err(super::operand_type_mismatch(&left));
     };
     crate::sql::acl::validate_array_shape(raw)?;
     let right_item = match right {
         Datum::AclItem(item) => Some(item),
         Datum::Text(_) => None,
-        _ => return Err(type_mismatch("aclcontains", &right)),
+        _ => return Err(super::operand_type_mismatch(&right)),
     };
     let right_text = match right {
         Datum::Text(value) => Some(crate::sql::acl::parse(value)?),
@@ -200,7 +199,7 @@ pub(crate) fn array_set_op<'a>(
         ));
     };
     // PostgreSQL looks up the element equality before it reads either array.
-    if !le.to_coltype().has_builtin_equality() {
+    if !le.to_coltype().has_default_equality() {
         return Err(could_not_identify_equality(le.to_coltype()));
     }
     let member = |needle: &Datum<'a>, elem, raw: &'a [u8]| -> Result<bool, SqlError> {
@@ -340,7 +339,7 @@ pub(crate) fn range_setop<'a>(
         BinaryOp::Add => range::union(lt, rt, lk, arena)?,
         BinaryOp::Sub => range::difference(lt, rt, lk, arena)?,
         BinaryOp::Mul => range::intersect(lt, rt, lk, arena)?,
-        _ => return Err(type_mismatch("range operator", &l)),
+        _ => return Err(super::operand_type_mismatch(&l)),
     };
     Ok(Datum::Range { text, kind: lk })
 }
@@ -385,7 +384,7 @@ fn range_contains<'a>(
 fn as_range<'a>(d: &Datum<'a>) -> Result<(&'a str, RangeKind), SqlError> {
     match d {
         Datum::Range { text, kind } => Ok((text, *kind)),
-        other => Err(type_mismatch("range operator", other)),
+        other => Err(super::operand_type_mismatch(other)),
     }
 }
 
@@ -488,9 +487,9 @@ pub(crate) fn bit_shift<'a>(
         return Ok(Datum::Null);
     }
     let Datum::Bit { bits, varying } = l else {
-        return Err(type_mismatch("bit-string shift", &l));
+        return Err(super::operand_type_mismatch(&l));
     };
-    let count = as_i64(&r).ok_or_else(|| type_mismatch("bit-string shift amount", &r))?;
+    let count = as_i64(&r).ok_or_else(|| super::operand_type_mismatch(&r))?;
     // `<<` moves bits toward the most-significant (left) end.
     let left = if matches!(operator, BinaryOp::Shl) {
         count
@@ -1108,7 +1107,7 @@ pub(crate) fn compare_datums_as(
         ) => left_slot.cmp(right_slot).then_with(|| left.cmp(right)),
         (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {
             let element_type = element.to_coltype();
-            if matches!(operator, "=" | "<>") && !element_type.has_builtin_equality() {
+            if matches!(operator, "=" | "<>") && !element_type.has_default_equality() {
                 // PostgreSQL's array_eq answers "not equal" for different
                 // shapes before it needs the element equality operator.
                 let shape_a = array::shape(ra).expect("array datum invariant");
@@ -1427,6 +1426,41 @@ pub(crate) fn arithmetic<'a>(
     r_unknown: bool,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    // PostgreSQL has no `+` between two timestamps or two times, so an
+    // untyped operand of `+` beside one is an interval. `date` and `timetz`
+    // have several `+` candidates and the call is ambiguous.
+    let (mut l, mut r) = (l, r);
+    if operator == BinaryOp::Add {
+        for (unknown_left, unknown, other) in [(true, l_unknown, r), (false, r_unknown, l)] {
+            if !unknown {
+                continue;
+            }
+            let ambiguous = match other {
+                Datum::Date(_) => Some("date"),
+                Datum::Timetz(..) => Some("time with time zone"),
+                _ => None,
+            };
+            if let Some(type_name) = ambiguous {
+                return Err(sql_err!(
+                    sqlstate::AMBIGUOUS_FUNCTION,
+                    "operator is not unique: {}",
+                    if unknown_left {
+                        crate::stack_format!(64, "unknown + {}", type_name)
+                    } else {
+                        crate::stack_format!(64, "{} + unknown", type_name)
+                    }
+                ));
+            }
+            let value = if unknown_left { &mut l } else { &mut r };
+            if let (
+                Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Time(_),
+                Datum::Text(text),
+            ) = (other, *value)
+            {
+                *value = Datum::Interval(datetime::parse_interval(text)?);
+            }
+        }
+    }
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
@@ -1932,7 +1966,7 @@ fn narrow_int<'a>(v: i64, l: &Datum, r: &Datum) -> Result<Datum<'a>, SqlError> {
 fn as_multirange<'a>(d: &Datum<'a>) -> Result<(&'a str, RangeKind), SqlError> {
     match d {
         Datum::Multirange { text, kind } => Ok((text, *kind)),
-        other => Err(type_mismatch("multirange operator", other)),
+        other => Err(super::operand_type_mismatch(other)),
     }
 }
 
@@ -1947,7 +1981,7 @@ fn as_multirange_coerce<'a>(
         Datum::Range { text, kind } => {
             Ok((range::multirange_from_range(text, *kind, arena)?, *kind))
         }
-        other => Err(type_mismatch("multirange operator", other)),
+        other => Err(super::operand_type_mismatch(other)),
     }
 }
 
@@ -1972,7 +2006,7 @@ pub(crate) fn multirange_setop<'a>(
         BinaryOp::Add => range::multirange_union(lt, rt, lk, arena)?,
         BinaryOp::Sub => range::multirange_difference(lt, rt, lk, arena)?,
         BinaryOp::Mul => range::multirange_intersect(lt, rt, lk, arena)?,
-        _ => return Err(type_mismatch("multirange operator", &l)),
+        _ => return Err(super::operand_type_mismatch(&l)),
     };
     Ok(Datum::Multirange { text, kind: lk })
 }
@@ -2018,7 +2052,7 @@ pub(crate) fn multirange_op<'a>(
                 lt, rt, lk, predicate,
             )?))
         }
-        _ => Err(type_mismatch("multirange operator", &l)),
+        _ => Err(super::operand_type_mismatch(&l)),
     }
 }
 
@@ -2064,7 +2098,7 @@ pub(crate) fn bitwise<'a>(
             Datum::Int2(v) => Ok(i64::from(*v)),
             Datum::Int4(v) => Ok(i64::from(*v)),
             Datum::Int8(v) => Ok(*v),
-            other => Err(type_mismatch("bitwise operator requires integers", other)),
+            other => Err(super::operand_type_mismatch(other)),
         }
     };
     if l.is_null() || r.is_null() {
@@ -2186,13 +2220,13 @@ pub(crate) fn unary<'a>(
             bytes.iter_mut().for_each(|byte| *byte = !*byte);
             Ok(Datum::Macaddr8(bytes))
         }
-        (UnaryOp::Neg, other) => Err(type_mismatch("-", &other)),
+        (UnaryOp::Neg, other) => Err(super::operand_type_mismatch(&other)),
         (UnaryOp::Not, other) => match super::boolean_argument(other, "NOT")? {
             Datum::Bool(b) => Ok(Datum::Bool(!b)),
             _ => Ok(Datum::Null),
         },
-        (UnaryOp::BitNot, other) => Err(type_mismatch("~", &other)),
-        (UnaryOp::TextSearchNot, other) => Err(type_mismatch("!!", &other)),
+        (UnaryOp::BitNot, other) => Err(super::operand_type_mismatch(&other)),
+        (UnaryOp::TextSearchNot, other) => Err(super::operand_type_mismatch(&other)),
         // The prefix arithmetic operators are evaluated through the functions
         // they compute, so a datum never reaches here wearing one.
         (UnaryOp::SquareRoot | UnaryOp::CubeRoot | UnaryOp::AbsoluteValue, _) => {
@@ -2253,6 +2287,30 @@ fn row_compare<'a>(
     }
 }
 
+/// PostgreSQL's `record_eq`/`record_lt` family for composite-typed values.
+fn record_compare<'a>(
+    operator: BinaryOp,
+    a: &[RecordField<'a>],
+    b: &[RecordField<'a>],
+) -> Result<Datum<'a>, SqlError> {
+    use BinaryOp::*;
+    if a.len() != b.len() {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "cannot compare record types with different numbers of columns"
+        ));
+    }
+    let ordering = compare_datums(&Datum::Record(a), &Datum::Record(b))?;
+    Ok(Datum::Bool(match operator {
+        Eq => ordering.is_eq(),
+        NotEq => !ordering.is_eq(),
+        Lt => ordering.is_lt(),
+        LtEq => ordering.is_le(),
+        Gt => ordering.is_gt(),
+        _ => ordering.is_ge(),
+    }))
+}
+
 /// SQL equality as the membership tests (`IN`, `NOT IN`) need it: three-valued,
 /// returning `None` for unknown. Rows go through [`row_compare`], so a NULL
 /// *inside* a row makes the membership unknown; `compare_datums` alone gives
@@ -2262,10 +2320,17 @@ pub(crate) fn membership_eq<'a>(l: &Datum<'a>, r: &Datum<'a>) -> Result<Option<b
         return Ok(None);
     }
     if let (
-        Datum::Record(a) | Datum::Composite { fields: a, .. },
+        Datum::Composite { fields: a, .. },
         Datum::Record(b) | Datum::Composite { fields: b, .. },
-    ) = (l, r)
+    )
+    | (Datum::Record(a), Datum::Composite { fields: b, .. }) = (l, r)
     {
+        return Ok(match record_compare(BinaryOp::Eq, a, b)? {
+            Datum::Bool(equal) => Some(equal),
+            _ => None,
+        });
+    }
+    if let (Datum::Record(a), Datum::Record(b)) = (l, r) {
         return Ok(match row_compare(BinaryOp::Eq, a, b)? {
             Datum::Bool(equal) => Some(equal),
             _ => None,
@@ -2540,6 +2605,23 @@ pub(crate) fn binary<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::*;
     let (mut l, mut r) = (l, r);
+    // Every range and multirange operator has a variant taking the same type
+    // on both sides, so PostgreSQL reads an untyped operand as the other
+    // operand's type (`int4range @> '[2,3)'` compares two ranges).
+    if r_unknown && matches!(r, Datum::Text(_)) {
+        match l {
+            Datum::Range { kind, .. } => r = cast_to(r, ColType::Range(kind), arena)?,
+            Datum::Multirange { kind, .. } => r = cast_to(r, ColType::Multirange(kind), arena)?,
+            _ => {}
+        }
+    }
+    if l_unknown && matches!(l, Datum::Text(_)) {
+        match r {
+            Datum::Range { kind, .. } => l = cast_to(l, ColType::Range(kind), arena)?,
+            Datum::Multirange { kind, .. } => l = cast_to(l, ColType::Multirange(kind), arena)?,
+            _ => {}
+        }
+    }
     if let Some(name) = operator.operator_name() {
         if l_unknown
             && matches!(l, Datum::Text(_))
@@ -2794,10 +2876,17 @@ pub(crate) fn binary<'a>(
             // Row comparison uses PostgreSQL's three-valued, short-circuiting
             // semantics (NULL-propagating), distinct from the total order that
             // `compare_datums` gives ORDER BY / DISTINCT.
+            // A composite-typed operand compares with the record btree
+            // operators: NULL fields are equal to each other and sort last,
+            // so the result is never unknown.
             (
-                Datum::Record(a) | Datum::Composite { fields: a, .. },
+                Datum::Composite { fields: a, .. },
                 Datum::Record(b) | Datum::Composite { fields: b, .. },
-            ) => row_compare(operator, a, b),
+            )
+            | (Datum::Record(a), Datum::Composite { fields: b, .. }) => {
+                record_compare(operator, a, b)
+            }
+            (Datum::Record(a), Datum::Record(b)) => row_compare(operator, a, b),
             _ => compare(operator, l, r, l_unknown, r_unknown),
         },
         Add | Sub

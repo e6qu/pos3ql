@@ -12,7 +12,7 @@ use crate::{sql_err, stack_format};
 
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, datum_to_text, eval_full,
-    expression_type_identity, sqlstate, text_arg, type_mismatch,
+    expression_type_identity, sqlstate, text_arg,
 };
 
 fn decimal(bytes: &[u8], at: &mut usize) -> Result<Option<usize>, SqlError> {
@@ -263,7 +263,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Int8(v) => v,
                     Datum::Numeric(n) => n.to_i64()?,
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 const UNITS: [&str; 6] = ["bytes", "kB", "MB", "GB", "TB", "PB"];
                 let limit: i64 = 10 * 1024;
@@ -354,7 +356,11 @@ pub(crate) fn dispatch<'a>(
                             Datum::Int2(value) => Some(i64::from(value)),
                             Datum::Int4(value) => Some(i64::from(value)),
                             Datum::Int8(value) => Some(value),
-                            other => return Err(type_mismatch("format", &other)),
+                            other => {
+                                return Err(crate::sql::eval::function_argument_mismatch(
+                                    "format", &other,
+                                ));
+                            }
                         };
                     } else if let Some(written) = decimal(bytes, &mut i)? {
                         width = Some(i64::try_from(written).map_err(|_| {

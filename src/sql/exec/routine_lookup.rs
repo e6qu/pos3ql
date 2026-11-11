@@ -276,34 +276,27 @@ pub(crate) fn lookup_routine<'a>(
 /// PostgreSQL's error for dropping a built-in, which names it as
 /// `format_procedure` does: `function name(type,type)`.
 pub(crate) fn builtin_drop_error(builtin: &BuiltinCallableSignature) -> SqlError {
-    let mut text = StackStr::<192>::new();
-    let _ = write!(text, "{}(", builtin.name);
-    for (index, oid) in builtin.arguments.iter().enumerate() {
-        if index != 0 {
-            let _ = text.write_char(',');
-        }
-        let Some(name) = crate::sql::catalog::intrinsic_type_name(*oid) else {
-            return sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "built-in argument type {} has no name",
-                oid
-            );
-        };
-        let _ = text.write_str(name);
-    }
-    let _ = text.write_char(')');
-    let error = sql_err!(
+    crate::sql::error_position::full_message_error(
         sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-        "cannot drop function {} because it is required by the database system",
-        text.as_str()
-    );
-    if text.is_truncated() || error.message.is_truncated() {
-        return sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "function diagnostic exceeds SQL error message capacity (192 bytes)"
-        );
-    }
-    error
+        |text| {
+            let _ = write!(text, "cannot drop function {}(", builtin.name);
+            for (index, oid) in builtin.arguments.iter().enumerate() {
+                if index != 0 {
+                    let _ = text.write_char(',');
+                }
+                let Some(name) = crate::sql::catalog::intrinsic_type_name(*oid) else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "built-in argument type {} has no name",
+                        oid
+                    ));
+                };
+                let _ = text.write_str(name);
+            }
+            let _ = text.write_str(") because it is required by the database system");
+            Ok(())
+        },
+    )
 }
 
 /// pos3ql cannot change a built-in's catalog entry.
@@ -475,7 +468,7 @@ impl core::fmt::Display for QualifiedName<'_> {
 
 /// `prefix name(type, ...) suffix` with PostgreSQL's `func_signature_string`
 /// spelling of each argument type (`format_type_be`).
-fn signature_error(
+pub(crate) fn signature_error(
     storage: &Storage,
     txid: u32,
     state: &'static str,
@@ -483,34 +476,18 @@ fn signature_error(
     identity: &RoutineIdentity<'_>,
     suffix: &str,
 ) -> SqlError {
-    let format = || -> Result<StackStr<192>, SqlError> {
-        let mut message = StackStr::<192>::new();
+    crate::sql::error_position::full_message_error(state, |message| {
         let _ = write!(message, "{}{}(", prefix, QualifiedName(identity.name));
         for (index, argument) in identity.argument_types.iter().enumerate() {
             if index != 0 {
                 let _ = message.write_str(", ");
             }
             let resolved = resolve_routine_type(storage, txid, argument.name)?;
-            message
-                .write_str(format_routine_type(storage, txid, resolved)?.as_str())
-                .ok();
+            let _ = message.write_str(format_routine_type(storage, txid, resolved)?.as_str());
         }
         let _ = write!(message, "){}", suffix);
-        if message.is_truncated() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "function diagnostic exceeds SQL error message capacity (192 bytes)"
-            ));
-        }
-        Ok(message)
-    };
-    match format() {
-        Ok(message) => SqlError {
-            sqlstate: crate::sql::eval::SqlState::known(state),
-            message,
-        },
-        Err(error) => error,
-    }
+        Ok(())
+    })
 }
 
 fn format_routine_type(

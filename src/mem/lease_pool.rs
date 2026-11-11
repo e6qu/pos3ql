@@ -51,6 +51,12 @@ impl Purpose {
         leases: "result_spool_leases",
         ranges: "result spool free ranges",
     };
+    pub(crate) const PLAN_BUILD: Self = Self {
+        pool: "plan build pool",
+        bytes: "plan_build_bytes",
+        leases: "plan_build_leases",
+        ranges: "plan build free ranges",
+    };
 }
 
 #[repr(C, align(64))]

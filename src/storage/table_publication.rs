@@ -1273,7 +1273,7 @@ mod tests {
     };
     use crate::storage::{ForeignKey, comment_stackstr};
     use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     fn fixture() -> (Storage, usize, usize, usize) {
         let config = test_config();
@@ -1601,7 +1601,7 @@ mod tests {
     }
 
     fn waited(storage: &Storage, before: usize) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = crate::test_wait::deadline();
         while storage.definition_publication.waits.load(Ordering::Acquire) == before {
             if Instant::now() >= deadline {
                 return false;
@@ -1860,7 +1860,7 @@ mod tests {
                 let writer = scope
                     .spawn(|| crate::mem::guard::forbid_alloc(|| publish_change(&storage, change)));
                 let resume = ResumeScan(&storage.definition_publication.scan_pause);
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = crate::test_wait::deadline();
                 while storage
                     .definition_publication
                     .scan_pause
@@ -2096,7 +2096,7 @@ mod tests {
                 crate::mem::guard::forbid_alloc(|| publish_change(&storage, change))
             });
             let resume = ResumeRelease(&storage.definition_publication.release_pause);
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             while storage
                 .definition_publication
                 .release_pause

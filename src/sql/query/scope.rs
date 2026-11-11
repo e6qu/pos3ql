@@ -88,6 +88,25 @@ fn catalog_scan(
     }
 }
 
+/// 42P10 for a column alias list longer than its table's columns. The
+/// query an `INSERT` with subscripted targets reads instead reports
+/// PostgreSQL's `INSERT has more target columns than expressions`.
+pub(crate) fn derived_alias_mismatch(table: &str, available: usize, specified: usize) -> SqlError {
+    if table == crate::sql::ast::INSERT_SUBSCRIPT_SOURCE {
+        return sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "INSERT has more target columns than expressions"
+        );
+    }
+    sql_err!(
+        sqlstate::INVALID_COLUMN_REFERENCE,
+        "table \"{}\" has {} columns available but {} columns specified",
+        table,
+        available,
+        specified
+    )
+}
+
 fn validate_table_sample<'a>(
     storage: &Storage,
     table: &TableRef<'a>,
@@ -333,6 +352,7 @@ impl<'a> QueryDefinitions<'a> {
 /// The resolved FROM clause: per table, its exposed name (alias or table
 /// name), definition, and storage slot.
 pub struct QueryScope<'d> {
+    storage: &'d Storage,
     txid: u32,
     type_sources: Option<crate::storage::StatementFileLease>,
     pub names: &'d mut [&'d str],
@@ -367,6 +387,9 @@ pub struct QueryScope<'d> {
     /// alias yields that scalar, not a one-field record (which is how a
     /// subquery- or storage-derived table's whole-row reference behaves).
     pub func_scalar: &'d mut [bool],
+    /// The row type of a physical relation source; its whole-row reference
+    /// has that type rather than an anonymous record.
+    row_types: &'d mut [Option<crate::storage::TypeCreation>],
     pub n: usize,
     /// USING/NATURAL-merged join columns (see `MergedColumn`).
     pub merged: &'d mut [MergedColumn<'d>],
@@ -384,6 +407,11 @@ pub struct QueryScope<'d> {
     /// `FromClause::joins` (whose `on` is None for such joins). Filled only
     /// on the executor path (predicate synthesis needs an arena).
     pub join_on: &'d mut [Option<&'d Expr<'d>>],
+    /// Whether the FROM item being added may refer to the items before it
+    /// without `LATERAL`. PostgreSQL makes a function implicitly lateral,
+    /// except on the nullable side of a RIGHT or FULL join, where it is read
+    /// once like any other item.
+    implicit_lateral: bool,
 }
 
 /// Type-only lookup over FROM items already registered in a scope. Table
@@ -515,8 +543,7 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
     }
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
-        self.0.qualified_star_columns(table).ok()?;
-        Some(self.0.func_scalar_type(table).unwrap_or(ColType::Record))
+        self.0.whole_row_type(table)
     }
 }
 
@@ -643,6 +670,9 @@ impl<'d> QueryScope<'d> {
         let func_scalar = arena
             .alloc_slice_with(table_count, |_| false)
             .map_err(|_| arena_full())?;
+        let row_types = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
         let merged = arena
             .alloc_slice_with(0, |_| MergedColumn {
                 name: "",
@@ -660,6 +690,7 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(join_count.max(1), |_| None)
             .map_err(|_| arena_full())?;
         Ok(QueryScope {
+            storage,
             txid,
             type_sources: None,
             names,
@@ -677,6 +708,7 @@ impl<'d> QueryScope<'d> {
             external_runs,
             lateral,
             func_scalar,
+            row_types,
             n: 0,
             merged,
             n_merged: 0,
@@ -684,6 +716,7 @@ impl<'d> QueryScope<'d> {
             output,
             n_output: 0,
             join_on,
+            implicit_lateral: true,
         })
     }
 
@@ -732,6 +765,10 @@ impl<'d> QueryScope<'d> {
             catalog_scan(&from.base, predicate, from.joins.is_empty()),
         )?;
         for j in from.joins {
+            scope.implicit_lateral = !matches!(
+                j.kind,
+                crate::sql::ast::JoinKind::Right | crate::sql::ast::JoinKind::Full
+            );
             scope.add_exec(
                 storage,
                 &j.table,
@@ -776,13 +813,7 @@ impl<'d> QueryScope<'d> {
         if let Some(aliases) = tref.col_alias
             && aliases.len() > ncols
         {
-            return Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "table \"{}\" has {} columns available but {} columns specified",
-                exposed,
-                ncols,
-                aliases.len()
-            ));
+            return Err(derived_alias_mismatch(exposed, ncols, aliases.len()));
         }
         let mut names = [""; MAX_COLUMNS];
         for (index, name) in names.iter_mut().enumerate().take(ncols) {
@@ -1044,6 +1075,10 @@ impl<'d> QueryScope<'d> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
         scope.add_schema(storage, &from.base, txid, arena, outer)?;
         for j in from.joins {
+            scope.implicit_lateral = !matches!(
+                j.kind,
+                crate::sql::ast::JoinKind::Right | crate::sql::ast::JoinKind::Full
+            );
             scope.add_schema(storage, &j.table, txid, arena, outer)?;
         }
         scope.build_merges(from, arena, None)?;
@@ -1200,12 +1235,10 @@ impl<'d> QueryScope<'d> {
         let mut definition = synth.def;
         if let Some(aliases) = tref.col_alias {
             if aliases.len() > definition.n_columns {
-                return Err(sql_err!(
-                    sqlstate::INVALID_COLUMN_REFERENCE,
-                    r#"table "{}" has {} columns available but {} columns specified"#,
+                return Err(derived_alias_mismatch(
                     exposed,
                     definition.n_columns,
-                    aliases.len()
+                    aliases.len(),
                 ));
             }
             let columns = arena
@@ -1400,10 +1433,11 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        // Every table function is implicitly lateral to preceding FROM items;
-        // the keyword is optional for functions in PostgreSQL. Such rows are
-        // built per left-hand row by the scan.
-        if tref.lateral || self.n > 0 {
+        // A table function is implicitly lateral to preceding FROM items
+        // (the keyword is optional for functions in PostgreSQL) unless it is
+        // the nullable side of a RIGHT or FULL join. Lateral rows are built
+        // per left-hand row by the scan.
+        if tref.lateral || self.n > 0 && self.implicit_lateral {
             self.names[self.n] = exposed;
             self.defs.set_arena(self.n, def_reference);
             self.derived[self.n] = Some(&[]);
@@ -1475,7 +1509,7 @@ impl<'d> QueryScope<'d> {
                 })
         });
         let Some(slot) = slot else {
-            return Err(match tref.schema {
+            let error = match tref.schema {
                 Some(s) => sql_err!(
                     sqlstate::UNDEFINED_TABLE,
                     "relation \"{}.{}\" does not exist",
@@ -1487,7 +1521,11 @@ impl<'d> QueryScope<'d> {
                     "relation \"{}\" does not exist",
                     tref.table
                 ),
-            });
+            };
+            return Err(crate::sql::error_position::at_reference(
+                error,
+                tref.schema.unwrap_or(tref.table),
+            ));
         };
         let stored_def = self.defs.retain(storage, slot)?;
         let source_scope = self
@@ -1515,12 +1553,10 @@ impl<'d> QueryScope<'d> {
         };
         let renamed = if let Some(aliases) = tref.col_alias {
             if aliases.len() > stored_def.n_columns {
-                return Err(sql_err!(
-                    sqlstate::INVALID_COLUMN_REFERENCE,
-                    "table \"{}\" has {} columns available but {} columns specified",
+                return Err(derived_alias_mismatch(
                     exposed,
                     stored_def.n_columns,
-                    aliases.len()
+                    aliases.len(),
                 ));
             }
             let columns = arena
@@ -1594,6 +1630,8 @@ impl<'d> QueryScope<'d> {
         };
         self.defs.sources[self.n] = Some(source);
         self.slots[self.n] = slot;
+        self.row_types[self.n] =
+            Some(storage.relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)));
         self.authorization_roles[self.n] = tref.authorization_role;
         self.n += 1;
         Ok(())
@@ -2020,6 +2058,19 @@ impl<'d> QueryScope<'d> {
                 "missing FROM-clause entry for table \"{}\"",
                 table
             ),
+            // A bare name of a table the FROM clause gave an alias.
+            None if (0..self.n).any(|index| {
+                self.defs
+                    .get(index)
+                    .is_some_and(|definition| definition.name.as_str() == name)
+            }) =>
+            {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    name
+                )
+            }
             None => sql_err!(
                 sqlstate::UNDEFINED_TABLE,
                 "missing FROM-clause entry for table \"{}\"",
@@ -2067,6 +2118,35 @@ impl<'d> QueryScope<'d> {
     /// scalar output column — the type a whole-row reference to it carries. A
     /// storage- or subquery-derived table returns None (its whole-row reference
     /// is a record).
+    /// The declared type of a whole-row reference to a FROM item: a function
+    /// scan's single scalar column, a relation's row type, or an anonymous
+    /// record for every other source.
+    pub fn whole_row_type(&self, name: &str) -> Option<ColType> {
+        self.qualified_star_columns(name).ok()?;
+        if let Some(scalar) = self.func_scalar_type(name) {
+            return Some(scalar);
+        }
+        let composite = self
+            .using_alias(name)
+            .is_none()
+            .then(|| self.table_index(name).ok())
+            .flatten()
+            .and_then(|table| self.row_types[table]);
+        Some(composite.map_or(ColType::Record, |creation| {
+            ColType::Composite(Some(creation))
+        }))
+    }
+
+    /// The OID a type name denotes under this scope's transaction.
+    pub(crate) fn named_type_oid(&self, type_name: &str) -> Option<i32> {
+        crate::sql::catalog::user_type_oid(self.storage, self.txid, type_name)
+            .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
+    }
+
+    pub(crate) fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
+        self.storage.domain_base_type_for_oid(type_oid, self.txid)
+    }
+
     pub fn func_scalar_type(&self, name: &str) -> Option<ColType> {
         self.func_scalar_column(name)
             .map(|column| self.output_type(column))
@@ -2082,6 +2162,15 @@ impl<'d> QueryScope<'d> {
     }
 
     pub fn find_column(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_column_unpositioned(qualifier, name)
+            .map_err(|error| crate::sql::error_position::column_reference(error, qualifier, name))
+    }
+
+    fn find_column_unpositioned(
         &self,
         qualifier: Option<&str>,
         name: &str,

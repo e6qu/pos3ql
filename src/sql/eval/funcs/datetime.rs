@@ -19,7 +19,7 @@ use crate::{sql_err, stack_format};
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, cast_to, datum_numeric, eval_full, int_arg,
     interval_extract, num_f64, num_factor, overlaps_end_micros, overlaps_micros, sqlstate,
-    text_arg, text_view, timestamp_micros, type_mismatch,
+    text_arg, text_view, timestamp_micros,
 };
 
 /// The session zone's offset (seconds east) at an instant.
@@ -51,7 +51,9 @@ fn timezone_from_datum(value: Datum<'_>) -> Result<crate::sql::timezone::Timezon
             sqlstate::INVALID_PARAMETER_VALUE,
             "interval time zone must not include months or days"
         )),
-        other => Err(type_mismatch("timezone", &other)),
+        other => Err(crate::sql::eval::function_argument_mismatch(
+            "timezone", &other,
+        )),
     }
 }
 
@@ -139,7 +141,7 @@ fn temporal_hash_input(name: &str, value: Datum<'_>) -> Result<u32, SqlError> {
                 + i128::from(interval.months) * 30 * 86_400_000_000;
             Ok(int64(span as i64))
         }
-        (_, other) => Err(type_mismatch(name, &other)),
+        (_, other) => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
     }
 }
 
@@ -271,8 +273,10 @@ pub(crate) fn dispatch<'a>(
                 }
                 let input = temporal_hash_input(name, value)?;
                 if extended {
-                    let seed = int_arg(name, args, 1, arena, params, row, hooks)?
-                        .ok_or_else(|| type_mismatch(name, &Datum::Null))?;
+                    let seed =
+                        int_arg(name, args, 1, arena, params, row, hooks)?.ok_or_else(|| {
+                            crate::sql::eval::function_argument_mismatch(name, &Datum::Null)
+                        })?;
                     Ok(Datum::Int8(
                         crate::sql::identity::hash_uint32_extended(input, seed) as i64,
                     ))
@@ -288,13 +292,15 @@ pub(crate) fn dispatch<'a>(
                     if value.is_null() {
                         return Ok(Datum::Null);
                     }
-                    return Err(type_mismatch(name, &value));
+                    return Err(crate::sql::eval::function_argument_mismatch(name, &value));
                 };
                 let time_input = crate::sql::identity::hash_int64_input(micros);
                 let zone = (-seconds_east) as u32;
                 if extended {
-                    let seed = int_arg(name, args, 1, arena, params, row, hooks)?
-                        .ok_or_else(|| type_mismatch(name, &Datum::Null))?;
+                    let seed =
+                        int_arg(name, args, 1, arena, params, row, hooks)?.ok_or_else(|| {
+                            crate::sql::eval::function_argument_mismatch(name, &Datum::Null)
+                        })?;
                     let time = crate::sql::identity::hash_uint32_extended(time_input, seed);
                     let zone = crate::sql::identity::hash_uint32_extended(zone, seed);
                     Ok(Datum::Int8((time ^ zone) as i64))
@@ -354,7 +360,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int8(value) => i32::try_from(value).map_err(|_| {
                         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
                     })?,
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 crate::sql::exec::apply_typmod(first, target, typmod, arena)
             }
@@ -463,7 +471,7 @@ pub(crate) fn dispatch<'a>(
                             },
                         },
                     )),
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             name if temporal_support(name) => {
@@ -645,14 +653,18 @@ pub(crate) fn dispatch<'a>(
                     Datum::Timestamptz(v) => (v, true),
                     Datum::Null => return Ok(Datum::Null),
                     other => {
-                        return Err(type_mismatch("date_bin source must be a timestamp", &other));
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "date_bin", &other,
+                        ));
                     }
                 };
                 let origin_micros = match origin {
                     Datum::Timestamp(v) | Datum::Timestamptz(v) => v,
                     Datum::Null => return Ok(Datum::Null),
                     other => {
-                        return Err(type_mismatch("date_bin origin must be a timestamp", &other));
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "date_bin", &other,
+                        ));
                     }
                 };
                 if matches!(
@@ -724,9 +736,8 @@ pub(crate) fn dispatch<'a>(
                     Datum::Interval(value) => {
                         Ok(Datum::Bool(datetime::interval_infinity_sign(value) == 0))
                     }
-                    other => Err(type_mismatch(
-                        "isfinite requires a date/time/interval",
-                        &other,
+                    other => Err(crate::sql::eval::function_argument_mismatch(
+                        "isfinite", &other,
                     )),
                 }
             }
@@ -746,7 +757,7 @@ pub(crate) fn dispatch<'a>(
                 }
                 let f = text_view(f);
                 let Datum::Text(fmt) = f else {
-                    return Err(type_mismatch(name, &f));
+                    return Err(crate::sql::eval::function_argument_mismatch(name, &f));
                 };
                 match v {
                     Datum::Timestamp(value) | Datum::Timestamptz(value)
@@ -825,7 +836,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => Ok(Datum::Null),
                     d => {
                         let Some(seconds) = num_factor(&d) else {
-                            return Err(type_mismatch(name, &d));
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &d));
                         };
                         let micros = (seconds * 1_000_000.0).round() as i64
                             - datetime::PG_EPOCH_DAYS * 86_400_000_000;
@@ -936,7 +947,9 @@ pub(crate) fn dispatch<'a>(
                         Datum::Int2(value) => i64::from(value),
                         Datum::Int4(value) => i64::from(value),
                         Datum::Int8(value) => value,
-                        other => return Err(type_mismatch(name, &other)),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
                     };
                 }
                 let secs = super::super::args::datum_f64(name, values[6])?;
@@ -1052,7 +1065,7 @@ pub(crate) fn dispatch<'a>(
                             new_offset,
                         ))
                     }
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "age" => {
@@ -1062,7 +1075,9 @@ pub(crate) fn dispatch<'a>(
                     let transaction_id = match eval_full(args[0], arena, params, row, hooks)? {
                         Datum::Oid(value) => value,
                         Datum::Null => return Ok(Datum::Null),
-                        other => return Err(type_mismatch(name, &other)),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
                     };
                     return hooks
                         .catalog
@@ -1121,7 +1136,7 @@ pub(crate) fn dispatch<'a>(
                         "justify_days" => datetime::justify_days(interval),
                         _ => datetime::justify_interval(interval),
                     })),
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             // `(s1, e1) OVERLAPS (s2, e2)`: whether two half-open time periods
@@ -1250,7 +1265,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Interval(interval) => {
                         return interval_extract(name == "extract", field, interval, arena);
                     }
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 use datetime::{
                     PG_EPOCH_DAYS, PG_EPOCH_SECS, civil_from_days, day_of_week, days_from_civil,
@@ -1603,7 +1620,9 @@ pub(crate) fn dispatch<'a>(
                             (true, local)
                         }
                     }
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 use datetime::{PG_EPOCH_DAYS, civil_from_days, day_of_week, days_from_civil};
                 let (days, in_day) = (t.div_euclid(86_400_000_000), t.rem_euclid(86_400_000_000));

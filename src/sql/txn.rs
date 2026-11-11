@@ -429,6 +429,14 @@ pub struct TxnState {
     suspended_statement: Option<SuspendedStatement>,
     pub(super) write_completion_boundary: Option<WriteCompletionBoundary>,
     pub(super) pending_write_completion: Option<super::exec::SuspendedWriteCompletion>,
+    /// The top-level `CALL` or `DO` body waiting at a saved statement. It
+    /// outlives transactions the body commits; ending the statement releases it.
+    pub(super) pending_procedure: Option<super::exec::SuspendedProcedure>,
+    /// Saved procedure bodies currently running, and whether a wait inside
+    /// one reached a position no saved frame can own, so the whole statement
+    /// must instead roll back and run again.
+    pub(super) running_procedures: u16,
+    pub(super) procedure_restart: bool,
     pub(super) cache_capacity_wait: Option<CacheCapacityWait>,
     pub(super) checkpoint_request: Option<crate::checkpoint::CheckpointRequest>,
     /// Current statement identity. Snapshot K sees own writes with identifiers
@@ -778,6 +786,11 @@ pub(crate) enum DdlUndo {
     },
     ParameterAclChanged {
         prior: crate::storage::ParameterAclUndo,
+    },
+    /// `ALTER FUNCTION` changed a built-in routine's row in this database.
+    BuiltinRoutineChanged {
+        slot: u16,
+        prior: Option<crate::storage::PendingBuiltinRoutine>,
     },
     /// A `COMMENT ON` set or removed an object's comment — undo by restoring
     /// the slot's prior uncommitted overlay. On commit, the overlay is
@@ -1136,6 +1149,9 @@ impl TxnState {
             suspended_statement: None,
             write_completion_boundary: None,
             pending_write_completion: None,
+            pending_procedure: None,
+            running_procedures: 0,
+            procedure_restart: false,
             cache_capacity_wait: None,
             checkpoint_request: None,
             command_id: 1,
@@ -1593,6 +1609,19 @@ impl TxnState {
         } else {
             deadline
         }
+    }
+
+    /// Moves a suspended statement's armed deadline into the past, so tests
+    /// expire statement_timeout without racing the host clock. Returns the
+    /// deadline it replaced.
+    #[cfg(test)]
+    pub(crate) fn expire_suspended_statement_deadline(&mut self) -> i64 {
+        let suspended = self
+            .suspended_statement
+            .as_mut()
+            .expect("a suspended statement");
+        assert_ne!(suspended.deadline, 0, "statement_timeout is armed");
+        core::mem::replace(&mut suspended.deadline, 1)
     }
 
     pub(crate) fn enter_statement_timeout(&mut self, entry: super::StatementTimeoutEntry) {
@@ -3259,6 +3288,8 @@ impl TxnState {
 
     pub fn clear(&mut self) {
         self.pending_write_completion = None;
+        self.pending_procedure = None;
+        self.procedure_restart = false;
         self.write_completion_boundary = None;
         self.concurrent_index = None;
         self.immediate_index_utility = None;

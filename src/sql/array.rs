@@ -452,6 +452,7 @@ pub fn get<'a>(raw: &'a [u8], element: ArrElem, index: usize) -> Option<Datum<'a
 /// carry an offset table, so bulk operations must use this iterator rather
 /// than repeated indexed lookup, which would rescan the prefix for every
 /// element.
+#[derive(Clone, Copy)]
 pub struct Elements<'a> {
     payloads: ElementPayloads<'a>,
     element: ArrElem,
@@ -464,6 +465,7 @@ pub fn elements(raw: &[u8], element: ArrElem) -> Elements<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct ElementPayloads<'a> {
     raw: &'a [u8],
     remaining: usize,

@@ -18,9 +18,7 @@ use crate::util::StackStr;
 
 use crate::sql::ast::Expr;
 
-use super::{
-    ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, parse_bytea, sqlstate, type_mismatch,
-};
+use super::{ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, parse_bytea, sqlstate};
 
 /// Evaluates the variadic tail of a built-in call.  In explicit `VARIADIC`
 /// syntax PostgreSQL passes the members of the final array as individual
@@ -126,7 +124,7 @@ pub(crate) fn text_arg<'a>(
         Datum::Null => Ok(None),
         Datum::Text(s) => Ok(Some(s)),
         Datum::Bpchar(s) => Ok(Some(s.trim_end_matches(' '))),
-        other => Err(type_mismatch(name, &other)),
+        other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
     }
 }
 
@@ -147,7 +145,7 @@ pub(crate) fn bytea_arg<'a>(
         Datum::Bytea(b) => Ok(Some(b)),
         Datum::Text(s) => Ok(Some(parse_bytea(s, arena)?)),
         Datum::Bpchar(s) => Ok(Some(parse_bytea(s.trim_end_matches(' '), arena)?)),
-        other => Err(type_mismatch(name, &other)),
+        other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
     }
 }
 
@@ -167,7 +165,7 @@ pub(crate) fn int_arg<'a>(
         Datum::Int2(v) => Ok(Some(v as i64)),
         Datum::Int4(v) => Ok(Some(v as i64)),
         Datum::Int8(v) => Ok(Some(v)),
-        other => Err(type_mismatch(name, &other)),
+        other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
     }
 }
 
@@ -190,7 +188,7 @@ pub(crate) fn num_f64<'a>(
         Datum::Float4(v) => Ok(Some(f64::from(v))),
         Datum::Float8(v) => Ok(Some(v)),
         Datum::Numeric(n) => Ok(Some(n.to_f64())),
-        other => Err(type_mismatch(name, &other)),
+        other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
     }
 }
 
@@ -203,7 +201,7 @@ pub(crate) fn datum_f64(name: &str, d: Datum<'_>) -> Result<f64, SqlError> {
         Datum::Float4(v) => Ok(f64::from(v)),
         Datum::Float8(v) => Ok(v),
         Datum::Numeric(n) => Ok(n.to_f64()),
-        other => Err(type_mismatch(name, &other)),
+        other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
     }
 }
 
@@ -415,7 +413,7 @@ pub(crate) fn datum_numeric<'a>(
         Datum::Int8(v) => Numeric::from_i64(v, arena),
         Datum::Float4(v) => Numeric::parse(stack_format!(64, "{}", v).as_str(), arena),
         Datum::Float8(v) => Numeric::parse(stack_format!(64, "{}", v).as_str(), arena),
-        other => Err(type_mismatch(name, &other)),
+        other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
     }
 }
 

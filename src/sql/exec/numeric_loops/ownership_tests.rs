@@ -270,9 +270,17 @@ fn reservation_failure_names_statement_memory_without_heap_growth() {
     )
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        let empty =
-            NumericLoopFrames::new(&arena, TriggerBlock { statements: &[] }, &[], &pool, &pool)
-                .unwrap();
+        let empty = NumericLoopFrames::new(
+            &arena,
+            TriggerBlock {
+                statements: &[],
+                sources: &[],
+            },
+            &[],
+            &pool,
+            &pool,
+        )
+        .unwrap();
         assert_eq!(empty.active, 0);
         assert_eq!(arena.used(), 0);
         drop(empty);

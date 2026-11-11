@@ -235,7 +235,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [memory-sql, storage]
+        group: [memory-sql, sql-exec, storage, storage-definitions]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly

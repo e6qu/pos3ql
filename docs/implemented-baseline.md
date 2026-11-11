@@ -145,9 +145,14 @@ with its next message once its client has read the result.
 reads it gradually. Meanwhile other applications keep inserting orders. If the
 tool falls behind by more than `result_spool_bytes`, it receives the rows
 already queued followed by `54000` naming that setting, and its session stays
-usable. A large `SELECT` from one ordinary table without sorting, grouping or
-joins resumes row by row instead: it waits for the client and for cold storage
-without holding the worker, and rows already delivered are never repeated.
+usable. A large `SELECT` from one ordinary table or one builtin series such
+as `generate_series`, without sorting, grouping or joins, resumes row by row
+instead: it waits for the client and for cold storage without holding the
+worker, and rows already delivered are never repeated. A paged portal (an
+extended `Execute` with a row limit) over such a query evaluates rows only as
+each `Execute` asks for them, as PostgreSQL does, so
+`CASE WHEN id > 1 THEN nextval('s') END` takes nine numbers for a first page
+of ten rows.
 Other large results, once their first byte reaches the client, read cold
 storage without yielding; extending resumable output to them is tracked in
 [the plan](../PLAN.md#pause-and-resume-every-query-path).
@@ -212,25 +217,41 @@ change the cursor. Dynamic SQL sees only the explicit `USING` arguments.
 
 ### Cursors that read as you fetch
 
-A cursor over one table, over constant `VALUES` rows, or over
-`generate_series` (integer, bigint, numeric or timestamp) or a one-array
-`unnest` with constant arguments, reads input only as rows are fetched when
+A cursor over one table, over constant `VALUES` rows, or over a builtin
+set-returning function with constant arguments (literals, parameters and
+casts of them) reads input only as rows are fetched when
 its query uses only columns, constants, parameters,
 built-in operators and casts, boolean logic, `CASE`, `BETWEEN`, null tests,
 array construction, subscripts, slices, scalar function calls, `LIMIT` and
-`OFFSET`. A row-locking cursor (`FOR UPDATE`, `FOR SHARE` and their variants)
-over one table may also order by its columns. Other cursor queries, including
-other orderings, user-defined operators or row-level security, run when
-declared; see [the plan](../PLAN.md#pause-and-resume-every-query-path).
+`OFFSET`. A cursor over one table, including a row-locking cursor (`FOR
+UPDATE`, `FOR SHARE` and their variants), may also order by its columns. Other
+cursor queries, including orderings by other expressions, user-defined
+operators or row-level security, run when declared; see
+[the plan](../PLAN.md#pause-and-resume-every-query-path). The functions are
+`generate_series` (integer, bigint, numeric or timestamp),
+`generate_subscripts`, a one-array `unnest`, `regexp_matches`,
+`regexp_split_to_table`, and the `json`/`jsonb` `_each`, `_each_text`,
+`_array_elements`, `_array_elements_text` and `_object_keys` functions, alone
+or combined in `ROWS FROM (...)` (which `FROM unnest(a, b)` expands to), with
+or without `WITH ORDINALITY`. Such a cursor keeps only the arguments and the
+next position; argument errors, such as `jsonb_each('[1]')`, are raised by the
+first `FETCH`. Other function sources, including column definition lists such
+as `jsonb_to_recordset(...) AS t(a int)`, run when declared.
 
 ```sql
 DECLARE c NO SCROLL CURSOR FOR SELECT id, label FROM orders;
 FETCH 2 FROM c;  -- reads two rows
+DECLARE parts NO SCROLL CURSOR FOR
+  SELECT key, value FROM jsonb_each('{"a": 1, "b": 2}');
+FETCH 1 FROM parts;  -- produces only the "a" row
 ```
 
 - `FETCH 0` before the first row reads nothing; `MOVE` skips without saving
   output. Each batch reuses the result buffer, so many small fetches do not
-  accumulate memory.
+  accumulate memory. A forward `FETCH n` or `FETCH ALL` sent by the client
+  from a `NO SCROLL` cursor saves no rows at all: each row is evaluated as the
+  client reads it, like a large `SELECT`, so `FETCH ALL` returns any number
+  of rows and other sessions keep running while the client reads slowly.
 - `SELECT 100/id FROM orders WHERE id<>0` divides only fetched rows.
   `CASE WHEN id<>0 THEN 100/id END` evaluates only the chosen branch.
 - `DECLARE c NO SCROLL CURSOR FOR SELECT nextval('order_numbers')` issues no
@@ -253,8 +274,15 @@ FETCH 2 FROM c;  -- reads two rows
 - Selecting `id` from a row with a 128 KiB text column does not copy that text
   into cursor memory.
 
-`SCROLL` cursors save visited rows so `FETCH PRIOR` and jumps backward need no
-new reads; `FETCH LAST` reads the rest. When the output list calls a volatile
+A `SCROLL` cursor (and a table scan's or function's cursor declared without a
+scroll option) whose output list and filter call no volatile function keeps
+only the rows of its current `FETCH`: a forward fetch from the client streams
+like a `NO SCROLL` cursor's, and a motion back to rows it no longer holds reads
+the input again from its first row with the cursor's snapshot, so rows
+inserted since `DECLARE` stay invisible. `FETCH PRIOR` right after a fetch
+reuses that fetch's rows; otherwise moving back costs a read of the input up
+to the target row, and `pg_stat_*_tables.seq_tup_read` counts the rows read
+again. When the output list calls a volatile
 function such as `nextval`, a row reached again by `FETCH PRIOR`, `ABSOLUTE`,
 `RELATIVE` or a later forward fetch is evaluated again, as PostgreSQL scans
 backward: with `SELECT id, nextval('s') FROM t`, `FETCH NEXT` twice then
@@ -263,12 +291,31 @@ input columns of each row instead of its output, and a volatile filter also
 saves the rows it rejected, because the filter runs again too. `LIMIT` returns
 the row at the edge of its window again without evaluating it, and `MOVE` and
 `FETCH ABSOLUTE` take PostgreSQL's steps (an absolute target less than halfway
-back rewinds and reads forward). History must fit `cursor_bytes`; exhaustion
+back rewinds and reads forward). Such a cursor's history, and an ordered
+scrollable cursor's, must fit `cursor_bytes`; exhaustion
 returns `54000` and leaves the cursor failed until closed. Without a scroll
 option, a table scan, a retained set-returning function and a list of two or
 more `VALUES` rows allow scrolling; one row, `UNION ALL` and a provably empty
 result are forward-only and return saved rows. `pg_cursors.is_scrollable`
 reports the choice made at declaration.
+
+A cursor over a join of tables, `VALUES` lists and retained set-returning
+functions (inner, cross or `LEFT`, with a non-volatile condition) also reads
+as it fetches, as a nested loop or, for a two-table equality join, a hash
+join whose build table is read into `plan_build_bytes` at `DECLARE` (a table
+that does not fit makes the cursor save its rows at `DECLARE` instead):
+
+```sql
+DECLARE c CURSOR FOR SELECT nextval('s'), o.id, c.name
+  FROM orders o JOIN customers c ON c.id = o.customer_id + 0;
+FETCH 1 FROM c;  -- reads one joined row and takes one number
+```
+
+Such a cursor is `NO SCROLL` without a scroll option, as in PostgreSQL. A
+`SCROLL` join cursor whose output list or filter calls a volatile function
+returns a revisited row's first values, as PostgreSQL's Material node does;
+without volatile functions it reads its input again to move back. A join the
+engine reads with index lookups per outer row still runs at `DECLARE`.
 
 A row-locking cursor locks each row when a `FETCH` or `MOVE` reaches it, not
 at `DECLARE`, after evaluating its output list and before `OFFSET` counts it:
@@ -278,8 +325,15 @@ DECLARE c CURSOR FOR SELECT id, v FROM orders ORDER BY id FOR UPDATE;
 FETCH 1 FROM c;  -- locks only the first row
 ```
 
-An ordered cursor first saves every qualifying row in `cursor_bytes` (a full
-buffer returns `54000` before any row is locked) and sorts them. A `FETCH` that
+An ordered cursor sorts at its first `FETCH`, as PostgreSQL's sort reads its
+whole input then: it saves the columns it reads of every row its filter
+passes in `cursor_bytes` (a full buffer returns `54000` before any row is
+returned or locked) and sorts them, keeping scan order for equal keys. Each
+row's output list is then evaluated when a fetch reaches it, so
+`SELECT v, nextval('s') FROM t ORDER BY id` takes numbers in sorted order, and
+a scrollable ordered cursor evaluates a revisited row's volatile output again
+without running its filter again. A row-locking ordered cursor saves whole
+rows. A `FETCH` that
 meets a row locked by another transaction waits like `SELECT ... FOR UPDATE`;
 `lock_timeout`, `statement_timeout` and cancel end the wait. A row changed by a
 transaction that committed after `DECLARE` is checked again: under `READ
@@ -317,7 +371,11 @@ COPY (SELECT id, status FROM orders ORDER BY id) TO STDOUT (FORMAT csv);
 
 Table-form `COPY TO` returns `42809` for a partitioned parent without an
 applicable row-security rewrite and `0A000` for an unpopulated materialized
-view. Views, foreign tables and catalog tables require query form.
+view. Views, foreign tables and catalog tables require query form. Otherwise
+it sends the rows of `SELECT columns FROM ONLY table`, in the same order a
+`SELECT` without `ORDER BY` returns them. A large `COPY ... TO STDOUT` from
+one table or a streamable query resumes row by row like a large `SELECT`:
+it waits for a slow client and for cold storage without holding the worker.
 
 `COPY FROM` statement triggers declared with
 `REFERENCING NEW TABLE AS inserted_rows` see the values saved after BEFORE
@@ -395,6 +453,19 @@ Evaluation order follows PostgreSQL:
   handler sees the original table. Cursors opened inside the failed block close;
   older cursors keep their position. See the
   [PostgreSQL reference results](https://github.com/e6qu/pos3ql/tree/854feb372391d1c87f3d5b261e85a78430d96449/tests/external/reference/2026-11-05-procedural-subtransactions).
+- `CALL` works inside `DO` blocks, procedures, functions and trigger
+  functions, assigning output parameters to the argument variables. A
+  procedure called from a `DO` block may `COMMIT`. A PL/pgSQL procedure or
+  `DO` block that waits for a lock, storage or `pg_sleep` resumes at the
+  waiting statement, also after its own `COMMIT` or `ROLLBACK`: finished
+  statements, inserts, sequence values and `pg_stat_user_functions` calls are
+  not repeated, and a write that was waiting runs again from its own start.
+  For example, `CALL import_batches()` that commits each batch keeps the
+  committed batches when a later batch waits for a row lock, and continues
+  with that batch once the lock is free. A lock timeout or cancel while it
+  waits ends only the current transaction; earlier commits stay.
+- `pg_sleep(1)` releases the SQL worker while it waits, so other connections
+  keep running; `statement_timeout` and cancel requests end the sleep.
 - DDL succeeds only after its end-of-command event triggers. A failing hook for
   `DO 'BEGIN CREATE TABLE orders(id integer); END'` leaves no `orders` table and
   sends no `DO` success tag. Static DDL in routines uses the same path as
@@ -510,7 +581,19 @@ deparsing can fail with `XX000`. This matches PostgreSQL's
 
 Information-schema views follow the pinned PostgreSQL 18.6
 [definitions](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql),
-including hiding definitions from non-owners and masking password fields.
+including hiding definitions from non-owners and masking password fields. Their
+columns have that script's domains (`sql_identifier`, `cardinal_number`,
+`character_data`, `yes_or_no`, `time_stamp`), which also exist as ordinary
+types with their CHECK constraints.
+
+Every table, materialized view and view has a row type named like the relation,
+usable in casts, columns and routine signatures; the relation owns it, so
+dropping the relation reaches the routines and columns that use it.
+
+Column defaults, CHECK constraints and routine defaults are printed in
+PostgreSQL's analyzed form for the expression shapes listed in
+[PLAN](../PLAN.md#close-application-compatibility-gaps): **example:**
+`DEFAULT 'x'` on a `text` column is `'x'::text` in `pg_get_expr`.
 
 - `tableoid` must be named explicitly.
 - Index vectors start at subscript zero and keep that bound when cast to

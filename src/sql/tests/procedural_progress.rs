@@ -2250,26 +2250,136 @@ fn unhandled_diagnostic_details_preserve_original_errors_at_small_control_capaci
 }
 
 #[test]
-fn procedural_bound_cursor_declarations_are_rejected_as_unsupported() {
+fn procedural_bound_cursors_open_with_checked_arguments() {
     let config = test_config("procedural-bound-cursor");
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    for declaration in [
-        "c CURSOR FOR SELECT 1",
-        "c SCROLL CURSOR FOR SELECT 1",
-        "c NO SCROLL CURSOR (n integer) FOR SELECT n",
+    session.success(
+        &mut engine,
+        "CREATE TABLE bound_rows(id integer, v text); \
+         INSERT INTO bound_rows VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        true,
+    );
+    // Expected values come from PostgreSQL 18.6.
+    for (function, call, expected) in [
+        (
+            "CREATE FUNCTION bound_plain() RETURNS text LANGUAGE plpgsql AS $$\
+             DECLARE c CURSOR FOR SELECT v FROM bound_rows ORDER BY id; r text; acc text := '';\
+             BEGIN OPEN c; LOOP FETCH c INTO r; EXIT WHEN NOT FOUND; acc := acc || r; END LOOP;\
+             CLOSE c; RETURN acc; END$$",
+            "SELECT bound_plain()",
+            "abc",
+        ),
+        (
+            // Positional and named arguments; the query also reads a
+            // routine parameter when the cursor opens.
+            "CREATE FUNCTION bound_arguments(lim integer) RETURNS text LANGUAGE plpgsql AS $$\
+             DECLARE c NO SCROLL CURSOR (lo int, hi integer) FOR \
+               SELECT v FROM bound_rows WHERE id BETWEEN lo AND hi AND id <= lim ORDER BY id;\
+             r text; acc text := '';\
+             BEGIN OPEN c(2, hi := 3); FETCH c INTO r; acc := acc || r; FETCH c INTO r;\
+             acc := acc || r; CLOSE c; OPEN c(lo => 1, hi => 1); FETCH c INTO r; CLOSE c;\
+             RETURN acc || r; END$$",
+            "SELECT bound_arguments(5)",
+            "bca",
+        ),
+        (
+            "CREATE FUNCTION bound_scroll() RETURNS integer LANGUAGE plpgsql AS $$\
+             DECLARE c SCROLL CURSOR IS SELECT id FROM bound_rows ORDER BY id; r integer;\
+             BEGIN OPEN c; FETCH LAST FROM c INTO r; FETCH PRIOR FROM c INTO r; RETURN r; END$$",
+            "SELECT bound_scroll()",
+            "2",
+        ),
+        (
+            // An assigned name names the portal.
+            "CREATE FUNCTION bound_renamed() RETURNS text LANGUAGE plpgsql AS $$\
+             DECLARE c CURSOR FOR SELECT 1; BEGIN c := 'renamed'; OPEN c;\
+             RETURN (SELECT string_agg(name, ',') FROM pg_cursors); END$$",
+            "SELECT bound_renamed()",
+            "renamed",
+        ),
+        (
+            // Arguments convert to their declared types and shadow the
+            // routine parameter of the same name.
+            "CREATE FUNCTION bound_typed(x numeric) RETURNS text LANGUAGE plpgsql AS $$\
+             DECLARE c CURSOR (x text) FOR SELECT pg_typeof(x)::text || ':' || x; r text;\
+             BEGIN OPEN c(x); FETCH c INTO r; RETURN r; END$$",
+            "SELECT bound_typed(1.5)",
+            "text:1.5",
+        ),
+    ] {
+        session.success(&mut engine, function, true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, &format!("BEGIN; {call}; COMMIT"), true)),
+            [expected],
+            "{call}"
+        );
+    }
+    // PostgreSQL 18 leaves a bound cursor variable NULL until OPEN names it,
+    // so opening it twice finds the generated portal already in use.
+    session.success(
+        &mut engine,
+        "CREATE FUNCTION bound_twice() RETURNS text LANGUAGE plpgsql AS $$\
+         DECLARE c CURSOR FOR SELECT 1; BEGIN OPEN c; OPEN c; RETURN 'x'; END$$",
+        true,
+    );
+    let response = session.execute(&mut engine, "BEGIN; SELECT bound_twice()", true);
+    assert_eq!(error_sqlstates(&response), ["42P03"]);
+    session.execute(&mut engine, "ROLLBACK", true);
+    // Argument mistakes are rejected when the routine is created.
+    for (body, message) in [
+        (
+            "DECLARE c CURSOR (x int) FOR SELECT x; BEGIN OPEN c; RETURN 'x'; END",
+            "cursor \"c\" has arguments",
+        ),
+        (
+            "DECLARE c CURSOR FOR SELECT 1; BEGIN OPEN c(1); RETURN 'x'; END",
+            "cursor \"c\" has no arguments",
+        ),
+        (
+            "DECLARE c CURSOR (x int) FOR SELECT x; BEGIN OPEN c(1, 2); RETURN 'x'; END",
+            "too many arguments for cursor \"c\"",
+        ),
+        (
+            "DECLARE c CURSOR (x int, y int) FOR SELECT x; BEGIN OPEN c(1); RETURN 'x'; END",
+            "not enough arguments for cursor \"c\"",
+        ),
+        (
+            "DECLARE c CURSOR (x int) FOR SELECT x; BEGIN OPEN c(z := 1); RETURN 'x'; END",
+            "cursor \"c\" has no argument named \"z\"",
+        ),
+        (
+            "DECLARE c CURSOR (x int, y int) FOR SELECT x; \
+             BEGIN OPEN c(x := 1, x := 2); RETURN 'x'; END",
+            "value for parameter \"x\" of cursor \"c\" specified more than once",
+        ),
+        (
+            "DECLARE c CURSOR FOR SELECT 1; BEGIN OPEN c FOR SELECT 2; RETURN 'x'; END",
+            "syntax error at or near \"FOR\"",
+        ),
     ] {
         let response = session.execute(
             &mut engine,
-            &format!(
-                "CREATE FUNCTION bound_cursor() RETURNS integer LANGUAGE plpgsql AS \
-                 $$DECLARE {declaration}; BEGIN RETURN 1; END$$"
-            ),
+            &format!("CREATE FUNCTION bound_invalid() RETURNS text LANGUAGE plpgsql AS $${body}$$"),
             true,
         );
-        assert_eq!(error_sqlstates(&response), ["0A000"], "{declaration}");
+        assert_eq!(error_sqlstates(&response), ["42601"], "{body}");
+        assert!(
+            String::from_utf8_lossy(&response).contains(message),
+            "{body}: {}",
+            String::from_utf8_lossy(&response)
+        );
     }
+    // A FOR loop over a bound cursor is rejected loudly.
+    let response = session.execute(
+        &mut engine,
+        "CREATE FUNCTION bound_loop() RETURNS text LANGUAGE plpgsql AS $$\
+         DECLARE c CURSOR (x int) FOR SELECT x * 2 AS d; rec record; acc text := '';\
+         BEGIN FOR rec IN c(21) LOOP acc := acc || rec.d; END LOOP; RETURN acc; END$$",
+        true,
+    );
+    assert_eq!(error_sqlstates(&response), ["0A000"]);
     // Locals merely named like the keywords keep their declared types.
     assert_eq!(
         data_rows(&session.success(

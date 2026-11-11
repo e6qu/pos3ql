@@ -20,6 +20,127 @@ use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, ValidationRead, 
 
 use super::{RowCtx, check_not_null};
 
+/// The longest prefix of one value PostgreSQL shows in a row description
+/// (`ExecBuildSlotValueDescription`'s `maxfieldlen`).
+const MAX_DESCRIBED_FIELD_BYTES: usize = 64;
+
+type DetailText = crate::util::StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>;
+
+fn detail_full() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "error detail exceeds {} bytes",
+        crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES
+    )
+}
+
+/// Writes `value`'s output text, cut to [`MAX_DESCRIBED_FIELD_BYTES`] at a
+/// character boundary and followed by `...` when longer, as PostgreSQL
+/// describes a failing row.
+fn write_described_value(out: &mut DetailText, value: Datum<'_>) {
+    use core::fmt::Write;
+    struct Clip<'o> {
+        out: &'o mut DetailText,
+        written: usize,
+        clipped: bool,
+    }
+    impl Write for Clip<'_> {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            for character in text.chars() {
+                if self.clipped {
+                    return Ok(());
+                }
+                if self.written + character.len_utf8() > MAX_DESCRIBED_FIELD_BYTES {
+                    self.clipped = true;
+                    return Ok(());
+                }
+                self.written += character.len_utf8();
+                self.out.write_char(character)?;
+            }
+            Ok(())
+        }
+    }
+    if value.is_null() {
+        let _ = out.write_str("null");
+        return;
+    }
+    let mut clip = Clip {
+        out,
+        written: 0,
+        clipped: false,
+    };
+    let _ = write!(clip, "{value}");
+    if clip.clipped {
+        let _ = clip.out.write_str("...");
+    }
+}
+
+/// `Failing row contains (...).`, PostgreSQL's detail for a row that
+/// violates a NOT NULL or CHECK constraint.
+pub(crate) fn failing_row_detail(values: &[Datum<'_>]) -> Result<DetailText, SqlError> {
+    use core::fmt::Write;
+    let mut detail = DetailText::new();
+    let _ = detail.write_str("Failing row contains (");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            let _ = detail.write_str(", ");
+        }
+        write_described_value(&mut detail, *value);
+    }
+    let _ = detail.write_str(").");
+    if detail.is_truncated() {
+        return Err(detail_full());
+    }
+    Ok(detail)
+}
+
+/// `Key (a, b)=(1, 2)`, PostgreSQL's description of an index key
+/// (`BuildIndexValueDescription`), written to `detail`.
+fn write_key_description(
+    detail: &mut DetailText,
+    label: &str,
+    columns: &mut dyn Iterator<Item = &str>,
+    values: &mut dyn Iterator<Item = Datum<'_>>,
+) {
+    use core::fmt::Write;
+    let _ = detail.write_str(label);
+    let _ = detail.write_str(" (");
+    for (index, column) in columns.enumerate() {
+        if index > 0 {
+            let _ = detail.write_str(", ");
+        }
+        let _ = detail.write_str(column);
+    }
+    let _ = detail.write_str(")=(");
+    for (index, value) in values.enumerate() {
+        if index > 0 {
+            let _ = detail.write_str(", ");
+        }
+        if value.is_null() {
+            let _ = detail.write_str("null");
+        } else {
+            let _ = write!(detail, "{value}");
+        }
+    }
+    let _ = detail.write_char(')');
+}
+
+/// A key description followed by `suffix`, such as ` already exists.`.
+pub(crate) fn key_detail<'v>(
+    columns: &mut dyn Iterator<Item = &str>,
+    values: &mut dyn Iterator<Item = Datum<'v>>,
+    suffix: core::fmt::Arguments<'_>,
+) -> Result<DetailText, SqlError> {
+    use core::fmt::Write;
+    let mut detail = DetailText::new();
+    write_key_description(&mut detail, "Key", columns, values);
+    let _ = detail.write_fmt(suffix);
+    if detail.is_truncated() {
+        return Err(detail_full());
+    }
+    Ok(detail)
+}
+
 type ValidationRowVisitor<'callback> =
     dyn for<'row> FnMut(u64, &'row [Datum<'row>]) -> Result<(), SqlError> + 'callback;
 
@@ -188,7 +309,7 @@ fn validate_domain_value(
     params: &[Datum],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
-    validate_domain_not_null(domain, value)?;
+    validate_domain_not_null(storage, txid, domain, value)?;
     for check in domain.checks() {
         validate_domain_check(
             storage, txid, domain, check, value, arena, params, sequences,
@@ -201,17 +322,45 @@ fn validate_domain_value(
 /// validation scan of `ALTER DOMAIN ... SET NOT NULL`; unrelated CHECK rules
 /// must not make that transition fail.
 pub(crate) fn validate_domain_not_null(
+    storage: &Storage,
+    txid: u32,
     domain: &crate::storage::DomainDef,
     value: Datum,
 ) -> Result<(), SqlError> {
     if value.is_null() && domain.not_null {
+        let name = domain_display_name(storage, txid, domain)?;
+        crate::sql::eval::stash_object_diagnostic(
+            None,
+            crate::sql::eval::ErrorObjects::datatype(
+                domain.schema.as_str(),
+                domain.name.as_str(),
+                None,
+            ),
+        );
         return Err(sql_err!(
             sqlstate::NOT_NULL_VIOLATION,
             "domain {} does not allow null values",
-            domain.name.as_str()
+            name.as_str()
         ));
     }
     Ok(())
+}
+
+/// A domain's name as PostgreSQL's `format_type_be` writes it: qualified
+/// only when the search path does not find it unqualified.
+fn domain_display_name(
+    storage: &Storage,
+    txid: u32,
+    domain: &crate::storage::DomainDef,
+) -> Result<crate::util::StackStr<260>, SqlError> {
+    let oid = crate::sql::types::oid::domain_oid(domain.creation());
+    crate::sql::catalog::user_type_name_fixed(storage, txid, oid)?.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "domain {} has no catalog type",
+            domain.name.as_str()
+        )
+    })
 }
 
 /// Enforces one named domain CHECK. This is deliberately separate from the
@@ -251,10 +400,19 @@ pub(crate) fn validate_domain_check<'a>(
             .map_err(SqlError::input_expression_failure)?,
         Datum::Bool(false)
     ) {
+        let name = domain_display_name(storage, txid, domain)?;
+        crate::sql::eval::stash_object_diagnostic(
+            None,
+            crate::sql::eval::ErrorObjects::datatype(
+                domain.schema.as_str(),
+                domain.name.as_str(),
+                Some(check.name.as_str()),
+            ),
+        );
         return Err(sql_err!(
             sqlstate::CHECK_VIOLATION,
             "value for domain {} violates check constraint \"{}\"",
-            domain.name.as_str(),
+            name.as_str(),
             check.name.as_str()
         ));
     }
@@ -276,7 +434,10 @@ pub(crate) fn column_domain_target(
     if bound.polymorphic_type().is_some() {
         return Ok(None);
     }
-    let Some(identity) = bound.user_type else {
+    let Some(identity) = bound.user_type.filter(|identity| {
+        identity.relation_row_type_creation().is_none()
+            && identity.information_schema_domain_binding().is_none()
+    }) else {
         return Ok(None);
     };
     let reference = crate::storage::TypeReference::from_bound_name(identity)?;
@@ -302,6 +463,29 @@ pub(crate) fn check_domain_constraints(
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     for (i, col) in def.columns().iter().enumerate() {
+        if let Some(domain) = col
+            .user_type
+            .and_then(crate::storage::UserTypeName::information_schema_domain_binding)
+        {
+            match (col.ctype, values.get(i).copied().unwrap_or(Datum::Null)) {
+                (ColType::Array(element), Datum::Array { raw, .. }) => {
+                    for item in crate::sql::array::elements(raw, element) {
+                        // The element's declared length applies as it does
+                        // to a scalar of the domain.
+                        let item = crate::sql::exec::apply_typmod(
+                            item,
+                            domain.base(),
+                            domain.base_type_mod(),
+                            arena,
+                        )?;
+                        domain.validate(&item)?;
+                    }
+                }
+                (ColType::Array(_), _) => {}
+                (_, value) => domain.validate(&value)?,
+            }
+            continue;
+        }
         let Some(slot) = column_domain_target(storage, col, txid)? else {
             continue;
         };
@@ -314,7 +498,39 @@ pub(crate) fn check_domain_constraints(
     Ok(())
 }
 
-fn unique_violation(name: SqlName) -> SqlError {
+/// 23505 for the key `columns` of `values`, with PostgreSQL's detail and
+/// the constraint's table.
+fn unique_violation(
+    name: SqlName,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    columns: &[u16],
+    values: &[Datum],
+) -> SqlError {
+    let names = columns
+        .iter()
+        .map(|column| def.columns()[*column as usize].name.as_str());
+    let keys = columns.iter().map(|column| values[*column as usize]);
+    described_unique_violation(name, def, &mut { names }, &mut { keys })
+}
+
+fn described_unique_violation<'v>(
+    name: SqlName,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    names: &mut dyn Iterator<Item = &str>,
+    keys: &mut dyn Iterator<Item = Datum<'v>>,
+) -> SqlError {
+    let detail = match key_detail(names, keys, format_args!(" already exists.")) {
+        Ok(detail) => detail,
+        Err(error) => return error,
+    };
+    crate::sql::eval::stash_object_diagnostic(
+        Some(detail.as_str()),
+        crate::sql::eval::ErrorObjects::table_constraint(
+            def.schema.as_str(),
+            def.name.as_str(),
+            name.as_str(),
+        ),
+    );
     sql_err!(
         sqlstate::UNIQUE_VIOLATION,
         "duplicate key value violates unique constraint \"{}\"",
@@ -626,6 +842,7 @@ fn enforce_expression_index_uniqueness<'a>(
     txid: u32,
     columns: &[u16],
     expressions: &[Option<&'a Expr<'a>>],
+    expression_texts: &[Option<&str>],
     collations: &[crate::sql::ast::Collation],
     operator_classes: &[crate::storage::IndexOperatorClass],
     nulls_not_distinct: bool,
@@ -644,6 +861,13 @@ fn enforce_expression_index_uniqueness<'a>(
     if !nulls_not_distinct && keys[..columns.len()].iter().any(Datum::is_null) {
         return Ok(());
     }
+    let violation = || {
+        let names = columns.iter().enumerate().map(|(position, column)| {
+            expression_texts[position].unwrap_or(def.columns()[*column as usize].name.as_str())
+        });
+        let values = keys[..columns.len()].iter().copied();
+        described_unique_violation(name, def, &mut { names }, &mut { values })
+    };
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
         if let Some(predicate) = predicate
             && !index_predicate_matches(storage, txid, def, other, predicate, arena)?
@@ -680,7 +904,7 @@ fn enforce_expression_index_uniqueness<'a>(
                 matches(&other)
             })?;
             if matched {
-                return Err(unique_violation(name));
+                return Err(violation());
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -707,7 +931,7 @@ fn enforce_expression_index_uniqueness<'a>(
                 "statement is waiting for a concurrent unique-key writer"
             ));
         }
-        Err(unique_violation(name))
+        Err(violation())
     })?;
     Ok(())
 }
@@ -849,7 +1073,7 @@ fn enforce_key_uniqueness(
                     ),
                 };
                 match matched {
-                    Ok(true) => result = Err(unique_violation(name)),
+                    Ok(true) => result = Err(unique_violation(name, def, columns, values)),
                     Ok(false) => {}
                     Err(e) => result = Err(e),
                 }
@@ -933,7 +1157,7 @@ fn committed_scan_uniqueness(
                 )
             })?;
             if matched {
-                return Err(unique_violation(name));
+                return Err(unique_violation(name, def, columns, values));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -989,7 +1213,7 @@ fn pending_scan_uniqueness(
                     "statement is waiting for a concurrent unique-key writer"
                 ));
             }
-            return Err(unique_violation(name));
+            return Err(unique_violation(name, def, columns, values));
         }
         Ok(ControlFlow::Continue(()))
     })?;
@@ -1056,7 +1280,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 matches(&other)
             })?;
             if matched {
-                return Err(unique_violation(name));
+                return Err(unique_violation(name, def, columns, values));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -1083,7 +1307,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 "statement is waiting for a concurrent unique-key writer"
             ));
         }
-        Err(unique_violation(name))
+        Err(unique_violation(name, def, columns, values))
     })?;
     Ok(())
 }
@@ -1538,11 +1762,13 @@ pub fn check_unique_indexes(
         let index_name = index.name_for(txid);
         let name = index_name;
         let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
+        let mut expression_texts = [None; crate::storage::MAX_INDEX_COLS];
         for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
             if let Some(source) = source {
                 let source = arena
                     .alloc_str(source.as_str())
                     .map_err(|_| crate::sql::eval::arena_full())?;
+                expression_texts[position] = Some(source);
                 expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
             }
         }
@@ -1589,6 +1815,7 @@ pub fn check_unique_indexes(
                 txid,
                 icols,
                 &expressions[..index.n_cols],
+                &expression_texts[..index.n_cols],
                 &index.collations[..index.n_cols],
                 &classes[..index.n_cols],
                 index.nulls_not_distinct,
@@ -2027,6 +2254,15 @@ fn check_row_checks(
             eval_full(expression, arena, params, &context, &hooks)?,
             Datum::Bool(false)
         ) {
+            let detail = failing_row_detail(&values[..def.columns().len()])?;
+            crate::sql::eval::stash_object_diagnostic(
+                Some(detail.as_str()),
+                crate::sql::eval::ErrorObjects::table_constraint(
+                    def.schema.as_str(),
+                    def.name.as_str(),
+                    c.name.as_str(),
+                ),
+            );
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::CHECK_VIOLATION,
                 "new row for relation \"{}\" violates check constraint \"{}\"",
@@ -2221,6 +2457,35 @@ fn enforce_exclusion_constraint(
                     return Ok(false);
                 }
             }
+            let names = || {
+                exclusion.columns[..exclusion.n_cols]
+                    .iter()
+                    .map(|column| def.columns()[*column as usize].name.as_str())
+            };
+            let mut existing_text = DetailText::new();
+            write_key_description(
+                &mut existing_text,
+                "key",
+                &mut names(),
+                &mut exclusion.columns[..exclusion.n_cols]
+                    .iter()
+                    .map(|column| other[*column as usize]),
+            );
+            let detail = key_detail(
+                &mut names(),
+                &mut exclusion.columns[..exclusion.n_cols]
+                    .iter()
+                    .map(|column| values[*column as usize]),
+                format_args!(" conflicts with existing {}.", existing_text.as_str()),
+            )?;
+            crate::sql::eval::stash_object_diagnostic(
+                Some(detail.as_str()),
+                crate::sql::eval::ErrorObjects::table_constraint(
+                    def.schema.as_str(),
+                    def.name.as_str(),
+                    exclusion.name.as_str(),
+                ),
+            );
             Ok(true)
         })?;
         if conflicts {
@@ -2291,12 +2556,7 @@ fn check_fk_child_one_at(
     let Some(parent_index) =
         storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
     else {
-        return Err(sql_err!(
-            sqlstate::FOREIGN_KEY_VIOLATION,
-            "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
-            def.name.as_str(),
-            fk.name.as_str()
-        ));
+        return Err(missing_parent_key(def, fk, values));
     };
     let parent = storage.table_def(parent_index, txid).clone();
     let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -2313,13 +2573,42 @@ fn check_fk_child_one_at(
     )? {
         Ok(())
     } else {
-        Err(sql_err!(
-            sqlstate::FOREIGN_KEY_VIOLATION,
-            "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
-            def.name.as_str(),
-            fk.name.as_str()
-        ))
+        Err(missing_parent_key(def, fk, values))
     }
+}
+
+/// 23503 for a referencing row whose key `values` has no parent row.
+fn missing_parent_key(
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    fk: &crate::storage::ForeignKey,
+    values: &[Datum],
+) -> SqlError {
+    let detail = key_detail(
+        &mut fk
+            .columns()
+            .iter()
+            .map(|column| def.columns()[*column as usize].name.as_str()),
+        &mut fk.columns().iter().map(|column| values[*column as usize]),
+        format_args!(" is not present in table \"{}\".", fk.parent.as_str()),
+    );
+    let detail = match detail {
+        Ok(detail) => detail,
+        Err(error) => return error,
+    };
+    crate::sql::eval::stash_object_diagnostic(
+        Some(detail.as_str()),
+        crate::sql::eval::ErrorObjects::table_constraint(
+            def.schema.as_str(),
+            def.name.as_str(),
+            fk.name.as_str(),
+        ),
+    );
+    sql_err!(
+        sqlstate::FOREIGN_KEY_VIOLATION,
+        "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+        def.name.as_str(),
+        fk.name.as_str()
+    )
 }
 
 /// Validates the current image of the row that created a deferred obligation.
@@ -3036,14 +3325,37 @@ pub(crate) fn apply_fk_parent_actions(
             }
             use crate::storage::FkAction as StorageFkAction;
             if existence_only {
-                let code = if action == StorageFkAction::Restrict {
-                    "23001"
+                // PostgreSQL names a RESTRICT action and drops "still" from
+                // its detail, since no deferral could change the outcome.
+                let restrict = action == StorageFkAction::Restrict;
+                let (code, setting, still) = if restrict {
+                    ("23001", "RESTRICT setting of ", "")
                 } else {
-                    "23503"
+                    ("23503", "", "still ")
                 };
+                let detail = key_detail(
+                    &mut parent_columns
+                        .iter()
+                        .map(|column| physical_parent.columns()[*column as usize].name.as_str()),
+                    &mut parent_columns
+                        .iter()
+                        .map(|column| old_parent[*column as usize]),
+                    format_args!(
+                        " is {still}referenced from table \"{}\".",
+                        cdef.name.as_str()
+                    ),
+                )?;
+                crate::sql::eval::stash_object_diagnostic(
+                    Some(detail.as_str()),
+                    crate::sql::eval::ErrorObjects::table_constraint(
+                        cdef.schema.as_str(),
+                        cdef.name.as_str(),
+                        fk.name.as_str(),
+                    ),
+                );
                 return Err(sql_err!(
                     code,
-                    "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
+                    "update or delete on table \"{}\" violates {setting}foreign key constraint \"{}\" on table \"{}\"",
                     parent_name,
                     fk.name.as_str(),
                     cdef.name.as_str()

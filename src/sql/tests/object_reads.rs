@@ -74,29 +74,11 @@ impl HttpObjectServer {
                     }
                     Err(error) => panic!("accept object read: {error}"),
                 };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
                 let mut request = [0u8; 8192];
-                let mut received = 0;
-                let header_end = loop {
-                    if let Some(at) = request[..received]
-                        .windows(4)
-                        .position(|bytes| bytes == b"\r\n\r\n")
-                    {
-                        break at + 4;
-                    }
-                    assert!(
-                        received < request.len(),
-                        "fixture request headers are too large"
-                    );
-                    let n = stream.read(&mut request[received..]).unwrap();
-                    assert_ne!(n, 0, "request ended before its headers");
-                    received += n;
+                let Some((received, header_end)) =
+                    crate::test_wait::read_request_head(&mut stream, &mut request, &server_stop)
+                else {
+                    break;
                 };
                 let headers = std::str::from_utf8(&request[..header_end]).unwrap();
                 let mut words = headers.lines().next().unwrap().split_whitespace();
@@ -458,7 +440,7 @@ pub(super) fn advance(engine: &mut Engine) {
 }
 
 pub(super) fn accept(engine: &mut Engine, listener: &TcpListener) -> (TcpStream, String) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     let mut stream = loop {
         advance(engine);
         match listener.accept() {
@@ -475,7 +457,7 @@ pub(super) fn accept(engine: &mut Engine, listener: &TcpListener) -> (TcpStream,
 }
 
 pub(super) fn read_request(engine: &mut Engine, stream: &mut TcpStream) -> String {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     stream.set_nonblocking(true).unwrap();
     let mut request = [0; 8192];
     let mut used = 0;
@@ -498,7 +480,7 @@ pub(super) fn read_request(engine: &mut Engine, stream: &mut TcpStream) -> Strin
     }
     stream.set_nonblocking(false).unwrap();
     stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
+        .set_write_timeout(Some(crate::test_wait::HANG))
         .unwrap();
     core::str::from_utf8(&request[..used]).unwrap().to_owned()
 }

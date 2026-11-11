@@ -33,6 +33,10 @@ struct SqlSource {
     owner: type_input_plans::Owner,
     input_source: type_inputs::Source,
     stored: Option<StoredSource>,
+    /// Whether the routine's declaration lets PostgreSQL inline a body that
+    /// is a single plain `SELECT` of one expression into its caller, which
+    /// then reports no context line for it.
+    inlinable: bool,
 }
 
 struct ParsedSource<'a> {
@@ -99,6 +103,16 @@ impl SqlSource {
                 }
                 None => type_inputs::validate_restored(parser, storage, transaction),
             },
+        )?;
+        super::check_called_sql_routine_result(
+            storage,
+            transaction,
+            &program,
+            self.kind,
+            &self.columns,
+            &self.parameters,
+            self.result_contract(storage, transaction, arena)?,
+            arena,
         )?;
         Ok(ParsedSource {
             text,
@@ -194,12 +208,54 @@ impl SqlResult {
                 Ok(())
             }
             Self::Rows(rows) => {
-                let width =
-                    if matches!(source.kind, crate::storage::RoutineKind::SetFunction { .. }) {
-                        1
-                    } else {
-                        source.columns.len()
-                    };
+                let set_function =
+                    matches!(source.kind, crate::storage::RoutineKind::SetFunction { .. });
+                // A set of composite values takes each row's columns as the
+                // fields unless the row is one value of that composite type.
+                if set_function
+                    && let ColType::Composite(Some(creation)) = source.return_type.ctype
+                    && !matches!(values, [Datum::Composite { slot, .. } | Datum::CompositeText { slot, .. }] if *slot == creation)
+                    && !matches!(values, [Datum::Null])
+                {
+                    let width = storage
+                        .require_row_type_definition(creation, txid)?
+                        .active_field_count();
+                    if values.len() != width {
+                        return Err(query::routine_result_width_mismatch(
+                            source.declared_result(storage, txid, arena)?,
+                            false,
+                            values.len(),
+                            width,
+                        ));
+                    }
+                    let fields = arena
+                        .alloc_slice_with(values.len(), |index| crate::sql::types::RecordField {
+                            name: "",
+                            type_oid: values[index].type_oid(),
+                            value: values[index],
+                        })
+                        .map_err(|_| query::arena_full_pub())?;
+                    for field in fields.iter_mut() {
+                        field.value = detach_routine_datum(field.value, arena)?;
+                    }
+                    let converted = arena
+                        .alloc_slice_with(1, |_| Datum::Null)
+                        .map_err(|_| query::arena_full_pub())?;
+                    converted[0] = coerce_routine_argument(
+                        Datum::Record(fields),
+                        source.return_type,
+                        storage,
+                        txid,
+                        arena,
+                        Some(sequences),
+                    )?;
+                    return rows.append(converted);
+                }
+                let width = if set_function {
+                    1
+                } else {
+                    source.columns.len()
+                };
                 if values.len() != width {
                     return Err(query::routine_result_width_mismatch(
                         source.declared_result(storage, txid, arena)?,
@@ -234,6 +290,34 @@ impl SqlResult {
             }
         }
     }
+}
+
+/// Whether PostgreSQL's `inline_function` would replace a call of this body
+/// by its expression: one `SELECT` of one expression with no other clause,
+/// subquery or set-returning call.
+fn inlined_by_postgresql(program: &query::RoutineFunctionProgram<'_>) -> bool {
+    let query::RoutineFunctionResult::Query(query::RoutineQuery::Select(select)) = program.result
+    else {
+        return false;
+    };
+    let [crate::sql::ast::SelectItem::Expr { expression, .. }] = select.items else {
+        return false;
+    };
+    program.preceding.is_empty()
+        && !select.distinct
+        && select.distinct_on.is_empty()
+        && select.from.is_none()
+        && select.where_clause.is_none()
+        && select.group_by.is_empty()
+        && select.grouping_sets.is_empty()
+        && select.having.is_none()
+        && select.order_by.is_empty()
+        && select.limit.is_none()
+        && select.offset.is_none()
+        && select.with.is_empty()
+        && select.set_body.is_none()
+        && select.locking.is_empty()
+        && !expression.contains_subquery()
 }
 
 pub(crate) struct SuspendedSqlFunction {
@@ -397,9 +481,23 @@ impl SqlExecution {
                     depth: context.txn.trigger_depth(),
                 });
         }
-        let result = type_input_plans::with_owner(self.source.owner, || {
-            type_inputs::with_source(self.source.input_source, parsed.text, parsed.inputs, || {
-                self.execute_body(parsed, arguments, context)
+        let name = self.source.name;
+        let frame = crate::sql::error_context::SqlFunctionFrame {
+            name: name.as_str(),
+            body: parsed.text,
+            statement: core::cell::Cell::new(0),
+            inlined: self.source.inlinable && inlined_by_postgresql(&parsed.program),
+        };
+        let result = crate::sql::error_context::within(&frame, || {
+            crate::sql::error_position::with_internal_source(parsed.text, || {
+                type_input_plans::with_owner(self.source.owner, || {
+                    type_inputs::with_source(
+                        self.source.input_source,
+                        parsed.text,
+                        parsed.inputs,
+                        || self.execute_body(parsed, arguments, context, &frame),
+                    )
+                })
             })
         });
         context.txn.write_completion_boundary = prior;
@@ -411,8 +509,10 @@ impl SqlExecution {
         parsed: &ParsedSource<'a>,
         arguments: &'a [Datum<'a>],
         context: &mut TriggerExecContext<'_, 'a, '_>,
+        frame: &crate::sql::error_context::SqlFunctionFrame<'_>,
     ) -> Result<FunctionOutput<'a>, SqlError> {
         while !self.finished_body {
+            frame.statement.set(self.step + 1);
             self.enter_step()?;
             let final_step = self.step == parsed.program.preceding.len();
             let mut command = if let Some(command) = self.command.take() {
@@ -503,6 +603,7 @@ impl SqlExecution {
                 let txid = context.txn.txid;
                 execute_procedural_query(
                     context,
+                    false,
                     (self.policy == query::RoutineExecution::Retained)
                         .then_some(&mut self.pending_query),
                     |storage, sequences| {
@@ -1022,6 +1123,11 @@ pub(in crate::sql) fn execute_sql_function<'a>(
                 owner: body_inputs.owner,
                 input_source: body_inputs.source,
                 stored,
+                inlinable: !routine.attributes.security_definer
+                    && !routine.attributes.strict
+                    && routine.config_count == 0
+                    && !routine.kind.is_set_returning()
+                    && routine.kind.function_result() != Some(ColType::Record),
             },
             arguments,
             result,

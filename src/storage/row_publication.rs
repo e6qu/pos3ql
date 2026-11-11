@@ -594,7 +594,7 @@ mod tests {
     use super::super::tests::{make_def, test_budget, test_config};
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     fn fixture(config: &Config) -> (Storage, usize) {
         let mut budget = test_budget(config);
@@ -1135,7 +1135,7 @@ mod tests {
                 crate::mem::guard::forbid_alloc(|| storage.restore_pending(table, 1, 7, undo));
                 finished.store(true, Ordering::Release);
             });
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::test_wait::deadline();
             while !started.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::yield_now();
             }
@@ -1158,7 +1158,7 @@ mod tests {
                 });
                 progressed.store(true, Ordering::Release);
             });
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::test_wait::deadline();
             while !progressed.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::yield_now();
             }
@@ -1647,7 +1647,7 @@ mod tests {
     #[test]
     fn row_read_ownership_retained_metadata_allows_unrelated_publication() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
         let config = test_config();
         let (mut storage, table) = fixture(&config);
         let original = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
@@ -1669,7 +1669,7 @@ mod tests {
                     finished.store(true, Ordering::Release);
                 });
             });
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::test_wait::deadline();
             while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::yield_now();
             }
@@ -1709,7 +1709,7 @@ mod tests {
                     undo
                 })
             });
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::yield_now();
             }
@@ -1766,7 +1766,7 @@ mod tests {
                     crate::mem::guard::forbid_alloc(|| storage.publish_pending_write(prepared));
                 send.send(result).unwrap();
             });
-            let result = receive.recv_timeout(Duration::from_secs(5));
+            let result = receive.recv_timeout(crate::test_wait::HANG);
             // Release before assertions so even the blocking regression can
             // finish its scope without stranding a worker.
             if matches!(result, Ok(Ok(PendingPublication::DefinitionBusy))) {
@@ -2083,7 +2083,7 @@ mod tests {
                         .sqlstate
                 })
             });
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             let mut publishing = false;
             while Instant::now() < deadline {
                 if storage.tables[table].rows.test_write().is_err() {

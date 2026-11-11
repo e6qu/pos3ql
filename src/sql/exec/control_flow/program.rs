@@ -46,7 +46,7 @@ impl ProgramSource {
             )
         })?;
         let program = parse_plpgsql_program(text, parsing, self.kind)?;
-        let code = CompiledProgram::new(self.clone(), program.body, program.locals, parsing)?;
+        let code = CompiledProgram::new(self.clone(), text, program.body, program.locals, parsing)?;
         Ok((program, code))
     }
 }
@@ -67,6 +67,8 @@ pub(in crate::sql::exec) struct ProgramLayout {
 }
 
 pub(in crate::sql::exec) struct CompiledProgram<'a> {
+    /// The program text every statement and declaration source slices.
+    text: &'a str,
     blocks: &'a [TriggerBlock<'a>],
     layout: ProgramLayout,
     pub(in crate::sql::exec) declarations: &'a [ParsedTriggerLocalDecl<'a>],
@@ -75,6 +77,7 @@ pub(in crate::sql::exec) struct CompiledProgram<'a> {
 impl<'a> CompiledProgram<'a> {
     fn new(
         source: ProgramSource,
+        text: &'a str,
         block: TriggerBlock<'a>,
         declarations: &'a [ParsedTriggerLocalDecl<'a>],
         arena: &'a Arena,
@@ -99,12 +102,16 @@ impl<'a> CompiledProgram<'a> {
         }
         let (count, depth, handlers) = layout(block);
         let blocks = arena
-            .alloc_slice_with(count, |_| TriggerBlock { statements: &[] })
+            .alloc_slice_with(count, |_| TriggerBlock {
+                statements: &[],
+                sources: &[],
+            })
             .map_err(|_| frame_full())?;
         let mut next = 0;
         compile(block, blocks, &mut next);
         assert_eq!(next, count);
         Ok(Self {
+            text,
             blocks,
             layout: ProgramLayout {
                 source,
@@ -125,6 +132,14 @@ impl<'a> CompiledProgram<'a> {
 
     pub(in crate::sql::exec) fn kind(&self) -> PlpgsqlProgramKind {
         self.layout.source.kind
+    }
+
+    /// The one-based line of `source`, a slice of the program text, as
+    /// PostgreSQL numbers a routine body's lines.
+    pub(in crate::sql::exec) fn line_of(&self, source: &str) -> Option<usize> {
+        let offset = (source.as_ptr() as usize).checked_sub(self.text.as_ptr() as usize)?;
+        let before = self.text.as_bytes().get(..offset)?;
+        Some(1 + before.iter().filter(|byte| **byte == b'\n').count())
     }
 
     pub(in crate::sql::exec) fn root(&self) -> TriggerBlock<'a> {

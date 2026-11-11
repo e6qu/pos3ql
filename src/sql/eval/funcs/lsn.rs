@@ -4,7 +4,7 @@ use crate::sql::ast::Expr;
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 
-use super::super::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate, type_mismatch};
+use super::super::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
 
 fn is_unknown(expression: &Expr<'_>) -> bool {
     matches!(expression, Expr::Str(_) | Expr::Null | Expr::Param(_))
@@ -20,7 +20,7 @@ fn lsn_argument<'a>(
             crate::sql::lsn::parse(value).map(Datum::PgLsn)
         }
         Datum::PgLsn(_) | Datum::Null => Ok(value),
-        other => Err(type_mismatch(name, &other)),
+        other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
     }
 }
 
@@ -39,7 +39,7 @@ fn numeric_argument<'a>(
         Datum::Text(value) if is_unknown(expression) => {
             crate::sql::numeric::Numeric::parse(value, arena)
         }
-        other => return Err(type_mismatch(name, &other)),
+        other => return Err(crate::sql::eval::function_argument_mismatch(name, &other)),
     }?;
     Ok(Datum::Numeric(numeric))
 }
@@ -105,29 +105,29 @@ pub(crate) fn dispatch<'a>(
         match name {
             "pg_lsn_in" => match left {
                 Datum::Text(value) => crate::sql::lsn::parse(value).map(Datum::PgLsn),
-                other => Err(type_mismatch(name, &other)),
+                other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
             },
             "pg_lsn_out" => match left {
                 Datum::PgLsn(value) => arena
                     .alloc_str_display(Datum::PgLsn(value))
                     .map(Datum::Text)
                     .map_err(|_| super::super::arena_full()),
-                other => Err(type_mismatch(name, &other)),
+                other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
             },
             "pg_lsn_send" => match left {
                 Datum::PgLsn(value) => arena
                     .alloc_slice_copy(&value.to_be_bytes())
                     .map(|bytes| Datum::Bytea(&*bytes))
                     .map_err(|_| super::super::arena_full()),
-                other => Err(type_mismatch(name, &other)),
+                other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
             },
             "pg_lsn" => match left {
                 Datum::Numeric(value) => crate::sql::lsn::from_numeric(&value).map(Datum::PgLsn),
-                other => Err(type_mismatch(name, &other)),
+                other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
             },
             "pg_lsn_hash" => match left {
                 Datum::PgLsn(value) => Ok(Datum::Int4(crate::sql::lsn::hash(value))),
-                other => Err(type_mismatch(name, &other)),
+                other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
             },
             _ => {
                 let right = eval_full(args[1], arena, params, row, hooks)?;
@@ -137,7 +137,9 @@ pub(crate) fn dispatch<'a>(
                         Datum::Int4(value) => Datum::Int8(i64::from(value)),
                         Datum::Oid(value) => Datum::Int8(i64::from(value)),
                         Datum::Int8(_) | Datum::Null => right,
-                        other => return Err(type_mismatch(name, &other)),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
                     },
                     "pg_lsn_pli" | "pg_lsn_mii" => numeric_argument(name, args[1], right, arena)?,
                     "numeric_pl_pg_lsn" => lsn_argument(name, args[1], right)?,
@@ -163,31 +165,31 @@ fn binary<'a>(
             (Datum::PgLsn(value), Datum::Int8(seed)) => {
                 Ok(Datum::Int8(crate::sql::lsn::hash_extended(value, seed)))
             }
-            (left, _) => Err(type_mismatch(name, &left)),
+            (left, _) => Err(crate::sql::eval::function_argument_mismatch(name, &left)),
         },
         "pg_lsn_mi" | "pg_wal_lsn_diff" => match (left, right) {
             (Datum::PgLsn(left), Datum::PgLsn(right)) => {
                 crate::sql::lsn::difference(left, right, arena).map(Datum::Numeric)
             }
-            (left, _) => Err(type_mismatch(name, &left)),
+            (left, _) => Err(crate::sql::eval::function_argument_mismatch(name, &left)),
         },
         "pg_lsn_pli" | "pg_lsn_mii" => match (left, right) {
             (Datum::PgLsn(value), Datum::Numeric(offset)) => {
                 crate::sql::lsn::shift(value, &offset, name == "pg_lsn_mii", arena)
                     .map(Datum::PgLsn)
             }
-            (left, _) => Err(type_mismatch(name, &left)),
+            (left, _) => Err(crate::sql::eval::function_argument_mismatch(name, &left)),
         },
         "numeric_pl_pg_lsn" => match (left, right) {
             (Datum::Numeric(offset), Datum::PgLsn(value)) => {
                 crate::sql::lsn::shift(value, &offset, false, arena).map(Datum::PgLsn)
             }
-            (left, _) => Err(type_mismatch(name, &left)),
+            (left, _) => Err(crate::sql::eval::function_argument_mismatch(name, &left)),
         },
         _ => {
             let (left, right) = match (left, right) {
                 (Datum::PgLsn(left), Datum::PgLsn(right)) => (left, right),
-                (left, _) => return Err(type_mismatch(name, &left)),
+                (left, _) => return Err(crate::sql::eval::function_argument_mismatch(name, &left)),
             };
             Ok(match name {
                 "pg_lsn_lt" => Datum::Bool(left < right),

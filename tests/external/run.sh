@@ -281,7 +281,10 @@ statistics_bytes = 1MiB
 statistics_leases = 1024
 result_spool_bytes = 16MiB
 result_spool_leases = 64
+plan_build_bytes = 16MiB
+plan_build_leases = 64
 result_stream_bytes = 256KiB
+result_stream_slots = 2
 index_statistics_slots = 4096
 max_value_indexes = 64
 max_prepared_transactions = 8
@@ -390,10 +393,12 @@ psql_run() { # <name>
   # Their ordering after `2>&1` is scheduler-dependent, so compare each
   # stream against the corresponding portion of the established golden file.
   local expected_out="$WORK/$name.expected.out" expected_err="$WORK/$name.expected.err"
-  # An error's cursor position follows it as psql's `LINE n:` and caret lines.
+  # An error's cursor position follows it as psql's `LINE n:` and caret
+  # lines, and its detail, hint, context and object-name lines are
+  # diagnostics too.
   awk -v out="$expected_out" -v err="$expected_err" \
     '/^psql:/ { cursor = 1; print > err; next }
-     cursor && (/^LINE [0-9]+: / || /^ *\^$/) { print > err; next }
+     cursor && (/^LINE [0-9]+: / || /^ *\^$/ || /^(DETAIL|HINT|QUERY|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|DATATYPE NAME|CONSTRAINT NAME):  /) { print > err; next }
      { cursor = 0; print > out }' \
     "$EXT/expected/$name.out"
   "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -a -q -P pager=off \
@@ -436,6 +441,7 @@ step "stalled result clients do not stall other sessions (object-store mode)"
 restart_main_server result-streams
 ensure_psycopg_venv || exit 1
 if "$VENV/bin/python" "$EXT/result_streams.py" --host 127.0.0.1 --p3 "$PG_PORT" \
+    --storage-mode object-store \
     > "$WORK/result_streams.out" 2>&1; then
   ok "stalled result clients"
 else
@@ -656,7 +662,10 @@ statistics_bytes = 1MiB
 statistics_leases = 1024
 result_spool_bytes = 16MiB
 result_spool_leases = 64
+plan_build_bytes = 16MiB
+plan_build_leases = 64
 result_stream_bytes = 256KiB
+result_stream_slots = 2
 index_statistics_slots = 4096
 listen_addr = 127.0.0.1:$((PG_PORT + 2))
 data_dir = ${WORK}/rpo0-data
@@ -761,7 +770,10 @@ statistics_bytes = 1MiB
 statistics_leases = 1024
 result_spool_bytes = 16MiB
 result_spool_leases = 64
+plan_build_bytes = 16MiB
+plan_build_leases = 64
 result_stream_bytes = 256KiB
+result_stream_slots = 2
 index_statistics_slots = 4096
 object_store = on
 object_store_endpoint = 127.0.0.1:${S3_TEST_PORT}
@@ -1244,7 +1256,10 @@ statistics_bytes = 1MiB
 statistics_leases = 1024
 result_spool_bytes = 16MiB
 result_spool_leases = 64
+plan_build_bytes = 16MiB
+plan_build_leases = 64
 result_stream_bytes = 256KiB
+result_stream_slots = 2
 index_statistics_slots = 4096
 max_value_indexes = 16
 max_replication_slots = 4
@@ -1581,7 +1596,10 @@ statistics_bytes = 1MiB
 statistics_leases = 1024
 result_spool_bytes = 16MiB
 result_spool_leases = 64
+plan_build_bytes = 16MiB
+plan_build_leases = 64
 result_stream_bytes = 256KiB
+result_stream_slots = 2
 index_statistics_slots = 4096
 listen_addr = 127.0.0.1:${STLS_PORT}
 data_dir = ${WORK}/server-tls-data

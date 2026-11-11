@@ -232,6 +232,7 @@ pub(super) fn visit_nested_blocks<'a>(
             | TriggerStatement::DynamicQuery(_)
             | TriggerStatement::DynamicSelectInto(_)
             | TriggerStatement::Utility { .. }
+            | TriggerStatement::Call { .. }
             | TriggerStatement::CursorOpen(_)
             | TriggerStatement::CursorMotion(_)
             | TriggerStatement::CursorClose(_)

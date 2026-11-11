@@ -1264,7 +1264,7 @@ fn lowered_assignment_inputs_bind_handler_variables_from_the_original_source() {
                 generation: 1,
                 statement: 0,
             },
-            TriggerInvocation::anonymous,
+            || TriggerInvocation::anonymous(crate::sql::guc::VariableConflict::Error),
         )
         .unwrap()
         .with_input_sites(program.input_sites);
@@ -1374,9 +1374,10 @@ fn lexical_variable_values_types_and_domains_select_one_binding() {
         generation: 1,
         statement: 0,
     };
-    let mut invocation =
-        super::super::super::type_input_plans::with_owner(owner, TriggerInvocation::anonymous)
-            .unwrap();
+    let mut invocation = super::super::super::type_input_plans::with_owner(owner, || {
+        TriggerInvocation::anonymous(crate::sql::guc::VariableConflict::Error)
+    })
+    .unwrap();
     invocation.program_kind = PlpgsqlProgramKind::Trigger;
     invocation.name = "actual trigger";
     let mut locals = ["tg_name", "found", "sqlstate", "sqlerrm"].map(|name| TriggerLocalDecl {
@@ -1527,6 +1528,7 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                         locals,
                         body: parsed.body,
                         input_sites: parsed.input_sites,
+                        variable_conflict: parsed.variable_conflict,
                     };
                     let result = validate_plpgsql_constant_assignments(&program, &|_| false);
                     match expected {

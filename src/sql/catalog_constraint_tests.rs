@@ -700,7 +700,10 @@ fn catalog_constraint_reports_use_postgresql_visibility_and_declared_types() {
            FROM information_schema.table_constraints WHERE constraint_name='constraint_child_parent';
          SELECT pg_typeof(table_catalog)::text,pg_typeof(table_name)::text
            FROM information_schema.constraint_table_usage WHERE constraint_name='constraint_child_parent'", true)),
-        ["name|name|character varying|character varying", "name|name"]);
+        [
+            "information_schema.sql_identifier|information_schema.sql_identifier|information_schema.character_data|information_schema.yes_or_no",
+            "information_schema.sql_identifier|information_schema.sql_identifier"
+        ]);
 }
 
 #[test]

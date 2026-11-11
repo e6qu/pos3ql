@@ -327,7 +327,7 @@ else bad "wire probes"; cat "$WORK/wire.out"; fi
 restart_p3_fresh || exit 1
 echo "=== stalled result clients (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/result_streams.py" --host 127.0.0.1 --p3 "$P3_PORT" \
-  --pg "$PGPORT" --user "$PGUSER" > "$WORK/result_streams.out" 2>&1; then
+  --pg "$PGPORT" --user "$PGUSER" --storage-mode local > "$WORK/result_streams.out" 2>&1; then
   ok "stalled result clients"
 else bad "stalled result clients"; cat "$WORK/result_streams.out"; fi
 

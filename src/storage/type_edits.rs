@@ -1000,7 +1000,7 @@ mod tests {
     #[test]
     fn type_retirement_wait_releases_catalog_and_revalidates_rollback() {
         use std::sync::atomic::Ordering;
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
         for (kind, block_images) in [
             (NamedTypeKind::Domain, false),
             (NamedTypeKind::Enum, false),
@@ -1035,7 +1035,7 @@ mod tests {
                             storage.finish_type_ddl(dropped, TypeDdlDecision::Commit)
                         })
                     });
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     while storage.definition_publication.waits.load(Ordering::Acquire) == before
                         && Instant::now() < deadline
                     {

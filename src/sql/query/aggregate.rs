@@ -100,8 +100,15 @@ pub(crate) fn fold_aggregates<'a>(
     let states: &mut [AggState] = arena
         .alloc_slice_with(agg_nodes.len(), |_| AggState::default())
         .map_err(|_| arena_full())?;
+    let scope_columns = super::ScopeCols(scope);
+    let outer_columns =
+        super::aggregate_outer_columns(Some(scope), outer_arg, storage, txid, arena);
+    let columns: &dyn crate::sql::exec::ColTypeResolver = match &outer_columns {
+        Some(columns) => columns,
+        None => &scope_columns,
+    };
     for (i, (_, node)) in agg_nodes.iter().enumerate() {
-        states[i].init(node, storage, txid, &super::ScopeCols(scope), arena)?;
+        states[i].init(node, storage, txid, columns, arena)?;
     }
     let recycling_safe = states[..agg_nodes.len()]
         .iter()
@@ -2847,6 +2854,29 @@ impl<'a> AggState<'a> {
                 "function array_agg(unknown) is not unique"
             )
         })?;
+        // Named composite members enter the array codec in their durable
+        // scalar form, as an ARRAY constructor stores them.
+        let values = if let crate::sql::types::ArrElem::Composite(Some(slot)) = element
+            && values
+                .iter()
+                .any(|value| matches!(value, Datum::Composite { .. }))
+        {
+            let catalog = catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "named composite catalog access is unavailable"
+                )
+            })?;
+            let members = arena.alloc_slice_copy(values).map_err(|_| arena_full())?;
+            for member in members.iter_mut() {
+                if matches!(member, Datum::Composite { .. }) {
+                    *member = catalog.composite_array_element(*member, slot, arena)?;
+                }
+            }
+            &*members
+        } else {
+            values
+        };
         let raw = crate::sql::array::build(values, arena)?;
         Ok(Datum::Array { element, raw })
     }
@@ -2924,8 +2954,10 @@ impl<'a> AggState<'a> {
             let out = arena
                 .alloc_slice_with(rows.len(), |_| Datum::Null)
                 .map_err(|_| arena_full())?;
+            // Records keep their structure: a whole-row value aggregated in
+            // ORDER BY order must reach the array or JSON as a record.
             for (i, &row) in rows.iter().enumerate() {
-                out[i] = crate::sql::exec::decode_projected_pub(row, 0);
+                out[i] = crate::sql::exec::decode_projected_col_record(row, 0, arena)?;
             }
             Ok(out)
         } else if self.distinct {

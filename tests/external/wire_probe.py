@@ -121,6 +121,15 @@ def simple_query(s, text):
             return out
 
 
+def read_until_ready(s):
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            return out
+
+
 def row_description_type_oids(payload):
     (count,) = struct.unpack("!h", payload[:2])
     at = 2
@@ -971,7 +980,10 @@ def test_paged_portal_capacity_is_a_named_error_not_a_disconnect():
     simple_query(s, "BEGIN")
     parse = frontend_message(
         b"P",
-        b"bounded_statement\x00SELECT repeat('x', 1024) FROM generate_series(1,100)\x00\x00\x00",
+        # Grouping is not a retained shape, so this paged portal buffers its
+        # whole result in portal_result_bytes.
+        b"bounded_statement\x00SELECT repeat('x', 1024) || g FROM generate_series(1,100) g "
+        b"GROUP BY g\x00\x00\x00",
     )
     bind = frontend_message(
         b"B", b"bounded_portal\x00bounded_statement\x00" + struct.pack("!hhh", 0, 0, 0)
@@ -988,7 +1000,7 @@ def test_paged_portal_capacity_is_a_named_error_not_a_disconnect():
     check(
         "bounded portal: result capacity reports 54000 and keeps the connection",
         b"C54000\x00" in error
-        and b"statement response exceeds its configured buffer" in error
+        and b"statement response exceeds portal_result_bytes" in error
         and output[-1][0] == b"Z",
         output,
     )
@@ -3001,7 +3013,7 @@ def test_catalog_definition_oid_over_raw_wire():
         first_text_row(definition)
         == "CREATE INDEX wire_catalog_definition_value_idx ON public.wire_catalog_definition USING btree "
         "(value COLLATE \"C\" DESC NULLS LAST) INCLUDE (id) "
-        "WITH (fillfactor='80', deduplicate_items=off) WHERE id > 0",
+        "WITH (fillfactor='80', deduplicate_items=off) WHERE (id > 0)",
         definition,
     )
     for missing_oid in (0x7FFFFFFF, 0x80000000, 0xFFFFFFFF):
@@ -3430,24 +3442,30 @@ def test_plpgsql_transaction_boundaries_over_raw_wire():
         not any(kind == b"E" for kind, _ in locked),
         locked,
     )
-    waited = simple_query(s, "CALL wire_plpgsql_wait_transaction()")
-    check(
-        "raw wire: a post-boundary wait is rejected instead of replayed",
-        has_sqlstate(waited, "0A000") and waited[-1][0] == b"Z",
-        waited,
-    )
+    # PostgreSQL's procedure waits for the row after its own COMMIT and then
+    # continues at the waiting statement; the committed prefix is not rerun.
+    s.sendall(frontend_message(b"Q", b"CALL wire_plpgsql_wait_transaction()\x00"))
+    time.sleep(0.5)
     simple_query(blocker, "COMMIT")
     blocker.close()
+    waited = read_until_ready(s)
     check(
-        "raw wire: the committed procedure prefix executes exactly once",
+        "raw wire: a post-boundary wait resumes at the waiting statement",
+        [kind for kind, _ in waited] == [b"C", b"Z"],
+        waited,
+    )
+    check(
+        "raw wire: the resumed procedure ran its committed prefix once",
         first_text_row(
             simple_query(
                 s,
                 "SELECT count(*) FILTER (WHERE phase = 'before') || ':' || "
-                "count(*) FILTER (WHERE phase = 'after') FROM wire_plpgsql_wait_log",
+                "count(*) FILTER (WHERE phase = 'after') || ':' || "
+                "(SELECT value FROM wire_plpgsql_wait_target WHERE id = 1) "
+                "FROM wire_plpgsql_wait_log",
             )
         )
-        == "1:0",
+        == "1:1:21",
     )
 
     reset = simple_query(
@@ -3456,7 +3474,7 @@ def test_plpgsql_transaction_boundaries_over_raw_wire():
         "UPDATE wire_plpgsql_wait_target SET value = 10 WHERE id = 1",
     )
     check(
-        "raw wire: extended wait replay setup succeeds",
+        "raw wire: extended wait setup succeeds",
         not any(kind == b"E" for kind, _ in reset),
         reset,
     )
@@ -3472,29 +3490,27 @@ def test_plpgsql_transaction_boundaries_over_raw_wire():
     bind = frontend_message(b"B", b"\x00\x00\x00\x00\x00\x00\x00\x00")
     execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
     s.sendall(parse + bind + execute + frontend_message(b"S"))
-    waited = []
-    while True:
-        item = read_message(s)
-        waited.append(item)
-        if item[0] == b"Z":
-            break
-    check(
-        "raw wire: extended CALL never replays a committed prefix",
-        has_sqlstate(waited, "0A000") and waited[-1][0] == b"Z",
-        waited,
-    )
+    time.sleep(0.5)
     simple_query(blocker, "COMMIT")
     blocker.close()
+    waited = read_until_ready(s)
     check(
-        "raw wire: extended CALL committed its prefix once",
+        "raw wire: extended CALL resumes at the waiting statement",
+        [kind for kind, _ in waited] == [b"1", b"2", b"C", b"Z"],
+        waited,
+    )
+    check(
+        "raw wire: extended CALL ran its committed prefix once",
         first_text_row(
             simple_query(
                 s,
                 "SELECT count(*) FILTER (WHERE phase = 'before') || ':' || "
-                "count(*) FILTER (WHERE phase = 'after') FROM wire_plpgsql_wait_log",
+                "count(*) FILTER (WHERE phase = 'after') || ':' || "
+                "(SELECT value FROM wire_plpgsql_wait_target WHERE id = 1) "
+                "FROM wire_plpgsql_wait_log",
             )
         )
-        == "1:0",
+        == "1:1:31",
     )
     s.close()
 

@@ -47,6 +47,16 @@ SELECT (json_each('{"k":1}')).value;
 SELECT pg_typeof((json_each('{"k":1}')).value);
 SELECT (jsonb_each_text('{"k":1}')).*;
 SELECT (json_array_elements('[1,2]')).*;
+-- Expanding a value that is not a row names its type.
+SELECT (1).*;
+SELECT ('a'::text).*;
+SELECT (NULL).*;
+SELECT (ARRAY[1]).*;
+SELECT (x).* FROM (VALUES (1)) v(x);
+SELECT (rt.b).* FROM rt;
+CREATE DOMAIN record_access_scalar AS int;
+SELECT (1::record_access_scalar).*;
+DROP DOMAIN record_access_scalar;
 
 -- Derived tables and CTEs: whole-row access over their columns.
 SELECT (v).a, (v.*).b FROM (SELECT 1 AS a, 'z'::text AS b) v;

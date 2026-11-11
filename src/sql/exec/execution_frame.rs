@@ -58,6 +58,8 @@ pub(super) struct SuspendedExecutionFrame {
     pending_write: Option<write_completion::PendingNestedWrite>,
     pending_statement: Option<super::super::sequence::SavedStatementPosition>,
     pending_query: Option<super::super::query::RoutineInvocationState>,
+    expressions: local_values::ExpressionProgress,
+    pending_call: Option<procedure_execution::SuspendedProcedure>,
     initialization: Initialization,
 }
 
@@ -125,6 +127,8 @@ impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
             pending_write,
             pending_statement,
             pending_query,
+            expressions,
+            pending_call,
         } = self.status;
         Ok(SuspendedExecutionFrame {
             locals,
@@ -140,6 +144,8 @@ impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
             pending_write,
             pending_statement,
             pending_query,
+            expressions,
+            pending_call,
             initialization: self.initialization,
         })
     }
@@ -176,6 +182,8 @@ impl SuspendedExecutionFrame {
             pending_write,
             pending_statement,
             pending_query,
+            expressions,
+            pending_call,
             initialization,
         } = self;
         let mark = arena.mark();
@@ -195,6 +203,8 @@ impl SuspendedExecutionFrame {
                         pending_write,
                         pending_statement,
                         pending_query,
+                        expressions,
+                        pending_call,
                         initialization,
                     },
                     error,
@@ -215,6 +225,8 @@ impl SuspendedExecutionFrame {
                 pending_write,
                 pending_statement,
                 pending_query,
+                expressions,
+                pending_call,
                 initialization,
             };
             // SAFETY: suspension removed all references created while decoding.
@@ -239,6 +251,8 @@ impl SuspendedExecutionFrame {
                 pending_write,
                 pending_statement,
                 pending_query,
+                expressions,
+                pending_call,
             },
             initialization,
         })

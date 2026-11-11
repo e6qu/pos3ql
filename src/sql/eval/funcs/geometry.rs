@@ -629,7 +629,7 @@ fn polygon_from_circle<'a>(
     if count < 2 {
         return Err(sql_err!(
             sqlstate::INVALID_PARAMETER_VALUE,
-            "polygon must have at least 2 points"
+            "must request at least 2 points"
         ));
     }
     let (circle, _, _) = points_parts(GeometryKind::Circle, text, arena)?;
@@ -999,7 +999,7 @@ pub(crate) fn dispatch<'a>(
                     let count = usize::try_from(count).map_err(|_| {
                         sql_err!(
                             sqlstate::INVALID_PARAMETER_VALUE,
-                            "polygon must have at least 2 points"
+                            "must request at least 2 points"
                         )
                     })?;
                     return polygon_from_circle(

@@ -80,3 +80,31 @@ fn sql_functions_run_data_modifying_with_queries_once() {
         );
     });
 }
+
+#[test]
+fn plpgsql_statements_read_ordinary_with_queries() {
+    with_engine("plpgsql-ordinary-with", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE FUNCTION listed() RETURNS SETOF int LANGUAGE plpgsql AS $$ BEGIN \
+             RETURN QUERY WITH c AS (SELECT 1 UNION ALL SELECT 2) SELECT * FROM c; END $$",
+        );
+        assert_eq!(
+            data_rows(&run_with(engine, budget, "SELECT * FROM listed()")),
+            ["1", "2"]
+        );
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "DO $$ DECLARE r record; t int := 0; n int; BEGIN \
+                 FOR r IN WITH c AS (SELECT g FROM generate_series(1, 3) g) SELECT g FROM c \
+                 LOOP t := t + r.g; END LOOP; \
+                 WITH c AS MATERIALIZED (SELECT 4 v) SELECT v INTO n FROM c; \
+                 RAISE NOTICE '% %', t, n; END $$",
+            )),
+            ["NOTICE 00000 6 4", "DO"]
+        );
+    });
+}

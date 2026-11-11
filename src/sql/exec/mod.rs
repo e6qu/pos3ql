@@ -19345,7 +19345,7 @@ fn bind_plpgsql_dml_ctes<'a>(
     query: &'a Select<'a>,
 ) -> Result<(&'a Select<'a>, MaterializedWithQueries<'a>), SqlError> {
     if !query.with.iter().any(|cte| cte.dml.is_some()) {
-        return Ok((query, &[]));
+        return Ok((expand_plpgsql_with(context, query)?, &[]));
     }
     let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
         return Err(sql_err!(
@@ -19383,7 +19383,32 @@ fn bind_plpgsql_dml_ctes<'a>(
         context.txn.txid,
         arena,
     )?;
-    Ok((bound, materialized))
+    Ok((expand_plpgsql_with(context, bound)?, materialized))
+}
+
+/// Binds a query's ordinary `WITH` queries. A materialized one only
+/// describes its rows here and runs when the query first reads them.
+fn expand_plpgsql_with<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    query: &'a Select<'a>,
+) -> Result<&'a Select<'a>, SqlError> {
+    if query.with.is_empty() {
+        return Ok(query);
+    }
+    let sequences = crate::sql::sequence::SeqEval::new(
+        context.storage(),
+        context.seq_session(),
+        context.txn.txid,
+    );
+    super::query::expand_ctes_exec(
+        query,
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+        context.params,
+        &[],
+        Some(&sequences),
+    )
 }
 
 /// Runs the data-modifying `WITH` queries of `query` that nothing read.
@@ -20200,7 +20225,10 @@ fn parse_trigger_for_header<'a>(
         )?;
         return Ok(Some((variable, TriggerForSource::DynamicQuery(query))));
     }
-    if strip_trigger_keyword(source, "select").is_some() {
+    if strip_trigger_keyword(source, "select").is_some()
+        || (strip_trigger_keyword(source, "with").is_some()
+            && plpgsql_with_main_keyword(source, arena)? == Some("select"))
+    {
         return Ok(Some((
             variable,
             TriggerForSource::Query(parse_plpgsql_query(source, source, arena)?),
@@ -30763,6 +30791,13 @@ fn execute_trigger_step_in<'a>(
                         };
                         let values = match program.source {
                             TriggerForSource::Query(query) => {
+                                if query.with.iter().any(|cte| cte.dml.is_some()) {
+                                    return Err(sql_err!(
+                                        sqlstate::FEATURE_NOT_SUPPORTED,
+                                        "data-modifying WITH queries are not supported in a FOR loop query"
+                                    ));
+                                }
+                                let query = expand_plpgsql_with(&context, query)?;
                                 let query = match transition_relations {
                                     Some(relations) => super::query::bind_materialized_relations(
                                         query,

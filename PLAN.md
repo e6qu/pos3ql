@@ -289,8 +289,10 @@ target and expression count errors are positioned. Under
 `0A000`: aggregate inputs and grouping keys bind names to columns before the
 variable could win. PL/pgSQL `SELECT ... INTO`, `PERFORM` and `RETURN QUERY` run a
 data-changing `WITH`, but other routine positions do not: a PL/pgSQL
-`WITH ... INSERT/UPDATE/DELETE` statement and `FOR ... IN WITH ...` are
-rejected as an unsupported body, `EXECUTE` and a cursor's query report the
+`WITH ... INSERT/UPDATE/DELETE` statement is rejected as an unsupported
+body, `FOR ... IN WITH ...` rejects a data-modifying `WITH` with `0A000`, a
+`WITH` query of a PL/pgSQL statement cannot read the routine's variables
+(the materialized query runs without the enclosing row), `EXECUTE` and a cursor's query report the
 `WITH` name unknown, and a trigger function rejects it with `0A000`. A
 SQL-language function's query runs them before reading, as a top-level
 query does. These need the routine's write

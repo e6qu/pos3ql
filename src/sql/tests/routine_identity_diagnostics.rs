@@ -55,7 +55,13 @@ pub(super) type Expected = (char, &'static str, &'static str);
 
 /// Expected PostgreSQL 18.6 diagnostics, captured from a reference server.
 pub(super) fn check(cases: &[(&str, &[Expected])]) {
-    let config = test_config("routine-identity-diagnostics");
+    // Tests share this helper and run in parallel: each needs its own data
+    // directory.
+    let test = std::thread::current();
+    let config = test_config(&format!(
+        "routine-identity-diagnostics-{}",
+        test.name().unwrap_or("main").replace("::", "-")
+    ));
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);

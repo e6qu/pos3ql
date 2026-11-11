@@ -303,8 +303,13 @@ Functions and expressions:
   convert to their declared types and the query reads them by name. As in
   PostgreSQL 18 the variable stays NULL until `OPEN` names the portal, and
   argument mistakes fail with `42601` when the routine is created.
-  `FOR rec IN c LOOP` over a bound cursor is rejected with `0A000`; open the
-  cursor and `FETCH` in a `LOOP` instead.
+  `FOR rec IN c LOOP` (or `FOR rec IN c(2) LOOP`) opens the cursor as a
+  portal listed in `pg_cursors`, fetches one row per iteration into its own
+  record `rec`, and closes the portal when the loop ends by any route. While
+  the loop runs, `CLOSE c` fails with `24000` (`cannot drop pinned portal`)
+  and an already open cursor fails with `42P03`; a variable that was NULL is
+  NULL again after the loop. `COMMIT` or `ROLLBACK` inside a procedure's
+  cursor loop keeps the loop reading, as PostgreSQL holds the portal.
 - User error codes such as `PZ001` behave as ordinary errors: `WHEN SQLSTATE
   'PZ001'`, `'PZ000'` (category match), or `WHEN OTHERS` catch them.
 - `pg_input_is_valid` and `pg_input_error_info` report invalid values, but an

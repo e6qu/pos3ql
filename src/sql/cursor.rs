@@ -170,6 +170,9 @@ struct CursorSlot {
     /// Created in the still-open transaction: a rollback closes it even WITH
     /// HOLD (holdability begins at commit, as PostgreSQL has it).
     tentative: bool,
+    /// A PL/pgSQL cursor `FOR` loop is reading it: it cannot be closed
+    /// until the loop ends, as PostgreSQL pins the loop's portal.
+    pinned: bool,
     failed: bool,
     query: CursorQuery,
     description: FixedBuf,
@@ -199,7 +202,24 @@ struct CursorSlot {
     position: i64,
 }
 
+fn pinned_portal(name: &str) -> SqlError {
+    sql_err!(
+        sqlstate::INVALID_CURSOR_STATE,
+        "cannot drop pinned portal \"{}\"",
+        name
+    )
+}
+
 impl CursorSlot {
+    fn close(&mut self) {
+        self.query.clear();
+        self.active = false;
+        self.tentative = false;
+        self.pinned = false;
+        self.plan_generation = None;
+        self.open_site = None;
+    }
+
     fn reset_rows(&mut self) {
         self.rows.clear();
         self.rows.clear_tail();
@@ -649,6 +669,7 @@ impl CursorPool {
                 hold: false,
                 binary: false,
                 tentative: false,
+                pinned: false,
                 failed: false,
                 query: CursorQuery::new(budget, config.cursor_query_bytes)?,
                 description: FixedBuf::new(budget, "cursor_description", DESCRIPTION_BYTES)?,
@@ -769,6 +790,7 @@ impl CursorPool {
         slot.hold = hold;
         slot.binary = binary;
         slot.tentative = true;
+        slot.pinned = false;
         slot.failed = false;
         slot.query.clear();
         slot.description.clear();
@@ -1452,11 +1474,7 @@ impl CursorPool {
 
     /// Drops a half-built slot after a failed DECLARE.
     pub fn abandon(&mut self, at: usize) {
-        self.slots[at].query.clear();
-        self.slots[at].active = false;
-        self.slots[at].tentative = false;
-        self.slots[at].plan_generation = None;
-        self.slots[at].open_site = None;
+        self.slots[at].close();
     }
 
     pub fn exists(&self, name: &str) -> bool {
@@ -1484,6 +1502,16 @@ impl CursorPool {
     }
 
     pub(crate) fn unnamed_name(&mut self) -> Result<StackStr<128>, SqlError> {
+        // An OPEN that waited while opening resumes under the name it was
+        // given, so the waiting reservation and its variable agree.
+        if let Some(slot) = self.slots.iter().find(|slot| {
+            !slot.active
+                && slot.plan_generation.is_some()
+                && slot.open_site.is_some()
+                && slot.name.as_str().starts_with("<unnamed portal ")
+        }) {
+            return Ok(crate::stack_format!(128, "{}", slot.name.as_str()));
+        }
         for _ in 0..=self.slots.len() {
             let name = crate::stack_format!(128, "<unnamed portal {}>", self.next_unnamed);
             self.next_unnamed = self.next_unnamed.checked_add(1).ok_or_else(|| {
@@ -1654,29 +1682,63 @@ impl CursorPool {
     }
 
     /// CLOSE name — false when no such cursor exists.
-    pub fn close(&mut self, name: &str) -> bool {
-        match self.find(name) {
-            Some(at) => {
-                self.slots[at].query.clear();
-                self.slots[at].active = false;
-                self.slots[at].tentative = false;
-                self.slots[at].plan_generation = None;
-                self.slots[at].open_site = None;
-                true
-            }
-            None => false,
+    /// Closes cursor `name`; `false` when no such cursor is open. A cursor
+    /// a `FOR` loop reads is pinned and cannot be closed.
+    pub fn close(&mut self, name: &str) -> Result<bool, SqlError> {
+        let Some(at) = self.find(name) else {
+            return Ok(false);
+        };
+        if self.slots[at].pinned {
+            return Err(pinned_portal(name));
         }
+        self.slots[at].close();
+        Ok(true)
     }
 
     /// CLOSE ALL.
-    pub fn close_all(&mut self) {
-        for s in &mut self.slots {
-            s.query.clear();
-            s.active = false;
-            s.tentative = false;
-            s.plan_generation = None;
-            s.open_site = None;
+    pub fn close_all(&mut self) -> Result<(), SqlError> {
+        if let Some(slot) = self.slots.iter().find(|slot| slot.active && slot.pinned) {
+            return Err(pinned_portal(slot.name.as_str()));
         }
+        for slot in &mut self.slots {
+            slot.close();
+        }
+        Ok(())
+    }
+
+    /// Pins open cursor `name` for a `FOR` loop that reads it.
+    pub(crate) fn pin(&mut self, name: &str) -> Result<(), SqlError> {
+        let at = self.find(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_CURSOR,
+                "cursor \"{}\" does not exist",
+                name
+            )
+        })?;
+        self.slots[at].pinned = true;
+        Ok(())
+    }
+
+    /// Closes the cursor a finished `FOR` loop pinned; a transaction or
+    /// savepoint rollback may have closed it already.
+    pub(crate) fn close_pinned(&mut self, name: &str) {
+        if let Some(at) = self.find(name) {
+            self.slots[at].close();
+        }
+    }
+
+    /// Makes every pinned cursor holdable before a procedure ends its
+    /// transaction, as PostgreSQL's `HoldPinnedPortals` does, so a `FOR`
+    /// loop keeps reading after `COMMIT` or `ROLLBACK`.
+    pub(crate) fn hold_pinned(&mut self) -> bool {
+        let mut held = false;
+        for slot in &mut self.slots {
+            if slot.active && slot.pinned && !slot.hold {
+                slot.hold = true;
+                held = true;
+            }
+        }
+        held
     }
 
     pub(crate) fn next_hold_source(&self) -> Option<usize> {
@@ -1741,6 +1803,16 @@ impl CursorPool {
             .any(|slot| slot.active && slot.tentative && slot.hold)
     }
 
+    /// The pinned cursors a procedure's `ROLLBACK` saved survive it, as
+    /// committed holdable cursors do.
+    pub(crate) fn keep_held_pinned(&mut self) {
+        for slot in &mut self.slots {
+            if slot.active && slot.pinned && slot.hold {
+                slot.tentative = false;
+            }
+        }
+    }
+
     /// Transaction commit: cursors become holdable or die.
     pub fn on_commit(&mut self) {
         for s in &mut self.slots {
@@ -1748,10 +1820,7 @@ impl CursorPool {
                 if s.active && s.hold {
                     s.tentative = false;
                 } else {
-                    s.query.clear();
-                    s.active = false;
-                    s.plan_generation = None;
-                    s.open_site = None;
+                    s.close();
                 }
             }
         }
@@ -1762,10 +1831,7 @@ impl CursorPool {
     pub fn on_rollback(&mut self) {
         for s in &mut self.slots {
             if (s.active || s.plan_generation.is_some()) && (s.tentative || !s.hold) {
-                s.query.clear();
-                s.active = false;
-                s.plan_generation = None;
-                s.open_site = None;
+                s.close();
             }
         }
     }
@@ -1997,7 +2063,7 @@ mod ownership_tests {
             pool.on_commit();
             pool.on_rollback();
             assert!(pool.contains_plan_owner(held));
-            assert!(pool.close("same"));
+            assert!(pool.close("same").unwrap());
             assert!(!pool.contains_plan_owner(held));
             let at = pool
                 .open("same", "SELECT 3", CursorScroll::Default, false, false, 1)
@@ -2059,7 +2125,7 @@ mod ownership_tests {
                 sqlstate::DUPLICATE_CURSOR
             );
             pool.fail("failed");
-            assert!(pool.close("failed"));
+            assert!(pool.close("failed").unwrap());
             assert!(!pool.exists("failed"));
         });
     }

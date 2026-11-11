@@ -835,7 +835,10 @@ fn sorted_results_stream_rows_as_the_client_reads() {
             ),
             3000,
         ),
-        ("SELECT id, payload FROM big ORDER BY payload, id DESC", 5000),
+        (
+            "SELECT id, payload FROM big ORDER BY payload, id DESC",
+            5000,
+        ),
         // DISTINCT ON returns each first row of the sort.
         ("SELECT DISTINCT ON (id / 2) id, payload FROM big", 2501),
         (

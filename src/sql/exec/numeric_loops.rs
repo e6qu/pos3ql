@@ -148,11 +148,13 @@ fn frame_layout(
     counts: &mut [usize],
 ) {
     visit_nested_blocks(block, |block, edge| {
-        if let BlockEdge::Numeric(name) = edge {
+        if let BlockEdge::Numeric(name) | BlockEdge::Cursor(name) = edge {
             let existing = locals.iter().any(|local| local.name == name)
                 || counters.is_some_and(|parent| parent.contains(name));
-            // Only a fresh name adds a slot; shadowed counters reuse one.
-            let count = count + usize::from(!existing);
+            // Only a fresh name adds a slot; shadowed counters reuse one. A
+            // cursor loop also keeps its portal's name in a slot of its own.
+            let count =
+                count + usize::from(!existing) + usize::from(matches!(edge, BlockEdge::Cursor(_)));
             counts[depth] = counts[depth].max(count);
             let counter = CounterName {
                 name,
@@ -175,8 +177,10 @@ fn frame_full() -> SqlError {
 fn numeric_depth(block: TriggerBlock<'_>) -> usize {
     let mut depth = 0;
     visit_nested_blocks(block, |block, edge| {
-        depth =
-            depth.max(numeric_depth(block) + usize::from(matches!(edge, BlockEdge::Numeric(_))));
+        depth = depth.max(
+            numeric_depth(block)
+                + usize::from(matches!(edge, BlockEdge::Numeric(_) | BlockEdge::Cursor(_))),
+        );
     });
     depth
 }
@@ -184,7 +188,11 @@ fn numeric_depth(block: TriggerBlock<'_>) -> usize {
 #[derive(Clone, Copy)]
 pub(super) enum BlockEdge {
     Ordinary,
+    /// An integer `FOR` loop, which declares its counter.
     Numeric(SqlName),
+    /// A cursor `FOR` loop, which declares its record and keeps its portal's
+    /// name in a hidden slot.
+    Cursor(SqlName),
     Handler,
 }
 
@@ -197,10 +205,12 @@ pub(super) fn visit_nested_blocks<'a>(
         match statement {
             TriggerStatement::For(program) => visit(
                 program.block,
-                if matches!(program.source, TriggerForSource::Numeric { .. }) {
-                    BlockEdge::Numeric(program.target)
-                } else {
-                    BlockEdge::Ordinary
+                match program.source {
+                    TriggerForSource::Numeric { .. } => BlockEdge::Numeric(program.target),
+                    TriggerForSource::Cursor { .. } => BlockEdge::Cursor(program.target),
+                    TriggerForSource::Query(_)
+                    | TriggerForSource::DynamicQuery(_)
+                    | TriggerForSource::Array { .. } => BlockEdge::Ordinary,
                 },
             ),
             TriggerStatement::If(program) => {

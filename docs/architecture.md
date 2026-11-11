@@ -190,6 +190,7 @@ BY id` sorts first, so its output queues in the spool instead.
 | Writing statements: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, DDL, `COPY FROM` | Blocks for the whole statement |
 | Top-level `CALL` and `DO` bodies: queries before the statement's first effect | Yields; the body resumes at its waiting statement |
 | Writes and statements after the first effect inside a `CALL` or `DO` body | Blocks |
+| PL/pgSQL `OPEN`, `FETCH` and cursor `FOR` loops reading cold rows (a lock wait parks) | Blocks |
 | Commit processing, deferred constraint triggers, `SET CONSTRAINTS`, `PREPARE TRANSACTION`, `COMMIT PREPARED`/`ROLLBACK PREPARED` | Blocks |
 | `COPY FROM` rows and completion; a `COPY TO` that cannot stream once its first byte reaches the client; logical-replication apply and initial copy | Blocks |
 | Large-object fast-path calls, login event triggers, manual `CHECKPOINT` | Blocks |

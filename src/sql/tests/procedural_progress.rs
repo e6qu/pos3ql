@@ -2371,15 +2371,18 @@ fn procedural_bound_cursors_open_with_checked_arguments() {
             String::from_utf8_lossy(&response)
         );
     }
-    // A FOR loop over a bound cursor is rejected loudly.
-    let response = session.execute(
-        &mut engine,
-        "CREATE FUNCTION bound_loop() RETURNS text LANGUAGE plpgsql AS $$\
-         DECLARE c CURSOR (x int) FOR SELECT x * 2 AS d; rec record; acc text := '';\
-         BEGIN FOR rec IN c(21) LOOP acc := acc || rec.d; END LOOP; RETURN acc; END$$",
-        true,
+    // A FOR loop over a bound cursor opens it with its arguments.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE FUNCTION bound_loop() RETURNS text LANGUAGE plpgsql AS $$\
+             DECLARE c CURSOR (x int) FOR SELECT x * 2 AS d; rec record; acc text := '';\
+             BEGIN FOR rec IN c(21) LOOP acc := acc || rec.d; END LOOP; RETURN acc; END$$; \
+             SELECT bound_loop()",
+            true,
+        )),
+        ["42"]
     );
-    assert_eq!(error_sqlstates(&response), ["0A000"]);
     // Locals merely named like the keywords keep their declared types.
     assert_eq!(
         data_rows(&session.success(

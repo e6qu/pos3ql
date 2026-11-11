@@ -83,7 +83,8 @@ is owned.
 **Remaining:**
 
 - **Functions:** writes inside a procedure body still read storage
-  synchronously. A top-level `SELECT` that the retained reader cannot hold
+  synchronously, as do PL/pgSQL cursor reads (`OPEN`, `FETCH` and cursor
+  `FOR` loops), whose lock waits already park. A top-level `SELECT` that the retained reader cannot hold
   (`DISTINCT` over routine output, grouping sets, groupings whose keys or aggregate inputs call
   routines, subqueries, sorts in object-store mode or over non-volatile
   routine output, joins it would probe through an index) restarts once for
@@ -131,12 +132,6 @@ is owned.
     their history in `cursor_bytes`. A scrollable cursor moving back rereads
     its input from the first row; retained position checkpoints would bound
     that reread.
-  - PL/pgSQL `FOR rec IN c LOOP` over a bound cursor is rejected with
-    `0A000`; it needs a loop frame that opens the cursor (a real portal, so
-    `pg_cursors`, `42P03` for an open cursor and the cursor variable behave as
-    in PostgreSQL), fetches one row per iteration and closes it on every exit,
-    across waits in every procedural executor. Materializing the query like
-    `FOR ... IN SELECT` would differ from PostgreSQL in those three ways.
   - Saving a held cursor at commit reads storage synchronously: the fourteen
     callers of the commit path (statement, protocol, procedure and
     replication commits) do not yet accept a wait before the commit is
@@ -310,7 +305,12 @@ with `0A000` where PostgreSQL changes the catalog entry; a revoked built-in
 `DROP ROLE` reports dependent objects without PostgreSQL's `DETAIL` list
 (`owner of function lower(text)`); built-in functions have no
 `pg_description` text of their own (`obj_description('lower(text)'::regprocedure)`
-is NULL where PostgreSQL returns `lowercase`). A SQL function whose earlier
+is NULL where PostgreSQL returns `lowercase`). PL/pgSQL compile errors in a
+`DO` body carry no cursor position (`LINE 1: ...` with a caret), though the
+same errors in `CREATE FUNCTION` do; a block label before `DECLARE` is
+rejected with `0A000`, and a label-qualified loop variable (`<<l>> FOR i IN
+1..2 LOOP ... l.i`) fails as an unknown table; exception conditions are
+limited to a fixed list of names (`SQLSTATE` codes work for every condition). A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

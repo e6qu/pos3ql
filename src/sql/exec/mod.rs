@@ -20001,11 +20001,15 @@ fn run_atomic_sql_procedure<'a>(
             _ => None,
         };
         if let Some(query) = query {
-            let sequences =
-                crate::sql::sequence::SeqEval::new(context.storage(), context.seq_session(), txid);
+            // Each statement is its own command, so a query sees the changes
+            // the body's earlier statements made.
+            let (storage, txn, _, seq_session) = context.dml_parts_with_sequence();
+            let _command = txn.enter_trigger_sql(storage)?;
+            let storage = &*storage;
+            let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
             super::query::execute_bound_routine_query(
                 &query,
-                context.storage(),
+                storage,
                 slot,
                 routine,
                 txid,

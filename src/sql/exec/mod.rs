@@ -39800,6 +39800,19 @@ pub(crate) fn validate_routine_body(
                     body_inputs,
                     |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 )?;
+                // A SQL-standard body is part of the statement, so PostgreSQL
+                // analyses it at CREATE, positioning its errors, before it
+                // compares the final statement with the declared result.
+                let standard_body = body_kind != crate::storage::RoutineBodyKind::String;
+                if standard_body
+                    && !arguments[..argument_count]
+                        .iter()
+                        .any(|argument| argument.polymorphic_type().is_some())
+                {
+                    crate::sql::error_position::with_analysis(|| {
+                        super::query::analyse_routine_program(&program, storage, txn.txid, arena)
+                    })?;
+                }
                 if let super::query::RoutineResultContract::Returns(declared) = sql_result {
                     check_sql_routine_result(
                         storage,
@@ -39815,19 +39828,7 @@ pub(crate) fn validate_routine_body(
                         arena,
                     )?;
                 }
-                if body_kind != crate::storage::RoutineBodyKind::String {
-                    // A SQL-standard body is part of the statement, so
-                    // PostgreSQL always analyses it at CREATE.
-                    if !arguments[..argument_count]
-                        .iter()
-                        .any(|argument| argument.polymorphic_type().is_some())
-                    {
-                        crate::sql::error_position::with_analysis(|| {
-                            super::query::analyse_routine_program(
-                                &program, storage, txn.txid, arena,
-                            )
-                        })?;
-                    }
+                if standard_body {
                     let raw_path = guc.search_path();
                     let user = super::eval::funcs::system::session_user_owned();
                     let path = storage.compute_path(raw_path.as_str(), user.as_str(), txn.txid);
@@ -79953,7 +79954,9 @@ fn prepare_insert_select_casts<'a>(
 /// PostgreSQL's analysis of `INSERT ... VALUES` lists against the target
 /// columns, positioned at the list, expression or target column at fault.
 fn check_insert_values_shape(statement: &Insert<'_>, n_targets: usize) -> Result<(), SqlError> {
-    let Some(first) = statement.rows.first() else {
+    // An empty row is `DEFAULT VALUES`, which an insert through a view
+    // carries with the base table's target columns.
+    let Some(first) = statement.rows.first().filter(|first| !first.is_empty()) else {
         return Ok(());
     };
     // PostgreSQL checks each list against the targets after comparing its

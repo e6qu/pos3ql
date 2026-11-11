@@ -167,7 +167,7 @@ fn procedures_resume_waits_after_transaction_control() {
                  CREATE PROCEDURE wait_outer() LANGUAGE plpgsql AS $$ \
                  DECLARE v int := 10; BEGIN \
                  INSERT INTO wait_log VALUES ('outer-before', nextval('wait_numbers')); \
-                 COMMIT; UPDATE wait_rows SET v = v + 1 WHERE id = 1; \
+                 COMMIT; UPDATE wait_rows SET v = wait_rows.v + 1 WHERE id = 1; \
                  INSERT INTO wait_log VALUES ('outer-updated', nextval('wait_numbers')); \
                  ROLLBACK; CALL wait_inner(v); \
                  INSERT INTO wait_log VALUES ('outer-after-' || v, nextval('wait_numbers')); \

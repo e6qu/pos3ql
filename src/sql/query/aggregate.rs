@@ -2954,8 +2954,10 @@ impl<'a> AggState<'a> {
             let out = arena
                 .alloc_slice_with(rows.len(), |_| Datum::Null)
                 .map_err(|_| arena_full())?;
+            // Records keep their structure: a whole-row value aggregated in
+            // ORDER BY order must reach the array or JSON as a record.
             for (i, &row) in rows.iter().enumerate() {
-                out[i] = crate::sql::exec::decode_projected_pub(row, 0);
+                out[i] = crate::sql::exec::decode_projected_col_record(row, 0, arena)?;
             }
             Ok(out)
         } else if self.distinct {

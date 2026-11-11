@@ -97,7 +97,7 @@ of writes in a PL/pgSQL or SQL-language function called from a query, which
 run on the engine (DDL and routine calls included) and restart the statement
 on a wait; multi-step
 statements nested in another's step (a rule action whose target has rules),
-which keep their own steps up to four levels deep.
+which keep their own steps up to `write_step_levels` levels deep.
 The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
@@ -125,9 +125,8 @@ is owned.
   bodies: a routine call after their first row change fails with `0A000`
   (`SQL row expression requires retained write progress`), because
   restarting would hide the earlier rows from the call. Multi-step
-  statements nested more than four deep fail the same way with `54000`
-  (`multi-step statements nest deeper than the 4 levels write progress
-  keeps`), the fixed per-statement capacity. `INSERT ... SELECT` materializes its source
+  statements nested deeper than `write_step_levels` fail the same way with
+  `54000` naming that setting. `INSERT ... SELECT` materializes its source
   before writing. Volatile user routine calls in its output list (also a
   rule action's `VALUES` over several rows) run as each row is inserted, as
   in PostgreSQL; calls in its `WHERE`, join conditions, subqueries,

@@ -129,13 +129,14 @@ original statement and actions) also keeps the steps it finished: their
 output rows and row counts are saved, the next attempt skips them, and the
 unfinished step continues at its row, or runs again from its own start.
 A multi-step statement inside another's step (a rule action whose target
-has rules of its own) keeps its steps one level deeper, up to four levels;
+has rules of its own) keeps its steps one level deeper, up to
+`write_step_levels` levels (4 by default);
 a step that is resumed keeps the effects of the calls that ran before it
 resumed. Where a write cannot keep its rows (a foreign table, or a step
 that changed rows without row progress), a call after its first change
 fails with `0A000` instead of running after a rollback that would hide
-those changes; at a fifth nested level it fails with `54000`, naming the
-four-level capacity. Writes that rules rewrite into
+those changes; one level deeper than `write_step_levels` it fails with
+`54000`, naming the setting. Writes that rules rewrite into
 several steps finish each step's `AFTER` triggers before the next step, so
 they never hand their completion to the caller.
 

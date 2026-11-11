@@ -107,7 +107,7 @@ pub(super) fn execute_procedural_write<'a, T>(
         .unwrap_or_else(|| query::RoutineInvocationState::new(owner, policy));
     calls.require_arena(owner)?;
     let replay = sequence::begin_replay_cursor()?;
-    let mut progress = RowProgress::new();
+    let mut progress = RowProgress::new(context.storage())?;
     let result = loop {
         sequence::rewind_replay_cursor(replay)?;
         calls.begin_attempt();

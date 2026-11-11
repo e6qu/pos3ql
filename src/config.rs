@@ -110,6 +110,11 @@ pub struct Config {
     /// The shared registry is reserved at startup from this PostgreSQL-shaped
     /// limit; exhaustion is reported instead of allocating while serving.
     pub max_locks_per_transaction: usize,
+    /// Levels of multi-step statements nested in one another's steps (a rule
+    /// action on a table with rules) whose progress a write keeps; a running
+    /// multi-step write leases one step record per level from
+    /// `execution_control_bytes`.
+    pub write_step_levels: usize,
     /// Bound-parameter format, length, and value bytes per portal.
     pub portal_bytes: usize,
     /// Buffered result bytes per portal (Execute max_rows paging).
@@ -449,6 +454,7 @@ impl Config {
             max_analyze_per_transaction: 64,
             max_prepared_transactions: 0,
             max_locks_per_transaction: 64,
+            write_step_levels: 4,
             memtable_bytes: 64 * MIB,
             wal_bytes: 256 * MIB,
             wal_buffer_bytes: MIB,
@@ -847,6 +853,10 @@ impl Config {
                 }
                 "max_locks_per_transaction" => {
                     config.max_locks_per_transaction =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "write_step_levels" => {
+                    config.write_step_levels =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "memtable_bytes" => {
@@ -1667,6 +1677,15 @@ impl Config {
                 "max_locks_per_transaction must be greater than zero".to_string(),
             ));
         }
+        if !(1..=Self::MAX_WRITE_STEP_LEVELS).contains(&config.write_step_levels) {
+            return Err(ConfigError::at(
+                0,
+                format!(
+                    "write_step_levels must be 1..{}",
+                    Self::MAX_WRITE_STEP_LEVELS
+                ),
+            ));
+        }
         if config.max_ddl_per_transaction == 0 {
             return Err(ConfigError::at(
                 0,
@@ -1929,6 +1948,8 @@ impl Config {
     /// Smallest nonzero `result_stream_bytes`: a stream's bound query, scope
     /// and description need this much before any row position.
     pub const MIN_RESULT_STREAM_BYTES: usize = 64 * KIB;
+    /// Upper bound of `write_step_levels`; rules nest no deeper in practice.
+    pub const MAX_WRITE_STEP_LEVELS: usize = 64;
 
     /// Shared resource validation for file and direct embedded startup.
     pub fn validate_runtime_resources(&self) -> Result<(), ConfigError> {
@@ -2763,6 +2784,23 @@ sql_arena_bytes = 4096
             error.message,
             "checkpoint_delete_objects_per_beat must not exceed checkpoint_garbage_batch_objects"
         );
+    }
+
+    #[test]
+    fn write_step_levels_are_bounded() {
+        const REQUIRED: &str = "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\n";
+        assert_eq!(Config::parse(REQUIRED).unwrap().write_step_levels, 4);
+        assert_eq!(
+            Config::parse(&format!("write_step_levels = 8\n{REQUIRED}"))
+                .unwrap()
+                .write_step_levels,
+            8
+        );
+        for levels in [0, Config::MAX_WRITE_STEP_LEVELS + 1] {
+            let error =
+                Config::parse(&format!("write_step_levels = {levels}\n{REQUIRED}")).unwrap_err();
+            assert_eq!(error.message, "write_step_levels must be 1..64");
+        }
     }
 
     #[test]

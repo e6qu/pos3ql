@@ -156,11 +156,6 @@ impl StepProgress {
     };
 }
 
-/// How deeply multi-step statements can nest inside one another's steps
-/// (a rule action on a table with rules, a rule on a `WITH` target) and
-/// still keep their progress.
-const STEP_LEVELS: usize = 4;
-
 /// A finished step's output, as a multi-step statement keeps it.
 #[derive(Clone, Copy)]
 pub(crate) struct StepRecord<'r> {
@@ -185,11 +180,17 @@ pub(crate) struct RowProgress {
     state: Option<transition_rows::SavedTransitionRows>,
     started: bool,
     unrestartable: bool,
-    steps: [StepProgress; STEP_LEVELS],
+    /// One record per level at which multi-step statements nest inside one
+    /// another's steps (a rule action on a table with rules, a rule on a
+    /// `WITH` target) and still keep their progress: `write_step_levels`,
+    /// leased when a multi-step statement first claims a level.
+    steps: crate::mem::lease_pool::MutableSlice<StepProgress>,
+    step_pool: std::sync::Arc<LeasePool>,
+    step_levels: usize,
     /// The level a data-modifying `WITH` claimed in this attempt.
     implicit_level: usize,
-    /// A multi-step statement of this attempt nested deeper than
-    /// `STEP_LEVELS` and runs its steps without progress.
+    /// A multi-step statement of this attempt nested deeper than the step
+    /// levels and runs its steps without progress.
     steps_exhausted: bool,
     /// The statement keeps this progress across storage and lock waits.
     retained: bool,
@@ -200,8 +201,13 @@ pub(crate) struct RowProgress {
 }
 
 impl RowProgress {
-    pub(crate) const fn new() -> Self {
-        Self {
+    /// Progress whose step records `execution_control_bytes` supplies.
+    pub(crate) fn new(storage: &crate::storage::Storage) -> Result<Self, SqlError> {
+        let step_pool = std::sync::Arc::clone(&storage.execution_control);
+        Ok(Self {
+            steps: step_pool.lease(0).map_err(step_records_full)?,
+            step_pool,
+            step_levels: storage.write_step_levels,
             journal: None,
             selection: None,
             running: None,
@@ -211,20 +217,19 @@ impl RowProgress {
             state: None,
             started: false,
             unrestartable: false,
-            steps: [StepProgress::EMPTY; STEP_LEVELS],
             implicit_level: 0,
             steps_exhausted: false,
             retained: false,
             attempt_effects: 0,
             rows_resumable: false,
-        }
+        })
     }
 
     /// Progress of a statement whose transaction keeps it across waits.
-    pub(crate) const fn retained() -> Self {
-        let mut progress = Self::new();
+    pub(crate) fn retained(storage: &crate::storage::Storage) -> Result<Self, SqlError> {
+        let mut progress = Self::new(storage)?;
         progress.retained = true;
-        progress
+        Ok(progress)
     }
 
     /// Records the journal and lock positions of the attempt about to run;
@@ -235,7 +240,7 @@ impl RowProgress {
         self.steps_exhausted = false;
         self.attempt_effects = query::unreplayable_effect_epoch();
         self.rows_resumable = false;
-        for level in &mut self.steps {
+        for level in self.steps.iter_mut() {
             level.running = false;
         }
     }
@@ -247,8 +252,9 @@ impl RowProgress {
         if self.steps_exhausted {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "multi-step statements nest deeper than the {} levels write progress keeps",
-                STEP_LEVELS
+                "multi-step statements nest deeper than the {} levels write progress keeps \
+                 (write_step_levels)",
+                self.step_levels
             )
         } else {
             super::write_attempts::retained_progress_required()
@@ -261,26 +267,38 @@ impl RowProgress {
     /// statement. `None` beyond the deepest level: the statement then runs
     /// its steps without progress, and a call after its first change fails
     /// loudly instead of hiding that change.
-    pub(crate) fn claim_step_level(&mut self) -> Option<usize> {
+    pub(crate) fn claim_step_level(&mut self) -> Result<Option<usize>, SqlError> {
+        if self.steps.is_empty() {
+            let mut steps = self
+                .step_pool
+                .lease(self.step_levels)
+                .map_err(step_records_full)?;
+            for _ in 0..self.step_levels {
+                steps
+                    .push_reserved(StepProgress::EMPTY)
+                    .map_err(step_records_full)?;
+            }
+            self.steps = steps;
+        }
         let level = self
             .steps
             .iter()
             .rposition(|level| level.running)
             .map_or(0, |running| running + 1);
-        self.steps_exhausted |= level >= STEP_LEVELS;
-        (level < STEP_LEVELS).then_some(level)
+        self.steps_exhausted |= level >= self.steps.len();
+        Ok((level < self.steps.len()).then_some(level))
     }
 
     /// [`Self::claim_step_level`] for a data-modifying `WITH`, whose steps
     /// then use the level implicitly.
-    pub(crate) fn claim_steps(&mut self) -> bool {
-        match self.claim_step_level() {
+    pub(crate) fn claim_steps(&mut self) -> Result<bool, SqlError> {
+        Ok(match self.claim_step_level()? {
             Some(level) => {
                 self.implicit_level = level;
                 true
             }
             None => false,
-        }
+        })
     }
 
     /// Before step `index` of the claimed statement: `false` when an earlier
@@ -965,6 +983,14 @@ pub(crate) fn cte_step_records<'a>(
         record.rows = rows;
     }
     Ok(records)
+}
+
+fn step_records_full(error: crate::mem::lease_pool::LeaseError) -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "write step progress: {}",
+        error
+    )
 }
 
 fn changed_steps() -> SqlError {

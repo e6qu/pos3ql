@@ -200,15 +200,13 @@ fn schema_drop_commits_view_trigger_once() {
 }
 
 /// Multi-step statements nested in one another's steps keep their progress
-/// up to four levels; a routine call after rows changed one level deeper
-/// fails with the named capacity instead of hiding those rows.
+/// up to `write_step_levels` levels (4 by default); a routine call after
+/// rows changed one level deeper fails with the named capacity instead of
+/// hiding those rows, and a fifth level keeps its progress when the setting
+/// allows it. Values from PostgreSQL 18.6.
 #[test]
 fn nested_step_progress_beyond_its_capacity_fails_loudly() {
-    let (mut engine, mut budget) = test_engine();
-    let output = run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE TABLE a1(n int); CREATE TABLE a2(n int); CREATE TABLE a3(n int); \
+    const SETUP: &str = "CREATE TABLE a1(n int); CREATE TABLE a2(n int); CREATE TABLE a3(n int); \
          CREATE TABLE a4(n int); CREATE TABLE a5(n int); CREATE TABLE a6(n int, c bigint); \
          CREATE FUNCTION cnt() RETURNS bigint LANGUAGE plpgsql AS \
            $$BEGIN RETURN (SELECT count(*) FROM a6); END$$; \
@@ -217,26 +215,50 @@ fn nested_step_progress_beyond_its_capacity_fails_loudly() {
          CREATE RULE r3 AS ON INSERT TO a3 DO ALSO INSERT INTO a4 VALUES (new.n); \
          CREATE RULE r4 AS ON INSERT TO a4 DO ALSO INSERT INTO a5 VALUES (new.n); \
          CREATE RULE r5 AS ON INSERT TO a5 DO ALSO \
-           INSERT INTO a6 VALUES (new.n, cnt()), (new.n + 1, cnt()); \
-         INSERT INTO a3 VALUES (2); SELECT n, c FROM a6 ORDER BY n, c",
-    );
-    assert!(
-        error_sqlstates(&output).is_empty(),
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
-    assert_eq!(data_rows(&output), ["2|0", "3|1"]);
-    let output = run_with(&mut engine, &mut budget, "INSERT INTO a1 VALUES (3)");
-    assert_eq!(
-        error_sqlstates(&output),
-        ["54000"],
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
-    assert!(
-        String::from_utf8_lossy(&output)
-            .contains("multi-step statements nest deeper than the 4 levels write progress keeps")
-    );
+           INSERT INTO a6 VALUES (new.n, cnt()), (new.n + 1, cnt())";
+    for levels in [4, 5] {
+        let mut config = test_config(&format!("write-step-levels-{levels}"));
+        config.write_step_levels = levels;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        writer.success(&mut engine, SETUP, true);
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "INSERT INTO a3 VALUES (2); SELECT n, c FROM a6 ORDER BY n, c",
+                true
+            )),
+            ["2|0", "3|1"],
+            "{levels}"
+        );
+        let output = writer.execute(&mut engine, "INSERT INTO a1 VALUES (3)", true);
+        if levels == 4 {
+            assert_eq!(
+                error_sqlstates(&output),
+                ["54000"],
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(String::from_utf8_lossy(&output).contains(
+                "multi-step statements nest deeper than the 4 levels write progress keeps \
+                 (write_step_levels)"
+            ));
+        } else {
+            assert!(
+                error_sqlstates(&output).is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+            assert_eq!(
+                data_rows(&writer.success(&mut engine, "SELECT n, c FROM a6 ORDER BY n, c", true)),
+                ["2|0", "3|1", "3|2", "4|3"],
+                "{levels}"
+            );
+        }
+        drop((writer, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
 }
 
 /// A call in an `INSERT ... SELECT` output list runs as its row is

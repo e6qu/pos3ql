@@ -14165,9 +14165,8 @@ impl Engine {
         // Each data-modifying sub-statement is a step: one an earlier attempt
         // finished keeps its output rows instead of running again. A
         // statement nested in another's step keeps no steps of its own.
-        if progress
-            .as_deref_mut()
-            .is_some_and(|progress| !progress.claim_steps())
+        if let Some(claimed) = progress.as_deref_mut()
+            && !claimed.claim_steps()?
         {
             *progress = None;
         }
@@ -14882,9 +14881,14 @@ impl Engine {
         // The original statement and each rule action are steps: one an
         // earlier attempt finished keeps its row count instead of running again.
         let mut progress = progress;
-        let level = progress
+        let level = match progress
             .as_deref_mut()
-            .and_then(exec::RowProgress::claim_step_level);
+            .map(exec::RowProgress::claim_step_level)
+            .transpose()
+        {
+            Ok(level) => level.flatten(),
+            Err(error) => return Ok(Err(error)),
+        };
         let mut progress = progress.filter(|_| level.is_some());
         let level = level.unwrap_or(0);
         let resumed = match progress
@@ -16342,9 +16346,11 @@ impl Engine {
             start: mut statement_start,
         } = match txn.take_retained_write() {
             Some(write) => write,
-            None => match sequence::begin_replay_cursor() {
-                Ok(replay) => exec::RetainedWrite {
-                    progress: exec::RowProgress::retained(),
+            None => match sequence::begin_replay_cursor()
+                .and_then(|replay| Ok((replay, exec::RowProgress::retained(&self.storage)?)))
+            {
+                Ok((replay, progress)) => exec::RetainedWrite {
+                    progress,
                     invocations: query::RoutineInvocationState::new(
                         arena,
                         crate::sql::query::RoutineExecution::StatementReplay,
@@ -16635,7 +16641,10 @@ impl Engine {
                 // Rows already sent cannot be withdrawn for another run.
                 return Ok(Err(error));
             }
-            write.progress = exec::RowProgress::retained();
+            write.progress = match exec::RowProgress::retained(&self.storage) {
+                Ok(progress) => progress,
+                Err(error) => return Ok(Err(error)),
+            };
             write.invocations = query::RoutineInvocationState::new(
                 arena,
                 crate::sql::query::RoutineExecution::StatementReplay,

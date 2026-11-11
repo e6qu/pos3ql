@@ -155,7 +155,7 @@ Scrape `/metrics` from the private network. Suggested first alerts:
 | Connections near `pos3ql_postgres_connection_capacity` | Raise the startup limit or reduce client concurrency. |
 | WAL or row-heap use near capacity | Check checkpoint progress and object-store latency. |
 | Sustained object read latency, cache misses, or prefetch saturation | Compare the working set with cache and object-read slot capacities. |
-| `pos3ql_result_stream_spooled_total{reason="capacity"}` grows | Large simple results queue in the spool because their read position exceeds `result_stream_bytes`; raise it or checkpoint more often. |
+| `pos3ql_result_stream_spooled_total{reason="capacity"}` grows | Large results queue in the spool (or paged portals buffer in `portal_result_bytes`) because their read position exceeds `result_stream_bytes`, or another suspended portal holds the connection's stream; raise it, checkpoint more often, or finish one portal before paging the next. |
 
 Counters reset at process start. Block-object request counters cover
 immutable SST traffic through the cache stack only, not root, commit-batch,

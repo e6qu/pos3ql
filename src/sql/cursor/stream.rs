@@ -7,6 +7,11 @@
 //! It yields when the client is behind, when a row waits for object storage,
 //! and when a row waits for a lock. Rows already delivered are final; a wait
 //! inside a row re-evaluates only that row.
+//!
+//! A paged portal (`Execute` with a row limit) opens its stream before its
+//! first row and evaluates rows as each Execute asks for them. Between
+//! Executes the stream is suspended: it holds its read position, but no
+//! statement is running, so other statements of the transaction may run.
 
 use super::*;
 
@@ -15,7 +20,8 @@ use super::*;
 pub(crate) enum StreamProtocol {
     /// Statement `statement` of the simple Query at the front of `recv`.
     Simple { statement: usize },
-    /// The unnamed or unpaged portal executed by the Execute at the front of `recv`.
+    /// The portal executed by the Execute at the front of `recv` while
+    /// running, or the suspended portal between Executes.
     Extended { portal: usize },
 }
 
@@ -27,7 +33,12 @@ pub(crate) struct StreamState {
     pub(crate) protocol: StreamProtocol,
     pub(crate) source_snapshot: u32,
     pub(crate) deadline: i64,
+    /// Rows delivered by this statement or Execute: its command tag count.
     pub(crate) emitted: u64,
+    /// The current Execute's row limit; reaching it suspends the portal.
+    pub(crate) page_limit: Option<u64>,
+    /// A paged portal between Executes.
+    pub(crate) suspended: bool,
     /// Whether a previous turn already entered the statement's effect scope.
     pub(crate) resumed: bool,
 }
@@ -45,17 +56,45 @@ impl ResultStream {
         })
     }
 
+    /// A statement is running in the stream.
     pub(crate) fn is_active(&self) -> bool {
+        self.state.is_some_and(|state| !state.suspended)
+    }
+
+    /// The stream allocation is in use, running or suspended.
+    pub(crate) fn is_held(&self) -> bool {
         self.state.is_some()
     }
 
+    /// The protocol owner of a running stream.
     pub(crate) fn protocol(&self) -> Option<StreamProtocol> {
-        self.state.map(|state| state.protocol)
+        self.state
+            .filter(|state| !state.suspended)
+            .map(|state| state.protocol)
     }
 
-    /// Drops the query, its reader leases and position.
-    pub(crate) fn release(&mut self) {
+    /// The portal of a suspended stream.
+    pub(crate) fn suspended_portal(&self) -> Option<usize> {
+        match self.state {
+            Some(StreamState {
+                suspended: true,
+                protocol: StreamProtocol::Extended { portal },
+                ..
+            }) => Some(portal),
+            _ => None,
+        }
+    }
+
+    /// The table a held stream reads.
+    pub(crate) fn source_table(&self) -> Option<usize> {
+        self.state?;
+        self.query.retained.as_ref()?.source_table()
+    }
+
+    /// Drops the query, its reader leases and position, and its table hold.
+    pub(crate) fn release(&mut self, cursors: &mut CursorPool) {
         self.state = None;
         self.query.clear();
+        cursors.hold_stream_table(None);
     }
 }

@@ -69,8 +69,8 @@ declaration initializers; SQL-language function bodies, child calls and return
 checks; SQL cursors executing from retained query state, including row locks
 taken per `FETCH` and scrollable cursors that evaluate revisited rows again;
 client output that never blocks the worker on a slow reader; large
-single-table results resuming row by row across client, storage and lock
-waits. The
+single-table and generated-series results, and paged portals over them,
+resuming row by row across client, storage and lock waits. The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
 
@@ -89,12 +89,13 @@ is owned.
   of row progress in multirow updates with saved progress: a child statement must
   see earlier changed rows before the next row is written, and each operation
   keeps its own transition table and firing order.
-- **Results and cursors:** resume more large results row by row; only
-  single-table `SELECT` from a simple Query or an unpaged `Execute` does today.
-  Remaining: paged and named portals (`Execute` with a row limit still buffers
-  into `portal_result_bytes`), `FETCH` output, `COPY TO`, and more retained
-  shapes (joins, sorting, grouping, subqueries, set operations, and more
-  set-returning functions than `generate_series` and one-array `unnest`).
+- **Results and cursors:** resume more large results row by row; `SELECT`
+  from one table or one generated series does today, including paged
+  portals. Remaining: a second paged portal while one holds the connection's
+  stream (it buffers into `portal_result_bytes`), `FETCH` output, `COPY TO`,
+  and more retained shapes (joins, sorting, grouping, subqueries, set
+  operations, and more set-returning functions than `generate_series` and
+  one-array `unnest`).
   Cursors over those shapes still run at `DECLARE`, so a scrollable sorted
   cursor returns saved values where PostgreSQL evaluates a volatile output
   list again, and a row-locking cursor over a join, or ordered by an

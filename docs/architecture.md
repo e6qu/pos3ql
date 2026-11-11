@@ -93,11 +93,12 @@ already reached the client, the statement fails with `0A000` instead of
 repeating them.
 
 **Large results resume row by row.** Before a top-level `SELECT` runs (simple
-Query, or an unpaged extended `Execute`), the engine decides whether it can
-become a **result stream**: a single ordinary table without joins, grouping,
-sorting, `DISTINCT`, set operations, subqueries, CTEs, row locking or row
-security, whose read position (one record per resident row plus the query
-text) fits `result_stream_bytes`. If such a statement's output first outgrows
+Query or extended `Execute`), the engine decides whether it can become a
+**result stream**: one ordinary table, or one builtin set-returning function
+with constant arguments (`generate_series`, a one-array `unnest`), without
+joins, grouping, sorting, `DISTINCT`, set operations, subqueries, CTEs, row
+locking or row security, whose read position (one record per resident row
+plus the query text) fits `result_stream_bytes`. If such a statement's output first outgrows
 the send buffer before any byte left and before any effect, that attempt is
 discarded and the statement reopens from a retained read position in the
 connection's `result_stream_bytes` allocation. It then delivers rows while the
@@ -110,6 +111,18 @@ are released before the next row starts, so statement memory holds one row's
 receipts however long the stream runs. Every other large result uses the spool above, decided before
 any of its rows reach the client; `pos3ql_result_stream_spooled_total` counts
 those by reason (`shape`, `capacity`, `effects`).
+
+**Paged portals evaluate rows per `Execute`.** An `Execute` with a row limit
+opens such a statement's stream before its first row. Each `Execute`
+evaluates only the rows it returns, then the portal suspends with
+`PortalSuspended`, keeping its read position and snapshot while other
+statements of the transaction run. The connection has one stream allocation:
+while a suspended portal holds it, other large results spool for `capacity`,
+and another paged portal buffers its whole result in `portal_result_bytes`
+(`54000` naming that setting when full), as do paged portals of other shapes.
+DDL on a suspended portal's table fails with `55006`, as in PostgreSQL. The
+stream ends when its portal completes, is closed or rebound, or its
+transaction ends.
 
 **Example:** `SELECT id, payload FROM orders` sent by a client on a slow link
 delivers rows as the client reads them; while it waits for the client or for a

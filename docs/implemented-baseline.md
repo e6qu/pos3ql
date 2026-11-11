@@ -145,9 +145,14 @@ with its next message once its client has read the result.
 reads it gradually. Meanwhile other applications keep inserting orders. If the
 tool falls behind by more than `result_spool_bytes`, it receives the rows
 already queued followed by `54000` naming that setting, and its session stays
-usable. A large `SELECT` from one ordinary table without sorting, grouping or
-joins resumes row by row instead: it waits for the client and for cold storage
-without holding the worker, and rows already delivered are never repeated.
+usable. A large `SELECT` from one ordinary table or one builtin series such
+as `generate_series`, without sorting, grouping or joins, resumes row by row
+instead: it waits for the client and for cold storage without holding the
+worker, and rows already delivered are never repeated. A paged portal (an
+extended `Execute` with a row limit) over such a query evaluates rows only as
+each `Execute` asks for them, as PostgreSQL does, so
+`CASE WHEN id > 1 THEN nextval('s') END` takes nine numbers for a first page
+of ten rows.
 Other large results, once their first byte reaches the client, read cold
 storage without yielding; extending resumable output to them is tracked in
 [the plan](../PLAN.md#pause-and-resume-every-query-path).

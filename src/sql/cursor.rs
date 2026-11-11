@@ -73,6 +73,10 @@ pub struct CursorPool {
     emit: Vec<u32>,
     next_unnamed: u64,
     next_plan_generation: u64,
+    /// The table this connection's held result stream reads. A suspended
+    /// portal keeps it open between statements, and a running stream's
+    /// routine calls run nested statements, so DDL on it must see it.
+    stream_table: Option<usize>,
 }
 
 const CURSOR_STATEMENT_BYTES: usize = 4096;
@@ -119,7 +123,7 @@ pub(crate) fn require_table_idle(table: usize, name: &str, command: &str) -> Res
                         .retained
                         .as_ref()
                         .is_some_and(|query| query.uses_table(table))
-            })
+            }) || pool.stream_table == Some(table)
         })
     });
     if busy {
@@ -577,6 +581,7 @@ impl CursorPool {
             emit: Vec::with_capacity(row_capacity),
             next_unnamed: 1,
             next_plan_generation: 1,
+            stream_table: None,
         })
     }
 
@@ -591,6 +596,13 @@ impl CursorPool {
         }
         self.emit.clear();
         self.next_unnamed = 1;
+        self.stream_table = None;
+    }
+
+    /// Records the table a newly held result stream reads, or none once the
+    /// stream is released.
+    pub(crate) fn hold_stream_table(&mut self, table: Option<usize>) {
+        self.stream_table = table;
     }
 
     fn find(&self, name: &str) -> Option<usize> {

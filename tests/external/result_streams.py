@@ -2,13 +2,18 @@
 """A client that stops reading a large result must not stall other sessions.
 
 Client A sends a large simple Query, then the same result through an unpaged
-extended Execute (Parse/Bind/Execute(0)/Sync), and stops reading with a small
-receive buffer. Two results are used: a generated series (pos3ql queues it in
-the result spool) and a scan of one table (pos3ql resumes it row by row). Client B, a psycopg session, must keep completing queries
-while A is stalled. A then reads everything: exactly one RowDescription per
-simple query, every row once and in order, one CommandComplete and one
-ReadyForQuery. With --pg, the same protocol transcript summary is compared
-with PostgreSQL 18.
+extended Execute (Parse/Bind/Execute(0)/Sync) and through a paged portal
+(Execute with a row limit, repeated, then Execute(0)), and stops reading with
+a small receive buffer. Three results are used: a generated series and a scan
+of one table (pos3ql resumes both row by row, and evaluates a paged portal's
+rows as each Execute asks for them), and a join (pos3ql queues it in the
+result spool; a paged join buffers in portal_result_bytes, so it is not paged
+here).
+Client B, a psycopg session, must keep completing queries while A is stalled.
+A then reads everything: exactly one RowDescription per simple query, every
+row once and in order, PortalSuspended after each full page, one
+CommandComplete and one ReadyForQuery. With --pg, the same protocol
+transcript summary is compared with PostgreSQL 18.
 
 PostgreSQL references:
 https://www.postgresql.org/docs/18/protocol-flow.html
@@ -26,12 +31,20 @@ ROWS = 20000
 TABLE_ROWS = 5000
 # Results must exceed what loopback socket buffers can absorb (Linux grows a
 # send buffer to 4 MiB), so the server really holds output for a stalled client.
+ALL_PROTOCOLS = ("simple", "extended", "paged")
 QUERIES = (
-    (f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g", ROWS),
-    ("SELECT id, payload FROM result_stream_rows", TABLE_ROWS),
+    (f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g", ROWS, ALL_PROTOCOLS),
+    ("SELECT id, payload FROM result_stream_rows", TABLE_ROWS, ALL_PROTOCOLS),
+    (
+        f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g, (VALUES (1)) v",
+        ROWS,
+        ("simple", "extended"),
+    ),
 )
 OTHER_QUERIES = 100
 STALL_SECONDS = 2.0
+PAGE = 1500
+PAGES = 2
 
 
 def message(kind, payload=b""):
@@ -92,7 +105,8 @@ def summarize(messages):
             else:
                 shape.append(("D", 1))
             continue
-        if expected != 1:
+        # A suspended portal continues its numbering on the next Execute.
+        if kind != b"s":
             expected = 1
         if kind == b"C":
             shape.append(("C", payload.rstrip(b"\0").decode()))
@@ -159,18 +173,20 @@ def create_table(host, port, user, database):
 def probe(host, port, user, database):
     create_table(host, port, user, database)
     results = {}
-    for (query, rows), protocol in [
-        (entry, protocol) for entry in QUERIES for protocol in ("simple", "extended")
+    for query, rows, protocol in [
+        (query, rows, protocol) for query, rows, protocols in QUERIES for protocol in protocols
     ]:
         sock = stalled_client(host, port, user, database)
         if protocol == "simple":
             request = message(b"Q", query.encode() + b"\0") + message(b"Q", b"SELECT 1\0")
             ready_count = 2
         else:
+            limit = PAGE if protocol == "paged" else 0
             request = (
                 message(b"P", b"\0" + query.encode() + b"\0\0\0")
                 + message(b"B", b"\0\0\0\0\0\0\0\0")
-                + message(b"E", b"\0\0\0\0\0")
+                + message(b"E", b"\0" + struct.pack("!i", limit)) * (PAGES if limit else 1)
+                + (message(b"E", b"\0\0\0\0\0") if limit else b"")
                 + message(b"S")
             )
             ready_count = 1
@@ -196,8 +212,14 @@ def probe(host, port, user, database):
                 ("C", "SELECT 1"),
                 ("Z", None),
             ]
-        else:
+        elif protocol == "extended":
             expected = [("1", None), ("2", None), ("D", rows), ("C", f"SELECT {rows}"), ("Z", None)]
+        else:
+            rest = rows - PAGE * PAGES
+            expected = [("1", None), ("2", None)]
+            for _ in range(PAGES):
+                expected += [("D", PAGE), ("s", None)]
+            expected += [("D", rest), ("C", f"SELECT {rest}"), ("Z", None)]
         assert transcript == expected, transcript
     with psycopg.connect(
         host=host, port=port, user=user, dbname=database, autocommit=True, connect_timeout=5

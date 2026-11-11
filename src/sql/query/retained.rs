@@ -57,6 +57,15 @@ pub(crate) enum LockedRow {
     Updated,
 }
 
+/// What a result stream reads, as decided before its statement runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamSource {
+    /// One ordinary table: its retained read position grows with its rows.
+    Table(usize),
+    /// A builtin set-returning function: only its next value is retained.
+    Generated,
+}
+
 /// One ORDER BY key of a sorted locking cursor: a source column.
 #[derive(Clone, Copy)]
 pub(crate) struct RetainedOrderKey {
@@ -1492,27 +1501,38 @@ impl<'a> RetainedSelect<'a> {
             && !matches!(self.state, ReaderState::Eliminated)
     }
 
+    /// The physical table this reader scans, if any.
+    pub(crate) fn source_table(&self) -> Option<usize> {
+        (matches!(self.source, RetainedSource::Physical(_))
+            && !matches!(self.state, ReaderState::Eliminated))
+        .then(|| self.scope.slots[0])
+    }
+
     pub(crate) fn uses_table(&self, table: usize) -> bool {
         !matches!(self.state, ReaderState::Eliminated)
             && self.scope.slots[..self.scope.n].contains(&table)
     }
 
-    /// The physical table a top-level `SELECT` reads when a cursor-mode open
-    /// would retain it, decided before execution and without capturing rows.
-    /// Literal and `FROM`-less sources are excluded: their output is bounded
-    /// by the statement itself. Scope resolution borrows `arena`; the caller
-    /// rewinds it.
-    pub(crate) fn stream_source_table(
+    /// The source a top-level `SELECT` reads when a cursor-mode open would
+    /// retain it, decided before execution and without capturing rows: one
+    /// physical table, or a builtin set-returning function advanced from
+    /// fixed generator state. Literal and `FROM`-less sources are excluded:
+    /// their output is bounded by the statement itself. Scope resolution
+    /// borrows `arena`; the caller rewinds it.
+    pub(crate) fn stream_source(
         storage: &'a Storage,
         txid: u32,
         statement: &'a Select<'a>,
         arena: &'a Arena,
-    ) -> Result<Option<usize>, SqlError> {
+    ) -> Result<Option<StreamSource>, SqlError> {
         let Some(from) = statement.from.as_ref() else {
             return Ok(None);
         };
+        let generated = from.joins.is_empty()
+            && from.base.is_function_source()
+            && retained_function_source(&from.base, storage, txid, arena).is_some();
         if !from.joins.is_empty()
-            || from.base.is_function_source()
+            || from.base.is_function_source() && !generated
             || from.base.subquery.is_some()
             || from.base.cte.is_some()
             || from.base.sample.is_some()
@@ -1526,10 +1546,11 @@ impl<'a> RetainedSelect<'a> {
             || !statement.order_by.is_empty()
             || !statement.locking.is_empty()
             || statement.with_ties
-            || !matches!(
-                storage.resolve_relation(from.base.schema, from.base.table, txid),
-                Some(crate::storage::ResolvedRelation::Table(_))
-            )
+            || !generated
+                && !matches!(
+                    storage.resolve_relation(from.base.schema, from.base.table, txid),
+                    Some(crate::storage::ResolvedRelation::Table(_))
+                )
         {
             return Ok(None);
         }
@@ -1552,7 +1573,9 @@ impl<'a> RetainedSelect<'a> {
             return Ok(None);
         }
         let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
-        if scope.n != 1 || scope.derived[0].is_some() || scope.slots[0] == usize::MAX {
+        if scope.n != 1
+            || !generated && (scope.derived[0].is_some() || scope.slots[0] == usize::MAX)
+        {
             return Ok(None);
         }
         let columns = CatalogScopeCols {
@@ -1588,6 +1611,9 @@ impl<'a> RetainedSelect<'a> {
                 return Ok(None);
             }
         }
+        if generated {
+            return Ok(Some(StreamSource::Generated));
+        }
         let table = scope.slots[0];
         let definition = scope.defs.stored(0).expect("resolved physical source");
         if definition.kind != crate::storage::TableKind::Local
@@ -1604,7 +1630,7 @@ impl<'a> RetainedSelect<'a> {
         if storage.row_security_applies(table, role, txid) {
             return Ok(None);
         }
-        Ok(Some(table))
+        Ok(Some(StreamSource::Table(table)))
     }
 
     pub(crate) fn open(

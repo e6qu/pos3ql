@@ -233,7 +233,8 @@ fn sqlstate_of(payload: &[u8]) -> &str {
     panic!("error without SQLSTATE")
 }
 
-const BIG: &str = "SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g";
+/// A join is not a retained shape: a large result queues in the spool.
+const BIG: &str = "SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g, (VALUES (1)) v";
 
 /// Rows 1..=count in order, each exactly once.
 fn assert_rows(rows: &[&(u8, &[u8])], count: usize) {
@@ -377,7 +378,7 @@ fn unpaged_extended_execute_queues_large_results_and_mid_result_errors() {
         for (sql, rows, error) in [
             (BIG, 5000usize, None),
             (
-                "SELECT g, 1 / (g - 3001) FROM generate_series(1, 5000) g",
+                "SELECT g, 1 / (g - 3001) FROM generate_series(1, 5000) g, (VALUES (1)) v",
                 3000,
                 Some("22012"),
             ),
@@ -1041,7 +1042,7 @@ fn paged_portal_rows_use_the_spool_and_fail_by_name_when_it_is_full() {
         let (mut conn, mut client) = connection(&mut fixture, 1);
         let mut input = frontend(
             wire::FMSG_PARSE,
-            b"\0SELECT repeat('x', 1000) FROM generate_series(1, 60)\0\0\0",
+            b"\0SELECT repeat('x', 1000) FROM generate_series(1, 60), (VALUES (1)) v\0\0\0",
         );
         input.extend_from_slice(&frontend(wire::FMSG_BIND, b"\0\0\0\0\0\0\0\0"));
         input.extend_from_slice(&frontend(wire::FMSG_EXECUTE, b"\0\0\0\0\x32"));
@@ -1377,4 +1378,218 @@ fn a_stream_whose_open_outgrows_its_estimate_fails_by_name() {
             .iter()
             .any(|message| message.0 == b'D' && first_text(message.1) == "5")
     );
+}
+
+fn parse(statement: &str, sql: &str) -> Vec<u8> {
+    let mut payload = statement.as_bytes().to_vec();
+    payload.push(0);
+    payload.extend_from_slice(sql.as_bytes());
+    payload.extend_from_slice(b"\0\0\0");
+    frontend(wire::FMSG_PARSE, &payload)
+}
+
+fn bind(portal: &str, statement: &str) -> Vec<u8> {
+    let mut payload = portal.as_bytes().to_vec();
+    payload.push(0);
+    payload.extend_from_slice(statement.as_bytes());
+    payload.extend_from_slice(b"\0\0\0\0\0\0\0");
+    frontend(wire::FMSG_BIND, &payload)
+}
+
+fn execute(portal: &str, max_rows: i32) -> Vec<u8> {
+    let mut payload = portal.as_bytes().to_vec();
+    payload.push(0);
+    payload.extend_from_slice(&max_rows.to_be_bytes());
+    frontend(wire::FMSG_EXECUTE, &payload)
+}
+
+fn sync() -> Vec<u8> {
+    frontend(wire::FMSG_SYNC, b"")
+}
+
+/// The second column of a DataRow as text.
+fn second_text(payload: &[u8]) -> Option<&str> {
+    let first = 6 + i32::from_be_bytes(payload[2..6].try_into().unwrap()) as usize;
+    let length = i32::from_be_bytes(payload[first..first + 4].try_into().unwrap());
+    (length >= 0)
+        .then(|| core::str::from_utf8(&payload[first + 4..first + 4 + length as usize]).unwrap())
+}
+
+#[test]
+fn paged_portals_evaluate_rows_per_execute_across_client_waits() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let (mut fixture, mut conn, mut client, _, _) = stream_fixture(mode, "paged-stream");
+        run(
+            &mut conn,
+            &mut fixture.engine,
+            &mut client,
+            "CREATE SEQUENCE numbers",
+        );
+        let opened = fixture.engine.result_stream_metrics().opened;
+        // The first row starts no effect, so the portal opens as a stream
+        // and later rows take numbers only when an Execute asks for them.
+        let mut input = parse(
+            "",
+            "SELECT id, CASE WHEN id > 1 THEN nextval('numbers') END, payload FROM big",
+        );
+        input.extend_from_slice(&bind("", ""));
+        input.extend_from_slice(&execute("", 10));
+        input.extend_from_slice(&parse("", "SELECT nextval('numbers')"));
+        input.extend_from_slice(&bind("other", ""));
+        input.extend_from_slice(&execute("other", 0));
+        client.write_all(&input).unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        let mut received = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while messages(&received)
+            .iter()
+            .filter(|message| message.0 == b'C')
+            .count()
+            == 0
+        {
+            assert!(Instant::now() < deadline, "first page did not arrive");
+            read_available(&mut client, &mut received);
+            assert_eq!(conn.on_writable(), After::Continue);
+        }
+        assert_eq!(fixture.engine.result_stream_metrics().opened, opened + 1);
+        assert!(conn.result_stream.is_held());
+        assert!(!conn.result_stream.is_active());
+        {
+            let response = messages(&received);
+            let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+            assert_eq!(&kinds[..2], b"12");
+            assert_eq!(&kinds[12..], b"s12DC");
+            let rows: Vec<_> = response[..12]
+                .iter()
+                .filter(|message| message.0 == b'D')
+                .collect();
+            assert_rows(&rows, 10);
+            // Rows 2..=10 took nine numbers; the other portal takes the tenth.
+            assert_eq!(second_text(rows[9].1), Some("9"));
+            assert_eq!(first_text(response[15].1), "10");
+        }
+
+        // A page larger than the send buffer waits for the client, then the
+        // portal suspends again; the final unlimited Execute completes it.
+        let mut input = execute("", 3000);
+        input.extend_from_slice(&execute("", 0));
+        input.extend_from_slice(&sync());
+        client.write_all(&input).unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        assert_eq!(
+            conn.parked_wait(),
+            Some(crate::sql::StatementWait::ClientOutput)
+        );
+        assert!(conn.result_stream.is_active());
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+        let response = messages(&response);
+        let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+        let suspended = kinds.iter().position(|kind| *kind == b's').unwrap();
+        assert_eq!(suspended, 3000);
+        assert_eq!(&kinds[kinds.len() - 2..], b"CZ");
+        assert_eq!(response[kinds.len() - 2].1, b"SELECT 1990\0");
+        let rows: Vec<_> = response
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .collect();
+        assert_eq!(rows.len(), 4990);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(first_text(row.1), (index + 11).to_string());
+            assert_eq!(second_text(row.1), Some((index + 11).to_string().as_str()));
+        }
+        // Sync ended the implicit transaction and with it the portal.
+        assert!(!conn.result_stream.is_held());
+    }
+}
+
+#[test]
+fn suspended_portals_hold_their_table_and_leave_one_stream_to_share() {
+    let (mut fixture, mut conn, mut client, _, _) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "paged-hold");
+    let before = fixture.engine.result_stream_metrics();
+    let mut input = query("BEGIN");
+    input.extend_from_slice(&parse("first", "SELECT id, payload FROM big"));
+    input.extend_from_slice(&bind("a", "first"));
+    input.extend_from_slice(&execute("a", 2));
+    // The stream is held, so this portal pages from its own buffer.
+    input.extend_from_slice(&parse(
+        "second",
+        "SELECT id, payload FROM big WHERE id <= 40",
+    ));
+    input.extend_from_slice(&bind("b", "second"));
+    input.extend_from_slice(&execute("b", 3));
+    input.extend_from_slice(&execute("a", 2));
+    input.extend_from_slice(&execute("b", 3));
+    input.extend_from_slice(&sync());
+    client.write_all(&input).unwrap();
+    assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+    let response = drain(&mut conn, &mut fixture.engine, &mut client, 2);
+    let response = messages(&response);
+    let rows: Vec<&str> = response
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .map(|message| first_text(message.1))
+        .collect();
+    assert_eq!(rows, ["1", "2", "1", "2", "3", "3", "4", "4", "5", "6"]);
+    assert_eq!(
+        response.iter().filter(|message| message.0 == b's').count(),
+        4
+    );
+    let after = fixture.engine.result_stream_metrics();
+    assert_eq!(after.opened, before.opened + 1);
+    assert_eq!(after.spooled_capacity, before.spooled_capacity + 1);
+    assert!(conn.result_stream.is_held());
+
+    // DDL on the table of a suspended portal fails as in PostgreSQL; the
+    // failed transaction keeps the portal from running until it ends.
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "DROP TABLE big",
+    );
+    let response = messages(&response);
+    assert_eq!(response[0].0, b'E');
+    assert_eq!(sqlstate_of(response[0].1), "55006");
+    let mut input = execute("a", 2);
+    input.extend_from_slice(&sync());
+    client.write_all(&input).unwrap();
+    assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+    let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+    let response = messages(&response);
+    assert_eq!(response[0].0, b'E');
+    assert_eq!(sqlstate_of(response[0].1), "25P02");
+    let response = run(&mut conn, &mut fixture.engine, &mut client, "ROLLBACK");
+    assert!(messages(&response).iter().all(|message| message.0 != b'E'));
+    assert!(!conn.result_stream.is_held());
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "DROP TABLE big",
+    );
+    assert!(messages(&response).iter().all(|message| message.0 != b'E'));
+}
+
+#[test]
+fn buffered_paged_portals_name_portal_result_bytes_when_full() {
+    let (mut fixture, mut conn, mut client, _, _) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "paged-full");
+    // Sorting is not a retained shape: the paged portal buffers its result.
+    let mut input = parse("", "SELECT id, payload FROM big ORDER BY id");
+    input.extend_from_slice(&bind("", ""));
+    input.extend_from_slice(&execute("", 10));
+    input.extend_from_slice(&sync());
+    client.write_all(&input).unwrap();
+    assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+    let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert_eq!(kinds, b"12EZ");
+    assert_eq!(sqlstate_of(response[2].1), "54000");
+    let message = String::from_utf8_lossy(response[2].1);
+    assert!(message.contains("portal_result_bytes"), "{message}");
 }

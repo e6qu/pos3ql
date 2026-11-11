@@ -30,7 +30,7 @@ mod suspended_invocations;
 pub(crate) use invocation_results::OwnedRoutineResult;
 use invocation_results::{RoutineInvocationResult, RoutineResults};
 mod retained;
-pub(crate) use retained::{LockedRow, RetainedSelect};
+pub(crate) use retained::{LockedRow, RetainedSelect, StreamSource};
 
 #[cfg(test)]
 mod routine_contract_tests;

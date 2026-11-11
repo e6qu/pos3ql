@@ -20,6 +20,9 @@ const STREAM_PLAN_HEADROOM: usize = 32 * 1024;
 pub(crate) enum StreamStep {
     /// CommandComplete is queued and the stream is released.
     Complete,
+    /// The Execute's row limit is reached: PortalSuspended is queued and
+    /// the stream holds its position until the portal's next Execute.
+    Suspended,
     /// Delivered rows are final; the stream continues after this wait.
     Wait(StatementWait),
     /// An ErrorResponse follows the delivered rows; the stream is released
@@ -46,6 +49,13 @@ fn stream_capacity(error: SqlError) -> SqlError {
     } else {
         error
     }
+}
+
+/// Why row delivery stopped without an error.
+enum DeliveryStop {
+    End,
+    PageFull,
+    Wait(StatementWait),
 }
 
 fn wait_kind(error: &SqlError) -> Option<StatementWait> {
@@ -78,21 +88,25 @@ impl Engine {
             return Err(SpoolReason::Capacity);
         }
         let mark = self.work.mark();
-        let table =
-            query::RetainedSelect::stream_source_table(&self.storage, txid, select, &self.work);
+        let source = query::RetainedSelect::stream_source(&self.storage, txid, select, &self.work);
         // The probe resolved names in scratch memory only.
         unsafe { self.work.rewind_to(mark) };
-        let Ok(Some(table)) = table else {
-            return Err(SpoolReason::Shape);
+        let positions = match source {
+            // Conservative: every resident entry and every saved generation.
+            Ok(Some(query::StreamSource::Table(table))) => {
+                crate::storage::RowCursor::position_bytes(
+                    self.storage.resident_row_entries(table),
+                    self.max_spill_generations_per_table,
+                )
+            }
+            // A generator retains only its next value.
+            Ok(Some(query::StreamSource::Generated)) => Some(0),
+            _ => return Err(SpoolReason::Shape),
         };
-        // Conservative: every resident entry and every saved generation, plus
-        // the copied text, its parse tree and the bound scope.
-        let estimate = crate::storage::RowCursor::position_bytes(
-            self.storage.resident_row_entries(table),
-            self.max_spill_generations_per_table,
-        )
-        .and_then(|positions| positions.checked_add(source_len.saturating_mul(16)))
-        .and_then(|bytes| bytes.checked_add(STREAM_PLAN_HEADROOM));
+        // Plus the copied text, its parse tree and the bound scope.
+        let estimate = positions
+            .and_then(|positions| positions.checked_add(source_len.saturating_mul(16)))
+            .and_then(|bytes| bytes.checked_add(STREAM_PLAN_HEADROOM));
         match estimate {
             Some(bytes) if bytes <= self.result_stream_bytes => Ok(()),
             _ => Err(SpoolReason::Capacity),
@@ -120,23 +134,26 @@ impl Engine {
 
     /// Reopens a promoted statement as a stream: copies its text and
     /// parameters into the stream allocation, captures the read position and
-    /// sends its RowDescription (extended Execute suppresses it).
+    /// sends its RowDescription (extended Execute suppresses it). A paged
+    /// portal passes its Execute's row limit.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_result_stream(
         &mut self,
         stream: &mut ResultStream,
         protocol: StreamProtocol,
+        page_limit: Option<u64>,
         sql: &str,
         params: &[Datum],
         parameter_types: &[i32],
         owner: type_input_plans::Owner,
         deadline: i64,
         txn: &mut TxnState,
+        cursors: &mut cursor::CursorPool,
         guc: &GucState,
         responder: &mut Responder,
         conn_id: i32,
     ) -> Result<(), SqlError> {
-        stream.release();
+        stream.release(cursors);
         let txid = txn.txid;
         let source_snapshot = txn.command_id().saturating_add(1);
         let _guc_eval_scope = guc::enter_eval_scope(guc, txn);
@@ -157,14 +174,14 @@ impl Engine {
         match opened {
             Ok(true) => {}
             Ok(false) => {
-                stream.release();
+                stream.release(cursors);
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "result stream source no longer retains its read position"
                 ));
             }
             Err(error) => {
-                stream.release();
+                stream.release(cursors);
                 return Err(error);
             }
         }
@@ -176,9 +193,64 @@ impl Engine {
             source_snapshot,
             deadline,
             emitted: 0,
+            page_limit,
+            suspended: false,
             resumed: false,
         });
+        cursors.hold_stream_table(stream.source_table());
         self.result_streams_opened = self.result_streams_opened.saturating_add(1);
+        Ok(())
+    }
+
+    /// Starts the next Execute of a suspended portal: a new statement with
+    /// its own row limit and deadline over the portal's read position and
+    /// snapshot. Returns an error (and keeps the stream) when the portal
+    /// cannot run, as PostgreSQL does in a failed transaction.
+    pub(crate) fn resume_portal_stream(
+        &mut self,
+        stream: &mut ResultStream,
+        page_limit: Option<u64>,
+        text: &str,
+        txn: &TxnState,
+        guc: &GucState,
+        conn_id: i32,
+    ) -> Result<(), SqlError> {
+        let state = stream
+            .state
+            .as_mut()
+            .filter(|state| state.suspended)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "portal stream is not suspended"))?;
+        if txn.failed {
+            return Err(sql_err!(
+                sqlstate::IN_FAILED_SQL_TRANSACTION,
+                "current transaction is aborted, commands ignored until end of transaction block"
+            ));
+        }
+        if state.connection != conn_id || state.txid != txn.txid {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "result stream resumed outside its transaction"
+            ));
+        }
+        txn.begin_statement_clock();
+        state.command = txn.command_id();
+        state.deadline = query::statement_deadline();
+        state.emitted = 0;
+        state.page_limit = page_limit;
+        state.suspended = false;
+        state.resumed = false;
+        let application_name = guc.get_owned("application_name").unwrap_or_default();
+        let backend_xid = self
+            .storage
+            .assigned_transaction_identity(txn.txid)
+            .map(|xid| xid as u32);
+        self.storage.begin_backend_statement(
+            conn_id,
+            text,
+            application_name.as_str(),
+            datetime::transaction_micros(),
+            backend_xid,
+        );
         Ok(())
     }
 
@@ -197,7 +269,7 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<StreamStep, WireFull> {
-        let Some(mut state) = stream.state else {
+        let Some(mut state) = stream.state.filter(|state| !state.suspended) else {
             return self.fail_result_stream(
                 stream,
                 sql_err!(sqlstate::INTERNAL_ERROR, "no result stream is open"),
@@ -252,14 +324,24 @@ impl Engine {
             })
         })()?;
         match outcome {
-            Ok(None) => {
+            Ok(DeliveryStop::End) => {
                 let tag = stack_format!(48, "SELECT {}", state.emitted);
-                stream.release();
+                stream.release(cursors);
                 txn.release_suspended_statement();
                 responder.command_complete(tag.as_str())?;
                 Ok(StreamStep::Complete)
             }
-            Ok(Some(wait)) => {
+            Ok(DeliveryStop::PageFull) => {
+                // No statement runs between Executes: the portal keeps only
+                // its read position and snapshot.
+                state.suspended = true;
+                state.resumed = false;
+                stream.state = Some(state);
+                txn.release_suspended_statement();
+                responder.portal_suspended()?;
+                Ok(StreamStep::Suspended)
+            }
+            Ok(DeliveryStop::Wait(wait)) => {
                 state.resumed = true;
                 stream.state = Some(state);
                 if txn.suspended_statement_context().is_none() {
@@ -286,7 +368,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<StreamStep, WireFull> {
-        stream.release();
+        stream.release(cursors);
         txn.release_suspended_statement();
         sequence::finish_statement(guc.seq_session());
         if error.sqlstate == sqlstate::DEADLOCK_DETECTED {
@@ -340,7 +422,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Returns `None` at the end of the result, or the wait that stopped it.
+    /// Delivers rows until the result ends, the Execute's row limit is
+    /// reached, or a wait stops it.
     #[allow(clippy::too_many_arguments)]
     fn deliver_stream_rows(
         &mut self,
@@ -353,16 +436,20 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         lock_timeout_expired: bool,
-    ) -> Result<Result<Option<StatementWait>, SqlError>, WireFull> {
+    ) -> Result<Result<DeliveryStop, SqlError>, WireFull> {
         let mut row_attempted = state.resumed;
         loop {
             if let Err(error) = query::check_timeout() {
                 return Ok(Err(error));
             }
+            // A paged portal evaluates no row beyond its Execute's limit.
+            if state.page_limit.is_some_and(|limit| state.emitted >= limit) {
+                return Ok(Ok(DeliveryStop::PageFull));
+            }
             // Rows already queued stay final; evaluate another only once the
             // client has room for it.
             if responder.output_backlogged() {
-                return Ok(Ok(Some(StatementWait::ClientOutput)));
+                return Ok(Ok(DeliveryStop::Wait(StatementWait::ClientOutput)));
             }
             // A delivered row's receipts are never replayed: each new row
             // starts with empty statement memory, so a long stream cannot
@@ -411,7 +498,7 @@ impl Engine {
                     if let Err(error) = sequence_scope.finish(guc.seq_session()) {
                         return Ok(Err(error));
                     }
-                    return Ok(Ok(None));
+                    return Ok(Ok(DeliveryStop::End));
                 }
                 Err(error) => {
                     let Some(wait) = wait_kind(&error) else {
@@ -435,7 +522,7 @@ impl Engine {
                     self.storage.preserve_advisory_statement();
                     self.rollback_waiting_statement(txn, row_mark);
                     state.resumed = true;
-                    return Ok(Ok(Some(wait)));
+                    return Ok(Ok(DeliveryStop::Wait(wait)));
                 }
             }
         }

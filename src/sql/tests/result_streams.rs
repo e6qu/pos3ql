@@ -71,12 +71,45 @@ fn read_available(client: &mut TcpStream, into: &mut Vec<u8>) {
     }
 }
 
+fn message(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut message = vec![kind];
+    message.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+    message.extend_from_slice(payload);
+    message
+}
+
+/// Parse, Bind, three Executes of `page` rows, an unlimited Execute and Sync.
+fn paged_request(sql: &str, page: i32) -> Vec<u8> {
+    let mut parse = b"\0".to_vec();
+    parse.extend_from_slice(sql.as_bytes());
+    parse.extend_from_slice(b"\0\0\0");
+    let mut request = message(b'P', &parse);
+    request.extend_from_slice(&message(b'B', b"\0\0\0\0\0\0\0\0"));
+    let mut execute = b"\0".to_vec();
+    execute.extend_from_slice(&page.to_be_bytes());
+    for _ in 0..3 {
+        request.extend_from_slice(&message(b'E', &execute));
+    }
+    request.extend_from_slice(&message(b'E', b"\0\0\0\0\0"));
+    request.extend_from_slice(&message(b'S', b""));
+    request
+}
+
 #[test]
 fn result_streams_yield_on_cold_reads_after_delivered_rows() {
-    let mut config = test_config("result-stream-cold");
+    cold_result_stream("result-stream-cold", false);
+}
+
+#[test]
+fn paged_portals_yield_on_cold_reads_between_and_within_pages() {
+    cold_result_stream("result-stream-cold-paged", true);
+}
+
+fn cold_result_stream(name: &str, paged: bool) {
+    let mut config = test_config(name);
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("result-stream-cold-{}", std::process::id());
+    config.object_store_bucket = format!("{name}-{}", std::process::id());
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.object_store_get_slots = 4;
@@ -140,8 +173,13 @@ fn result_streams_yield_on_cold_reads_after_delivered_rows() {
         password: String::new(),
         scram: None,
     };
+    let sql = "SELECT id, code FROM cold_orders";
     client
-        .write_all(&query("SELECT id, code FROM cold_orders"))
+        .write_all(&if paged {
+            paged_request(sql, 50)
+        } else {
+            query(sql)
+        })
         .unwrap();
     let mut poll = libc::pollfd {
         fd: std::os::fd::AsRawFd::as_raw_fd(conn.stream()),
@@ -172,6 +210,7 @@ fn result_streams_yield_on_cold_reads_after_delivered_rows() {
         );
         if conn.parked_wait() == Some(StatementWait::ObjectIo)
             && conn.result_stream_active()
+            && (!paged || delivered > 50)
             && delivered > 0
             && !yielded_after_rows
         {
@@ -221,14 +260,20 @@ fn result_streams_yield_on_cold_reads_after_delivered_rows() {
     }
     let response = messages(&received);
     let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
-    assert_eq!(kinds.iter().filter(|kind| **kind == b'T').count(), 1);
     assert_eq!(
         &kinds[kinds.len() - 2..],
         b"CZ",
         "{:?}",
         String::from_utf8_lossy(response[kinds.len() - 2].1)
     );
-    assert_eq!(response[kinds.len() - 2].1, b"SELECT 320\0");
+    if paged {
+        // Each full page suspends; the unlimited Execute returns the rest.
+        assert_eq!(kinds.iter().filter(|kind| **kind == b's').count(), 3);
+        assert_eq!(response[kinds.len() - 2].1, b"SELECT 170\0");
+    } else {
+        assert_eq!(kinds.iter().filter(|kind| **kind == b'T').count(), 1);
+        assert_eq!(response[kinds.len() - 2].1, b"SELECT 320\0");
+    }
     let rows: Vec<_> = response
         .iter()
         .filter(|message| message.0 == b'D')

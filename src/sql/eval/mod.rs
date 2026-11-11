@@ -4371,6 +4371,26 @@ fn require_builtin_subquery_operator_execute<'a>(
     if !catalog.builtin_routine_privileges_present() {
         return Ok(());
     }
+    // A row operand compares column by column with the subquery's output.
+    if let Some(fields) = row_constructor_fields(operand) {
+        let base = Expr::RowSubquery {
+            select,
+            arity: u8::try_from(fields.len()).unwrap_or(u8::MAX),
+        };
+        for (index, field) in fields.iter().enumerate() {
+            let column = Expr::RecordFieldIndex {
+                base: &base,
+                index: u16::try_from(index).unwrap_or(u16::MAX),
+            };
+            let left = operator_input_type(field, row, hooks, catalog)?;
+            let Some(right) = catalog.subquery_type(&column, row)? else {
+                continue;
+            };
+            let right = catalog.domain_base_type(right).map_or(right, ColType::oid);
+            require_builtin_operator_types_execute(catalog, name, Some(left), right)?;
+        }
+        return Ok(());
+    }
     let left = operator_input_type(operand, row, hooks, catalog)?;
     let Some(right) = catalog.subquery_type(&Expr::Subquery(select), row)? else {
         return Ok(());

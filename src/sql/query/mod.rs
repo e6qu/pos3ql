@@ -8174,6 +8174,38 @@ pub(super) fn require_select_routine_execute<'a>(
     require_select_expressions_execute(statement, &ScopeSchema(scope), &catalog, false)
 }
 
+/// [`require_select_routine_execute`] for one `SELECT` of an `INSERT` source
+/// whose routine calls run later, as each row is inserted: the plan still
+/// checks them when it starts.
+pub(crate) fn require_source_routine_execute<'s, 'a: 's>(
+    statement: &'a Select<'a>,
+    storage: &'s Storage,
+    txid: u32,
+    arena: &'s Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<(), SqlError> {
+    let catalog = storage_catalog(storage, arena, txid);
+    if !super::eval::CatalogAccess::routine_privileges_present(&catalog) {
+        return Ok(());
+    }
+    match statement.from.as_ref() {
+        Some(from) => {
+            let from: &'s FromClause<'s> = from;
+            let scope = QueryScope::resolve_schema(storage, from, txid, arena, outer)?;
+            require_select_expressions_execute(statement, &ScopeSchema(&scope), &catalog, false)
+        }
+        None => match outer {
+            Some(outer) => require_select_expressions_execute(statement, outer, &catalog, false),
+            None => require_select_expressions_execute(
+                statement,
+                &super::eval::NoColumns,
+                &catalog,
+                false,
+            ),
+        },
+    }
+}
+
 /// Checks `EXECUTE` behind each expression of one `SELECT` level; `exists`
 /// skips the select list an `EXISTS` test discards.
 fn require_select_expressions_execute<'a>(

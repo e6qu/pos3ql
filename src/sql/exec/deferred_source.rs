@@ -451,6 +451,9 @@ pub(super) fn defer_source_calls<'a>(
     if deferred.is_empty() {
         return Ok(None);
     }
+    for leaf in sources.as_slice() {
+        crate::sql::query::require_source_routine_execute(leaf, storage, txid, arena, outer)?;
+    }
     // Every leaf has the written items, its leaf number, then each leaf's
     // hidden columns: its own values and NULL in the other leaves' slots.
     let width = leaves.as_slice()[0].items.len();

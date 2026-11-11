@@ -823,6 +823,7 @@ pub(super) use sql_function_execution::execute_sql_function;
 mod engine_triggers;
 mod plpgsql_conditions;
 pub(crate) use engine_triggers::{engine_required, run_pending_trigger};
+mod row_conflicts;
 mod row_progress;
 mod trigger_firing;
 mod write_attempts;
@@ -6027,22 +6028,9 @@ fn update_lock_strength<Definition0: crate::storage::DefinitionBacking>(
     updated: ColumnSet,
     txid: u32,
 ) -> crate::sql::ast::LockStrength {
-    let changes_key = def
-        .columns()
-        .iter()
-        .enumerate()
-        .any(|(column, definition)| {
-            updated.contains(column)
-                && (definition.primary
-                    || definition.unique
-                    || def
-                        .uniques()
-                        .iter()
-                        .any(|key| key.columns().contains(&(column as u16)))
-                    || storage
-                        .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
-                        .any(|index| index.columns[..index.n_cols].contains(&(column as u16))))
-        });
+    let changes_key = (0..def.n_columns).any(|column| {
+        updated.contains(column) && row_conflicts::is_key_column(storage, def, column, txid)
+    });
     if changes_key {
         crate::sql::ast::LockStrength::Update
     } else {

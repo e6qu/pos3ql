@@ -5952,7 +5952,14 @@ impl Engine {
         if let Err(error) =
             exec::constraints::validate_deferred_constraints(&self.storage, txn, false, &self.work)
         {
-            self.rollback_txn(txn, guc);
+            // A foreign key check waiting for its parent row's lock keeps
+            // the admission, the completed checks and their locks, and
+            // continues when the commit runs again.
+            if error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
+                && error.sqlstate != sqlstate::INTERNAL_IO_WAIT
+            {
+                self.rollback_txn(txn, guc);
+            }
             return Err(error);
         }
         if txn.isolation == TransactionIsolation::Serializable
@@ -9850,6 +9857,7 @@ impl Engine {
                             identity,
                             obligation.rowid,
                             txn.txid,
+                            txn.isolation,
                             arena,
                         ) {
                             return Ok(Err(error));

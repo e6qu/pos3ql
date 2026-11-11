@@ -44,6 +44,21 @@ earlier status after another transaction changes it. In locking mode, a
 conflicting writer waits for the reader's relation lock, while work on
 unrelated tables continues.
 
+**Foreign keys and concurrent writers.** Inserting or updating a row that
+references another table locks the referenced (parent) row `FOR KEY SHARE`, as
+PostgreSQL does. A delete or key change of that parent waits for the inserting
+transaction, and an insert waits for a transaction that is deleting the parent
+or changing its key; after the wait each side checks the outcome again. For
+example, if one session deletes customer 7 while another inserts an order for
+customer 7, the order insert waits; when the delete commits the insert fails
+with `23503`, and when it rolls back the insert succeeds. Under `REPEATABLE
+READ` and `SERIALIZABLE`, an insert whose parent was deleted or had its key
+changed after the transaction's snapshot fails with `40001`. Changing other
+parent columns does not conflict. `ON DELETE`/`ON UPDATE` actions lock the
+referencing rows they check or rewrite. Each locked row takes one entry of the
+row-lock registry, (`max_connections` + `max_prepared_transactions`) ×
+`txn_rows` entries in total; a full registry fails the statement with `54000`.
+
 A commit becomes visible all at once, and only after it is durable: new
 statements never see half of an order-and-invoice update. If commit waits for
 storage, completed work is not repeated; a default that issued an order number

@@ -8406,6 +8406,16 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let mut columns = ArenaList::new(self.arena);
         loop {
+            // PostgreSQL accepts `(expression)` and function-call keys too;
+            // pos3ql partitions only by columns and refuses the rest loudly.
+            let at = self.peek_at;
+            if self.peeked == Tok::Op("(") || self.peek_is_function_call()? {
+                self.expression(0)?;
+                let mut error =
+                    ParseError::new(at, "partition keys that are expressions are not supported");
+                error.sqlstate = crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED;
+                return Err(error);
+            }
             let column = self.col_ident("partition key column")?;
             self.push(&mut columns, column)?;
             if !self.eat_op(",")? {

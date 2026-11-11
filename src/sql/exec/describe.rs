@@ -5351,6 +5351,14 @@ pub fn infer_type_res(
             builtin_binary_type(operator, lo, ro)?
         }
         Expr::Collate { operand, .. } => infer_type_res(operand, columns)?,
+        // A cast to `"any"` converts nothing: the value keeps its type.
+        Expr::Cast {
+            operand, type_name, ..
+        } if ColType::from_sql_name(type_name)
+            == Some(ColType::Pseudo(crate::sql::types::PseudoType::Any)) =>
+        {
+            infer_type_res(operand, columns)?
+        }
         Expr::Cast {
             operand, type_name, ..
         } => {

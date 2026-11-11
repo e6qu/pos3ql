@@ -33261,13 +33261,24 @@ impl Storage {
         let extension_name = catalog.definitions[extension].name;
         drop(catalog);
         let (_, name) = self.access_object_name_to(object, txid);
-        Err(sql_err!(
+        // PostgreSQL's dependency walk names the member and its extension
+        // as `getObjectDescription` does, without quotes.
+        let error = sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-            "cannot drop {} \"{}\" because extension \"{}\" requires it",
+            "cannot drop {} {} because extension {} requires it",
             kind,
             name.as_str(),
             extension_name.as_str()
-        ))
+        );
+        crate::sql::eval::stash_diagnostic(
+            None,
+            Some(crate::stack_format!(
+                128,
+                "You can drop extension {} instead.",
+                extension_name.as_str()
+            )),
+        );
+        Err(error)
     }
 
     pub(crate) fn change_extension_dependency(

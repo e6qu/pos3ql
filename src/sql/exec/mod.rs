@@ -36006,6 +36006,46 @@ pub(crate) fn drop_collation(
     if let Err(error) = require_definition_owner(storage, txn.txid, definition.owner, "collation") {
         return sql_fail(error);
     }
+    let report = dependency_report::report_drop(
+        storage,
+        txn.txid,
+        &[ObjectAddress::new(
+            super::catalog::PG_COLLATION_OID,
+            storage.collation(slot).oid(),
+            0,
+        )],
+        cascade,
+        arena,
+        responder,
+    );
+    run_reported_drop(report, responder, |responder| {
+        drop_collation_slot(
+            storage,
+            wal,
+            txn,
+            scratch,
+            slot,
+            cascade,
+            arena,
+            seq_session,
+            responder,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drop_collation_slot(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    slot: usize,
+    cascade: bool,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    let definition = storage.collation(slot).definition_for(txn.txid);
     let identity = crate::sql::ast::Collation::Catalog(storage.collation(slot).binding());
     let StoredDependencyClosure {
         views: dependent_views,
@@ -38153,11 +38193,8 @@ pub(crate) fn resolve_routine_declaration(
         let ctype = resolved.ctype;
         if ctype.is_pseudo() {
             check_routine_argument_type(routine.language, resolved)?;
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "PL/pgSQL functions with arguments of type {} are not supported",
-                ctype.name()
-            ));
+            // Only PL/pgSQL's `record` arguments pass the check above; they
+            // bind like a `record` variable to the caller's row value.
         }
         let default = match argument.mode.default_text() {
             Some(text) => {

@@ -285,8 +285,9 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         }
         // A cast *to* record has no source but a record itself; PostgreSQL
         // has no input conversion for anonymous records either.
+        // A named composite value is already a record; it keeps its type.
         ColType::Record => match v {
-            Datum::Record(_) => v,
+            Datum::Record(_) | Datum::Composite { .. } | Datum::CompositeText { .. } => v,
             _ => return Err(cast_unsupported(&v, "record")),
         },
         ColType::Int2Vector => match v {

@@ -676,8 +676,18 @@ pub(crate) fn expression_type_identity<'a>(
                 )
             });
     }
-    if let Expr::Cast { type_name, .. } = expression {
+    if let Expr::Cast {
+        operand, type_name, ..
+    } = expression
+    {
         if let Some(ctype) = super::types::ColType::from_sql_name(type_name) {
+            if ctype == super::types::ColType::Pseudo(super::types::PseudoType::Any) {
+                // An untyped literal stays `unknown`.
+                if matches!(operand, Expr::Str(_)) {
+                    return Ok(ExpressionTypeIdentity::Known(super::types::oid::UNKNOWN));
+                }
+                return expression_type_identity(operand, row, hooks);
+            }
             return Ok(ExpressionTypeIdentity::Known(ctype.oid()));
         }
         let Some(catalog) = hooks.catalog else {
@@ -4634,6 +4644,30 @@ fn eval_full_inner<'a>(
                 Some(element) => Ok(ExpressionTypeIdentity::Known(element.array_oid())),
                 None => expression_type_identity(operand, row, hooks),
             };
+            let target_type = ColType::from_sql_name(type_name);
+            if let Some(ColType::Pseudo(kind)) = target_type {
+                return pseudo_type_cast(kind, v, source_identity()?.routine_argument_oid(), arena);
+            }
+            if source_identity()?.routine_argument_oid() == super::types::oid::CSTRING
+                && !matches!(
+                    target_type,
+                    Some(ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name)
+                )
+            {
+                let error = match target_type {
+                    Some(target) => sql_err!(
+                        sqlstate::CANNOT_COERCE,
+                        "cannot cast type cstring to {}",
+                        target.name()
+                    ),
+                    None => sql_err!(
+                        sqlstate::CANNOT_COERCE,
+                        "cannot cast type cstring to {}",
+                        type_name
+                    ),
+                };
+                return Err(error);
+            }
             if ColType::from_sql_name(type_name) == Some(ColType::PgNodeTree)
                 && !v.is_null()
                 && source_identity()?.routine_argument_oid() != super::types::oid::PG_NODE_TREE
@@ -11315,6 +11349,37 @@ pub(crate) fn regtype_of_normalized_name<'a>(
         )
     })?;
     regtype_of_oid(i64::from(referenced_oid), arena)
+}
+
+/// A cast to `cstring`, `unknown` or `"any"`. PostgreSQL converts a string
+/// value or an untyped literal to `cstring` through its output, keeps an
+/// untyped literal as `unknown`, and treats `"any"` as no conversion; other
+/// sources fail with `42846`, and the remaining pseudo-types accept no value.
+fn pseudo_type_cast<'a>(
+    kind: super::types::PseudoType,
+    value: Datum<'a>,
+    source_oid: i32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use super::types::{PseudoType, oid};
+    let accepted = match kind {
+        PseudoType::Any => return Ok(value),
+        PseudoType::Cstring => matches!(
+            source_oid,
+            oid::UNKNOWN | oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::CSTRING
+        ),
+        PseudoType::Unknown => source_oid == oid::UNKNOWN,
+        _ => return Err(cast::pseudo_type_value(kind)),
+    };
+    if !accepted {
+        return Err(sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "cannot cast type {} to {}",
+            crate::sql::exec::coltype_of_oid(source_oid).map_or("record", ColType::name),
+            kind.display_name()
+        ));
+    }
+    cast_to(value, ColType::Text, arena)
 }
 
 /// `format_type` of a built-in `pg_type` row that no routine or column type

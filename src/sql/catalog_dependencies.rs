@@ -557,6 +557,14 @@ pub(crate) fn for_each_dependency(
         let Some(index) = storage.index_visible_to(index_slot, txid) else {
             continue;
         };
+        // PostgreSQL's `index_create` records each key column's collation.
+        for collation in index.collations[..index.n_cols].iter().copied() {
+            collation_edge(
+                ObjectAddress::new(PG_CLASS_OID, explicit_index_oid(&index), 0),
+                collation,
+                visit,
+            )?;
+        }
         for position in 0..index.n_cols {
             let Some(crate::storage::IndexOperatorClass::Catalog(class_oid)) =
                 index.resolved_operator_classes[position]
@@ -1124,6 +1132,11 @@ fn relation_dependencies(
                     kind: b'n',
                 })?;
             }
+            collation_edge(
+                ObjectAddress::new(PG_CLASS_OID, relation, attribute),
+                column.collation,
+                visit,
+            )?;
             let Some(default) = definition.attribute_default_oid(column_index) else {
                 continue;
             };
@@ -1205,6 +1218,27 @@ fn type_dependencies(
         )?;
         let row_type = view_row_type_oid(storage, view, false);
         visit(internal(row_type, PG_CLASS_OID, view_oid(storage, view)))?;
+        // A view's columns depend on their user-defined types and collations,
+        // as a table's do.
+        let (_, columns) = storage.view_column_shape(view, txid);
+        for position in 0..columns {
+            let Some((_, column_type)) = storage.view_column(view, txid, position) else {
+                break;
+            };
+            let column = ObjectAddress::new(
+                PG_CLASS_OID,
+                view_oid(storage, view),
+                i32::try_from(position + 1).expect("view attribute fits"),
+            );
+            if crate::storage::NamedTypeKind::from_oid(column_type.oid()).is_some() {
+                visit(DependencyEdge {
+                    dependent: column,
+                    referenced: ObjectAddress::new(PG_TYPE_OID, column_type.oid(), 0),
+                    kind: b'n',
+                })?;
+            }
+            collation_edge(column, column_type.collation(), visit)?;
+        }
         visit(internal(
             view_row_type_oid(storage, view, true),
             PG_TYPE_OID,
@@ -1276,6 +1310,11 @@ fn type_dependencies(
             kind: b'i',
         })?;
         for field in definition.active_fields_for(txid) {
+            collation_edge(
+                ObjectAddress::new(PG_CLASS_OID, relation, i32::from(field.attribute_number)),
+                field.collation,
+                visit,
+            )?;
             if let Some(field_type) = user_type_oid(storage, txid, field.ctype, field.user_type) {
                 visit(DependencyEdge {
                     dependent: ObjectAddress::new(
@@ -1576,4 +1615,21 @@ fn transition_columns<'a, 'f>(
         *slot = u16::try_from(column + 1).expect("attribute number fits");
     }
     Ok(attributes)
+}
+
+/// The dependency of a column, index or attribute on a user-defined
+/// collation; built-in collations are pinned and have no row.
+fn collation_edge(
+    dependent: ObjectAddress,
+    collation: crate::sql::ast::Collation,
+    visit: &mut dyn FnMut(DependencyEdge) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    if !matches!(collation, crate::sql::ast::Collation::Catalog(_)) {
+        return Ok(());
+    }
+    visit(DependencyEdge {
+        dependent,
+        referenced: ObjectAddress::new(PG_COLLATION_OID, collation.oid(), 0),
+        kind: b'n',
+    })
 }

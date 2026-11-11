@@ -61,8 +61,9 @@ Schemas and catalogs:
   send routine, an array's `array_subscript_handler`). Of `information_schema`'s
   types only its domains and their arrays are listed, not its views' row types.
 - `DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`, `FOREIGN TABLE`, `SEQUENCE`,
-  `FUNCTION`, `PROCEDURE`, `ROUTINE`, `TYPE`, `DOMAIN`, `SCHEMA`, `OPERATOR`
-  and `TEXT SEARCH` objects report
+  `FUNCTION`, `PROCEDURE`, `ROUTINE`, `TYPE`, `DOMAIN`, `SCHEMA`, `OPERATOR`,
+  `COLLATION`, `SERVER`, `FOREIGN DATA WRAPPER` and `TEXT SEARCH` objects
+  report
   dependent objects as PostgreSQL does, from the rows `pg_depend` lists:
   without `CASCADE`, one `2BP01` error whose `DETAIL` names every dependent
   (`column b of table orders depends on type amount`, `view totals depends on
@@ -75,7 +76,10 @@ Schemas and catalogs:
   walk copies every `pg_depend` row into the statement arena; a catalog whose
   rows do not fit in `sql_arena_bytes` fails the `DROP` with `54000`.
   `pg_depend` has PostgreSQL's rows for partition key columns, PL/pgSQL
-  routines' language, index and extended statistics key columns, and the
+  routines' language, index and extended statistics key columns, columns and
+  indexes that use a user-defined collation, the columns a rule or trigger
+  `WHEN` condition reads through `NEW` and `OLD`, foreign servers, user
+  mappings and foreign tables, and the
   parsers, templates and dictionaries text search objects use, so dropping a
   dictionary with `CASCADE` drops the configurations that map it
   (`drop cascades to text search configuration tc`). A partition key column
@@ -240,9 +244,13 @@ Functions and expressions:
   and `'"any"'::regtype` or `'_cstring'::regtype` name their catalog types.
   A user-defined routine refuses pseudo-type arguments and results with
   PostgreSQL's messages (`SQL functions cannot have arguments of type
-  cstring`). Limits: renaming or moving a built-in fails with `0A000`; values
-  of `cstring`, `"any"` and `unknown` (`SELECT 'abc'::cstring`) fail with
-  `0A000`, and a PL/pgSQL routine with a `record` argument fails with `0A000`.
+  cstring`). A PL/pgSQL routine may take a `record` argument
+  (`CREATE FUNCTION f(r record) ... RETURN r.a`). `'abc'::cstring`,
+  `name_column::cstring` and `'abc'::unknown` are values of those types, as in
+  PostgreSQL, and a cast to `"any"` keeps its operand; other sources fail
+  with `42846` (`cannot cast type integer to cstring`). Limits: renaming or
+  moving a built-in fails with `0A000`; `cstring` arrays and operators are
+  not modeled.
   Dropping a built-in fails with `2BP01`, as in PostgreSQL.
 - PostgreSQL 18.6's predefined roles exist from the start, with their
   OIDs, and initdb's memberships of `pg_monitor` in `pg_read_all_settings`,
@@ -435,7 +443,8 @@ ALTER TABLE orders ATTACH PARTITION early_orders FOR VALUES FROM (0) TO (10);
 INSERT INTO orders VALUES (1, 30) RETURNING id, amount;
 ```
 
-A generated column cannot be a partition key (`42P17`). `ON CONFLICT DO UPDATE`
+A generated column cannot be a partition key (`42P17`), and a key that is an
+expression (`PARTITION BY RANGE (lower(name))`) fails with `0A000`. `ON CONFLICT DO UPDATE`
 cannot move a row to another partition (`0A000`).
 
 ## Capacity boundaries

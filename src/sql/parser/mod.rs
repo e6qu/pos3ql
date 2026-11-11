@@ -9144,6 +9144,34 @@ impl<'a> Parser<'a> {
         Ok(next == Tok::Ident(word))
     }
 
+    /// Whether the current identifier starts a call: `lower(a)`.
+    fn peek_is_function_call(&mut self) -> Result<bool, ParseError> {
+        if !matches!(self.peeked, Tok::Ident(_) | Tok::QuotedIdent(_)) {
+            return Ok(false);
+        }
+        let mark = self.lexer.mark();
+        let mut next = self
+            .lexer
+            .next_token()
+            .map_err(|error| ParseError::lexical(error, self.text))?;
+        // A qualified name: `schema.function(`.
+        while next == Tok::Op(".") {
+            let name = self
+                .lexer
+                .next_token()
+                .map_err(|error| ParseError::lexical(error, self.text))?;
+            if !matches!(name, Tok::Ident(_) | Tok::QuotedIdent(_)) {
+                break;
+            }
+            next = self
+                .lexer
+                .next_token()
+                .map_err(|error| ParseError::lexical(error, self.text))?;
+        }
+        self.lexer.reset(mark);
+        Ok(next == Tok::Op("("))
+    }
+
     fn eat_op(&mut self, operator: &str) -> Result<bool, ParseError> {
         if self.peeked == Tok::Op(operator) {
             self.advance()?;

@@ -1567,7 +1567,8 @@ fn attribute_default_oids_follow_default_lifetimes_through_journal_and_checkpoin
     // PostgreSQL stores a new pg_attrdef row (and OID) whenever a default or
     // generation expression is set; renames and unrelated changes keep it.
     const SETUP: &str = "CREATE TABLE ad_t(a int DEFAULT 1, b int GENERATED ALWAYS AS (a * 2) STORED, c text DEFAULT 'x');
-         CREATE VIEW ad_v AS SELECT a FROM ad_t;
+         CREATE TABLE ad_src(a int);
+         CREATE VIEW ad_v AS SELECT a FROM ad_src;
          ALTER VIEW ad_v ALTER a SET DEFAULT 5;
          CREATE TABLE ad_saved(identity oid, relid oid, num int2);
          INSERT INTO ad_saved SELECT oid, adrelid, adnum FROM pg_attrdef;
@@ -16580,7 +16581,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         "DROP TABLE moved_extensions.typed_values CASCADE",
     );
     assert!(
-        String::from_utf8_lossy(&rejected).contains("extension \"typed_ext\" requires it"),
+        String::from_utf8_lossy(&rejected).contains("because extension typed_ext requires it"),
         "{}",
         String::from_utf8_lossy(&rejected)
     );
@@ -16798,7 +16799,7 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
     );
     let member_drop = run_with(&mut engine, &mut budget, "DROP TABLE member_table");
     assert!(
-        String::from_utf8_lossy(&member_drop).contains("extension \"empty_ext\" requires it"),
+        String::from_utf8_lossy(&member_drop).contains("because extension empty_ext requires it"),
         "{}",
         String::from_utf8_lossy(&member_drop)
     );
@@ -16908,7 +16909,7 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
     ] {
         let rejected = run_with(&mut engine, &mut budget, command);
         assert!(
-            String::from_utf8_lossy(&rejected).contains("extension \"empty_ext\" requires it"),
+            String::from_utf8_lossy(&rejected).contains("because extension empty_ext requires it"),
             "{command}: {}",
             String::from_utf8_lossy(&rejected)
         );

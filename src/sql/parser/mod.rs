@@ -354,7 +354,8 @@ pub struct Parser<'a> {
     /// Tokens whose text does not start at their token (strings, quoted and
     /// copied identifiers), for positioning analysis errors. Recorded only
     /// when the caller keeps the parser's arena for the whole text.
-    source_copies: Option<ArenaList<'a, crate::sql::error_position::SourceCopy>>,
+    source_copies:
+        Option<core::cell::RefCell<ArenaList<'a, crate::sql::error_position::SourceCopy>>>,
     /// End of the furthest identifier whose truncation NOTICE was recorded,
     /// so a token scanned again after lookahead is reported once.
     truncation_reported_to: usize,
@@ -364,6 +365,12 @@ pub struct Parser<'a> {
     defer_analysis_errors: bool,
     /// The first analysis error in the statement being parsed.
     analysis_error: Option<ParseError>,
+    /// The type a deferred "type modifier is not allowed" error names, which
+    /// PostgreSQL reports as unknown instead when no such type exists.
+    analysis_error_type: Option<&'a str>,
+    /// The statement whose analysis error was last reported, so the caller
+    /// can report the analysis errors PostgreSQL finds before it.
+    rejected_statement: Option<Stmt<'a>>,
     /// The last `next_stmt` failure was a deferred analysis error, and the
     /// parser stands at the end of that statement.
     analysis_error_reported: bool,
@@ -963,6 +970,8 @@ impl<'a> Parser<'a> {
             truncation_reported_to: 0,
             defer_analysis_errors: false,
             analysis_error: None,
+            analysis_error_type: None,
+            rejected_statement: None,
             analysis_error_reported: false,
             allow_into: false,
             into_clause: None,
@@ -979,14 +988,16 @@ impl<'a> Parser<'a> {
     /// Tokens copied or offset from their token start, recorded while
     /// parsing, which [`crate::sql::error_position`] maps back to the text.
     pub(crate) fn source_copies(&self) -> &'a [crate::sql::error_position::SourceCopy] {
-        self.source_copies.as_ref().map_or(&[], ArenaList::as_slice)
+        self.source_copies
+            .as_ref()
+            .map_or(&[], |copies| copies.borrow().as_slice())
     }
 
     /// Records where copied tokens came from, for [`Self::source_copies`].
     /// The caller must not rewind the arena while this parser lives: the
     /// record grows with every string and copied identifier.
     pub(crate) fn record_source_copies(&mut self) -> Result<(), ParseError> {
-        self.source_copies = Some(ArenaList::new(self.arena));
+        self.source_copies = Some(core::cell::RefCell::new(ArenaList::new(self.arena)));
         // The first token was scanned before recording began.
         self.note_token_source()
     }
@@ -1001,8 +1012,8 @@ impl<'a> Parser<'a> {
         };
         let pushed = self
             .source_copies
-            .as_mut()
-            .is_none_or(|copies| copies.push(copy).is_ok());
+            .as_ref()
+            .is_none_or(|copies| copies.borrow_mut().push(copy).is_ok());
         if pushed {
             Ok(())
         } else {
@@ -1023,14 +1034,14 @@ impl<'a> Parser<'a> {
             _ => None,
         };
         if let Some(text) = text
-            && let Some(copies) = self.source_copies.as_mut()
+            && let Some(copies) = self.source_copies.as_ref()
         {
             let copy = crate::sql::error_position::SourceCopy {
                 address: text.as_ptr() as usize,
                 len: text.len(),
                 at: self.peek_at,
             };
-            if copies.push(copy).is_err() {
+            if copies.borrow_mut().push(copy).is_err() {
                 return Err(self.arena_full("statement too large for SQL arena"));
             }
         }
@@ -1359,6 +1370,8 @@ impl<'a> Parser<'a> {
     pub fn next_stmt(&mut self) -> Result<Option<Stmt<'a>>, ParseError> {
         self.analysis_error_reported = false;
         self.analysis_error = None;
+        self.analysis_error_type = None;
+        self.rejected_statement = None;
         while self.peeked == Tok::Op(";") {
             self.advance()?;
         }
@@ -1370,6 +1383,7 @@ impl<'a> Parser<'a> {
             Tok::Op(";") | Tok::Eof => match self.analysis_error.take() {
                 Some(error) => {
                     self.analysis_error_reported = true;
+                    self.rejected_statement = Some(statement);
                     Err(error)
                 }
                 None => Ok(Some(statement)),
@@ -1394,6 +1408,14 @@ impl<'a> Parser<'a> {
     /// the error belongs where that statement would have run.
     pub(crate) fn analysis_error_reported(&self) -> bool {
         self.analysis_error_reported
+    }
+
+    /// The statement whose deferred analysis error [`Self::next_stmt`] last
+    /// returned, and the type a modifier error names.
+    pub(crate) fn take_rejected_statement(&mut self) -> Option<(Stmt<'a>, Option<&'a str>)> {
+        self.rejected_statement
+            .take()
+            .map(|statement| (statement, self.analysis_error_type.take()))
     }
 
     /// Reports an error PostgreSQL raises during parse analysis rather than
@@ -7554,20 +7576,94 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        if !column_subscripts.is_empty() {
-            if select.is_some() {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: StackStr::from_str(
-                        "INSERT ... SELECT into a subscripted target column is not supported",
-                    ),
-                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                    cursor: None,
-                    hint: None,
-                    near: None,
-                    detail: None,
-                });
+        if !column_subscripts.is_empty()
+            && let Some(query) = select
+        {
+            // PostgreSQL assigns each subscripted target from its output
+            // column into a NULL of the column's type: select the assignments
+            // from the query.
+            const SOURCE: &str = crate::sql::ast::INSERT_SUBSCRIPT_SOURCE;
+            let width = column_names.len();
+            let names = self
+                .arena
+                .alloc_slice_with(width, |_| "")
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+            let mut items = ArenaList::new(self.arena);
+            for (index, name) in names.iter_mut().enumerate() {
+                *name = self
+                    .arena
+                    .alloc_str_display(format_args!("column{}", index + 1))
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+                let value = self.arena_expr(Expr::Column {
+                    qualifier: Some(SOURCE),
+                    name,
+                })?;
+                let expression = match column_subscripts
+                    .as_slice()
+                    .iter()
+                    .find(|(column, _)| *column == index)
+                {
+                    Some((_, subscripts)) => {
+                        let base = self.arena_expr(Expr::Null)?;
+                        self.subscript_assignment(base, value, subscripts)?
+                    }
+                    None => value,
+                };
+                self.push(
+                    &mut items,
+                    SelectItem::Expr {
+                        expression,
+                        alias: None,
+                    },
+                )?;
             }
+            let wrapped = Select {
+                items: items.as_slice(),
+                distinct: false,
+                distinct_on: &[],
+                from: Some(FromClause {
+                    base: TableRef {
+                        schema: None,
+                        table: "",
+                        alias: Some(SOURCE),
+                        subquery: Some(query),
+                        func_args: None,
+                        func_argument_names: &[],
+                        func_variadic: false,
+                        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                        rows_from: None,
+                        col_alias: Some(&*names),
+                        inheritance: crate::sql::ast::RelationInheritance::Descendants,
+                        sample: None,
+                        cte: None,
+                        with_ordinality: false,
+                        lateral: false,
+                        authorization_role: None,
+                        bound_table: None,
+                        view_access: None,
+                    },
+                    joins: &[],
+                }),
+                where_clause: None,
+                group_by: &[],
+                grouping_sets: &[],
+                having: None,
+                order_by: &[],
+                limit: None,
+                offset: None,
+                with_ties: false,
+                with: &[],
+                set_body: None,
+                locking: &[],
+                ..*query
+            };
+            select = Some(
+                self.arena
+                    .alloc(wrapped)
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?
+                    as &_,
+            );
+        } else if !column_subscripts.is_empty() {
             // PostgreSQL assigns into a NULL of the column's type.
             let rows = rows
                 .as_mut_slice()
@@ -9309,6 +9405,24 @@ impl<'a> Parser<'a> {
     }
 
     fn arena_expr(&self, e: Expr<'a>) -> Result<&'a Expr<'a>, ParseError> {
+        // A constant keeps no source text; its node records where its token
+        // was written, so an error about it can point there.
+        if matches!(
+            e,
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null | Expr::Param(_)
+        ) && let Some((_, start, _)) = self.previous_token
+            && let Some(copies) = &self.source_copies
+        {
+            let expression = self
+                .arena
+                .alloc(e)
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+            let node = crate::sql::error_position::SourceCopy::node(expression, start);
+            if copies.borrow_mut().push(node).is_err() {
+                return Err(self.arena_full("statement too large for SQL arena"));
+            }
+            return Ok(expression);
+        }
         if let Some(sources) = &self.column_sources
             && let Expr::Column { name, .. } | Expr::SchemaColumn { name, .. } = e
             && let Some((Tok::Ident(token) | Tok::QuotedIdent(token), start, end)) =

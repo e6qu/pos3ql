@@ -7241,6 +7241,196 @@ fn correlated_row_hooks<'scratch, 'a>(
 /// three sort and deduplicate by the projected encoding and so never consult
 /// it, which is why each has to be checked where its keys are known rather than
 /// where they are compared. `cid` and `cid[]` have equality but no ordering.
+/// Checks a SQL-language routine body statement as PostgreSQL's parse
+/// analysis does at `CREATE FUNCTION`: a query's relations, columns,
+/// functions and types, and a data-changing statement's target relation.
+/// Nothing is read or written.
+pub(crate) fn analyse_routine_statement<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let target = match statement {
+        Stmt::Select(select) => {
+            let mark = arena.mark();
+            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let described = expand_ctes(select, storage, txid, arena).and_then(|select| {
+                describe_select(
+                    select,
+                    storage,
+                    txid,
+                    arena,
+                    &mut columns,
+                    crate::sql::exec::DescriptionTarget::Sql,
+                    None,
+                )
+            });
+            // Only the verdict leaves; the description is discarded.
+            unsafe { arena.rewind_to(mark) };
+            return described.map(|_| ());
+        }
+        Stmt::Insert(statement) => statement.table,
+        Stmt::Update(statement) => statement.table,
+        Stmt::Delete(statement) => statement.table,
+        _ => return Ok(()),
+    };
+    if storage
+        .resolve_relation(target.schema, target.name, txid)
+        .is_some()
+    {
+        return Ok(());
+    }
+    let error = match target.schema {
+        Some(schema) => sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "relation \"{}.{}\" does not exist",
+            schema,
+            target.name
+        ),
+        None => sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "relation \"{}\" does not exist",
+            target.name
+        ),
+    };
+    Err(crate::sql::error_position::at_reference(
+        error,
+        target.schema.unwrap_or(target.name),
+    ))
+}
+
+/// [`analyse_routine_statement`] for every statement of a parsed body.
+pub(crate) fn analyse_routine_program<'a>(
+    program: &RoutineFunctionProgram<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    for prelude in program.preceding {
+        if let RoutinePrelude::Statement(statement) = prelude {
+            analyse_routine_statement(statement, storage, txid, arena)?;
+        }
+    }
+    match program.result {
+        RoutineFunctionResult::Query(RoutineQuery::Select(select)) => {
+            let statement = arena
+                .alloc(Stmt::Select(**select))
+                .map_err(|_| arena_full())?;
+            analyse_routine_statement(statement, storage, txid, arena)
+        }
+        RoutineFunctionResult::DataModification(statement)
+        | RoutineFunctionResult::Void(statement) => {
+            analyse_routine_statement(statement, storage, txid, arena)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// PostgreSQL resolves an operator between a typed value and an
+/// unknown-type literal by converting the literal to the value's type while
+/// analysing the query, so `WHERE a = 'abc'` on an integer column fails
+/// before any row is read, pointing at the literal.
+fn check_literal_operands<'a>(
+    expression: &'a Expr<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    check_literal_operands_typed(
+        expression,
+        &|other| {
+            infer_scope_type(other, scope)
+                .ok()
+                .and_then(|(oid, _)| ColType::from_oid(oid))
+        },
+        arena,
+    )
+}
+
+/// [`check_literal_operands`] with `infer` naming each operand's type.
+pub(crate) fn check_literal_operands_typed<'a>(
+    expression: &'a Expr<'a>,
+    infer: &dyn Fn(&'a Expr<'a>) -> Option<ColType>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    use crate::sql::ast::BinaryOp;
+    let convert = |literal: &'a str, other: &'a Expr<'a>, arithmetic: bool| {
+        let Some(ctype) = infer(other) else {
+            return Ok(());
+        };
+        let numeric = matches!(
+            ctype,
+            ColType::Int2
+                | ColType::Int4
+                | ColType::Int8
+                | ColType::Float4
+                | ColType::Float8
+                | ColType::Numeric
+        );
+        let comparable = numeric
+            || matches!(
+                ctype,
+                ColType::Bool
+                    | ColType::Date
+                    | ColType::Timestamp
+                    | ColType::Timestamptz
+                    | ColType::Uuid
+            );
+        if !(if arithmetic { numeric } else { comparable }) {
+            return Ok(());
+        }
+        crate::sql::eval::cast_to(Datum::Text(literal), ctype, arena)
+            .map(|_| ())
+            .map_err(|error| crate::sql::error_position::at_subject(error, literal))
+    };
+    match expression {
+        Expr::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } => {
+            check_literal_operands_typed(left, infer, arena)?;
+            check_literal_operands_typed(right, infer, arena)?;
+            let arithmetic = match operator {
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq => false,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                    true
+                }
+                _ => return Ok(()),
+            };
+            match (left, right) {
+                (Expr::Str(_), Expr::Str(_)) => Ok(()),
+                (Expr::Str(literal), other) | (other, Expr::Str(literal)) => {
+                    convert(literal, other, arithmetic)
+                }
+                _ => Ok(()),
+            }
+        }
+        Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
+            check_literal_operands_typed(operand, infer, arena)
+        }
+        Expr::InList { operand, list, .. } => {
+            check_literal_operands_typed(operand, infer, arena)?;
+            for item in *list {
+                match item {
+                    Expr::Str(literal) if !matches!(operand, Expr::Str(_)) => {
+                        convert(literal, operand, false)?
+                    }
+                    item => check_literal_operands_typed(item, infer, arena)?,
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn check_key_types<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
@@ -7248,6 +7438,24 @@ fn check_key_types<'a>(
     storage: &Storage,
     txid: u32,
 ) -> Result<(), SqlError> {
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item {
+            check_literal_operands(expression, scope, arena)?;
+        }
+    }
+    for expression in statement
+        .where_clause
+        .into_iter()
+        .chain(statement.having)
+        .chain(
+            statement
+                .from
+                .iter()
+                .flat_map(|from| from.joins.iter().filter_map(|join| join.on)),
+        )
+    {
+        check_literal_operands(expression, scope, arena)?;
+    }
     let noncomparable = |e: &Expr<'a>| {
         infer_scope_type(e, scope)
             .ok()
@@ -8942,25 +9150,7 @@ fn check_select_types<'a>(
     }
     if let Some(w) = statement.where_clause {
         check(w)?;
-        let (oid, _) = super::exec::infer_type_res(w, columns)?;
-        let catalog = storage_catalog(storage, arena, txid);
-        let boolean = oid == super::types::oid::BOOL
-            || oid == super::types::oid::UNKNOWN
-            || catalog.domain_base_type(oid) == Some(ColType::Bool);
-        if !boolean {
-            let type_name = match ColType::from_oid(oid) {
-                Some(ctype) => ctype.name(),
-                None => catalog.type_name(oid, arena)?.unwrap_or("unknown"),
-            };
-            return Err(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
-                "argument of WHERE must be type boolean, not type {}",
-                type_name
-            ));
-        }
-        if let Expr::Str(text) = w {
-            super::eval::parse_bool(text)?;
-        }
+        check_where_type(w, columns, storage, txid, arena)?;
     }
     for g in statement.group_by {
         check(g)?;
@@ -9918,6 +10108,40 @@ fn over_one_row<'a>(
         .map_err(|_| arena_full())?)
 }
 
+/// A WHERE condition must be boolean (or a literal that reads as one); its
+/// type is checked before any row is read.
+fn check_where_type<'a>(
+    w: &'a Expr<'a>,
+    columns: &dyn super::exec::ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let (oid, _) = super::exec::infer_type_res(w, columns)?;
+    let catalog = storage_catalog(storage, arena, txid);
+    let boolean = oid == super::types::oid::BOOL
+        || oid == super::types::oid::UNKNOWN
+        || catalog.domain_base_type(oid) == Some(ColType::Bool);
+    if !boolean {
+        let type_name = match ColType::from_oid(oid) {
+            Some(ctype) => ctype.name(),
+            None => catalog.type_name(oid, arena)?.unwrap_or("unknown"),
+        };
+        return Err(crate::sql::error_position::at_expression(
+            sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "argument of WHERE must be type boolean, not type {}",
+                type_name
+            ),
+            w,
+        ));
+    }
+    if let Expr::Str(text) = w {
+        super::eval::parse_bool(text)?;
+    }
+    Ok(())
+}
+
 /// Admit the virtual input row once before scalar projection or set expansion.
 /// Both wire results and INSERT/function row sources use this boundary.
 fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
@@ -10001,6 +10225,11 @@ pub(crate) fn constant_select_resumable<'a>(
         txid,
         arena,
     };
+    if let Some(w) = statement.where_clause
+        && let Err(error) = check_where_type(w, &resolved_columns, storage, txid, arena)
+    {
+        return sql_fail(error);
+    }
     if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
     }

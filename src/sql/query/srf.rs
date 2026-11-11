@@ -2523,12 +2523,10 @@ pub(crate) fn describe_derived_definition<'a>(
     // supply no more names than the derived table has columns.
     if let Some(aliases) = col_alias {
         if aliases.len() > n_cols {
-            return Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "table \"{}\" has {} columns available but {} columns specified",
+            return Err(super::scope::derived_alias_mismatch(
                 exposed,
                 n_cols,
-                aliases.len()
+                aliases.len(),
             ));
         }
         for (i, alias) in aliases.iter().enumerate() {
@@ -3908,12 +3906,10 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     if let Some(aliases) = tref.col_alias
         && aliases.len() > n_out
     {
-        return Err(sql_err!(
-            sqlstate::INVALID_COLUMN_REFERENCE,
-            "table \"{}\" has {} columns available but {} columns specified",
+        return Err(super::scope::derived_alias_mismatch(
             name,
             n_out,
-            aliases.len()
+            aliases.len(),
         ));
     }
     let mut columns = [ColumnMeta::EMPTY; MAX_COLUMNS];

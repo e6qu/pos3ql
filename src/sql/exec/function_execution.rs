@@ -434,10 +434,11 @@ impl SuspendedFunctionState {
         }
         match result {
             Ok(flow) => {
-                let output =
+                let output = control_flow::at_routine_exit(context, invocation, || {
                     self.binding
                         .returns
-                        .finish(&execution, flow, self.binding.result_type, arena);
+                        .finish(&execution, flow, self.binding.result_type, arena)
+                });
                 self.binding.environment.complete();
                 Ok(output)
             }
@@ -757,12 +758,14 @@ pub(crate) fn execute<'a>(
     );
     drop(seeded);
     match result {
-        Ok(flow) => returns.finish(
-            &execution,
-            flow,
-            routine.kind.function_result().ok_or_else(changed)?,
-            arena,
-        ),
+        Ok(flow) => control_flow::at_routine_exit(&context, invocation, || {
+            returns.finish(
+                &execution,
+                flow,
+                routine.kind.function_result().ok_or_else(changed)?,
+                arena,
+            )
+        }),
         Err(error) if control_flow::is_execution_wait(&error) => {
             if policy == super::super::query::RoutineExecution::StatementReplay {
                 return Err(error);

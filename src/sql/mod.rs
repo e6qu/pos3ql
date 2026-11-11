@@ -21,6 +21,7 @@ pub mod cursor;
 pub mod datetime;
 pub mod encoding;
 pub(crate) mod enum_values;
+pub(crate) mod error_context;
 pub(crate) mod error_position;
 pub mod eval;
 pub(crate) mod event_trigger;
@@ -11652,7 +11653,9 @@ impl Engine {
                 match parser.next_stmt() {
                     Ok(Some(_)) if rejected.is_some() => {}
                     Err(_) if parser.analysis_error_reported() && rejected.is_some() => {}
-                    Err(error) if parser.analysis_error_reported() => rejected = Some(error),
+                    Err(error) if parser.analysis_error_reported() => {
+                        rejected = Some((error, parser.take_rejected_statement()));
+                    }
                     Ok(Some(statement)) => {
                         debug_assert!(statement_count < statements.len());
                         statements[statement_count] = Some((
@@ -12137,14 +12140,27 @@ impl Engine {
                 }
                 txn.compact_completed_constraints();
             }
-            if let Some(error) = &rejected {
+            if let Some((error, statement)) = &rejected {
+                // PostgreSQL finds some analysis errors before the deferred
+                // one: an unknown type, the FROM clause, and earlier output
+                // columns.
+                let earlier = statement.as_ref().and_then(|(statement, type_name)| {
+                    error_position::with_statement_source(text, source_copies, true, 0, || {
+                        self.analysis_error_before(
+                            statement, *type_name, error, text, txn.txid, arena,
+                        )
+                    })
+                });
                 if txn.is_explicit() {
                     txn.failed = true;
                 } else {
                     cursors.on_rollback();
                     self.rollback_txn(txn, guc);
                 }
-                report_parse_error(responder, error, text)?;
+                match earlier {
+                    Some(earlier) => responder.error(earlier.sqlstate, earlier.message.as_str())?,
+                    None => report_parse_error(responder, error, text)?,
+                }
                 return Ok(ExecutionStatus::Complete);
             }
             if !executed_any {
@@ -16513,6 +16529,11 @@ impl Engine {
                         })
                         .map_err(|error| error_position::body_parse_error(&error, written_body))?;
                     parser.capture_type_inputs();
+                    // PostgreSQL analyses each statement of a body whose
+                    // parameters have concrete types.
+                    let analyse = !declaration.arguments[..declaration.argument_count]
+                        .iter()
+                        .any(|argument| argument.polymorphic_type().is_some());
                     while let Some(statement) = parser
                         .next_stmt()
                         .map_err(|error| error_position::body_parse_error(&error, written_body))?
@@ -16524,6 +16545,21 @@ impl Engine {
                             txn.txid,
                             arena,
                         )?;
+                        if analyse {
+                            let statement =
+                                arena.alloc(statement).map_err(|_| eval::arena_full())?;
+                            error_position::with_internal_source(body, || {
+                                query::analyse_routine_statement(
+                                    statement,
+                                    &self.storage,
+                                    txn.txid,
+                                    arena,
+                                )
+                            })
+                            .map_err(|error| {
+                                error_position::body_analysis_error(error, body, written_body)
+                            })?;
+                        }
                     }
                     Ok((body, parser))
                 })();
@@ -24057,6 +24093,76 @@ fn emit_parse_notices(
 
 /// Reports a failure parsing `text`, with PostgreSQL's cursor position when it
 /// reports one.
+impl Engine {
+    /// The analysis error PostgreSQL reports instead of `deferred`, an error
+    /// it would find later in the same statement: `type "x" does not exist`
+    /// for a modifier on an unknown type, a missing relation in the FROM
+    /// clause, or an output column before the deferred error's position.
+    fn analysis_error_before<'a>(
+        &self,
+        statement: &'a Stmt<'a>,
+        type_name: Option<&str>,
+        deferred: &ParseError,
+        text: &str,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Option<SqlError> {
+        let deferred_at = deferred
+            .cursor
+            .map(|cursor| crate::pg::respond::CursorPosition::in_text(text, cursor).get());
+        let described = match statement {
+            Stmt::Select(select) => {
+                let mark = arena.mark();
+                let mut columns = [ColDesc::new("", 0, 0); exec::MAX_PROJ];
+                let described = query::describe_select(
+                    select,
+                    &self.storage,
+                    txid,
+                    arena,
+                    &mut columns,
+                    exec::DescriptionTarget::Sql,
+                    None,
+                );
+                // Only the verdict leaves; the description is discarded.
+                unsafe { arena.rewind_to(mark) };
+                described
+                    .err()
+                    .filter(|error| error.sqlstate.internal_control().is_none())
+            }
+            _ => None,
+        };
+        // The FROM clause is analysed first.
+        if described
+            .as_ref()
+            .is_some_and(|error| error.sqlstate == eval::sqlstate::UNDEFINED_TABLE)
+        {
+            return described;
+        }
+        if let Some(type_name) = type_name
+            && let Err(error) = exec::resolve_routine_type(&self.storage, txid, type_name)
+            && error.sqlstate == eval::sqlstate::UNDEFINED_OBJECT
+        {
+            let error = sql_err!(
+                eval::sqlstate::UNDEFINED_OBJECT,
+                "type \"{}\" does not exist",
+                type_name
+            );
+            if let Some(deferred_at) = deferred_at {
+                error_position::restore_position(&error, deferred_at);
+            }
+            return Some(error);
+        }
+        // An output column written before the deferred error is analysed
+        // before it.
+        let error = described?;
+        let position = error_position::take_position(&error)?;
+        error_position::restore_position(&error, position);
+        deferred_at
+            .is_some_and(|deferred_at| position < deferred_at)
+            .then_some(error)
+    }
+}
+
 pub(crate) fn report_parse_error(
     responder: &mut Responder,
     e: &ParseError,
@@ -24078,10 +24184,14 @@ pub(crate) fn report_parse_error(
 }
 
 pub(crate) fn parse_error_to_sql(error: &ParseError) -> SqlError {
-    error_position::full_message_error(error.sqlstate, |message| {
+    let sql_error = error_position::full_message_error(error.sqlstate, |message| {
         let _ = message.write_str(error.message.as_str());
         Ok(())
-    })
+    });
+    if let Some(cursor) = error.cursor {
+        error_position::internal_parse_cursor(&sql_error, cursor);
+    }
+    sql_error
 }
 
 /// Rewrites a CREATE SCHEMA element to create inside the new schema. An

@@ -86,23 +86,57 @@ Syntax and errors:
   errors, unknown relations, columns, types, functions and operators (with
   PostgreSQL's hints), failed constant input (`SELECT 'zap'::int`) and syntax
   errors inside a SQL function body given to `CREATE FUNCTION`. An error
-  about an expression that keeps no source position, such as the integer in
-  `SELECT 1 WHERE 1`, has no position. PL/pgSQL errors carry no `CONTEXT`
-  line, and a failing `EXECUTE` does not report the dynamic query as
-  PostgreSQL's `QUERY:` field.
+  about a whole expression points at its start, as in PostgreSQL: the `1` of
+  `SELECT 1 WHERE 1` (`argument of WHERE must be type boolean, not type
+  integer`), a `CASE WHEN`, `AND`, `OR` or `NOT` operand.
+- Errors and notices raised inside PL/pgSQL and SQL-language functions carry
+  PostgreSQL's `CONTEXT` lines, innermost first: `PL/pgSQL function
+  f(integer) line 3 at RAISE`, `SQL statement "INSERT INTO t VALUES (1)"`,
+  `PL/pgSQL assignment "x := 1/0"` and `SQL function "f" statement 2`. An
+  error analysing a query a function runs, such as an unknown column in
+  `EXECUTE 'SELECT nocol FROM t'`, reports that query and the error's place in
+  it as psql's `QUERY:` and `LINE` lines instead of the client's statement.
+  `GET DIAGNOSTICS ... PG_CONTEXT` and `GET STACKED DIAGNOSTICS ...
+  PG_EXCEPTION_CONTEXT` return the same text, and `RAISE;` re-raises the
+  caught error with its original context. A call PostgreSQL inlines into its
+  caller's query (a SQL function whose body is one `SELECT expression`) adds
+  no line; when PostgreSQL would fail while inlining it (`SELECT f(0)` for a
+  body `SELECT 1/$1`), pos3ql reports no `SQL function "f" during inlining`
+  line. A longer context than 64 KiB is reported as a `54000` error.
+- Constraint violations carry PostgreSQL's `DETAIL` and object fields:
+  `Failing row contains (null, x).` with the schema, table and column of a
+  not-null violation; `Key (id)=(1) already exists.` with the constraint of a
+  unique, foreign-key or exclusion violation; and the schema, data type and
+  constraint of a domain violation. `RAISE ... USING COLUMN`, `CONSTRAINT`,
+  `DATATYPE`, `TABLE` and `SCHEMA` set those fields (up to 1,024 bytes each)
+  and `GET STACKED DIAGNOSTICS` reads them.
 - Checks PostgreSQL makes after parsing are reported when the statement would
   run, with PostgreSQL's code and message: type modifiers (`numeric(2000)` is
   `22023`, `NUMERIC precision 2000 must be between 1 and 1000`; `numeric(5,-2)`
   and `numeric(3,5)` are accepted), COPY options, storage parameters and
   sequence, database and large-object values. An earlier statement in the same
   query string still runs, and a syntax error anywhere in the string is
-  reported first.
+  reported first. In a `SELECT`, errors PostgreSQL's analysis finds earlier
+  come first: `SELECT 1::numeric(5000) FROM missing` reports the missing
+  relation, and `1::nosuch(5)` reports `type "nosuch" does not exist`.
+- Statements are analysed before they read a row, as in PostgreSQL: a `WITH`
+  query nothing reads must still be valid (`WITH x AS (SELECT * FROM missing)
+  SELECT 1` fails), a constant compared with or added to a column must convert
+  to its type (`WHERE id = 'abc'` fails even on an empty table), and
+  `CREATE FUNCTION` checks a SQL body's queries and target relations unless
+  `check_function_bodies` is off (always for a `BEGIN ATOMIC` body).
+- A PL/pgSQL condition of another type converts through its text form as in
+  PostgreSQL: `IF 1` is true and `IF 5` fails with `invalid input syntax for
+  type boolean`.
 - An unsupported cast reports `42846` with both types as `format_type` names
   them (`cannot cast type integer to timestamp without time zone`).
 - Array elements and slices can be assigned (`UPDATE t SET a[2] = 9`,
-  `a[1:2] = '{1,2}'`, `INSERT INTO t (a[1]) VALUES (5)`): a one-dimensional
-  array grows with NULLs, other arrays stay within their bounds, and a slice
-  anywhere in a subscript list makes the whole list a slice (`a[1:1][1]`).
+  `a[1:2] = '{1,2}'`, `INSERT INTO t (a[1]) VALUES (5)`, `INSERT INTO t (a[1])
+  SELECT 5`): a one-dimensional array grows with NULLs, other arrays stay
+  within their bounds, and a slice anywhere in a subscript list makes the whole
+  list a slice (`a[1:1][1]`). A subscripted jsonb target in an `INSERT` starts
+  from a jsonb NULL (`INSERT INTO t (j['x']) VALUES ('1')` stores
+  `{"x": 1}`).
 
 Functions and expressions:
 

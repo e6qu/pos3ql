@@ -25,6 +25,21 @@ pub(crate) struct SourceCopy {
     pub(crate) at: usize,
 }
 
+/// The length a [`SourceCopy`] of an expression node records: the node's
+/// address locates a constant that keeps no source text.
+const NODE: usize = usize::MAX;
+
+impl SourceCopy {
+    /// Records that the constant `expression` was written at byte `at`.
+    pub(crate) fn node(expression: &crate::sql::ast::Expr<'_>, at: usize) -> Self {
+        Self {
+            address: core::ptr::from_ref(expression) as usize,
+            len: NODE,
+            at,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Source {
     text: *const u8,
@@ -34,6 +49,8 @@ struct Source {
     /// Where the text the statement was parsed from starts in `text`, which
     /// parsed source offsets are relative to.
     offset_base: usize,
+    /// Whether `text` is a query a routine runs rather than the client's.
+    internal: bool,
 }
 
 const NO_SOURCE: Source = Source {
@@ -42,6 +59,7 @@ const NO_SOURCE: Source = Source {
     copies: core::ptr::null(),
     copies_len: 0,
     offset_base: 0,
+    internal: false,
 };
 
 #[derive(Clone, Copy)]
@@ -95,6 +113,7 @@ pub(crate) fn with_statement_source<R>(
     run: impl FnOnce() -> R,
 ) -> R {
     PENDING.with(|pending| pending.set(None));
+    crate::sql::error_context::reset();
     let _scope = SourceScope(
         SOURCE.with(|source| {
             source.replace(Source {
@@ -103,6 +122,7 @@ pub(crate) fn with_statement_source<R>(
                 copies: copies.as_ptr(),
                 copies_len: copies.len(),
                 offset_base,
+                internal: false,
             })
         }),
         ANALYZED.with(|flag| flag.replace(analyzed)),
@@ -138,8 +158,78 @@ fn locate(subject: &str) -> Option<(usize, Source)> {
         return Some((copy.at, source));
     }
     let start = source.text as usize;
-    (address >= start && address + subject.len() <= start + source.len)
-        .then(|| (address - start, source))
+    if address < start || address + subject.len() > start + source.len {
+        return None;
+    }
+    let at = address - start;
+    // A quoted token parsed without a copy map (a routine's query) is a
+    // slice inside its quotes; PostgreSQL points at the opening quote.
+    let text = unsafe { core::slice::from_raw_parts(source.text, source.len) };
+    let quoted = at > 0
+        && matches!(text[at - 1], b'\'' | b'"')
+        && text.get(at + subject.len()) == Some(&text[at - 1]);
+    Some((if quoted { at - 1 } else { at }, source))
+}
+
+/// Where `expression` starts in the installed statement text, as
+/// PostgreSQL's `exprLocation` places an error about the whole expression.
+fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, Source)> {
+    use crate::sql::ast::Expr;
+    let source = SOURCE.with(Cell::get);
+    if source.text.is_null() {
+        return None;
+    }
+    let parsed = |position: crate::sql::ast::SourcePosition| {
+        position
+            .get()
+            .map(|at| at + source.offset_base)
+            .filter(|at| *at <= source.len)
+            .map(|at| (at, source))
+    };
+    match expression {
+        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null | Expr::Param(_) => {
+            let address = core::ptr::from_ref(expression) as usize;
+            // with_statement_source keeps the copy map alive with its text.
+            let copies = unsafe { core::slice::from_raw_parts(source.copies, source.copies_len) };
+            copies
+                .iter()
+                .find(|copy| copy.len == NODE && copy.address == address)
+                .map(|copy| (copy.at, source))
+        }
+        Expr::Str(text) | Expr::NumericLit(text) | Expr::BitLit(text) => locate(text),
+        Expr::Column { qualifier, name } => locate(qualifier.unwrap_or(name)),
+        Expr::Binary { left, .. } => expression_start(left),
+        Expr::Cast {
+            operand,
+            source_position,
+            ..
+        } => {
+            let operand = expression_start(operand);
+            match (operand, parsed(*source_position)) {
+                (Some(operand), Some(cast)) if cast.0 < operand.0 => Some(cast),
+                (Some(operand), _) => Some(operand),
+                (None, cast) => cast,
+            }
+        }
+        Expr::Unary {
+            source_position, ..
+        }
+        | Expr::Call {
+            source_position, ..
+        } => parsed(*source_position),
+        Expr::IsNull { operand, .. }
+        | Expr::Collate { operand, .. }
+        | Expr::InList { operand, .. }
+        | Expr::Like { operand, .. } => expression_start(operand),
+        _ => None,
+    }
+}
+
+/// Marks `error` as being about the whole of `expression`, at its start.
+pub(crate) fn at_expression(error: SqlError, expression: &crate::sql::ast::Expr<'_>) -> SqlError {
+    let position = expression_start(expression).map(|(at, source)| character_position(source, at));
+    record(&error, position, None);
+    error
 }
 
 /// One-based character position of byte offset `at` in the source text.
@@ -297,6 +387,92 @@ fn record(error: &SqlError, position: Option<usize>, hint: Option<&'static str>)
     });
 }
 
+/// Removes the cursor position recorded for `error`, keeping its hint, so an
+/// internal query can report it instead.
+pub(crate) fn take_position(error: &SqlError) -> Option<usize> {
+    let message_hash = message_hash(&error.message);
+    PENDING.with(|pending| {
+        let mut known = pending.get().filter(|known| {
+            known.sqlstate == error.sqlstate && known.message_hash == message_hash
+        })?;
+        let position = known.position.take();
+        pending.set(Some(known));
+        position
+    })
+}
+
+/// Positions a syntax error at byte `cursor` of a query a routine runs, the
+/// text it was parsed from. Client statements report their syntax error
+/// cursor directly.
+pub(crate) fn internal_parse_cursor(error: &SqlError, cursor: usize) {
+    let source = SOURCE.with(Cell::get);
+    if source.internal && cursor <= source.len {
+        record(error, Some(character_position(source, cursor)), None);
+    }
+}
+
+/// Runs `probe`, an evaluation whose own errors are discarded, keeping the
+/// position, hint and diagnostic recorded for the error being reported.
+pub(crate) fn preserving_pending<R>(probe: impl FnOnce() -> R) -> R {
+    let pending = PENDING.with(Cell::get);
+    let diagnostic = crate::sql::eval::take_diagnostic();
+    let result = probe();
+    PENDING.with(|slot| slot.set(pending));
+    let _ = crate::sql::eval::take_diagnostic();
+    if let Some(diagnostic) = diagnostic {
+        crate::sql::eval::stash_full_diagnostic(diagnostic);
+    }
+    result
+}
+
+/// Restores a position [`take_position`] removed.
+pub(crate) fn restore_position(error: &SqlError, position: usize) {
+    record(error, Some(position), None);
+}
+
+/// Runs `run` with `text`, a query a routine runs, as the source its
+/// analysis errors are positioned in.
+pub(crate) fn with_internal_source<R>(text: &str, run: impl FnOnce() -> R) -> R {
+    let _scope = SourceScope(
+        SOURCE.with(|source| {
+            source.replace(Source {
+                text: text.as_ptr(),
+                len: text.len(),
+                copies: (&[] as &[SourceCopy]).as_ptr(),
+                copies_len: 0,
+                offset_base: 0,
+                internal: true,
+            })
+        }),
+        ANALYZED.with(|flag| flag.replace(true)),
+    );
+    run()
+}
+
+/// Runs `run` positioning relation and column lookups in the installed
+/// statement text, for a query written inside a utility statement such as
+/// the body of `CREATE FUNCTION ... BEGIN ATOMIC`.
+pub(crate) fn with_analysis<R>(run: impl FnOnce() -> R) -> R {
+    let _scope = SourceScope(
+        SOURCE.with(Cell::get),
+        ANALYZED.with(|flag| flag.replace(true)),
+    );
+    run()
+}
+
+/// Names `text`, a dynamic query a routine has just built, as the internal
+/// source of the enclosing [`with_internal_source`] scope.
+pub(crate) fn set_internal_source(text: &str) {
+    SOURCE.with(|source| {
+        let mut current = source.get();
+        if current.internal {
+            current.text = text.as_ptr();
+            current.len = text.len();
+            source.set(current);
+        }
+    });
+}
+
 /// The position and hint recorded for the error being reported, if it is
 /// the error they were computed for.
 pub(crate) fn take_annotation(sqlstate: &str, message: &dyn core::fmt::Display) -> Annotation {
@@ -414,7 +590,32 @@ pub(crate) fn with_full_message<R>(
 /// reports it. `body` is the parsed body and `error` indexes it.
 pub(crate) fn body_parse_error(error: &crate::sql::parser::ParseError, body: &str) -> SqlError {
     let sql_error = crate::sql::parse_error_to_sql(error);
-    let position = error.cursor.and_then(|cursor| {
+    let position = error.cursor.and_then(|cursor| body_position(cursor, body));
+    record(&sql_error, position, error.hint);
+    sql_error
+}
+
+/// An analysis error positioned in a routine body (the internal source it
+/// was analysed under), moved to the body's place in the statement text.
+/// `body` is the body as written in that text.
+pub(crate) fn body_analysis_error(error: SqlError, analysed: &str, body: &str) -> SqlError {
+    let Some(position) = take_position(&error) else {
+        return error;
+    };
+    let cursor = analysed
+        .char_indices()
+        .nth(position.saturating_sub(1))
+        .map_or(analysed.len(), |(at, _)| at);
+    if let Some(position) = body_position(cursor, body) {
+        record(&error, Some(position), None);
+    }
+    error
+}
+
+/// The one-based character position in the statement text of byte `cursor`
+/// of `body`, a string constant written in it.
+fn body_position(cursor: usize, body: &str) -> Option<usize> {
+    {
         let (token_at, source) = locate(body)?;
         let text = unsafe { core::slice::from_raw_parts(source.text, source.len) };
         let at = match text.get(token_at) {
@@ -434,7 +635,5 @@ pub(crate) fn body_parse_error(error: &crate::sql::parser::ParseError, body: &st
             _ => return None,
         };
         (at <= source.len).then(|| character_position(source, at))
-    });
-    record(&sql_error, position, error.hint);
-    sql_error
+    }
 }

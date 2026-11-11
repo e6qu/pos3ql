@@ -1950,7 +1950,8 @@ impl<'a> RetainedSelect<'a> {
                     &super::super::eval::NoColumns,
                     &hooks,
                 )?;
-                let value = super::super::eval::boolean_argument(value, "WHERE")?;
+                let value = super::super::eval::boolean_argument(value, "WHERE")
+                    .map_err(|error| crate::sql::error_position::at_expression(error, predicate))?;
                 (None, !matches!(value, Datum::Bool(true)))
             }
             Some(predicate) => (

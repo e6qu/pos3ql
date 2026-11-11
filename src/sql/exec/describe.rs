@@ -5284,9 +5284,15 @@ fn infer_type_unpositioned(
                 for (condition, _) in *whens {
                     let condition_oid = infer_type_res(condition, columns)?.0;
                     if !matches!(condition_oid, oid::BOOL | oid::UNKNOWN) {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "argument of CASE/WHEN must be type boolean"
+                        let type_name = ColType::from_oid(condition_oid)
+                            .map_or("unknown", |ctype| ctype.name());
+                        return Err(crate::sql::error_position::at_expression(
+                            sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "argument of CASE/WHEN must be type boolean, not type {}",
+                                type_name
+                            ),
+                            condition,
                         ));
                     }
                 }

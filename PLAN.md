@@ -283,33 +283,33 @@ the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
 than one deparsed statement per line. Errors in a client's query report
 PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
 caret) for syntax errors and for unknown relations, columns, types, functions
-and operators and failed constant input, except where the AST keeps no
-position: an operand of `WHERE` that is not boolean (`SELECT 1 WHERE 1`), an
-integer constant, and a folded or quoted identifier in a statement that waited
-for typed inputs. A SQL function body is not analysed at `CREATE FUNCTION`
-(`AS 'SELECT * FROM missing'` succeeds where PostgreSQL reports the missing
-relation at its place in the `CREATE` text; syntax errors are reported there).
-PL/pgSQL errors carry no `CONTEXT` line (`PL/pgSQL function f() line 1 at
-EXECUTE`), and a failing `EXECUTE 'SELEC 1'` does not report the dynamic query
-and its position as the internal query fields (`q`, `p`): the PL/pgSQL program
-keeps no source line per statement, and the error path carries no context. A constant compared with a column is checked only when a row is
-compared, so `SELECT a FROM t WHERE a = 'abc'` on an empty integer column
-returns no rows where PostgreSQL rejects `'abc'`, and a `WITH` query no
-statement references is not analysed (`WITH x AS (SELECT * FROM missing)
-SELECT 1` succeeds). A not-null violation lacks PostgreSQL's `DETAIL` (`Failing
-row contains ...`) and schema, table and column fields, and a domain check
-violation lacks the schema, data type and constraint fields. `INSERT ...
-SELECT` into a subscripted target column (`INSERT INTO t (a[1]) SELECT 5`) is
-rejected with `0A000`, and a subscripted jsonb target in an `INSERT` column
-list builds an array where PostgreSQL builds a jsonb value. `pg_sleep` and its
+and operators, failed constant input and non-boolean conditions, except a
+folded or quoted identifier in a statement that waited for typed inputs and a
+constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
+`INSERT has more target columns than expressions` without its position. At
+`CREATE FUNCTION`, a SQL body's queries are analysed for their relations,
+output columns, functions and types, and a data-changing statement only for
+its target relation, so an unknown column in an `UPDATE ... SET` list is
+found when the function runs. An error raised while PostgreSQL inlines a SQL function's body
+(`SQL function "f" during inlining`) has no context line, and a PL/pgSQL
+statement naming a variable that is also a column of its table (`UPDATE t SET
+a = 1/(a-15)` in a function with parameter `a`) uses the column where
+PostgreSQL reports `column reference "a" is ambiguous`. A constant compared
+with a column inside a subquery (`SELECT (SELECT a FROM t WHERE a = 'q')`) is
+checked only when a row is compared, so an empty table returns NULL where
+PostgreSQL rejects `'q'`; the outer query's conditions, output list and joins
+and an `UPDATE` or `DELETE` condition are checked before any row is read. An
+`INSERT ... SELECT` into a subscripted array target accepts a text column
+(`INSERT INTO t (m[1:2]) SELECT '{1,2}' UNION ALL SELECT '{3,4}'`) where
+PostgreSQL requires the array type. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,
-SQL/JSON result types) are reported when the statement would run, but before
-analysis errors PostgreSQL finds first in the same statement (`SELECT
-1::numeric(5000) FROM missing` reports the modifier, not the missing relation),
-and a modifier on an unknown type reports `type modifier is not allowed` rather
-than `type ... does not exist`. COPY to or from a server file or program,
+SQL/JSON result types) are reported when the statement would run. In a
+`SELECT`, an unknown relation, a modifier's unknown type and an output column
+written before the failing modifier are reported first, as PostgreSQL's
+analysis order finds them; in other statements the modifier error comes first.
+COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
 PL/pgSQL `CALL`, written directly or run with `EXECUTE`, fails with `0A000`

@@ -144,10 +144,12 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
                 }
                 _ => Ok(true),
             },
-            None => Err(sql_err!(
-                sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
-                "control reached end of trigger procedure without RETURN"
-            )),
+            None => control_flow::at_routine_exit(context, self.binding.invocation, || {
+                Err(sql_err!(
+                    sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
+                    "control reached end of trigger procedure without RETURN"
+                ))
+            }),
             Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
                 Err(unsupported_trigger_body())
             }

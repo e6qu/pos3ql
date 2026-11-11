@@ -16,6 +16,7 @@ mod client_catalog;
 mod compatibility_diagnostics;
 mod constraint_index_identity;
 mod cursor_execution;
+mod error_report_fields;
 mod foreign_parent_admission;
 mod function_progress;
 mod geometric_casts;
@@ -45348,7 +45349,7 @@ fn trigger_exception_diagnostic_surface_is_typed_and_scoped() {
     assert_eq!(
         data_rows(&output),
         [
-            "ZX123|typed failure|typed detail|typed hint|PL/pgSQL function public.trigger_diagnostic_surface()|PL/pgSQL function public.trigger_diagnostic_surface()|||||"
+            "ZX123|typed failure|typed detail|typed hint|PL/pgSQL function trigger_diagnostic_surface() line 6 at RAISE|PL/pgSQL function trigger_diagnostic_surface() line 9 at GET DIAGNOSTICS|||||"
         ],
         "{}",
         String::from_utf8_lossy(&output)
@@ -47783,7 +47784,10 @@ fn sql_procedure_call_is_typed_durable_and_catalogued() {
         let failing_created = run_with(
             &mut engine,
             &mut budget,
-            "CREATE PROCEDURE log_then_fail(value integer) LANGUAGE SQL AS \
+            // PostgreSQL rejects the missing relation at CREATE unless body
+            // checks are off.
+            "SET check_function_bodies = off; \
+             CREATE PROCEDURE log_then_fail(value integer) LANGUAGE SQL AS \
              'INSERT INTO procedure_log VALUES ($1); INSERT INTO missing_log VALUES ($1)'",
         );
         assert!(

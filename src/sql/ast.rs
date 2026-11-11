@@ -3327,6 +3327,10 @@ pub enum CteCycleMark<'a> {
     },
 }
 
+/// The derived-table alias of the query `INSERT INTO t (a[1]) SELECT ...`
+/// assigns subscripted targets from; it cannot be written in SQL.
+pub const INSERT_SUBSCRIPT_SOURCE: &str = "*INSERT source*";
+
 /// One `WITH name [(col, ...)] AS (SELECT ...)` common table expression.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cte<'a> {

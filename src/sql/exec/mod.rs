@@ -17029,6 +17029,8 @@ struct TriggerLocalAssignment<'a> {
 
 #[derive(Clone, Copy)]
 struct ParsedTriggerLocalDecl<'a> {
+    /// The declaration's text, a slice of the program text.
+    source: &'a str,
     name: SqlName,
     ty: ParsedPlpgsqlLocalType<'a>,
     initial: Option<&'a Expr<'a>>,
@@ -17454,41 +17456,6 @@ impl<'a> TriggerInvocation<'a> {
         self
     }
 
-    fn context(self) -> StackStr<192> {
-        match self.program_kind {
-            PlpgsqlProgramKind::Trigger => stack_format!(
-                192,
-                "PL/pgSQL function {}.{}()",
-                self.routine_schema,
-                self.routine_name
-            ),
-            PlpgsqlProgramKind::EventTrigger => stack_format!(
-                192,
-                "PL/pgSQL function {}.{}()",
-                self.routine_schema,
-                self.routine_name
-            ),
-            PlpgsqlProgramKind::Function
-            | PlpgsqlProgramKind::VoidFunction
-            | PlpgsqlProgramKind::OutputFunction
-            | PlpgsqlProgramKind::SetFunction => stack_format!(
-                192,
-                "PL/pgSQL function {}.{}()",
-                self.routine_schema,
-                self.routine_name
-            ),
-            PlpgsqlProgramKind::Procedure => stack_format!(
-                192,
-                "PL/pgSQL procedure {}.{}()",
-                self.routine_schema,
-                self.routine_name
-            ),
-            PlpgsqlProgramKind::Anonymous => {
-                stack_format!(192, "PL/pgSQL function inline_code_block")
-            }
-        }
-    }
-
     fn value(self, field: TriggerContextField) -> Datum<'a> {
         match field {
             TriggerContextField::Name => Datum::Text(self.name),
@@ -17587,7 +17554,14 @@ struct TriggerRaisedMessage<'a> {
     message: Option<&'a Expr<'a>>,
     detail: Option<&'a Expr<'a>>,
     hint: Option<&'a Expr<'a>>,
+    objects: RaiseObjects<'a>,
 }
+
+/// `RAISE ... USING SCHEMA, TABLE, COLUMN, DATATYPE, CONSTRAINT`, in
+/// [`crate::sql::eval::ErrorObjects`] field order.
+type RaiseObjects<'a> = [Option<&'a Expr<'a>>; 5];
+
+const RAISE_OBJECT_OPTIONS: [&str; 5] = ["schema", "table", "column", "datatype", "constraint"];
 
 /// `RAISE;` has no independently executable meaning: parsing permits it only
 /// in an exception handler, where it re-emits the handler's caught error.
@@ -17603,6 +17577,7 @@ struct TriggerRaiseOptions<'a> {
     message: Option<&'a Expr<'a>>,
     detail: Option<&'a Expr<'a>>,
     hint: Option<&'a Expr<'a>>,
+    objects: RaiseObjects<'a>,
 }
 
 /// A RAISE SQLSTATE becomes a validated value while parsing whenever its
@@ -17835,6 +17810,9 @@ enum TriggerLoopControl<'a> {
 #[derive(Clone, Copy)]
 struct TriggerBlock<'a> {
     statements: &'a [TriggerStatement<'a>],
+    /// Each statement's source text, a slice of the program text, which
+    /// locates its line for error context.
+    sources: &'a [&'a str],
 }
 
 /// A growable list backed only by the statement arena. Growth leaves the old
@@ -18948,6 +18926,7 @@ fn parse_trigger_local<'a>(
         ParsedPlpgsqlLocalType::Named { name, type_mod }
     };
     Ok(ParsedTriggerLocalDecl {
+        source: statement,
         name,
         ty,
         initial,
@@ -19024,9 +19003,17 @@ fn parse_trigger_select_into<'a>(
         })
         .map_err(|_| super::query::arena_full_pub())??;
     let tail = &after_into[end..];
+    // PostgreSQL blanks the INTO clause, so positions in the query it runs
+    // and reports match the statement as written.
     let mut source = StackStr::<ROUTINE_SQL_MAX>::new();
     use core::fmt::Write as _;
-    let _ = write!(source, "{} {}", statement[..into_at].trim_end(), tail);
+    let _ = source.write_str(&statement[..into_at]);
+    for _ in 0..4 + end {
+        let _ = source.write_char(' ');
+    }
+    let _ = source.write_str(tail);
+    let trimmed = source.as_str().trim_end().len();
+    source.truncate(trimmed);
     if source.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -19341,6 +19328,7 @@ fn parse_trigger_raise<'a>(
         message: options.message,
         detail: options.detail,
         hint: options.hint,
+        objects: options.objects,
     })))
 }
 
@@ -19354,6 +19342,7 @@ fn parse_trigger_raise_options<'a>(
             message: None,
             detail: None,
             hint: None,
+            objects: [None; 5],
         });
     };
     let (parts, count) = split_trigger_arguments(options, arena)?;
@@ -19361,6 +19350,7 @@ fn parse_trigger_raise_options<'a>(
     let mut message = None;
     let mut detail = None;
     let mut hint = None;
+    let mut objects: RaiseObjects<'a> = [None; 5];
     for part in parts[..count].iter().filter_map(|part| *part) {
         let Some((name, expression)) = part.split_once('=') else {
             return Err(unsupported_trigger_body());
@@ -19389,6 +19379,11 @@ fn parse_trigger_raise_options<'a>(
             &mut detail
         } else if name.trim().eq_ignore_ascii_case("hint") {
             &mut hint
+        } else if let Some(index) = RAISE_OBJECT_OPTIONS
+            .iter()
+            .position(|option| name.trim().eq_ignore_ascii_case(option))
+        {
+            &mut objects[index]
         } else {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -19409,6 +19404,7 @@ fn parse_trigger_raise_options<'a>(
         message,
         detail,
         hint,
+        objects,
     })
 }
 
@@ -19568,10 +19564,10 @@ fn parse_trigger_perform<'a>(
     statement: &'a str,
     arena: &'a Arena,
 ) -> Result<Option<&'a Select<'a>>, SqlError> {
-    let Some(body) = strip_trigger_keyword(statement, "perform") else {
+    let Some(written) = strip_trigger_keyword(statement, "perform") else {
         return Ok(None);
     };
-    let body = body.trim();
+    let body = written.trim();
     if body.is_empty() {
         return Err(unsupported_trigger_body());
     }
@@ -19581,9 +19577,10 @@ fn parse_trigger_perform<'a>(
             "PERFORM takes a query body without SELECT"
         ));
     }
+    // PostgreSQL runs the statement with SELECT in place of PERFORM.
     let mut source = StackStr::<ROUTINE_SQL_MAX>::new();
     use core::fmt::Write as _;
-    let _ = write!(source, "SELECT {}", body);
+    let _ = write!(source, "SELECT{}", written);
     if source.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -20456,6 +20453,7 @@ fn parse_trigger_block<'a>(
     program_kind: PlpgsqlProgramKind,
 ) -> Result<(TriggerBlock<'a>, TriggerBlockEnd<'a>), SqlError> {
     let mut statements = ProgramList::new(arena);
+    let mut sources = ProgramList::new(arena);
     let mut saw_return = false;
     while let Some(&segment) = segments.get(*at) {
         if segment.eq_ignore_ascii_case("exception") {
@@ -20463,6 +20461,7 @@ fn parse_trigger_block<'a>(
             return Ok((
                 TriggerBlock {
                     statements: statements.as_slice(),
+                    sources: sources.as_slice(),
                 },
                 TriggerBlockEnd::Exception,
             ));
@@ -20472,6 +20471,7 @@ fn parse_trigger_block<'a>(
             return Ok((
                 TriggerBlock {
                     statements: statements.as_slice(),
+                    sources: sources.as_slice(),
                 },
                 TriggerBlockEnd::End,
             ));
@@ -20481,6 +20481,7 @@ fn parse_trigger_block<'a>(
             return Ok((
                 TriggerBlock {
                     statements: statements.as_slice(),
+                    sources: sources.as_slice(),
                 },
                 TriggerBlockEnd::EndIf,
             ));
@@ -20490,6 +20491,7 @@ fn parse_trigger_block<'a>(
             return Ok((
                 TriggerBlock {
                     statements: statements.as_slice(),
+                    sources: sources.as_slice(),
                 },
                 TriggerBlockEnd::EndCase,
             ));
@@ -20499,6 +20501,7 @@ fn parse_trigger_block<'a>(
             return Ok((
                 TriggerBlock {
                     statements: statements.as_slice(),
+                    sources: sources.as_slice(),
                 },
                 TriggerBlockEnd::EndLoop,
             ));
@@ -20508,6 +20511,7 @@ fn parse_trigger_block<'a>(
             return Ok((
                 TriggerBlock {
                     statements: statements.as_slice(),
+                    sources: sources.as_slice(),
                 },
                 TriggerBlockEnd::Else,
             ));
@@ -20520,6 +20524,7 @@ fn parse_trigger_block<'a>(
             return Ok((
                 TriggerBlock {
                     statements: statements.as_slice(),
+                    sources: sources.as_slice(),
                 },
                 TriggerBlockEnd::Elsif(condition),
             ));
@@ -20532,6 +20537,7 @@ fn parse_trigger_block<'a>(
             return Ok((
                 TriggerBlock {
                     statements: statements.as_slice(),
+                    sources: sources.as_slice(),
                 },
                 TriggerBlockEnd::When(condition),
             ));
@@ -20776,6 +20782,7 @@ fn parse_trigger_block<'a>(
         };
         saw_return = matches!(statement, TriggerStatement::Return(_));
         statements.push(statement)?;
+        sources.push(segment)?;
     }
     Err(incomplete_trigger_body())
 }
@@ -20830,35 +20837,41 @@ fn parse_plpgsql_program_inner<'a>(
     if body.is_empty() {
         return Err(incomplete_trigger_body());
     }
-    let (locals, body) = if let Some(declarations) = strip_trigger_keyword(body, "declare") {
-        let Some(begin_at) = trigger_top_level_keyword(declarations, "begin", arena)? else {
-            return Err(incomplete_trigger_body());
-        };
-        let declaration_source = declarations[..begin_at].trim();
-        let segments = split_trigger_statements(declaration_source, arena)?;
-        let mut locals = ProgramList::new(arena);
-        for declaration in segments.iter().copied() {
-            let local = parse_trigger_local(declaration, arena)?;
-            if locals
-                .as_slice()
-                .iter()
-                .any(|prior: &ParsedTriggerLocalDecl<'_>| prior.name == local.name)
-            {
-                return Err(sql_err!(
-                    sqlstate::DUPLICATE_COLUMN,
-                    "duplicate declaration of PL/pgSQL local \"{}\"",
-                    local.name.as_str()
-                ));
+    let (locals, body, block_source) =
+        if let Some(declarations) = strip_trigger_keyword(body, "declare") {
+            let Some(begin_at) = trigger_top_level_keyword(declarations, "begin", arena)? else {
+                return Err(incomplete_trigger_body());
+            };
+            let declaration_source = declarations[..begin_at].trim();
+            let segments = split_trigger_statements(declaration_source, arena)?;
+            let mut locals = ProgramList::new(arena);
+            for declaration in segments.iter().copied() {
+                let local = parse_trigger_local(declaration, arena)?;
+                if locals
+                    .as_slice()
+                    .iter()
+                    .any(|prior: &ParsedTriggerLocalDecl<'_>| prior.name == local.name)
+                {
+                    return Err(sql_err!(
+                        sqlstate::DUPLICATE_COLUMN,
+                        "duplicate declaration of PL/pgSQL local \"{}\"",
+                        local.name.as_str()
+                    ));
+                }
+                locals.push(local)?;
             }
-            locals.push(local)?;
-        }
-        (locals.as_slice(), declarations[begin_at + 5..].trim())
-    } else {
-        (
-            &[][..],
-            strip_trigger_keyword(body, "begin").ok_or_else(unsupported_trigger_body)?,
-        )
-    };
+            (
+                locals.as_slice(),
+                declarations[begin_at + 5..].trim(),
+                &declarations[begin_at..],
+            )
+        } else {
+            (
+                &[][..],
+                strip_trigger_keyword(body, "begin").ok_or_else(unsupported_trigger_body)?,
+                body,
+            )
+        };
     let segments = split_trigger_statements(body, arena)?;
     let mut at = 0;
     let loop_labels = arena
@@ -20888,6 +20901,9 @@ fn parse_plpgsql_program_inner<'a>(
             TriggerBlock {
                 statements: arena
                     .alloc_slice_copy(&[TriggerStatement::Exception(exception)])
+                    .map_err(|_| super::query::arena_full_pub())?,
+                sources: arena
+                    .alloc_slice_copy(&[block_source])
                     .map_err(|_| super::query::arena_full_pub())?,
             }
         }
@@ -23030,7 +23046,142 @@ fn execute_procedural_query<T>(
     }
 }
 
+/// Runs `run` as PostgreSQL runs a query a procedural statement issues:
+/// analysis errors are positioned in `text`, which becomes their internal
+/// query, and other errors name it in their context unless it is a simple
+/// expression.
+fn in_procedural_query<T>(
+    text: &str,
+    mode: crate::sql::error_context::QueryMode,
+    simple: bool,
+    run: impl FnOnce() -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    let frame = crate::sql::error_context::QueryFrame::new(text, mode, simple);
+    crate::sql::error_context::within(&frame, || {
+        crate::sql::error_position::with_internal_source(text, run)
+    })
+}
+
+/// [`in_procedural_query`] for a simple expression. PostgreSQL folds its
+/// constant parts while planning it, so an error a constant part raises
+/// (`x := 1/0`) is reported with the query's context line like any planning
+/// error, while one raised evaluating it is not.
+fn in_simple_expression<T>(
+    text: &str,
+    mode: crate::sql::error_context::QueryMode,
+    expression: &Expr<'_>,
+    arena: &Arena,
+    run: impl FnOnce() -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    let frame = crate::sql::error_context::QueryFrame::new(text, mode, true);
+    crate::sql::error_context::with_frame(&frame, || {
+        crate::sql::error_position::with_internal_source(text, run).map_err(|error| {
+            if error.sqlstate.internal_control().is_none() {
+                let mark = arena.mark();
+                let folded = crate::sql::error_position::preserving_pending(|| {
+                    constant_fold_error(expression, arena)
+                });
+                // The probe's values are discarded with its scratch.
+                unsafe { arena.rewind_to(mark) };
+                if folded.is_some_and(|folded| {
+                    folded.sqlstate == error.sqlstate && folded.message == error.message
+                }) {
+                    frame.planned();
+                }
+            }
+            crate::sql::error_context::capture(error)
+        })
+    })
+}
+
+/// The error PostgreSQL's planner raises folding `expression`'s constant
+/// subexpressions (literals combined by operators and casts), in the order
+/// it folds them, if any.
+fn constant_fold_error(expression: &Expr<'_>, arena: &Arena) -> Option<SqlError> {
+    fn constant(expression: &Expr<'_>) -> bool {
+        match expression {
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_) => true,
+            Expr::Unary { operand, .. } | Expr::Cast { operand, .. } => constant(operand),
+            Expr::Binary { left, right, .. } => constant(left) && constant(right),
+            _ => false,
+        }
+    }
+    if constant(expression) {
+        if matches!(
+            expression,
+            Expr::Unary { .. } | Expr::Binary { .. } | Expr::Cast { .. }
+        ) {
+            return eval_full(expression, arena, &[], &NoColumns, &NO_HOOKS).err();
+        }
+        return None;
+    }
+    match expression {
+        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } => {
+            constant_fold_error(operand, arena)
+        }
+        Expr::Binary { left, right, .. } => {
+            constant_fold_error(left, arena).or_else(|| constant_fold_error(right, arena))
+        }
+        Expr::Call { args, .. } => args
+            .iter()
+            .find_map(|argument| constant_fold_error(argument, arena)),
+        _ => None,
+    }
+}
+
+/// [`in_procedural_query`] for a SQL statement whose text is known.
+fn in_statement_query<T>(
+    text: Option<&str>,
+    run: impl FnOnce() -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    match text {
+        Some(text) => in_procedural_query(
+            text,
+            crate::sql::error_context::QueryMode::Statement,
+            false,
+            run,
+        ),
+        None => run(),
+    }
+}
+
+/// Evaluates a PL/pgSQL expression as the query PostgreSQL makes of it: the
+/// whole statement for an assignment, otherwise the expression's text.
 fn eval_procedural_expression<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    expression: &'a Expr<'a>,
+    row: &TriggerLocalScope<'_, 'a>,
+    continuation: Option<&mut Option<super::query::RoutineInvocationState>>,
+) -> Result<Datum<'a>, SqlError> {
+    use crate::sql::error_context::QueryMode;
+    let site = row.invocation.input_sites.iter().find(|site| {
+        site.kind == super::plpgsql_inputs::Kind::Expression
+            && site.key == core::ptr::from_ref(expression) as usize
+    });
+    let Some(site) = site else {
+        return eval_procedural_expression_in(context, expression, row, continuation);
+    };
+    let (text, mode) = match crate::sql::error_context::innermost_assignment() {
+        Some(statement) => (statement, QueryMode::Assignment),
+        None => (site.text, QueryMode::Expression),
+    };
+    if expression.contains_subquery() {
+        return in_procedural_query(text, mode, false, || {
+            eval_procedural_expression_in(context, expression, row, continuation)
+        });
+    }
+    let arena = context.arena;
+    in_simple_expression(text, mode, expression, arena, || {
+        eval_procedural_expression_in(context, expression, row, continuation)
+    })
+}
+
+fn eval_procedural_expression_in<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     expression: &'a Expr<'a>,
     row: &TriggerLocalScope<'_, 'a>,
@@ -23226,6 +23377,7 @@ fn bind_plpgsql_dynamic_query<'a>(
             context.arena,
         )?;
     }
+    crate::sql::error_context::begin_dynamic_query(command);
     if matches!(kind, DynamicCommandKind::Cursor) {
         let mark = context.arena.mark();
         let validated =
@@ -26102,13 +26254,13 @@ fn trigger_format_message<'a>(
 
     let mut message = StackStr::<192>::new();
     let mut argument = 0usize;
-    let mut characters = format.chars();
+    let mut characters = format.chars().peekable();
     while let Some(character) = characters.next() {
         if character != '%' {
             let _ = message.write_char(character);
             continue;
         }
-        if characters.next() == Some('%') {
+        if characters.next_if_eq(&'%').is_some() {
             let _ = message.write_char('%');
             continue;
         }
@@ -26188,7 +26340,7 @@ fn trigger_condition<'a>(
     values: &[Datum<'a>],
     found: Option<bool>,
 ) -> Result<bool, SqlError> {
-    match eval_procedural_expression(
+    let value = eval_procedural_expression(
         context,
         expression,
         &TriggerLocalScope {
@@ -26203,13 +26355,25 @@ fn trigger_condition<'a>(
             },
         },
         None,
-    )? {
+    )?;
+    plpgsql_condition(value, context.arena)
+}
+
+/// A PL/pgSQL condition's truth: NULL is false, and a value of another type
+/// converts through its text form as PostgreSQL's `exec_eval_boolean` does
+/// (`IF 1` is true, `IF 5` is invalid input for boolean).
+fn plpgsql_condition(value: Datum<'_>, arena: &Arena) -> Result<bool, SqlError> {
+    match value {
         Datum::Bool(value) => Ok(value),
         Datum::Null => Ok(false),
-        _ => Err(sql_err!(
-            sqlstate::DATATYPE_MISMATCH,
-            "trigger condition must be type boolean"
-        )),
+        value => match cast_to(
+            Datum::Text(datum_to_text(value, arena)?),
+            ColType::Bool,
+            arena,
+        )? {
+            Datum::Bool(value) => Ok(value),
+            _ => Ok(false),
+        },
     }
 }
 
@@ -26641,11 +26805,99 @@ fn prepare_static_plpgsql_statement<'a>(
     Ok((statement, Some((site, prepared))))
 }
 
+/// The text of the static query a procedural statement runs in full, as
+/// PostgreSQL names it in error context.
+fn procedural_statement_query<'a>(
+    statement: TriggerStatement<'a>,
+    invocation: TriggerInvocation<'a>,
+) -> Option<&'a str> {
+    let site = |key: usize| {
+        invocation
+            .input_sites
+            .iter()
+            .find(|site| site.kind == super::plpgsql_inputs::Kind::Query && site.key == key)
+            .map(|site| site.text)
+    };
+    match statement {
+        TriggerStatement::Utility { source, .. } | TriggerStatement::Dml { source, .. } => {
+            Some(source)
+        }
+        TriggerStatement::Perform(query)
+        | TriggerStatement::ReturnQuery(query)
+        | TriggerStatement::SelectInto(TriggerSelectInto { query, .. }) => {
+            site(core::ptr::from_ref(query) as usize)
+        }
+        TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
+            query: PlpgsqlCursorQuery::Static(source),
+            ..
+        }) => Some(source),
+        _ => None,
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "a trigger block carries the complete typed firing context"
+    reason = "the interpreter retains the complete typed firing context"
 )]
 fn execute_trigger_step<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    definition: crate::storage::RelationDefinition<'_>,
+    invocation: TriggerInvocation<'a>,
+    old: Option<&[Datum<'a>]>,
+    new: &mut Option<&mut [Datum<'a>]>,
+    before: bool,
+    transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
+    locals: &[TriggerLocalDecl],
+    local_values: &mut [Datum<'a>],
+    statement: TriggerStatement<'a>,
+    child_scope: PlpgsqlScope,
+    status: &mut TriggerExecutionStatus<'a>,
+    exception: Option<diagnostics::CaughtDiagnostic<'_>>,
+) -> Result<control_flow::Step<'a, 'a>, SqlError> {
+    let run = || {
+        execute_trigger_step_in(
+            context,
+            definition,
+            invocation,
+            old,
+            new,
+            before,
+            transition_relations,
+            locals,
+            local_values,
+            statement,
+            child_scope,
+            status,
+            exception,
+        )
+    };
+    if matches!(
+        statement,
+        TriggerStatement::DynamicQuery(_)
+            | TriggerStatement::DynamicSelectInto(_)
+            | TriggerStatement::ReturnDynamicQuery(_)
+            | TriggerStatement::For(TriggerFor {
+                source: TriggerForSource::DynamicQuery(_),
+                ..
+            })
+            | TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
+                query: PlpgsqlCursorQuery::Dynamic(_),
+                ..
+            })
+    ) {
+        let frame = crate::sql::error_context::DynamicQueryFrame::new();
+        return crate::sql::error_context::within(&frame, || {
+            crate::sql::error_position::with_internal_source("", run)
+        });
+    }
+    in_statement_query(procedural_statement_query(statement, invocation), run)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the interpreter retains the complete typed firing context"
+)]
+fn execute_trigger_step_in<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     definition: crate::storage::RelationDefinition<'_>,
     invocation: TriggerInvocation<'a>,
@@ -27056,7 +27308,22 @@ fn execute_trigger_step<'a>(
                 transition: &transition,
             };
             let value = eval_procedural_expression(context, assignment.expression, &scope, None)?;
-            if locals.iter().any(|local| local.name == assignment.name) {
+            if let Expr::Str(literal) = assignment.expression
+                && let Some(statement) = crate::sql::error_context::innermost_assignment()
+                && locals.iter().any(|local| local.name == assignment.name)
+            {
+                // PostgreSQL converts a literal to the target's type while
+                // analysing the assignment, so the failure points at it.
+                in_procedural_query(
+                    statement,
+                    crate::sql::error_context::QueryMode::Assignment,
+                    true,
+                    || {
+                        assign_trigger_local(context, locals, local_values, assignment.name, value)
+                            .map_err(|error| crate::sql::error_position::at_subject(error, literal))
+                    },
+                )?;
+            } else if locals.iter().any(|local| local.name == assignment.name) {
                 assign_trigger_local(context, locals, local_values, assignment.name, value)?;
             } else if TriggerStatusVariable::parse(assignment.name.as_str()).is_some() {
                 status.found = match cast_to(value, ColType::Bool, context.arena)? {
@@ -27648,29 +27915,37 @@ fn execute_trigger_step<'a>(
                     Ok((selected, row_count))
                 })?;
             status.set_rows(row_count as u64)?;
-            if statement.strict {
-                match row_count {
-                    0 => {
-                        return Err(sql_err!(sqlstate::NO_DATA_FOUND, "query returned no rows"));
-                    }
-                    1 => {}
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::TOO_MANY_ROWS,
-                            "query returned more than one row"
-                        ));
+            // Checking the row count and storing the row happen after the
+            // query, outside its context.
+            crate::sql::error_context::outside_query(|| {
+                if statement.strict {
+                    match row_count {
+                        0 => {
+                            return Err(sql_err!(
+                                sqlstate::NO_DATA_FOUND,
+                                "query returned no rows"
+                            ));
+                        }
+                        1 => {}
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::TOO_MANY_ROWS,
+                                "query returned more than one row"
+                            ));
+                        }
                     }
                 }
-            }
-            for (index, _) in targets[..statement.targets.len()].iter().enumerate() {
-                assign_trigger_local(
-                    context,
-                    locals,
-                    local_values,
-                    statement.targets[index],
-                    selected[index],
-                )?;
-            }
+                for (index, _) in targets[..statement.targets.len()].iter().enumerate() {
+                    assign_trigger_local(
+                        context,
+                        locals,
+                        local_values,
+                        statement.targets[index],
+                        selected[index],
+                    )?;
+                }
+                Ok(())
+            })?;
 
             Ok(None)
         }),
@@ -28247,18 +28522,21 @@ fn execute_trigger_step<'a>(
         }),
         TriggerStatement::Raise(TriggerRaise::Rethrow) => execute_trigger_statement(|| {
             let exception = exception.expect("bare RAISE is parsed only in an exception handler");
-            crate::sql::eval::stash_diagnostic(
-                exception.stack::<{ super::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>(
+            crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+                detail: exception.stack::<{ super::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>(
                     diagnostics::Field::Detail,
                 )?,
-                exception.stack::<128>(diagnostics::Field::Hint)?,
-            );
-            Err(SqlError {
+                hint: exception.stack::<128>(diagnostics::Field::Hint)?,
+                objects: exception.objects()?,
+            });
+            let error = SqlError {
                 sqlstate: exception.sqlstate,
                 message: exception
                     .stack::<192>(diagnostics::Field::Message)?
                     .expect("caught error has a message"),
-            })
+            };
+            exception.restore_context(&error);
+            Err(error)
         }),
         TriggerStatement::Raise(TriggerRaise::Message(raise)) => execute_trigger_statement(|| {
             let transition = TriggerTransition {
@@ -28298,8 +28576,27 @@ fn execute_trigger_step<'a>(
                 .hint
                 .map(|hint| trigger_diagnostic_text::<128>(hint, context, &scope))
                 .transpose()?;
-            if detail.is_some() || hint.is_some() {
-                crate::sql::eval::stash_diagnostic(detail, hint);
+            let mut objects = crate::sql::eval::ErrorObjects::default();
+            for (field, expression) in [
+                &mut objects.schema,
+                &mut objects.table,
+                &mut objects.column,
+                &mut objects.datatype,
+                &mut objects.constraint,
+            ]
+            .into_iter()
+            .zip(raise.objects)
+            {
+                *field = expression
+                    .map(|expression| trigger_diagnostic_text(expression, context, &scope))
+                    .transpose()?;
+            }
+            if detail.is_some() || hint.is_some() || !objects.is_empty() {
+                crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+                    detail,
+                    hint,
+                    objects,
+                });
             }
             match raise.level {
                 TriggerRaiseLevel::Debug => context
@@ -28334,15 +28631,12 @@ fn execute_trigger_step<'a>(
                 let value = match assignment.item {
                     TriggerDiagnostic::RowCount => Datum::Int8(status.row_count),
                     TriggerDiagnostic::PgRoutineOid => Datum::Int4(invocation.routine_oid),
-                    TriggerDiagnostic::PgContext => {
-                        let text = invocation.context();
-                        Datum::Text(
-                            context
-                                .arena
-                                .alloc_str(text.as_str())
-                                .map_err(|_| super::query::arena_full_pub())?,
-                        )
-                    }
+                    TriggerDiagnostic::PgContext => Datum::Text(
+                        context
+                            .arena
+                            .alloc_str_display(crate::sql::error_context::Live)
+                            .map_err(|_| super::query::arena_full_pub())?,
+                    ),
                 };
                 assign_trigger_local(context, locals, local_values, assignment.target, value)?;
             }
@@ -28362,11 +28656,13 @@ fn execute_trigger_step<'a>(
                         Some(diagnostics::Field::Sqlstate)
                     }
                     TriggerStackedDiagnostic::MessageText => Some(diagnostics::Field::Message),
-                    TriggerStackedDiagnostic::ColumnName
-                    | TriggerStackedDiagnostic::ConstraintName
-                    | TriggerStackedDiagnostic::PgDatatypeName
-                    | TriggerStackedDiagnostic::TableName
-                    | TriggerStackedDiagnostic::SchemaName => None,
+                    TriggerStackedDiagnostic::ColumnName => Some(diagnostics::Field::Column),
+                    TriggerStackedDiagnostic::ConstraintName => {
+                        Some(diagnostics::Field::Constraint)
+                    }
+                    TriggerStackedDiagnostic::PgDatatypeName => Some(diagnostics::Field::Datatype),
+                    TriggerStackedDiagnostic::TableName => Some(diagnostics::Field::Table),
+                    TriggerStackedDiagnostic::SchemaName => Some(diagnostics::Field::Schema),
                     TriggerStackedDiagnostic::PgExceptionDetail => Some(diagnostics::Field::Detail),
                     TriggerStackedDiagnostic::PgExceptionHint => Some(diagnostics::Field::Hint),
                     TriggerStackedDiagnostic::PgExceptionContext => {
@@ -29043,31 +29339,25 @@ fn execute_trigger_step<'a>(
             for branch in program.branches {
                 let selected = match branch.condition {
                     None => true,
-                    Some(condition) => match eval_procedural_expression(
-                        context,
-                        condition,
-                        &TriggerLocalScope {
-                            locals,
-                            values: &local_values[..locals.len()],
-                            found: status.found,
-                            invocation,
-                            transition: &TriggerTransition {
-                                definition,
-                                old,
-                                new: new.as_deref(),
+                    Some(condition) => plpgsql_condition(
+                        eval_procedural_expression(
+                            context,
+                            condition,
+                            &TriggerLocalScope {
+                                locals,
+                                values: &local_values[..locals.len()],
+                                found: status.found,
+                                invocation,
+                                transition: &TriggerTransition {
+                                    definition,
+                                    old,
+                                    new: new.as_deref(),
+                                },
                             },
-                        },
-                        None,
-                    )? {
-                        Datum::Bool(value) => value,
-                        Datum::Null => false,
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "IF condition must be type boolean"
-                            ));
-                        }
-                    },
+                            None,
+                        )?,
+                        context.arena,
+                    )?,
                 };
                 if selected {
                     return Ok(control_flow::Step::branch(branch.block));
@@ -29119,16 +29409,7 @@ fn execute_trigger_step<'a>(
                                 &value,
                             )? == core::cmp::Ordering::Equal
                     }
-                    None => match value {
-                        Datum::Bool(value) => value,
-                        Datum::Null => false,
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "CASE condition must be type boolean"
-                            ));
-                        }
-                    },
+                    None => plpgsql_condition(value, context.arena)?,
                 };
                 if matches {
                     selected = Some(branch.block);
@@ -36656,6 +36937,18 @@ pub(crate) fn validate_routine_body(
                     |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 )?;
                 if body_kind != crate::storage::RoutineBodyKind::String {
+                    // A SQL-standard body is part of the statement, so
+                    // PostgreSQL always analyses it at CREATE.
+                    if !arguments[..argument_count]
+                        .iter()
+                        .any(|argument| argument.polymorphic_type().is_some())
+                    {
+                        crate::sql::error_position::with_analysis(|| {
+                            super::query::analyse_routine_program(
+                                &program, storage, txn.txid, arena,
+                            )
+                        })?;
+                    }
                     let raw_path = guc.search_path();
                     let user = super::eval::funcs::system::session_user_owned();
                     let path = storage.compute_path(raw_path.as_str(), user.as_str(), txn.txid);
@@ -46462,7 +46755,12 @@ fn validate_stored_domain_value(
         .map(|_| ()),
         DomainValidation::NotNull { target } => {
             let target_domain = storage.domain_for(target, txid);
-            crate::sql::exec::constraints::validate_domain_not_null(&target_domain, value)
+            crate::sql::exec::constraints::validate_domain_not_null(
+                storage,
+                txid,
+                &target_domain,
+                value,
+            )
         }
         DomainValidation::Check { target, index } => {
             let target_domain = storage.domain_for(target, txid);
@@ -65498,6 +65796,12 @@ where
         }
         statement.columns.len()
     };
+    let typed_statement =
+        match type_insert_subscript_bases(statement, def, &targets[..n_targets], arena) {
+            Ok(statement) => statement,
+            Err(error) => return sql_fail(error),
+        };
+    let statement = &typed_statement;
     let source_assignment_casts = match source {
         InsertSource::MaterializedSelect { .. } => None,
         InsertSource::Statement => match statement.select {
@@ -66766,6 +67070,9 @@ pub(crate) fn update<'a>(
         Ok(definition) => definition,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = check_dml_literal_operands(statement.where_clause, def, arena) {
+        return sql_fail(error);
+    }
     let authorization_role = match authorization.role(storage, txn.txid) {
         Ok(role) => role,
         Err(error) => return sql_fail(error),
@@ -67962,6 +68269,9 @@ pub(crate) fn delete<'a>(
         Ok(definition) => definition,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = check_dml_literal_operands(statement.where_clause, def, arena) {
+        return sql_fail(error);
+    }
     let reads_target = match (|| -> Result<ColumnSet, SqlError> {
         let mut columns = ColumnSet::EMPTY;
         if let Some(expression) = statement.where_clause {
@@ -76338,6 +76648,145 @@ fn prepare_dml_assignment_casts<'a>(
     Ok(AssignmentCasts(entries.as_slice()))
 }
 
+/// PostgreSQL assigns a subscripted INSERT target (`INSERT INTO t (j['k'])`)
+/// into a NULL of the column's type. The parser writes that NULL untyped,
+/// which subscripting takes for an array; a column of another subscriptable
+/// type (jsonb) gets a NULL of its own type.
+fn type_insert_subscript_bases<'a>(
+    statement: &Insert<'a>,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    targets: &[usize],
+    arena: &'a Arena,
+) -> Result<Insert<'a>, SqlError> {
+    let typed = |expression: &'a Expr<'a>, target: usize| {
+        typed_subscript_base(expression, def.columns()[target].ctype, arena)
+    };
+    let mut typed_statement = *statement;
+    if let Some(select) = statement.select
+        && select.items.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Expr {
+                    expression: Expr::Call {
+                        name: "__jsonb_subscript_set",
+                        args: [Expr::Null, ..],
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+    {
+        let items = arena
+            .alloc_slice_with(select.items.len(), |index| select.items[index])
+            .map_err(|_| super::query::arena_full_pub())?;
+        for (index, item) in items.iter_mut().enumerate() {
+            if let (SelectItem::Expr { expression, .. }, Some(&target)) =
+                (&mut *item, targets.get(index))
+            {
+                *expression = typed(expression, target)?;
+            }
+        }
+        typed_statement.select = Some(
+            arena
+                .alloc(Select { items, ..*select })
+                .map_err(|_| super::query::arena_full_pub())?,
+        );
+    }
+    Ok(typed_statement)
+}
+
+/// [`type_insert_subscript_bases`] for one assigned expression and the
+/// target column's type.
+fn typed_subscript_base<'e, 'a: 'e>(
+    expression: &'e Expr<'a>,
+    ctype: ColType,
+    arena: &'a Arena,
+) -> Result<&'e Expr<'a>, SqlError> {
+    {
+        let Expr::Call {
+            kind,
+            name: name @ "__jsonb_subscript_set",
+            bound_oid,
+            bound_strict,
+            source_position,
+            args: [Expr::Null, rest @ ..],
+            argument_names,
+            variadic,
+            star,
+            distinct,
+            order_by,
+            over,
+            filter,
+        } = expression
+        else {
+            return Ok(expression);
+        };
+        if matches!(ctype, ColType::Array(_)) {
+            return Ok(expression);
+        }
+        let base = arena
+            .alloc(Expr::Cast {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                operand: &Expr::Null,
+                type_name: ctype.name(),
+                type_mod: -1,
+                binding: crate::sql::ast::CastBinding::Builtin,
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        let args = arena
+            .alloc_slice_with(rest.len() + 1, |index| {
+                if index == 0 { &*base } else { rest[index - 1] }
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        arena
+            .alloc(Expr::Call {
+                kind: *kind,
+                name,
+                bound_oid: *bound_oid,
+                bound_strict: *bound_strict,
+                source_position: *source_position,
+                args,
+                argument_names,
+                variadic: *variadic,
+                star: *star,
+                distinct: *distinct,
+                order_by,
+                over: *over,
+                filter: *filter,
+            })
+            .map(|expression| &*expression)
+            .map_err(|_| super::query::arena_full_pub())
+    }
+}
+
+/// [`super::query::check_literal_operands_typed`] for a data-changing
+/// statement's condition over its one target table.
+fn check_dml_literal_operands<'a>(
+    expression: Option<&'a Expr<'a>>,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let Some(expression) = expression else {
+        return Ok(());
+    };
+    super::query::check_literal_operands_typed(
+        expression,
+        &|operand| match operand {
+            Expr::Column { name, .. } => def
+                .column_index(name)
+                .map(|column| def.columns()[column].ctype),
+            Expr::Int(value) => Some(if i32::try_from(*value).is_ok() {
+                ColType::Int4
+            } else {
+                ColType::Int8
+            }),
+            _ => None,
+        },
+        arena,
+    )
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "prepared assignment execution context"
@@ -76355,6 +76804,7 @@ fn eval_prepared_assignment<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let mut cast = casts.selected(expression, column, storage, txid)?;
     cast.input_collation = super::eval::coercion_input_collation(expression, row, hooks.catalog)?;
+    let expression = typed_subscript_base(expression, column.ctype, arena)?;
     let value = eval_full(expression, arena, params, row, hooks)?;
     coerce_assignment(value, column, cast, storage, txid, arena, hooks.sequences)
 }
@@ -76422,6 +76872,36 @@ fn prepare_insert_select_casts<'a>(
     } else {
         statement.columns.len()
     };
+    // Subscripted targets are assigned from the written query's columns,
+    // which must match the target list.
+    if let Some(crate::sql::ast::FromClause {
+        base:
+            crate::sql::ast::TableRef {
+                alias: Some(crate::sql::ast::INSERT_SUBSCRIPT_SOURCE),
+                subquery: Some(written),
+                ..
+            },
+        ..
+    }) = select.from
+    {
+        let mut width = 0usize;
+        super::query::visit_projection_types(written, storage, txid, arena, outer, &mut |_, _| {
+            width += 1;
+            Ok(())
+        })?;
+        if width < count {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "INSERT has more target columns than expressions"
+            ));
+        }
+        if width > count {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "INSERT has more expressions than target columns"
+            ));
+        }
+    }
     let casts = arena
         .alloc_slice_with(count, |_| PlannedAssignmentCast::NONE)
         .map_err(|_| super::eval::arena_full())?;
@@ -78098,6 +78578,15 @@ fn check_not_null<Definition0: crate::storage::DefinitionBacking>(
 ) -> Result<(), SqlError> {
     for (i, c) in def.columns().iter().enumerate() {
         if c.not_null.is_required() && values[i].is_null() {
+            let detail = constraints::failing_row_detail(&values[..def.columns().len()])?;
+            crate::sql::eval::stash_object_diagnostic(
+                Some(detail.as_str()),
+                crate::sql::eval::ErrorObjects::table_column(
+                    def.schema.as_str(),
+                    def.name.as_str(),
+                    c.name.as_str(),
+                ),
+            );
             return Err(sql_err!(
                 sqlstate::NOT_NULL_VIOLATION,
                 "null value in column \"{}\" of relation \"{}\" violates not-null constraint",

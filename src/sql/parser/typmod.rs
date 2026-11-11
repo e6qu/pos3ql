@@ -80,7 +80,7 @@ impl<'a> Parser<'a> {
     /// the cursor of its diagnostics, the type name's start when it has one.
     pub(super) fn type_modifier(
         &mut self,
-        base: &str,
+        base: &'a str,
         keyword_spelling: bool,
         type_at: Option<usize>,
     ) -> Result<i32, ParseError> {
@@ -191,7 +191,7 @@ impl<'a> Parser<'a> {
     /// A failure is an analysis error; the result is then unused.
     pub(super) fn checked_typmod(
         &mut self,
-        base: &str,
+        base: &'a str,
         written: WrittenTypmods<'a>,
         type_at: Option<usize>,
         display: core::fmt::Arguments<'_>,
@@ -211,6 +211,9 @@ impl<'a> Parser<'a> {
                 sqlstate::SYNTAX_ERROR,
                 format_args!("type modifier is not allowed for type \"{display}\""),
             );
+            if self.analysis_error.is_none() {
+                self.analysis_error_type = Some(base);
+            }
             return self.analysis_error(error).map(|()| -1);
         };
         if !written.simple {

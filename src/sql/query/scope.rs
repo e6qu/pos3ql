@@ -88,6 +88,25 @@ fn catalog_scan(
     }
 }
 
+/// 42P10 for a column alias list longer than its table's columns. The
+/// query an `INSERT` with subscripted targets reads instead reports
+/// PostgreSQL's `INSERT has more target columns than expressions`.
+pub(crate) fn derived_alias_mismatch(table: &str, available: usize, specified: usize) -> SqlError {
+    if table == crate::sql::ast::INSERT_SUBSCRIPT_SOURCE {
+        return sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "INSERT has more target columns than expressions"
+        );
+    }
+    sql_err!(
+        sqlstate::INVALID_COLUMN_REFERENCE,
+        "table \"{}\" has {} columns available but {} columns specified",
+        table,
+        available,
+        specified
+    )
+}
+
 fn validate_table_sample<'a>(
     storage: &Storage,
     table: &TableRef<'a>,
@@ -776,13 +795,7 @@ impl<'d> QueryScope<'d> {
         if let Some(aliases) = tref.col_alias
             && aliases.len() > ncols
         {
-            return Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "table \"{}\" has {} columns available but {} columns specified",
-                exposed,
-                ncols,
-                aliases.len()
-            ));
+            return Err(derived_alias_mismatch(exposed, ncols, aliases.len()));
         }
         let mut names = [""; MAX_COLUMNS];
         for (index, name) in names.iter_mut().enumerate().take(ncols) {
@@ -1200,12 +1213,10 @@ impl<'d> QueryScope<'d> {
         let mut definition = synth.def;
         if let Some(aliases) = tref.col_alias {
             if aliases.len() > definition.n_columns {
-                return Err(sql_err!(
-                    sqlstate::INVALID_COLUMN_REFERENCE,
-                    r#"table "{}" has {} columns available but {} columns specified"#,
+                return Err(derived_alias_mismatch(
                     exposed,
                     definition.n_columns,
-                    aliases.len()
+                    aliases.len(),
                 ));
             }
             let columns = arena
@@ -1519,12 +1530,10 @@ impl<'d> QueryScope<'d> {
         };
         let renamed = if let Some(aliases) = tref.col_alias {
             if aliases.len() > stored_def.n_columns {
-                return Err(sql_err!(
-                    sqlstate::INVALID_COLUMN_REFERENCE,
-                    "table \"{}\" has {} columns available but {} columns specified",
+                return Err(derived_alias_mismatch(
                     exposed,
                     stored_def.n_columns,
-                    aliases.len()
+                    aliases.len(),
                 ));
             }
             let columns = arena

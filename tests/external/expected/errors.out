@@ -17,6 +17,10 @@ LINE 1: SELECT no_such_column FROM t_err;
                ^
 INSERT INTO t_err VALUES (NULL, 'x');
 psql:tests/external/sql/errors.sql:11: ERROR:  23502: null value in column "id" of relation "t_err" violates not-null constraint
+DETAIL:  Failing row contains (null, x).
+SCHEMA NAME:  public
+TABLE NAME:  t_err
+COLUMN NAME:  id
 INSERT INTO t_err (no_col) VALUES (1);
 psql:tests/external/sql/errors.sql:12: ERROR:  42703: column "no_col" of relation "t_err" does not exist
 LINE 1: INSERT INTO t_err (no_col) VALUES (1);

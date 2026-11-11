@@ -57,6 +57,79 @@ pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 64 * 192;
 pub struct Diagnostic {
     pub detail: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
     pub hint: Option<StackStr<128>>,
+    pub objects: ErrorObjects,
+}
+
+/// The longest schema, table, column, data type or constraint name an error
+/// reports. Catalog names are at most 63 bytes; `RAISE ... USING` accepts
+/// longer text up to this bound and rejects the rest with 54000.
+pub const MAX_ERROR_OBJECT_BYTES: usize = 1024;
+
+/// The database objects PostgreSQL names in an error's `s`, `t`, `c`, `d`
+/// and `n` fields.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct ErrorObjects {
+    pub schema: Option<StackStr<MAX_ERROR_OBJECT_BYTES>>,
+    pub table: Option<StackStr<MAX_ERROR_OBJECT_BYTES>>,
+    pub column: Option<StackStr<MAX_ERROR_OBJECT_BYTES>>,
+    pub datatype: Option<StackStr<MAX_ERROR_OBJECT_BYTES>>,
+    pub constraint: Option<StackStr<MAX_ERROR_OBJECT_BYTES>>,
+}
+
+impl ErrorObjects {
+    /// A table's schema and name, as `errtable` reports them.
+    pub fn table(schema: &str, table: &str) -> Self {
+        Self {
+            schema: Some(StackStr::from_str(schema)),
+            table: Some(StackStr::from_str(table)),
+            ..Self::default()
+        }
+    }
+
+    /// A table constraint, as `errtableconstraint` reports it.
+    pub fn table_constraint(schema: &str, table: &str, constraint: &str) -> Self {
+        Self {
+            constraint: Some(StackStr::from_str(constraint)),
+            ..Self::table(schema, table)
+        }
+    }
+
+    /// A table column, as `errtablecol` reports it.
+    pub fn table_column(schema: &str, table: &str, column: &str) -> Self {
+        Self {
+            column: Some(StackStr::from_str(column)),
+            ..Self::table(schema, table)
+        }
+    }
+
+    /// A data type and optionally one of its constraints, as
+    /// `errdatatype` and `errdomainconstraint` report them.
+    pub fn datatype(schema: &str, datatype: &str, constraint: Option<&str>) -> Self {
+        Self {
+            schema: Some(StackStr::from_str(schema)),
+            datatype: Some(StackStr::from_str(datatype)),
+            constraint: constraint.map(StackStr::from_str),
+            ..Self::default()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Each present field with its ErrorResponse code, in PostgreSQL's
+    /// field order.
+    pub fn fields(&self) -> impl Iterator<Item = (u8, &str)> {
+        [
+            (b's', &self.schema),
+            (b't', &self.table),
+            (b'c', &self.column),
+            (b'd', &self.datatype),
+            (b'n', &self.constraint),
+        ]
+        .into_iter()
+        .filter_map(|(code, value)| value.as_ref().map(|value| (code, value.as_str())))
+    }
 }
 
 std::thread_local! {
@@ -68,7 +141,25 @@ pub fn stash_diagnostic(
     detail: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
     hint: Option<StackStr<128>>,
 ) {
-    PENDING_DIAGNOSTIC.with(|d| *d.borrow_mut() = Some(Diagnostic { detail, hint }));
+    stash_full_diagnostic(Diagnostic {
+        detail,
+        hint,
+        objects: ErrorObjects::default(),
+    });
+}
+
+/// Replaces the pending diagnostic, including the objects it names.
+pub fn stash_full_diagnostic(diagnostic: Diagnostic) {
+    PENDING_DIAGNOSTIC.with(|d| *d.borrow_mut() = Some(diagnostic));
+}
+
+/// Stashes `detail` and `objects` for the next error.
+pub fn stash_object_diagnostic(detail: Option<&str>, objects: ErrorObjects) {
+    stash_full_diagnostic(Diagnostic {
+        detail: detail.map(StackStr::from_str),
+        hint: None,
+        objects,
+    });
 }
 
 pub fn take_diagnostic() -> Option<Diagnostic> {
@@ -4248,7 +4339,13 @@ fn eval_full_inner<'a>(
                 );
             }
             let v = eval_full(operand, arena, params, row, hooks)?;
-            unary(operator, v, arena)
+            unary(operator, v, arena).map_err(|error| {
+                if operator == UnaryOp::Not && error.sqlstate == sqlstate::DATATYPE_MISMATCH {
+                    crate::sql::error_position::at_expression(error, operand)
+                } else {
+                    error
+                }
+            })
         }
         Expr::Binary {
             operator: BinaryOp::And,
@@ -4839,7 +4936,10 @@ fn eval_full_inner<'a>(
                             boolean_argument(
                                 eval_full(cond, arena, params, row, hooks)?,
                                 "CASE/WHEN"
-                            )?,
+                            )
+                            .map_err(|error| {
+                                crate::sql::error_position::at_expression(error, cond)
+                            })?,
                             Datum::Bool(true)
                         ),
                     };
@@ -9781,11 +9881,14 @@ fn check_boolean_operand<'a>(
             Expr::Str(text) => parse_bool(text).map(|_| ()),
             _ => Ok(()),
         },
-        Some(other) => Err(sql_err!(
-            crate::sql::eval::sqlstate::DATATYPE_MISMATCH,
-            "argument of {} must be type boolean, not type {}",
-            context,
-            other.name()
+        Some(other) => Err(crate::sql::error_position::at_expression(
+            sql_err!(
+                crate::sql::eval::sqlstate::DATATYPE_MISMATCH,
+                "argument of {} must be type boolean, not type {}",
+                context,
+                other.name()
+            ),
+            expression,
         )),
     }
 }

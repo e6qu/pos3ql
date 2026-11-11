@@ -1,7 +1,9 @@
 -- Scanner, parse-analysis and runtime type diagnostics: Unicode escapes,
 -- identifier truncation, type modifiers, COPY and storage options checked when
--- the statement runs, unsupported casts, operator and subscript errors, and
--- array element and slice assignment.
+-- the statement runs, unsupported casts, operator and subscript errors, array
+-- element and slice assignment, analysis order, WITH queries nothing reads,
+-- constants compared with columns, SQL function bodies analysed at CREATE,
+-- subscripted INSERT targets, constraint violations and PL/pgSQL errors.
 SELECT U&'d!0061t!+000061' UESCAPE '!' AS u, U&"\0061bc" FROM (SELECT 1 AS abc) s;
 SELECT U&'\D83D';
 SELECT U&'\00';
@@ -62,3 +64,45 @@ SELECT id, a, m FROM parser_diag ORDER BY id;
 SELECT ('{{1,2},{3,4}}'::int[])[1] AS a, ('{{1,2},{3,4}}'::int[])[1:1][1] AS c, ('{{1,2},{3,4}}'::int[])[2][1:2] AS e;
 SELECT (SELECT ARRAY[1,2] AS x)[1], (SELECT ARRAY[1,2])[1];
 DROP TABLE parser_diag;
+CREATE TABLE parser_order (a int);
+SELECT 1::numeric(5000) FROM missing_relation;
+SELECT 1::nosuchtype(5);
+SELECT parser_nocol, 1::numeric(5000) FROM parser_order;
+SELECT 1::numeric(5000), parser_nocol FROM parser_order;
+SELECT x::nosuchtype(1) FROM parser_order;
+WITH unread AS (SELECT * FROM missing_relation) SELECT 1;
+WITH unread AS (SELECT parser_nocol FROM parser_order) SELECT 1;
+WITH unread AS (SELECT 1/0) SELECT 1;
+SELECT a FROM parser_order WHERE a = 'abc';
+SELECT a FROM parser_order WHERE a IN ('x');
+SELECT a + 'x' FROM parser_order;
+CREATE FUNCTION parser_body() RETURNS int LANGUAGE sql AS 'SELECT a FROM missing_relation';
+CREATE FUNCTION parser_body() RETURNS int LANGUAGE sql AS $$ INSERT INTO missing_relation VALUES (1); SELECT 1 $$;
+CREATE FUNCTION parser_body() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT a FROM missing_relation; END;
+SET check_function_bodies = off;
+CREATE FUNCTION parser_body() RETURNS int LANGUAGE sql AS 'SELECT a FROM missing_relation';
+RESET check_function_bodies;
+DROP FUNCTION parser_body();
+CREATE TABLE parser_targets (a int[], j jsonb, t text);
+INSERT INTO parser_targets (a[1]) SELECT 5;
+INSERT INTO parser_targets (j['x'], a[2]) SELECT '{"y":2}', 7;
+INSERT INTO parser_targets (j['x']) VALUES ('1');
+INSERT INTO parser_targets (j['a']['b']) VALUES ('true');
+INSERT INTO parser_targets (a[1]) SELECT 1, 2;
+SELECT a, j FROM parser_targets ORDER BY a, j::text;
+CREATE TABLE parser_violations (a int NOT NULL, b text CHECK (b <> 'x'));
+INSERT INTO parser_violations VALUES (NULL, 'y');
+INSERT INTO parser_violations VALUES (1, 'x');
+DO $$ BEGIN IF 1 THEN RAISE NOTICE 'one [%]', 'a'; END IF; END $$;
+DO $$ BEGIN IF 5 THEN NULL; END IF; END $$;
+DO $$ DECLARE x int; BEGIN x := 'abc'; END $$;
+DO $$ BEGIN EXECUTE 'SELEC 1'; END $$;
+SELECT 1 WHERE 1;
+SELECT 1 WHERE 'a'::text;
+SELECT CASE WHEN 1 THEN 1 END;
+SELECT NOT 1;
+SELECT 1 WHERE NULL::int;
+UPDATE parser_order SET a = 1 WHERE a = 'abc';
+DELETE FROM parser_order WHERE a = 'abc';
+SELECT * FROM parser_order x JOIN parser_order y ON x.a = 'abc';
+DROP TABLE parser_order, parser_targets, parser_violations;

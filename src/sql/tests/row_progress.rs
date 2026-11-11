@@ -65,6 +65,8 @@ fn routine_lock_waits_after_kept_rows_restart_the_statement_once() {
         "DO $$BEGIN UPDATE items SET a = step(id); END$$",
         "MERGE INTO items t USING (SELECT id FROM items) s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET a = step(s.id) RETURNING t.id, t.a",
+        "DO $$BEGIN MERGE INTO items t USING (SELECT id FROM items) s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET a = step(s.id); END$$",
     ];
     for mode in [
         crate::config::TransactionMode::Mvcc,

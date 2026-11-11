@@ -17665,6 +17665,7 @@ enum TriggerDml<'a> {
     Insert(Insert<'a>),
     Update(Update<'a>),
     Delete(Delete<'a>),
+    Merge(&'a crate::sql::ast::Merge<'a>),
 }
 
 static NO_TRIGGER_DML_COLUMNS: NoColumns = NoColumns;
@@ -20493,7 +20494,7 @@ fn parse_trigger_dml<'a>(source: &'a str, arena: &'a Arena) -> Result<TriggerDml
     if trigger_top_level_keyword(source, "returning", arena)?.is_some() {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "RETURNING in a static PL/pgSQL INSERT, UPDATE or DELETE is not supported"
+            "RETURNING in a static PL/pgSQL INSERT, UPDATE, DELETE or MERGE is not supported"
         ));
     }
     let mut parser = super::parser::Parser::new(source, arena)
@@ -20518,6 +20519,11 @@ fn parse_trigger_dml<'a>(source: &'a str, arena: &'a Arena) -> Result<TriggerDml
         Some(Stmt::Delete(statement)) if statement.returning.is_empty() => {
             Ok(TriggerDml::Delete(statement))
         }
+        Some(Stmt::Merge(statement)) if statement.returning.is_empty() => Ok(TriggerDml::Merge(
+            arena
+                .alloc(statement)
+                .map_err(|_| super::query::arena_full_pub())?,
+        )),
         _ => Err(unsupported_trigger_body()),
     }
 }
@@ -21240,6 +21246,7 @@ fn parse_trigger_statement<'a>(
     if strip_trigger_keyword(segment, "insert").is_some()
         || strip_trigger_keyword(segment, "update").is_some()
         || strip_trigger_keyword(segment, "delete").is_some()
+        || strip_trigger_keyword(segment, "merge").is_some()
     {
         super::plpgsql_inputs::record(
             super::plpgsql_inputs::Kind::Statement,
@@ -25050,9 +25057,76 @@ fn execute_nested_data_modification<'a>(
             leave_write_command(command, progress);
             dynamic_dml_outcome(responder, outcome, "DELETE")
         }
+        Stmt::Merge(_) => {
+            let arena = context.arena;
+            let params = arguments;
+            let sequence = crate::sql::sequence::SeqEval::new(
+                context.storage(),
+                context.seq_session(),
+                context.txn.txid,
+            );
+            let Stmt::Merge(statement) = super::query::expand_dml_ctes(
+                statement,
+                &[],
+                context.storage(),
+                context.txn.txid,
+                arena,
+                params,
+                &[],
+                Some(&sequence),
+            )?
+            else {
+                unreachable!("MERGE source expansion keeps its statement kind");
+            };
+            let boundary = context.nested_write_boundary();
+            let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
+            let mut command = enter_write_command(txn, storage, progress.as_deref_mut())?;
+            let txn = &mut *command;
+            let parent_boundary = txn.write_completion_boundary;
+            txn.write_completion_boundary =
+                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    mark,
+                    command: txn.command_id(),
+                    depth: txn.trigger_depth(),
+                });
+            responder.clear_affected_rows();
+            let outcome = responder.without_query_output(|responder| {
+                merge(
+                    storage,
+                    txn,
+                    statement,
+                    arena,
+                    params,
+                    seq_session,
+                    responder,
+                    capture,
+                    progress.as_deref_mut(),
+                    None,
+                )
+            });
+            txn.write_completion_boundary = parent_boundary;
+            let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+            {
+                txn.pending_write_completion.take()
+            } else {
+                None
+            };
+            if let Some(completion) = completion {
+                *pending = Some(write_completion::PendingNestedWrite::new(
+                    command.suspend(),
+                    completion,
+                ));
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                    "nested dynamic write completion is pending"
+                ));
+            }
+            leave_write_command(command, progress);
+            dynamic_dml_outcome(responder, outcome, "MERGE")
+        }
         _ => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "nested command is not an INSERT, UPDATE or DELETE"
+            "nested command is not an INSERT, UPDATE, DELETE or MERGE"
         )),
     }
 }
@@ -27944,6 +28018,7 @@ fn prepare_static_plpgsql_statement<'a>(
                 Stmt::Insert(statement) => TriggerDml::Insert(*statement),
                 Stmt::Update(statement) => TriggerDml::Update(*statement),
                 Stmt::Delete(statement) => TriggerDml::Delete(*statement),
+                Stmt::Merge(statement) => TriggerDml::Merge(statement),
                 _ => {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -29112,6 +29187,7 @@ fn execute_trigger_step<'a>(
                     Stmt::Insert(statement) => !statement.returning.is_empty(),
                     Stmt::Update(statement) => !statement.returning.is_empty(),
                     Stmt::Delete(statement) => !statement.returning.is_empty(),
+                    Stmt::Merge(statement) => !statement.returning.is_empty(),
                     _ => true,
                 };
                 with_bound_parameter_types(query.parameter_types, || {
@@ -29170,7 +29246,10 @@ fn execute_trigger_step<'a>(
                                         crate::sql::exec::DescriptionTarget::Sql,
                                     )?
                                 }
-                                Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
+                                Stmt::Insert(_)
+                                | Stmt::Update(_)
+                                | Stmt::Delete(_)
+                                | Stmt::Merge(_)
                                     if record_target =>
                                 {
                                     describe_data_modification_columns(
@@ -29387,7 +29466,7 @@ fn execute_trigger_step<'a>(
                         Stmt::Select(_) | Stmt::SetQuery(_) => {
                             execute_bound_plpgsql_dynamic_query(context, query, &mut capture)?;
                         }
-                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
                             let mut returning =
                                 |_: &Storage,
                                  _: u32,
@@ -29523,7 +29602,7 @@ fn execute_trigger_step<'a>(
                             })?;
                             rows
                         }
-                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
                             let result = execute_procedural_write(
                                 context,
                                 status,
@@ -30298,6 +30377,124 @@ fn execute_trigger_step<'a>(
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             "trigger-side DELETE response exceeded the output buffer"
+                        ));
+                    }
+                }
+
+                Ok(None)
+            }),
+            TriggerStatement::Dml {
+                statement: TriggerDml::Merge(statement),
+                ..
+            } => execute_trigger_statement(|| {
+                let statement = match transition_relations {
+                    Some(relations) => {
+                        let dml = context
+                            .arena
+                            .alloc(super::ast::Stmt::Merge(*statement))
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        super::query::bind_dml_materialized_relations(
+                            dml,
+                            context.storage(),
+                            context.txn.txid,
+                            context.arena,
+                            context.params,
+                            relations,
+                        )?
+                    }
+                    None => context
+                        .arena
+                        .alloc(super::ast::Stmt::Merge(*statement))
+                        .map_err(|_| super::query::arena_full_pub())?,
+                };
+                let sequence = crate::sql::sequence::SeqEval::new(
+                    context.storage(),
+                    context.seq_session(),
+                    context.txn.txid,
+                );
+                let Stmt::Merge(statement) = super::query::expand_dml_ctes(
+                    statement,
+                    &[],
+                    context.storage(),
+                    context.txn.txid,
+                    context.arena,
+                    context.params,
+                    &[],
+                    Some(&sequence),
+                )?
+                else {
+                    unreachable!("MERGE source expansion keeps its statement kind");
+                };
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let arena = context.arena;
+                let params = context.params;
+                let boundary = context.nested_write_boundary();
+                let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
+                let mut command = enter_write_command(txn, storage, progress.as_deref_mut())?;
+                let txn = &mut *command;
+                let parent_boundary = txn.write_completion_boundary;
+                txn.write_completion_boundary =
+                    boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                        mark,
+                        command: txn.command_id(),
+                        depth: txn.trigger_depth(),
+                    });
+                responder.clear_affected_rows();
+                let outcome = responder.without_command_complete(|responder| {
+                    merge(
+                        storage,
+                        txn,
+                        statement,
+                        arena,
+                        params,
+                        seq_session,
+                        responder,
+                        None,
+                        progress.as_deref_mut(),
+                        Some(&scope),
+                    )
+                });
+                txn.write_completion_boundary = parent_boundary;
+                let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+                {
+                    txn.pending_write_completion.take()
+                } else {
+                    None
+                };
+                if let Some(completion) = completion {
+                    status.pending_write = Some(write_completion::PendingNestedWrite::new(
+                        command.suspend(),
+                        completion,
+                    ));
+                    let (rows, output) = resume_nested_write(context, status)?;
+                    debug_assert!(output.is_none());
+                    status.set_rows(rows)?;
+                    return Ok(None);
+                }
+                leave_write_command(command, progress);
+                match outcome {
+                    Ok(Ok(())) => status.set_rows(
+                        context
+                            .responder
+                            .take_affected_rows()
+                            .expect("trigger MERGE publishes an affected-row count"),
+                    )?,
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "trigger-side MERGE response exceeded the output buffer"
                         ));
                     }
                 }
@@ -63487,6 +63684,133 @@ fn reject_generated_write<Definition0: crate::storage::DefinitionBacking>(
 /// A two-table column lookup for MERGE's ON / WHEN-condition / SET expressions:
 /// a qualified name resolves to the target or source half; an unqualified name
 /// searches both (ambiguous if in both, 42702).
+/// A `MERGE` row scope inside PL/pgSQL: a name the routine declares reads
+/// the routine's variable, as in a static `UPDATE`; others read the row.
+struct ProceduralMergeScope<'s, 'o, R> {
+    row: &'s R,
+    outer: Option<&'s dyn ColumnLookup<'o>>,
+}
+
+impl<'o: 'v, 'v, R: ColumnLookup<'v>> ColumnLookup<'v> for ProceduralMergeScope<'_, 'o, R> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        match self.variable(qualifier, name) {
+            Some(outer) => outer.lookup(qualifier, name),
+            None => self.row.lookup(qualifier, name),
+        }
+    }
+
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        match self.variable(qualifier, name) {
+            Some(outer) => outer.column_type_mod(qualifier, name),
+            None => self.row.column_type_mod(qualifier, name),
+        }
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.row.is_empty_scope()
+    }
+
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'v>, SqlError> {
+        self.row.recursive_state(qualifier, index)
+    }
+
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        match self.variable(qualifier, name) {
+            Some(outer) => outer.column_identity(qualifier, name),
+            None => self.row.column_identity(qualifier, name),
+        }
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<Option<&'v [crate::sql::types::RecordField<'v>]>, SqlError> {
+        self.row.whole_row_fields(table, arena)
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(StackStr<64>, StaticTypeMeta)> {
+        self.row.whole_row_field_metadata(table, index, catalog)
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<&'v [crate::sql::types::RecordField<'v>], SqlError> {
+        self.row.whole_row_expansion_fields(table, arena)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        self.row.whole_row_present(table)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        match self.variable(qualifier, name) {
+            Some(outer) => outer.col_type(qualifier, name),
+            None => self.row.col_type(qualifier, name),
+        }
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        match self.variable(qualifier, name) {
+            Some(outer) => outer.column_type_oid(qualifier, name),
+            None => self.row.column_type_oid(qualifier, name),
+        }
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        match self.variable(qualifier, name) {
+            Some(outer) => outer.collation(qualifier, name),
+            None => self.row.collation(qualifier, name),
+        }
+    }
+
+    fn record_field_collation(&self, base: &Expr<'v>, field: &str) -> crate::sql::ast::Collation {
+        self.row.record_field_collation(base, field)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        match self.variable(qualifier, name) {
+            Some(outer) => outer.column_user_type(qualifier, name),
+            None => self.row.column_user_type(qualifier, name),
+        }
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.row.whole_row_is_scalar(table)
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.row.whole_row_type(table)
+    }
+}
+
+impl<'o, R> ProceduralMergeScope<'_, 'o, R> {
+    /// The routine variable a name reads: one the routine declares with a
+    /// type, or an unqualified name the row does not have.
+    fn variable<'v>(&self, qualifier: Option<&str>, name: &str) -> Option<&dyn ColumnLookup<'o>>
+    where
+        R: ColumnLookup<'v>,
+    {
+        self.outer.filter(|outer| {
+            outer.column_type_oid(qualifier, name).is_some()
+                || (qualifier.is_none()
+                    && self.row.col_type(None, name).is_none()
+                    && outer.col_type(None, name).is_some())
+        })
+    }
+}
+
 struct MergeLookup<'d, 'v> {
     target_def: crate::storage::RelationDefinition<'d>,
     target_alias: &'d str,
@@ -64021,6 +64345,7 @@ pub(crate) fn merge<'a>(
     responder: &mut Responder,
     mut capture: Option<&mut super::ReturningCapture<'_>>,
     mut progress: Option<&mut RowProgress>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Outcome {
     let coercion_txid = txn.txid;
     use crate::sql::ast::MergeActionRef as MergeAction;
@@ -64029,7 +64354,7 @@ pub(crate) fn merge<'a>(
         storage,
         txn.txid,
         arena,
-        None,
+        outer,
     ) {
         return sql_fail(error);
     }
@@ -64038,7 +64363,7 @@ pub(crate) fn merge<'a>(
         storage,
         txn.txid,
         arena,
-        None,
+        outer,
     ) {
         Ok(casts) => casts,
         Err(error) => return sql_fail(error),
@@ -65076,7 +65401,10 @@ pub(crate) fn merge<'a>(
                         seq_session,
                         arena,
                         params,
-                        &lookup,
+                        &ProceduralMergeScope {
+                            row: &lookup,
+                            outer,
+                        },
                         None,
                     ) {
                         Ok(Datum::Bool(true)) => {}
@@ -65135,7 +65463,10 @@ pub(crate) fn merge<'a>(
                             seq_session,
                             arena,
                             params,
-                            &lookup,
+                            &ProceduralMergeScope {
+                                row: &lookup,
+                                outer,
+                            },
                             None,
                         ) {
                             Ok(Datum::Bool(true)) => {}
@@ -65419,7 +65750,10 @@ pub(crate) fn merge<'a>(
                                         seq_session,
                                         arena,
                                         params,
-                                        &lookup,
+                                        &ProceduralMergeScope {
+                                            row: &lookup,
+                                            outer,
+                                        },
                                         Some((
                                             &def.columns()[ci],
                                             match assignment_casts.selected(
@@ -65904,7 +66238,10 @@ pub(crate) fn merge<'a>(
                             seq_session,
                             arena,
                             params,
-                            &source_ctx,
+                            &ProceduralMergeScope {
+                                row: &source_ctx,
+                                outer,
+                            },
                             None,
                         ) {
                             Ok(Datum::Bool(true)) => {}
@@ -65930,7 +66267,10 @@ pub(crate) fn merge<'a>(
                                 values,
                                 default_values,
                                 overriding,
-                                &source_ctx,
+                                &ProceduralMergeScope {
+                                    row: &source_ctx,
+                                    outer,
+                                },
                                 &generated,
                                 &defaults,
                                 seq_session,
@@ -66227,7 +66567,7 @@ fn merge_cardinality() -> SqlError {
 /// clause (values evaluated with the source row in scope), fills defaults and
 /// generated columns, and stores it.
 #[allow(clippy::too_many_arguments)]
-fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
+fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: ColumnLookup<'a>>(
     storage: &mut Storage,
     txn: &mut TxnState,
     assignment_casts: AssignmentCasts<'a>,
@@ -66237,7 +66577,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
     values: &[&'a Expr<'a>],
     default_values: bool,
     overriding: Overriding,
-    source_ctx: &RowCtx<'_, 'a, '_>,
+    source_ctx: &Scope,
     generated: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
     defaults: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
     seq_session: &crate::sql::guc::SeqSession,

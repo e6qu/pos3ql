@@ -81,9 +81,11 @@ single-table results resuming row by row across client, storage and lock
 waits; `INSERT ... SELECT`, `UPDATE`, `DELETE` and `MERGE`, at top level and
 in `CALL` and `DO` bodies, yielding on storage reads while they select and lock
 rows and restarting from their start; routine calls inside the rows of an
-`INSERT`, `UPDATE` or `DELETE` (expressions, row triggers, `RETURNING`) at top
-level, in PL/pgSQL statements and `EXECUTE`, and in SQL-language bodies,
-which keep the rows already changed so the call sees them, as in PostgreSQL.
+`INSERT`, `UPDATE`, `DELETE` or `MERGE` (expressions, join conditions, row
+triggers, `RETURNING`) at top level, in PL/pgSQL statements and `EXECUTE`,
+and in SQL-language bodies, which keep the rows already changed so the call
+sees them, as in PostgreSQL; `MERGE` as a static PL/pgSQL statement and
+through `EXECUTE`.
 The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
@@ -109,8 +111,9 @@ is owned.
   expression requires retained write progress`), at top level and inside a
   routine, because restarting would hide the earlier rows from the call. `INSERT ... SELECT` evaluates its whole source before writing, so a
   volatile call in the source does not see rows inserted earlier by the same
-  statement. A static PL/pgSQL `INSERT`, `UPDATE` or `DELETE` with
-  `RETURNING` (with or without `INTO`) fails with `0A000`; dynamic `EXECUTE
+  statement. A static PL/pgSQL `INSERT`, `UPDATE`, `DELETE` or `MERGE` with
+  `RETURNING` (with or without `INTO`) fails with `0A000`, and a static
+  `MERGE` source subquery cannot read routine variables (`42703`); dynamic `EXECUTE
   ... INTO` already assigns returned values. Triggers fired inside a write run
   without the engine's utility
   executor, so DDL there (PL/pgSQL `CREATE TABLE`, or a SQL procedure that a

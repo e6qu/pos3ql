@@ -100,8 +100,8 @@ built-in such as `random()`, an advisory lock, output that reached the
 client) makes the rest of its row read synchronously; one before the rows,
 in the scan, would select different rows, so such a write reads its rows
 synchronously and a lock wait runs it again from its first start. Reads
-after the last row (statement-level and `AFTER` triggers, deferred checks)
-block. A wait inside a routine body run for a row keeps the body's progress
+after a write's last row block until the next step's rows start
+(statement-level and `AFTER` triggers, the next step's selection). A wait inside a routine body run for a row keeps the body's progress
 and continues it. Cancellation, a statement or lock timeout, an error and
 the end of the transaction release the kept progress. Writes in a `CALL` or
 `DO` body read synchronously after their first row change, `VALUES` row or
@@ -227,7 +227,7 @@ BY id` sorts first, so its output queues in the spool instead.
 | Result streams (see above): each row before its first effect | Yields; delivered rows are kept |
 | Writes (`INSERT ... SELECT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`), also in a `CALL` or `DO` body: selecting and locking rows before the first row change, `VALUES` row or trigger body | Yields; the statement restarts from its start (see above) |
 | Top-level writes after their first row change: each row's index maintenance, constraint checks, trigger bodies and `RETURNING`, until an effect a rerun would not repeat identically | Yields; only the unfinished row rolls back (see above) |
-| Writes in a `CALL` or `DO` body after their first row change; a top-level write's row after an effect a rerun would not repeat, or every row when such an effect ran in its scan; reads after a write's last row (statement-level and `AFTER` triggers) | Blocks until the statement ends |
+| Writes in a `CALL` or `DO` body after their first row change; a top-level write's row after an effect a rerun would not repeat, or every row when such an effect ran in its scan; reads after a write's last row (statement-level and `AFTER` triggers, the next step's selection) | Blocks until the next step's rows or the statement's end |
 | Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, rule actions, `INSTEAD OF` view triggers): row expressions, row triggers, `RETURNING`; `BEFORE` and `INSTEAD OF` trigger bodies that need the engine | Run on the engine between attempts; the write keeps its changed rows and finished steps and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
 | DDL and `COPY FROM` | Blocks for the whole statement |
 | Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |

@@ -28,6 +28,7 @@ fn cold_table(label: &str, mode: crate::config::TransactionMode, setup: &str) ->
     config.object_store_bucket = name;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
+    config.max_tables = 16;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let server = HttpObjectServer::start(&mut config);
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -43,8 +44,14 @@ fn cold_table(label: &str, mode: crate::config::TransactionMode, setup: &str) ->
         true,
     );
     assert!(crate::mem::guard::forbid_alloc(|| engine.checkpoint()).unwrap());
-    // `cold_items` and any `cold_more` or `cold_extra` the setup creates.
-    for name in ["cold_items", "cold_more", "cold_extra"] {
+    // `cold_items` and the other `cold_` tables a setup may create.
+    for name in [
+        "cold_items",
+        "cold_more",
+        "cold_extra",
+        "cold_gone",
+        "cold_pairs",
+    ] {
         let Some(table) = engine.storage.find_table("public", name) else {
             continue;
         };
@@ -143,7 +150,7 @@ impl ColdTable {
                 break;
             };
             assert_eq!(wait, StatementWait::ObjectIo, "{sql}");
-            self.kept_waits += usize::from(self.writer.transaction.retains_statement_progress());
+            self.kept_waits += usize::from(self.writer.transaction.has_retained_write());
             output_mark.truncate_unsent(&mut self.writer.send);
             self.writer.arena.recycle_front();
             completed_statements = completed;
@@ -684,6 +691,115 @@ fn write_rows_resume_after_storage_waits() {
             assert_eq!(
                 cold.rows("SELECT count(*) FROM hot_log"),
                 ["3"],
+                "{context}"
+            );
+            cold.finish();
+        }
+    }
+}
+
+/// Storage waits inside the rows of multi-step writes, a `MERGE` and a
+/// `DELETE` whose trigger reads a cold table: a rule's original statement
+/// and action, a data-modifying `WITH` and its main statement, and `MERGE`'s
+/// update and insert actions keep their finished steps and rows across the
+/// waits, and each row, trigger write and `RETURNING` row happens once, as in
+/// PostgreSQL 18.6; both transaction modes and both protocols.
+#[test]
+fn write_steps_resume_after_storage_waits() {
+    let statements: &[(&str, &[&str])] = &[
+        (
+            "INSERT INTO links SELECT g, CASE WHEN g >= 3 THEN g END, 'r' || g \
+             FROM generate_series(1, 4) g RETURNING id, more",
+            &["1|NULL", "2|NULL", "3|3", "4|4"],
+        ),
+        (
+            "WITH gone AS (DELETE FROM links WHERE id <= 2 RETURNING id, note) \
+             INSERT INTO gone_log SELECT note || '-gone', id + 10 FROM gone RETURNING note, more",
+            &["r1-gone|11", "r2-gone|12"],
+        ),
+        (
+            "MERGE INTO pairs p USING generate_series(1, 6) g ON p.id = g \
+             WHEN MATCHED THEN UPDATE SET more = g + 20 \
+             WHEN NOT MATCHED THEN INSERT VALUES (g, g + 30, 'm' || g) \
+             RETURNING p.id, p.more, p.note",
+            &[
+                "1|21|p1", "2|22|p2", "3|33|m3", "4|34|m4", "5|35|m5", "6|36|m6",
+            ],
+        ),
+        (
+            "DELETE FROM links WHERE id >= 3 RETURNING id, note",
+            &["3|r3", "4|r4"],
+        ),
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for extended in [false, true] {
+            let mut cold = cold_table(
+                &format!("row-steps-{extended}"),
+                mode,
+                "CREATE TABLE hot_log(stage text); \
+                 CREATE TABLE cold_more(id integer PRIMARY KEY); \
+                 INSERT INTO cold_more SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_extra(id integer PRIMARY KEY); \
+                 INSERT INTO cold_extra SELECT generate_series(1, 40); \
+                 CREATE TABLE links(id int, more int REFERENCES cold_more, note text); \
+                 CREATE TABLE log(note text, more int REFERENCES cold_extra); \
+                 CREATE TABLE cold_gone(id integer PRIMARY KEY); \
+                 INSERT INTO cold_gone SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_pairs(id integer PRIMARY KEY); \
+                 INSERT INTO cold_pairs SELECT generate_series(1, 40); \
+                 CREATE TABLE gone_log(note text, more int REFERENCES cold_gone); \
+                 CREATE TABLE pairs(id int, more int REFERENCES cold_pairs, note text); \
+                 CREATE RULE log_links AS ON INSERT TO links \
+                 DO ALSO INSERT INTO log VALUES (NEW.note, NEW.id); \
+                 CREATE FUNCTION check_delete() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                 DECLARE seen bigint; BEGIN IF OLD.id >= 3 THEN \
+                 SELECT count(*) INTO seen FROM cold_items; \
+                 INSERT INTO log VALUES ('deleting-' || OLD.id || '-' || seen, NULL); \
+                 END IF; RETURN OLD; END$$; \
+                 CREATE TRIGGER links_delete BEFORE DELETE ON links \
+                 FOR EACH ROW EXECUTE FUNCTION check_delete()",
+            );
+            cold.rows("INSERT INTO pairs VALUES (1, NULL, 'p1'), (2, NULL, 'p2')");
+            for &(sql, returned) in statements {
+                let context = format!("{mode:?} extended={extended}: {sql}");
+                let kept = cold.kept_waits;
+                let waits = cold.run(sql, extended, other_client_progresses);
+                assert!(waits > 0, "{context}: a row must wait");
+                assert!(cold.kept_waits > kept, "{context}: the wait must keep rows");
+                let output = cold.writer.send.readable().to_vec();
+                assert!(
+                    error_sqlstates(&output).is_empty(),
+                    "{context}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                let mut rows = data_rows(&output);
+                rows.sort();
+                assert_eq!(rows, returned, "{context}");
+            }
+            let context = format!("{mode:?} extended={extended}");
+            assert_eq!(
+                cold.rows(
+                    "SELECT string_agg(note || ':' || coalesce(more::text, '-'), ',' \
+                     ORDER BY note) FROM log"
+                ),
+                ["deleting-3-40:-,deleting-4-40:-,r1:1,r2:2,r3:3,r4:4"],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows(
+                    "SELECT count(*), coalesce(sum(id), 0) FROM links; \
+                     SELECT count(*), sum(more) FROM pairs; \
+                     SELECT string_agg(note || ':' || more, ',' ORDER BY note) FROM gone_log"
+                ),
+                ["0|0", "6|181", "r1-gone:11,r2-gone:12"],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows("SELECT count(*) FROM hot_log"),
+                ["4"],
                 "{context}"
             );
             cold.finish();

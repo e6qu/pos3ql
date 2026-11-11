@@ -824,7 +824,7 @@ impl RowProgress {
     }
 
     /// The row phase finished; a later wait or call is not inside a row,
-    /// so the statement's remaining reads block.
+    /// so the statement's remaining reads block until another row starts.
     pub(super) fn finish_rows(&mut self) {
         self.running = None;
         if self.rows_resumable {

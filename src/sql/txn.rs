@@ -1778,6 +1778,11 @@ impl TxnState {
         self.pending_write_completion.is_some() || self.retained_write.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_retained_write(&self) -> bool {
+        self.retained_write.is_some()
+    }
+
     pub(super) fn retain_write(&mut self, write: super::exec::RetainedWrite) {
         self.retained_write = Some(write);
     }

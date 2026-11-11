@@ -423,7 +423,7 @@ fn row_lock_waits_resume_at_the_waiting_row() {
                 let status = run_protocol(&mut engine, &mut writer, sql, extended, 0, false);
                 let completed = blocked_on_lock(status, &mut writer);
                 assert!(
-                    writer.transaction.retains_statement_progress(),
+                    writer.transaction.has_retained_write(),
                     "{context}: the wait keeps the earlier rows"
                 );
                 // Another client runs while the write waits.
@@ -515,7 +515,7 @@ fn row_lock_waits_release_kept_rows_on_timeout_and_rollback() {
             writer.arena.reset();
             let status = run_protocol(&mut engine, &mut writer, sql, false, 0, false);
             let completed = blocked_on_lock(status, &mut writer);
-            assert!(writer.transaction.retains_statement_progress(), "{context}");
+            assert!(writer.transaction.has_retained_write(), "{context}");
             if ending == "statement_timeout" {
                 std::thread::sleep(std::time::Duration::from_millis(600));
             }

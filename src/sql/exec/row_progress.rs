@@ -33,9 +33,6 @@ pub(crate) struct RetainedWrite {
     pub(crate) progress: RowProgress,
     pub(crate) invocations: query::RoutineInvocationState,
     pub(crate) replay: Option<StatementReplayStart>,
-    /// Where the statement's first run started: its `AFTER` triggers belong
-    /// there, and a run from the start rolls back to it.
-    pub(crate) start: Option<(StatementMark, crate::pg::overflow::OutputMark)>,
 }
 
 /// Where an attempt's replay of routine results and sequence values stands.
@@ -198,6 +195,9 @@ pub(crate) struct RowProgress {
     attempt_effects: u64,
     /// This attempt's rows can resume after a wait.
     rows_resumable: bool,
+    /// Where the statement's first attempt started: its `AFTER` triggers
+    /// belong there, and a run from the start rolls back to it.
+    start: Option<(StatementMark, crate::pg::overflow::OutputMark)>,
 }
 
 impl RowProgress {
@@ -222,7 +222,30 @@ impl RowProgress {
             retained: false,
             attempt_effects: 0,
             rows_resumable: false,
+            start: None,
         })
+    }
+
+    /// Records where an attempt starts and returns where the first one did.
+    pub(crate) fn note_start(
+        &mut self,
+        mark: StatementMark,
+        output: crate::pg::overflow::OutputMark,
+    ) -> (StatementMark, crate::pg::overflow::OutputMark) {
+        *self.start.get_or_insert((mark, output))
+    }
+
+    /// Fresh progress for running the statement again from its first start,
+    /// which it keeps.
+    pub(crate) fn restarted(&self, storage: &crate::storage::Storage) -> Result<Self, SqlError> {
+        let mut progress = Self::retained(storage)?;
+        progress.start = self.start;
+        Ok(progress)
+    }
+
+    /// Where the statement's first attempt started.
+    pub(crate) fn first_start(&self) -> Option<(StatementMark, crate::pg::overflow::OutputMark)> {
+        self.start
     }
 
     /// Progress of a statement whose transaction keeps it across waits.

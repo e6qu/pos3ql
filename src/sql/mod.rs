@@ -16343,7 +16343,6 @@ impl Engine {
             mut progress,
             invocations,
             replay,
-            start: mut statement_start,
         } = match txn.take_retained_write() {
             Some(write) => write,
             None => match sequence::begin_replay_cursor()
@@ -16356,7 +16355,6 @@ impl Engine {
                         crate::sql::query::RoutineExecution::StatementReplay,
                     ),
                     replay,
-                    start: None,
                 },
                 Err(error) => return Ok(Err(error)),
             },
@@ -16388,7 +16386,6 @@ impl Engine {
                             progress,
                             invocations,
                             replay,
-                            start: statement_start,
                         },
                     );
                 }
@@ -16443,7 +16440,7 @@ impl Engine {
             let effects = txn.transaction_effect_mark();
             progress.begin_attempt(wal, lock);
             // AFTER triggers of a write that kept rows belong to its first attempt.
-            let (start, _) = *statement_start.get_or_insert((statement_mark, output_mark));
+            let (start, _) = progress.note_start(statement_mark, output_mark);
             let boundary = completion_handoff.then_some(txn::WriteCompletionBoundary {
                 mark: if progress.changed_rows() {
                     start
@@ -16536,7 +16533,6 @@ impl Engine {
                         progress,
                         invocations,
                         replay,
-                        start: statement_start,
                     },
                 );
             }
@@ -16595,7 +16591,6 @@ impl Engine {
                             progress,
                             invocations,
                             replay,
-                            start: statement_start,
                         },
                     );
                 }
@@ -16623,7 +16618,7 @@ impl Engine {
             txn.retain_write(write);
             return Ok(Err(wait));
         }
-        let Some((start, start_output)) = write.start else {
+        let Some((start, start_output)) = write.progress.first_start() else {
             return Ok(Err(wait));
         };
         if !write.progress.changed_rows() {
@@ -16641,7 +16636,7 @@ impl Engine {
                 // Rows already sent cannot be withdrawn for another run.
                 return Ok(Err(error));
             }
-            write.progress = match exec::RowProgress::retained(&self.storage) {
+            write.progress = match write.progress.restarted(&self.storage) {
                 Ok(progress) => progress,
                 Err(error) => return Ok(Err(error)),
             };

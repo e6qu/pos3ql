@@ -831,6 +831,8 @@ pub(crate) use row_progress::{
     settle_main_step,
 };
 mod write_completion;
+#[cfg(test)]
+pub(crate) use write_attempts::KEPT_ROW_WAITS;
 use write_attempts::execute_procedural_write;
 mod deferred_source;
 pub(super) use write_completion::SuspendedWriteCompletion;
@@ -17997,6 +17999,9 @@ struct TriggerExecutionStatus<'a> {
     pending_query: Option<super::query::RoutineInvocationState>,
     /// Calls a waiting data change completed before its wait.
     write_calls: Option<super::query::RoutineInvocationState>,
+    /// The rows a waiting data change keeps; it continues at its
+    /// unfinished row.
+    write_progress: Option<RowProgress>,
     /// Finished expressions of a waiting statement that evaluates several.
     expressions: local_values::ExpressionProgress,
     /// A procedure this frame's `CALL` started that is waiting.
@@ -18036,6 +18041,7 @@ impl<'a> TriggerExecutionStatus<'a> {
             pending_statement: None,
             pending_query: None,
             write_calls: None,
+            write_progress: None,
             expressions: local_values::ExpressionProgress::new(rows)?,
             pending_call: None,
         })
@@ -32766,8 +32772,11 @@ fn execute_trigger_step_in<'a>(
     };
     drop(write_effects);
     drop(write_reads);
+    // A write that kept its rows rolled back only its unfinished row.
+    let kept = status.write_progress.is_some();
     if let Some((mark, output)) = write_start
         && status.pending_write.is_none()
+        && !kept
         && result.as_ref().is_err_and(|error| {
             matches!(
                 error.sqlstate.internal_control(),
@@ -32796,6 +32805,7 @@ fn execute_trigger_step_in<'a>(
         status.write_calls = None;
     } else if write_start.is_some()
         && status.pending_write.is_none()
+        && !kept
         && result.as_ref().is_err_and(control_flow::is_execution_wait)
     {
         return Err(sql_err!(

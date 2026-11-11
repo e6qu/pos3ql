@@ -104,21 +104,22 @@ is owned.
 
 **Remaining:**
 
-- **Functions:** writes inside a procedure body still read storage synchronously. A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
+- **Functions:** a wait inside a write in a function called from a query restarts the statement. A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
   grouping, subqueries) restarts once for each first call of a SQL-language
   routine, so its work grows with the square of those calls; single-table,
   `VALUES` and `generate_series` sources hand each call off on its row.
-- **Write phases:** a top-level write keeps its changed rows across storage
-  and lock waits and continues at the unfinished row (see the
+- **Write phases:** a write keeps its changed rows across storage and lock
+  waits and continues at the unfinished row, at top level and in `CALL` and
+  `DO` bodies (see the
   [execution model](docs/architecture.md#execution-model)). Remaining: a
-  write in a `CALL` or `DO` body still yields only before its first row
-  change, `VALUES` row or trigger body, and reads synchronously after it,
-  because its frame does not keep row progress, and its resumed run would
-  need the first run's command and `AFTER` trigger boundary. A top-level
   write whose scan ran a volatile built-in reads its rows synchronously.
   Reads after a write's last row (statement-level and `AFTER` triggers,
-  transition tables), `INSTEAD OF` view rows, DDL, COPY, replication apply
-  and deferred triggers read synchronously. A routine call inside the rows
+  foreign key checks queued as constraint events, transition tables, the
+  next step's selection) read synchronously: the write completion advances
+  its event cursor before an event runs, so yielding there first needs the
+  completion to run the waiting event again instead of skipping it.
+  `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
+  triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written
   from PL/pgSQL and SQL-language bodies. Extend row
   progress to foreign tables and to data-modifying `WITH` inside routine

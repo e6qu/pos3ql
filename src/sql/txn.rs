@@ -860,15 +860,20 @@ pub(crate) struct DeferredTriggerEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeferredTriggerKind {
+    /// `trigger_depth` and `command` name the statement whose end fires an
+    /// immediate event: a statement waiting between attempts of its rows
+    /// keeps its events from another statement at the same depth.
     Constraint {
         identity: ConstraintIdentity,
         effective_table: u16,
         trigger_depth: u16,
+        command: u32,
     },
     AfterRow {
         trigger_slot: u16,
         effective_table: u16,
         trigger_depth: u16,
+        command: u32,
     },
 }
 
@@ -2479,6 +2484,7 @@ impl TxnState {
                 identity,
                 effective_table,
                 trigger_depth: self.trigger_depth,
+                command: self.command_id,
             },
             event,
             updated_columns,
@@ -2501,6 +2507,7 @@ impl TxnState {
                 trigger_slot,
                 effective_table,
                 trigger_depth: self.trigger_depth,
+                command: self.command_id,
             },
             event,
             updated_columns,

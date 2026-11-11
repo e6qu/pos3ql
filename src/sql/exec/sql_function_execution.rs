@@ -999,7 +999,10 @@ impl SqlExecution {
                         Ok(unfinished) => unfinished,
                         Err(error) => break Err(error),
                     };
-                    if unfinished.is_none() && changed_effects {
+                    if unfinished.is_none()
+                        && changed_effects
+                        && !calls.pending_firing_started_at(effects.transaction)
+                    {
                         break Err(super::write_attempts::retained_progress_required());
                     }
                     let PlpgsqlExecHost::Routine {

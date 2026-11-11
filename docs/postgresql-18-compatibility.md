@@ -182,9 +182,22 @@ Syntax and errors:
   rules goes through the view's triggers and the rules, as at top level:
   static PL/pgSQL, `EXECUTE` and SQL-language functions alike. A static
   statement reads the routine's variables and a trigger's `NEW` and `OLD`
-  rows, so `INSERT INTO active_orders VALUES (id)` works in a body. In a
-  `BEFORE` row trigger, or a trigger of a write that another trigger made,
-  it fails with `0A000`.
+  rows, so `INSERT INTO active_orders VALUES (id)` works in a body, also in a
+  `BEFORE` row trigger and in a trigger of a write that another trigger made.
+- A `BEFORE` or `INSTEAD OF` row trigger whose body runs DDL (`CREATE TABLE`,
+  `EXECUTE 'CREATE ...'`), writes a view or a table with rules, calls a
+  procedure that does, or calls a function that reads the trigger's own
+  earlier writes, runs once for its row as in PostgreSQL: the write stops at
+  that row, the whole trigger body runs, and the write continues with the
+  row the body returned. Its notices, sequence values and writes appear once.
+- A trigger's `NEW` and `OLD` have the table's row type in every firing. One
+  without a row (`OLD` in an `INSERT` trigger, `NEW` in a `DELETE` trigger,
+  both in a statement trigger) is NULL, and so are its fields; a field the
+  table lacks fails with `42703` (`record "new" has no field "x"`).
+- An exception handler accepts every PostgreSQL condition name, such as
+  `duplicate_table` or `invalid_text_representation`; a name that belongs to
+  two codes (`null_value_not_allowed`) catches both. An unknown name fails with
+  `42704` (`unrecognized exception condition "x"`).
 - A `WITH` query of a static PL/pgSQL statement's main query cannot read
   the routine's variables: `INSERT INTO t WITH c AS (SELECT id_var) SELECT *
   FROM c` fails with `42703` (`column "id_var" does not exist`), where
@@ -359,11 +372,12 @@ Functions and expressions:
   termination`). A trigger function may `CALL` a procedure; the call is
   atomic, so its `COMMIT` fails with `2D000`. A trigger fired inside a write
   (a BEFORE row trigger, or a deferred constraint trigger at `COMMIT`) can
-  call PL/pgSQL and SQL-language procedures. A SQL procedure called there
-  runs its queries, `INSERT`, `UPDATE`, `DELETE` and nested `CALL`
+  call PL/pgSQL and SQL-language procedures, with arguments such as
+  `NEW.id + 1`. A SQL procedure that a deferred constraint trigger calls at
+  `COMMIT` runs its queries, `INSERT`, `UPDATE`, `DELETE` and nested `CALL`
   statements; any other statement in its body, such as `CREATE TABLE`, fails
   with `0A000` (`a SQL procedure called during a write cannot run CREATE
-  TABLE`) where PostgreSQL runs it.
+  TABLE`) where PostgreSQL runs it. From a `BEFORE` row trigger it runs.
 - A procedure or `DO` block that waits for a lock or storage, before or after
   its own `COMMIT`, continues at the waiting statement as in PostgreSQL. A
   PL/pgSQL statement whose function call waits continues at that call,
@@ -595,8 +609,9 @@ PostgreSQL). Current `0A000` messages:
 | `SQL row expression requires retained write progress` | A multirow UPDATE that changes one row, then calls a function for the next row that must wait |
 | `expression restart requires owned volatile values` | Restarting would repeat an unsaved `random()` or clock value |
 
-Data-change triggers also return `0A000` for a reached literal of an array of a
-named domain, such as `PERFORM cardinality('{1}'::positive_integer[])`. Owned
+Constraint triggers deferred to `COMMIT` also return `0A000` for a reached
+literal of an array of a named domain, such as
+`PERFORM cardinality('{1}'::positive_integer[])`. Owned
 `PERFORM`/`SELECT ... INTO` calls, SQL-language function bodies, and nested
 AFTER-trigger results already survive waits. Closing these gaps is tracked in
 [PLAN.md](../PLAN.md#pause-and-resume-every-query-path).

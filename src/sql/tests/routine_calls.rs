@@ -4453,8 +4453,9 @@ fn trigger_functions_call_procedures_atomically() {
 /// constraint trigger run statement by statement on the write's storage:
 /// each statement sees the earlier ones, the final row fills INOUT
 /// arguments (also from `RETURNING`), nested `CALL` works and errors abort
-/// the write. Expected notices and errors come from PostgreSQL 18.6, except
-/// that PostgreSQL also runs DDL there, which pos3ql rejects with `0A000`.
+/// the write. A procedure that runs DDL moves the whole trigger body to the
+/// statement executor, which runs it once. Expected notices and errors come
+/// from PostgreSQL 18.6.
 #[test]
 fn trigger_functions_call_sql_procedures_atomically() {
     use super::routine_identity_diagnostics::{NONE, check};
@@ -4499,14 +4500,7 @@ fn trigger_functions_call_sql_procedures_atomically() {
         ),
         (
             "INSERT INTO sql_call_rows(a) VALUES (0)",
-            &[
-                ('N', "00000", "0 in0,in7,in8,ret0,ret7,ret8"),
-                (
-                    'E',
-                    "0A000",
-                    "a SQL procedure called during a write cannot run CREATE TABLE",
-                ),
-            ],
+            &[('N', "00000", "0 in0,in7,in8,ret0,ret7,ret8")],
         ),
         (
             "CREATE PROCEDURE sql_call_bad(x integer, INOUT r integer) LANGUAGE sql AS \
@@ -4543,7 +4537,11 @@ fn trigger_functions_call_sql_procedures_atomically() {
              SELECT string_agg(a || ':' || b, ',' ORDER BY a) INTO rows FROM sql_call_rows; \
              SELECT string_agg(msg || n, ',' ORDER BY msg, n) INTO logged FROM sql_call_log; \
              RAISE NOTICE '% %', rows, logged; END$$",
-            &[('N', "00000", "7:21,8:24 in7,in8,in21,ret7,ret8")],
+            &[(
+                'N',
+                "00000",
+                "0:0,7:21,8:24 in0,in7,in8,in21,ret0,ret7,ret8",
+            )],
         ),
     ]);
 }

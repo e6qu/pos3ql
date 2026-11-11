@@ -89,7 +89,14 @@ the call sees them, as in PostgreSQL; `MERGE` as a static PL/pgSQL statement
 and through `EXECUTE`;
 routine variables and a trigger's `NEW` and `OLD` read as the outer level of
 every subquery of a static statement (derived tables, `UPDATE ... FROM`,
-`MERGE` sources, correlated, grouped and set-operation subqueries). The
+`MERGE` sources, correlated, grouped and set-operation subqueries); `BEFORE` and `INSTEAD OF`
+row trigger bodies that need the engine (DDL, view and rule writes,
+procedures with DDL, calls reading the trigger's own writes), which run once
+on it between write attempts with their result kept in the invocation log;
+`FOR` loops over a data change whose `AFTER` trigger waits; multi-step
+statements nested in another's step (a rule action whose target has rules),
+which keep their own steps up to four levels deep.
+The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
 
@@ -118,10 +125,10 @@ is owned.
   startup-reserved owner so a storage or lock wait in the row phase also
   resumes at its row instead of restarting the statement. Extend row
   progress to foreign tables, to data-modifying `WITH` inside routine
-  bodies, and to a multi-step statement inside another's step: a routine
-  call after their first row change fails with `0A000` (`SQL row expression
-  requires retained write progress`), because restarting would hide the
-  earlier rows from the call. `INSERT ... SELECT` evaluates its whole source
+  bodies, and to multi-step statements nested more than four deep: a
+  routine call after their first row change fails with `0A000` (`SQL row
+  expression requires retained write progress`), because restarting would
+  hide the earlier rows from the call. `INSERT ... SELECT` evaluates its whole source
   before writing, so a volatile call in the source does not see rows
   inserted earlier by the same statement (this includes a rule action's
   `VALUES` over several rows); fixing it needs the source and the row phase
@@ -130,9 +137,11 @@ is owned.
   between attempts. A data-modifying `WITH` sub-statement runs to completion
   before the main statement reads it, where PostgreSQL interleaves them row
   by row, so a call in the main statement sees all of its rows. A PL/pgSQL
-  `WITH ... INSERT/UPDATE/DELETE` statement fails with `0A000`. A `FOR` loop over a
-  data change fails with `0A000` when an `AFTER` trigger of that change
-  waits, since the loop has no owner for its returned rows.
+  `WITH ... INSERT/UPDATE/DELETE` statement fails with `0A000`. A PL/pgSQL
+  function called from a query (`SELECT f()`) runs its writes' `AFTER`
+  triggers without the engine, so DDL or a routine call there fails with
+  `0A000`; handing them to the function needs its frame to own the completion
+  across waits, as `CALL` and `DO` frames do.
 - **Routine variables in `WITH`:** the `WITH` queries of a PL/pgSQL
   `RETURN QUERY`, `SELECT ... INTO`, `PERFORM` or `FOR` query read the
   routine's variables, materialized or not, but three other `WITH` positions
@@ -144,13 +153,6 @@ is owned.
   (INSERT ... SELECT * FROM c RETURNING ...)`): their expansion or run takes
   no enclosing row. Passing the routine's row to those expansions, as
   `expand_plpgsql_with` does, fixes them.
-- **Triggers fired inside a write** run without the engine's utility
-  executor, so DDL there (PL/pgSQL `CREATE TABLE`, `EXECUTE 'CREATE ...'`,
-  or a SQL procedure that a BEFORE trigger calls) and writes to views or
-  tables with rules from a `BEFORE` row trigger, or from a trigger of a write
-  another trigger made, fail with `0A000`. Running the trigger body on the
-  engine between write attempts, as routine calls in the rows already run,
-  removes the limit.
 - **Results and cursors:** large results resume row by row for `SELECT`
   from one table or builtin set-returning functions with constant arguments,
   or a nested-loop or hash join of up to eight such items and `VALUES` lists,

@@ -14,7 +14,7 @@ use crate::sql::{query, sequence};
 /// started its row changes, so rolling it back would hide them from the
 /// calls that follow.
 pub(super) struct WriteAttemptEffects<'a> {
-    transaction: crate::sql::txn::TransactionEffectMark,
+    pub(super) transaction: crate::sql::txn::TransactionEffectMark,
     descriptors: &'a [crate::sql::txn::LargeObjectDescriptor],
     advisory: crate::sql::lock::AdvisoryStatementMark,
     settings: crate::sql::guc::StatementSettings,
@@ -159,7 +159,10 @@ pub(super) fn execute_procedural_write<'a, T>(
                     Ok(unfinished) => unfinished,
                     Err(error) => break Err(error),
                 };
-                if unfinished.is_none() && effects.changed(context) {
+                if unfinished.is_none()
+                    && effects.changed(context)
+                    && !calls.pending_firing_started_at(effects.transaction)
+                {
                     break Err(retained_progress_required());
                 }
                 let PlpgsqlExecHost::Routine {

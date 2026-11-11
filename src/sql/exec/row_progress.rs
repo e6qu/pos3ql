@@ -119,9 +119,9 @@ struct StepStart {
 
 /// The finished steps of a multi-step statement.
 struct StepProgress {
-    /// Whether a statement claimed the steps in the running attempt; a
-    /// multi-step statement nested in a step keeps no steps of its own.
-    claimed: bool,
+    /// Whether this attempt runs a step at this level, so a multi-step
+    /// statement inside it keeps its steps one level deeper.
+    running: bool,
     finished: usize,
     start: Option<StepStart>,
     /// The finished steps' output rows and row counts, then the unfinished
@@ -129,6 +129,20 @@ struct StepProgress {
     /// in `new`.
     saved: Option<transition_rows::SavedTransitionRows>,
 }
+
+impl StepProgress {
+    const EMPTY: Self = Self {
+        running: false,
+        finished: 0,
+        start: None,
+        saved: None,
+    };
+}
+
+/// How deeply multi-step statements can nest inside one another's steps
+/// (a rule action on a table with rules, a rule on a `WITH` target) and
+/// still keep their progress.
+const STEP_LEVELS: usize = 4;
 
 /// A finished step's output, as a multi-step statement keeps it.
 #[derive(Clone, Copy)]
@@ -154,7 +168,9 @@ pub(crate) struct RowProgress {
     state: Option<transition_rows::SavedTransitionRows>,
     started: bool,
     unrestartable: bool,
-    steps: StepProgress,
+    steps: [StepProgress; STEP_LEVELS],
+    /// The level a data-modifying `WITH` claimed in this attempt.
+    implicit_level: usize,
     /// Where the statement's output began in its first attempt.
     output: Option<crate::pg::overflow::OutputMark>,
 }
@@ -171,12 +187,8 @@ impl RowProgress {
             state: None,
             started: false,
             unrestartable: false,
-            steps: StepProgress {
-                claimed: false,
-                finished: 0,
-                start: None,
-                saved: None,
-            },
+            steps: [StepProgress::EMPTY; STEP_LEVELS],
+            implicit_level: 0,
             output: None,
         }
     }
@@ -195,15 +207,36 @@ impl RowProgress {
     pub(crate) fn begin_attempt(&mut self, wal: usize, lock: u64) {
         self.journal = Some((wal, lock));
         self.running = None;
-        self.steps.claimed = false;
+        for level in &mut self.steps {
+            level.running = false;
+        }
     }
 
-    /// Claims step progress for a multi-step statement. `false` when an
-    /// enclosing statement already keeps steps: the nested statement then
-    /// runs its steps without progress, and a call after its first change
-    /// fails loudly instead of hiding that change.
+    /// Claims the step level of a multi-step statement: one deeper than the
+    /// innermost step this attempt runs. Levels follow the statements'
+    /// nesting, so each attempt claims the same level for the same
+    /// statement. `None` beyond the deepest level: the statement then runs
+    /// its steps without progress, and a call after its first change fails
+    /// loudly instead of hiding that change.
+    pub(crate) fn claim_step_level(&mut self) -> Option<usize> {
+        let level = self
+            .steps
+            .iter()
+            .rposition(|level| level.running)
+            .map_or(0, |running| running + 1);
+        (level < STEP_LEVELS).then_some(level)
+    }
+
+    /// [`Self::claim_step_level`] for a data-modifying `WITH`, whose steps
+    /// then use the level implicitly.
     pub(crate) fn claim_steps(&mut self) -> bool {
-        !core::mem::replace(&mut self.steps.claimed, true)
+        match self.claim_step_level() {
+            Some(level) => {
+                self.implicit_level = level;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Before step `index` of the claimed statement: `false` when an earlier
@@ -219,35 +252,50 @@ impl RowProgress {
         txn: &mut TxnState,
         responder: &Responder<'_>,
     ) -> Result<bool, SqlError> {
-        if index < self.steps.finished {
+        self.begin_step_at(self.implicit_level, index, separate, txn, responder)
+    }
+
+    /// [`Self::begin_step`] at a claimed `level`.
+    pub(crate) fn begin_step_at(
+        &mut self,
+        level: usize,
+        index: usize,
+        separate: bool,
+        txn: &mut TxnState,
+        responder: &Responder<'_>,
+    ) -> Result<bool, SqlError> {
+        let steps = &mut self.steps[level];
+        if index < steps.finished {
             return Ok(false);
         }
-        if index != self.steps.finished {
+        if index != steps.finished {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "a write step started before the previous one finished"
             ));
         }
-        match self.steps.start {
+        steps.running = true;
+        match &mut steps.start {
             Some(start) => {
                 txn.resume_command(start.command);
                 start.point.seek()?;
-                // Calls completed between attempts belong to no attempt: this
-                // attempt's rollback starts after them.
+                // The calls between attempts ran after the step's rollback:
+                // a later rollback of the step keeps their effects and output.
                 let (wal, lock) = self.journal.ok_or_else(|| {
                     sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "write step progress has no attempt journal position"
                     )
                 })?;
-                self.steps.start = Some(StepStart {
-                    mark: txn.statement_mark(wal, lock),
-                    output: responder.mark(),
-                    effects: txn.transaction_effect_mark(),
-                    ..start
-                });
+                start.mark = txn.statement_mark(wal, lock);
+                start.output = responder.mark();
+                start.effects = txn.transaction_effect_mark();
             }
             None => {
+                // A new step keeps nothing of statements nested in earlier ones.
+                for deeper in &mut self.steps[level + 1..] {
+                    *deeper = StepProgress::EMPTY;
+                }
                 if separate && index != 0 {
                     txn.begin_command()?;
                 }
@@ -257,7 +305,7 @@ impl RowProgress {
                         "write step progress has no attempt journal position"
                     )
                 })?;
-                self.steps.start = Some(StepStart {
+                self.steps[level].start = Some(StepStart {
                     mark: txn.statement_mark(wal, lock),
                     output: responder.mark(),
                     point: ReplayPoint::capture()?,
@@ -271,8 +319,18 @@ impl RowProgress {
 
     /// The running step finished; the next one starts with no row progress.
     pub(crate) fn finish_step(&mut self) {
-        self.steps.finished += 1;
-        self.steps.start = None;
+        self.finish_step_at(self.implicit_level);
+    }
+
+    /// [`Self::finish_step`] at a claimed `level`.
+    pub(crate) fn finish_step_at(&mut self, level: usize) {
+        let steps = &mut self.steps[level];
+        steps.finished += 1;
+        steps.start = None;
+        steps.running = false;
+        for deeper in &mut self.steps[level + 1..] {
+            *deeper = StepProgress::EMPTY;
+        }
         self.selection = None;
         self.running = None;
         self.resume = None;
@@ -289,15 +347,35 @@ impl RowProgress {
         arena: &Arena,
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
-        if finished.len() != self.steps.finished {
+        self.keep_steps_at(self.implicit_level, finished, captured, arena, pool)
+    }
+
+    /// [`Self::keep_steps`] at a claimed `level`.
+    pub(crate) fn keep_steps_at(
+        &mut self,
+        level: usize,
+        finished: &[StepRecord<'_>],
+        captured: &[&[u8]],
+        arena: &Arena,
+        pool: &std::sync::Arc<LeasePool>,
+    ) -> Result<(), SqlError> {
+        if finished.len() != self.steps[level].finished {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "a write kept a different number of finished steps"
             ));
         }
         // Captured rows belong to rows the unfinished step keeps; a step that
-        // runs again from its start captures them again.
-        let captured = if self.resume.is_some() { captured } else { &[] };
+        // runs again from its start captures them again. Rows a deeper
+        // statement keeps belong to that statement's own step.
+        let deepest = self.steps[level + 1..]
+            .iter()
+            .all(|deeper| deeper.start.is_none());
+        let captured = if self.resume.is_some() && deepest {
+            captured
+        } else {
+            &[]
+        };
         let mark = arena.mark();
         let saved = (|| {
             let full = |_| crate::sql::query::arena_full_pub();
@@ -350,7 +428,7 @@ impl RowProgress {
         })();
         // SAFETY: the rows and counts were copied into the saved owner.
         unsafe { arena.rewind_to(mark) };
-        self.steps.saved = Some(saved?);
+        self.steps[level].saved = Some(saved?);
         Ok(())
     }
 
@@ -360,7 +438,16 @@ impl RowProgress {
         &self,
         arena: &'a Arena,
     ) -> Result<Option<ResumedSteps<'a>>, SqlError> {
-        let Some(saved) = &self.steps.saved else {
+        self.resumed_steps_at(self.implicit_level, arena)
+    }
+
+    /// [`Self::resumed_steps`] at a claimed `level`.
+    pub(crate) fn resumed_steps_at<'a>(
+        &self,
+        level: usize,
+        arena: &'a Arena,
+    ) -> Result<Option<ResumedSteps<'a>>, SqlError> {
+        let Some(saved) = &self.steps[level].saved else {
             return Ok(None);
         };
         let full = |_| crate::sql::query::arena_full_pub();
@@ -396,7 +483,7 @@ impl RowProgress {
         let captured = copied
             .get(at..at + captured_length)
             .ok_or_else(changed_steps)?;
-        if at + captured_length != copied.len() || records.len() > self.steps.finished {
+        if at + captured_length != copied.len() || records.len() > self.steps[level].finished {
             return Err(changed_steps());
         }
         Ok(Some(ResumedSteps {
@@ -680,7 +767,7 @@ impl RowProgress {
     /// Whether an attempt has started changing rows, so running the write
     /// again from its start would repeat them.
     pub(crate) fn changed_rows(&self) -> bool {
-        self.started || self.steps.finished != 0
+        self.started || self.steps.iter().any(|level| level.finished != 0)
     }
 
     /// The write changed rows a rollback cannot undo, such as a foreign
@@ -734,7 +821,9 @@ impl RowProgress {
     /// attempt. `Err` when that rollback could not undo remote rows, or would
     /// hide changes the unfinished step made without row progress.
     pub(crate) fn unfinished_row(&self, txn: &TxnState) -> Result<Option<UnfinishedRow>, SqlError> {
-        match (&self.resume, self.steps.start) {
+        // The innermost unfinished step holds the rows the attempt stopped in.
+        let step = self.steps.iter().rev().find_map(|level| level.start);
+        match (&self.resume, step) {
             (Some(resume), _) => Ok(Some(UnfinishedRow {
                 mark: resume.start.mark,
                 output: resume.start.output,

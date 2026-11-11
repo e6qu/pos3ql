@@ -38,12 +38,18 @@ pub(super) struct QueuedFiring {
 
 pub(super) struct AfterRowCursor {
     depth: u16,
+    command: u32,
     next: usize,
 }
 
 impl AfterRowCursor {
-    pub(super) fn new(depth: u16) -> Self {
-        Self { depth, next: 0 }
+    /// The events of the statement at `depth` running as `command`.
+    pub(super) fn new(depth: u16, command: u32) -> Self {
+        Self {
+            depth,
+            command,
+            next: 0,
+        }
     }
 
     pub(super) fn next(
@@ -62,12 +68,16 @@ impl AfterRowCursor {
                     trigger_slot,
                     effective_table,
                     trigger_depth,
-                } if trigger_depth == self.depth => Some((trigger_slot, effective_table)),
+                    command,
+                } if trigger_depth == self.depth && command == self.command => {
+                    Some((trigger_slot, effective_table))
+                }
                 crate::sql::txn::DeferredTriggerKind::Constraint {
                     identity,
                     effective_table,
                     trigger_depth,
-                } if trigger_depth == self.depth => {
+                    command,
+                } if trigger_depth == self.depth && command == self.command => {
                     let Some(timing) = constraints::constraint_timing(
                         context.storage(),
                         identity,
@@ -119,8 +129,8 @@ impl StatementTriggerCursor {
         event: u8,
         before: bool,
         columns: ColumnSet,
-    ) -> Option<crate::storage::TriggerDef> {
-        while let Some(trigger) = context
+    ) -> Option<(u16, crate::storage::TriggerDef)> {
+        while let Some((slot, trigger)) = context
             .storage()
             .triggers_for_target(target, context.txn.txid)
             .filter(|(_, trigger)| {
@@ -132,7 +142,6 @@ impl StatementTriggerCursor {
                     .as_str()
                     .cmp(right.name_to(context.txn.txid).as_str())
             })
-            .map(|(_, trigger)| trigger)
         {
             self.last_name = Some(trigger.name_to(context.txn.txid));
             if !(if context.txn.replication_apply {
@@ -153,7 +162,7 @@ impl StatementTriggerCursor {
             {
                 continue;
             }
-            return Some(trigger);
+            return Some((slot as u16, trigger));
         }
         None
     }
@@ -380,7 +389,8 @@ impl SuspendedWriteCompletion {
             .map_err(control_flow::execution_full)?;
         let selected = SavedAfterFiring::capture(selected, &context.storage().execution_control)?;
         let definitions = context.storage().table_definition_images();
-        let mut row_cursor = AfterRowCursor::new(context.txn.trigger_depth());
+        let mut row_cursor =
+            AfterRowCursor::new(context.txn.trigger_depth(), context.txn.command_id());
         while let Some(firing) = row_cursor.next(context)? {
             definitions.definition(
                 context.storage(),
@@ -632,11 +642,11 @@ fn run_selected_firing<'run>(
 }
 
 impl CompletionCursor {
-    fn new(completion: WriteCompletion, reply: CompletionReply, depth: u16) -> Self {
+    fn new(completion: WriteCompletion, reply: CompletionReply, depth: u16, command: u32) -> Self {
         Self {
             completion,
             reply,
-            phase: AfterPhase::Rows(AfterRowCursor::new(depth)),
+            phase: AfterPhase::Rows(AfterRowCursor::new(depth, command)),
         }
     }
 
@@ -665,8 +675,9 @@ impl CompletionCursor {
                         continue;
                     }
                     if let Some((operation, columns)) = events[*event]
-                        && let Some(selected) =
-                            trigger.next(context, target, operation, false, columns)
+                        && let Some(selected) = trigger
+                            .next(context, target, operation, false, columns)
+                            .map(|(_, trigger)| trigger)
                     {
                         return Ok(Some(AfterFiring::Statement {
                             trigger: selected,
@@ -745,7 +756,7 @@ impl WriteCompletion {
         reply: CompletionReply,
     ) -> Outcome {
         let depth = context.txn.trigger_depth();
-        let mut cursor = CompletionCursor::new(self, reply, depth);
+        let mut cursor = CompletionCursor::new(self, reply, depth, context.txn.command_id());
         if let Some(boundary) = context.txn.write_completion_boundary
             && boundary.command == context.txn.command_id()
             && boundary.depth == depth
@@ -795,6 +806,7 @@ impl WriteCompletion {
                 ),
                 AfterFiring::Statement { trigger, event } => execute_statement_trigger(
                     &mut context,
+                    None,
                     &trigger,
                     target,
                     crate::storage::RelationDefinition::from_definition(definition),
@@ -826,6 +838,7 @@ mod ownership_tests {
                     conflict_update: None,
                 },
                 CompletionReply::Command,
+                0,
                 0,
             );
             let mut responder = Responder::new(&mut buffer);

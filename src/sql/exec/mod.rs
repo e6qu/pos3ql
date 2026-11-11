@@ -1069,6 +1069,9 @@ pub(super) use function_execution::{FunctionOutput, SuspendedFunction};
 pub(super) use procedure_execution::SuspendedProcedure;
 pub(super) use sql_function_execution::execute_sql_function;
 pub(crate) use sql_function_execution::sql_function_inlining;
+mod engine_triggers;
+mod plpgsql_conditions;
+pub(crate) use engine_triggers::{engine_required, run_pending_trigger};
 mod row_progress;
 mod trigger_firing;
 mod write_attempts;
@@ -4177,6 +4180,44 @@ fn row_trigger_when_passes<'a>(
     reason = "a trigger firing carries its complete typed transition context"
 )]
 fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    slot: u16,
+    trigger: &crate::storage::TriggerDef,
+    target: crate::storage::TriggerTarget,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    event: u8,
+    before: bool,
+    old: Option<&[Datum<'a>]>,
+    new: &mut Option<&mut [Datum<'a>]>,
+    transition_rows: Option<TransitionRows<'a>>,
+) -> Result<bool, SqlError> {
+    // A BEFORE or INSTEAD OF row trigger can move to the engine; an AFTER
+    // row trigger fired here belongs to a write without completion handoff.
+    let movable = (before && transition_rows.is_none()).then_some(engine_triggers::MovableFiring {
+        slot,
+        target,
+        event,
+    });
+    engine_triggers::fire(context, movable, old, new, |context, new| {
+        execute_row_trigger_body_here(
+            context,
+            trigger,
+            target,
+            definition,
+            event,
+            before,
+            old,
+            new,
+            transition_rows,
+        )
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a trigger firing carries its complete typed transition context"
+)]
+fn execute_row_trigger_body_here<'a, Definition0: crate::storage::DefinitionBacking>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     trigger: &crate::storage::TriggerDef,
     target: crate::storage::TriggerTarget,
@@ -19272,10 +19313,10 @@ where
                 name
             ));
         };
-        let (transition, values) = if qualifier == "old" {
-            ("OLD", self.old)
+        let values = if qualifier == "old" {
+            self.old
         } else if qualifier == "new" {
-            ("NEW", self.new)
+            self.new
         } else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
@@ -19283,21 +19324,18 @@ where
                 qualifier
             ));
         };
-        let Some(values) = values else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "record \"{}\" is not assigned yet",
-                transition
-            ));
-        };
+        // As in PostgreSQL, both records have the relation's row type in
+        // every firing; one without a row (OLD on INSERT, NEW on DELETE,
+        // both in a statement trigger) is NULL.
         let Some(column) = self.definition.column_index(name) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
-                "column \"{}\" does not exist",
+                "record \"{}\" has no field \"{}\"",
+                qualifier,
                 name
             ));
         };
-        Ok(values[column])
+        Ok(values.map_or(Datum::Null, |values| values[column]))
     }
 
     fn whole_row_fields(
@@ -19317,12 +19355,8 @@ where
             ));
         };
         let Some(values) = values else {
-            let transition = if table == "old" { "OLD" } else { "NEW" };
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "record \"{}\" is not assigned yet",
-                transition
-            ));
+            // A record without a row is NULL.
+            return Ok(None);
         };
         let mut materialized = [RecordField {
             name: "",
@@ -19751,10 +19785,10 @@ fn execute_plpgsql_dynamic_call<'a>(
         transaction_context,
     } = &mut context.host
     else {
-        return Err(sql_err!(
+        return Err(engine_triggers::engine_required(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "CALL is not supported in a trigger function"
-        ));
+        )));
     };
     let mut outputs = ProcedureOutputs::new([true; crate::storage::MAX_ROUTINE_ARGUMENTS]);
     let outcome = super::type_input_plans::with_owner(query.owner, || {
@@ -20282,7 +20316,7 @@ fn run_atomic_sql_procedure<'a>(
             statement,
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
         ) {
-            return Err(sql_err!(
+            return Err(engine_triggers::engine_required(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "a SQL procedure called during a write cannot run {}",
                 match statement {
@@ -20291,7 +20325,7 @@ fn run_atomic_sql_procedure<'a>(
                     other =>
                         super::unquoted_body_unsupported_tag(other).unwrap_or("this statement"),
                 }
-            ));
+            )));
         }
         let mut capture = |_: &Storage,
                            _: u32,
@@ -21799,7 +21833,7 @@ fn parse_trigger_raise<'a>(
             Some(code.1),
             &[][..],
         )
-    } else if let Some(code) = trigger_condition_sqlstate(format_body) {
+    } else if let Some(code) = plpgsql_conditions::condition_sqlstate(format_body.trim()) {
         if options.sqlstate.is_some() {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
@@ -22593,28 +22627,39 @@ fn trigger_tail<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
         .then_some(text[..start].trim_end())
 }
 
-fn parse_trigger_exception_condition(text: &str) -> Result<TriggerExceptionCondition, SqlError> {
+/// Adds the handler conditions `text` names: `OTHERS`, `SQLSTATE 'code'`,
+/// or a condition name, which matches every code of that name.
+fn push_trigger_exception_condition(
+    text: &str,
+    conditions: &mut ProgramList<'_, TriggerExceptionCondition>,
+) -> Result<(), SqlError> {
     let text = text.trim();
     if text.eq_ignore_ascii_case("others") {
-        return Ok(TriggerExceptionCondition::Others);
+        return conditions.push(TriggerExceptionCondition::Others);
     }
-    let state = if let Some(state) = trigger_condition_sqlstate(text) {
-        state
-    } else if text.eq_ignore_ascii_case("data_exception") {
-        return Ok(TriggerExceptionCondition::SqlStateClass(*b"22"));
-    } else if text.eq_ignore_ascii_case("integrity_constraint_violation") {
-        return Ok(TriggerExceptionCondition::SqlStateClass(*b"23"));
-    } else {
-        let Some((state, _)) = parse_trigger_raise_sqlstate(text)? else {
-            return Err(unsupported_trigger_body());
-        };
-        state
+    let condition = |state: crate::sql::eval::SqlState| {
+        if state.as_str().ends_with("000") {
+            TriggerExceptionCondition::SqlStateClass(state.category())
+        } else {
+            TriggerExceptionCondition::SqlState(state)
+        }
     };
-    if state.as_str().ends_with("000") {
-        Ok(TriggerExceptionCondition::SqlStateClass(state.category()))
-    } else {
-        Ok(TriggerExceptionCondition::SqlState(state))
+    if let Some((state, _)) = parse_trigger_raise_sqlstate(text)? {
+        return conditions.push(condition(state));
     }
+    let mut named = false;
+    for state in plpgsql_conditions::condition_sqlstates(text) {
+        conditions.push(condition(state))?;
+        named = true;
+    }
+    if !named {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "unrecognized exception condition \"{}\"",
+            text
+        ));
+    }
+    Ok(())
 }
 
 /// Parses an explicit `SQLSTATE 'code'` into the validated value used by the
@@ -22642,46 +22687,6 @@ fn parse_trigger_raised_sqlstate(code: &str) -> Option<crate::sql::eval::SqlStat
 
 fn invalid_trigger_sqlstate(code: &str) -> SqlError {
     sql_err!(sqlstate::SYNTAX_ERROR, "invalid SQLSTATE code \"{}\"", code)
-}
-
-/// Maps the bounded language's named conditions to canonical PostgreSQL
-/// SQLSTATEs before execution; arbitrary identifier spellings cannot enter a
-/// compiled PL/pgSQL program.
-fn trigger_condition_sqlstate(text: &str) -> Option<crate::sql::eval::SqlState> {
-    let state = if text.eq_ignore_ascii_case("unique_violation") {
-        sqlstate::UNIQUE_VIOLATION
-    } else if text.eq_ignore_ascii_case("foreign_key_violation") {
-        sqlstate::FOREIGN_KEY_VIOLATION
-    } else if text.eq_ignore_ascii_case("not_null_violation") {
-        sqlstate::NOT_NULL_VIOLATION
-    } else if text.eq_ignore_ascii_case("check_violation") {
-        sqlstate::CHECK_VIOLATION
-    } else if text.eq_ignore_ascii_case("division_by_zero") {
-        sqlstate::DIVISION_BY_ZERO
-    } else if text.eq_ignore_ascii_case("undefined_column") {
-        sqlstate::UNDEFINED_COLUMN
-    } else if text.eq_ignore_ascii_case("error_in_assignment") {
-        sqlstate::ERROR_IN_ASSIGNMENT
-    } else if text.eq_ignore_ascii_case("case_not_found") {
-        sqlstate::CASE_NOT_FOUND
-    } else if text.eq_ignore_ascii_case("cardinality_violation") {
-        sqlstate::CARDINALITY_VIOLATION
-    } else if text.eq_ignore_ascii_case("invalid_transaction_termination") {
-        sqlstate::INVALID_TRANSACTION_TERMINATION
-    } else if text.eq_ignore_ascii_case("no_data_found") {
-        sqlstate::NO_DATA_FOUND
-    } else if text.eq_ignore_ascii_case("too_many_rows") {
-        sqlstate::TOO_MANY_ROWS
-    } else if text.eq_ignore_ascii_case("raise_exception") {
-        sqlstate::RAISE_EXCEPTION
-    } else if text.eq_ignore_ascii_case("query_canceled") {
-        sqlstate::QUERY_CANCELED
-    } else if text.eq_ignore_ascii_case("assert_failure") {
-        sqlstate::ASSERT_FAILURE
-    } else {
-        return None;
-    };
-    Some(crate::sql::eval::SqlState::known(state))
 }
 
 fn parse_plpgsql_cursor_open<'a>(
@@ -22985,7 +22990,7 @@ fn parse_trigger_exception_conditions<'a>(
         if condition.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
-        conditions.push(parse_trigger_exception_condition(condition)?)?;
+        push_trigger_exception_condition(condition, &mut conditions)?;
         remaining = rest;
     }
     Ok(conditions.as_slice())
@@ -25288,6 +25293,8 @@ mod trigger_program_tests {
 
     #[test]
     fn exception_matching_keeps_private_controls_outside_sql_handlers() {
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "exception conditions", 1 << 12).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             for state in [sqlstate::QUERY_CANCELED, sqlstate::ASSERT_FAILURE] {
                 let error = sql_err!(state, "special exception");
@@ -25325,7 +25332,10 @@ mod trigger_program_tests {
                 ("SQLSTATE '22000'", "22012"),
                 ("SQLSTATE '23000'", "23514"),
             ] {
-                let condition = parse_trigger_exception_condition(condition).unwrap();
+                let &[condition] = parse_trigger_exception_conditions(condition, &arena).unwrap()
+                else {
+                    panic!("{condition} names one condition");
+                };
                 let error = sql_err!(code, "application category member");
                 assert!(trigger_exception_matches(condition, &error));
                 assert!(trigger_exception_matches(
@@ -25631,7 +25641,7 @@ impl<'a> TriggerLocalScope<'_, 'a> {
     /// variable; outside a trigger both are ordinary names.
     fn transition_row(&self, table: &str) -> bool {
         matches!(table, "new" | "old")
-            && (self.transition.new.is_some() || self.transition.old.is_some())
+            && self.invocation.program_kind == PlpgsqlProgramKind::Trigger
             && self.local_index(table).is_none()
     }
 
@@ -27275,10 +27285,10 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
         engine, sqlprep, ..
     } = &context.host
     else {
-        return Err(sql_err!(
+        return Err(engine_triggers::engine_required(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "prepared statements are not available in trigger execution"
-        ));
+        )));
     };
     let text = sqlprep.get(name).ok_or_else(|| {
         sql_err!(
@@ -27779,10 +27789,10 @@ fn execute_bound_plpgsql_utility<'a>(
                         super::eval::funcs::system::session_identity(),
                     )?,
                     PlpgsqlExecHost::Atomic { .. } => {
-                        return Err(sql_err!(
+                        return Err(engine_triggers::engine_required(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
                             "PL/pgSQL utility commands are not valid in trigger execution"
-                        ));
+                        )));
                     }
                 };
                 let authorization = resolved.authorization.as_ref().map(|role| role.as_str());
@@ -27799,10 +27809,10 @@ fn execute_bound_plpgsql_utility<'a>(
                         transaction_context,
                     } = &mut context.host
                     else {
-                        return Err(sql_err!(
+                        return Err(engine_triggers::engine_required(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
                             "PL/pgSQL utility commands are not valid in trigger execution"
-                        ));
+                        )));
                     };
                     context.responder.without_query_output(|responder| {
                         engine.execute_routine_utility(
@@ -27961,10 +27971,10 @@ fn execute_bound_plpgsql_utility<'a>(
                 transaction_context,
             } = &mut context.host
             else {
-                return Err(sql_err!(
+                return Err(engine_triggers::engine_required(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "PL/pgSQL utility commands are not valid in trigger execution"
-                ));
+                )));
             };
             let outcome = context.responder.without_query_output(|responder| {
         engine.execute_routine_utility(
@@ -29638,6 +29648,29 @@ fn routine_utility_outcome(outcome: Outcome) -> Result<(), SqlError> {
     }
 }
 
+/// Whether rules for its event rewrite a write into several steps.
+fn rewritten_into_steps(storage: &Storage, statement: &Stmt<'_>, txn: &TxnState) -> bool {
+    let (relation, event) = match statement {
+        Stmt::Insert(insert) => (insert.table, crate::storage::RewriteEvent::Insert),
+        Stmt::Update(update) => (update.table, crate::storage::RewriteEvent::Update),
+        Stmt::Delete(delete) => (delete.table, crate::storage::RewriteEvent::Delete),
+        _ => return false,
+    };
+    let target = match storage.resolve_relation(relation.schema, relation.name, txn.txid) {
+        Some(crate::storage::ResolvedRelation::View(slot)) => {
+            crate::storage::RuleTarget::View(slot as u16)
+        }
+        Some(crate::storage::ResolvedRelation::Table(slot)) => {
+            crate::storage::RuleTarget::Table(slot as u16)
+        }
+        _ => return false,
+    };
+    storage
+        .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+        .next()
+        .is_some()
+}
+
 /// The command of a routine's `INSERT`, `UPDATE` or `DELETE` whose target
 /// is a view or a table with rules for it: the engine rewrites those.
 fn rewritten_write_target(
@@ -29676,10 +29709,13 @@ fn static_write_locals<'a>(
 ) -> Result<&'a [super::cursor::CursorLocal<'a>], SqlError> {
     let locals = scope.cursor_locals(storage, txid, arena)?;
     let transition = scope.transition;
+    // As in PostgreSQL, a trigger's NEW and OLD have the relation's row type
+    // in every firing; one without a row reads its fields as NULL.
     let rows = [("new", transition.new), ("old", transition.old)];
+    let trigger = scope.invocation.program_kind == PlpgsqlProgramKind::Trigger;
     let rows = || {
         rows.into_iter()
-            .filter(|(name, values)| values.is_some() && scope.local_index(name).is_none())
+            .filter(|(name, _)| trigger && scope.local_index(name).is_none())
     };
     if rows().count() == 0 {
         return Ok(locals);
@@ -29699,7 +29735,6 @@ fn static_write_locals<'a>(
         .map_err(|_| super::query::arena_full_pub())?;
     let columns = transition.definition.columns();
     for ((name, values), slot) in rows().zip(&mut captured[locals.len()..]) {
-        let values = values.expect("filtered transition row");
         let fields = arena
             .alloc_slice_with(columns.len(), |_| RecordField {
                 name: "",
@@ -29707,7 +29742,7 @@ fn static_write_locals<'a>(
                 value: Datum::Null,
             })
             .map_err(|_| super::query::arena_full_pub())?;
-        for ((field, column), value) in fields.iter_mut().zip(columns).zip(values) {
+        for (index, (field, column)) in fields.iter_mut().zip(columns).enumerate() {
             field.name = arena
                 .alloc_str(column.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?;
@@ -29720,7 +29755,7 @@ fn static_write_locals<'a>(
                         column.name.as_str()
                     )
                 })?;
-            field.value = *value;
+            field.value = values.map_or(Datum::Null, |values| values[index]);
         }
         *slot = super::cursor::CursorLocal {
             name: SqlName::parse(name).expect("static transition name"),
@@ -29844,13 +29879,18 @@ fn execute_rewritten_nested_write<'a>(
     command_name: &str,
 ) -> Result<u64, SqlError> {
     let arena = context.arena;
-    let boundary = context.nested_write_boundary();
+    // A statement rules rewrite into several steps finishes each step's
+    // AFTER triggers before the next step runs, so none of them can hand
+    // its completion to the caller.
+    let boundary = context
+        .nested_write_boundary()
+        .filter(|_| !rewritten_into_steps(context.storage(), statement, context.txn));
     let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
-        return Err(sql_err!(
+        return Err(engine_triggers::engine_required(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "{} on a view or a table with rules is not supported inside a trigger fired by a write",
             command_name
-        ));
+        )));
     };
     let engine = &mut **engine;
     let mut command = enter_write_command(context.txn, &engine.storage, progress.as_deref_mut())?;
@@ -29974,10 +30014,10 @@ fn execute_plpgsql_dynamic_explain(
                 ..
             } = context;
             let PlpgsqlExecHost::Routine { engine, guc, .. } = host else {
-                return Err(sql_err!(
+                return Err(engine_triggers::engine_required(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "EXPLAIN ANALYZE is not available in trigger execution"
-                ));
+                )));
             };
             let before = engine.storage.block_io_stats();
             let (before_wal_records, before_wal_bytes) = engine.wal.stage_stats(txn.txid);
@@ -31023,6 +31063,38 @@ fn materialize_trigger_for_dml<'a>(
     })
 }
 
+/// Finishes a `FOR` loop's data change that waited for its AFTER triggers
+/// and returns the rows it saved before the wait.
+fn resume_for_dml_rows<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    status: &mut TriggerExecutionStatus<'a>,
+) -> Result<TriggerForRows<'a>, SqlError> {
+    let (_, output) = resume_nested_write(context, status)?;
+    let Some(write_completion::NestedWriteOutput::Rows { values, rows, .. }) = output else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a FOR loop's data change lost its returned rows"
+        ));
+    };
+    let values = values.decode(context.arena)?;
+    let (empty, values) = values.split_last().ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a FOR loop's data change lost its empty row"
+        )
+    })?;
+    if values.len() as u64 != rows {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a FOR loop's data change lost its returned rows"
+        ));
+    }
+    Ok(TriggerForRows {
+        values,
+        empty: *empty,
+    })
+}
+
 /// One attempt of a `FOR` loop's data change, given its `RETURNING` capture.
 type ForDmlAttempt<'f, 'a> = dyn FnMut(
         &mut TriggerExecContext<'_, 'a, '_>,
@@ -31099,21 +31171,6 @@ fn for_dml_rows<'a>(
             run(context, &mut capture, &mut status.pending_write, progress)
         };
         let result = execute_procedural_write(context, status, retained, &mut attempt);
-        if let Err(error) = result {
-            if status.pending_write.is_none() {
-                return Err(error);
-            }
-            if let Err(error) = resume_nested_write(context, status) {
-                if status.pending_write.take().is_some() {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "FOR over {} cannot wait for its AFTER triggers",
-                        command
-                    ));
-                }
-                return Err(error);
-            }
-        }
         let empty = if record_target && rows.is_empty() {
             Datum::Record(
                 arena
@@ -31123,6 +31180,31 @@ fn for_dml_rows<'a>(
         } else {
             Datum::Null
         };
+        if let Err(error) = result {
+            let Some(pending) = status.pending_write.as_mut() else {
+                return Err(error);
+            };
+            if !retained {
+                status.pending_write = None;
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "FOR over {} cannot wait for its AFTER triggers",
+                    command
+                ));
+            }
+            // The loop's rows wait with the data change: the returned rows,
+            // then the row an empty result assigns.
+            rows.push(empty)
+                .map_err(|_| super::query::arena_full_pub())?;
+            let saved = rows.len() as u64 - 1;
+            pending.save_output(
+                Some(rows.as_slice()),
+                saved,
+                &[],
+                &context.storage().row_work,
+            )?;
+            return resume_for_dml_rows(context, status);
+        }
         Ok(TriggerForRows {
             values: rows.as_slice(),
             empty,
@@ -31616,7 +31698,12 @@ fn execute_trigger_step_in<'a>(
     exception: Option<diagnostics::CaughtDiagnostic<'_>>,
 ) -> Result<control_flow::Step<'a, 'a>, SqlError> {
     super::query::check_timeout()?;
-    if status.pending_write.is_some() {
+    let resumed_for = matches!(
+        statement,
+        TriggerStatement::For(program)
+            if matches!(program.source, TriggerForSource::Dml(_) | TriggerForSource::DynamicQuery(_))
+    );
+    if status.pending_write.is_some() && !resumed_for {
         if !matches!(
             statement,
             TriggerStatement::Dml { .. }
@@ -32230,10 +32317,10 @@ fn execute_trigger_step_in<'a>(
                             Datum::Null => {
                                 let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host
                                 else {
-                                    return Err(sql_err!(
+                                    return Err(engine_triggers::engine_required(sql_err!(
                                         sqlstate::FEATURE_NOT_SUPPORTED,
                                         "SQL cursors are not available in trigger execution"
-                                    ));
+                                    )));
                                 };
                                 generated = cursors.unnamed_name()?;
                                 context
@@ -32415,10 +32502,10 @@ fn execute_trigger_step_in<'a>(
                             ..
                         } = &mut context.host
                         else {
-                            return Err(sql_err!(
+                            return Err(engine_triggers::engine_required(sql_err!(
                                 sqlstate::FEATURE_NOT_SUPPORTED,
                                 "SQL cursors are not available in trigger execution"
-                            ));
+                            )));
                         };
                         let mut open = || {
                             engine.materialize_cursor(
@@ -32512,10 +32599,10 @@ fn execute_trigger_step_in<'a>(
                                 ..
                             } = &mut context.host
                             else {
-                                return Err(sql_err!(
+                                return Err(engine_triggers::engine_required(sql_err!(
                                     sqlstate::FEATURE_NOT_SUPPORTED,
                                     "SQL cursors are not available in trigger execution"
-                                ));
+                                )));
                             };
                             let count = engine.fetch_cursor(
                                 name,
@@ -32685,10 +32772,10 @@ fn execute_trigger_step_in<'a>(
                             ));
                         };
                         let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host else {
-                            return Err(sql_err!(
+                            return Err(engine_triggers::engine_required(sql_err!(
                                 sqlstate::FEATURE_NOT_SUPPORTED,
                                 "SQL cursors are not available in trigger execution"
-                            ));
+                            )));
                         };
                         if !cursors.close(name) {
                             return Err(sql_err!(
@@ -32964,10 +33051,10 @@ fn execute_trigger_step_in<'a>(
                             } = query.statement
                         {
                             let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
-                                return Err(sql_err!(
+                                return Err(engine_triggers::engine_required(sql_err!(
                                     sqlstate::FEATURE_NOT_SUPPORTED,
                                     "SQL cursors are not available in trigger execution"
-                                ));
+                                )));
                             };
                             let mut borrowed = [None; MAX_PROJ];
                             let width =
@@ -33135,10 +33222,10 @@ fn execute_trigger_step_in<'a>(
                             let value = {
                                 let PlpgsqlExecHost::Routine { engine, guc, .. } = &context.host
                                 else {
-                                    return Err(sql_err!(
+                                    return Err(engine_triggers::engine_required(sql_err!(
                                         sqlstate::FEATURE_NOT_SUPPORTED,
                                         "SHOW is not available in trigger execution"
-                                    ));
+                                    )));
                                 };
                                 engine.show_setting_value(name, guc, context.txn)?
                             };
@@ -33150,10 +33237,10 @@ fn execute_trigger_step_in<'a>(
                         }
                         Stmt::ShowAll => {
                             let PlpgsqlExecHost::Routine { engine, guc, .. } = &context.host else {
-                                return Err(sql_err!(
+                                return Err(engine_triggers::engine_required(sql_err!(
                                     sqlstate::FEATURE_NOT_SUPPORTED,
                                     "SHOW ALL is not available in trigger execution"
-                                ));
+                                )));
                             };
                             engine.visit_show_all_rows(guc, context.txn, |name, value| {
                                 let name = context
@@ -33182,10 +33269,10 @@ fn execute_trigger_step_in<'a>(
                                     ..
                                 } = &mut context.host
                                 else {
-                                    return Err(sql_err!(
+                                    return Err(engine_triggers::engine_required(sql_err!(
                                         sqlstate::FEATURE_NOT_SUPPORTED,
                                         "SQL cursors are not available in trigger execution"
-                                    ));
+                                    )));
                                 };
                                 engine.fetch_cursor(
                                     name,
@@ -34627,6 +34714,13 @@ fn execute_trigger_step_in<'a>(
                     let record_target = locals[target].ctype == ColType::Record;
                     let mut dynamic = None;
                     let dml_rows = match program.source {
+                        // The data change waited for its AFTER triggers with
+                        // its returned rows saved: finish it, then loop.
+                        TriggerForSource::Dml(_) | TriggerForSource::DynamicQuery(_)
+                            if status.pending_write.is_some() =>
+                        {
+                            Some(resume_for_dml_rows(context, status)?)
+                        }
                         TriggerForSource::DynamicQuery(query) => {
                             let transition = TriggerTransition {
                                 definition,
@@ -36077,6 +36171,7 @@ fn fire_row_trigger_slot<'a, Definition0: crate::storage::DefinitionBacking>(
     }
     if !execute_row_trigger_body(
         &mut context,
+        trigger_slot as u16,
         &trigger,
         effective_target,
         definition,
@@ -36216,6 +36311,7 @@ fn execute_deferred_trigger_event<'a>(
     context.txn.complete_deferred_trigger(index)?;
     execute_row_trigger_body(
         context,
+        trigger_slot,
         &trigger,
         crate::storage::TriggerTarget::Table(table as u16),
         &definition,
@@ -36236,7 +36332,7 @@ fn fire_statement_row_trigger_events<'a>(
     trigger_depth: u16,
     transition_rows: TransitionRowSets<'a>,
 ) -> Result<(), SqlError> {
-    let mut cursor = write_completion::AfterRowCursor::new(trigger_depth);
+    let mut cursor = write_completion::AfterRowCursor::new(trigger_depth, context.txn.command_id());
     while let Some(firing) = cursor.next(context)? {
         execute_deferred_trigger_event(
             context,
@@ -36280,7 +36376,7 @@ pub(crate) fn fire_constraint_triggers(
             crate::sql::txn::DeferredTriggerKind::Constraint {
                 identity,
                 effective_table,
-                trigger_depth: _,
+                ..
             } => {
                 let Some(timing) = constraints::constraint_timing(storage, identity, txn.txid)
                 else {
@@ -36531,9 +36627,11 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
     rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
     let mut cursor = write_completion::StatementTriggerCursor::new();
-    while let Some(trigger) = cursor.next(&context, target, event, before, updated_columns) {
+    while let Some((slot, trigger)) = cursor.next(&context, target, event, before, updated_columns)
+    {
         execute_statement_trigger(
             &mut context,
+            Some(slot),
             &trigger,
             target,
             crate::storage::RelationDefinition::from_definition(definition),
@@ -36545,7 +36643,37 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a trigger firing carries its complete typed transition context"
+)]
 fn execute_statement_trigger<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    slot: Option<u16>,
+    trigger: &crate::storage::TriggerDef,
+    target: crate::storage::TriggerTarget,
+    definition: crate::storage::RelationDefinition<'_>,
+    event: u8,
+    before: bool,
+    rows: Option<TransitionRows<'a>>,
+) -> Result<(), SqlError> {
+    // A BEFORE statement trigger can move to the engine; an AFTER one fired
+    // here belongs to a write without completion handoff.
+    let movable =
+        slot.filter(|_| before && rows.is_none())
+            .map(|slot| engine_triggers::MovableFiring {
+                slot,
+                target,
+                event,
+            });
+    engine_triggers::fire(context, movable, None, &mut None, |context, _| {
+        execute_statement_trigger_here(context, trigger, target, definition, event, before, rows)
+            .map(|()| true)
+    })
+    .map(|_| ())
+}
+
+fn execute_statement_trigger_here<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     trigger: &crate::storage::TriggerDef,
     target: crate::storage::TriggerTarget,
@@ -48299,16 +48427,23 @@ fn stored_rule_definition(
         if !super::query::statement_returns_rows(action.statement) {
             continue;
         }
-        if rule.condition.is_some() || !matches!(mode, crate::storage::RewriteMode::Instead) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "RETURNING lists are not supported in conditional or non-INSTEAD rules"
-            ));
-        }
+        // PostgreSQL's DefineQueryRewrite checks in this order.
         if returning_action.replace(index as u8).is_some() {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "cannot have multiple RETURNING lists in a rule"
+            ));
+        }
+        if rule.condition.is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "RETURNING lists are not supported in conditional rules"
+            ));
+        }
+        if !matches!(mode, crate::storage::RewriteMode::Instead) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "RETURNING lists are not supported in non-INSTEAD rules"
             ));
         }
     }

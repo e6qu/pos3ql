@@ -13730,7 +13730,7 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
         (
             "CREATE RULE invalid_returning AS ON INSERT TO rule_defaults \
              DO ALSO INSERT INTO rule_default_log VALUES (NEW.id, NEW.label) RETURNING id",
-            "conditional or non-INSTEAD",
+            "RETURNING lists are not supported in non-INSTEAD rules",
         ),
         (
             "CREATE RULE second_returning AS ON INSERT TO rule_redirect DO INSTEAD \
@@ -100882,6 +100882,7 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
     }
 }
 
+mod engine_triggers;
 mod relation_input_granularity;
 mod row_progress;
 

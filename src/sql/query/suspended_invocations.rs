@@ -38,6 +38,7 @@ impl PendingRoutineInvocation {
                 PendingRoutineTarget::Stored(target.retain(contract).map_err(|_| arena_full())?)
             }
             PendingRoutineTarget::Intrinsic(oid) => PendingRoutineTarget::Intrinsic(oid),
+            PendingRoutineTarget::WriteQuery(write) => PendingRoutineTarget::WriteQuery(write),
         };
         Ok(Self {
             arguments,
@@ -93,7 +94,28 @@ impl RoutineInvocationState {
                 )
                 .map_err(invocation_results::directory_error)?;
         }
+        let writes = self.writes.borrow();
+        for index in 0..writes.len() {
+            let write = writes
+                .get(source, index)
+                .map_err(|_| inactive_pending_call())?
+                .ok_or_else(inactive_pending_call)?;
+            output
+                .writes
+                .borrow_mut()
+                .push(
+                    target,
+                    WriteQueryResult {
+                        rows: write.rows.relocate(source, target)?,
+                        ..write
+                    },
+                )
+                .map_err(invocation_results::directory_error)?;
+        }
+        output.reads_writes.set(self.reads_writes.get());
+        output.writes_root.set(self.writes_root.get());
         Ok(Self {
+            id: self.id,
             inputs: self.inputs.relocate(source, target)?,
             ..output
         })

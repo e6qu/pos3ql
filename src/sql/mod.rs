@@ -16,6 +16,7 @@ mod concurrent_index;
 #[cfg(all(test, not(miri)))]
 pub(crate) use concurrent_index::CommitPhase as IndexCommitPhaseForTests;
 pub(crate) mod array_assignment;
+pub(crate) mod assignment_path;
 pub mod copy;
 pub mod cursor;
 pub mod datetime;
@@ -13999,32 +14000,27 @@ impl Engine {
         }
     }
 
-    /// Runs a statement's data-modifying CTEs (`WITH x AS (INSERT/UPDATE/DELETE
-    /// ... RETURNING ...)`) once each, capturing each RETURNING output as a
-    /// materialized relation the main query binds by name. Runs under this
-    /// statement's command snapshot, so the CTEs' base-table changes are not
-    /// visible to sibling CTEs or the main query except through these relations
-    /// (matching PostgreSQL's single-snapshot rule). Returns `None` when the
-    /// statement has no data-modifying CTE, so the ordinary path is unchanged.
-    ///
-    /// PostgreSQL runs a data-modifying query that nothing reads after the
-    /// main query: `after` selects those, with `prior` holding the outputs of
-    /// the ones that ran first.
+    /// Binds a statement's data-modifying `WITH` queries (`WITH x AS
+    /// (INSERT/UPDATE/DELETE ... RETURNING ...)`) as relations the main query
+    /// reads by name. Every query is analysed before any of them runs. Under a
+    /// statement invocation log, a query runs when its rows are first read, as
+    /// PostgreSQL's CTE scan runs it, and [`Self::finish_dml_ctes`] runs the
+    /// rest after the main query, last written first. Without one (`EXPLAIN
+    /// ANALYZE`), the queries the main query reads run here in written order.
+    /// All of them use this statement's command snapshot, so their changes
+    /// reach sibling queries and the main query only through these relations.
+    /// Returns `None` when the statement has no data-modifying query.
     #[allow(clippy::too_many_arguments)]
-    fn run_dml_ctes<'a>(
+    fn bind_dml_ctes<'a>(
         &mut self,
         with: &'a [ast::Cte<'a>],
         main: query::CteReader<'_>,
-        after: bool,
-        prior: &'a [(&'a str, &'a ast::MaterializedCte<'a>)],
         txn: &mut TxnState,
         arena: &'a Arena,
         params: &[Datum<'a>],
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Option<&'a [(&'a str, &'a ast::MaterializedCte<'a>)]>, SqlError> {
-        use crate::sql::exec::{MAX_PROJ, encode_projected_pub};
-        use crate::sql::types::ColDesc;
         if !with.iter().any(|c| c.dml.is_some()) {
             return Ok(None);
         }
@@ -14040,93 +14036,178 @@ impl Engine {
                 ));
             }
         }
+        let deferred = query::with_active_routine_invocations(|context| {
+            context.map(|(invocations, _)| invocations.hold_output_for_write_queries())
+        })
+        .is_some();
         // All of this statement's sub-parts share one command snapshot.
         self.storage.set_read_snapshot(txn.command_id());
         let mut mats = ArenaList::new(arena);
-        for materialized in prior {
-            mats.push(*materialized)
-                .map_err(|_| query::arena_full_pub())?;
-        }
-        // PostgreSQL finishes unread queries last first.
-        let order = (0..with.len()).map(|index| if after { with.len() - 1 - index } else { index });
-        for cte_index in order {
-            let cte = &with[cte_index];
-            let Some(dml) = cte.dml else { continue };
-            if query::dml_cte_runs_after(with, cte_index, main) != after {
+        for cte_index in 0..with.len() {
+            if with[cte_index].dml.is_none()
+                || (!deferred && query::dml_cte_runs_after(with, cte_index, main))
+            {
                 continue;
             }
-            // Earlier ordinary, recursive, and data-modifying CTEs are in
-            // scope inside this CTE body. Expansion finishes its immutable
-            // catalog work before the statement takes a mutable storage borrow.
-            let dml = query::expand_dml_ctes(
-                dml,
-                &with[..cte_index],
+            let (dml, mut materialized) =
+                self.analyze_dml_cte(with, cte_index, mats.as_slice(), txn, arena, params, guc)?;
+            materialized.source = if deferred {
+                Self::write_query_source(with, cte_index, params)
+            } else {
+                ast::MaterializedCteSource::Inline(Self::execute_dml_cte(
+                    &mut self.storage,
+                    &mut self.dml_scratch,
+                    &self.work,
+                    self.work.connection_id(),
+                    dml,
+                    txn,
+                    arena,
+                    params,
+                    guc,
+                    responder,
+                )?)
+            };
+            let materialized = arena
+                .alloc(materialized)
+                .map_err(|_| query::arena_full_pub())?;
+            mats.push((with[cte_index].name, &*materialized))
+                .map_err(|_| query::arena_full_pub())?;
+        }
+        Ok(Some(
+            arena
+                .alloc_slice_copy(mats.as_slice())
+                .map_err(|_| query::arena_full_pub())?,
+        ))
+    }
+
+    fn write_query_source<'a>(
+        with: &'a [ast::Cte<'a>],
+        index: usize,
+        params: &[Datum<'a>],
+    ) -> ast::MaterializedCteSource<'a> {
+        ast::MaterializedCteSource::Write(ast::WriteQuerySource {
+            with,
+            index,
+            params: (params.as_ptr() as usize, params.len()),
+        })
+    }
+
+    /// Expands one data-modifying `WITH` query against the queries before it
+    /// and describes its output relation, without running it.
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_dml_cte<'a>(
+        &mut self,
+        with: &'a [ast::Cte<'a>],
+        cte_index: usize,
+        earlier: &[(&'a str, &'a ast::MaterializedCte<'a>)],
+        txn: &mut TxnState,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        guc: &GucState,
+    ) -> Result<(&'a Stmt<'a>, ast::MaterializedCte<'a>), SqlError> {
+        use crate::sql::exec::MAX_PROJ;
+        use crate::sql::types::ColDesc;
+        let cte = &with[cte_index];
+        let Some(dml) = cte.dml else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "WITH query \"{}\" does not modify data",
+                cte.name
+            ));
+        };
+        // Earlier ordinary, recursive, and data-modifying CTEs are in scope
+        // inside this CTE body. Expansion finishes its immutable catalog work
+        // before the statement takes a mutable storage borrow.
+        let dml = query::expand_dml_ctes(
+            dml,
+            &with[..cte_index],
+            &self.storage,
+            txn.txid,
+            arena,
+            params,
+            earlier,
+            Some(&sequence::SeqEval::new(
                 &self.storage,
+                guc.seq_session(),
                 txn.txid,
-                arena,
-                params,
-                mats.as_slice(),
-                Some(&sequence::SeqEval::new(
-                    &self.storage,
-                    guc.seq_session(),
-                    txn.txid,
-                )),
-            )?;
-            if !matches!(
-                dml,
-                Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)
-            ) {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "a data-modifying WITH sub-statement must be INSERT, UPDATE, DELETE or MERGE"
-                ));
-            }
-            // Protocol and CTE outputs share view rewriting, target ownership,
-            // aliases, and catalog-derived result types.
-            let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
-            let ncols = self.describe_data_modification_columns(
-                dml,
-                arena,
-                txn,
-                &mut descs,
-                crate::sql::exec::DescriptionTarget::Sql,
-            )?;
-            if cte.columns.len() > ncols {
-                return Err(sql_err!(
-                    sqlstate::INVALID_COLUMN_REFERENCE,
-                    "WITH query \"{}\" has {} columns available but {} columns specified",
-                    cte.name,
-                    ncols,
-                    cte.columns.len()
-                ));
-            }
-            let mut names: [&str; MAX_PROJ] = [""; MAX_PROJ];
-            let mut types = [(0i32, 0i16, -1i32); MAX_PROJ];
-            for i in 0..ncols {
-                // Materialized names outlive the local description and schema owner.
-                let nm = cte.columns.get(i).copied().unwrap_or(descs[i].name);
-                names[i] = arena.alloc_str(nm).map_err(|_| query::arena_full_pub())?;
-                types[i] = (descs[i].type_oid, descs[i].typlen, descs[i].type_mod);
-            }
-            let column_names = arena
-                .alloc_slice_copy(&names[..ncols])
-                .map_err(|_| query::arena_full_pub())?;
-            let column_types = arena
-                .alloc_slice_copy(&types[..ncols])
-                .map_err(|_| query::arena_full_pub())?;
-            let column_collations = arena
-                .alloc_slice_with(ncols, |index| descs[index].collation)
-                .map_err(|_| query::arena_full_pub())?;
-            // Run the DML once, capturing RETURNING rows (projected-encoded).
-            const EMPTY: &[u8] = &[];
-            let mut store: *mut &[u8] = core::ptr::null_mut();
-            let mut len = 0usize;
-            let mut cap = 0usize;
-            let mut sink = |_: &Storage,
-                            _: u32,
-                            _: &dyn SequenceAccess,
-                            vals: &[Datum]|
-             -> Result<(), SqlError> {
+            )),
+        )?;
+        if !matches!(
+            dml,
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)
+        ) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a data-modifying WITH sub-statement must be INSERT, UPDATE, DELETE or MERGE"
+            ));
+        }
+        // Protocol and CTE outputs share view rewriting, target ownership,
+        // aliases, and catalog-derived result types.
+        let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let ncols = self.describe_data_modification_columns(
+            dml,
+            arena,
+            txn,
+            &mut descs,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?;
+        if cte.columns.len() > ncols {
+            return Err(sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "WITH query \"{}\" has {} columns available but {} columns specified",
+                cte.name,
+                ncols,
+                cte.columns.len()
+            ));
+        }
+        let mut names: [&str; MAX_PROJ] = [""; MAX_PROJ];
+        let mut types = [(0i32, 0i16, -1i32); MAX_PROJ];
+        for i in 0..ncols {
+            // Materialized names outlive the local description and schema owner.
+            let nm = cte.columns.get(i).copied().unwrap_or(descs[i].name);
+            names[i] = arena.alloc_str(nm).map_err(|_| query::arena_full_pub())?;
+            types[i] = (descs[i].type_oid, descs[i].typlen, descs[i].type_mod);
+        }
+        Ok((
+            dml,
+            ast::MaterializedCte {
+                column_names: arena
+                    .alloc_slice_copy(&names[..ncols])
+                    .map_err(|_| query::arena_full_pub())?,
+                column_types: arena
+                    .alloc_slice_copy(&types[..ncols])
+                    .map_err(|_| query::arena_full_pub())?,
+                column_collations: arena
+                    .alloc_slice_with(ncols, |index| descs[index].collation)
+                    .map_err(|_| query::arena_full_pub())?,
+                definition: None,
+                source: ast::MaterializedCteSource::Inline(&[]),
+            },
+        ))
+    }
+
+    /// Runs one analysed data-modifying `WITH` query once and returns its
+    /// `RETURNING` rows, projected-encoded in `arena`.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_dml_cte<'a, 'e>(
+        storage: &mut Storage,
+        dml_scratch: &mut exec::DmlScratch,
+        executor: &'e Arena,
+        connection_id: i32,
+        dml: &'e Stmt<'e>,
+        txn: &mut TxnState,
+        arena: &'a Arena,
+        params: &[Datum<'e>],
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<&'a [&'a [u8]], SqlError> {
+        use crate::sql::exec::encode_projected_pub;
+        const EMPTY: &[u8] = &[];
+        let mut store: *mut &[u8] = core::ptr::null_mut();
+        let mut len = 0usize;
+        let mut cap = 0usize;
+        let mut sink =
+            |_: &Storage, _: u32, _: &dyn SequenceAccess, vals: &[Datum]| -> Result<(), SqlError> {
                 let enc = encode_projected_pub(vals, arena)?;
                 if len == cap {
                     let new_cap = if cap == 0 { 8 } else { cap * 2 };
@@ -14144,58 +14225,225 @@ impl Engine {
                 len += 1;
                 Ok(())
             };
-            let outcome = match dml {
-                Stmt::Merge(_) => Self::execute_merge(
-                    &mut self.storage,
-                    &self.work,
-                    dml,
-                    txn,
-                    params,
-                    guc,
-                    responder,
-                    Some(&mut sink),
-                ),
-                _ => Self::execute_data_modification(
-                    &mut self.storage,
-                    &mut self.dml_scratch,
-                    &self.work,
-                    dml,
-                    exec::DmlAuthorization::Invoker,
-                    txn,
-                    params,
-                    guc,
-                    responder,
-                    Some(&mut sink),
-                    self.work.connection_id(),
-                ),
-            };
-            match outcome {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Err(query::arena_full_pub()),
+        storage.set_read_snapshot(txn.command_id());
+        let outcome = match dml {
+            Stmt::Merge(_) => Self::execute_merge(
+                storage,
+                executor,
+                dml,
+                txn,
+                params,
+                guc,
+                responder,
+                Some(&mut sink),
+            ),
+            _ => Self::execute_data_modification(
+                storage,
+                dml_scratch,
+                executor,
+                dml,
+                exec::DmlAuthorization::Invoker,
+                txn,
+                params,
+                guc,
+                responder,
+                Some(&mut sink),
+                connection_id,
+            ),
+        };
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(query::arena_full_pub()),
+        }
+        Ok(if len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(store, len) }
+        })
+    }
+
+    /// Runs a pending data-modifying `WITH` query at the invocation ordinal of
+    /// its first read and records its rows. Calls it makes complete in turn,
+    /// each followed by a fresh run of the query that replays them.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_pending_write(
+        &mut self,
+        write: query::PendingWriteQuery,
+        invocations: &query::RoutineInvocationState,
+        arena: &Arena,
+        work: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let replay = invocations.take_pending_replay();
+        query::protect_statement_effects();
+        // SAFETY: the loop completing this call still executes the statement.
+        let (with, params) = unsafe { write.statement() };
+        let snapshot = self.storage.read_snapshot();
+        let calls = invocations.write_query_child(arena);
+        loop {
+            if let Err(error) = sequence::rewind_replay_cursor(replay) {
+                return Ok(Err(error));
             }
-            let rows: &'a [&'a [u8]] = if len == 0 {
-                &[]
-            } else {
-                unsafe { core::slice::from_raw_parts(store, len) }
+            calls.begin_attempt();
+            let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            // The run's syntax and rows use the statement arena, whose tail
+            // also takes the child log's retained calls; its executor uses
+            // the query workspace, which the next attempt resets.
+            let rows = query::with_routine_invocation_scope(
+                Some(query::RoutineInvocationContext::new(&calls, arena)),
+                || {
+                    let rows = self.run_write_query(
+                        with,
+                        write.index,
+                        txn,
+                        arena,
+                        params,
+                        guc,
+                        responder,
+                    )?;
+                    let length = exec::projected_rows_len(rows)?;
+                    let image = arena
+                        .retain_slice_with(length, |_| 0u8)
+                        .map_err(|_| query::arena_full_pub())?;
+                    let mut bytes = arena
+                        .retained_slice_mut(image)
+                        .map_err(|_| query::inactive_pending_call())?;
+                    exec::pack_projected_rows_into(rows, &mut bytes)?;
+                    drop(bytes);
+                    arena
+                        .freeze_retained_slice(image)
+                        .map_err(|_| query::inactive_pending_call())
+                },
+            );
+            self.storage.set_read_snapshot(snapshot);
+            let error = match rows {
+                Ok(rows) => {
+                    return Ok(invocations.complete_write_query(write, rows, replay, arena, work));
+                }
+                Err(error) => error,
             };
-            let mcte = arena
-                .alloc(ast::MaterializedCte {
-                    column_names,
-                    column_types,
-                    column_collations,
-                    definition: None,
-                    source: ast::MaterializedCteSource::Inline(rows),
-                })
+            if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                return Ok(Err(error));
+            }
+            self.rollback_waiting_statement(txn, mark);
+            self.dml_scratch.clear();
+            let Some(pending) = calls.take_pending() else {
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "data-modifying WITH query yielded without a pending call"
+                )));
+            };
+            if let Err(error) = self.complete_pending_routine(
+                pending, &calls, arena, work, txn, sqlprep, cursors, guc, responder,
+            )? {
+                return Ok(Err(error));
+            }
+        }
+    }
+
+    /// Expands and runs data-modifying `WITH` query `index`. The queries
+    /// before it are bound for reading, so one it reads first runs then.
+    #[allow(clippy::too_many_arguments)]
+    fn run_write_query<'a>(
+        &mut self,
+        with: &'a [ast::Cte<'a>],
+        index: usize,
+        txn: &mut TxnState,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<&'a [&'a [u8]], SqlError> {
+        self.storage.set_read_snapshot(txn.command_id());
+        let mut earlier = ArenaList::new(arena);
+        for prior in 0..index {
+            if with[prior].dml.is_none() {
+                continue;
+            }
+            let (_, mut materialized) =
+                self.analyze_dml_cte(with, prior, earlier.as_slice(), txn, arena, params, guc)?;
+            materialized.source = Self::write_query_source(with, prior, params);
+            let materialized = arena
+                .alloc(materialized)
                 .map_err(|_| query::arena_full_pub())?;
-            mats.push((cte.name, &*mcte))
+            earlier
+                .push((with[prior].name, &*materialized))
                 .map_err(|_| query::arena_full_pub())?;
         }
-        Ok(Some(
-            arena
-                .alloc_slice_copy(mats.as_slice())
-                .map_err(|_| query::arena_full_pub())?,
-        ))
+        let (dml, _) =
+            self.analyze_dml_cte(with, index, earlier.as_slice(), txn, arena, params, guc)?;
+        Self::execute_dml_cte(
+            &mut self.storage,
+            &mut self.dml_scratch,
+            &self.work,
+            self.work.connection_id(),
+            dml,
+            txn,
+            arena,
+            params,
+            guc,
+            responder,
+        )
+    }
+
+    /// Runs the data-modifying `WITH` queries the main query did not read,
+    /// last written first, as PostgreSQL finishes them after the main query.
+    #[allow(clippy::too_many_arguments)]
+    fn run_unread_dml_ctes<'a>(
+        &mut self,
+        with: &'a [ast::Cte<'a>],
+        main: query::CteReader<'_>,
+        bound: &'a [(&'a str, &'a ast::MaterializedCte<'a>)],
+        txn: &mut TxnState,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<(), SqlError> {
+        if bound.iter().any(|(_, materialized)| {
+            matches!(materialized.source, ast::MaterializedCteSource::Write(_))
+        }) {
+            for (_, materialized) in bound.iter().rev() {
+                materialized.read_rows(arena)?;
+            }
+            return Ok(());
+        }
+        self.storage.set_read_snapshot(txn.command_id());
+        let mut mats = ArenaList::new(arena);
+        for materialized in bound {
+            mats.push(*materialized)
+                .map_err(|_| query::arena_full_pub())?;
+        }
+        for cte_index in (0..with.len()).rev() {
+            if with[cte_index].dml.is_none() || !query::dml_cte_runs_after(with, cte_index, main) {
+                continue;
+            }
+            let (dml, mut materialized) =
+                self.analyze_dml_cte(with, cte_index, mats.as_slice(), txn, arena, params, guc)?;
+            materialized.source = ast::MaterializedCteSource::Inline(Self::execute_dml_cte(
+                &mut self.storage,
+                &mut self.dml_scratch,
+                &self.work,
+                self.work.connection_id(),
+                dml,
+                txn,
+                arena,
+                params,
+                guc,
+                responder,
+            )?);
+            let materialized = arena
+                .alloc(materialized)
+                .map_err(|_| query::arena_full_pub())?;
+            mats.push((with[cte_index].name, &*materialized))
+                .map_err(|_| query::arena_full_pub())?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -15978,11 +16226,18 @@ impl Engine {
                         .is_none()
                 })
             });
+        // Every attempt reads under the statement's snapshot: a routine
+        // completed between attempts must not show its changes to the next.
+        let source_snapshot = self
+            .storage
+            .read_snapshot()
+            .min(txn.command_id().saturating_add(1));
         loop {
             if let Err(error) = sequence::rewind_replay_cursor(replay) {
                 return Ok(Err(error));
             }
             self.work.reset();
+            self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
             let attempt_arena_mark = arena.mark();
             let output_mark = responder.mark();
@@ -16096,9 +16351,27 @@ impl Engine {
         if let Err(error) = invocations.require_replay() {
             return Ok(Err(error));
         }
+        if let query::PendingRoutineTarget::WriteQuery(write) = pending.target {
+            return type_input_plans::with_owner(pending.plan_owner, || {
+                self.complete_pending_write(
+                    write,
+                    invocations,
+                    arena,
+                    work,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                )
+            });
+        }
         let outcome = type_input_plans::with_owner(pending.plan_owner, || {
             query::protect_statement_effects();
             let contract = match pending.target {
+                query::PendingRoutineTarget::WriteQuery(_) => {
+                    return Ok(Err(query::inactive_pending_call()));
+                }
                 query::PendingRoutineTarget::Stored(handle) => match arena.retained(handle) {
                     Some(contract) => contract,
                     None => return Ok(Err(query::inactive_pending_call())),
@@ -16449,11 +16722,9 @@ impl Engine {
             invocations.map(|invocations| query::RoutineInvocationContext::new(invocations, arena)),
             || {
                 let main = query::CteReader::Select(statement);
-                let dml_mats = match self.run_dml_ctes(
+                let dml_mats = match self.bind_dml_ctes(
                     statement.with,
                     main,
-                    false,
-                    &[],
                     txn,
                     arena,
                     params,
@@ -17678,11 +17949,10 @@ impl Engine {
             return Ok(Err(error));
         }
         let main = query::CteReader::Statement(statement);
-        let dml_mats =
-            match self.run_dml_ctes(ctes, main, false, &[], txn, arena, params, guc, responder) {
-                Ok(materialized) => materialized.unwrap_or(&[]),
-                Err(error) => return Ok(Err(error)),
-            };
+        let dml_mats = match self.bind_dml_ctes(ctes, main, txn, arena, params, guc, responder) {
+            Ok(materialized) => materialized.unwrap_or(&[]),
+            Err(error) => return Ok(Err(error)),
+        };
         let output_mark = responder.mark();
         let outcome = self.execute_with_main_statement(
             ctes, statement, dml_mats, params, txn, guc, responder, capture,
@@ -17720,9 +17990,9 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
-        let error = match self.run_dml_ctes(
-            with, main, true, dml_mats, txn, arena, params, guc, responder,
-        ) {
+        let error = match self
+            .run_unread_dml_ctes(with, main, dml_mats, txn, arena, params, guc, responder)
+        {
             Ok(_) => return Ok(()),
             Err(error) => error,
         };

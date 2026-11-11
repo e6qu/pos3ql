@@ -30,6 +30,15 @@ pub(crate) struct SourceCopy {
 const NODE: usize = usize::MAX;
 
 impl SourceCopy {
+    /// Records that the sublink querying `select` was written at byte `at`.
+    pub(crate) fn query(select: &crate::sql::ast::Select<'_>, at: usize) -> Self {
+        Self {
+            address: core::ptr::from_ref(select) as usize,
+            len: NODE,
+            at,
+        }
+    }
+
     /// Records that the constant `expression` was written at byte `at`.
     pub(crate) fn node(expression: &crate::sql::ast::Expr<'_>, at: usize) -> Self {
         Self {
@@ -247,6 +256,46 @@ pub(crate) fn at_expression(error: SqlError, expression: &crate::sql::ast::Expr<
     let position = expression_start(expression).map(|(at, source)| character_position(source, at));
     record(&error, position, None);
     error
+}
+
+/// Marks `error` as being about the node `expression` at the position the
+/// parser recorded for it: a subquery at its parenthesis, an `IN` or
+/// quantified sublink at its keyword or operator.
+pub(crate) fn at_node(error: SqlError, expression: &crate::sql::ast::Expr<'_>) -> SqlError {
+    let node = core::ptr::from_ref(expression) as usize;
+    let query = sublink_query(expression).map(|select| core::ptr::from_ref(select) as usize);
+    let source = SOURCE.with(Cell::get);
+    let position = (!source.copies.is_null())
+        .then(|| {
+            // with_statement_source keeps the copy map alive with its text.
+            let copies = unsafe { core::slice::from_raw_parts(source.copies, source.copies_len) };
+            let at = |address: usize| {
+                copies
+                    .iter()
+                    .find(|copy| copy.len == NODE && copy.address == address)
+                    .map(|copy| character_position(source, copy.at))
+            };
+            at(node).or_else(|| query.and_then(at))
+        })
+        .flatten();
+    record(&error, position, None);
+    error
+}
+
+/// The query of a sublink expression.
+pub(crate) fn sublink_query<'e, 'a>(
+    expression: &'e crate::sql::ast::Expr<'a>,
+) -> Option<&'e crate::sql::ast::Select<'a>> {
+    use crate::sql::ast::Expr;
+    match expression {
+        Expr::Subquery(select)
+        | Expr::ArraySubquery(select)
+        | Expr::Exists(select)
+        | Expr::RowSubquery { select, .. }
+        | Expr::InSubquery { select, .. }
+        | Expr::QuantifiedSubquery { select, .. } => Some(select),
+        _ => None,
+    }
 }
 
 /// One-based character position of byte offset `at` in the source text.

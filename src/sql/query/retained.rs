@@ -1892,6 +1892,7 @@ impl<'a> RetainedSelect<'a> {
         let subqueries = SubqueryValues {
             scalars: &[],
             lists: &[],
+            deferred: &[],
         };
         patch_subquery_column_types(
             statement.items,

@@ -1710,32 +1710,56 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
             }
         }
         // A scalar subquery is named by its single output column.
-        Expr::Subquery(select) => {
-            let mut select = *select;
-            while let Some(tree) = select.set_body {
-                let mut left = tree;
-                loop {
-                    match left {
-                        crate::sql::ast::SetTree::Select(leaf) => {
-                            select = leaf;
-                            break;
-                        }
-                        crate::sql::ast::SetTree::Op { left: branch, .. } => left = branch,
-                    }
+        Expr::Subquery(select) => first_output_name(select).unwrap_or("?column?"),
+        _ => "?column?",
+    }
+}
+
+/// The name of a query's first output column, as PostgreSQL names a scalar
+/// subquery after it. A star takes the first column of the relation it
+/// expands; a stored table's columns are not known here.
+fn first_output_name<'a>(select: &crate::sql::ast::Select<'a>) -> Option<&'a str> {
+    let mut select = select;
+    while let Some(tree) = select.set_body {
+        let mut left = tree;
+        loop {
+            match left {
+                crate::sql::ast::SetTree::Select(leaf) => {
+                    select = leaf;
+                    break;
                 }
-            }
-            match select.items.first() {
-                Some(SelectItem::Expr {
-                    alias: Some(alias), ..
-                }) => alias,
-                Some(SelectItem::Expr {
-                    expression,
-                    alias: None,
-                }) => derived_name(expression),
-                _ => "?column?",
+                crate::sql::ast::SetTree::Op { left: branch, .. } => left = branch,
             }
         }
-        _ => "?column?",
+    }
+    let relation_name = |table: &crate::sql::ast::TableRef<'a>| -> Option<&'a str> {
+        if let Some(name) = table.col_alias.and_then(|aliases| aliases.first()) {
+            return Some(name);
+        }
+        if let Some(subquery) = table.subquery {
+            return first_output_name(subquery);
+        }
+        table
+            .cte
+            .and_then(|materialized| materialized.column_names.first().copied())
+    };
+    match select.items.first()? {
+        SelectItem::Expr {
+            alias: Some(alias), ..
+        } => Some(alias),
+        SelectItem::Expr {
+            expression,
+            alias: None,
+        } => Some(derived_name(expression)),
+        SelectItem::Wildcard => relation_name(&select.from?.base),
+        SelectItem::TableWildcard(qualifier) => {
+            let from = select.from?;
+            core::iter::once(&from.base)
+                .chain(from.joins.iter().map(|join| &join.table))
+                .find(|table| table.alias.unwrap_or(table.table) == *qualifier)
+                .and_then(relation_name)
+        }
+        SelectItem::RecordStar(_) => None,
     }
 }
 
@@ -5042,17 +5066,22 @@ fn infer_type_unpositioned(
             table,
             name,
         } => {
+            // PostgreSQL positions a three-part reference at its start.
+            let positioned =
+                |error| crate::sql::error_position::column_reference(error, Some(schema), name);
             if columns.is_empty_scope() {
-                return Err(crate::sql::eval::empty_scope_column_error(
+                return Err(positioned(crate::sql::eval::empty_scope_column_error(
                     Some(table),
                     name,
-                ));
+                )));
             }
             // Composed-qualifier resolution, as the evaluator binds it: only
             // an unaliased base table of that schema answers.
             let mut composed = crate::util::StackStr::<130>::new();
             let _ = core::fmt::Write::write_fmt(&mut composed, format_args!("{schema}.{table}"));
-            of(columns.resolve(Some(composed.as_str()), name)?)
+            of(columns
+                .resolve(Some(composed.as_str()), name)
+                .map_err(positioned)?)
         }
         Expr::BitLit(_) => (oid::BIT, -1),
         Expr::Bool(_) => of(ColType::Bool),
@@ -5756,6 +5785,13 @@ fn infer_type_unpositioned(
             "__json_serialize_bytea" => of(ColType::Bytea),
             name if name.starts_with("__json_exists_") => of(ColType::Bool),
             "__json_value" => of(ColType::Text),
+            // A path assignment yields its base's type; an INSERT base starts
+            // as a NULL whose type the third argument names.
+            "__assign_path" => match args {
+                [Expr::Null, _, Expr::Int(type_oid), ..] => (*type_oid as i32, -1),
+                [base, ..] => infer_type_res(base, columns)?,
+                [] => of(ColType::Text),
+            },
             "__jsonb_subscript_set" | "__array_subscript_set" => {
                 let base = args
                     .first()

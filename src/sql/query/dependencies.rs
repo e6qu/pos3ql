@@ -1277,27 +1277,20 @@ pub(crate) fn validate_dml_assignment_casts(
             returning_output: None,
             arena,
         };
-        let assign = |name: &str, expression: &Expr<'_>| -> Result<(), SqlError> {
-            let index = target.column_index(name).ok_or_else(|| {
-                crate::sql::error_position::at_reference(
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
-                        name,
-                        target_name
-                    ),
-                    name,
+        let assign =
+            |name: &str, expression: &Expr<'_>, alias: Option<&str>| -> Result<(), SqlError> {
+                let index = target
+                    .column_index(name)
+                    .ok_or_else(|| undefined_set_target(name, target_name, alias, expression))?;
+                validate_assignment_expression(
+                    expression,
+                    Some(name),
+                    &target.columns()[index],
+                    &columns,
+                    storage,
+                    txid,
                 )
-            })?;
-            validate_assignment_expression(
-                expression,
-                Some(name),
-                &target.columns()[index],
-                &columns,
-                storage,
-                txid,
-            )
-        };
+            };
         let insert_values = |names: &[&str], values: &[&Expr<'_>]| -> Result<(), SqlError> {
             for (index, expression) in values.iter().enumerate() {
                 let column = if names.is_empty() {
@@ -1360,7 +1353,7 @@ pub(crate) fn validate_dml_assignment_casts(
                     .into_iter()
                     .flatten()
                 {
-                    assign(name, expression)?;
+                    assign(name, expression, None)?;
                 }
             }
             Stmt::Update(update) => {
@@ -1369,7 +1362,7 @@ pub(crate) fn validate_dml_assignment_casts(
                 }
                 for (name, expression) in update.assignments {
                     subquery_literals(expression, Some(&scope), storage, txid, arena)?;
-                    assign(name, expression)?;
+                    assign(name, expression, update.alias)?;
                 }
             }
             Stmt::Delete(delete) => {
@@ -1382,7 +1375,7 @@ pub(crate) fn validate_dml_assignment_casts(
                     match when.action() {
                         crate::sql::ast::MergeActionRef::Update(assignments) => {
                             for (name, expression) in assignments {
-                                assign(name, expression)?;
+                                assign(name, expression, merge.target_alias)?;
                             }
                         }
                         crate::sql::ast::MergeActionRef::Insert {
@@ -1467,7 +1460,20 @@ fn validate_insert_projection(
             else {
                 continue;
             };
-            let mut source_of = |_: &Expr<'_>| Ok(source);
+            // A merged target reads each written column it assigns.
+            let mut source_of = |value: &Expr<'_>| {
+                Ok(match value {
+                    Expr::Column {
+                        qualifier: Some(crate::sql::ast::INSERT_SUBSCRIPT_SOURCE),
+                        name,
+                    } => name
+                        .strip_prefix("column")
+                        .and_then(|ordinal| ordinal.parse::<usize>().ok())
+                        .and_then(|ordinal| sources[..count.min(sources.len())].get(ordinal - 1))
+                        .map_or(source, |(source, _)| *source),
+                    _ => source,
+                })
+            };
             let target_name = names.get(index).copied();
             if validate_subscript_assignment(
                 expression,
@@ -1798,10 +1804,10 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
 ) -> Result<(), SqlError> {
     let mark = arena.mark();
     let result = (|| {
-        let target_name = match statement {
-            Stmt::Insert(insert) => insert.table.name,
-            Stmt::Update(update) => update.table.name,
-            Stmt::Merge(merge) => merge.target.name,
+        let (target_name, alias) = match statement {
+            Stmt::Insert(insert) => (insert.table.name, None),
+            Stmt::Update(update) => (update.table.name, update.alias),
+            Stmt::Merge(merge) => (merge.target.name, merge.target_alias),
             _ => return Ok(()),
         };
         let target = scope.defs.get(0).expect("assignment target resolved");
@@ -1826,15 +1832,19 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
             let ordinal = index;
             let index = match name {
                 Some(name) => target.column_index(name).ok_or_else(|| {
-                    crate::sql::error_position::at_reference(
-                        sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column \"{}\" of relation \"{}\" does not exist",
+                    if matches!(statement, Stmt::Insert(_)) {
+                        crate::sql::error_position::at_reference(
+                            sql_err!(
+                                sqlstate::UNDEFINED_COLUMN,
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                name,
+                                target_name
+                            ),
                             name,
-                            target_name
-                        ),
-                        name,
-                    )
+                        )
+                    } else {
+                        undefined_set_target(name, target_name, alias, expression)
+                    }
                 })?,
                 None => index,
             };
@@ -2047,6 +2057,25 @@ fn validate_subscript_assignment(
     storage: &Storage,
     txid: u32,
 ) -> Result<bool, SqlError> {
+    if let Expr::Call {
+        name: "__assign_path",
+        args: [base, value, _, Expr::Str(kinds), operands @ ..],
+        ..
+    } = expression
+    {
+        validate_subscript_assignment(base, target_name, column, source_of, storage, txid)?;
+        validate_assignment_path(
+            value,
+            kinds,
+            operands,
+            target_name,
+            column,
+            source_of,
+            storage,
+            txid,
+        )?;
+        return Ok(true);
+    }
     let Expr::Call {
         name: name @ ("__jsonb_subscript_set" | "__array_subscript_set"),
         args: [base, value, ..],
@@ -2086,6 +2115,170 @@ fn validate_subscript_assignment(
         Some(name) => crate::sql::error_position::at_reference(error, name),
         None => error,
     })
+}
+
+/// PostgreSQL's unknown `SET` target: `SET t.a = 1` reads as column `t`,
+/// field `a`, so a target named like the relation gets a hint.
+pub(crate) fn undefined_set_target(
+    name: &str,
+    relation: &str,
+    alias: Option<&str>,
+    expression: &Expr<'_>,
+) -> SqlError {
+    let error = crate::sql::error_position::at_reference(
+        sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" of relation \"{}\" does not exist",
+            name,
+            relation
+        ),
+        name,
+    );
+    if is_indirect_assignment(expression) && name == alias.unwrap_or(relation) {
+        crate::sql::error_position::with_hint(
+            error,
+            "SET target columns cannot be qualified with the relation name.",
+        )
+    } else {
+        error
+    }
+}
+
+/// Whether an assigned value writes through a field or subscript.
+pub(crate) fn is_indirect_assignment(expression: &Expr<'_>) -> bool {
+    matches!(
+        expression,
+        Expr::Call {
+            name: "__assign_path" | "__jsonb_subscript_set" | "__array_subscript_set",
+            ..
+        }
+    )
+}
+
+/// PostgreSQL's `transformAssignmentIndirection` for a target through
+/// fields and element subscripts: each field must exist in a composite, and
+/// the value must coerce to the last field or element in assignment context.
+/// Errors are positioned at the target column.
+#[allow(clippy::too_many_arguments)]
+fn validate_assignment_path(
+    value: &Expr<'_>,
+    kinds: &str,
+    operands: &[&Expr<'_>],
+    target_name: Option<&str>,
+    column: &crate::storage::ColumnMeta,
+    source_of: &mut dyn FnMut(&Expr<'_>) -> Result<i32, SqlError>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let at_target = |error| match target_name {
+        Some(name) => crate::sql::error_position::at_reference(error, name),
+        None => error,
+    };
+    let type_name = |type_oid| crate::sql::catalog::format_type_name(storage, txid, type_oid);
+    let Some(mut container) = storage.routine_type_oid(column.ctype, column.user_type, txid) else {
+        return Ok(());
+    };
+    let mut target = crate::util::StackStr::<64>::from_str(column.name.as_str());
+    let mut subscripted = false;
+    let mut operands = operands.iter();
+    for kind in kinds.bytes() {
+        if kind != b'f' {
+            for _ in 0..match kind {
+                b'e' | b'l' | b'u' => 1,
+                b's' => 2,
+                _ => 0,
+            } {
+                operands.next();
+            }
+            let Some(element) = crate::sql::assignment_path::element_type_oid(container) else {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "cannot subscript type {} because it does not support subscripting",
+                    type_name(container)?.as_str()
+                ));
+            };
+            // A slice assigns an array of the container's type.
+            if kind == b'e' {
+                container = element;
+            }
+            subscripted = true;
+            continue;
+        }
+        let Some(Expr::Str(field)) = operands.next().copied() else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "assignment field step lacks its name"
+            ));
+        };
+        let creation = match crate::storage::NamedTypeKind::from_oid(container) {
+            Some((crate::storage::NamedTypeKind::Composite, creation, false)) => Some(creation),
+            // A table's row type is checked when the value is built.
+            _ if (crate::sql::types::oid::FIRST_TABLE_COMPOSITE
+                ..crate::sql::types::oid::FIRST_TABLE_COMPOSITE_ARRAY)
+                .contains(&container) =>
+            {
+                return Ok(());
+            }
+            _ => None,
+        };
+        let mut found = None;
+        let fields = crate::sql::exec::visit_catalog_composite_fields(
+            storage,
+            txid,
+            creation,
+            &mut |name, metadata| {
+                if found.is_none() && name == *field {
+                    found = Some(metadata.type_oid);
+                }
+            },
+        );
+        if fields.is_none() {
+            return Err(at_target(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "cannot assign to field \"{}\" of column \"{}\" because its type {} is not a composite type",
+                field,
+                target.as_str(),
+                type_name(container)?.as_str()
+            )));
+        }
+        let Some(field_type) = found else {
+            return Err(at_target(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "cannot assign to field \"{}\" of column \"{}\" because there is no such column in data type {}",
+                field,
+                target.as_str(),
+                type_name(container)?.as_str()
+            )));
+        };
+        container = field_type;
+        target = crate::util::StackStr::from_str(field);
+        subscripted = false;
+    }
+    let source = source_of(value)?;
+    if crate::sql::catalog::can_coerce_assignment(storage, txid, source, container) {
+        return Ok(());
+    }
+    let error = if subscripted {
+        sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "subscripted assignment to \"{}\" requires type {} but expression is of type {}",
+            target.as_str(),
+            type_name(container)?.as_str(),
+            type_name(source)?.as_str()
+        )
+    } else {
+        sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "subfield \"{}\" is of type {} but expression is of type {}",
+            target.as_str(),
+            type_name(container)?.as_str(),
+            type_name(source)?.as_str()
+        )
+    };
+    Err(at_target(crate::sql::error_position::with_hint(
+        error,
+        "You will need to rewrite or cast the expression.",
+    )))
 }
 
 /// [`validate_assignment_expression`] for a value of a known type.

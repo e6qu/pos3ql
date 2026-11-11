@@ -831,15 +831,14 @@ mod projected;
 use numeric_loops::NumericLoopFrames;
 pub(crate) use projected::{
     compare_projected_prefix, decode_projected_row_into, encode_projected_by_into,
-    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows, projected_row_len,
-    projected_row_len_by, projected_row_width, unpack_projected_rows,
+    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows,
+    pack_projected_rows_into, projected_row_len, projected_row_len_by, projected_row_width,
+    projected_rows_len, unpack_projected_rows,
 };
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,
     encode_projected_pub, projected_prefix_len, projected_value_len, sort_dedup_projected,
 };
-#[cfg(test)]
-pub(crate) use projected::{pack_projected_rows_into, projected_rows_len};
 
 mod ddl;
 pub(crate) use ddl::check_referenced_columns;
@@ -67384,11 +67383,17 @@ where
         }
         statement.columns.len()
     };
-    let typed_statement =
-        match type_insert_subscript_bases(statement, def, &targets[..n_targets], arena) {
-            Ok(statement) => statement,
-            Err(error) => return sql_fail(error),
-        };
+    let typed_statement = match type_insert_subscript_bases(
+        statement,
+        def,
+        &targets[..n_targets],
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        Ok(statement) => statement,
+        Err(error) => return sql_fail(error),
+    };
     let statement = &typed_statement;
     let source_assignment_casts = match source {
         InsertSource::MaterializedSelect { .. } => None,
@@ -68664,22 +68669,19 @@ pub(crate) fn update<'a>(
     };
     let mut targets = [0usize; MAX_COLUMNS];
     let mut updated_columns = ColumnSet::EMPTY;
-    for (i, (name, _)) in statement.assignments.iter().enumerate() {
+    for (i, (name, assigned)) in statement.assignments.iter().enumerate() {
         let Some(column) = def.column_index(name) else {
-            return sql_fail(crate::sql::error_position::at_reference(
-                sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" of relation \"{}\" does not exist",
-                    name,
-                    statement.table.name
-                ),
+            return sql_fail(super::query::undefined_set_target(
                 name,
+                statement.table.name,
+                statement.alias,
+                assigned,
             ));
         };
         if targets[..i].contains(&column) {
             return sql_fail(sql_err!(
                 sqlstate::SYNTAX_ERROR,
-                "multiple assignments to the same column \"{}\"",
+                "multiple assignments to same column \"{}\"",
                 name
             ));
         }
@@ -78241,10 +78243,19 @@ fn type_insert_subscript_bases<'a>(
     statement: &Insert<'a>,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     targets: &[usize],
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<Insert<'a>, SqlError> {
     let typed = |expression: &'a Expr<'a>, target: usize| {
-        typed_subscript_base(expression, def.columns()[target].ctype, arena)
+        let column = &def.columns()[target];
+        typed_assignment_path(
+            typed_subscript_base(expression, column.ctype, arena)?,
+            column,
+            storage,
+            txid,
+            arena,
+        )
     };
     let mut typed_statement = *statement;
     if let Some(select) = statement.select
@@ -78255,6 +78266,9 @@ fn type_insert_subscript_bases<'a>(
                     expression: Expr::Call {
                         name: "__jsonb_subscript_set",
                         args: [Expr::Null, ..],
+                        ..
+                    } | Expr::Call {
+                        name: "__assign_path",
                         ..
                     },
                     ..
@@ -78345,6 +78359,75 @@ fn typed_subscript_base<'e, 'a: 'e>(
     }
 }
 
+/// Names the column's type in an assignment through a field, which a NULL
+/// base (an INSERT target) needs.
+fn typed_assignment_path<'e, 'a: 'e>(
+    expression: &'e Expr<'a>,
+    column: &ColumnMeta,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'e Expr<'a>, SqlError> {
+    let Expr::Call {
+        kind,
+        name: name @ "__assign_path",
+        bound_oid,
+        bound_strict,
+        source_position,
+        args: [base, value, Expr::Null, rest @ ..],
+        argument_names,
+        variadic,
+        star,
+        distinct,
+        order_by,
+        over,
+        filter,
+    } = expression
+    else {
+        return Ok(expression);
+    };
+    // Targets of one INSERT column merge into a chain whose first base is
+    // the NULL every link starts from.
+    let base = typed_assignment_path(base, column, storage, txid, arena)?;
+    let type_oid = storage
+        .routine_type_oid(column.ctype, column.user_type, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "column type identity is unavailable"
+            )
+        })?;
+    let typed = arena
+        .alloc(Expr::Int(i64::from(type_oid)))
+        .map_err(|_| super::query::arena_full_pub())?;
+    let args = arena
+        .alloc_slice_with(rest.len() + 3, |index| match index {
+            0 => base,
+            1 => *value,
+            2 => &*typed,
+            _ => rest[index - 3],
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    arena
+        .alloc(Expr::Call {
+            kind: *kind,
+            name,
+            bound_oid: *bound_oid,
+            bound_strict: *bound_strict,
+            source_position: *source_position,
+            args,
+            argument_names,
+            variadic: *variadic,
+            star: *star,
+            distinct: *distinct,
+            order_by,
+            over: *over,
+            filter: *filter,
+        })
+        .map(|expression| &*expression)
+        .map_err(|_| super::query::arena_full_pub())
+}
+
 /// [`super::query::check_literal_operands_typed`] for a data-changing
 /// statement's condition over its one target table.
 fn check_dml_literal_operands<'a>(
@@ -78389,7 +78472,13 @@ fn eval_prepared_assignment<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let mut cast = casts.selected(expression, column, storage, txid)?;
     cast.input_collation = super::eval::coercion_input_collation(expression, row, hooks.catalog)?;
-    let expression = typed_subscript_base(expression, column.ctype, arena)?;
+    let expression = typed_assignment_path(
+        typed_subscript_base(expression, column.ctype, arena)?,
+        column,
+        storage,
+        txid,
+        arena,
+    )?;
     let value = eval_full(expression, arena, params, row, hooks)?;
     coerce_assignment(value, column, cast, storage, txid, arena, hooks.sequences)
 }
@@ -78457,29 +78546,39 @@ fn prepare_insert_select_casts<'a>(
     } else {
         statement.columns.len()
     };
-    // Subscripted targets are assigned from the written query's columns,
-    // which must match the target list.
+    // Targets with indirection are assigned from the written query's
+    // columns, one per written target before targets of one column merge.
     if let Some(crate::sql::ast::FromClause {
         base:
             crate::sql::ast::TableRef {
                 alias: Some(crate::sql::ast::INSERT_SUBSCRIPT_SOURCE),
                 subquery: Some(written),
+                col_alias: Some(written_targets),
                 ..
             },
         ..
     }) = select.from
     {
+        let written_count = written_targets.len();
         let mut width = 0usize;
         super::query::visit_projection_types(written, storage, txid, arena, outer, &mut |_, _| {
             width += 1;
             Ok(())
         })?;
-        if width < count {
-            return Err(insert_more_targets(statement.columns, width));
+        if width < written_count {
+            return Err(insert_more_targets(
+                if written_count == count {
+                    statement.columns
+                } else {
+                    &[]
+                },
+                width,
+            ));
         }
-        if width > count {
+        if width > written_count {
             return Err(insert_more_expressions(select_output_expression(
-                written, count,
+                written,
+                written_count,
             )));
         }
     }
@@ -78619,13 +78718,14 @@ fn insert_more_expressions(expression: Option<&Expr<'_>>) -> SqlError {
 /// PostgreSQL's error for an INSERT target column without an expression,
 /// positioned at the first such column.
 fn insert_more_targets(columns: &[&str], at: usize) -> SqlError {
-    crate::sql::error_position::at_reference(
-        sql_err!(
-            sqlstate::SYNTAX_ERROR,
-            "INSERT has more target columns than expressions"
-        ),
-        columns[at],
-    )
+    let error = sql_err!(
+        sqlstate::SYNTAX_ERROR,
+        "INSERT has more target columns than expressions"
+    );
+    match columns.get(at) {
+        Some(column) => crate::sql::error_position::at_reference(error, column),
+        None => error,
+    }
 }
 
 #[expect(

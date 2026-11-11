@@ -291,13 +291,22 @@ PostgreSQL inlines a SQL function's body
 `0A000`: aggregate inputs and grouping keys bind names to columns before the
 variable could win. A `STRICT` failure of a dynamic `EXECUTE` that waited
 for storage omits its `parameters:` detail. PL/pgSQL errors found while compiling a body (an unknown label, a duplicate
-declaration) have no cursor position. Assigning a composite
-column's field (`UPDATE t SET pair.x = 1`) is a syntax error; PostgreSQL
-assigns the field. A
-data-changing `WITH` query that the main query reads runs before the main
-query, in written order; PostgreSQL runs it when the main query first reads
-its rows, so a volatile function called after that point sees them and
-side effects interleave in reading order. `pg_sleep` and its
+declaration) have no cursor position. A materialized
+ordinary `WITH` query that calls a volatile function runs before the main
+query; PostgreSQL runs it when its rows are first read, as it now runs a
+data-changing one. A data-changing `WITH` inside a routine body fails
+(`WITH x AS (INSERT ...) SELECT ... INTO v` in PL/pgSQL is rejected as an
+unsupported body, `RETURN QUERY` reports the query unknown and a SQL-language
+function reports an internal error). An `IN`, `ANY` or `ALL` subquery that
+calls a volatile function runs before the expression containing it, where
+PostgreSQL runs it when evaluation reaches it. `RETURNING *` of an `UPDATE ...
+FROM` or `DELETE ... USING` returns only the target's columns, and `RETURNING
+s.*` for a `FROM` item `s` fails, where PostgreSQL returns every item's
+columns. A four-part column name (`a.b.c.d`) is a syntax error where
+PostgreSQL reports `cross-database references are not implemented`.
+`SELECT ... INTO` a composite PL/pgSQL variable from one composite column
+reports a field-count error where PostgreSQL assigns the column to the first
+field. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,

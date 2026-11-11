@@ -867,6 +867,7 @@ pub(crate) fn dispatch<'a>(
         && !name.starts_with("__json_query_")
         && name != "__jsonb_subscript_set"
         && name != "__array_subscript_set"
+        && name != "__assign_path"
         && name != "__json_format"
         && !matches!(
             name,
@@ -1004,6 +1005,96 @@ pub(crate) fn dispatch<'a>(
                     };
                 }
                 result
+            }
+            "__assign_path" => {
+                // (base, value, base type OID or NULL, kinds, operands...):
+                // `f` steps name a field, `e` steps take an element index.
+                let [base_expression, value, base_type, kinds, operands @ ..] = args else {
+                    return Err(arity_err("assignment through a field", args.len()));
+                };
+                let Expr::Str(kinds) = **kinds else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "path assignment lacks its step kinds"
+                    ));
+                };
+                let base = eval_full(base_expression, arena, params, row, hooks)?;
+                let base_type = match **base_type {
+                    Expr::Int(type_oid) => Some(type_oid as i32),
+                    _ => super::super::expression_type_identity(base_expression, row, hooks)
+                        .ok()
+                        .and_then(|identity| identity.known_oid()),
+                };
+                let value_expression = value;
+                let value = eval_full(value, arena, params, row, hooks)?;
+                // `f` names a field; `e` is an element; `s`, `l`, `u` and `a`
+                // are slices with both, the lower, the upper or no bound.
+                use crate::sql::array_assignment::AssignmentSubscript::{Element, Slice};
+                use crate::sql::assignment_path::Step;
+                let mut steps = [Step::Field(""); 32];
+                if kinds.len() > steps.len() {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "path assignment has too many steps"
+                    ));
+                }
+                let mut operands = operands.iter();
+                let mut operand = || {
+                    operands.next().copied().ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "path assignment steps lack an operand"
+                        )
+                    })
+                };
+                let bound = |operand: &Expr<'a>| -> Result<i32, SqlError> {
+                    assignment_subscript(eval_full(operand, arena, params, row, hooks)?)
+                };
+                for (slot, kind) in steps.iter_mut().zip(kinds.bytes()) {
+                    *slot = match kind {
+                        b'f' => match operand()? {
+                            Expr::Str(name) => Step::Field(name),
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "path assignment field step lacks its name"
+                                ));
+                            }
+                        },
+                        b'e' => Step::Subscript(Element(bound(operand()?)?)),
+                        b's' => Step::Subscript(Slice {
+                            lower: Some(bound(operand()?)?),
+                            upper: Some(bound(operand()?)?),
+                        }),
+                        b'l' => Step::Subscript(Slice {
+                            lower: Some(bound(operand()?)?),
+                            upper: None,
+                        }),
+                        b'u' => Step::Subscript(Slice {
+                            lower: None,
+                            upper: Some(bound(operand()?)?),
+                        }),
+                        _ => Step::Subscript(Slice {
+                            lower: None,
+                            upper: None,
+                        }),
+                    };
+                }
+                crate::sql::assignment_path::assign(
+                    base,
+                    base_type,
+                    &steps[..kinds.len()],
+                    value,
+                    hooks.catalog,
+                    arena,
+                )
+                // A constant fails its input conversion where it is written.
+                .map_err(|error| match **value_expression {
+                    Expr::Str(_) if error.sqlstate.as_str().starts_with("22") => {
+                        crate::sql::error_position::at_expression(error, value_expression)
+                    }
+                    _ => error,
+                })
             }
             "__array_subscript_set" => {
                 // (base, value, kinds, bounds...): `kinds` holds one letter

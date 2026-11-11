@@ -194,9 +194,26 @@ Syntax and errors:
   snapshot, as in PostgreSQL: in `WITH d AS (DELETE FROM t) INSERT INTO t
   VALUES (9)`, the delete removes only the rows that existed before the
   statement, and the main query sees a `WITH` query's changes only through
-  its `RETURNING` rows. One that nothing reads runs after the main query, the
-  last written first. One the main query reads runs before it, in written
-  order, where PostgreSQL runs it when its rows are first read.
+  its `RETURNING` rows. Each runs when the statement first reads its rows,
+  so in `WITH w AS (INSERT INTO t VALUES (1) RETURNING a) SELECT f(), (SELECT
+  a FROM w), f()` the first call of a volatile `f` does not see the new row
+  and the second does. One that nothing reads runs after the main query, the
+  last written first.
+- A scalar, `EXISTS` or `ARRAY` subquery that calls a volatile function, or
+  any subquery of a statement with a data-changing `WITH`, runs where
+  evaluation reaches it, once when it is uncorrelated, so its notices,
+  sequence values and writes interleave with the rest of the expression as
+  in PostgreSQL.
+- `UPDATE` and `INSERT` assign through composite fields and array elements:
+  `UPDATE t SET pair.x = 1, pair.y = 'a'`, `SET n.inner.x = 3`, `SET
+  a[2].x = 5`, `SET bag.arr[1:2] = '{1,2}'` and `INSERT INTO t (pair.x,
+  pair.y) VALUES (1, 'a')`. A NULL composite becomes a row of NULL fields
+  first. Several targets through one column apply left to right; any other
+  repeated target fails (`multiple assignments to same column "pair"`, or
+  `column "pair" specified more than once` in an `INSERT`). Values convert
+  as assignments do, and PostgreSQL's analysis errors are reported at the
+  target (`subfield "x" is of type integer but expression is of type
+  timestamp with time zone`, `cannot set a subfield to DEFAULT`).
 - A PL/pgSQL condition of another type converts through its text form as in
   PostgreSQL: `IF 1` is true and `IF 5` fails with `invalid input syntax for
   type boolean`.

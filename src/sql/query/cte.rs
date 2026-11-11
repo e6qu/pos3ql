@@ -3487,7 +3487,7 @@ fn frame_bound_mentions_column(
     }
 }
 
-fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
+pub(super) fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
     select_contains_function(select, &|name, arguments| {
         super::super::ast::is_volatile_function(name)
             || storage.has_volatile_function_routine_candidate(name, arguments, txid)

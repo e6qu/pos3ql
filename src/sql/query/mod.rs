@@ -288,8 +288,8 @@ pub(crate) use dependencies::collect_routine_parameter_defaults;
 pub(crate) use dependencies::collect_runtime_expression;
 pub(crate) use dependencies::collect_runtime_statement;
 pub(crate) use dependencies::{
-    for_each_dml_assignment, validate_dml_assignment_casts, visit_dml_assignment_types,
-    visit_projection_types,
+    for_each_dml_assignment, undefined_set_target, validate_dml_assignment_casts,
+    visit_dml_assignment_types, visit_projection_types,
 };
 
 pub(crate) fn stored_routine_dependencies(
@@ -954,6 +954,66 @@ pub(crate) struct PendingRoutineInvocation {
 pub(crate) enum PendingRoutineTarget {
     Stored(crate::mem::arena::ArenaHandle<OwnedRoutineCallContract>),
     Intrinsic(i32),
+    WriteQuery(PendingWriteQuery),
+}
+
+/// A data-modifying `WITH` query whose rows were first read. It runs at the
+/// invocation ordinal of that read; calls it makes take the ordinals after it.
+#[derive(Clone, Copy)]
+pub(crate) struct PendingWriteQuery {
+    with: (usize, usize),
+    pub index: usize,
+    params: (usize, usize),
+    pub ordinal: usize,
+}
+
+impl PendingWriteQuery {
+    fn key(&self) -> (usize, usize) {
+        (self.with.0, self.index)
+    }
+
+    /// The statement's `WITH` list and parameters.
+    ///
+    /// # Safety
+    /// The statement that raised this read is still executing: every loop that
+    /// completes a pending call owns the statement for longer than the call.
+    pub(crate) unsafe fn statement<'x>(&self) -> (&'x [super::ast::Cte<'x>], &'x [Datum<'x>]) {
+        unsafe {
+            (
+                core::slice::from_raw_parts(self.with.0 as *const super::ast::Cte<'x>, self.with.1),
+                core::slice::from_raw_parts(self.params.0 as *const Datum<'x>, self.params.1),
+            )
+        }
+    }
+}
+
+/// A completed data-modifying `WITH` query and its rows.
+#[derive(Clone, Copy)]
+struct WriteQueryResult {
+    key: (usize, usize),
+    /// The invocation log whose read ran the query, and that read's ordinal.
+    owner: u64,
+    ordinal: usize,
+    rows: OwnedRoutineResult,
+    replay: super::sequence::StatementReplayCursor,
+}
+
+/// Reads a data-modifying `WITH` query's rows for the running statement
+/// attempt, or makes its run the attempt's pending call.
+pub(crate) fn read_write_query<'a>(
+    source: &super::ast::WriteQuerySource<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((invocations, statement_arena)) = context else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "data-modifying WITH query \"{}\" was read outside its statement",
+                source.with[source.index].name
+            ));
+        };
+        invocations.resolve_write_query(source, statement_arena, arena)
+    })
 }
 
 impl PendingRoutineInvocation {
@@ -985,7 +1045,7 @@ impl PendingRoutineInvocation {
     }
 }
 
-pub(super) fn inactive_pending_call() -> SqlError {
+pub(crate) fn inactive_pending_call() -> SqlError {
     sql_err!(
         sqlstate::INTERNAL_ERROR,
         "pending routine call storage is inactive"
@@ -1365,6 +1425,15 @@ pub(crate) struct RoutineInvocationState {
     pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
     owner: ArenaIdentity,
     results: RefCell<RoutineResults>,
+    /// Identifies this log across relocation.
+    id: u64,
+    writes: RefCell<crate::mem::arena::RetainedList<WriteQueryResult>>,
+    /// The address of the log holding `writes` for a write query's run;
+    /// zero for the statement's own log.
+    writes_root: Cell<usize>,
+    /// The statement reads data-modifying `WITH` queries, so any attempt may
+    /// still restart after its main query has produced rows.
+    reads_writes: Cell<bool>,
     inputs: input_progress::RoutineInputs,
 }
 
@@ -1387,6 +1456,7 @@ impl<'scope, 'arena> RoutineInvocationContext<'scope, 'arena> {
 }
 
 thread_local! {
+    static INVOCATION_LOG_IDS: Cell<u64> = const { Cell::new(1) };
     static ACTIVE_ROUTINE_INVOCATIONS: Cell<Option<(*const (), *const ())>> = const { Cell::new(None) };
 }
 
@@ -1448,13 +1518,22 @@ pub(crate) fn statement_effect_epoch() -> u64 {
     STATEMENT_EFFECT_EPOCH.with(Cell::get)
 }
 
+/// Whether the running statement reads data-modifying `WITH` queries.
+pub(crate) fn statement_reads_write_queries() -> bool {
+    with_active_routine_invocations(|context| {
+        context.is_some_and(|(invocations, _)| invocations.reads_writes.get())
+    })
+}
+
 /// Whether the running statement attempt has invoked a routine whose result
 /// a later attempt would replay. Such an attempt may still restart, so its
 /// output must not leave for the client yet.
 pub(crate) fn statement_attempt_may_restart() -> bool {
     with_active_routine_invocations(|context| {
         context.is_some_and(|(invocations, _)| {
-            invocations.next.get() != 0 || invocations.pending.get().is_some()
+            invocations.next.get() != 0
+                || invocations.pending.get().is_some()
+                || invocations.reads_writes.get()
         })
     })
 }
@@ -1520,8 +1599,161 @@ impl RoutineInvocationState {
             pending_replay: Cell::new(None),
             owner: arena.identity(),
             results: RefCell::new(RoutineResults::new()),
+            id: INVOCATION_LOG_IDS.with(|next| {
+                let id = next.get();
+                next.set(id.wrapping_add(1));
+                id
+            }),
+            writes: RefCell::new(crate::mem::arena::RetainedList::new()),
+            writes_root: Cell::new(0),
+            reads_writes: Cell::new(false),
             inputs: input_progress::RoutineInputs::new(),
         }
+    }
+
+    /// Holds the statement's output until it completes: a data-modifying
+    /// `WITH` query nothing read yet runs after the main query.
+    pub(crate) fn hold_output_for_write_queries(&self) {
+        self.reads_writes.set(true);
+    }
+
+    /// The state holding the statement's completed write queries.
+    fn write_table(&self) -> &Self {
+        let root = self.writes_root.get();
+        if root == 0 {
+            self
+        } else {
+            // A child state lives only inside the call on its root that made it.
+            unsafe { &*(root as *const Self) }
+        }
+    }
+
+    /// The invocation log of one run of a pending write query. Its calls
+    /// replay inside that run only; completed write queries stay shared.
+    pub(crate) fn write_query_child(&self, arena: &Arena) -> Self {
+        let child = Self::new(arena, self.execution);
+        child
+            .writes_root
+            .set(core::ptr::from_ref(self.write_table()) as usize);
+        child
+    }
+
+    fn write_query(
+        &self,
+        arena: &Arena,
+        key: (usize, usize),
+    ) -> Result<Option<WriteQueryResult>, SqlError> {
+        self.writes
+            .borrow()
+            .with_slice(arena, |writes| {
+                writes.iter().find(|write| write.key == key).copied()
+            })
+            .map_err(|_| inactive_pending_call())
+    }
+
+    fn resolve_write_query<'query>(
+        &self,
+        source: &super::ast::WriteQuerySource<'_>,
+        statement_arena: &Arena,
+        query_arena: &'query Arena,
+    ) -> Result<&'query [&'query [u8]], SqlError> {
+        self.require_arena(statement_arena)?;
+        let key = (source.with.as_ptr() as usize, source.index);
+        let next = self.next.get();
+        if let Some(write) = self.write_table().write_query(statement_arena, key)? {
+            // A query first read here takes its ordinal in this log, and its
+            // first read in each attempt skips the sequence values it used. A
+            // query first read inside another query's run was skipped with it.
+            if write.owner == self.id {
+                if next == write.ordinal {
+                    self.next.set(next + 1);
+                    super::sequence::restore_replay_cursor(
+                        write.replay,
+                        super::sequence::ReplayInputPosition::KeepConsumed,
+                    )?;
+                } else if next < write.ordinal {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "data-modifying WITH query replay changed order"
+                    ));
+                }
+            }
+            let OwnedRoutineResult::Rows(rows) = write.rows else {
+                return Err(inactive_pending_call());
+            };
+            // The rows stay in the statement arena's retained tail until the
+            // statement ends, after every query that reads them; only the
+            // row index is built in the reading query's memory.
+            let statement_arena: &'query Arena = unsafe { &*core::ptr::from_ref(statement_arena) };
+            return rows.rows(statement_arena, query_arena);
+        }
+        self.next.set(next + 1);
+        self.pending_replay
+            .set(super::sequence::begin_replay_cursor()?);
+        self.pending.set(Some(PendingRoutineInvocation {
+            plan_owner: super::type_input_plans::owner()?,
+            source_position: None,
+            input_collation: super::ast::Collation::None,
+            access: super::eval::RoutineCallAccess::Caller,
+            target: PendingRoutineTarget::WriteQuery(PendingWriteQuery {
+                with: (source.with.as_ptr() as usize, source.with.len()),
+                index: source.index,
+                params: source.params,
+                ordinal: next,
+            }),
+            arguments: PendingRoutineInvocation::capture_arguments(&[], statement_arena)?,
+            argument_count: 0,
+        }));
+        Err(sql_err!(
+            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+            "data-modifying WITH query is pending"
+        ))
+    }
+
+    /// The sequence position where the pending call was first reached.
+    pub(crate) fn take_pending_replay(&self) -> Option<super::sequence::StatementReplayStart> {
+        self.pending_replay.take()
+    }
+
+    /// Records a finished write query at the ordinal of the read that ran it.
+    pub(crate) fn complete_write_query(
+        &self,
+        write: PendingWriteQuery,
+        rows: crate::mem::arena::FrozenArenaSliceHandle<u8>,
+        replay: Option<super::sequence::StatementReplayStart>,
+        arena: &Arena,
+        scratch: &Arena,
+    ) -> Result<(), SqlError> {
+        self.require_arena(arena)?;
+        if self.results.borrow().len() != write.ordinal {
+            return Err(inactive_pending_call());
+        }
+        let replay = super::sequence::finish_replay_cursor(replay, scratch)?;
+        let rows = OwnedRoutineResult::from_row_image(rows);
+        self.results
+            .borrow_mut()
+            .push(
+                arena,
+                RoutineInvocationResult {
+                    value: rows,
+                    replay,
+                },
+            )
+            .map_err(invocation_results::directory_error)?;
+        self.write_table()
+            .writes
+            .borrow_mut()
+            .push(
+                arena,
+                WriteQueryResult {
+                    key: write.key(),
+                    owner: self.id,
+                    ordinal: write.ordinal,
+                    rows,
+                    replay,
+                },
+            )
+            .map_err(invocation_results::directory_error)
     }
 
     pub(crate) fn require_arena(&self, arena: &Arena) -> Result<(), SqlError> {
@@ -12522,7 +12754,8 @@ pub(crate) fn subquery_result_type<'a>(
     arena: &'a Arena,
 ) -> Result<Option<SubqueryResultType>, SqlError> {
     let mark = arena.mark();
-    let result = subquery_result_type_inner(expression, outer_scope, storage, txid, arena);
+    let result = subquery_result_type_inner(expression, outer_scope, storage, txid, arena)
+        .map_err(|error| subquery::subquery_shape_position(error, expression));
     unsafe {
         arena.rewind_to(mark);
     }

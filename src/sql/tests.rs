@@ -51319,14 +51319,22 @@ fn merge_assignment_states_and_inheritance_selection_are_typed() {
         ["1|10"]
     );
 
-    for invalid in [
-        "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
-           ON target.id = source.id WHEN MATCHED THEN UPDATE SET value = 1, value = 2",
-        "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
-           ON target.id = source.id WHEN NOT MATCHED THEN INSERT (id, id) VALUES (1, 2)",
+    // PostgreSQL's rewriter and checkInsertTargets report these.
+    for (invalid, sqlstate) in [
+        (
+            "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
+               ON target.id = source.id WHEN MATCHED THEN UPDATE SET value = 1, value = 2",
+            "42601",
+        ),
+        (
+            "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
+               ON target.id = source.id WHEN NOT MATCHED THEN INSERT (id, id) VALUES (1, 2)",
+            "42701",
+        ),
     ] {
         assert!(
-            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, invalid)).contains("42601"),
+            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, invalid))
+                .contains(sqlstate),
             "{invalid}"
         );
     }

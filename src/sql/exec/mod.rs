@@ -17022,6 +17022,72 @@ struct ParsedTriggerLocalDecl<'a> {
     initial: Option<&'a Expr<'a>>,
     constant: bool,
     not_null: bool,
+    /// `name [NO] [SCROLL] CURSOR [(arguments)] FOR query`: a `refcursor`
+    /// local whose `OPEN` runs this query.
+    bound: Option<BoundPlpgsqlCursor<'a>>,
+}
+
+/// A bound cursor's declared query, as PostgreSQL's `cursor_explicit_expr`.
+#[derive(Clone, Copy)]
+struct BoundPlpgsqlCursor<'a> {
+    scroll: super::cursor::CursorScroll,
+    parameters: &'a [BoundCursorParameter<'a>],
+    query: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct BoundCursorParameter<'a> {
+    name: SqlName,
+    type_name: &'a str,
+}
+
+/// One argument of `OPEN c(...)`, already in declaration order and converted
+/// to its parameter's type; the query sees it under the parameter's name.
+#[derive(Clone, Copy)]
+struct BoundCursorArgument<'a> {
+    name: SqlName,
+    type_name: &'a str,
+    value: &'a Expr<'a>,
+}
+
+thread_local! {
+    /// The bound cursors of the program being parsed, for its `OPEN`s.
+    static BOUND_CURSORS: core::cell::Cell<(*const (), usize)> =
+        const { core::cell::Cell::new((core::ptr::null(), 0)) };
+}
+
+/// Runs `parse` with `locals` visible to [`bound_plpgsql_cursor`].
+fn with_bound_plpgsql_cursors<'a, T>(
+    locals: &'a [ParsedTriggerLocalDecl<'a>],
+    parse: impl FnOnce() -> T,
+) -> T {
+    struct Restore((*const (), usize));
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BOUND_CURSORS.with(|slot| slot.set(self.0));
+        }
+    }
+    let previous = BOUND_CURSORS.with(|slot| slot.replace((locals.as_ptr().cast(), locals.len())));
+    let _restore = Restore(previous);
+    parse()
+}
+
+/// The bound cursor declared as `name` in the program being parsed.
+fn bound_plpgsql_cursor<'a>(name: SqlName, _arena: &'a Arena) -> Option<BoundPlpgsqlCursor<'a>> {
+    let (pointer, len) = BOUND_CURSORS.with(core::cell::Cell::get);
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: `with_bound_plpgsql_cursors` publishes these declarations only
+    // while the program that owns them is parsed from the same arena, and
+    // restores the previous value before that borrow ends. Statements parsed
+    // in that window borrow the arena for the declarations' lifetime.
+    let locals =
+        unsafe { core::slice::from_raw_parts(pointer.cast::<ParsedTriggerLocalDecl<'a>>(), len) };
+    locals
+        .iter()
+        .find(|local| local.name == name)
+        .and_then(|local| local.bound)
 }
 
 /// A local declaration has either a complete type spelling or a catalog
@@ -17529,6 +17595,8 @@ struct PlpgsqlCursorOpen<'a> {
     variable: SqlName,
     scroll: super::cursor::CursorScroll,
     query: PlpgsqlCursorQuery<'a>,
+    /// A bound cursor's arguments, visible to its query by parameter name.
+    arguments: &'a [BoundCursorArgument<'a>],
 }
 
 #[derive(Clone, Copy)]
@@ -18900,18 +18968,21 @@ fn parse_trigger_local<'a>(
     if declaration.is_empty() {
         return Err(unsupported_trigger_body());
     }
-    // `name [NO] [SCROLL] CURSOR ... FOR query` declares a bound cursor.
-    let cursor = strip_trigger_keyword(declaration, "no")
-        .map(str::trim_start)
-        .unwrap_or(declaration);
-    let cursor = strip_trigger_keyword(cursor, "scroll")
-        .map(str::trim_start)
-        .unwrap_or(cursor);
-    if strip_trigger_keyword(cursor, "cursor").is_some() {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "PL/pgSQL bound cursor declarations are not supported; declare a refcursor and use OPEN ... FOR"
-        ));
+    if let Some(bound) = parse_bound_plpgsql_cursor(declaration, arena)? {
+        if constant || not_null || initial.is_some() {
+            return Err(unsupported_trigger_body());
+        }
+        return Ok(ParsedTriggerLocalDecl {
+            name,
+            ty: ParsedPlpgsqlLocalType::Named {
+                name: "refcursor",
+                type_mod: -1,
+            },
+            initial: None,
+            constant: false,
+            not_null: false,
+            bound: Some(bound),
+        });
     }
     let ty = if declaration.eq_ignore_ascii_case("record") {
         ParsedPlpgsqlLocalType::Record
@@ -18941,7 +19012,68 @@ fn parse_trigger_local<'a>(
         initial,
         constant,
         not_null,
+        bound: None,
     })
+}
+
+/// `[NO] [SCROLL] CURSOR [(name type, ...)] {FOR | IS} query` after a local's
+/// name. Locals merely named `scroll` or `cursor` are not cursors.
+fn parse_bound_plpgsql_cursor<'a>(
+    declaration: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<BoundPlpgsqlCursor<'a>>, SqlError> {
+    let (scroll, rest) = if let Some(rest) = strip_trigger_keyword(declaration, "no")
+        .and_then(|rest| strip_trigger_keyword(rest.trim_start(), "scroll"))
+    {
+        (super::cursor::CursorScroll::NoScroll, rest.trim_start())
+    } else if let Some(rest) = strip_trigger_keyword(declaration, "scroll") {
+        (super::cursor::CursorScroll::Scroll, rest.trim_start())
+    } else {
+        (super::cursor::CursorScroll::Default, declaration)
+    };
+    let Some(rest) = strip_trigger_keyword(rest, "cursor") else {
+        return Ok(None);
+    };
+    let mut rest = rest.trim_start();
+    let mut parameters = ProgramList::new(arena);
+    if rest.starts_with('(') {
+        // The first top-level token follows the parenthesized parameters.
+        let after = scan_trigger_top_level(rest, arena, |_, start, _| Ok(Some(start)))?
+            .ok_or_else(unsupported_trigger_body)?;
+        let list = rest[..after]
+            .trim_end()
+            .strip_suffix(')')
+            .ok_or_else(unsupported_trigger_body)?;
+        let (arguments, count) = split_trigger_arguments(&list[1..], arena)?;
+        for argument in arguments.iter().take(count).flatten() {
+            let (parameter, split) = parse_plpgsql_identifier_prefix(argument, arena)?;
+            let type_name = argument[split..].trim();
+            if type_name.is_empty() {
+                return Err(unsupported_trigger_body());
+            }
+            parameters.push(BoundCursorParameter {
+                name: parameter,
+                type_name,
+            })?;
+        }
+        rest = &rest[after..];
+    }
+    let query = strip_trigger_keyword(rest, "for")
+        .or_else(|| strip_trigger_keyword(rest, "is"))
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .ok_or_else(unsupported_trigger_body)?;
+    super::plpgsql_inputs::record(
+        super::plpgsql_inputs::Kind::Statement,
+        query.as_ptr() as usize,
+        query,
+        query,
+    )?;
+    Ok(Some(BoundPlpgsqlCursor {
+        scroll,
+        parameters: parameters.as_slice(),
+        query,
+    }))
 }
 
 fn strip_plpgsql_type_suffix<'a>(value: &'a str, suffix: &str) -> Option<&'a str> {
@@ -19728,6 +19860,15 @@ fn parse_trigger_for_header<'a>(
             TriggerForSource::Query(parse_plpgsql_query(source, source, arena)?),
         )));
     }
+    if let Ok((cursor, split)) = parse_plpgsql_identifier_prefix(source, arena)
+        && bound_plpgsql_cursor(cursor, arena).is_some()
+        && (source[split..].trim().is_empty() || source[split..].trim_start().starts_with('('))
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "FOR loops over bound cursors are not supported; OPEN the cursor and FETCH in a LOOP"
+        ));
+    }
     let reverse = if let Some(rest) = strip_trigger_keyword(source, "reverse") {
         source = rest.trim();
         true
@@ -20063,6 +20204,9 @@ fn parse_plpgsql_cursor_open<'a>(
     let body = body.trim();
     let (variable, split) = parse_plpgsql_identifier_prefix(body, arena)?;
     let body = body[split..].trim();
+    if let Some(bound) = bound_plpgsql_cursor(variable, arena) {
+        return parse_bound_cursor_open(variable, bound, body, arena).map(Some);
+    }
     let Some(for_at) = trigger_top_level_keyword(body, "for", arena)? else {
         return Err(unsupported_trigger_body());
     };
@@ -20099,7 +20243,123 @@ fn parse_plpgsql_cursor_open<'a>(
         variable,
         scroll,
         query,
+        arguments: &[],
     }))
+}
+
+/// `OPEN c [(arguments)]` of a bound cursor, checked as PostgreSQL's
+/// `read_cursor_args` does when the routine is created. Positional arguments
+/// precede named ones (`name := value` or `name => value`).
+fn parse_bound_cursor_open<'a>(
+    variable: SqlName,
+    bound: BoundPlpgsqlCursor<'a>,
+    body: &'a str,
+    arena: &'a Arena,
+) -> Result<PlpgsqlCursorOpen<'a>, SqlError> {
+    let syntax = |message: core::fmt::Arguments<'_>| {
+        let mut text = StackStr::<256>::new();
+        let _ = core::fmt::Write::write_fmt(&mut text, message);
+        sql_err!(sqlstate::SYNTAX_ERROR, "{}", text.as_str())
+    };
+    let name = variable.as_str();
+    if body.is_empty() {
+        if !bound.parameters.is_empty() {
+            return Err(syntax(format_args!("cursor \"{name}\" has arguments")));
+        }
+        return Ok(PlpgsqlCursorOpen {
+            variable,
+            scroll: bound.scroll,
+            query: PlpgsqlCursorQuery::Static(bound.query),
+            arguments: &[],
+        });
+    }
+    let Some(list) = body
+        .strip_prefix('(')
+        .and_then(|list| list.trim_end().strip_suffix(')'))
+    else {
+        return Err(syntax(format_args!(
+            "syntax error at or near \"{}\"",
+            body.split_ascii_whitespace().next().unwrap_or(body)
+        )));
+    };
+    if bound.parameters.is_empty() {
+        return Err(syntax(format_args!("cursor \"{name}\" has no arguments")));
+    }
+    let (sources, count) = split_trigger_arguments(list, arena)?;
+    if count > bound.parameters.len() {
+        return Err(syntax(format_args!(
+            "too many arguments for cursor \"{name}\""
+        )));
+    }
+    let mut values: [Option<&'a str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+    let mut named = false;
+    for (position, source) in sources.iter().take(count).flatten().enumerate() {
+        let assignment = scan_trigger_top_level(source, arena, |token, start, end| {
+            Ok(matches!(token, crate::sql::lexer::Tok::Op(":=" | "=>")).then_some((start, end)))
+        })?;
+        let (index, value) = match assignment {
+            Some((start, end)) => {
+                named = true;
+                let parameter = parse_plpgsql_identifier(source[..start].trim(), arena)?.name;
+                let index = bound
+                    .parameters
+                    .iter()
+                    .position(|candidate| candidate.name == parameter)
+                    .ok_or_else(|| {
+                        syntax(format_args!(
+                            "cursor \"{name}\" has no argument named \"{}\"",
+                            parameter.as_str()
+                        ))
+                    })?;
+                (index, source[end..].trim())
+            }
+            None if named => {
+                return Err(syntax(format_args!(
+                    "positional argument cannot follow named argument"
+                )));
+            }
+            None => (position, *source),
+        };
+        if values[index].is_some() {
+            return Err(syntax(format_args!(
+                "value for parameter \"{}\" of cursor \"{name}\" specified more than once",
+                bound.parameters[index].name.as_str()
+            )));
+        }
+        values[index] = Some(value);
+    }
+    if values[..bound.parameters.len()].iter().any(Option::is_none) {
+        return Err(syntax(format_args!(
+            "not enough arguments for cursor \"{name}\""
+        )));
+    }
+    let mut arguments = ProgramList::new(arena);
+    for (parameter, value) in bound.parameters.iter().zip(values) {
+        let value = value.expect("every parameter has a value");
+        // The value converts to the parameter's declared type, as an
+        // assignment does.
+        let converted = arena
+            .alloc_str_display(format_args!("CAST(({value}) AS {})", parameter.type_name))
+            .map_err(|_| super::query::arena_full_pub())?;
+        let expression = super::parser::parse_expr(converted, arena)?;
+        super::plpgsql_inputs::record(
+            super::plpgsql_inputs::Kind::Expression,
+            core::ptr::from_ref(expression) as usize,
+            converted,
+            value,
+        )?;
+        arguments.push(BoundCursorArgument {
+            name: parameter.name,
+            type_name: parameter.type_name,
+            value: expression,
+        })?;
+    }
+    Ok(PlpgsqlCursorOpen {
+        variable,
+        scroll: bound.scroll,
+        query: PlpgsqlCursorQuery::Static(bound.query),
+        arguments: arguments.as_slice(),
+    })
 }
 
 fn parse_plpgsql_cursor_motion<'a>(
@@ -20852,21 +21112,27 @@ fn parse_plpgsql_program_inner<'a>(
     let loop_labels = arena
         .alloc_slice_with(segments.len().max(1), |_| None)
         .map_err(|_| super::query::arena_full_pub())?;
-    let (body, ending) = parse_trigger_block(
-        segments,
-        &mut at,
-        arena,
-        loop_labels,
-        0,
-        false,
-        program_kind,
-    )?;
+    with_bound_plpgsql_cursors(locals, || {
+        parse_plpgsql_program_body(locals, segments, &mut at, arena, loop_labels, program_kind)
+    })
+}
+
+fn parse_plpgsql_program_body<'a>(
+    locals: &'a [ParsedTriggerLocalDecl<'a>],
+    segments: &'a [&'a str],
+    at: &mut usize,
+    arena: &'a Arena,
+    loop_labels: &mut [Option<SqlName>],
+    program_kind: PlpgsqlProgramKind,
+) -> Result<ParsedTriggerProgram<'a>, SqlError> {
+    let (body, ending) =
+        parse_trigger_block(segments, at, arena, loop_labels, 0, false, program_kind)?;
     let body = match ending {
         TriggerBlockEnd::End => body,
         TriggerBlockEnd::Exception => {
             let exception = parse_trigger_exception_handlers(
                 segments,
-                &mut at,
+                at,
                 arena,
                 loop_labels,
                 0,
@@ -20881,7 +21147,7 @@ fn parse_plpgsql_program_inner<'a>(
         }
         _ => return Err(unsupported_trigger_body()),
     };
-    if at != segments.len() {
+    if *at != segments.len() {
         return Err(unsupported_trigger_body());
     }
     Ok(ParsedTriggerProgram {
@@ -26497,10 +26763,13 @@ fn prepare_static_plpgsql_statement<'a>(
             source: TriggerForSource::Query(query),
             ..
         }) => (Kind::Query, core::ptr::from_ref(query) as usize),
+        // A bound cursor's arguments are variables only its query sees:
+        // its inputs are checked when OPEN binds the query with them.
         TriggerStatement::Utility { source, .. }
         | TriggerStatement::Dml { source, .. }
         | TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
             query: PlpgsqlCursorQuery::Static(source),
+            arguments: [],
             ..
         }) => (Kind::Statement, source.as_ptr() as usize),
         _ => return Ok((statement, None)),
@@ -27174,6 +27443,55 @@ fn execute_trigger_step<'a>(
                         scope.cursor_locals(context.storage(), context.txn.txid, context.arena)?
                     } else {
                         &[]
+                    };
+                    // A bound cursor's arguments precede, and so shadow, the
+                    // routine's variables of the same names.
+                    let captured = if statement.arguments.is_empty() {
+                        captured
+                    } else {
+                        let all = context
+                            .arena
+                            .alloc_slice_with(statement.arguments.len() + captured.len(), |_| {
+                                super::cursor::CursorLocal {
+                                    name: SqlName::EMPTY,
+                                    type_oid: 0,
+                                    value: Datum::Null,
+                                }
+                            })
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        for (slot, argument) in all.iter_mut().zip(statement.arguments) {
+                            let declared = resolve_routine_type(
+                                context.storage(),
+                                context.txn.txid,
+                                argument.type_name,
+                            )?;
+                            let type_oid = context
+                                .storage()
+                                .routine_type_oid(
+                                    declared.ctype,
+                                    declared.user_type,
+                                    context.txn.txid,
+                                )
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_OBJECT,
+                                        "type \"{}\" does not exist",
+                                        argument.type_name
+                                    )
+                                })?;
+                            *slot = super::cursor::CursorLocal {
+                                name: argument.name,
+                                type_oid,
+                                value: eval_procedural_expression(
+                                    context,
+                                    argument.value,
+                                    &scope,
+                                    None,
+                                )?,
+                            };
+                        }
+                        all[statement.arguments.len()..].copy_from_slice(captured);
+                        &*all
                     };
                     let PlpgsqlExecHost::Routine {
                         engine,

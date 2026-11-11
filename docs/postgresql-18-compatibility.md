@@ -117,6 +117,13 @@ Functions and expressions:
   fails with `22023`.
 - An unmatched PL/pgSQL `CASE` without `ELSE` raises `20000` (`case not found`,
   hint `CASE statement is missing ELSE part.`).
+- PL/pgSQL bound cursors (`c [NO] [SCROLL] CURSOR [(lo int, hi int)] FOR
+  query` in `DECLARE`) open with `OPEN c` or `OPEN c(2, hi := 3)`; arguments
+  convert to their declared types and the query reads them by name. As in
+  PostgreSQL 18 the variable stays NULL until `OPEN` names the portal, and
+  argument mistakes fail with `42601` when the routine is created.
+  `FOR rec IN c LOOP` over a bound cursor is rejected with `0A000`; open the
+  cursor and `FETCH` in a `LOOP` instead.
 - User error codes such as `PZ001` behave as ordinary errors: `WHEN SQLSTATE
   'PZ001'`, `'PZ000'` (category match), or `WHEN OTHERS` catch them.
 - `pg_input_is_valid` and `pg_input_error_info` report invalid values, but an

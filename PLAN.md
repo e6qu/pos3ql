@@ -104,10 +104,10 @@ is owned.
   cursor returns saved values where PostgreSQL evaluates a volatile output
   list again, and a row-locking cursor over a join, or ordered by an
   expression that is not a source column, locks its rows at `DECLARE`.
-  PL/pgSQL bound cursor declarations (`c CURSOR FOR ...` in `DECLARE`) are
-  rejected with `0A000`; a `refcursor` opened with `OPEN ... FOR` works. Saving a held cursor at
-  commit yields during storage waits. Cursors keep declared record and domain
-  types after their source query ends.
+  PL/pgSQL `FOR rec IN c LOOP` over a bound cursor is rejected with `0A000`;
+  it needs a loop frame that opens, fetches and closes the cursor across
+  waits. Saving a held cursor at commit yields during storage waits. Cursors
+  keep declared record and domain types after their source query ends.
 
 **Done when:**
 

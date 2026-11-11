@@ -18364,7 +18364,58 @@ struct TriggerDmlScope<'t, 'r, 'v, 'd> {
     outer: &'t dyn ColumnLookup<'v>,
 }
 
+impl<'v> TriggerDmlScope<'_, '_, 'v, '_> {
+    /// The level whose whole row `table` names: the written row's tables,
+    /// else a trigger's `NEW` or `OLD` or a routine's row variable.
+    fn whole_row_owner(&self, table: &str) -> &dyn ColumnLookup<'v> {
+        if self.row.whole_row_type(table).is_some() {
+            self.row
+        } else {
+            self.outer
+        }
+    }
+}
+
 impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.whole_row_owner(table).whole_row_type(table)
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<Option<&'v [RecordField<'v>]>, SqlError> {
+        self.whole_row_owner(table).whole_row_fields(table, arena)
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::eval::CatalogAccess>,
+    ) -> Option<(StackStr<64>, StaticTypeMeta)> {
+        self.whole_row_owner(table)
+            .whole_row_field_metadata(table, index, catalog)
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<&'v [RecordField<'v>], SqlError> {
+        self.whole_row_owner(table)
+            .whole_row_expansion_fields(table, arena)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        self.whole_row_owner(table).whole_row_present(table)
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.whole_row_owner(table).whole_row_is_scalar(table)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if matches!(qualifier, Some("old" | "new"))
             || self.outer.column_type_oid(qualifier, name).is_some()
@@ -24094,6 +24145,20 @@ where
     // A counting pass would also execute source functions. Stage each row once.
     let mut rows = crate::mem::arena::ArenaList::new_persistent(result_arena);
     let live = crate::sql::sequence::SeqEval::new(storage, execution.seq_session, txid);
+    // The source's own `WITH` names relations only it reads.
+    let select = if select.with.is_empty() {
+        select
+    } else {
+        super::query::expand_ctes_exec(
+            select,
+            storage,
+            txid,
+            query_arena,
+            execution.params,
+            &[],
+            Some(&live),
+        )?
+    };
     super::query::select_into_rows_recycling(
         storage,
         txid,
@@ -66640,6 +66705,7 @@ pub(crate) fn merge<'a>(
         txn.txid,
         arena,
         None,
+        outer,
     ) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
@@ -66700,6 +66766,7 @@ pub(crate) fn merge<'a>(
         txn.txid,
         arena,
         None,
+        outer,
     ) {
         Ok(definition) => definition,
         Err(error) => return sql_fail(error),
@@ -66741,13 +66808,16 @@ pub(crate) fn merge<'a>(
     let mut source_capacity = 0usize;
     let mut source_rows_ptr: *mut &[u8] = core::ptr::null_mut();
     let source_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+    let source_outer = outer.map(crate::sql::eval::EnclosingRow);
     if let Err(e) = super::query::select_into_rows(
         storage,
         txn.txid,
         &source_select,
         arena,
         params,
-        None,
+        source_outer
+            .as_ref()
+            .map(|row| row as &dyn ColumnLookup<'_>),
         Some(&source_sequences),
         &mut |values| {
             let encoded = encode_projected_pub(values, arena)?;
@@ -71215,12 +71285,13 @@ where
                 for (index, expression) in row_exprs.iter().enumerate() {
                     subquery_expressions[index] = Some(expression);
                 }
-                let subqueries = match super::query::subquery_hooks(
+                let subqueries = match super::query::subquery_hooks_with_outer(
                     &subquery_expressions[..row_exprs.len()],
                     storage,
                     txn.txid,
                     arena,
                     params,
+                    transition,
                     Some(&crate::sql::sequence::SeqEval::new(
                         storage,
                         seq_session,
@@ -72140,12 +72211,13 @@ pub(crate) fn update<'a>(
             subquery_expression_count += 1;
         }
     }
-    let subs = match super::query::subquery_hooks(
+    let subs = match super::query::subquery_hooks_with_outer(
         &subquery_expressions[..subquery_expression_count],
         storage,
         txn.txid,
         arena,
         params,
+        outer,
         Some(&crate::sql::sequence::SeqEval::new(
             storage,
             seq_session,

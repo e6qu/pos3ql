@@ -524,6 +524,91 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
     }
 }
 
+/// An enclosing row read by a query whose own values live shorter than the
+/// row's, such as a routine's variables read by a statement's derived source.
+/// Whole-row expansion allocates in the row's own arena, which a shorter
+/// query cannot supply, so it fails loudly as in any other row without it.
+pub(crate) struct EnclosingRow<'s, 'a>(pub(crate) &'s dyn ColumnLookup<'a>);
+
+impl<'b, 'a: 'b> ColumnLookup<'b> for EnclosingRow<'_, 'a> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'b>, SqlError> {
+        self.0.lookup(qualifier, name)
+    }
+
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        self.0.procedural_variable(qualifier, name)
+    }
+
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.0.column_type_mod(qualifier, name)
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.0.resolve_column_type(qualifier, name)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.0.is_empty_scope()
+    }
+
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'b>, SqlError> {
+        self.0.recursive_state(qualifier, index)
+    }
+
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        self.0.column_identity(qualifier, name)
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn CatalogAccess>,
+    ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        self.0.whole_row_field_metadata(table, index, catalog)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        self.0.whole_row_present(table)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.0.col_type(qualifier, name)
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.0.column_type_oid(qualifier, name)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.0.collation(qualifier, name)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        self.0.column_user_type(qualifier, name)
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.0.whole_row_is_scalar(table)
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.0.whole_row_type(table)
+    }
+}
+
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
 
@@ -3875,8 +3960,8 @@ fn array_subscripts<'a>(
                 slice: false,
             },
             Expr::Slice { lower, upper, .. } => ReadSubscript {
-                lower: lower.map(&bound).transpose()?,
-                upper: upper.map(&bound).transpose()?,
+                lower: lower.map(bound).transpose()?,
+                upper: upper.map(bound).transpose()?,
                 slice: true,
             },
             _ => unreachable!("the chain holds subscripts"),

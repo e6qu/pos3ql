@@ -1005,12 +1005,21 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         table: &ast::TableRef<'a>,
         columns: &dyn ColTypeResolver,
         row: &dyn ColumnLookup<'a>,
+        enclosing: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<(), SqlError>
     where
         'storage: 'a,
     {
+        // A plain derived table reads only the levels around its query; a
+        // LATERAL one also reads the tables beside it.
         if let Some(query) = table.subquery {
-            self.select(query, Some(row), None)?;
+            let unenclosed = crate::sql::eval::NoColumns;
+            let outer = match (table.lateral, enclosing) {
+                (true, _) => row,
+                (false, Some(enclosing)) => enclosing,
+                (false, None) => &unenclosed,
+            };
+            self.select(query, Some(outer), None)?;
         }
         if let Some(arguments) = table.func_args {
             for expression in arguments {
@@ -1057,7 +1066,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         }
         if let Some(group) = table.rows_from {
             for table in group {
-                self.table_ref(table, columns, row)?;
+                self.table_ref(table, columns, row, enclosing)?;
             }
         }
         Ok(())
@@ -1102,7 +1111,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 let mark = arena.mark();
                 let result: Result<(), SqlError> = (|| {
                     let output = super::srf::describe_derived_definition(
-                        storage, select, "", None, txid, arena, None,
+                        storage, select, "", None, txid, arena, None, outer,
                     )?;
                     // Set outputs can repeat names such as ?column?. Bind by
                     // ordinal so one output never acquires a sibling's type.
@@ -1172,9 +1181,9 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             catalog: Some(&catalog),
         };
         if let Some(from) = select.from {
-            self.table_ref(&from.base, &columns, &row)?;
+            self.table_ref(&from.base, &columns, &row, outer)?;
             for join in from.joins {
-                self.table_ref(&join.table, &columns, &row)?;
+                self.table_ref(&join.table, &columns, &row, outer)?;
                 if let Some(expression) = join.on {
                     self.expression(expression, &columns, &row)?;
                 }
@@ -1499,6 +1508,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             extra,
             self.txid,
             self.arena,
+            outer.map(|outer| outer as &dyn ColumnLookup<'_>),
         )?;
         let schema = super::materialize::ScopeSchema(&scope);
         let row = super::Chained {
@@ -1511,9 +1521,9 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             catalog: Some(&catalog),
         };
         if let Some(from) = extra {
-            self.table_ref(&from.base, &columns, &row)?;
+            self.table_ref(&from.base, &columns, &row, outer)?;
             for join in from.joins {
-                self.table_ref(&join.table, &columns, &row)?;
+                self.table_ref(&join.table, &columns, &row, outer)?;
                 if let Some(expression) = join.on {
                     self.expression(expression, &columns, &row)?;
                 }

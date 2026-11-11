@@ -3265,7 +3265,7 @@ pub enum LockWait {
 }
 
 /// PostgreSQL's table-level lock modes, weakest to strongest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TableLockMode {
     AccessShare,
     RowShare,
@@ -5721,6 +5721,11 @@ pub enum AlterStatisticsAction<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParameterSource {
     SqlRoutine,
+    /// `p.f` in a SQL-language routine, where `p` names a composite
+    /// parameter: a column `f` of a FROM item `p` wins, and otherwise the
+    /// reference is field `f` (the node's `name`) of parameter `index`, as
+    /// PostgreSQL's `sql_fn_post_column_ref` resolves it.
+    SqlRoutineField,
     PlpgsqlCursor,
 }
 
@@ -5878,11 +5883,10 @@ pub enum Expr<'a> {
         operand: Option<&'a Expr<'a>>,
         whens: &'a [(&'a Expr<'a>, &'a Expr<'a>)],
         otherwise: Option<&'a Expr<'a>>,
-        /// True when this `CASE` is the desugaring of a syntactic construct that
-        /// is not itself a `CASE` — `IS TRUE`, `IS DISTINCT FROM`. PostgreSQL
-        /// labels those output columns `?column?`, not `case`, so the flag lets
-        /// naming tell them from a `CASE` the query actually wrote.
-        synthetic: bool,
+        /// The syntax this node represents. PostgreSQL labels `IS TRUE` and
+        /// `IS DISTINCT FROM` output columns `?column?`, not `case`, and
+        /// deparses them in their own spelling.
+        origin: CaseOrigin,
     },
     /// The DEFAULT keyword inside INSERT VALUES.
     DefaultMarker,
@@ -5967,6 +5971,21 @@ pub enum Expr<'a> {
         array: &'a Expr<'a>,
         all: bool,
     },
+}
+
+/// The SQL construct an [`Expr::Case`] node was parsed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseOrigin {
+    /// A `CASE` expression the query wrote.
+    Written,
+    /// `x IS [NOT] TRUE` (`value`) or `x IS [NOT] FALSE`: one `WHEN` whose
+    /// condition is `x`, or `NOT x` for `FALSE`.
+    BooleanTest { value: bool, negated: bool },
+    /// `x IS [NOT] DISTINCT FROM y`: `WHEN x IS NULL AND y IS NULL`, then
+    /// `WHEN x IS NULL OR y IS NULL`, else the `=` comparison of `x` and `y`
+    /// (negated for `IS DISTINCT FROM`), as PostgreSQL's `DistinctExpr` calls
+    /// the equality operator's function.
+    DistinctFrom { negated: bool },
 }
 
 pub(crate) fn is_volatile_function(name: &str) -> bool {
@@ -6090,7 +6109,66 @@ fn is_nonimmutable_function(name: &str) -> bool {
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
-impl Expr<'_> {
+impl<'a> Expr<'a> {
+    /// The operands of `x IS [NOT] DISTINCT FROM y` and whether it is negated
+    /// (`IS NOT DISTINCT FROM`).
+    pub(crate) fn distinct_from_operands(&self) -> Option<(&'a Expr<'a>, &'a Expr<'a>, bool)> {
+        let Expr::Case {
+            origin: CaseOrigin::DistinctFrom { negated },
+            otherwise: Some(otherwise),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let otherwise: &'a Expr<'a> = otherwise;
+        let equality: &'a Expr<'a> = match otherwise {
+            Expr::Unary {
+                operator: UnaryOp::Not,
+                operand,
+                ..
+            } if !negated => operand,
+            _ if *negated => otherwise,
+            _ => return None,
+        };
+        match equality {
+            Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } => Some((left, right, *negated)),
+            _ => None,
+        }
+    }
+
+    /// The operand of `x IS [NOT] TRUE/FALSE`, the tested value and whether
+    /// the test is negated.
+    pub(crate) fn boolean_test_operand(&self) -> Option<(&'a Expr<'a>, bool, bool)> {
+        let Expr::Case {
+            origin: CaseOrigin::BooleanTest { value, negated },
+            whens: [(condition, _)],
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let condition: &'a Expr<'a> = condition;
+        let operand = if *value {
+            condition
+        } else {
+            match condition {
+                Expr::Unary {
+                    operator: UnaryOp::Not,
+                    operand,
+                    ..
+                } => operand,
+                _ => return None,
+            }
+        };
+        Some((operand, *value, *negated))
+    }
+
     pub(crate) const fn source_position(&self) -> SourcePosition {
         match self {
             Self::Call {

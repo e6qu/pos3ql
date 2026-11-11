@@ -25,6 +25,8 @@ pub(crate) enum Destination {
     Assignment(i32),
     /// A boolean condition (CHECK, policy and trigger qualifications).
     Condition,
+    /// A value of its own type, such as a select-list item.
+    Value,
 }
 
 pub(crate) struct Context<'s> {
@@ -70,6 +72,7 @@ pub(crate) fn deparse<'a>(
     match destination {
         Destination::Assignment(target) => context.assigned(expression, target, &mut output)?,
         Destination::Condition => context.write(expression, Some(oid::BOOL), &mut output)?,
+        Destination::Value => context.write(expression, None, &mut output)?,
     }
     Ok(output.supported.then(|| output.text.as_str()))
 }
@@ -760,10 +763,58 @@ impl Context<'_> {
                 output.push(")")
             }
             Expr::Case {
+                origin: crate::sql::ast::CaseOrigin::DistinctFrom { .. },
+                ..
+            } => {
+                let Some((left, right, negated)) = expression.distinct_from_operands() else {
+                    return output.unsupported();
+                };
+                // PostgreSQL parses `IS NOT DISTINCT FROM` as the negation of
+                // a DistinctExpr.
+                if negated {
+                    self.open(output)?;
+                    output.push("NOT ")?;
+                }
+                let (left_type, right_type) = self.operand_types(left, right)?;
+                self.open(output)?;
+                let parent = Parent::Operator("IS DISTINCT FROM");
+                self.wrapped(left, Some(left_type), parent, true, output)?;
+                output.push(" IS DISTINCT FROM ")?;
+                self.wrapped(right, Some(right_type), parent, false, output)?;
+                self.close(output)?;
+                if negated {
+                    self.close(output)?;
+                }
+                Ok(())
+            }
+            Expr::Case {
+                origin: crate::sql::ast::CaseOrigin::BooleanTest { .. },
+                ..
+            } => {
+                let Some((operand, value, negated)) = expression.boolean_test_operand() else {
+                    return output.unsupported();
+                };
+                self.open(output)?;
+                self.wrapped(
+                    operand,
+                    Some(Some(oid::BOOL)),
+                    Parent::NullTest,
+                    true,
+                    output,
+                )?;
+                output.push(match (value, negated) {
+                    (true, false) => " IS TRUE",
+                    (true, true) => " IS NOT TRUE",
+                    (false, false) => " IS FALSE",
+                    (false, true) => " IS NOT FALSE",
+                })?;
+                self.close(output)
+            }
+            Expr::Case {
                 operand: None,
                 whens,
                 otherwise,
-                synthetic: false,
+                origin: crate::sql::ast::CaseOrigin::Written,
             } => {
                 let Some((_, first)) = whens.first() else {
                     return output.unsupported();
@@ -948,7 +999,17 @@ fn simple(expression: &Expr<'_>, parent: Parent, first: bool) -> bool {
         } => connective(Some(*kind)),
         Expr::Binary { operator: kind, .. } => operator_symbol(*kind).is_some_and(operator),
         Expr::Like { .. } | Expr::Match { .. } => operator("~~"),
-        Expr::IsNull { .. } => matches!(parent, Parent::Connective(_) | Parent::Not),
+        Expr::IsNull { .. }
+        | Expr::Case {
+            origin:
+                crate::sql::ast::CaseOrigin::BooleanTest { .. }
+                | crate::sql::ast::CaseOrigin::DistinctFrom { negated: false },
+            ..
+        } => matches!(parent, Parent::Connective(_) | Parent::Not),
+        Expr::Case {
+            origin: crate::sql::ast::CaseOrigin::DistinctFrom { negated: true },
+            ..
+        } => connective(None),
         _ => false,
     }
 }
@@ -1137,7 +1198,7 @@ pub(crate) fn view_definition<'a>(
             operand: None,
             whens,
             otherwise,
-            synthetic: false,
+            origin: crate::sql::ast::CaseOrigin::Written,
         } = expression
         {
             // The indented layout starts a searched CASE on its own line.

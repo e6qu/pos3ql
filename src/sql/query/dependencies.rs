@@ -1447,6 +1447,134 @@ pub(crate) fn validate_dml_assignment_casts(
     result
 }
 
+/// PostgreSQL checks `EXECUTE` on every function a data-changing plan calls
+/// when its executor starts, so a revoked function fails even when no row
+/// matches: assignments, conditions, `ON CONFLICT` and `MERGE` actions and
+/// `RETURNING` lists. Rows reaching evaluation are checked again there.
+pub(crate) fn require_dml_builtin_execute<'a>(
+    statement: &Stmt<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let catalog = super::storage_catalog(storage, arena, txid);
+    if !crate::sql::eval::CatalogAccess::routine_privileges_present(&catalog) {
+        return Ok(());
+    }
+    let (target, alias) = match statement {
+        Stmt::Update(update) => (update.table, update.alias),
+        Stmt::Delete(delete) => (delete.table, delete.alias),
+        // `VALUES` and `SELECT` sources are checked as they are evaluated.
+        Stmt::Insert(insert)
+            if insert.returning.items.is_empty()
+                && insert
+                    .on_conflict
+                    .is_none_or(|conflict| conflict.update.is_none()) =>
+        {
+            return Ok(());
+        }
+        Stmt::Insert(insert) => (insert.table, None),
+        Stmt::Merge(merge) => (merge.target, merge.target_alias),
+        _ => return Ok(()),
+    };
+    if !matches!(
+        storage.resolve_relation(target.schema, target.name, txid),
+        Some(ResolvedRelation::Table(_))
+    ) {
+        return Ok(());
+    }
+    let mark = arena.mark();
+    let result = (|| {
+        let extra = match statement {
+            Stmt::Update(update) => update.from,
+            Stmt::Delete(delete) => delete.using,
+            // `ON CONFLICT DO UPDATE` reads the proposed row as `excluded`.
+            Stmt::Insert(insert)
+                if insert
+                    .on_conflict
+                    .is_some_and(|conflict| conflict.update.is_some()) =>
+            {
+                Some(
+                    &*arena
+                        .alloc(FromClause {
+                            base: super::dml_target_ref(target, Some("excluded")),
+                            joins: &[],
+                        })
+                        .map_err(|_| super::arena_full())?,
+                )
+            }
+            Stmt::Merge(merge) => Some(
+                &*arena
+                    .alloc(FromClause {
+                        base: merge.source,
+                        joins: &[],
+                    })
+                    .map_err(|_| super::arena_full())?,
+            ),
+            _ => None,
+        };
+        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena)?;
+        let hooks = crate::sql::eval::EvalHooks {
+            catalog: Some(&catalog),
+            ..crate::sql::eval::NO_HOOKS
+        };
+        let row = super::ScopeSchema(&scope);
+        let check = |expression: &Expr<'a>| {
+            crate::sql::eval::require_expression_builtin_execute(expression, &row, &hooks)
+        };
+        let assignments = |assignments: &[(&str, &'a Expr<'a>)]| {
+            assignments
+                .iter()
+                .try_for_each(|(_, expression)| check(expression))
+        };
+        let returning = |returning: &crate::sql::ast::Returning<'a>| {
+            returning.items.iter().try_for_each(|item| match item {
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    check(expression)
+                }
+                _ => Ok(()),
+            })
+        };
+        match statement {
+            Stmt::Update(update) => {
+                assignments(update.assignments)?;
+                update.where_clause.map_or(Ok(()), check)?;
+                returning(&update.returning)
+            }
+            Stmt::Delete(delete) => {
+                delete.where_clause.map_or(Ok(()), check)?;
+                returning(&delete.returning)
+            }
+            Stmt::Insert(insert) => {
+                if let Some(conflict) = insert.on_conflict {
+                    assignments(conflict.update.unwrap_or(&[]))?;
+                    conflict.update_where.map_or(Ok(()), check)?;
+                }
+                returning(&insert.returning)
+            }
+            Stmt::Merge(merge) => {
+                check(merge.on)?;
+                for when in merge.whens {
+                    when.condition().map_or(Ok(()), check)?;
+                    match when.action() {
+                        crate::sql::ast::MergeActionRef::Update(list) => assignments(list)?,
+                        crate::sql::ast::MergeActionRef::Insert { values, .. } => {
+                            values.iter().try_for_each(|value| check(value))?
+                        }
+                        crate::sql::ast::MergeActionRef::Delete
+                        | crate::sql::ast::MergeActionRef::DoNothing => {}
+                    }
+                }
+                returning(&merge.returning)
+            }
+            _ => Ok(()),
+        }
+    })();
+    // The check returns no arena-backed values.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
 fn validate_insert_projection(
     select: &Select<'_>,
     names: &[&str],

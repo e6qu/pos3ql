@@ -269,7 +269,8 @@ Row types:
   a row type named like the relation. `ROW(1, 'a')::orders`, `'(1,a)'::orders`,
   `orders[]`, whole-row references (`SELECT o FROM orders o` has type
   `orders`), routine parameters and results (`RETURNS SETOF orders`) and table
-  columns (`CREATE TABLE archive(o orders)`) behave as in PostgreSQL. A routine
+  columns (`CREATE TABLE archive(o orders)`) and prepared statement
+  parameters (`PREPARE q(orders) AS SELECT $1.note`) behave as in PostgreSQL. A routine
   or column using the row type blocks `DROP TABLE orders`; `CASCADE` drops the
   routine or column. Comparing two composite values uses PostgreSQL's record
   ordering, so `ROW(1, NULL)::orders = ROW(1, NULL)::orders` is true.
@@ -319,7 +320,11 @@ Functions and expressions:
   fails at `CREATE` (`0A000`, `COMMIT is not yet supported in unquoted SQL
   function body`). A quoted SQL body cannot `CALL` a procedure with output
   parameters (`0A000`, `calling procedures with output arguments is not
-  supported in SQL functions`).
+  supported in SQL functions`). `pg_get_function_sqlbody`
+  returns a `RETURN` or `BEGIN ATOMIC` body (`RETURN (x * 2)`; `BEGIN ATOMIC`
+  then one statement per line) and NULL for a quoted body; a `SELECT` of
+  expressions without `FROM` is printed in PostgreSQL's analyzed form
+  (`SELECT (x + 1);`), other statements as written.
 - PL/pgSQL `CALL` assigns output parameters to the variables written as
   their arguments: `CALL doubled(x, y)` updates `x` and `y`, and a constant in
   an output position fails with `42601` (`procedure parameter "b" is an output
@@ -355,20 +360,93 @@ Functions and expressions:
   schema-qualified type names fit; a longer one fails with `54000`.
 - Each database has its own copy of a built-in function's catalog row, as in
   PostgreSQL. `ALTER FUNCTION lower(text) STABLE` changes volatility,
-  `PARALLEL`, `LEAKPROOF`, `COST`, `ROWS` and `OWNER TO` in the current
-  database only; `pg_proc` shows the change, and a generated column or
-  publication row filter then rejects a function marked stable or volatile. `REVOKE EXECUTE ON FUNCTION md5(text) FROM PUBLIC` makes a
-  later `SELECT md5('a')` fail with `42501` for roles without a grant, and
-  `GRANT`, `has_function_privilege`, `proacl` and psql's `\df+` follow
-  PostgreSQL. Changes survive restart and are copied by `CREATE DATABASE ...
-  TEMPLATE`. Each changed routine uses one of the `max_builtin_routine_entries`
-  rows (default 64); running out fails with `54000`. Limits: changing
-  `STRICT`, `SECURITY` or `SET`/`RESET` settings of a built-in, and renaming
-  or moving one, fail with `0A000`, because pos3ql runs built-ins through
-  fixed implementations; a revoked `EXECUTE` is checked for function calls
-  but not for the function behind an operator (`1 + 1` still runs after
-  `REVOKE EXECUTE ON FUNCTION int4pl(integer, integer) FROM PUBLIC`).
-  Dropping a built-in fails with `2BP01`, as in PostgreSQL.
+  `PARALLEL`, `LEAKPROOF`, `COST`, `ROWS`, `STRICT`, `SECURITY`, `SET`/`RESET`
+  settings (`proconfig`, at most 16 per routine, then `54000`) and `OWNER TO`
+  in the current database only; `pg_proc` shows the change, and a
+  generated column or publication row filter then rejects a function marked
+  stable or volatile. As in PostgreSQL, a built-in still runs with its own
+  null handling and as the caller: `STRICT` only makes a constant NULL input
+  fold to NULL (`array_append(ARRAY[1], NULL)` is NULL, but a NULL column
+  value is still appended), and `SECURITY DEFINER` and `SET` settings change
+  nothing at run time, as PostgreSQL calls built-ins without consulting
+  `pg_proc`. `REVOKE EXECUTE ON FUNCTION md5(text) FROM PUBLIC` makes a later
+  `SELECT md5('a')` fail with `42501` for roles without a grant. The check
+  also covers the function behind an operator, cast, `IN`, `ANY`, `LIKE`,
+  regular-expression match, simple `CASE`, `IS DISTINCT FROM`, `NULLIF`,
+  `DISTINCT`, `GROUP BY`, window `PARTITION BY` and `ORDER BY` keys, `ROW(a,
+  b) = ROW(c, d)` field comparisons and `UNION`/`INTERSECT`/`EXCEPT`: after
+  `REVOKE EXECUTE ON FUNCTION int4pl(integer, integer) FROM PUBLIC`,
+  `SELECT a + 1 FROM t` fails even when `t` is empty, as PostgreSQL checks
+  every function when a plan starts. User-defined functions are checked the
+  same way, in select lists, filters, ordering, `LIMIT`, subqueries, `INSERT`
+  values and `ON CONFLICT DO UPDATE`, `MERGE` conditions and actions and
+  `RETURNING`; branches the planner folds away (`WHERE false AND f(x)`,
+  `CASE WHEN false THEN f(x) END`) are not checked. Every PostgreSQL 18.6
+  `pg_proc` row is listed, so operator, cast and support functions such as
+  `texteq`, `int4um` and `int4in` can be granted, revoked and altered; called
+  by name, an operator, cast or type-input function runs as that operator or
+  cast (`texteq('a', 'b')` is `'a' = 'b'`), and another listed routine
+  pos3ql does not run fails with `0A000`. Server administration functions
+  keep initdb's ACL: `pg_reload_conf()` and `pg_read_file(text)` are
+  executable only by superusers and roles granted `EXECUTE`, and initdb's
+  grants to predefined roles (`pg_monitor` may run `pg_ls_waldir()`) are
+  kept in `proacl` and `pg_init_privs`. `GRANT`, `has_function_privilege`,
+  `proacl`, `pg_get_function_arguments`, `pg_get_function_result` and psql's
+  `\df+` follow PostgreSQL, including the description PostgreSQL ships for
+  each built-in routine
+  (`obj_description('lower(text)'::regprocedure)` is `lowercase`);
+  `COMMENT ON FUNCTION` replaces it and `COMMENT ... IS NULL` removes it in
+  the current database. Changes survive restart and
+  are copied by `CREATE DATABASE ... TEMPLATE`. Each changed routine uses one
+  of the `max_builtin_routine_entries` rows (default 64); running out fails
+  with `54000`. Limits: renaming or moving a built-in fails with `0A000`; a signature naming `cstring` or `"any"`
+  (`'int4in(cstring)'::regprocedure`, `GRANT ... ON FUNCTION
+  int4in(cstring)`) is not recognized (`42883`). Dropping a built-in fails
+  with `2BP01`, as in PostgreSQL.
+- PostgreSQL 18.6's predefined roles exist from the start, with their
+  OIDs, and initdb's memberships of `pg_monitor` in `pg_read_all_settings`,
+  `pg_read_all_stats` and `pg_stat_scan_tables`. Like PostgreSQL, pos3ql
+  rejects creating, altering or renaming a role whose name starts with `pg_`
+  (`42939`) and dropping a predefined role (`2BP01`); `pg_database_owner` has
+  only its implicit member, the current database's owner. Their privileges
+  apply where pos3ql has the feature: `pg_read_all_data` reads every table,
+  view and sequence and uses every schema, `pg_write_all_data` inserts,
+  updates and deletes everywhere, `pg_maintain` may `VACUUM`, `ANALYZE`,
+  `REINDEX`, `REFRESH MATERIALIZED VIEW` and `LOCK` every table,
+  `pg_checkpoint` may run `CHECKPOINT`, `pg_signal_backend` may cancel or
+  terminate other non-superuser sessions, and `pg_read_all_stats` sees every
+  session's `pg_stat_activity` details. For example, after
+  `GRANT pg_read_all_data TO reporting`, the `reporting` role can
+  `SELECT` from any table without per-table grants. pos3ql has no server
+  files, superuser-only settings, reserved connections or autovacuum workers,
+  so `pg_read_server_files`, `pg_write_server_files`,
+  `pg_execute_server_program`, `pg_read_all_settings`,
+  `pg_use_reserved_connections` and `pg_signal_autovacuum_worker` grant
+  nothing more. `VACUUM` and `ANALYZE` skip a table the role may not
+  maintain with PostgreSQL's `permission denied to analyze "t", skipping it`
+  warning. The predefined roles are not counted in `max_roles`.
+- `DROP ROLE` of a role that still owns objects or holds privileges fails
+  with `2BP01` and PostgreSQL's `DETAIL` list (`owner of table t`,
+  `privileges for function upper(text)`, `privileges for column b of table
+  t`, `target of policy p on table t`, `owner of default privileges on new
+  relations belonging to role r`), at most 100 lines and then `and N other
+  objects`, then `N objects in database d` for each other database.
+  `pg_shdepend` holds the same rows for every database (with that
+  database's OID in `dbid`) and for databases themselves: owners other than the bootstrap superuser and
+  predefined roles, every grantee or grantor in an
+  ACL other than the owner, the roles a policy names, and default-privilege
+  owners and grantees. `pg_describe_object` names objects as PostgreSQL does,
+  without their schema when the search path finds them (`table t`,
+  `function lower(text)`, `operator <<<(integer,integer)`, `collation c`,
+  `constraint c on table t`, `trigger tg on table t`, `default value for
+  column a of table t`, `default privileges on new relations belonging to
+  role r`), and `pg_identify_object` names default-privilege rows
+  (`for role r in schema s on sequences`). Limits: owners are listed in object OID order and
+  privileges in grant order, where PostgreSQL lists catalog insertion order.
+  Casts, operator classes and operator families, built-in ones included,
+  are described as `cast from money to numeric` and `operator class int4_ops
+  for access method btree`, and `pg_cast` lists PostgreSQL's 235 built-in
+  casts.
 - Array and `CASE` result types follow declarations, including subqueries and
   nulls: `ARRAY[(SELECT NULL::date)]` is `date[]`; mixing integer and bigint
   gives `bigint[]`; an empty constructor needs a type (`ARRAY[]::integer[]`).
@@ -427,6 +505,15 @@ Domains and checked inputs:
   over `integer[]`). Arrays of domains whose base is an array of user-defined
   values are rejected. A domain over an array of scalar domains
   (`CREATE DOMAIN positive_ids AS positive_integer[]`) works.
+- `PREPARE q(type, ...)` keeps each parameter's full catalog type, so a
+  domain, enum, composite, relation row type or array parameter is coerced by
+  `EXECUTE` with PostgreSQL's assignment rules: `EXECUTE q(5)` for an `orders`
+  parameter fails with `42804`, and `EXECUTE q(1.5)` for an `integer` one
+  passes 2. A parameter the declaration omits takes its type from its use
+  (`PREPARE r AS SELECT round($1)` has a `double precision` parameter), and
+  one whose use determines nothing is `text`. PostgreSQL instead rejects a
+  parameter that stays undetermined inside a call taking `"any"`
+  (`PREPARE x AS SELECT pg_typeof($1)` fails with `42P18`).
 - Bind validates parameters before function inputs are prepared, so an invalid
   integer parameter fails at Bind. `PREPARE saved AS SELECT
   '{paid}'::checked_status[]` checks the literal once at `PREPARE`;
@@ -449,6 +536,11 @@ Domains and checked inputs:
   one instance per resolved argument types and collation. Views, rules,
   `BEGIN ATOMIC` bodies, and stored defaults keep their checked inputs with the
   definition. See [plan lifetimes](architecture.md#the-request-path).
+- In a SQL function body, `o.note` reads field `note` of a composite
+  parameter `o` (also written `f.o.note` with the function's name `f`), unless
+  a table or alias `o` in the query has a column `note`, which wins as in
+  PostgreSQL. A field the parameter's type lacks fails with `42P01` (`missing
+  FROM-clause entry for table "o"`).
 - `DISCARD PLANS` drops cached routine plans for future calls; `DISCARD ALL`
   also drops prepared statements. Either returns `0A000` while such a plan is
   executing.

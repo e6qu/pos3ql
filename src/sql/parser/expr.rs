@@ -225,7 +225,10 @@ impl<'a> Parser<'a> {
                         operand: None,
                         whens,
                         otherwise: Some(else_v),
-                        synthetic: true,
+                        origin: crate::sql::ast::CaseOrigin::BooleanTest {
+                            value: is_true,
+                            negated,
+                        },
                     })?;
                     continue;
                 }
@@ -717,7 +720,18 @@ impl<'a> Parser<'a> {
             Tok::Param(n) => {
                 self.advance()?;
                 self.max_param = self.max_param.max(n);
-                self.arena_expr(Expr::Param(n))
+                // PostgreSQL's `PARAM opt_indirection`: `$1.field`, `$1.*`.
+                let mut base = self.arena_expr(Expr::Param(n))?;
+                while self.peeked == Tok::Op(".") {
+                    self.advance()?;
+                    if self.peeked == Tok::Op("*") {
+                        self.advance()?;
+                        return self.arena_expr(Expr::Field { base, field: "*" });
+                    }
+                    let field = self.any_ident("field name")?;
+                    base = self.arena_expr(Expr::Field { base, field })?;
+                }
+                Ok(base)
             }
             Tok::Op("(") => {
                 let source_position_at = self.peek_at;
@@ -988,7 +1002,7 @@ impl<'a> Parser<'a> {
                     operand,
                     whens: whens.as_slice(),
                     otherwise,
-                    synthetic: false,
+                    origin: crate::sql::ast::CaseOrigin::Written,
                 })
             }
             Tok::Ident("true") => {
@@ -1220,6 +1234,19 @@ impl<'a> Parser<'a> {
                         if self.peeked == Tok::Op(".") {
                             return self.catalog_qualified_column(name_at, name, column, third);
                         }
+                        // `routine.parameter.field` names a field of a
+                        // composite parameter unless a relation answers.
+                        if self.routine_name == Some(name)
+                            && let Some((index, source)) = self.routine_parameter_field(column)
+                        {
+                            self.max_param = self.max_param.max(index);
+                            return self.arena_expr(Expr::RoutineParam {
+                                qualifier: Some(self.composed_qualifier(name, column)?),
+                                name: third,
+                                index,
+                                source,
+                            });
+                        }
                         return self.arena_expr(Expr::SchemaColumn {
                             schema: name,
                             table: column,
@@ -1331,6 +1358,19 @@ impl<'a> Parser<'a> {
                         let third = self.any_ident("column name")?;
                         if self.peeked == Tok::Op(".") {
                             return self.catalog_qualified_column(name_at, name, column, third);
+                        }
+                        // `routine.parameter.field` names a field of a
+                        // composite parameter unless a relation answers.
+                        if self.routine_name == Some(name)
+                            && let Some((index, source)) = self.routine_parameter_field(column)
+                        {
+                            self.max_param = self.max_param.max(index);
+                            return self.arena_expr(Expr::RoutineParam {
+                                qualifier: Some(self.composed_qualifier(name, column)?),
+                                name: third,
+                                index,
+                                source,
+                            });
                         }
                         return self.arena_expr(Expr::SchemaColumn {
                             schema: name,
@@ -3371,17 +3411,23 @@ impl<'a> Parser<'a> {
             left: l_null,
             right: r_null,
         })?;
-        let cmp_op = if negated {
-            BinaryOp::Eq
-        } else {
-            BinaryOp::NotEq
-        };
-        let cmp = self.arena_expr(Expr::Binary {
+        // PostgreSQL's DistinctExpr calls the `=` operator's function and
+        // negates its result; it never looks up `<>`.
+        let equal = self.arena_expr(Expr::Binary {
             source_position,
-            operator: cmp_op,
+            operator: BinaryOp::Eq,
             left,
             right,
         })?;
+        let cmp = if negated {
+            equal
+        } else {
+            self.arena_expr(Expr::Unary {
+                source_position,
+                operator: UnaryOp::Not,
+                operand: equal,
+            })?
+        };
         let both_val = self.arena_expr(Expr::Bool(negated))?;
         let either_val = self.arena_expr(Expr::Bool(!negated))?;
         let whens = self.arena_slice(&[(both, both_val), (either, either_val)])?;
@@ -3389,7 +3435,7 @@ impl<'a> Parser<'a> {
             operand: None,
             whens,
             otherwise: Some(cmp),
-            synthetic: true,
+            origin: crate::sql::ast::CaseOrigin::DistinctFrom { negated },
         })
     }
 

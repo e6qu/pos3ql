@@ -14,9 +14,11 @@ mod builtin_argument_binding;
 mod builtin_routine_changes;
 mod builtin_routine_comments;
 mod canonical_sequences;
+mod cast_and_operator_class_descriptions;
 mod catalog_identity_lookup;
 mod client_catalog;
 mod compatibility_diagnostics;
+mod composite_parameter_fields;
 mod constraint_index_identity;
 mod cursor_execution;
 mod deparsed_expressions;
@@ -26,6 +28,7 @@ mod function_progress;
 mod geometric_casts;
 mod geometry_assignments;
 mod index_parent_ownership;
+mod indirect_execute_privileges;
 mod information_schema_domains;
 mod joined_dml_returning;
 mod key_preparation;
@@ -36,6 +39,7 @@ mod owner_role_inheritance;
 mod partition_ancestry;
 mod plpgsql_row_variables;
 mod polymorphic_resolution;
+mod predefined_roles;
 mod prepared_object_capacity;
 mod prepared_parameter_types;
 mod procedural_expression_calls;
@@ -53,6 +57,8 @@ mod row_layout;
 mod runtime_input_validity;
 mod runtime_plan_invalidation;
 mod sequence_inheritance;
+mod shared_dependencies;
+mod shared_dependency_databases;
 mod shared_row_capacity;
 mod shared_row_work;
 mod shared_statistics;
@@ -62,6 +68,7 @@ mod stored_relation_sources;
 mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
+mod type_dependent_routines;
 mod type_input_binding;
 mod type_input_positions;
 mod virtual_search_path;
@@ -4725,7 +4732,7 @@ fn metadata_sequence_comment_reuse_keeps_replacement() {
         let output = session.success(
             &mut engine,
             include_str!(
-                "../../tests/external/differential_exact/06_metadata_comment_lifetimes.sql"
+                "../../tests/external/differential_exact/104_metadata_comment_lifetimes.sql"
             ),
             true,
         );
@@ -19817,7 +19824,7 @@ fn configured_role_authorization_capacity_survives_object_cold_recovery() {
          GRANT SELECT ON scaled_role_data TO scaled_role_001; \
          SELECT count(*) FROM pg_roles WHERE rolname LIKE 'scaled_role_%'; \
          SELECT count(*) FROM pg_group WHERE groname LIKE 'scaled_role_%'; \
-         SELECT count(*) FROM pg_auth_members; \
+         SELECT count(*) FROM pg_auth_members WHERE roleid >= 16384; \
          SELECT count(*) FROM pg_db_role_setting WHERE setrole <> 0; \
          SELECT count(*) FROM information_schema.enabled_roles \
           WHERE role_name LIKE 'scaled_role_%'; \
@@ -19883,7 +19890,7 @@ fn configured_role_authorization_capacity_survives_object_cold_recovery() {
         &mut recovered,
         &mut recovered_budget,
         "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'scaled_role_%'; \
-         SELECT count(*) FROM pg_auth_members; \
+         SELECT count(*) FROM pg_auth_members WHERE roleid >= 16384; \
          SELECT count(*) FROM pg_db_role_setting WHERE setrole <> 0; \
          SELECT has_table_privilege('scaled_role_095', 'scaled_role_data', 'SELECT'); \
          SET SESSION AUTHORIZATION scaled_role_095; \
@@ -20356,7 +20363,8 @@ fn role_catalog_replays_from_wal() {
          SELECT parent.rolname, child.rolname, membership.admin_option
            FROM pg_auth_members membership
            JOIN pg_roles parent ON parent.oid = membership.roleid
-           JOIN pg_roles child ON child.oid = membership.member;
+           JOIN pg_roles child ON child.oid = membership.member
+          WHERE membership.roleid >= 16384;
          SELECT parent.rolname, child.rolname, membership.admin_option,
                 membership.inherit_option, membership.set_option, grantor.rolname
            FROM pg_auth_members membership
@@ -23796,15 +23804,16 @@ fn role_membership_controls_set_role_and_catalog_rows() {
                 membership.inherit_option, membership.set_option
            FROM pg_auth_members membership
            JOIN pg_roles parent ON parent.oid = membership.roleid
-           JOIN pg_roles child ON child.oid = membership.member;
+           JOIN pg_roles child ON child.oid = membership.member
+          WHERE membership.roleid >= 16384;
          SET ROLE child;
          SET ROLE parent;
          SELECT current_user, session_user;
          RESET ROLE;
          REVOKE ADMIN OPTION FOR parent FROM child;
-         SELECT admin_option, inherit_option, set_option FROM pg_auth_members;
+         SELECT admin_option, inherit_option, set_option FROM pg_auth_members WHERE roleid >= 16384;
          REVOKE parent FROM child;
-         SELECT count(*) FROM pg_auth_members;",
+         SELECT count(*) FROM pg_auth_members WHERE roleid >= 16384;",
     );
     assert_eq!(
         data_rows(&output),
@@ -24546,7 +24555,7 @@ fn dropping_a_role_removes_memberships_transactionally() {
             &mut engine,
             &mut budget,
             "DROP ROLE dropped_member; DROP ROLE dropped_parent; \
-             SELECT count(*) FROM pg_auth_members; \
+             SELECT count(*) FROM pg_auth_members WHERE roleid >= 16384; \
              SELECT count(*) FROM pg_roles \
               WHERE rolname IN ('dropped_parent', 'dropped_member')",
         )),
@@ -24577,7 +24586,7 @@ fn dropped_role_memberships_do_not_reappear_after_wal_replay() {
         data_rows(&run_with(
             &mut restarted,
             &mut restarted_budget,
-            "SELECT count(*) FROM pg_auth_members; \
+            "SELECT count(*) FROM pg_auth_members WHERE roleid >= 16384; \
              SELECT count(*) FROM pg_roles \
              WHERE rolname IN ('replay_parent', 'replay_member'); \
              SELECT shobj_description(oid, 'pg_authid') FROM pg_roles \
@@ -24601,6 +24610,7 @@ fn create_role_membership_clauses_match_grant_role_state() {
            FROM pg_auth_members membership
            JOIN pg_roles parent ON parent.oid = membership.roleid
            JOIN pg_roles child ON child.oid = membership.member
+          WHERE membership.roleid >= 16384
           ORDER BY parent.rolname, child.rolname;",
     );
     assert_eq!(
@@ -55240,7 +55250,8 @@ fn comment_roundtrip_and_removal() {
         &mut e,
         &mut b,
         "SELECT description FROM pg_description \
-         WHERE description LIKE 'the %' OR description IN ('col a', 'view col') \
+         WHERE description LIKE 'the %' AND description NOT LIKE 'the average %' \
+           AND description NOT LIKE 'the smallest %' OR description IN ('col a', 'view col') \
          ORDER BY description",
     );
     assert_eq!(

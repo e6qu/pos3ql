@@ -292,8 +292,8 @@ pub(crate) use dependencies::collect_routine_signature_row_types;
 pub(crate) use dependencies::collect_runtime_expression;
 pub(crate) use dependencies::collect_runtime_statement;
 pub(crate) use dependencies::{
-    for_each_dml_assignment, undefined_set_target, validate_dml_assignment_casts,
-    visit_dml_assignment_types, visit_projection_types,
+    for_each_dml_assignment, require_dml_builtin_execute, undefined_set_target,
+    validate_dml_assignment_casts, visit_dml_assignment_types, visit_projection_types,
 };
 
 pub(crate) fn stored_routine_dependencies(
@@ -4135,16 +4135,70 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn builtin_routine_privileges_present(&self) -> bool {
+        self.txid != 0 && self.storage.builtin_routine_count() != 0
+    }
+
+    fn builtin_routine_strict(&self, oid: i32) -> Option<bool> {
+        let routine = crate::storage::BuiltinRoutineOid::parse(oid)?;
+        Some(
+            self.storage
+                .builtin_routine_state(routine, self.txid)
+                .attributes
+                .attributes
+                .strict,
+        )
+    }
+
+    fn routine_privileges_present(&self) -> bool {
+        self.txid != 0
+            && (self.storage.builtin_routine_count() != 0 || self.storage.routine_count() != 0)
+    }
+
+    fn require_stored_routine_execute(&self, oid: i32) -> Result<(), SqlError> {
+        match self.storage.routine_slot_by_oid(oid, self.txid) {
+            Some(slot) => self.storage.require_routine_execute(slot, self.txid),
+            None => Ok(()),
+        }
+    }
+
+    fn require_subquery_routine_execute<'a>(
+        &self,
+        select: &Select<'a>,
+        outer: &dyn super::eval::ColumnLookup<'a>,
+        exists: bool,
+    ) -> Result<(), SqlError> {
+        if select.set_body.is_some() || !select.with.is_empty() {
+            return Ok(());
+        }
+        let arena = self.routine_workspace;
+        let mark = arena.mark();
+        let result = (|| {
+            let scope = select
+                .from
+                .as_ref()
+                .map(|from| {
+                    QueryScope::resolve_schema(self.storage, from, self.txid, arena, Some(outer))
+                })
+                .transpose()?;
+            let schema = scope.as_ref().map(ScopeSchema);
+            let row = scan::Chained {
+                inner: schema.as_ref().map_or(
+                    &super::eval::NoColumns as &dyn super::eval::ColumnLookup<'_>,
+                    |schema| schema,
+                ),
+                outer: Some(outer),
+            };
+            require_select_expressions_execute(select, &row, self, exists)
+        })();
+        // The check returns no workspace-backed values.
+        unsafe { arena.rewind_to(mark) };
+        result
+    }
+
     fn require_builtin_routine_execute(&self, oid: i32) -> Result<(), SqlError> {
         let Some(routine) = crate::storage::BuiltinRoutineOid::parse(oid) else {
             return Ok(());
-        };
-        let Some(slot) = self.storage.builtin_routine_slot(routine) else {
-            return Ok(());
-        };
-        let object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::BuiltinRoutine,
-            slot: slot as u16,
         };
         if self.txid != 0 {
             let role = self.storage.current_role_slot(self.txid).ok_or_else(|| {
@@ -4153,12 +4207,32 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     "current role is not present in the role catalog"
                 )
             })?;
-            if !self.storage.has_object_privilege(
-                object,
-                role,
-                crate::storage::PrivilegeSet::EXECUTE,
-                self.txid,
-            ) {
+            let allowed = match self.storage.builtin_routine_slot(routine) {
+                Some(slot) => self.storage.has_object_privilege(
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::BuiltinRoutine,
+                        slot: slot as u16,
+                    },
+                    role,
+                    crate::storage::PrivilegeSet::EXECUTE,
+                    self.txid,
+                ),
+                // Without a row the routine keeps its initdb ACL: `PUBLIC`
+                // or only its bootstrap-superuser owner may execute it.
+                None => {
+                    super::catalog::intrinsic_routine_public_execute(oid) != Some(false)
+                        || self.storage.role_has_privileges_of(
+                            role,
+                            usize::from(crate::storage::BOOTSTRAP_ROLE),
+                            self.txid,
+                        )
+                        || super::catalog::builtin_routine_initial_grantees(oid).any(|grantee| {
+                            self.storage
+                                .role_has_privileges_of(role, grantee.slot(), self.txid)
+                        })
+                }
+            };
+            if !allowed {
                 return Err(sql_err!(
                     sqlstate::INSUFFICIENT_PRIVILEGE,
                     "permission denied for function {}",
@@ -5757,6 +5831,31 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::sequence_state_by_oid(self.storage, oid, self.txid)
     }
 
+    fn database_name_by_oid(&self, oid: i32) -> Option<crate::storage::SqlName> {
+        let database = crate::storage::DatabaseOid::parse(oid)?;
+        self.storage
+            .database_slot_by_oid(database, self.txid)
+            .map(|slot| self.storage.database_definition(slot, self.txid).name)
+    }
+
+    fn attribute_default_column(&self, oid: i32) -> Option<(i32, i32)> {
+        super::catalog::attribute_default_column(self.storage, self.txid, oid)
+    }
+
+    fn cast_type_oids(&self, oid: i32) -> Option<(i32, i32)> {
+        super::catalog::cast_type_oids(self.storage, self.txid, oid)
+    }
+
+    fn default_acl_description<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::default_acl_description(self.storage, self.txid, oid, arena)?
+            .map(|text| arena.alloc_str(text.as_str()).map_err(|_| arena_full()))
+            .transpose()
+    }
+
     fn relation_is_visible(&self, oid: i32) -> Option<bool> {
         super::catalog::relation_oid_visibility(self.storage, self.txid, oid)
     }
@@ -5838,6 +5937,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
         super::catalog::serial_sequence_name(self.storage, self.txid, table, column, arena)
+    }
+
+    fn function_sqlbody<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::function_sqlbody_text(self.storage, self.txid, oid, arena)
     }
 
     fn function_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
@@ -5941,8 +6048,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             Ok(Some(
                 arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
             ))
-        } else if let Some(name) = super::catalog::predefined_role_name(oid) {
-            Ok(Some(arena.alloc_str(name).map_err(|_| arena_full())?))
         } else {
             Ok(None)
         }
@@ -5952,7 +6057,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage
             .find_role_visible(name, self.txid)
             .map(|slot| self.storage.role_oid(slot))
-            .or_else(|| super::catalog::predefined_role_oid(name))
     }
 
     fn written_role_oid(&self, name: &str) -> Option<i32> {
@@ -6295,6 +6399,91 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         .map(Some)
     }
 
+    fn has_role_privilege(
+        &self,
+        role: Option<&str>,
+        target: super::eval::PrivilegeObject<'_>,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        use super::eval::PrivilegeObject;
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let target = match target {
+            PrivilegeObject::Oid(oid) => match self.storage.role_slot_by_oid(oid, self.txid) {
+                Some(slot) => slot,
+                None => return Ok(None),
+            },
+            PrivilegeObject::Name(name) => self
+                .storage
+                .find_role_visible(name, self.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "role \"{}\" does not exist",
+                        name
+                    )
+                })?,
+        };
+        // PostgreSQL 18.6 convert_role_priv_string and pg_role_aclcheck.
+        #[derive(Clone, Copy)]
+        enum RolePrivilege {
+            Member,
+            Usage,
+            Set,
+            Admin,
+        }
+        let mut requested = [None; 4];
+        for item in privileges.split(',') {
+            let item = item.trim_matches(|c: char| c.is_ascii_whitespace());
+            let privilege = [
+                ("MEMBER", RolePrivilege::Member),
+                ("USAGE", RolePrivilege::Usage),
+                ("SET", RolePrivilege::Set),
+            ]
+            .into_iter()
+            .find_map(|(name, privilege)| {
+                if item.eq_ignore_ascii_case(name) {
+                    return Some(privilege);
+                }
+                let rest = item
+                    .get(..name.len())?
+                    .eq_ignore_ascii_case(name)
+                    .then(|| &item[name.len()..])?;
+                (rest.eq_ignore_ascii_case(" WITH GRANT OPTION")
+                    || rest.eq_ignore_ascii_case(" WITH ADMIN OPTION"))
+                .then_some(RolePrivilege::Admin)
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unrecognized privilege type: \"{}\"",
+                    item
+                )
+            })?;
+            requested[privilege as usize] = Some(privilege);
+        }
+        let superuser = self.storage.role(role).attributes_to(self.txid).superuser;
+        Ok(Some(requested.into_iter().flatten().any(
+            |privilege| match privilege {
+                RolePrivilege::Admin => {
+                    superuser
+                        || (role != target && self.storage.role_can_admin(role, target, self.txid))
+                }
+                RolePrivilege::Member => {
+                    superuser || self.storage.role_is_member_of(role, target, self.txid)
+                }
+                RolePrivilege::Usage => {
+                    self.storage.role_has_privileges_of(role, target, self.txid)
+                }
+                RolePrivilege::Set => {
+                    superuser || self.storage.role_can_set(role, target, self.txid)
+                }
+            },
+        )))
+    }
+
     fn has_schema_privilege(
         &self,
         role: Option<&str>,
@@ -6532,9 +6721,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             None => {
                 if let Some(public) = super::catalog::intrinsic_routine_public_execute(oid) {
                     let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
+                    let granted =
+                        super::catalog::builtin_routine_initial_grantees(oid).any(|grantee| {
+                            self.storage
+                                .role_has_privileges_of(role, grantee.slot(), self.txid)
+                        });
                     return Ok(Some(requested.allows(
                         PrivilegeSet::NONE,
-                        |_| owner || public,
+                        |_| owner || public || granted,
                         |_| owner,
                     )));
                 }
@@ -7739,6 +7933,64 @@ fn correlated_row_hooks<'scratch, 'a>(
     }
 }
 
+/// PostgreSQL checks `EXECUTE` on every function a plan calls when the
+/// executor starts, so a revoked function fails even when no row reaches it.
+pub(super) fn require_select_routine_execute<'a>(
+    statement: &Select<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let catalog = storage_catalog(storage, arena, txid);
+    if !super::eval::CatalogAccess::routine_privileges_present(&catalog) {
+        return Ok(());
+    }
+    require_select_expressions_execute(statement, &ScopeSchema(scope), &catalog, false)
+}
+
+/// Checks `EXECUTE` behind each expression of one `SELECT` level; `exists`
+/// skips the select list an `EXISTS` test discards.
+fn require_select_expressions_execute<'a>(
+    statement: &Select<'a>,
+    row: &dyn ColumnLookup<'a>,
+    catalog: &dyn super::eval::CatalogAccess,
+    exists: bool,
+) -> Result<(), SqlError> {
+    let hooks = super::eval::EvalHooks {
+        catalog: Some(catalog),
+        ..super::eval::NO_HOOKS
+    };
+    let items = statement
+        .items
+        .iter()
+        .filter(|_| !exists)
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                Some(*expression)
+            }
+            _ => None,
+        });
+    let joins = statement
+        .from
+        .iter()
+        .flat_map(|from| from.joins.iter().filter_map(|join| join.on));
+    let orders = statement.order_by.iter().map(|order| order.expression);
+    for expression in items
+        .chain(statement.where_clause)
+        .chain(statement.group_by.iter().copied())
+        .chain(statement.having)
+        .chain(statement.distinct_on.iter().copied())
+        .chain(joins)
+        .chain(orders)
+        .chain(statement.limit)
+        .chain(statement.offset)
+    {
+        super::eval::require_expression_builtin_execute(expression, row, &hooks)?;
+    }
+    Ok(())
+}
+
 /// PostgreSQL has no equality or ordering for `json` — two documents differing
 /// only in whitespace or key order are the same value but not the same text, so
 /// it declines rather than answer by a rule it does not hold to, and offers
@@ -7995,6 +8247,8 @@ fn check_key_types<'a>(
             SelectItem::Expr { expression, .. } => Some(*expression),
             _ => None,
         });
+    require_select_routine_execute(statement, scope, arena, storage, txid)?;
+    let catalog = storage_catalog(storage, arena, txid);
     for key in statement
         .group_by
         .iter()
@@ -8008,6 +8262,16 @@ fn check_key_types<'a>(
                 "could not identify an equality operator for type {}",
                 ctype.name()
             ));
+        }
+        // Grouping and duplicate removal call the key type's `=` function,
+        // which PostgreSQL's executor checks for EXECUTE.
+        // A key whose type is not known yet reports that when evaluated.
+        if super::eval::CatalogAccess::builtin_routine_privileges_present(&catalog)
+            && let Ok((oid, _)) = infer_scope_type(key, scope)
+        {
+            let oid = super::eval::CatalogAccess::domain_base_type(&catalog, oid)
+                .map_or(oid, ColType::oid);
+            super::eval::require_builtin_operator_types_execute(&catalog, "=", Some(oid), oid)?;
         }
     }
     for order in statement.order_by {
@@ -9482,7 +9746,7 @@ fn rewrite_grouped_expr<'a>(
             negated: *negated,
             case_insensitive: *case_insensitive,
         }),
-        Expr::Case { operand, whens, otherwise, synthetic } => {
+        Expr::Case { operand, whens, otherwise, origin } => {
             let operand = match operand {
                 Some(o) => Some(rewrite(o)?),
                 None => None,
@@ -9498,7 +9762,7 @@ fn rewrite_grouped_expr<'a>(
                 Some(o) => Some(rewrite(o)?),
                 None => None,
             };
-            alloc(Expr::Case { operand, whens, otherwise, synthetic: *synthetic })
+            alloc(Expr::Case { operand, whens, otherwise, origin: *origin })
         }
         Expr::Call {
             name,
@@ -10687,6 +10951,16 @@ fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
     row: &R,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<srf::ProjectSet<'a>, SqlError> {
+    // PostgreSQL checks the plan's functions before its filter runs.
+    let items = statement.items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            Some(*expression)
+        }
+        _ => None,
+    });
+    for expression in items.chain(statement.where_clause) {
+        super::eval::require_expression_builtin_execute(expression, row, hooks)?;
+    }
     if let Some(predicate) = statement.where_clause
         && !where_passes(predicate, arena, params, row, hooks)?
     {
@@ -11907,6 +12181,7 @@ fn select_into_rows_mode<'a>(
         seq,
         outer,
     )?;
+    require_select_routine_execute(statement, &scope, arena, storage, txid)?;
     let resolved_columns = subquery::SubqueryColumns {
         scope: Some(&scope),
         outer,

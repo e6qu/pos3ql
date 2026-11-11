@@ -6847,7 +6847,7 @@ fn subst_expr<'a>(
             operand,
             whens,
             otherwise,
-            synthetic,
+            origin,
         } => {
             let operand = opt_subst(*operand, context, arena)?;
             let mut ws: ArenaList<'a, (&'a Expr<'a>, &'a Expr<'a>)> = ArenaList::new(arena);
@@ -6863,7 +6863,7 @@ fn subst_expr<'a>(
                 operand,
                 whens,
                 otherwise: opt_subst(*otherwise, context, arena)?,
-                synthetic: *synthetic,
+                origin: *origin,
             }
         }
         Expr::Array(items) => Expr::Array(subst_expr_slice(items, context, arena)?),

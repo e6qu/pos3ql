@@ -4001,7 +4001,7 @@ impl Engine {
                 .saturating_mul(size_of::<(u64, RowHome)>()),
             (config.max_connections as usize).saturating_mul(config.wal_buffer_bytes),
             config
-                .max_roles
+                .role_catalog_slots()
                 .saturating_mul(size_of::<RoleConnections>()),
             config.max_databases.saturating_mul(size_of::<u16>()),
             notify::NotifyState::budget_bytes(
@@ -4290,14 +4290,15 @@ impl Engine {
                 .push(0)
                 .expect("sized to max_databases");
         }
-        let mut role_connections = FixedVec::new(budget, "role_connections", config.max_roles)?;
-        for _ in 0..config.max_roles {
+        let mut role_connections =
+            FixedVec::new(budget, "role_connections", config.role_catalog_slots())?;
+        for _ in 0..config.role_catalog_slots() {
             role_connections
                 .push(RoleConnections {
                     source: crate::storage::SessionRole::Unauthenticated,
                     count: 0,
                 })
-                .expect("sized to max_roles");
+                .expect("sized to the role catalog");
         }
         let mut logical_decoding_truncates = FixedVec::new(
             budget,
@@ -9232,18 +9233,36 @@ impl Engine {
         Ok(())
     }
 
-    fn lock_maintenance_targets(
+    /// PostgreSQL's `vacuum_is_permitted_for_relation`: VACUUM and ANALYZE
+    /// need the MAINTAIN privilege (owners and pg_maintain have it).
+    fn maintenance_permitted(&self, slot: usize, txid: u32) -> bool {
+        self.storage.current_role_slot(txid).is_some_and(|role| {
+            self.storage.has_object_privilege(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Table,
+                    slot: slot as u16,
+                },
+                role,
+                crate::storage::PrivilegeSet::MAINTAIN,
+                txid,
+            )
+        })
+    }
+
+    /// The tables a VACUUM or ANALYZE processes, in order: every visible
+    /// table, or each target and (unless ONLY) its descendants.
+    fn for_each_maintenance_slot(
         &self,
         targets: &[ast::MaintenanceTarget<'_>],
         txid: u32,
-        mode: ast::TableLockMode,
+        mut visit: impl FnMut(usize) -> Result<(), SqlError>,
     ) -> Result<(), SqlError> {
         if targets.is_empty() {
             for slot in 0..self.storage.table_count() {
                 if self.storage.table_slot_visible_to(slot, txid)
                     && self.storage.relation_visible_to_current_session(slot, txid)
                 {
-                    self.storage.lock_table(txid, slot, mode, false)?;
+                    visit(slot)?;
                 }
             }
             return Ok(());
@@ -9257,11 +9276,55 @@ impl Engine {
                         || (target.inheritance == ast::RelationInheritance::Descendants
                             && self.storage.relation_descends_from(slot, root, txid)))
                 {
-                    self.storage.lock_table(txid, slot, mode, false)?;
+                    visit(slot)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Warns once per table the current role may not maintain, as
+    /// PostgreSQL does before skipping it.
+    fn warn_maintenance_denials(
+        &self,
+        targets: &[ast::MaintenanceTarget<'_>],
+        txid: u32,
+        verb: &str,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let mut wire = Ok(());
+        let result = self.for_each_maintenance_slot(targets, txid, |slot| {
+            if wire.is_ok() && !self.maintenance_permitted(slot, txid) {
+                let name = self.storage.table_def(slot, txid).name;
+                wire = responder.warning(
+                    sqlstate::WARNING,
+                    stack_format!(
+                        160,
+                        "permission denied to {} \"{}\", skipping it",
+                        verb,
+                        name.as_str()
+                    )
+                    .as_str(),
+                );
+            }
+            Ok(())
+        });
+        wire?;
+        Ok(result)
+    }
+
+    fn lock_maintenance_targets(
+        &self,
+        targets: &[ast::MaintenanceTarget<'_>],
+        txid: u32,
+        mode: ast::TableLockMode,
+    ) -> Result<(), SqlError> {
+        self.for_each_maintenance_slot(targets, txid, |slot| {
+            if self.maintenance_permitted(slot, txid) {
+                self.storage.lock_table(txid, slot, mode, false)?;
+            }
+            Ok(())
+        })
     }
 
     fn analyze_targets(
@@ -9278,6 +9341,7 @@ impl Engine {
                     && self
                         .storage
                         .relation_visible_to_current_session(slot, txn.txid)
+                    && self.maintenance_permitted(slot, txn.txid)
                 {
                     txn.record_statistics(slot as u32)?;
                     self.work.reset();
@@ -9316,6 +9380,7 @@ impl Engine {
                     || (slot != root
                         && (target.inheritance == ast::RelationInheritance::Only
                             || !self.storage.relation_descends_from(slot, root, txn.txid)))
+                    || !self.maintenance_permitted(slot, txn.txid)
                 {
                     continue;
                 }
@@ -9373,6 +9438,7 @@ impl Engine {
             for slot in 0..self.storage.table_count() {
                 if self.storage.table_slot_visible_to(slot, txid)
                     && self.storage.relation_visible_to_current_session(slot, txid)
+                    && self.maintenance_permitted(slot, txid)
                 {
                     self.work.reset();
                     self.storage
@@ -9391,6 +9457,7 @@ impl Engine {
                     && (slot == root
                         || (target.inheritance == ast::RelationInheritance::Descendants
                             && self.storage.relation_descends_from(slot, root, txid)))
+                    && self.maintenance_permitted(slot, txid)
                 {
                     self.work.reset();
                     self.storage
@@ -9408,6 +9475,28 @@ impl Engine {
         txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if txn.checkpoint_request.is_none()
+            && !self
+                .storage
+                .current_role_slot(txn.txid)
+                .is_some_and(|role| {
+                    self.storage.role_has_privileges_of(
+                        role,
+                        crate::storage::PredefinedRole::Checkpoint.slot(),
+                        txn.txid,
+                    )
+                })
+        {
+            return Ok(Err(crate::sql::eval::with_detail(
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied to execute CHECKPOINT command"
+                ),
+                format_args!(
+                    "Only roles with privileges of the \"pg_checkpoint\" role may execute this command."
+                ),
+            )));
+        }
         if self.commit_progress == CommitProgressMode::Reactor
             && let Some(checkpointer) = self.ckpt.as_mut()
         {
@@ -9462,6 +9551,9 @@ impl Engine {
         } else {
             ast::TableLockMode::ShareUpdateExclusive
         };
+        if let Err(error) = self.warn_maintenance_denials(targets, txn.txid, "vacuum", responder)? {
+            return Ok(Err(error));
+        }
         if let Err(error) = self.lock_maintenance_targets(targets, txn.txid, mode) {
             return Ok(Err(error));
         }
@@ -9495,6 +9587,11 @@ impl Engine {
         txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) =
+            self.warn_maintenance_denials(targets, txn.txid, "analyze", responder)?
+        {
+            return Ok(Err(error));
+        }
         if let Err(error) = self.lock_maintenance_targets(
             targets,
             txn.txid,
@@ -9763,6 +9860,55 @@ impl Engine {
         }
     }
 
+    /// PostgreSQL 18.6 `LockTableAclCheck`: MAINTAIN, UPDATE, DELETE or
+    /// TRUNCATE permit any mode; SELECT also permits ACCESS SHARE and INSERT
+    /// also permits ROW EXCLUSIVE and weaker modes.
+    fn require_lock_table_privilege(
+        &self,
+        slot: usize,
+        mode: ast::TableLockMode,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        use crate::storage::PrivilegeSet;
+        let mut accepted = [
+            PrivilegeSet::MAINTAIN,
+            PrivilegeSet::UPDATE,
+            PrivilegeSet::DELETE,
+            PrivilegeSet::TRUNCATE,
+            PrivilegeSet::NONE,
+            PrivilegeSet::NONE,
+        ];
+        if mode <= ast::TableLockMode::AccessShare {
+            accepted[4] = PrivilegeSet::SELECT;
+        }
+        if mode <= ast::TableLockMode::RowExclusive {
+            accepted[5] = PrivilegeSet::INSERT;
+        }
+        let object = self.storage.table_access_object(slot, txid);
+        let permitted = self.storage.current_role_slot(txid).is_some_and(|role| {
+            accepted.into_iter().any(|privilege| {
+                privilege.0 != 0
+                    && self
+                        .storage
+                        .has_object_privilege(object, role, privilege, txid)
+            })
+        });
+        if permitted {
+            return Ok(());
+        }
+        let kind = if object.class == crate::storage::AccessClass::MaterializedView {
+            "materialized view"
+        } else {
+            "table"
+        };
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for {} {}",
+            kind,
+            self.storage.table_def(slot, txid).name.as_str()
+        ))
+    }
+
     pub(crate) fn execute_lock_table_statement(
         &mut self,
         tables: &[ast::QualName<'_>],
@@ -9785,6 +9931,9 @@ impl Engine {
             };
         }
         for &slot in &slots[..tables.len()] {
+            if let Err(error) = self.require_lock_table_privilege(slot, mode, txn.txid) {
+                return Ok(Err(error));
+            }
             if let Err(error) = self.storage.lock_table(txn.txid, slot, mode, nowait) {
                 return Ok(Err(error));
             }
@@ -9946,6 +10095,42 @@ impl Engine {
         Ok(Ok(()))
     }
 
+    /// Resolves `PREPARE name(types)` through the catalog, as PostgreSQL's
+    /// `typenameTypeId`; a type modifier is not part of a parameter's type.
+    /// The remaining `count` positions start as text for inference.
+    fn prepared_parameter_types<'a>(
+        &self,
+        names: &[&str],
+        count: usize,
+        arena: &'a Arena,
+        txid: u32,
+    ) -> Result<&'a mut [i32], SqlError> {
+        let types = arena
+            .alloc_slice_with(count, |_| types::oid::TEXT)
+            .map_err(|_| eval::arena_full())?;
+        for (target, name) in types.iter_mut().zip(names) {
+            let resolved = exec::resolve_routine_type(&self.storage, txid, name)?;
+            if resolved.polymorphic_type().is_some() {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "prepared statement parameters of polymorphic type {} are not supported",
+                    name
+                ));
+            }
+            *target = self
+                .storage
+                .routine_type_oid(resolved.ctype, resolved.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "type \"{}\" does not exist",
+                        name
+                    )
+                })?;
+        }
+        Ok(types)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_prepare_statement(
         &mut self,
@@ -9972,23 +10157,11 @@ impl Engine {
         if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
             return Ok(Err(error));
         }
-        let types = match arena.alloc_slice_with(param_types.len(), |_| types::oid::UNKNOWN) {
-            Ok(types) => types,
-            Err(_) => return Ok(Err(eval::arena_full())),
-        };
-        // Declared types may be user-defined; PostgreSQL records them exactly.
-        for (index, type_name) in param_types.iter().enumerate() {
-            let Some(type_oid) = ColType::from_sql_name(type_name)
-                .map(ColType::oid)
-                .or_else(|| catalog::user_type_oid(&self.storage, txn.txid, type_name))
-            else {
-                return Ok(Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::UNDEFINED_OBJECT),
-                    message: stack_format!(192, "type \"{}\" does not exist", type_name),
-                }));
+        let types =
+            match self.prepared_parameter_types(param_types, param_types.len(), arena, txn.txid) {
+                Ok(types) => types,
+                Err(error) => return Ok(Err(error)),
             };
-            types[index] = type_oid;
-        }
         let inherited = match type_inputs::bindings_for_active_source(sql, arena) {
             Ok(bindings) => bindings.unwrap_or(&[]),
             Err(error) => return Ok(Err(error)),
@@ -10156,6 +10329,7 @@ impl Engine {
             || -> Result<(), SqlError> {
                 param_types::infer(&self.storage, statement, txn.txid, arena, parameter_oids);
                 parameter_oids[..types.len()].copy_from_slice(types);
+                reject_unknown_parameter_fields(parser.parameter_fields(), parameter_oids)?;
                 param_types::finish_unresolved(sql, arena, parameter_oids)
             },
         );
@@ -13918,6 +14092,7 @@ impl Engine {
                 oids[i] = c;
             }
         }
+        reject_unknown_parameter_fields(parser.parameter_fields(), oids)?;
         param_types::finish_unresolved(text, arena, oids)?;
         Ok(oids)
     }
@@ -19510,6 +19685,12 @@ impl Engine {
             ..NO_HOOKS
         };
         for (index, argument) in arguments.iter().enumerate() {
+            if argument.contains_subquery() {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot use subquery in EXECUTE parameter"
+                ));
+            }
             let source = exec::infer_type_catalog(argument, None, &self.storage, txid, arena)?.0;
             let value = eval::eval_full(argument, arena, outer_params, &NoColumns, &hooks)?;
             values[index] = prep::coerce_argument(
@@ -20231,30 +20412,42 @@ impl Engine {
                 } else {
                     guc::PlannerSettings::EMPTY
                 };
-                let planned_statement = match statement {
+                let (planned_statement, parameter_types) = match statement {
                     Stmt::ExecutePrepared { name, args } => {
-                        match self.prepared_statement(name, args.len(), sqlprep, arena, txn.txid) {
-                            Ok(statement) => statement,
+                        let declared = self
+                            .prepared_statement(name, args.len(), sqlprep, arena, txn.txid)
+                            .and_then(|statement| {
+                                let types = sqlprep
+                                    .parameter_types(name)
+                                    .expect("a parsed prepared statement exists")
+                                    .copy_into(arena)?;
+                                Ok((statement, Some(types)))
+                            });
+                        match declared {
+                            Ok(declared) => declared,
                             Err(error) => return Ok(Err(error)),
                         }
                     }
-                    _ => statement,
+                    _ => (&**statement, None),
                 };
-                let planned = self.prepare_planner_inputs(
-                    planned_statement,
-                    None,
-                    arena,
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                )?;
+                let planned = with_prepared_parameter_types(parameter_types, || {
+                    self.prepare_planner_inputs(
+                        planned_statement,
+                        None,
+                        arena,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                    )
+                })?;
                 if planned.is_err() {
                     return Ok(planned);
                 }
-                let plan =
-                    explain::plan_statement(&self.storage, txn.txid, planned_statement, arena);
+                let plan = with_prepared_parameter_types(parameter_types, || {
+                    explain::plan_statement(&self.storage, txn.txid, planned_statement, arena)
+                });
                 let plan = match plan {
                     Ok(plan) => plan,
                     Err(error) => return Ok(Err(error)),
@@ -20290,14 +20483,16 @@ impl Engine {
                     } else {
                         params
                     };
-                    let execution = self.execute_explained_statement(
-                        planned_statement,
-                        arena,
-                        execution_params,
-                        txn,
-                        guc,
-                        responder,
-                    );
+                    let execution = with_prepared_parameter_types(parameter_types, || {
+                        self.execute_explained_statement(
+                            planned_statement,
+                            arena,
+                            execution_params,
+                            txn,
+                            guc,
+                            responder,
+                        )
+                    });
                     let output = responder.finish_discard_query_output();
                     match execution {
                         Err(wire) => return Err(wire),
@@ -21939,6 +22134,7 @@ impl Engine {
                 guc,
                 names,
                 *if_exists,
+                arena,
                 responder,
             ),
             Stmt::SetRole { role, local, reset } => {
@@ -30051,6 +30247,54 @@ impl Engine {
     }
 }
 
+/// PostgreSQL rejects a field of a parameter whose type its use leaves
+/// undetermined (`SELECT ($1).a`) while that type is still `unknown`.
+fn reject_unknown_parameter_fields(fields: &[(u32, &str)], oids: &[i32]) -> Result<(), SqlError> {
+    for &(index, field) in fields {
+        if (index as usize)
+            .checked_sub(1)
+            .and_then(|index| oids.get(index))
+            .is_some_and(|oid| *oid == types::oid::UNKNOWN)
+        {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "column notation .{} applied to type unknown, which is not a composite type",
+                field
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Types an `EXPLAIN EXECUTE` statement by its prepared parameter types; any
+/// other explained statement keeps the enclosing parameter context.
+fn with_prepared_parameter_types<R>(types: Option<&[i32]>, run: impl FnOnce() -> R) -> R {
+    match types {
+        Some(types) => exec::with_bound_parameter_types(types, run),
+        None => run(),
+    }
+}
+
+/// PostgreSQL's `EvaluateParams` count check: a statement with declared or
+/// inferred parameters takes exactly that many arguments.
+fn check_prepared_argument_count(
+    name: &str,
+    declared: usize,
+    supplied: usize,
+) -> Result<(), SqlError> {
+    if declared == 0 || declared == supplied {
+        return Ok(());
+    }
+    Err(eval::with_detail(
+        sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "wrong number of parameters for prepared statement \"{}\"",
+            name
+        ),
+        format_args!("Expected {} parameters but got {}.", declared, supplied),
+    ))
+}
+
 // Native SQL fixtures are separate from the ownership tests beside runtime modules.
 #[cfg(all(test, not(miri)))]
 mod tests;
@@ -30068,27 +30312,6 @@ fn prepared_statement_missing(name: &str) -> SqlError {
 
 /// PostgreSQL types every parameter at PREPARE, so `EXECUTE` must supply each
 /// one; a statement without parameters ignores any arguments.
-fn check_prepared_argument_count(
-    name: &str,
-    declared: usize,
-    supplied: usize,
-) -> Result<(), SqlError> {
-    if declared == 0 || supplied == declared {
-        return Ok(());
-    }
-    let mut detail = crate::util::StackStr::<{ eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
-    let _ = core::fmt::Write::write_fmt(
-        &mut detail,
-        format_args!("Expected {declared} parameters but got {supplied}."),
-    );
-    eval::stash_diagnostic(Some(detail), None);
-    Err(sql_err!(
-        sqlstate::SYNTAX_ERROR,
-        "wrong number of parameters for prepared statement \"{}\"",
-        name
-    ))
-}
-
 /// The steps of a statement rewritten by rules, for its row progress.
 struct RuleSteps<'a> {
     finished: crate::mem::arena::ArenaList<'a, exec::StepRecord<'a>>,

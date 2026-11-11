@@ -1617,7 +1617,8 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             | Expr::Array(_)
             | Expr::ArraySubquery(_)
             | Expr::Case {
-                synthetic: false, ..
+                origin: crate::sql::ast::CaseOrigin::Written,
+                ..
             } => name_of(operand),
             Expr::Cast { operand, .. } => {
                 cast_source_name(operand).or_else(|| cast_target_name(type_name))
@@ -1633,7 +1634,10 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         // A desugared CASE (`IS TRUE`, `IS DISTINCT FROM`) is anonymous, as
         // PostgreSQL labels those `?column?`; a real CASE forwards to its ELSE.
         Expr::Case {
-            synthetic: true, ..
+            origin:
+                crate::sql::ast::CaseOrigin::BooleanTest { .. }
+                | crate::sql::ast::CaseOrigin::DistinctFrom { .. },
+            ..
         } => None,
         Expr::Case {
             otherwise: Some(e), ..
@@ -1707,7 +1711,8 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
     }
     match expression {
         Expr::Case {
-            synthetic: false, ..
+            origin: crate::sql::ast::CaseOrigin::Written,
+            ..
         } => "case",
         Expr::WholeRow(t) => t,
         Expr::Exists(_) => "exists",
@@ -2294,6 +2299,11 @@ pub(crate) fn bound_parameter_type_oid(index: u32) -> Option<i32> {
     })
 }
 
+/// Whether statement parameter `$index` is bound (its type may be unknown).
+pub(crate) fn bound_parameter_exists(index: u32) -> bool {
+    index >= 1 && BOUND_PARAMETER_TYPES.with(|types| (index as usize) <= types.get().len)
+}
+
 pub(crate) fn bound_parameter_context_active() -> bool {
     matches!(PARAMETER_CONTEXT.with(Cell::get), ParameterContext::Bound)
 }
@@ -2377,6 +2387,22 @@ impl Drop for RoutineParameterScope {
 
 fn routine_parameter_type(index: u32) -> Option<(i32, i16)> {
     routine_parameter_metadata(index).map(|metadata| (metadata.type_oid, metadata.ctype.typlen()))
+}
+
+/// A statement parameter bound to a named composite or relation row type
+/// (`PREPARE q(t)`, or a Parse type OID), typed through its catalog identity.
+fn bound_composite_parameter(index: u32) -> Option<StaticTypeMeta> {
+    if !bound_parameter_context_active() {
+        return None;
+    }
+    let type_oid = bound_parameter_type_oid(index)?;
+    match crate::storage::NamedTypeKind::from_oid(type_oid)? {
+        (crate::storage::NamedTypeKind::Composite, creation, false) => Some(StaticTypeMeta {
+            type_oid,
+            ..StaticTypeMeta::of(ColType::Composite(Some(creation)))
+        }),
+        _ => None,
+    }
 }
 
 fn routine_parameter_metadata(index: u32) -> Option<StaticTypeMeta> {
@@ -3544,6 +3570,7 @@ fn record_shape_metadata_dyn(
         {
             routine_parameter_metadata(*index)
         }
+        Expr::Param(index) => bound_composite_parameter(*index),
         Expr::RoutineParam {
             qualifier,
             name,
@@ -3826,6 +3853,35 @@ pub fn record_field_metadata(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "row expansion via \"*\" is not supported here"
         ));
+    }
+    // Outside a routine, the parameters are the ones bound to the statement;
+    // a simple query has none (`SELECT ($1).a`).
+    if let Expr::Param(index) = base
+        && bound_parameter_context_active()
+        && !bound_parameter_exists(*index)
+    {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_PARAMETER,
+            "there is no parameter ${}",
+            index
+        ));
+    }
+    if let Expr::Param(index) = base
+        && let Some(parameter) = bound_composite_parameter(*index)
+        && let ColType::Composite(slot) = parameter.ctype
+    {
+        return columns.composite_field(slot, field).ok_or_else(|| {
+            match columns.type_name_fixed(parameter.type_oid) {
+                Ok(Some(name)) => sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" not found in data type {}",
+                    field,
+                    name.as_str()
+                ),
+                Ok(None) => could_not_identify(field),
+                Err(error) => error,
+            }
+        });
     }
     // A bare unknown literal cannot be coerced out of a ROW(...) — but only
     // selecting *that* field (star expansion checks every field elsewhere)
@@ -5160,6 +5216,13 @@ fn infer_type_unpositioned(
             {
                 match source {
                     crate::sql::ast::ParameterSource::SqlRoutine => routine_parameter_type(*index),
+                    // A field the parameter's type lacks leaves the column
+                    // reference unresolved, as in PostgreSQL.
+                    crate::sql::ast::ParameterSource::SqlRoutineField => {
+                        let meta = record_field_metadata(&Expr::Param(*index), name, columns)
+                            .map_err(|_| error)?;
+                        Some((meta.type_oid, meta.ctype.typlen()))
+                    }
                     crate::sql::ast::ParameterSource::PlpgsqlCursor => {
                         bound_parameter_type_oid(*index)
                             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))

@@ -4153,6 +4153,7 @@ impl Checkpointer {
             .map_err(|_| CheckpointSetupError::Corrupt("invalid role identity allocator"))?;
         storage.restore_next_large_object_oid(metadata.next_large_object_oid);
         storage.clear_schemas_for_restore();
+        storage.clear_initdb_role_memberships();
         let lines = text.lines().skip(1);
         let mut database_identities = Vec::with_capacity(storage.database_count());
         let mut system_setting_names = Vec::with_capacity(crate::storage::MAX_SYSTEM_SETTINGS);
@@ -5197,7 +5198,8 @@ impl Checkpointer {
                 }
                 Some("rmem") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
+                    let identity =
+                        parse_membership_position(&mut words, metadata.catalog_sequence)?;
                     let role_oid =
                         |word, name| -> Result<crate::storage::RoleOid, CheckpointSetupError> {
                             crate::storage::RoleOid::parse(parse_field(word, name)?).ok_or(
@@ -5828,11 +5830,28 @@ impl Checkpointer {
                         cost_bits: Some(parse_field(words.next(), "brtn cost")?),
                         rows_bits: Some(parse_field(words.next(), "brtn rows")?),
                     };
+                    // The settings use the journal image's encoding.
+                    let configs = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("brtn settings missing"))?,
+                    )?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("invalid brtn record"));
                     }
-                    let image = crate::storage::BuiltinRoutineAttributes::new(routine, attributes)
-                        .map_err(|_| CheckpointSetupError::Corrupt("invalid brtn image"))?;
+                    let mut encoded = Vec::with_capacity(21 + configs.len());
+                    encoded.extend_from_slice(&[
+                        u8::from(attributes.strict),
+                        attributes.volatility.code(),
+                        attributes.parallel.code(),
+                        u8::from(attributes.security_definer),
+                        u8::from(attributes.leakproof),
+                    ]);
+                    encoded.extend_from_slice(&attributes.cost_bits.unwrap_or(0).to_le_bytes());
+                    encoded.extend_from_slice(&attributes.rows_bits.unwrap_or(0).to_le_bytes());
+                    encoded.extend_from_slice(&configs);
+                    let image = crate::wal::decode_builtin_routine_image(routine, &encoded)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid brtn image"))?;
                     storage
                         .replay_builtin_routine_attributes(
                             storage.current_database_oid(),
@@ -10214,7 +10233,10 @@ impl Checkpointer {
 
         // Roles are durable catalog authority. Parsed verifier material crosses
         // this object-backed manifest; plaintext passwords never do.
-        for (slot, role) in storage.live_roles() {
+        for (slot, role) in storage
+            .live_roles()
+            .filter(|(slot, _)| crate::storage::PredefinedRole::from_slot(*slot).is_none())
+        {
             use core::fmt::Write;
             let attributes = role.attributes;
             let mut name = StackStr::<130>::new();
@@ -13540,10 +13562,25 @@ impl Checkpointer {
                 &mut database_context,
                 entry.database,
             )?;
+            struct ConfigsHex<'a>(&'a [crate::storage::RoutineConfig]);
+            impl core::fmt::Display for ConfigsHex<'_> {
+                fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    write!(out, "{:02x}", self.0.len())?;
+                    for config in self.0 {
+                        for text in [config.name.as_str(), config.value.as_str()] {
+                            write!(out, "{:02x}", text.len())?;
+                            for byte in text.as_bytes() {
+                                write!(out, "{byte:02x}")?;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            }
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "brtn {} {} {} {} {} {} {} {}",
+                    "brtn {} {} {} {} {} {} {} {} {}",
                     routine.get(),
                     u8::from(attributes.strict),
                     attributes.volatility.code(),
@@ -13552,6 +13589,7 @@ impl Checkpointer {
                     u8::from(attributes.leakproof),
                     image.cost().to_bits(),
                     image.rows().to_bits(),
+                    ConfigsHex(image.configs()),
                 ),
             )?;
         }
@@ -19160,6 +19198,26 @@ fn parse_catalog_position(
     }
     crate::storage::CatalogPosition::new(slot, created_at)
         .map_err(|_| CheckpointSetupError::Corrupt("invalid catalog source identity"))
+}
+
+/// A membership position: a catalog source position, or an initdb
+/// membership's reserved identity at its own position.
+fn parse_membership_position(
+    words: &mut core::str::Split<'_, char>,
+    catalog_sequence: u64,
+) -> Result<crate::storage::CatalogPosition, CheckpointSetupError> {
+    let slot: usize = parse_field(words.next(), "catalog source slot")?;
+    let created_at: u64 = parse_field(words.next(), "catalog source creation")?;
+    if crate::storage::initdb_membership(created_at).is_none() && created_at > catalog_sequence {
+        return Err(CheckpointSetupError::Corrupt(
+            "catalog source exceeds saved identity allocator",
+        ));
+    }
+    let position = crate::storage::CatalogPosition::new(slot, created_at)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid catalog source identity"))?;
+    crate::storage::Storage::require_membership_identity(position)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid role membership identity"))?;
+    Ok(position)
 }
 
 #[inline(never)]

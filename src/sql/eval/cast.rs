@@ -552,7 +552,8 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             };
             Datum::Char(byte)
         }
-        ColType::Text | ColType::Varchar | ColType::Bpchar => Datum::Text(cast_to_text(v, arena)?),
+        ColType::Text | ColType::Varchar => Datum::Text(cast_to_text(v, arena)?),
+        ColType::Bpchar => Datum::Bpchar(cast_to_text(v, arena)?),
         ColType::Name => {
             // PostgreSQL truncates name input to NAMEDATALEN-1 = 63 bytes,
             // silently, on a character boundary.

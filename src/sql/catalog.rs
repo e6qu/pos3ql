@@ -214,18 +214,18 @@ pub(crate) fn procedural_language_name(oid: i32) -> Option<&'static str> {
 struct IntrinsicRoutine {
     oid: i32,
     name: &'static str,
-    result_oid: i32,
     argument_types: &'static str,
     argument_count: i32,
     volatility: &'static str,
 }
 
 macro_rules! intrinsic {
+    // The result type is the shared callable contract's; it stays written
+    // here so each row reads as its PostgreSQL declaration.
     ($oid:literal, $name:literal, $result:expr, $args:literal, $count:literal, $volatility:literal) => {
         IntrinsicRoutine {
             oid: $oid,
             name: $name,
-            result_oid: $result,
             argument_types: $args,
             argument_count: $count,
             volatility: $volatility,
@@ -235,6 +235,17 @@ macro_rules! intrinsic {
 
 #[path = "catalog_callable_signatures.rs"]
 mod callable_signatures;
+#[path = "catalog_routine_descriptions.rs"]
+mod routine_descriptions;
+
+/// The `pg_description` text PostgreSQL 18.6 ships for a built-in routine.
+pub(crate) fn builtin_routine_description(oid: i32) -> Option<&'static str> {
+    let descriptions = routine_descriptions::ROUTINE_DESCRIPTIONS;
+    descriptions
+        .binary_search_by_key(&oid, |(candidate, _)| *candidate)
+        .ok()
+        .map(|index| descriptions[index].1)
+}
 
 /// Catalog properties and executable input declarations share one PG snapshot.
 pub(crate) struct BuiltinCallableCatalog {
@@ -333,16 +344,33 @@ mod callable_contract_tests {
     use super::*;
 
     #[test]
-    fn planner_procedures_cover_support_functions_without_exposing_new_callables() {
+    fn planner_procedures_match_every_callable_declaration() {
         let numeric = builtin_planner_procedure(1701).unwrap();
         assert_eq!(numeric.volatility, 0);
         assert!(numeric.strict && !numeric.forbidden);
         assert_eq!(numeric.cost, 1.0);
-        assert!(builtin_callable_by_oid(1701).is_none());
+        assert!(builtin_callable_by_oid(1701).is_some());
         for oid in [1084, 1150, 750] {
             assert_eq!(builtin_planner_procedure(oid).unwrap().volatility, 1);
         }
         assert_eq!(planner_properties::PROCEDURES.len(), 3397);
+        // Every PostgreSQL 18.6 pg_proc row, plus the two local FDW callbacks.
+        assert_eq!(callable_signatures::CALLABLES.len(), 3415);
+        assert!(
+            planner_properties::PROCEDURES
+                .iter()
+                .all(|(oid, _)| builtin_callable_by_oid(*oid).is_some())
+        );
+        assert!(
+            callable_signatures::CALLABLES
+                .iter()
+                .flat_map(|routine| routine
+                    .arguments
+                    .iter()
+                    .chain(routine.catalog.all_arguments)
+                    .chain([&routine.result_oid]))
+                .all(|oid| intrinsic_type_name(*oid).is_some())
+        );
         assert!(
             planner_properties::PROCEDURES
                 .windows(2)
@@ -352,7 +380,7 @@ mod callable_contract_tests {
             let properties = builtin_planner_procedure(oid).unwrap();
             assert_eq!(properties.volatility, 0);
             assert!(properties.strict && !properties.forbidden);
-            assert!(builtin_callable_by_oid(oid).is_none());
+            assert!(builtin_callable_by_oid(oid).is_some());
         }
         for (oid, _) in planner_properties::PROCEDURES {
             let Some(signature) = builtin_callable_by_oid(*oid) else {
@@ -590,7 +618,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2895,
         name: "xmlcomment",
-        result_oid: super::types::oid::XML,
         argument_types: "25",
         argument_count: 1,
         volatility: "i",
@@ -598,7 +625,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2900,
         name: "xmlconcat2",
-        result_oid: super::types::oid::XML,
         argument_types: "142 142",
         argument_count: 2,
         volatility: "i",
@@ -606,7 +632,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2901,
         name: "xmlagg",
-        result_oid: super::types::oid::XML,
         argument_types: "142",
         argument_count: 1,
         volatility: "i",
@@ -614,7 +639,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2931,
         name: "xpath",
-        result_oid: super::types::oid::XML_ARRAY,
         argument_types: "25 142 1009",
         argument_count: 3,
         volatility: "i",
@@ -622,7 +646,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2932,
         name: "xpath",
-        result_oid: super::types::oid::XML_ARRAY,
         argument_types: "25 142",
         argument_count: 2,
         volatility: "i",
@@ -630,7 +653,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3049,
         name: "xpath_exists",
-        result_oid: super::types::oid::BOOL,
         argument_types: "25 142 1009",
         argument_count: 3,
         volatility: "i",
@@ -638,7 +660,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3050,
         name: "xpath_exists",
-        result_oid: super::types::oid::BOOL,
         argument_types: "25 142",
         argument_count: 2,
         volatility: "i",
@@ -646,7 +667,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3051,
         name: "xml_is_well_formed",
-        result_oid: super::types::oid::BOOL,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -654,7 +674,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3052,
         name: "xml_is_well_formed_document",
-        result_oid: super::types::oid::BOOL,
         argument_types: "25",
         argument_count: 1,
         volatility: "i",
@@ -662,7 +681,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3053,
         name: "xml_is_well_formed_content",
-        result_oid: super::types::oid::BOOL,
         argument_types: "25",
         argument_count: 1,
         volatility: "i",
@@ -670,7 +688,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3577,
         name: "pg_logical_emit_message",
-        result_oid: super::types::oid::PG_LSN,
         argument_types: "16 25 25 16",
         argument_count: 4,
         volatility: "v",
@@ -678,7 +695,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3578,
         name: "pg_logical_emit_message",
-        result_oid: super::types::oid::PG_LSN,
         argument_types: "16 25 17 16",
         argument_count: 4,
         volatility: "v",
@@ -686,7 +702,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3786,
         name: "pg_create_logical_replication_slot",
-        result_oid: super::types::oid::RECORD,
         argument_types: "19 19 16 16 16",
         argument_count: 5,
         volatility: "v",
@@ -694,7 +709,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3780,
         name: "pg_drop_replication_slot",
-        result_oid: super::types::oid::VOID,
         argument_types: "19",
         argument_count: 1,
         volatility: "v",
@@ -702,7 +716,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4222,
         name: "pg_copy_logical_replication_slot",
-        result_oid: super::types::oid::RECORD,
         argument_types: "19 19 16 19",
         argument_count: 4,
         volatility: "v",
@@ -710,7 +723,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4223,
         name: "pg_copy_logical_replication_slot",
-        result_oid: super::types::oid::RECORD,
         argument_types: "19 19 16",
         argument_count: 3,
         volatility: "v",
@@ -718,7 +730,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4224,
         name: "pg_copy_logical_replication_slot",
-        result_oid: super::types::oid::RECORD,
         argument_types: "19 19",
         argument_count: 2,
         volatility: "v",
@@ -726,7 +737,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3878,
         name: "pg_replication_slot_advance",
-        result_oid: super::types::oid::RECORD,
         argument_types: "19 3220",
         argument_count: 2,
         volatility: "v",
@@ -734,7 +744,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 6170,
         name: "pg_stat_reset_replication_slot",
-        result_oid: super::types::oid::VOID,
         argument_types: "25",
         argument_count: 1,
         volatility: "v",
@@ -742,7 +751,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 6232,
         name: "pg_stat_reset_subscription_stats",
-        result_oid: super::types::oid::VOID,
         argument_types: "26",
         argument_count: 1,
         volatility: "v",
@@ -807,7 +815,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 540_000,
         name: "postgres_fdw_handler",
-        result_oid: super::types::oid::FDW_HANDLER,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -815,7 +822,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 540_001,
         name: "postgres_fdw_validator",
-        result_oid: super::types::oid::VOID,
         argument_types: "1009 26",
         argument_count: 2,
         volatility: "s",
@@ -823,7 +829,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 715,
         name: "lo_create",
-        result_oid: 26,
         argument_types: "26",
         argument_count: 1,
         volatility: "v",
@@ -831,7 +836,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 764,
         name: "lo_import",
-        result_oid: 26,
         argument_types: "25",
         argument_count: 1,
         volatility: "v",
@@ -839,7 +843,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 765,
         name: "lo_export",
-        result_oid: 23,
         argument_types: "26 25",
         argument_count: 2,
         volatility: "v",
@@ -847,7 +850,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 767,
         name: "lo_import",
-        result_oid: 26,
         argument_types: "25 26",
         argument_count: 2,
         volatility: "v",
@@ -855,7 +857,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 952,
         name: "lo_open",
-        result_oid: 23,
         argument_types: "26 23",
         argument_count: 2,
         volatility: "v",
@@ -863,7 +864,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 953,
         name: "lo_close",
-        result_oid: 23,
         argument_types: "23",
         argument_count: 1,
         volatility: "v",
@@ -871,7 +871,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 954,
         name: "loread",
-        result_oid: 17,
         argument_types: "23 23",
         argument_count: 2,
         volatility: "v",
@@ -879,7 +878,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 955,
         name: "lowrite",
-        result_oid: 23,
         argument_types: "23 17",
         argument_count: 2,
         volatility: "v",
@@ -887,7 +885,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 956,
         name: "lo_lseek",
-        result_oid: 23,
         argument_types: "23 23 23",
         argument_count: 3,
         volatility: "v",
@@ -895,7 +892,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 957,
         name: "lo_creat",
-        result_oid: 26,
         argument_types: "23",
         argument_count: 1,
         volatility: "v",
@@ -903,7 +899,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 958,
         name: "lo_tell",
-        result_oid: 23,
         argument_types: "23",
         argument_count: 1,
         volatility: "v",
@@ -911,7 +906,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 964,
         name: "lo_unlink",
-        result_oid: 23,
         argument_types: "26",
         argument_count: 1,
         volatility: "v",
@@ -919,7 +913,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1004,
         name: "lo_truncate",
-        result_oid: 23,
         argument_types: "23 23",
         argument_count: 2,
         volatility: "v",
@@ -927,7 +920,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3170,
         name: "lo_lseek64",
-        result_oid: 20,
         argument_types: "23 20 23",
         argument_count: 3,
         volatility: "v",
@@ -935,7 +927,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3171,
         name: "lo_tell64",
-        result_oid: 20,
         argument_types: "23",
         argument_count: 1,
         volatility: "v",
@@ -943,7 +934,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3172,
         name: "lo_truncate64",
-        result_oid: 23,
         argument_types: "23 20",
         argument_count: 2,
         volatility: "v",
@@ -951,7 +941,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3457,
         name: "lo_from_bytea",
-        result_oid: 26,
         argument_types: "26 17",
         argument_count: 2,
         volatility: "v",
@@ -959,7 +948,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3458,
         name: "lo_get",
-        result_oid: 17,
         argument_types: "26",
         argument_count: 1,
         volatility: "v",
@@ -967,7 +955,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3459,
         name: "lo_get",
-        result_oid: 17,
         argument_types: "26 20 23",
         argument_count: 3,
         volatility: "v",
@@ -975,7 +962,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3460,
         name: "lo_put",
-        result_oid: 2278,
         argument_types: "26 20 17",
         argument_count: 3,
         volatility: "v",
@@ -983,7 +969,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1644,
         name: "RI_FKey_check_ins",
-        result_oid: 2279,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -991,7 +976,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1645,
         name: "RI_FKey_check_upd",
-        result_oid: 2279,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -999,7 +983,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1646,
         name: "RI_FKey_cascade_del",
-        result_oid: 2279,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -1007,7 +990,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1647,
         name: "RI_FKey_cascade_upd",
-        result_oid: 2279,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -1015,7 +997,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1648,
         name: "RI_FKey_restrict_del",
-        result_oid: 2279,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -1023,7 +1004,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1649,
         name: "RI_FKey_restrict_upd",
-        result_oid: 2279,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -1031,7 +1011,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1650,
         name: "RI_FKey_setnull_del",
-        result_oid: 2279,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -1039,7 +1018,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1651,
         name: "RI_FKey_setnull_upd",
-        result_oid: 2279,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -1047,7 +1025,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1652,
         name: "RI_FKey_setdefault_del",
-        result_oid: 2279,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -1055,7 +1032,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1653,
         name: "RI_FKey_setdefault_upd",
-        result_oid: 2279,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -1063,7 +1039,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1654,
         name: "RI_FKey_noaction_del",
-        result_oid: 2279,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -1071,7 +1046,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1655,
         name: "RI_FKey_noaction_upd",
-        result_oid: 2279,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -1079,7 +1053,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3717,
         name: "prsd_start",
-        result_oid: 2281,
         argument_types: "2281 23",
         argument_count: 2,
         volatility: "i",
@@ -1087,7 +1060,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3718,
         name: "prsd_nexttoken",
-        result_oid: 2281,
         argument_types: "2281 2281 2281",
         argument_count: 3,
         volatility: "i",
@@ -1095,7 +1067,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3719,
         name: "prsd_end",
-        result_oid: 2278,
         argument_types: "2281",
         argument_count: 1,
         volatility: "i",
@@ -1103,7 +1074,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3720,
         name: "prsd_headline",
-        result_oid: 2281,
         argument_types: "2281 2281 3615",
         argument_count: 3,
         volatility: "i",
@@ -1111,7 +1081,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3721,
         name: "prsd_lextype",
-        result_oid: 2281,
         argument_types: "2281",
         argument_count: 1,
         volatility: "i",
@@ -1119,7 +1088,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3725,
         name: "dsimple_init",
-        result_oid: 2281,
         argument_types: "2281",
         argument_count: 1,
         volatility: "i",
@@ -1127,7 +1095,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3726,
         name: "dsimple_lexize",
-        result_oid: 2281,
         argument_types: "2281 2281 2281 2281",
         argument_count: 4,
         volatility: "i",
@@ -1135,7 +1102,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4568,
         name: "pg_event_trigger_ddl_commands",
-        result_oid: super::types::oid::RECORD,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -1143,7 +1109,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2511,
         name: "pg_cursor",
-        result_oid: super::types::oid::RECORD,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -1151,7 +1116,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3566,
         name: "pg_event_trigger_dropped_objects",
-        result_oid: super::types::oid::RECORD,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -1159,7 +1123,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4566,
         name: "pg_event_trigger_table_rewrite_oid",
-        result_oid: 26,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -1167,7 +1130,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4567,
         name: "pg_event_trigger_table_rewrite_reason",
-        result_oid: 23,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -1175,7 +1137,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3415,
         name: "pg_get_statisticsobjdef",
-        result_oid: 25,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1183,7 +1144,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 6173,
         name: "pg_get_statisticsobjdef_expressions",
-        result_oid: 1009,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1191,7 +1151,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 6174,
         name: "pg_get_statisticsobjdef_columns",
-        result_oid: 25,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1199,7 +1158,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 89,
         name: "version",
-        result_oid: 25,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -1207,7 +1165,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 861,
         name: "current_database",
-        result_oid: 19,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -1215,7 +1172,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1081,
         name: "format_type",
-        result_oid: 25,
         argument_types: "26 23",
         argument_count: 2,
         volatility: "s",
@@ -1224,7 +1180,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3476,
         name: "to_regoperator",
-        result_oid: 2204,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -1232,7 +1187,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3479,
         name: "to_regprocedure",
-        result_oid: 2202,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -1240,7 +1194,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3492,
         name: "to_regoper",
-        result_oid: 2203,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -1248,7 +1201,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3493,
         name: "to_regtype",
-        result_oid: 2206,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -1256,7 +1208,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3494,
         name: "to_regproc",
-        result_oid: 24,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -1264,7 +1215,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3495,
         name: "to_regclass",
-        result_oid: 2205,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -1272,7 +1222,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4086,
         name: "to_regnamespace",
-        result_oid: 4089,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -1280,7 +1229,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4093,
         name: "to_regrole",
-        result_oid: 4096,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -1288,7 +1236,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4195,
         name: "to_regcollation",
-        result_oid: 4191,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -1296,7 +1243,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 6317,
         name: "to_regtypemod",
-        result_oid: 23,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -1304,7 +1250,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2854,
         name: "pg_my_temp_schema",
-        result_oid: 26,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -1312,7 +1257,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2855,
         name: "pg_is_other_temp_schema",
-        result_oid: 16,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1320,7 +1264,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1215,
         name: "obj_description",
-        result_oid: 25,
         argument_types: "26 19",
         argument_count: 2,
         volatility: "s",
@@ -1328,7 +1271,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1216,
         name: "col_description",
-        result_oid: 25,
         argument_types: "26 23",
         argument_count: 2,
         volatility: "s",
@@ -1336,7 +1278,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1264,
         name: "pg_char_to_encoding",
-        result_oid: 23,
         argument_types: "19",
         argument_count: 1,
         volatility: "s",
@@ -1344,7 +1285,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1348,
         name: "obj_description",
-        result_oid: 25,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1352,7 +1292,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1387,
         name: "pg_get_constraintdef",
-        result_oid: 25,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1360,7 +1299,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1402,
         name: "current_schema",
-        result_oid: 19,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -1368,7 +1306,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1403,
         name: "current_schemas",
-        result_oid: 1003,
         argument_types: "16",
         argument_count: 1,
         volatility: "s",
@@ -1376,7 +1313,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1597,
         name: "pg_encoding_to_char",
-        result_oid: 19,
         argument_types: "23",
         argument_count: 1,
         volatility: "s",
@@ -1384,7 +1320,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1641,
         name: "pg_get_viewdef",
-        result_oid: 25,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1392,7 +1327,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1642,
         name: "pg_get_userbyid",
-        result_oid: 19,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1400,7 +1334,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1643,
         name: "pg_get_indexdef",
-        result_oid: 25,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1408,7 +1341,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1714,
         name: "convert_from",
-        result_oid: 25,
         argument_types: "17 19",
         argument_count: 2,
         volatility: "s",
@@ -1416,7 +1348,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1717,
         name: "convert_to",
-        result_oid: 17,
         argument_types: "25 19",
         argument_count: 2,
         volatility: "s",
@@ -1424,7 +1355,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1813,
         name: "convert",
-        result_oid: 17,
         argument_types: "17 19 19",
         argument_count: 3,
         volatility: "s",
@@ -1432,7 +1362,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4374,
         name: "iso8859_1_to_utf8",
-        result_oid: 23,
         argument_types: "23 23 2275 2281 23 16",
         argument_count: 6,
         volatility: "i",
@@ -1440,7 +1369,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4375,
         name: "utf8_to_iso8859_1",
-        result_oid: 23,
         argument_types: "23 23 2275 2281 23 16",
         argument_count: 6,
         volatility: "i",
@@ -1448,7 +1376,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1662,
         name: "pg_get_triggerdef",
-        result_oid: 25,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1456,7 +1383,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2730,
         name: "pg_get_triggerdef",
-        result_oid: 25,
         argument_types: "26 16",
         argument_count: 2,
         volatility: "s",
@@ -1464,7 +1390,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1716,
         name: "pg_get_expr",
-        result_oid: 25,
         argument_types: "194 26",
         argument_count: 2,
         volatility: "s",
@@ -1616,7 +1541,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2077,
         name: "current_setting",
-        result_oid: 25,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -1624,7 +1548,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3352,
         name: "pg_get_partkeydef",
-        result_oid: 25,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1632,7 +1555,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2078,
         name: "set_config",
-        result_oid: 25,
         argument_types: "25 25 16",
         argument_count: 3,
         volatility: "v",
@@ -1640,7 +1562,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2079,
         name: "pg_table_is_visible",
-        result_oid: 16,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1666,7 +1587,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2080,
         name: "pg_type_is_visible",
-        result_oid: 16,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1674,7 +1594,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2081,
         name: "pg_function_is_visible",
-        result_oid: 16,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1682,7 +1601,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2168,
         name: "pg_database_size",
-        result_oid: 20,
         argument_types: "19",
         argument_count: 1,
         volatility: "v",
@@ -1690,7 +1608,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2322,
         name: "pg_tablespace_size",
-        result_oid: 20,
         argument_types: "26",
         argument_count: 1,
         volatility: "v",
@@ -1698,7 +1615,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2997,
         name: "pg_table_size",
-        result_oid: 20,
         argument_types: "2205",
         argument_count: 1,
         volatility: "v",
@@ -1706,7 +1622,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3086,
         name: "pg_extension_config_dump",
-        result_oid: 2278,
         argument_types: "2205 25",
         argument_count: 2,
         volatility: "v",
@@ -1714,7 +1629,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3778,
         name: "pg_tablespace_location",
-        result_oid: 25,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1722,7 +1636,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2621,
         name: "pg_reload_conf",
-        result_oid: 16,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -1730,7 +1643,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3810,
         name: "pg_is_in_recovery",
-        result_oid: 16,
         argument_types: "",
         argument_count: 0,
         volatility: "v",
@@ -1738,7 +1650,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3815,
         name: "pg_collation_is_visible",
-        result_oid: 16,
         argument_types: "26",
         argument_count: 1,
         volatility: "s",
@@ -1746,7 +1657,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 6119,
         name: "pg_get_publication_tables",
-        result_oid: 2249,
         argument_types: "1009",
         argument_count: 1,
         volatility: "s",
@@ -1754,7 +1664,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 6120,
         name: "pg_get_replica_identity_index",
-        result_oid: 2205,
         argument_types: "2205",
         argument_count: 1,
         volatility: "s",
@@ -1762,7 +1671,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 6121,
         name: "pg_relation_is_publishable",
-        result_oid: 16,
         argument_types: "2205",
         argument_count: 1,
         volatility: "s",
@@ -1770,7 +1678,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1158,
         name: "to_timestamp",
-        result_oid: 1184,
         argument_types: "701",
         argument_count: 1,
         volatility: "i",
@@ -1778,7 +1685,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1768,
         name: "to_char",
-        result_oid: 25,
         argument_types: "1186 25",
         argument_count: 2,
         volatility: "s",
@@ -1786,7 +1692,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1770,
         name: "to_char",
-        result_oid: 25,
         argument_types: "1184 25",
         argument_count: 2,
         volatility: "s",
@@ -1794,7 +1699,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1772,
         name: "to_char",
-        result_oid: 25,
         argument_types: "1700 25",
         argument_count: 2,
         volatility: "s",
@@ -1802,7 +1706,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1773,
         name: "to_char",
-        result_oid: 25,
         argument_types: "23 25",
         argument_count: 2,
         volatility: "s",
@@ -1810,7 +1713,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1774,
         name: "to_char",
-        result_oid: 25,
         argument_types: "20 25",
         argument_count: 2,
         volatility: "s",
@@ -1818,7 +1720,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1775,
         name: "to_char",
-        result_oid: 25,
         argument_types: "700 25",
         argument_count: 2,
         volatility: "s",
@@ -1826,7 +1727,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1776,
         name: "to_char",
-        result_oid: 25,
         argument_types: "701 25",
         argument_count: 2,
         volatility: "s",
@@ -1834,7 +1734,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1777,
         name: "to_number",
-        result_oid: 1700,
         argument_types: "25 25",
         argument_count: 2,
         volatility: "s",
@@ -1842,7 +1741,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1778,
         name: "to_timestamp",
-        result_oid: 1184,
         argument_types: "25 25",
         argument_count: 2,
         volatility: "s",
@@ -1850,7 +1748,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1780,
         name: "to_date",
-        result_oid: 1082,
         argument_types: "25 25",
         argument_count: 2,
         volatility: "s",
@@ -1858,7 +1755,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2049,
         name: "to_char",
-        result_oid: 25,
         argument_types: "1114 25",
         argument_count: 2,
         volatility: "s",
@@ -1866,7 +1762,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1177,
         name: "jsonb_path_exists_tz",
-        result_oid: 16,
         argument_types: "3802 4072 3802 16",
         argument_count: 4,
         volatility: "s",
@@ -1874,7 +1769,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1179,
         name: "jsonb_path_query_tz",
-        result_oid: 3802,
         argument_types: "3802 4072 3802 16",
         argument_count: 4,
         volatility: "s",
@@ -1882,7 +1776,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1180,
         name: "jsonb_path_query_array_tz",
-        result_oid: 3802,
         argument_types: "3802 4072 3802 16",
         argument_count: 4,
         volatility: "s",
@@ -1890,7 +1783,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2023,
         name: "jsonb_path_query_first_tz",
-        result_oid: 3802,
         argument_types: "3802 4072 3802 16",
         argument_count: 4,
         volatility: "s",
@@ -1898,7 +1790,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2030,
         name: "jsonb_path_match_tz",
-        result_oid: 16,
         argument_types: "3802 4072 3802 16",
         argument_count: 4,
         volatility: "s",
@@ -1906,7 +1797,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3204,
         name: "json_to_record",
-        result_oid: 2249,
         argument_types: "114",
         argument_count: 1,
         volatility: "s",
@@ -1914,7 +1804,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3205,
         name: "json_to_recordset",
-        result_oid: 2249,
         argument_types: "114",
         argument_count: 1,
         volatility: "s",
@@ -1922,7 +1811,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3209,
         name: "jsonb_populate_record",
-        result_oid: 2283,
         argument_types: "2283 3802",
         argument_count: 2,
         volatility: "s",
@@ -1930,7 +1818,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3475,
         name: "jsonb_populate_recordset",
-        result_oid: 2283,
         argument_types: "2283 3802",
         argument_count: 2,
         volatility: "s",
@@ -1938,7 +1825,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3490,
         name: "jsonb_to_record",
-        result_oid: 2249,
         argument_types: "3802",
         argument_count: 1,
         volatility: "s",
@@ -1946,7 +1832,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3491,
         name: "jsonb_to_recordset",
-        result_oid: 2249,
         argument_types: "3802",
         argument_count: 1,
         volatility: "s",
@@ -1954,7 +1839,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3960,
         name: "json_populate_record",
-        result_oid: 2283,
         argument_types: "2283 114 16",
         argument_count: 3,
         volatility: "s",
@@ -1962,7 +1846,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3961,
         name: "json_populate_recordset",
-        result_oid: 2283,
         argument_types: "2283 114 16",
         argument_count: 3,
         volatility: "s",
@@ -1970,7 +1853,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4005,
         name: "jsonb_path_exists",
-        result_oid: 16,
         argument_types: "3802 4072 3802 16",
         argument_count: 4,
         volatility: "i",
@@ -1978,7 +1860,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4006,
         name: "jsonb_path_query",
-        result_oid: 3802,
         argument_types: "3802 4072 3802 16",
         argument_count: 4,
         volatility: "i",
@@ -1986,7 +1867,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4007,
         name: "jsonb_path_query_array",
-        result_oid: 3802,
         argument_types: "3802 4072 3802 16",
         argument_count: 4,
         volatility: "i",
@@ -1994,7 +1874,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4008,
         name: "jsonb_path_query_first",
-        result_oid: 3802,
         argument_types: "3802 4072 3802 16",
         argument_count: 4,
         volatility: "i",
@@ -2002,7 +1881,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4009,
         name: "jsonb_path_match",
-        result_oid: 16,
         argument_types: "3802 4072 3802 16",
         argument_count: 4,
         volatility: "i",
@@ -2010,7 +1888,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4010,
         name: "jsonb_path_exists_opr",
-        result_oid: 16,
         argument_types: "3802 4072",
         argument_count: 2,
         volatility: "i",
@@ -2018,7 +1895,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 4011,
         name: "jsonb_path_match_opr",
-        result_oid: 16,
         argument_types: "3802 4072",
         argument_count: 2,
         volatility: "i",
@@ -2026,7 +1902,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 6338,
         name: "jsonb_populate_record_valid",
-        result_oid: 16,
         argument_types: "2283 3802",
         argument_count: 2,
         volatility: "s",
@@ -2034,7 +1909,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 1181,
         name: "age",
-        result_oid: super::types::oid::INT4,
         argument_types: "28",
         argument_count: 1,
         volatility: "s",
@@ -2042,7 +1916,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2943,
         name: "txid_current",
-        result_oid: super::types::oid::INT8,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -2050,7 +1923,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3348,
         name: "txid_current_if_assigned",
-        result_oid: super::types::oid::INT8,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -2058,7 +1930,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2944,
         name: "txid_current_snapshot",
-        result_oid: super::types::oid::TXID_SNAPSHOT,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -2066,7 +1937,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2945,
         name: "txid_snapshot_xmin",
-        result_oid: super::types::oid::INT8,
         argument_types: "2970",
         argument_count: 1,
         volatility: "i",
@@ -2074,7 +1944,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2946,
         name: "txid_snapshot_xmax",
-        result_oid: super::types::oid::INT8,
         argument_types: "2970",
         argument_count: 1,
         volatility: "i",
@@ -2082,7 +1951,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2947,
         name: "txid_snapshot_xip",
-        result_oid: super::types::oid::INT8,
         argument_types: "2970",
         argument_count: 1,
         volatility: "i",
@@ -2090,7 +1958,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2948,
         name: "txid_visible_in_snapshot",
-        result_oid: super::types::oid::BOOL,
         argument_types: "20 2970",
         argument_count: 2,
         volatility: "i",
@@ -2098,7 +1965,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 3360,
         name: "txid_status",
-        result_oid: super::types::oid::TEXT,
         argument_types: "20",
         argument_count: 1,
         volatility: "v",
@@ -2106,7 +1972,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 5059,
         name: "pg_current_xact_id",
-        result_oid: super::types::oid::XID8,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -2114,7 +1979,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 5060,
         name: "pg_current_xact_id_if_assigned",
-        result_oid: super::types::oid::XID8,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -2122,7 +1986,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 5061,
         name: "pg_current_snapshot",
-        result_oid: super::types::oid::PG_SNAPSHOT,
         argument_types: "",
         argument_count: 0,
         volatility: "s",
@@ -2130,7 +1993,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 5062,
         name: "pg_snapshot_xmin",
-        result_oid: super::types::oid::XID8,
         argument_types: "5038",
         argument_count: 1,
         volatility: "i",
@@ -2138,7 +2000,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 5063,
         name: "pg_snapshot_xmax",
-        result_oid: super::types::oid::XID8,
         argument_types: "5038",
         argument_count: 1,
         volatility: "i",
@@ -2146,7 +2007,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 5064,
         name: "pg_snapshot_xip",
-        result_oid: super::types::oid::XID8,
         argument_types: "5038",
         argument_count: 1,
         volatility: "i",
@@ -2154,7 +2014,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 5065,
         name: "pg_visible_in_snapshot",
-        result_oid: super::types::oid::BOOL,
         argument_types: "5069 5038",
         argument_count: 2,
         volatility: "i",
@@ -2162,7 +2021,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 5066,
         name: "pg_xact_status",
-        result_oid: super::types::oid::TEXT,
         argument_types: "5069",
         argument_count: 1,
         volatility: "v",
@@ -4682,6 +4540,56 @@ pub(crate) fn builtin_cast_properties(source: i32, target: i32) -> Option<(bool,
         return builtin_inout_cast_properties(source, target);
     }
     None
+}
+
+/// The function of a `pg_cast` row whose method is a function call.
+pub(crate) fn builtin_function_cast_procedure(source: i32, target: i32) -> Option<i32> {
+    builtin_properties::CASTS
+        .iter()
+        .find(|cast| cast.source == source && cast.target == target && cast.method == b'f')
+        .map(|cast| cast.procedure)
+}
+
+/// Whether `procedure` implements a `pg_cast` row.
+pub(crate) fn builtin_procedure_is_cast(procedure: i32) -> bool {
+    builtin_properties::CASTS
+        .iter()
+        .any(|cast| cast.method == b'f' && cast.procedure == procedure)
+}
+
+/// The operator `procedure` implements: its name and left and right input
+/// types, the left being 0 for a prefix operator. A routine sharing an
+/// operator function's implementation and inputs (`like(text, text)` and
+/// `textlike`) implements the same operator.
+pub(crate) fn builtin_operator_of_procedure(procedure: i32) -> Option<(&'static str, i32, i32)> {
+    let signature = builtin_callable_by_oid(procedure)?;
+    builtin_properties::OPERATORS
+        .iter()
+        .find(|(_, _, _, candidate)| *candidate == procedure)
+        .or_else(|| {
+            builtin_properties::OPERATORS
+                .iter()
+                .find(|(_, _, _, candidate)| {
+                    builtin_callable_by_oid(*candidate).is_some_and(|operator| {
+                        operator.catalog.language == signature.catalog.language
+                            && operator.catalog.source == signature.catalog.source
+                            && operator.arguments == signature.arguments
+                    })
+                })
+        })
+        .map(|&(name, left, right, _)| (name, left, right))
+}
+
+/// The type whose single-argument input function is `procedure`.
+pub(crate) fn builtin_input_function_type(procedure: i32) -> Option<i32> {
+    let signature = builtin_callable_by_oid(procedure)?;
+    if signature.arguments.len() != 1 {
+        return None;
+    }
+    super::catalog_metadata::TYPE_IO
+        .iter()
+        .find(|io| io.input.oid == procedure)
+        .map(|io| io.oid)
 }
 
 /// Visits the actual input/output or cast functions; binary paths visit none.
@@ -10185,7 +10093,7 @@ pub(crate) fn synthesize_current<'a>(
         (false, "pg_ts_dict") => pg_ts_dict(storage, txid, arena),
         (false, "pg_ts_config") => pg_ts_config(storage, txid, arena),
         (false, "pg_ts_config_map") => pg_ts_config_map(storage, txid, arena),
-        (false, "pg_init_privs") => pg_init_privs(arena),
+        (false, "pg_init_privs") => pg_init_privs(storage, txid, arena),
         (false, "pg_cast") => pg_cast(storage, txid, arena),
         (false, "pg_transform") => finish(schema::require("pg_transform", false), &[], arena),
         (false, "pg_language") => pg_language(storage, txid, arena),
@@ -10224,7 +10132,7 @@ pub(crate) fn synthesize_current<'a>(
         ),
         (false, "pg_seclabel") => empty_monitoring_view("pg_seclabel", arena),
         (false, "pg_shdepend") => pg_shdepend(storage, txid, arena),
-        (false, "pg_description") => pg_description(storage, txid, arena),
+        (false, "pg_description") => pg_description(storage, txid, purpose, arena),
         (false, "pg_shdescription") => pg_shdescription(storage, txid, arena),
         (false, "pg_seclabels") => finish(schema::require("pg_seclabels", false), &[], arena),
         (false, "pg_shseclabel") => finish(schema::require("pg_shseclabel", false), &[], arena),
@@ -10932,20 +10840,7 @@ fn foreign_mapping_options_visible(
         && storage.has_object_privilege(server, current, crate::storage::PrivilegeSet::USAGE, txid)
 }
 
-const PG_DATABASE_OWNER_OID: i32 = 6_171;
-const PREDEFINED_ROLES: &[(i32, &str)] = &[(PG_DATABASE_OWNER_OID, "pg_database_owner")];
-
-pub(crate) fn predefined_role_name(oid: i32) -> Option<&'static str> {
-    PREDEFINED_ROLES
-        .iter()
-        .find_map(|(candidate, name)| (*candidate == oid).then_some(*name))
-}
-
-pub(crate) fn predefined_role_oid(name: &str) -> Option<i32> {
-    PREDEFINED_ROLES
-        .iter()
-        .find_map(|(oid, candidate)| (*candidate == name).then_some(*oid))
-}
+const PG_DATABASE_OWNER_OID: i32 = crate::storage::PredefinedRole::DatabaseOwner.oid();
 
 pub(crate) fn user_name_by_oid<'a>(
     catalog: &dyn super::eval::CatalogAccess,
@@ -11218,22 +11113,69 @@ fn builtin_acl<'a>(values: &[&str], arena: &'a Arena) -> Result<Datum<'a>, SqlEr
     })
 }
 
-fn pg_init_privs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("pg_init_privs", false);
-    let rows = arena
-        .alloc_slice_with(9, |_| &[] as &[Datum])
+/// An initdb ACL. Its roles are the bootstrap superuser and predefined
+/// roles, which cannot be dropped; a renamed bootstrap superuser is shown
+/// by its current name, as PostgreSQL stores ACL items by role OID.
+fn builtin_initial_acl<'a>(
+    storage: &Storage,
+    txid: u32,
+    items: &[&str],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use core::fmt::Write;
+    let bootstrap = storage.role_name(usize::from(crate::storage::BOOTSTRAP_ROLE), txid);
+    let datums = arena
+        .alloc_slice_with(items.len(), |_| Datum::Null)
         .map_err(|_| arena_full())?;
-    for (row_index, function_oid) in [764, 765, 767, 2274, 2307, 3775, 3776, 3777, 6387]
-        .into_iter()
-        .enumerate()
-    {
+    for (datum, item) in datums.iter_mut().zip(items) {
+        let (grantee, rest) = item.split_once('=').unwrap_or(("", item));
+        let (privileges, grantor) = rest.split_once('/').unwrap_or((rest, ""));
+        let rename = |name: &str| {
+            if name == "postgres" {
+                super::types::acl_identifier(bootstrap.as_str())
+            } else {
+                super::types::acl_identifier(name)
+            }
+        };
+        let mut rendered = StackStr::<256>::new();
+        let _ = write!(
+            rendered,
+            "{}={}/{}",
+            if grantee.is_empty() {
+                StackStr::new()
+            } else {
+                rename(grantee)
+            }
+            .as_str(),
+            privileges,
+            rename(grantor).as_str()
+        );
+        *datum = text(rendered.as_str(), arena)?;
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::AclItem,
+        raw: super::array::build(datums, arena)?,
+    })
+}
+
+fn pg_init_privs<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = schema::require("pg_init_privs", false);
+    let initial = callable_signatures::CALLABLE_INITIAL_ACLS;
+    let rows = arena
+        .alloc_slice_with(initial.len(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (row_index, (function_oid, items)) in initial.iter().enumerate() {
         rows[row_index] = row(
             &[
-                Datum::Int4(function_oid),
+                Datum::Int4(*function_oid),
                 Datum::Int4(PG_PROC_OID),
                 Datum::Int4(0),
                 Datum::Bpchar("i"),
-                builtin_acl(&["postgres=X/postgres"], arena)?,
+                builtin_initial_acl(storage, txid, items, arena)?,
             ],
             arena,
         )?;
@@ -11723,13 +11665,6 @@ pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str)
 }
 
 pub(crate) fn role_oid_by_written(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
-    if let Some(oid) = PREDEFINED_ROLES.iter().find_map(|(_, name)| {
-        identifier_spelling_matches(written, name)
-            .then(|| predefined_role_oid(name))
-            .flatten()
-    }) {
-        return Some(oid);
-    }
     (0..storage.role_count()).find_map(|slot| {
         let oid = storage.role_oid(slot);
         let visible = storage.role_slot_by_oid(oid, txid)?;
@@ -13594,11 +13529,38 @@ pub fn function_oid_is_visible(oid: i32) -> bool {
     builtin_callable_by_oid(oid).is_some()
 }
 
+/// The `proacl` initdb gives built-in routine `oid`, when it has one.
+pub(crate) fn builtin_routine_initial_acl(oid: i32) -> Option<&'static [&'static str]> {
+    let acls = callable_signatures::CALLABLE_INITIAL_ACLS;
+    acls.binary_search_by_key(&oid, |(candidate, _)| *candidate)
+        .ok()
+        .map(|index| acls[index].1)
+}
+
+/// The predefined roles initdb grants `EXECUTE` on built-in routine `oid`
+/// (`pg_monitor` on `pg_ls_waldir()`), in `proacl` order.
+pub(crate) fn builtin_routine_initial_grantees(
+    oid: i32,
+) -> impl Iterator<Item = crate::storage::PredefinedRole> {
+    builtin_routine_initial_acl(oid)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let grantee = item.split_once('=')?.0;
+            crate::storage::PredefinedRole::ALL
+                .into_iter()
+                .find(|role| role.name() == grantee)
+        })
+}
+
+/// Whether `PUBLIC` may execute built-in routine `oid` before any `GRANT` or
+/// `REVOKE`. initdb revokes it from server-administration functions such as
+/// `pg_reload_conf()` and `pg_read_file(text)`.
 pub(crate) fn intrinsic_routine_public_execute(oid: i32) -> Option<bool> {
-    function_oid_is_visible(oid).then_some(!matches!(
-        oid,
-        764 | 765 | 767 | 2274 | 2307 | 3775 | 3776 | 3777 | 6387
-    ))
+    function_oid_is_visible(oid).then(|| {
+        builtin_routine_initial_acl(oid)
+            .is_none_or(|items| items.iter().any(|item| item.starts_with("=X")))
+    })
 }
 
 pub(crate) fn function_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
@@ -14999,15 +14961,42 @@ pub fn function_def_text<'a>(
             }
             let _ = write!(definition, "AS {0}{body}{0}", delimiter.as_str());
         }
+        crate::storage::RoutineBodyKind::Return | crate::storage::RoutineBodyKind::Atomic => {
+            write_sql_body(&mut definition, storage, txid, &routine, arena)?;
+        }
+    }
+    let _ = definition.write_char('\n');
+    if definition.is_truncated() {
+        return Err(routine_definition_too_large());
+    }
+    Ok(Some(
+        arena
+            .alloc_str(definition.as_str())
+            .map_err(|_| super::eval::arena_full())?,
+    ))
+}
+
+/// PostgreSQL's `pg_get_function_sqlbody` of a SQL-standard body:
+/// `RETURN expression`, or `BEGIN ATOMIC` with one statement per line. A
+/// `RETURN` expression and a `SELECT` of expressions without `FROM` are
+/// printed in analyzed form (`SELECT (x + 1);`); other statements as written.
+fn write_sql_body(
+    output: &mut impl core::fmt::Write,
+    storage: &Storage,
+    txid: u32,
+    routine: &crate::storage::RoutineDef,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let context = deparse::Context {
+        storage,
+        txid,
+        table: None,
+        parameters: routine.parameters(),
+        joined: &[],
+        pretty: false,
+    };
+    match routine.body_kind {
         crate::storage::RoutineBodyKind::Return => {
-            let context = deparse::Context {
-                storage,
-                txid,
-                table: None,
-                parameters: routine.parameters(),
-                joined: &[],
-                pretty: false,
-            };
             let deparsed = match routine
                 .function_result_contract()
                 .and_then(|result| storage.routine_type_oid(result.ctype, result.user_type, txid))
@@ -15022,28 +15011,163 @@ pub fn function_def_text<'a>(
                 None => None,
             };
             let _ = write!(
-                definition,
+                output,
                 "RETURN {}",
                 deparsed.unwrap_or(routine.body.as_str())
             );
         }
         crate::storage::RoutineBodyKind::Atomic => {
-            let _ = definition.write_str("BEGIN ATOMIC\n");
-            if !routine.body.as_str().trim().is_empty() {
-                let _ = writeln!(definition, " {};", routine.body.as_str());
+            let _ = output.write_str("BEGIN ATOMIC\n");
+            for statement in split_sql_statements(routine.body.as_str()) {
+                let _ = output.write_char(' ');
+                write_atomic_statement(output, &context, statement, arena)?;
+                let _ = output.write_str(";\n");
             }
-            let _ = definition.write_str("END");
+            let _ = output.write_str("END");
+        }
+        crate::storage::RoutineBodyKind::String => {}
+    }
+    Ok(())
+}
+
+/// One `BEGIN ATOMIC` statement: a `SELECT` of expressions without `FROM`
+/// in analyzed form, any other statement as written.
+fn write_atomic_statement(
+    output: &mut impl core::fmt::Write,
+    context: &deparse::Context<'_>,
+    statement: &str,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let items = statement
+        .get(..7)
+        .filter(|keyword| keyword.eq_ignore_ascii_case("select "))
+        .map(|_| statement[7..].trim());
+    if let Some(items) = items.filter(|items| !items.is_empty()) {
+        let mark = arena.mark();
+        let mut printed = StackStr::<{ crate::storage::ROUTINE_SQL_MAX }>::from_str("SELECT ");
+        let mut complete = true;
+        for (index, item) in split_top_level_commas(items).enumerate() {
+            match deparse::deparse(context, item, deparse::Destination::Value, arena)? {
+                Some(deparsed) => {
+                    // PostgreSQL wraps each later item onto its own line and
+                    // names a bare parameter, whose column is not `?column?`.
+                    let _ = write!(
+                        printed,
+                        "{}{deparsed}",
+                        if index == 0 { "" } else { ",\n     " }
+                    );
+                    if let Ok(crate::sql::ast::Expr::Column {
+                        qualifier: None,
+                        name,
+                    }) = crate::sql::parser::parse_expr(item, arena)
+                    {
+                        let _ = printed.write_str(" AS ");
+                        write_identifier(&mut printed, name);
+                    }
+                }
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        // The printed items were copied out of the workspace.
+        unsafe { arena.rewind_to(mark) };
+        if complete && !printed.is_truncated() {
+            let _ = output.write_str(printed.as_str());
+            return Ok(());
         }
     }
-    let _ = definition.write_char('\n');
-    if definition.is_truncated() {
+    let _ = output.write_str(statement);
+    Ok(())
+}
+
+/// The `;`-separated statements of a `BEGIN ATOMIC` body, outside quotes,
+/// dollar quotes, parentheses and comments.
+fn split_sql_statements(body: &str) -> impl Iterator<Item = &str> {
+    let mut rest = body;
+    core::iter::from_fn(move || {
+        loop {
+            if rest.trim().is_empty() {
+                return None;
+            }
+            let bytes = rest.as_bytes();
+            let mut depth = 0usize;
+            let mut offset = 0;
+            let mut end = rest.len();
+            while offset < bytes.len() {
+                match bytes[offset] {
+                    quote @ (b'\'' | b'"') => {
+                        offset += 1;
+                        while offset < bytes.len() && bytes[offset] != quote {
+                            offset += 1;
+                        }
+                    }
+                    b'-' if bytes.get(offset + 1) == Some(&b'-') => {
+                        while offset < bytes.len() && bytes[offset] != b'\n' {
+                            offset += 1;
+                        }
+                    }
+                    b'$' => {
+                        let tag_end = rest[offset + 1..]
+                            .find(|character: char| {
+                                !(character.is_ascii_alphanumeric() || character == '_')
+                            })
+                            .map(|length| offset + 1 + length);
+                        if let Some(tag_end) = tag_end.filter(|end| bytes[*end] == b'$') {
+                            let tag = &rest[offset..=tag_end];
+                            match rest[tag_end + 1..].find(tag) {
+                                Some(close) => offset = tag_end + close + tag.len(),
+                                None => offset = bytes.len(),
+                            }
+                        }
+                    }
+                    b'(' => depth += 1,
+                    b')' => depth = depth.saturating_sub(1),
+                    b';' if depth == 0 => {
+                        end = offset;
+                        break;
+                    }
+                    _ => {}
+                }
+                offset += 1;
+            }
+            let statement = rest[..end].trim();
+            rest = rest.get(end + 1..).unwrap_or("");
+            if !statement.is_empty() {
+                return Some(statement);
+            }
+        }
+    })
+}
+
+/// `pg_get_function_sqlbody`: the SQL-standard body of a user-defined
+/// routine, or `None` for a body written as a string constant.
+pub fn function_sqlbody_text<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+        return Ok(None);
+    };
+    let routine = storage.routine_for(slot, txid);
+    if !matches!(
+        routine.body_kind,
+        crate::storage::RoutineBodyKind::Return | crate::storage::RoutineBodyKind::Atomic
+    ) {
+        return Ok(None);
+    }
+    let mut body = crate::util::StackStr::<{ crate::storage::ROUTINE_SQL_MAX * 2 }>::new();
+    write_sql_body(&mut body, storage, txid, &routine, arena)?;
+    if body.is_truncated() {
         return Err(routine_definition_too_large());
     }
-    Ok(Some(
-        arena
-            .alloc_str(definition.as_str())
-            .map_err(|_| super::eval::arena_full())?,
-    ))
+    arena
+        .alloc_str(body.as_str())
+        .map(Some)
+        .map_err(|_| super::eval::arena_full())
 }
 
 fn routine_definition_too_large() -> SqlError {
@@ -15426,70 +15550,16 @@ pub fn function_arguments_text<'a>(
     identity: bool,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
-        let mut output = StackStr::<256>::new();
-        use core::fmt::Write;
-        for (index, written) in routine.argument_types.split_ascii_whitespace().enumerate() {
-            if index != 0 {
-                write!(output, ", ").map_err(|_| super::eval::arena_full())?;
-            }
-            if routine.oid == 6212 {
-                write!(output, "{} ", ["mean", "stddev"][index])
-                    .map_err(|_| super::eval::arena_full())?;
-            } else if routine.oid == 2096 {
-                write!(output, "{} ", ["pid", "timeout"][index])
-                    .map_err(|_| super::eval::arena_full())?;
-            } else if routine.oid == 2171 {
-                output
-                    .write_str("pid ")
-                    .map_err(|_| super::eval::arena_full())?;
-            } else if (6339..=6341).contains(&routine.oid) {
-                write!(output, "{} ", ["min", "max"][index])
-                    .map_err(|_| super::eval::arena_full())?;
-            } else if routine.oid == 1268 {
-                write!(output, "{} ", ["str", "strict"][index])
-                    .map_err(|_| super::eval::arena_full())?;
-            }
-            if matches!(routine.oid, 3058 | 3059 | 3539)
-                && index + 1 == routine.argument_count as usize
-            {
-                output
-                    .write_str("VARIADIC ")
-                    .map_err(|_| super::eval::arena_full())?;
-            }
-            let type_oid = written.parse::<i32>().map_err(|_| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "intrinsic routine has an invalid argument OID"
-                )
-            })?;
-            let Some(type_name) = intrinsic_type_name(type_oid) else {
-                return Ok(None);
-            };
-            write!(output, "{type_name}").map_err(|_| super::eval::arena_full())?;
-            if routine.oid == 6212 && !identity {
-                write!(output, " DEFAULT {}", index).map_err(|_| super::eval::arena_full())?;
-            } else if routine.oid == 2096 && !identity && index == 1 {
-                output
-                    .write_str(" DEFAULT 0")
-                    .map_err(|_| super::eval::arena_full())?;
-            } else if !identity && routine.oid == 1268 && index == 1 {
-                output
-                    .write_str(" DEFAULT true")
-                    .map_err(|_| super::eval::arena_full())?;
-            } else if !identity && matches!(routine.oid, 4350 | 4351) && index == 1 {
-                output
-                    .write_str(" DEFAULT 'NFC'::text")
-                    .map_err(|_| super::eval::arena_full())?;
-            }
-        }
+    let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+        let Some(signature) = builtin_callable_by_oid(oid) else {
+            return Ok(None);
+        };
+        let mut output = StackStr::<{ crate::storage::ROUTINE_SQL_MAX }>::new();
+        write_builtin_arguments(&mut output, signature, false, !identity)?;
         return arena
             .alloc_str(output.as_str())
             .map(Some)
             .map_err(|_| super::eval::arena_full());
-    }
-    let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
-        return Ok(None);
     };
     let routine = storage.routine_for(slot, txid);
     let mut output = StackStr::<{ crate::storage::ROUTINE_SQL_MAX }>::new();
@@ -15632,19 +15702,179 @@ fn write_routine_result(
     }
 }
 
+/// The `format_type` name of a built-in routine's declared type.
+fn builtin_type_name(oid: i32) -> Result<&'static str, SqlError> {
+    intrinsic_type_name(oid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "built-in routine type {} has no name",
+            oid
+        )
+    })
+}
+
+/// PostgreSQL's `print_function_arguments` for a built-in routine: modes,
+/// quoted names and types of every parameter, `table` selecting the
+/// `RETURNS TABLE` columns, and an ordered-set aggregate's `ORDER BY`.
+fn write_builtin_arguments(
+    output: &mut impl core::fmt::Write,
+    signature: &BuiltinCallableSignature,
+    table: bool,
+    defaults: bool,
+) -> Result<(), SqlError> {
+    let full = || super::eval::arena_full();
+    let catalog = &signature.catalog;
+    let types = if catalog.all_arguments.is_empty() {
+        signature.arguments
+    } else {
+        catalog.all_arguments
+    };
+    let default_texts = signature.defaults.unwrap_or("");
+    let default_count = if default_texts.is_empty() {
+        0
+    } else {
+        split_top_level_commas(default_texts).count()
+    };
+    let lacking_defaults = signature.arguments.len() - default_count;
+    // PostgreSQL prints `ORDER BY` after an ordered-set aggregate's direct
+    // arguments, repeating a variadic aggregated argument.
+    let order_by_at = match signature.name {
+        _ if signature.kind != b'a' => None,
+        "percentile_cont" | "percentile_disc" => Some(1),
+        "mode" => Some(0),
+        "rank" | "dense_rank" | "percent_rank" | "cume_dist" => Some(1),
+        _ => None,
+    };
+    let mut printed = 0;
+    let mut input = 0;
+    let mut defaults = defaults;
+    let mut index = 0;
+    while index < types.len() {
+        let mode = catalog.modes.get(index).copied().unwrap_or(b'i');
+        let (mode_name, is_input) = match mode {
+            b'b' => ("INOUT ", true),
+            b'o' => ("OUT ", false),
+            b'v' => ("VARIADIC ", true),
+            b't' => ("", false),
+            _ => ("", true),
+        };
+        if is_input {
+            input += 1;
+        }
+        if table != (mode == b't') {
+            index += 1;
+            continue;
+        }
+        if Some(printed) == order_by_at {
+            output
+                .write_str(if printed == 0 {
+                    "ORDER BY "
+                } else {
+                    " ORDER BY "
+                })
+                .map_err(|_| full())?;
+        } else if printed != 0 {
+            output.write_str(", ").map_err(|_| full())?;
+        }
+        output.write_str(mode_name).map_err(|_| full())?;
+        let name = catalog
+            .all_argument_names
+            .get(index)
+            .copied()
+            .or_else(|| signature.argument_names.get(index).copied())
+            .unwrap_or("");
+        if !name.is_empty() {
+            write_identifier(output, name);
+            output.write_char(' ').map_err(|_| full())?;
+        }
+        output
+            .write_str(builtin_type_name(types[index])?)
+            .map_err(|_| full())?;
+        if defaults && is_input && input > lacking_defaults {
+            let default = split_top_level_commas(default_texts)
+                .nth(input - lacking_defaults - 1)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "built-in routine {} lacks a parameter default",
+                        signature.oid
+                    )
+                })?;
+            write!(output, " DEFAULT {default}").map_err(|_| full())?;
+        }
+        printed += 1;
+        if Some(printed) == order_by_at && index + 1 == types.len() {
+            // A variadic ordered-set aggregate's argument is both direct and
+            // aggregated.
+            defaults = false;
+            continue;
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+/// The comma-separated items of `text` outside quotes and parentheses.
+fn split_top_level_commas(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = Some(text);
+    core::iter::from_fn(move || {
+        let current = rest?;
+        let mut depth = 0usize;
+        let mut quoted = false;
+        for (offset, byte) in current.bytes().enumerate() {
+            match byte {
+                b'\'' => quoted = !quoted,
+                b'(' | b'[' if !quoted => depth += 1,
+                b')' | b']' if !quoted => depth = depth.saturating_sub(1),
+                b',' if !quoted && depth == 0 => {
+                    rest = Some(current[offset + 1..].trim_start());
+                    return Some(current[..offset].trim_end());
+                }
+                _ => {}
+            }
+        }
+        rest = None;
+        Some(current.trim())
+    })
+}
+
 pub fn function_result_text<'a>(
     storage: &Storage,
     txid: u32,
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
-        return intrinsic_type_name(routine.result_oid)
-            .map(|name| arena.alloc_str(name).map_err(|_| super::eval::arena_full()))
-            .transpose();
-    }
     let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
-        return Ok(None);
+        let Some(signature) = builtin_callable_by_oid(oid) else {
+            return Ok(None);
+        };
+        // PostgreSQL returns NULL for a procedure.
+        if signature.kind == b'p' {
+            return Ok(None);
+        }
+        let mut output = StackStr::<{ crate::storage::ROUTINE_SQL_MAX }>::new();
+        if signature.returns_set && signature.catalog.modes.contains(&b't') {
+            output
+                .write_str("TABLE(")
+                .map_err(|_| super::eval::arena_full())?;
+            write_builtin_arguments(&mut output, signature, true, false)?;
+            output
+                .write_char(')')
+                .map_err(|_| super::eval::arena_full())?;
+        } else {
+            if signature.returns_set {
+                output
+                    .write_str("SETOF ")
+                    .map_err(|_| super::eval::arena_full())?;
+            }
+            output
+                .write_str(builtin_type_name(signature.result_oid)?)
+                .map_err(|_| super::eval::arena_full())?;
+        }
+        return arena
+            .alloc_str(output.as_str())
+            .map(Some)
+            .map_err(|_| super::eval::arena_full());
     };
     let routine = storage.routine_for(slot, txid);
     // PostgreSQL returns NULL for a procedure.
@@ -15662,27 +15892,13 @@ pub fn function_result_text<'a>(
         .map_err(|_| super::eval::arena_full())
 }
 
+/// PostgreSQL's `format_type` name of a built-in type a `pg_proc` row uses.
 pub(crate) fn intrinsic_type_name(oid: i32) -> Option<&'static str> {
-    if crate::storage::NamedTypeKind::from_oid(oid).is_some() {
-        return None;
-    }
-    ColType::from_oid(oid).map(ColType::name).or_else(|| {
-        Some(match oid {
-            2276 => "\"any\"",
-            super::types::oid::ANYELEMENT => "anyelement",
-            super::types::oid::ANYARRAY => "anyarray",
-            super::types::oid::ANYNONARRAY => "anynonarray",
-            super::types::oid::ANYENUM => "anyenum",
-            super::types::oid::ANYRANGE => "anyrange",
-            super::types::oid::ANYMULTIRANGE => "anymultirange",
-            super::types::oid::ANYCOMPATIBLE => "anycompatible",
-            super::types::oid::ANYCOMPATIBLEARRAY => "anycompatiblearray",
-            super::types::oid::ANYCOMPATIBLENONARRAY => "anycompatiblenonarray",
-            super::types::oid::ANYCOMPATIBLERANGE => "anycompatiblerange",
-            super::types::oid::ANYCOMPATIBLEMULTIRANGE => "anycompatiblemultirange",
-            _ => return None,
-        })
-    })
+    let names = callable_signatures::CALLABLE_TYPE_NAMES;
+    names
+        .binary_search_by_key(&oid, |(candidate, _)| *candidate)
+        .ok()
+        .map(|index| names[index].1)
 }
 
 pub fn collation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
@@ -15936,17 +16152,58 @@ fn table_size(storage: &Storage, txid: u32, slot: usize) -> Result<i64, SqlError
 fn pg_description<'a>(
     storage: &Storage,
     txid: u32,
+    purpose: Materialization,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_description", false);
+    // Shipped descriptions never change, so history keeps only stored rows;
+    // a reader without a stored row falls back to the shipped text.
+    let shipped = match purpose {
+        Materialization::Query => routine_descriptions::ROUTINE_DESCRIPTIONS,
+        Materialization::History => &[],
+    };
     let out = arena
-        .alloc_slice_with(storage.comment_capacity(), |_| &[] as &[Datum])
+        .alloc_slice_with(storage.comment_capacity() + shipped.len(), |_| {
+            &[] as &[Datum]
+        })
         .map_err(|_| arena_full())?;
     let mut n = 0;
+    // Shipped built-in routine descriptions, unless a comment replaced or
+    // removed one in this database.
+    let commented = arena
+        .alloc_slice_with(storage.comment_capacity(), |_| u32::MAX)
+        .map_err(|_| arena_full())?;
+    let mut commented_count = 0;
+    for (class, _, _, subid, _) in storage.comments_visible(txid) {
+        if class == crate::storage::CommentClass::Routine && commented_count < commented.len() {
+            commented[commented_count] = subid;
+            commented_count += 1;
+        }
+    }
+    let commented = &mut commented[..commented_count];
+    commented.sort_unstable();
+    for &(oid, description) in shipped {
+        if commented.binary_search(&(oid as u32)).is_ok() {
+            continue;
+        }
+        out[n] = row(
+            &[
+                Datum::Oid(oid as u32),
+                Datum::Oid(PG_PROC_OID as u32),
+                Datum::Int4(0),
+                text(description, arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
     for (class, schema, name, subid, description) in storage.comments_visible(txid) {
         let schema = schema.as_str();
         let name = name.as_str();
         let description = description.as_str();
+        if description.is_empty() {
+            continue;
+        }
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_description"));
         }
@@ -16639,7 +16896,20 @@ pub fn comment_text_for<'a>(
             found_class = class;
         }
     }
-    Ok(found)
+    Ok(match found {
+        // An empty row hides a built-in routine's shipped description.
+        Some("") => None,
+        Some(text) => Some(text),
+        None => match target {
+            super::eval::DescriptionTarget::Local {
+                catalog: None | Some("pg_proc"),
+                column: 0,
+            } => i32::try_from(oid)
+                .ok()
+                .and_then(builtin_routine_description),
+            _ => None,
+        },
+    })
 }
 
 pub(crate) fn catalog_row_state(
@@ -23055,7 +23325,8 @@ fn pg_extension<'a>(
     finish(def, out, arena)
 }
 
-fn extension_dependency_catalog_identity(
+/// The `pg_class`/`pg_proc`/... identity of an access-controlled object.
+fn access_object_catalog_identity(
     storage: &Storage,
     txid: u32,
     object: crate::storage::AccessObject,
@@ -23109,7 +23380,7 @@ fn extension_dependency_catalog_identity(
         AccessClass::Extension => (3079, storage.extension(slot).oid()),
         AccessClass::Trigger => (2620, crate::storage::trigger_oid(&storage.trigger(slot))),
         AccessClass::EventTrigger => (3466, storage.event_trigger(slot).oid()),
-        AccessClass::Database => (1262, 5),
+        AccessClass::Database => (1262, storage.database(slot).oid.get()),
         AccessClass::LargeObject => (
             PG_LARGEOBJECT_OID,
             storage
@@ -23425,7 +23696,8 @@ fn pg_depend<'a>(
         let source = catalog_routine_result_oid(storage, txid, cast.source)?;
         let target = catalog_routine_result_oid(storage, txid, cast.target)?;
         for type_oid in [source, target] {
-            if ColType::from_oid(type_oid).is_none() {
+            // Built-in types are pinned and have no dependency rows.
+            if crate::storage::NamedTypeKind::from_oid(type_oid).is_some() {
                 push(PG_CAST_OID, cast.oid(), PG_TYPE_OID, type_oid, 0, "n")?;
             }
         }
@@ -24009,7 +24281,7 @@ fn pg_depend<'a>(
     }
     for (_, dependency) in storage.extension_dependencies_visible_to(txid) {
         let Some((class, object)) =
-            extension_dependency_catalog_identity(storage, txid, dependency.object)
+            access_object_catalog_identity(storage, txid, dependency.object)
         else {
             continue;
         };
@@ -25081,6 +25353,48 @@ fn pg_attribute<'a>(
     finish(def, &out[..n], arena)
 }
 
+/// The relation and attribute number a `pg_attrdef` OID names, when that
+/// column has a default visible to `txid`.
+pub(crate) fn attribute_default_column(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Option<(i32, i32)> {
+    let width = crate::storage::MAX_RELATION_COLUMNS as i32;
+    let (offset, view) = if (400_000_000..600_000_000).contains(&oid) {
+        (oid - 400_000_000, false)
+    } else if oid >= 600_000_000 {
+        (oid - 600_000_000, true)
+    } else {
+        return None;
+    };
+    let slot = usize::try_from(offset / width).ok()?;
+    let attribute = offset % width + 1;
+    if view {
+        let (_, definition) = storage
+            .views_visible_to(txid)
+            .find(|(candidate, _)| *candidate == slot)?;
+        let columns = definition.columns_for(txid);
+        let column = usize::try_from(attribute - 1).ok()?;
+        (column < columns.len() && columns.default_at_ref(column).is_some())
+            .then(|| (view_oid(storage, slot), attribute))
+    } else {
+        if slot >= storage.table_count() || !storage.table_slot_visible_to(slot, txid) {
+            return None;
+        }
+        let table = storage.table_def(slot, txid);
+        table
+            .columns()
+            .iter()
+            .enumerate()
+            .any(|(index, column)| {
+                i32::from(table.attribute_number(index)) == attribute
+                    && column.default.expression().is_some()
+            })
+            .then(|| (user_table_oid(storage, slot), attribute))
+    }
+}
+
 fn pg_attrdef<'a>(
     storage: &Storage,
     txid: u32,
@@ -25255,404 +25569,15 @@ fn catalog_regproc<'a>(
 
 fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_cast", false);
-    let builtin = [
-        (
-            10_001,
-            super::types::oid::MONEY,
-            super::types::oid::NUMERIC,
-            3823,
-            "a",
-            "f",
-        ),
-        (
-            10_002,
-            super::types::oid::NUMERIC,
-            super::types::oid::MONEY,
-            3824,
-            "a",
-            "f",
-        ),
-        (
-            10_003,
-            super::types::oid::INT4,
-            super::types::oid::MONEY,
-            3811,
-            "a",
-            "f",
-        ),
-        (
-            10_004,
-            super::types::oid::INT8,
-            super::types::oid::MONEY,
-            3812,
-            "a",
-            "f",
-        ),
-        (
-            10143,
-            super::types::oid::INT2,
-            super::types::oid::BYTEA,
-            6367,
-            "e",
-            "f",
-        ),
-        (
-            10144,
-            super::types::oid::INT4,
-            super::types::oid::BYTEA,
-            6368,
-            "e",
-            "f",
-        ),
-        (
-            10145,
-            super::types::oid::INT8,
-            super::types::oid::BYTEA,
-            6369,
-            "e",
-            "f",
-        ),
-        (
-            10146,
-            super::types::oid::BYTEA,
-            super::types::oid::INT2,
-            6370,
-            "e",
-            "f",
-        ),
-        (
-            10147,
-            super::types::oid::BYTEA,
-            super::types::oid::INT4,
-            6371,
-            "e",
-            "f",
-        ),
-        (
-            10148,
-            super::types::oid::BYTEA,
-            super::types::oid::INT8,
-            6372,
-            "e",
-            "f",
-        ),
-        (
-            10158,
-            super::types::oid::DATE,
-            super::types::oid::TIMESTAMP,
-            2024,
-            "i",
-            "f",
-        ),
-        (
-            10159,
-            super::types::oid::DATE,
-            super::types::oid::TIMESTAMPTZ,
-            1174,
-            "i",
-            "f",
-        ),
-        (
-            10160,
-            super::types::oid::TIME,
-            super::types::oid::INTERVAL,
-            1370,
-            "i",
-            "f",
-        ),
-        (
-            10161,
-            super::types::oid::TIME,
-            super::types::oid::TIMETZ,
-            2047,
-            "i",
-            "f",
-        ),
-        (
-            10162,
-            super::types::oid::TIMESTAMP,
-            super::types::oid::DATE,
-            2029,
-            "a",
-            "f",
-        ),
-        (
-            10163,
-            super::types::oid::TIMESTAMP,
-            super::types::oid::TIME,
-            1316,
-            "a",
-            "f",
-        ),
-        (
-            10164,
-            super::types::oid::TIMESTAMP,
-            super::types::oid::TIMESTAMPTZ,
-            2028,
-            "i",
-            "f",
-        ),
-        (
-            10165,
-            super::types::oid::TIMESTAMPTZ,
-            super::types::oid::DATE,
-            1178,
-            "a",
-            "f",
-        ),
-        (
-            10166,
-            super::types::oid::TIMESTAMPTZ,
-            super::types::oid::TIME,
-            2019,
-            "a",
-            "f",
-        ),
-        (
-            10167,
-            super::types::oid::TIMESTAMPTZ,
-            super::types::oid::TIMESTAMP,
-            2027,
-            "a",
-            "f",
-        ),
-        (
-            10168,
-            super::types::oid::TIMESTAMPTZ,
-            super::types::oid::TIMETZ,
-            1388,
-            "a",
-            "f",
-        ),
-        (
-            10169,
-            super::types::oid::INTERVAL,
-            super::types::oid::TIME,
-            1419,
-            "a",
-            "f",
-        ),
-        (
-            10170,
-            super::types::oid::TIMETZ,
-            super::types::oid::TIME,
-            2046,
-            "a",
-            "f",
-        ),
-        (
-            10212,
-            super::types::oid::TIME,
-            super::types::oid::TIME,
-            1968,
-            "i",
-            "f",
-        ),
-        (
-            10213,
-            super::types::oid::TIMESTAMP,
-            super::types::oid::TIMESTAMP,
-            1961,
-            "i",
-            "f",
-        ),
-        (
-            10214,
-            super::types::oid::TIMESTAMPTZ,
-            super::types::oid::TIMESTAMPTZ,
-            1967,
-            "i",
-            "f",
-        ),
-        (
-            10215,
-            super::types::oid::INTERVAL,
-            super::types::oid::INTERVAL,
-            1200,
-            "i",
-            "f",
-        ),
-        (
-            10216,
-            super::types::oid::TIMETZ,
-            super::types::oid::TIMETZ,
-            1969,
-            "i",
-            "f",
-        ),
-        (
-            10185,
-            super::types::oid::MACADDR,
-            super::types::oid::MACADDR8,
-            4123,
-            "i",
-            "f",
-        ),
-        (
-            10186,
-            super::types::oid::MACADDR8,
-            super::types::oid::MACADDR,
-            4124,
-            "i",
-            "f",
-        ),
-        (
-            10187,
-            super::types::oid::CIDR,
-            super::types::oid::INET,
-            0,
-            "i",
-            "b",
-        ),
-        (
-            10188,
-            super::types::oid::INET,
-            super::types::oid::CIDR,
-            1715,
-            "a",
-            "f",
-        ),
-        (
-            10195,
-            super::types::oid::CIDR,
-            super::types::oid::TEXT,
-            730,
-            "a",
-            "f",
-        ),
-        (
-            10196,
-            super::types::oid::INET,
-            super::types::oid::TEXT,
-            730,
-            "a",
-            "f",
-        ),
-        (
-            10200,
-            super::types::oid::CIDR,
-            super::types::oid::VARCHAR,
-            730,
-            "a",
-            "f",
-        ),
-        (
-            10201,
-            super::types::oid::INET,
-            super::types::oid::VARCHAR,
-            730,
-            "a",
-            "f",
-        ),
-        (
-            10205,
-            super::types::oid::CIDR,
-            super::types::oid::BPCHAR,
-            730,
-            "a",
-            "f",
-        ),
-        (
-            10206,
-            super::types::oid::INET,
-            super::types::oid::BPCHAR,
-            730,
-            "a",
-            "f",
-        ),
-        (
-            10081,
-            super::types::oid::OID,
-            super::types::oid::REGCOLLATION,
-            0,
-            "i",
-            "b",
-        ),
-        (
-            10082,
-            super::types::oid::REGCOLLATION,
-            super::types::oid::OID,
-            0,
-            "i",
-            "b",
-        ),
-        (
-            10083,
-            super::types::oid::INT8,
-            super::types::oid::REGCOLLATION,
-            1287,
-            "i",
-            "f",
-        ),
-        (
-            10084,
-            super::types::oid::INT2,
-            super::types::oid::REGCOLLATION,
-            313,
-            "i",
-            "f",
-        ),
-        (
-            10085,
-            super::types::oid::INT4,
-            super::types::oid::REGCOLLATION,
-            0,
-            "i",
-            "b",
-        ),
-        (
-            10086,
-            super::types::oid::REGCOLLATION,
-            super::types::oid::INT8,
-            1288,
-            "a",
-            "f",
-        ),
-        (
-            10087,
-            super::types::oid::REGCOLLATION,
-            super::types::oid::INT4,
-            0,
-            "a",
-            "b",
-        ),
-    ];
     let rows = catalog_rows(
         arena,
-        builtin.len()
-            + crate::sql::geometry::CAST_IDENTITIES.len()
-            + storage.casts_visible_to(txid).count(),
+        builtin_properties::CASTS.len() + storage.casts_visible_to(txid).count(),
     )?;
-    for (index, (oid, source, target, function, context, method)) in builtin.into_iter().enumerate()
-    {
-        rows[index] = row(
+    for (target, cast) in rows.iter_mut().zip(builtin_properties::CASTS) {
+        *target = row(
             &[
                 Datum::Int4(2605),
-                Datum::Int4(oid),
-                Datum::Int4(source),
-                Datum::Int4(target),
-                Datum::Int4(function),
-                Datum::Bpchar(context),
-                Datum::Bpchar(method),
-            ],
-            arena,
-        )?;
-    }
-    let mut count = builtin.len();
-    for &(oid, source, target) in crate::sql::geometry::CAST_IDENTITIES {
-        let cast = builtin_properties::CASTS
-            .iter()
-            .find(|cast| cast.source == source.oid() && cast.target == target.oid())
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "geometric catalog cast has no shared declaration"
-                )
-            })?;
-        rows[count] = row(
-            &[
-                Datum::Int4(2605),
-                Datum::Int4(oid),
+                Datum::Int4(cast.oid),
                 Datum::Int4(cast.source),
                 Datum::Int4(cast.target),
                 Datum::Int4(cast.procedure),
@@ -25671,8 +25596,8 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ],
             arena,
         )?;
-        count += 1;
     }
+    let mut count = builtin_properties::CASTS.len();
     for (_, cast) in storage.casts_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_cast"));
@@ -25839,6 +25764,132 @@ fn pg_operator<'a>(
 
 // PostgreSQL 18.6 bootstrap metadata; reference query and hashes are retained
 // in tests/external/reference/2026-11-03-input-plans/planner-metadata-reference.zip.
+/// PostgreSQL's built-in BRIN operator families.
+const BUILTIN_BRIN_FAMILIES: &[(i32, &str)] = &[
+    (4054, "integer_minmax_ops"),
+    (4055, "numeric_minmax_ops"),
+    (4056, "text_minmax_ops"),
+    (4058, "timetz_minmax_ops"),
+    (4059, "datetime_minmax_ops"),
+    (4062, "char_minmax_ops"),
+    (4064, "bytea_minmax_ops"),
+    (4065, "name_minmax_ops"),
+    (4068, "oid_minmax_ops"),
+    (4069, "tid_minmax_ops"),
+    (4070, "float_minmax_ops"),
+    (4074, "macaddr_minmax_ops"),
+    (4075, "network_minmax_ops"),
+    (4076, "bpchar_minmax_ops"),
+    (4077, "time_minmax_ops"),
+    (4078, "interval_minmax_ops"),
+    (4079, "bit_minmax_ops"),
+    (4080, "varbit_minmax_ops"),
+    (4081, "uuid_minmax_ops"),
+    (4082, "pg_lsn_minmax_ops"),
+    (4102, "network_inclusion_ops"),
+    (4103, "range_inclusion_ops"),
+    (4104, "box_inclusion_ops"),
+    (4109, "macaddr8_minmax_ops"),
+    (4572, "integer_bloom_ops"),
+    (4573, "text_bloom_ops"),
+    (4574, "numeric_bloom_ops"),
+    (4575, "timetz_bloom_ops"),
+    (4576, "datetime_bloom_ops"),
+    (4577, "char_bloom_ops"),
+    (4578, "bytea_bloom_ops"),
+    (4579, "name_bloom_ops"),
+    (4580, "oid_bloom_ops"),
+    (4581, "tid_bloom_ops"),
+    (4582, "float_bloom_ops"),
+    (4583, "macaddr_bloom_ops"),
+    (4584, "macaddr8_bloom_ops"),
+    (4585, "network_bloom_ops"),
+    (4586, "bpchar_bloom_ops"),
+    (4587, "time_bloom_ops"),
+    (4588, "interval_bloom_ops"),
+    (4589, "uuid_bloom_ops"),
+    (4590, "pg_lsn_bloom_ops"),
+    (4602, "integer_minmax_multi_ops"),
+    (4603, "numeric_minmax_multi_ops"),
+    (4604, "timetz_minmax_multi_ops"),
+    (4605, "datetime_minmax_multi_ops"),
+    (4606, "oid_minmax_multi_ops"),
+    (4607, "tid_minmax_multi_ops"),
+    (4608, "float_minmax_multi_ops"),
+    (4609, "macaddr_minmax_multi_ops"),
+    (4610, "macaddr8_minmax_multi_ops"),
+    (4611, "network_minmax_multi_ops"),
+    (4612, "time_minmax_multi_ops"),
+    (4613, "interval_minmax_multi_ops"),
+    (4614, "uuid_minmax_multi_ops"),
+    (4615, "pg_lsn_minmax_multi_ops"),
+];
+
+/// A built-in operator family's access method and name.
+pub(crate) fn builtin_operator_family(oid: i32) -> Option<(i32, &'static str)> {
+    BUILTIN_TREE_HASH_FAMILIES
+        .iter()
+        .map(|&(family, method, name)| (family, method, name))
+        .chain(
+            BUILTIN_BRIN_FAMILIES
+                .iter()
+                .map(|&(family, name)| (family, 3580, name)),
+        )
+        .chain(
+            super::gist_catalog::FAMILIES
+                .iter()
+                .map(|&(family, name)| (family, 783, name)),
+        )
+        .chain(
+            super::gin_catalog::FAMILIES
+                .iter()
+                .map(|&(family, name)| (family, 2742, name)),
+        )
+        .chain(
+            super::spgist_catalog::FAMILIES
+                .iter()
+                .map(|&(family, name)| (family, 4000, name)),
+        )
+        .find_map(|(family, method, name)| (family == oid).then_some((method, name)))
+}
+
+/// A built-in operator class's access method and name.
+pub(crate) fn builtin_operator_class(oid: i32) -> Option<(i32, &'static str)> {
+    if let Some(class) = BUILTIN_TREE_HASH_CLASSES
+        .iter()
+        .find(|class| class.0 == oid)
+    {
+        return Some((class.1, class.2));
+    }
+    if let Some(class) = super::types::BrinOperatorClass::from_oid(oid) {
+        return Some((3580, class.name()));
+    }
+    if let Some(class) = super::types::GistOperatorClass::from_oid(oid) {
+        return Some((783, class.name()));
+    }
+    if let Some(class) = super::types::GinOperatorClass::from_oid(oid) {
+        return Some((2742, class.name()));
+    }
+    super::types::SpGistOperatorClass::from_oid(oid).map(|class| (4000, class.name()))
+}
+
+/// The source and target type OIDs of a built-in or visible user cast.
+pub(crate) fn cast_type_oids(storage: &Storage, txid: u32, oid: i32) -> Option<(i32, i32)> {
+    if let Some(cast) = builtin_properties::CASTS
+        .iter()
+        .find(|cast| cast.oid == oid)
+    {
+        return Some((cast.source, cast.target));
+    }
+    let (_, cast) = storage
+        .casts_visible_to(txid)
+        .find(|(_, cast)| cast.oid() == oid)?;
+    Some((
+        catalog_routine_result_oid(storage, txid, cast.source).ok()?,
+        catalog_routine_result_oid(storage, txid, cast.target).ok()?,
+    ))
+}
+
 const BUILTIN_TREE_HASH_CLASSES: &[(i32, i32, &str, i32, i32, bool, i32)] = &[
     (1978, 403, "int4_ops", 1976, 23, true, 0),
     (1979, 403, "int2_ops", 1976, 21, true, 0),
@@ -26024,65 +26075,7 @@ fn pg_opfamily<'a>(
         )?;
         count += 1;
     }
-    for (oid, name) in [
-        (4054, "integer_minmax_ops"),
-        (4055, "numeric_minmax_ops"),
-        (4056, "text_minmax_ops"),
-        (4058, "timetz_minmax_ops"),
-        (4059, "datetime_minmax_ops"),
-        (4062, "char_minmax_ops"),
-        (4064, "bytea_minmax_ops"),
-        (4065, "name_minmax_ops"),
-        (4068, "oid_minmax_ops"),
-        (4069, "tid_minmax_ops"),
-        (4070, "float_minmax_ops"),
-        (4074, "macaddr_minmax_ops"),
-        (4075, "network_minmax_ops"),
-        (4076, "bpchar_minmax_ops"),
-        (4077, "time_minmax_ops"),
-        (4078, "interval_minmax_ops"),
-        (4079, "bit_minmax_ops"),
-        (4080, "varbit_minmax_ops"),
-        (4081, "uuid_minmax_ops"),
-        (4082, "pg_lsn_minmax_ops"),
-        (4102, "network_inclusion_ops"),
-        (4103, "range_inclusion_ops"),
-        (4104, "box_inclusion_ops"),
-        (4109, "macaddr8_minmax_ops"),
-        (4572, "integer_bloom_ops"),
-        (4573, "text_bloom_ops"),
-        (4574, "numeric_bloom_ops"),
-        (4575, "timetz_bloom_ops"),
-        (4576, "datetime_bloom_ops"),
-        (4577, "char_bloom_ops"),
-        (4578, "bytea_bloom_ops"),
-        (4579, "name_bloom_ops"),
-        (4580, "oid_bloom_ops"),
-        (4581, "tid_bloom_ops"),
-        (4582, "float_bloom_ops"),
-        (4583, "macaddr_bloom_ops"),
-        (4584, "macaddr8_bloom_ops"),
-        (4585, "network_bloom_ops"),
-        (4586, "bpchar_bloom_ops"),
-        (4587, "time_bloom_ops"),
-        (4588, "interval_bloom_ops"),
-        (4589, "uuid_bloom_ops"),
-        (4590, "pg_lsn_bloom_ops"),
-        (4602, "integer_minmax_multi_ops"),
-        (4603, "numeric_minmax_multi_ops"),
-        (4604, "timetz_minmax_multi_ops"),
-        (4605, "datetime_minmax_multi_ops"),
-        (4606, "oid_minmax_multi_ops"),
-        (4607, "tid_minmax_multi_ops"),
-        (4608, "float_minmax_multi_ops"),
-        (4609, "macaddr_minmax_multi_ops"),
-        (4610, "macaddr8_minmax_multi_ops"),
-        (4611, "network_minmax_multi_ops"),
-        (4612, "time_minmax_multi_ops"),
-        (4613, "interval_minmax_multi_ops"),
-        (4614, "uuid_minmax_multi_ops"),
-        (4615, "pg_lsn_minmax_multi_ops"),
-    ] {
+    for &(oid, name) in BUILTIN_BRIN_FAMILIES {
         rows[count] = row(
             &[
                 Datum::Int4(2753),
@@ -28252,10 +28245,10 @@ fn builtin_proc_row<'a>(
         Some(object) if storage.object_acl_defined(object, txid) => {
             acl(storage, object, txid, arena)?
         }
-        _ if intrinsic_routine_public_execute(signature.oid) == Some(false) => {
-            builtin_acl(&["postgres=X/postgres"], arena)?
-        }
-        _ => Datum::Null,
+        _ => match builtin_routine_initial_acl(signature.oid) {
+            Some(items) => builtin_initial_acl(storage, txid, items, arena)?,
+            None => Datum::Null,
+        },
     };
     let all_types = if metadata.all_arguments.is_empty() {
         Datum::Null
@@ -28325,7 +28318,7 @@ fn builtin_proc_row<'a>(
             Datum::Null,
             Datum::Bool(attributes.strict),
             Datum::Bool(attributes.leakproof),
-            Datum::Null,
+            builtin_proconfig(state.attributes.configs(), arena)?,
             Datum::Float8(state.attributes.cost()),
             Datum::Float8(state.attributes.rows()),
             Datum::Null,
@@ -28344,6 +28337,32 @@ fn builtin_proc_row<'a>(
         ],
         arena,
     )
+}
+
+/// `proconfig`: each setting as `name=value`, or NULL without settings.
+fn builtin_proconfig<'a>(
+    configs: &[crate::storage::RoutineConfig],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if configs.is_empty() {
+        return Ok(Datum::Null);
+    }
+    let mut rendered = [Datum::Null; crate::storage::MAX_BUILTIN_ROUTINE_CONFIGS];
+    for (output, config) in rendered.iter_mut().zip(configs) {
+        *output = Datum::Text(
+            arena
+                .alloc_str_display(format_args!(
+                    "{}={}",
+                    config.name.as_str(),
+                    config.value.as_str()
+                ))
+                .map_err(|_| catalog_capacity_exceeded("pg_proc.proconfig"))?,
+        );
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Text,
+        raw: super::array::build(&rendered[..configs.len()], arena)?,
+    })
 }
 
 fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
@@ -29715,8 +29734,15 @@ fn pg_stat_activity<'a>(
             .alloc_slice_with(activities.len(), |_| &[] as &[Datum])
             .map_err(|_| arena_full())?;
         let current_role = storage.current_role_slot(txid);
-        let see_all =
-            current_role.is_some_and(|role| storage.role(role).attributes_to(txid).superuser);
+        // PostgreSQL's HAS_PGSTAT_PERMISSIONS: the privileges of the
+        // backend's role or of pg_read_all_stats.
+        let see_all = current_role.is_some_and(|role| {
+            storage.role_has_privileges_of(
+                role,
+                crate::storage::PredefinedRole::ReadAllStats.slot(),
+                txid,
+            )
+        });
         let mut count = 0usize;
         let mut found_error = None;
         for &activity in activities {
@@ -29733,7 +29759,12 @@ fn pg_stat_activity<'a>(
             let role_name = role.map(|role| role.name());
             let visible = activity.pid == storage.current_connection_id()
                 || see_all
-                || (current_role.is_some() && current_role == activity_role);
+                || current_role
+                    .zip(activity_role)
+                    .is_some_and(|(current, role)| {
+                        storage.role_has_privileges_of(current, role, txid)
+                    });
+            let shown = |value: Datum<'a>| if visible { value } else { Datum::Null };
             let query = if visible {
                 activity.query.as_str()
             } else {
@@ -29754,23 +29785,23 @@ fn pg_stat_activity<'a>(
                         None => Datum::Null,
                     },
                     text(activity.application_name.as_str(), arena)?,
-                    activity.client_addr.map_or(Datum::Null, Datum::Inet),
+                    shown(activity.client_addr.map_or(Datum::Null, Datum::Inet)),
                     Datum::Null,
-                    Datum::Int4(activity.client_port),
-                    Datum::Timestamptz(activity.backend_start),
-                    activity.xact_start.map_or(Datum::Null, Datum::Timestamptz),
-                    activity.query_start.map_or(Datum::Null, Datum::Timestamptz),
-                    Datum::Timestamptz(activity.state_change),
-                    activity.wait_event_type.map_or(Datum::Null, Datum::Text),
-                    activity.wait_event.map_or(Datum::Null, Datum::Text),
-                    Datum::Text(activity.state.as_str()),
+                    shown(Datum::Int4(activity.client_port)),
+                    shown(Datum::Timestamptz(activity.backend_start)),
+                    shown(activity.xact_start.map_or(Datum::Null, Datum::Timestamptz)),
+                    shown(activity.query_start.map_or(Datum::Null, Datum::Timestamptz)),
+                    shown(Datum::Timestamptz(activity.state_change)),
+                    shown(activity.wait_event_type.map_or(Datum::Null, Datum::Text)),
+                    shown(activity.wait_event.map_or(Datum::Null, Datum::Text)),
+                    shown(Datum::Text(activity.state.as_str())),
                     activity
                         .backend_xid
                         .map_or(Datum::Null, |xid| Datum::Int4(xid as i32)),
                     Datum::Null,
                     Datum::Null,
                     text(query, arena)?,
-                    Datum::Text("client backend"),
+                    shown(Datum::Text("client backend")),
                 ];
                 row(&values, arena)
             })();
@@ -30629,27 +30660,7 @@ fn pg_prepared_statements<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_prepared_statements", false);
-    // Parameters and results show their exact types, including user-defined
-    // ones, the way `format_type` names them.
-    let type_datum = |oid: i32| -> Result<Datum<'a>, SqlError> {
-        let name = match intrinsic_type_name(oid) {
-            Some(name) => name,
-            None => {
-                let name = user_type_name_fixed(storage, txid, oid)?.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "prepared statement type {} has no catalog name",
-                        oid
-                    )
-                })?;
-                arena.alloc_str(name.as_str()).map_err(|_| arena_full())?
-            }
-        };
-        Ok(Datum::Regtype {
-            referenced_oid: oid,
-            name,
-        })
-    };
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     crate::sql::prep::with_active(|pool| {
         let rows = arena
             .alloc_slice_with(
@@ -30664,54 +30675,36 @@ fn pg_prepared_statements<'a>(
                 if found_error.is_some() {
                     return;
                 }
-                let parameters =
-                    match arena.alloc_slice_with(prepared.parameter_types.len(), |_| Datum::Null) {
-                        Ok(parameters) => parameters,
-                        Err(_) => {
-                            found_error = Some(arena_full());
-                            return;
-                        }
+                let type_array = |types: crate::sql::prep::PreparedTypeOids<'_>| {
+                    let mut names = [Datum::Null; super::exec::MAX_PROJ];
+                    let values = if types.len() <= names.len() {
+                        &mut names[..types.len()]
+                    } else {
+                        arena
+                            .alloc_slice_with(types.len(), |_| Datum::Null)
+                            .map_err(|_| arena_full())?
                     };
-                for (target, oid) in parameters.iter_mut().zip(prepared.parameter_types.iter()) {
-                    *target = match type_datum(oid) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            found_error = Some(error);
-                            return;
-                        }
-                    };
-                }
-                let parameter_types = match super::array::build(parameters, arena) {
-                    Ok(raw) => Datum::Array {
+                    for (target, oid) in values.iter_mut().zip(types.iter()) {
+                        *target = super::eval::regtype_of_oid_with_catalog(
+                            i64::from(oid),
+                            Some(&catalog),
+                            arena,
+                        )?;
+                    }
+                    super::array::build(values, arena).map(|raw| Datum::Array {
                         element: super::types::ArrElem::Regtype,
                         raw,
-                    },
+                    })
+                };
+                let (parameter_types, result_types) = match type_array(prepared.parameter_types)
+                    .and_then(|parameters| Ok((parameters, type_array(prepared.result_types)?)))
+                {
+                    Ok(types) => types,
                     Err(error) => {
                         found_error = Some(error);
                         return;
                     }
                 };
-                let mut results = [Datum::Null; super::exec::MAX_PROJ];
-                for (target, oid) in results.iter_mut().zip(prepared.result_types.iter()) {
-                    *target = match type_datum(oid) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            found_error = Some(error);
-                            return;
-                        }
-                    };
-                }
-                let result_types =
-                    match super::array::build(&results[..prepared.result_types.len()], arena) {
-                        Ok(raw) => Datum::Array {
-                            element: super::types::ArrElem::Regtype,
-                            raw,
-                        },
-                        Err(error) => {
-                            found_error = Some(error);
-                            return;
-                        }
-                    };
                 match row(
                     &[
                         match text(prepared.name, arena) {
@@ -30790,102 +30783,397 @@ fn pg_wait_events<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     finish(definition, &rows, arena)
 }
 
+/// A `pg_shdepend` row of the current database: a role owns (`o`) or is
+/// named in the ACL of (`a`) an object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SharedDependency {
+    /// The database of the dependent object; `None` in the current one.
+    pub database: Option<crate::storage::DatabaseOid>,
+    pub class: i32,
+    pub object: i32,
+    pub sub: i32,
+    pub role: u16,
+    pub kind: u8,
+}
+
+/// Object classes whose owner `pg_shdepend` records.
+const OWNED_ACCESS_CLASSES: [crate::storage::AccessClass; 17] = {
+    use crate::storage::AccessClass;
+    [
+        AccessClass::Database,
+        AccessClass::Schema,
+        AccessClass::Table,
+        AccessClass::View,
+        AccessClass::MaterializedView,
+        AccessClass::Sequence,
+        AccessClass::Domain,
+        AccessClass::Enum,
+        AccessClass::Composite,
+        AccessClass::Routine,
+        AccessClass::BuiltinRoutine,
+        AccessClass::Statistics,
+        AccessClass::Extension,
+        AccessClass::EventTrigger,
+        AccessClass::ForeignDataWrapper,
+        AccessClass::ForeignServer,
+        AccessClass::LargeObject,
+    ]
+};
+
+/// How many shared dependencies on `role` each other database holds, as
+/// PostgreSQL's DROP ROLE `DETAIL` summarizes them (`2 objects in database
+/// d`): owned objects, then ACL grantees and grantors other than the owner.
+/// `counts` receives `(database, count)` pairs in database OID order.
+pub(crate) fn other_database_role_dependencies<'a>(
+    storage: &Storage,
+    txid: u32,
+    role: usize,
+    arena: &'a Arena,
+) -> Result<&'a [(crate::storage::DatabaseOid, usize)], SqlError> {
+    let counts = arena
+        .alloc_slice_with(storage.database_count(), |_| {
+            (crate::storage::DatabaseOid::POSTGRES, 0usize)
+        })
+        .map_err(|_| arena_full())?;
+    let mut used = 0usize;
+    for dependency in shared_dependencies(storage, txid, arena)? {
+        let Some(database) = dependency.database else {
+            continue;
+        };
+        if usize::from(dependency.role) != role {
+            continue;
+        }
+        if let Some(entry) = counts[..used].iter_mut().find(|(oid, _)| *oid == database) {
+            entry.1 += 1;
+        } else if used < counts.len() {
+            counts[used] = (database, 1);
+            used += 1;
+        }
+    }
+    let counts = &mut counts[..used];
+    counts.sort_unstable_by_key(|(database, _)| database.get());
+    Ok(counts)
+}
+
+/// The current database's `pg_shdepend` rows. As in PostgreSQL, the
+/// bootstrap superuser and `PUBLIC` are never recorded, and an ACL records
+/// each grantee and grantor other than the object's owner. Owners come first
+/// in object-creation (OID) order, then privileges in grant order.
+/// PostgreSQL records no `pg_shdepend` row for a pinned role: the bootstrap
+/// superuser and the predefined roles (OIDs below `FirstUnpinnedObjectId`).
+fn role_is_pinned(role: u16) -> bool {
+    role == crate::storage::BOOTSTRAP_ROLE
+        || crate::storage::PredefinedRole::from_slot(usize::from(role)).is_some()
+}
+
+/// The catalog identity of an object in any database. A schema of another
+/// database cannot be found by name from this one.
+fn shared_object_identity(
+    storage: &Storage,
+    txid: u32,
+    object: crate::storage::AccessObject,
+) -> Option<(i32, i32)> {
+    if object.class == crate::storage::AccessClass::Schema {
+        return Some((
+            PG_NAMESPACE_OID,
+            namespace_oid_for_slot(storage, usize::from(object.slot)),
+        ));
+    }
+    access_object_catalog_identity(storage, txid, object)
+}
+
+pub(crate) fn shared_dependencies<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [SharedDependency], SqlError> {
+    use crate::storage::{AccessObject, PUBLIC_ROLE};
+    let capacity = OWNED_ACCESS_CLASSES
+        .iter()
+        .map(|class| storage.access_class_slots(*class))
+        .sum::<usize>()
+        + 2 * (storage.acl_entry_count() + storage.column_acl_entry_count());
+    let policy_roles = storage
+        .policies_with_slots_visible_to(txid)
+        .map(|(slot, _)| storage.policy_roles(slot, txid).len())
+        .sum::<usize>();
+    let default_acls = storage.snapshot_default_acl_grants(txid, arena)?;
+    let capacity = capacity + policy_roles + 2 * default_acls.len();
+    let rows = arena
+        .alloc_slice_with(capacity, |_| SharedDependency {
+            database: None,
+            class: 0,
+            object: 0,
+            sub: 0,
+            role: 0,
+            kind: 0,
+        })
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    for class in OWNED_ACCESS_CLASSES {
+        for slot in 0..storage.access_class_slots(class) {
+            let object = AccessObject {
+                class,
+                slot: slot as u16,
+            };
+            let database = storage.access_object_in_other_database(object, txid);
+            if database.is_none() && !storage.access_object_visible_to(object, txid) {
+                continue;
+            }
+            let CatalogOwner::Role(owner) = catalog_owner(storage, object, txid) else {
+                // pg_database_owner is pinned.
+                continue;
+            };
+            let owner = owner as u16;
+            if role_is_pinned(owner) {
+                continue;
+            }
+            let Some((class, oid)) = shared_object_identity(storage, txid, object) else {
+                continue;
+            };
+            rows[count] = SharedDependency {
+                database,
+                class,
+                object: oid,
+                sub: 0,
+                role: owner,
+                kind: b'o',
+            };
+            count += 1;
+        }
+    }
+    rows[..count].sort_unstable_by_key(|row| {
+        (
+            row.database.map_or(0, |database| database.get()),
+            row.object as u32,
+            row.class,
+        )
+    });
+    let mut push = |rows: &mut [SharedDependency], row: SharedDependency| {
+        if row.role == PUBLIC_ROLE || role_is_pinned(row.role) || rows[..count].contains(&row) {
+            return;
+        }
+        rows[count] = row;
+        count += 1;
+    };
+    // PostgreSQL records ACL dependencies as privileges are granted.
+    let granted = arena
+        .alloc_slice_with(storage.acl_entry_count(), |_| (u64::MAX, 0usize))
+        .map_err(|_| arena_full())?;
+    let mut granted_count = 0;
+    for slot in 0..storage.acl_entry_count() {
+        let entry = storage.acl_entry(slot);
+        if entry.object.slot != u16::MAX
+            && storage.acl_entry_visible(slot, txid)
+            && (storage.access_object_visible_to(entry.object, txid)
+                || storage
+                    .access_object_in_other_database(entry.object, txid)
+                    .is_some())
+            && granted_count < granted.len()
+        {
+            let order = storage
+                .object_acl_order(slot, txid)
+                .map_or(u64::MAX, core::num::NonZeroU64::get);
+            granted[granted_count] = (order, slot);
+            granted_count += 1;
+        }
+    }
+    granted[..granted_count].sort_unstable();
+    for &(_, slot) in &granted[..granted_count] {
+        let entry = storage.acl_entry(slot);
+        let Some((class, oid)) = shared_object_identity(storage, txid, entry.object) else {
+            continue;
+        };
+        let database = storage.access_object_in_other_database(entry.object, txid);
+        let owner = storage.object_owner(entry.object, txid) as u16;
+        let (grantee, grantor) = storage.acl_identity(slot, txid);
+        for role in [grantee, grantor] {
+            if role != owner {
+                push(
+                    rows,
+                    SharedDependency {
+                        database,
+                        class,
+                        object: oid,
+                        sub: 0,
+                        role,
+                        kind: b'a',
+                    },
+                );
+            }
+        }
+    }
+    for (slot, entry) in storage.column_acl_entries() {
+        let relation = entry.target.relation();
+        if storage.column_acl_state(slot, txid).0.0 == 0
+            || !storage.access_object_visible_to(relation, txid)
+        {
+            continue;
+        }
+        let Some((class, oid)) = access_object_catalog_identity(storage, txid, relation) else {
+            continue;
+        };
+        let owner = storage.object_owner(relation, txid) as u16;
+        let (grantee, grantor) = storage.column_acl_identity(slot, txid);
+        for role in [grantee, grantor] {
+            if role != owner {
+                push(
+                    rows,
+                    SharedDependency {
+                        database: None,
+                        class,
+                        object: oid,
+                        sub: i32::from(entry.target.column()) + 1,
+                        role,
+                        kind: b'a',
+                    },
+                );
+            }
+        }
+    }
+    // A policy depends on each role it names (`target of policy p on table t`).
+    for (slot, policy) in storage.policies_with_slots_visible_to(txid) {
+        for role in storage.policy_roles(slot, txid).iter().copied() {
+            push(
+                rows,
+                SharedDependency {
+                    database: None,
+                    class: 3256,
+                    object: crate::storage::policy_oid(&policy),
+                    sub: 0,
+                    role,
+                    kind: b'r',
+                },
+            );
+        }
+    }
+    // A default-privileges row depends on its owner and its grantees, in
+    // creation order.
+    let groups = arena
+        .alloc_slice_copy(default_acls)
+        .map_err(|_| arena_full())?;
+    groups.sort_unstable_by_key(|image| {
+        (
+            image.identity.creation.get(),
+            image.grantee.map_or(0, |role| role.get() as u32),
+        )
+    });
+    for (index, image) in groups.iter().enumerate() {
+        let first = index == 0 || groups[index - 1].identity != image.identity;
+        let slot_of = |oid: crate::storage::RoleOid| storage.role_slot_by_oid(oid.get(), txid);
+        if first && let Some(owner) = slot_of(image.identity.owner) {
+            push(
+                rows,
+                SharedDependency {
+                    database: None,
+                    class: 826,
+                    object: image.identity.oid(),
+                    sub: 0,
+                    role: owner as u16,
+                    kind: b'o',
+                },
+            );
+        }
+        if image.privileges.0 != 0
+            && image.grantee != Some(image.identity.owner)
+            && let Some(grantee) = image.grantee.and_then(slot_of)
+        {
+            push(
+                rows,
+                SharedDependency {
+                    database: None,
+                    class: 826,
+                    object: image.identity.oid(),
+                    sub: 0,
+                    role: grantee as u16,
+                    kind: b'a',
+                },
+            );
+        }
+    }
+    Ok(&rows[..count])
+}
+
+/// PostgreSQL's `getObjectDescription` of a `pg_default_acl` row
+/// (`default privileges on new relations belonging to role r in schema s`).
+pub(crate) fn default_acl_description(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &Arena,
+) -> Result<Option<StackStr<320>>, SqlError> {
+    use core::fmt::Write;
+    let images = storage.snapshot_default_acl_grants(txid, arena)?;
+    let Some(image) = images.iter().find(|image| image.identity.oid() == oid) else {
+        return Ok(None);
+    };
+    let owner = storage
+        .role_name_by_oid(image.identity.owner, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "default privilege owner identity is unavailable"
+            )
+        })?;
+    let objects = match image.identity.class {
+        crate::storage::DefaultPrivilegeClass::Table => "relations",
+        crate::storage::DefaultPrivilegeClass::Sequence => "sequences",
+        crate::storage::DefaultPrivilegeClass::Function => "functions",
+        crate::storage::DefaultPrivilegeClass::Type => "types",
+        crate::storage::DefaultPrivilegeClass::Schema => "schemas",
+    };
+    let mut text = StackStr::<320>::new();
+    let _ = write!(
+        text,
+        "default privileges on new {} belonging to role {}",
+        objects,
+        owner.as_str()
+    );
+    if let Some(schema) = image.identity.schema {
+        let name = schema_name_by_oid(storage, txid, schema.oid()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "default privilege schema identity is unavailable"
+            )
+        })?;
+        let _ = write!(text, " in schema {}", name.as_str());
+    }
+    Ok(Some(text))
+}
+
 fn pg_shdepend<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_shdepend", false);
-    let capacity = storage
-        .table_count()
-        .checked_add(storage.view_count())
-        .and_then(|count| count.checked_add(storage.sequence_count()))
-        .and_then(|count| count.checked_add(storage.routine_count()))
-        .and_then(|count| count.checked_add(storage.schema_count()))
-        .ok_or_else(|| catalog_capacity_exceeded("pg_shdepend"))?;
+    let dependencies = shared_dependencies(storage, txid, arena)?;
     let rows = arena
-        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .alloc_slice_with(dependencies.len(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let database = Datum::Oid(storage.current_database_oid().get() as u32);
-    let mut count = 0usize;
-    let mut append =
-        |class: i32, oid: i32, object: crate::storage::AccessObject| -> Result<(), SqlError> {
-            rows[count] = row(
-                &[
-                    database,
-                    Datum::Oid(class as u32),
-                    Datum::Oid(oid as u32),
-                    Datum::Int4(0),
-                    Datum::Oid(1260),
-                    Datum::Oid(storage.role_oid(storage.object_owner(object, txid)) as u32),
-                    Datum::Char(b'o'),
-                ],
-                arena,
-            )?;
-            count += 1;
-            Ok(())
-        };
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let class = storage
-            .matview_slot_for_table(slot, txid)
-            .map_or(crate::storage::AccessClass::Table, |_| {
-                crate::storage::AccessClass::MaterializedView
-            });
-        let object_slot = storage.matview_slot_for_table(slot, txid).unwrap_or(slot);
-        append(
-            PG_CLASS_OID,
-            user_table_oid(storage, slot),
-            crate::storage::AccessObject {
-                class,
-                slot: object_slot as u16,
-            },
-        )?;
-    }
-    for (slot, _) in storage.views_visible_to(txid) {
-        append(
-            PG_CLASS_OID,
-            view_oid(storage, slot),
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::View,
-                slot: slot as u16,
-            },
-        )?;
-    }
-    for slot in 0..storage.sequence_count() {
-        if storage.sequence_slot_visible_to(slot, txid) {
-            append(
-                PG_CLASS_OID,
-                sequence_oid(storage, slot),
-                crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Sequence,
-                    slot: slot as u16,
+    for (output, dependency) in rows.iter_mut().zip(dependencies) {
+        *output = row(
+            &[
+                // Shared objects (databases) record database 0.
+                if dependency.class == 1262 {
+                    Datum::Oid(0)
+                } else if let Some(other) = dependency.database {
+                    Datum::Oid(other.get() as u32)
+                } else {
+                    database
                 },
-            )?;
-        }
-    }
-    for slot in 0..storage.routine_count() {
-        if storage.routine_slot_visible_to(slot, txid) {
-            append(
-                PG_PROC_OID,
-                crate::storage::routine_oid(&storage.routine_for(slot, txid)),
-                Storage::routine_access_object(slot),
-            )?;
-        }
-    }
-    for (slot, _) in storage.visible_schemas(txid) {
-        append(
-            PG_NAMESPACE_OID,
-            namespace_oid_for_slot(storage, slot),
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Schema,
-                slot: slot as u16,
-            },
+                Datum::Oid(dependency.class as u32),
+                Datum::Oid(dependency.object as u32),
+                Datum::Int4(dependency.sub),
+                Datum::Oid(1260),
+                Datum::Oid(storage.role_oid(usize::from(dependency.role)) as u32),
+                Datum::Char(dependency.kind),
+            ],
+            arena,
         )?;
     }
-    finish(definition, &rows[..count], arena)
+    finish(definition, rows, arena)
 }
 
 fn pg_timezone_names<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
@@ -32107,31 +32395,9 @@ fn pg_authid<'a>(
     }
     let def = schema::require("pg_authid", false);
     let output = arena
-        .alloc_slice_with(storage.role_count() + PREDEFINED_ROLES.len(), |_| {
-            &[] as &[Datum]
-        })
+        .alloc_slice_with(storage.role_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
-    for &(oid, name) in PREDEFINED_ROLES {
-        output[count] = row(
-            &[
-                Datum::Int4(oid),
-                text(name, arena)?,
-                Datum::Bool(false),
-                Datum::Bool(true),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Int4(-1),
-                Datum::Null,
-                Datum::Null,
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
     for slot in 0..storage.role_count() {
         let role = storage.role(slot);
         if !role.visible_to(txid) {

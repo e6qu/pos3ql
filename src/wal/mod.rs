@@ -680,7 +680,8 @@ impl WalExtendedStatisticsKey<'_> {
 }
 
 /// A built-in routine's changeable `pg_proc` attributes: five attribute
-/// bytes, then cost and rows as IEEE-754 bits.
+/// bytes, cost and rows as IEEE-754 bits, then the settings count and each
+/// setting's name and value, each with a one-byte length.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum WalBuiltinRoutineImage<'a> {
     Captured(&'a crate::storage::BuiltinRoutineAttributes),
@@ -691,7 +692,18 @@ const BUILTIN_ROUTINE_IMAGE_BYTES: usize = 5 + 8 + 8;
 
 impl WalBuiltinRoutineImage<'_> {
     fn encoded_len(self) -> usize {
-        BUILTIN_ROUTINE_IMAGE_BYTES
+        match self {
+            Self::Captured(image) => {
+                BUILTIN_ROUTINE_IMAGE_BYTES
+                    + 1
+                    + image
+                        .configs()
+                        .iter()
+                        .map(|config| 2 + config.name.as_str().len() + config.value.len())
+                        .sum::<usize>()
+            }
+            Self::Encoded(bytes) => bytes.len(),
+        }
     }
 
     fn append(self, buffer: &mut FixedBuf) -> bool {
@@ -706,6 +718,15 @@ impl WalBuiltinRoutineImage<'_> {
                     u8::from(attributes.leakproof),
                 ]) && buffer.append(&image.cost().to_bits().to_le_bytes())
                     && buffer.append(&image.rows().to_bits().to_le_bytes())
+                    && buffer.append(&[image.configs().len() as u8])
+                    && image.configs().iter().all(|config| {
+                        let name = config.name.as_str().as_bytes();
+                        let value = config.value.as_str().as_bytes();
+                        buffer.append(&[name.len() as u8])
+                            && buffer.append(name)
+                            && buffer.append(&[value.len() as u8])
+                            && buffer.append(value)
+                    })
             }
             Self::Encoded(bytes) => buffer.append(bytes),
         }
@@ -721,23 +742,62 @@ impl WalBuiltinRoutineImage<'_> {
             Self::Captured(image) => return Some(*image),
             Self::Encoded(bytes) => bytes,
         };
-        let flag = |byte: u8| match byte {
-            0 => Some(false),
-            1 => Some(true),
-            _ => None,
-        };
-        let fixed: &[u8; BUILTIN_ROUTINE_IMAGE_BYTES] = bytes.try_into().ok()?;
-        let attributes = crate::storage::RoutineAttributes {
-            strict: flag(fixed[0])?,
-            volatility: crate::storage::RoutineVolatility::from_code(fixed[1])?,
-            parallel: crate::storage::RoutineParallel::from_code(fixed[2])?,
-            security_definer: flag(fixed[3])?,
-            leakproof: flag(fixed[4])?,
-            cost_bits: Some(u64::from_le_bytes(fixed[5..13].try_into().ok()?)),
-            rows_bits: Some(u64::from_le_bytes(fixed[13..21].try_into().ok()?)),
-        };
-        crate::storage::BuiltinRoutineAttributes::new(routine, attributes).ok()
+        decode_builtin_routine_image(routine, bytes)
     }
+}
+
+/// Decodes one built-in routine image; `None` for any malformed or trailing
+/// byte.
+pub(crate) fn decode_builtin_routine_image(
+    routine: crate::storage::BuiltinRoutineOid,
+    bytes: &[u8],
+) -> Option<crate::storage::BuiltinRoutineAttributes> {
+    let flag = |byte: u8| match byte {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    };
+    let fixed: &[u8; BUILTIN_ROUTINE_IMAGE_BYTES] =
+        bytes.get(..BUILTIN_ROUTINE_IMAGE_BYTES)?.try_into().ok()?;
+    let attributes = crate::storage::RoutineAttributes {
+        strict: flag(fixed[0])?,
+        volatility: crate::storage::RoutineVolatility::from_code(fixed[1])?,
+        parallel: crate::storage::RoutineParallel::from_code(fixed[2])?,
+        security_definer: flag(fixed[3])?,
+        leakproof: flag(fixed[4])?,
+        cost_bits: Some(u64::from_le_bytes(fixed[5..13].try_into().ok()?)),
+        rows_bits: Some(u64::from_le_bytes(fixed[13..21].try_into().ok()?)),
+    };
+    let mut rest = &bytes[BUILTIN_ROUTINE_IMAGE_BYTES..];
+    let (&count, tail) = rest.split_first()?;
+    rest = tail;
+    let count = usize::from(count);
+    if count > crate::storage::MAX_BUILTIN_ROUTINE_CONFIGS {
+        return None;
+    }
+    let mut configs =
+        [crate::storage::RoutineConfig::EMPTY; crate::storage::MAX_BUILTIN_ROUTINE_CONFIGS];
+    for config in &mut configs[..count] {
+        let mut field = || -> Option<&str> {
+            let (&length, tail) = rest.split_first()?;
+            let (text, tail) = tail.split_at_checked(usize::from(length))?;
+            rest = tail;
+            core::str::from_utf8(text).ok()
+        };
+        let name = crate::storage::SqlName::parse(field()?).ok()?;
+        let value = field()?;
+        if value.len() > crate::storage::ROUTINE_CONFIG_VALUE_MAX {
+            return None;
+        }
+        *config = crate::storage::RoutineConfig {
+            name,
+            value: crate::util::StackStr::from_str(value),
+        };
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    crate::storage::BuiltinRoutineAttributes::new(routine, attributes, &configs[..count]).ok()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -11997,7 +12057,7 @@ fn decode_op_inner<'a>(
         }),
         KIND_UPSERT_ROLE_MEMBERSHIP => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
-            crate::storage::CatalogIdentity::parse(identity.created_at())?;
+            crate::storage::Storage::require_membership_identity(identity).ok()?;
             let mut take_role = || {
                 let oid = crate::storage::RoleOid::parse(i32::from_le_bytes(
                     payload.get(at..at + 4)?.try_into().ok()?,
@@ -12027,7 +12087,7 @@ fn decode_op_inner<'a>(
         }),
         KIND_DROP_ROLE_MEMBERSHIP => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
-            crate::storage::CatalogIdentity::parse(identity.created_at())?;
+            crate::storage::Storage::require_membership_identity(identity).ok()?;
             (at == payload.len()).then_some(WalOp::DropRoleMembership { identity })
         }),
         KIND_SET_ROLE_SETTING => decode_large_op(|| {
@@ -14734,13 +14794,21 @@ mod tests {
     }
 
     #[test]
-    fn builtin_routine_codec_keeps_database_routine_and_fixed_attributes() {
+    fn builtin_routine_codec_keeps_database_routine_and_attributes() {
         use crate::storage::{BuiltinRoutineAttributes, BuiltinRoutineOid, RoutineVolatility};
         let lower = BuiltinRoutineOid::parse(870).unwrap();
         let mut attributes = BuiltinRoutineAttributes::catalog(lower).attributes;
         attributes.volatility = RoutineVolatility::Stable;
         attributes.cost_bits = Some(5.0f64.to_bits());
-        let image = BuiltinRoutineAttributes::new(lower, attributes).unwrap();
+        let image = BuiltinRoutineAttributes::new(
+            lower,
+            attributes,
+            &[crate::storage::RoutineConfig {
+                name: crate::storage::SqlName::parse("search_path").unwrap(),
+                value: crate::util::StackStr::from_str("pg_catalog, \"$user\""),
+            }],
+        )
+        .unwrap();
         let operation = WalOp::SetBuiltinRoutine {
             database: 5,
             routine: lower,
@@ -14760,9 +14828,23 @@ mod tests {
         assert_eq!(decoded.materialize(lower), Some(image));
         let mut invalid = [0; 256];
         invalid[..payload.len()].copy_from_slice(payload);
-        // Strictness is fixed for built-ins; a flipped flag is corruption.
-        invalid[8] = 0;
+        // A truncated setting is corruption, not a shorter list.
+        assert!(decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len() - 1]).is_none());
+        // Flags are bytes 0 or 1; any other value is corruption.
+        invalid[8] = 2;
         assert!(decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len()]).is_none());
+        invalid[8] = 0;
+        let Some(WalOp::SetBuiltinRoutine { image: changed, .. }) =
+            decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len()])
+        else {
+            panic!("a changed strictness is a valid built-in routine row");
+        };
+        assert_eq!(
+            changed
+                .materialize(lower)
+                .map(|image| image.attributes.strict),
+            Some(false)
+        );
         invalid[..payload.len()].copy_from_slice(payload);
         invalid[4..8].copy_from_slice(&16_384i32.to_le_bytes());
         assert!(decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len()]).is_none());

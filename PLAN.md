@@ -345,15 +345,21 @@ order and startup limits hold throughout. The
 **Work:** audit PostgreSQL 18 built-in functions by signature and executed
 behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
-unsupported case into an explicit error. Known gaps: changing `STRICT`,
-`SECURITY` or `SET` of a built-in function, or renaming or moving one, fails
-with `0A000` where PostgreSQL changes the catalog entry; a revoked built-in
-`EXECUTE` is not checked for the function behind an operator (`1 + 1` after
-`REVOKE EXECUTE ON FUNCTION int4pl(integer, integer) FROM PUBLIC`);
-`DROP ROLE` reports dependent objects without PostgreSQL's `DETAIL` list
-(`owner of function lower(text)`); built-in functions have no
-`pg_description` text of their own (`obj_description('lower(text)'::regprocedure)`
-is NULL where PostgreSQL returns `lowercase`). A SQL function whose earlier
+unsupported case into an explicit error. Known gaps: renaming or moving a
+built-in function fails with `0A000` where PostgreSQL changes the catalog
+entry (every built-in name lookup must consult a renamed or moved row); a routine signature naming `cstring` or `"any"` cannot be written
+(`GRANT ... ON FUNCTION int4in(cstring)` fails with `42883`) because those
+pseudo-types are not pos3ql column types, and `pg_type` lists 182 of
+PostgreSQL's 621 built-in types; a
+listed built-in that is neither implemented nor an operator, cast or input
+function fails with `0A000` when called; `DROP ROLE`'s `DETAIL` lists
+owners by OID and privileges by grant order, where PostgreSQL lists
+`pg_shdepend` rows in their physical order (insertion order in a fresh
+catalog), which needs a durable stamp for each owner change;
+`pg_attrdef` OIDs derive from
+table slots rather than creation identities; built-in operators, types and other
+catalog objects have no shipped `pg_description` text (built-in routines
+do). A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final
@@ -361,16 +367,20 @@ statement runs. Column defaults, CHECK constraints, routine parameter defaults
 `RETURN` bodies, index predicates, trigger `WHEN` conditions and rule
 conditions are printed in PostgreSQL's analyzed form (`'x'::text`,
 `((k >= 1) AND (k <= 5))`), but only for literals, columns, parameters,
-operators, `IN`, `LIKE`, `IS NULL`, `CASE`, casts, SQL value functions and
-built-in function calls; other expressions (subqueries, user-defined function
-calls, `$n` parameters, array constructors, whole-row references and `IS
-DISTINCT FROM`) are still printed as stored. `pg_get_viewdef` uses PostgreSQL's
+operators, `IN`, `LIKE`, `IS NULL`, `IS [NOT] DISTINCT FROM`, `IS [NOT]
+TRUE/FALSE`, `CASE`, casts, SQL value functions and built-in function calls;
+other expressions (subqueries, user-defined function calls, `$n` parameters,
+array constructors and whole-row references) are still printed as stored, and
+an index expression or view that passes a whole-row reference to a function
+taking the table's row type (`CREATE INDEX ON t (f(t.*))`) fails with `42883`
+because its validation types the reference as `record`. `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their
-query text. A `BEGIN ATOMIC` body is printed as written rather than one
-deparsed statement per line, and `pg_get_function_sqlbody` returns NULL for
-it; rule actions (`DO INSERT ...`) are printed as written, and their pretty
+query text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions
+without `FROM` is deparsed (`SELECT (x + 1);`); other statements are printed
+one per line as written, where PostgreSQL prints its analyzed form (`INSERT
+INTO t (a, b) VALUES (f.x, 'q'::text);`); rule actions (`DO INSERT ...`) are printed as written, and their pretty
 form fails with `0A000`; policy expressions are not deparsed. Errors in a client's query report
 PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
 caret) for syntax errors and for unknown relations, columns, types, functions
@@ -428,12 +438,11 @@ MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
 column uses its row type, fail with `0A000`; a `DROP TABLE ... CASCADE` that
 reaches both columns and routines, or names several tables, reports one notice
 per table or dependency kind where PostgreSQL reports one for the statement, and a routine's dependency on a row type is described as depending on the
-table. Values and columns of a view's row type need the view's column types,
+table; a `DROP TYPE` or `DROP DOMAIN` whose type both routines and other
+objects (columns, views, casts) use reports the routines separately from
+those objects where PostgreSQL reports them together. Values and columns of a view's row type need the view's column types,
 which pos3ql derives from the view's query on each use instead of storing them
-as PostgreSQL's `pg_attribute` rows do. In a SQL-language function, `o.note`
-for a composite parameter `o` fails with `42P01` (`(o).note` works): the
-reference must fall back from a column to the parameter's field in every typing
-pass, as PostgreSQL's `sql_fn_post_column_ref` does. The
+as PostgreSQL's `pg_attribute` rows do. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

@@ -225,7 +225,13 @@ impl Storage {
                     *word |= bit;
                     Ok(())
                 };
-                for membership in roles.memberships.iter() {
+                // Initdb memberships carry reserved identities outside the
+                // catalog creation range.
+                for membership in roles
+                    .memberships
+                    .iter()
+                    .filter(|membership| super::initdb_membership(membership.created_at).is_none())
+                {
                     if membership.live {
                         check(
                             database.unwrap_or(DatabaseOid::POSTGRES),

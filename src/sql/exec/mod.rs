@@ -8550,6 +8550,32 @@ fn resolve_role_name(written: &str) -> crate::util::StackStr<64> {
     }
 }
 
+/// PostgreSQL's `check_rolespec_name`: a role written by name in the
+/// reserved `pg_` namespace cannot be altered, whether or not it exists.
+fn require_alterable_role_name(
+    specification: crate::sql::ast::RoleSpecification<'_>,
+) -> Result<(), SqlError> {
+    match specification {
+        crate::sql::ast::RoleSpecification::Name(name) if name.starts_with("pg_") => {
+            Err(reserved_role_name(name, "Cannot alter reserved roles."))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn reserved_role_name(name: &str, detail: &str) -> SqlError {
+    crate::sql::eval::with_detail(
+        sql_err!(
+            sqlstate::RESERVED_NAME,
+            "role name \"{}\" is reserved",
+            name
+        ),
+        format_args!("{detail}"),
+    )
+}
+
+const RESERVED_ROLE_PREFIX_DETAIL: &str = "Role names starting with \"pg_\" are reserved.";
+
 fn resolve_role_specification(
     specification: crate::sql::ast::RoleSpecification<'_>,
 ) -> crate::util::StackStr<64> {
@@ -8581,6 +8607,56 @@ fn require_create_role(storage: &Storage, txid: u32) -> Result<(), SqlError> {
             "permission denied to create role"
         ))
     }
+}
+
+/// PostgreSQL's `check_role_membership_authorization`: `pg_database_owner`
+/// has only its implicit member, a superuser role is changed only by a
+/// superuser, and any other role needs the ADMIN option.
+fn require_role_membership_authority(
+    storage: &Storage,
+    current: usize,
+    role: usize,
+    grant: bool,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let name = storage.role_name(role, txid);
+    if grant && role == crate::storage::PredefinedRole::DatabaseOwner.slot() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "role \"{}\" cannot have explicit members",
+            name.as_str()
+        ));
+    }
+    if storage.role(current).attributes_to(txid).superuser {
+        return Ok(());
+    }
+    let action = if grant { "grant" } else { "revoke" };
+    let denied = || {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to {} role \"{}\"",
+            action,
+            name.as_str()
+        )
+    };
+    if storage.role(role).attributes_to(txid).superuser {
+        return Err(crate::sql::eval::with_detail(
+            denied(),
+            format_args!(
+                "Only roles with the SUPERUSER attribute may {action} roles with the SUPERUSER attribute."
+            ),
+        ));
+    }
+    if !storage.role_can_admin(current, role, txid) {
+        return Err(crate::sql::eval::with_detail(
+            denied(),
+            format_args!(
+                "Only roles with the ADMIN option on role \"{}\" may {action} this role.",
+                name.as_str()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn require_role_attribute_authority(
@@ -8758,6 +8834,12 @@ pub fn create_role(
         Ok(attributes) => attributes,
         Err(error) => return sql_fail(error),
     };
+    if name.as_str().starts_with("pg_") {
+        return sql_fail(reserved_role_name(
+            name.as_str(),
+            RESERVED_ROLE_PREFIX_DETAIL,
+        ));
+    }
     let (slot, prior) = match storage.create_role(name, attributes, txn.txid) {
         Ok(result) => result,
         Err(error) => return sql_fail(error),
@@ -8836,14 +8918,10 @@ pub fn create_role(
                 resolved.as_str()
             ));
         };
-        if !storage.role(grantor).attributes_to(txn.txid).superuser
-            && !storage.role_can_admin(grantor, parent, txn.txid)
+        if let Err(error) =
+            require_role_membership_authority(storage, grantor, parent, true, txn.txid)
         {
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "admin option for role \"{}\" is required",
-                resolved.as_str()
-            ));
+            return sql_fail(error);
         }
         if let Err(error) = stage_role_membership(
             storage,
@@ -8873,6 +8951,13 @@ pub fn create_role(
                     resolved.as_str()
                 ));
             };
+            if member == crate::storage::PredefinedRole::DatabaseOwner.slot() {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "role \"{}\" cannot be a member of any role",
+                    resolved.as_str()
+                ));
+            }
             if let Err(error) = stage_role_membership(
                 storage,
                 wal,
@@ -8961,6 +9046,9 @@ pub fn alter_role(
     guc: &crate::sql::guc::GucState,
     responder: &mut Responder,
 ) -> Outcome {
+    if let Err(error) = require_alterable_role_name(specification) {
+        return sql_fail(error);
+    }
     let resolved = resolve_role_specification(specification);
     let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
@@ -9066,6 +9154,11 @@ pub fn alter_role_setting(
     guc: &crate::sql::guc::GucState,
     responder: &mut Responder,
 ) -> Outcome {
+    if let Some(specification) = written_role
+        && let Err(error) = require_alterable_role_name(specification)
+    {
+        return sql_fail(error);
+    }
     let database = match written_database {
         Some(name) => {
             let Some(slot) = storage.database_slot(name, txn.txid) else {
@@ -9385,9 +9478,6 @@ pub fn rename_role(
     new_name: &str,
     responder: &mut Responder,
 ) -> Outcome {
-    if let Err(error) = require_create_role(storage, txn.txid) {
-        return sql_fail(error);
-    }
     let resolved = resolve_role_specification(specification);
     let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
@@ -9396,16 +9486,66 @@ pub fn rename_role(
             resolved.as_str()
         ));
     };
+    if resolved.as_str() == super::eval::funcs::system::session_user_owned().as_str() {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "session user cannot be renamed"
+        ));
+    }
     if resolved.as_str() == super::eval::funcs::system::current_user_owned().as_str() {
         return sql_fail(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "current user cannot be renamed"
         ));
     }
+    // PostgreSQL 18.6 RenameRole: reserved names, then a taken new name,
+    // then the caller's authority.
+    for name in [resolved.as_str(), new_name] {
+        if name.starts_with("pg_") {
+            return sql_fail(reserved_role_name(name, RESERVED_ROLE_PREFIX_DETAIL));
+        }
+    }
     let new_name = match SqlName::parse(new_name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
+    if storage
+        .find_role_visible(new_name.as_str(), txn.txid)
+        .is_some()
+    {
+        return sql_fail(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "role \"{}\" already exists",
+            new_name.as_str()
+        ));
+    }
+    let current = storage.current_role_slot(txn.txid);
+    let current_attributes = current.map(|current| storage.role(current).attributes_to(txn.txid));
+    if !current_attributes.is_some_and(|attributes| attributes.superuser) {
+        let denied = sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to rename role"
+        );
+        if storage.role(slot).attributes_to(txn.txid).superuser {
+            return sql_fail(crate::sql::eval::with_detail(
+                denied,
+                format_args!(
+                    "Only roles with the SUPERUSER attribute may rename roles with the SUPERUSER attribute."
+                ),
+            ));
+        }
+        if !current_attributes.is_some_and(|attributes| attributes.create_role)
+            || !current.is_some_and(|current| storage.role_can_admin(current, slot, txn.txid))
+        {
+            return sql_fail(crate::sql::eval::with_detail(
+                denied,
+                format_args!(
+                    "Only roles with the CREATEROLE attribute and the ADMIN option on role \"{}\" may rename this role.",
+                    resolved.as_str()
+                ),
+            ));
+        }
+    }
     let old_name = storage.role(slot).name_to(txn.txid);
     let prior = match storage.rename_role(slot, new_name, txn.txid) {
         Ok(prior) => prior,
@@ -9437,6 +9577,99 @@ pub fn rename_role(
     sql_ok()
 }
 
+/// PostgreSQL's `DETAIL` for a role that objects still depend on: one line
+/// per object in the current database (`owner of table t`, `privileges for
+/// function f(integer)`), at most 100, then a count of the rest.
+fn role_dependency_detail(
+    storage: &Storage,
+    role: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<
+    Option<crate::util::StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>>,
+    SqlError,
+> {
+    use core::fmt::Write;
+    const MAX_REPORTED_DEPENDENCIES: usize = 100;
+    let mark = arena.mark();
+    let result = (|| {
+        let catalog = super::query::storage_catalog(storage, arena, txid);
+        let mut detail =
+            crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+        let mut reported = 0usize;
+        let mut unreported = 0usize;
+        for dependency in super::catalog::shared_dependencies(storage, txid, arena)? {
+            if usize::from(dependency.role) != role || dependency.database.is_some() {
+                continue;
+            }
+            let Some(description) = super::eval::funcs::system::describe_object_text(
+                &catalog,
+                dependency.class,
+                dependency.object,
+                dependency.sub,
+                arena,
+            )?
+            else {
+                continue;
+            };
+            let prefix = match dependency.kind {
+                b'o' => "owner of ",
+                b'r' => "target of ",
+                _ => "privileges for ",
+            };
+            let separator = if reported == 0 { "" } else { "\n" };
+            if reported == MAX_REPORTED_DEPENDENCIES
+                || detail.len() + separator.len() + prefix.len() + description.len()
+                    > crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES - 64
+            {
+                unreported += 1;
+                continue;
+            }
+            let _ = write!(detail, "{separator}{prefix}{description}");
+            reported += 1;
+        }
+        if unreported != 0 {
+            let _ = write!(
+                detail,
+                "\nand {} other object{} (see server log for list)",
+                unreported,
+                if unreported == 1 { "" } else { "s" }
+            );
+        }
+        for &(database, count) in
+            super::catalog::other_database_role_dependencies(storage, txid, role, arena)?
+        {
+            let Some(name) = storage
+                .database_slot_by_oid(database, txid)
+                .map(|slot| storage.database_definition(slot, txid).name)
+            else {
+                continue;
+            };
+            let _ = write!(
+                detail,
+                "{}{} object{} in database {}",
+                if reported == 0 && unreported == 0 {
+                    ""
+                } else {
+                    "\n"
+                },
+                count,
+                if count == 1 { "" } else { "s" },
+                name.as_str()
+            );
+            reported += 1;
+        }
+        Ok((reported != 0).then_some(detail))
+    })();
+    // The detail was copied out of the workspace.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "DROP ROLE reads session identities and describes dependents"
+)]
 pub fn drop_role(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -9444,16 +9677,28 @@ pub fn drop_role(
     guc: &crate::sql::guc::GucState,
     names: &[&str],
     if_exists: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    if let Err(error) = require_create_role(storage, txn.txid) {
-        return sql_fail(error);
+    if require_create_role(storage, txn.txid).is_err() {
+        return sql_fail(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to drop role"
+            ),
+            format_args!(
+                "Only roles with the CREATEROLE attribute and the ADMIN option on the target roles may drop roles."
+            ),
+        ));
     }
+    let current = storage.current_role_slot(txn.txid);
+    let current_superuser =
+        current.is_some_and(|current| storage.role(current).attributes_to(txn.txid).superuser);
     let protected = [
-        storage.current_role_slot(txn.txid),
+        current,
         storage.session_role_slot(guc.current_identity().source(), txn.txid),
-        storage.session_role_slot(guc.session_identity().source(), txn.txid),
     ];
+    let session = storage.session_role_slot(guc.session_identity().source(), txn.txid);
     for written in names {
         let resolved = crate::util::StackStr::<64>::from_str(written);
         let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
@@ -9480,6 +9725,35 @@ pub fn drop_role(
                 sqlstate::OBJECT_IN_USE,
                 "current user cannot be dropped"
             ));
+        }
+        if session == Some(slot) {
+            return sql_fail(sql_err!(
+                sqlstate::OBJECT_IN_USE,
+                "session user cannot be dropped"
+            ));
+        }
+        if !current_superuser {
+            let denied = sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to drop role"
+            );
+            if storage.role(slot).attributes_to(txn.txid).superuser {
+                return sql_fail(crate::sql::eval::with_detail(
+                    denied,
+                    format_args!(
+                        "Only roles with the SUPERUSER attribute may drop roles with the SUPERUSER attribute."
+                    ),
+                ));
+            }
+            if !current.is_some_and(|current| storage.role_can_admin(current, slot, txn.txid)) {
+                return sql_fail(crate::sql::eval::with_detail(
+                    denied,
+                    format_args!(
+                        "Only roles with the CREATEROLE attribute and the ADMIN option on role \"{}\" may drop this role.",
+                        resolved.as_str()
+                    ),
+                ));
+            }
         }
         if let Err(error) = storage.lock_role_for_drop(slot, txn.txid) {
             return sql_fail(error);
@@ -9583,6 +9857,11 @@ pub fn drop_role(
             Err(error) => return sql_fail(error),
         };
         if dependency.is_some() {
+            match role_dependency_detail(storage, slot, txn.txid, arena) {
+                Ok(Some(detail)) => super::eval::stash_diagnostic(Some(detail), None),
+                Ok(None) => {}
+                Err(error) => return sql_fail(error),
+            }
             return sql_fail(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                 "role \"{}\" cannot be dropped because some objects depend on it",
@@ -9799,6 +10078,18 @@ pub fn grant_role(
         Ok(slots) => slots,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
+    // PostgreSQL resolves every recipient before the first granted role.
+    for (index, written) in members.iter().enumerate() {
+        let resolved = resolve_role_name(written);
+        let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                resolved.as_str()
+            ));
+        };
+        member_slots[index] = slot;
+    }
     for (index, written) in roles.iter().enumerate() {
         let resolved = resolve_role_name(written);
         let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
@@ -9808,12 +10099,10 @@ pub fn grant_role(
                 resolved.as_str()
             ));
         };
-        if !current_superuser && !storage.role_can_admin(current_slot, slot, txn.txid) {
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "admin option for role \"{}\" is required",
-                resolved.as_str()
-            ));
+        if let Err(error) =
+            require_role_membership_authority(storage, current_slot, slot, true, txn.txid)
+        {
+            return sql_fail(error);
         }
         let grantor = if let Some(grantor) = selected_grantor {
             let direct_admin = (0..storage.role_membership_count()).any(|membership| {
@@ -9839,22 +10128,18 @@ pub fn grant_role(
         };
         role_slots[index] = (slot, grantor);
     }
-    for (index, written) in members.iter().enumerate() {
-        let resolved = resolve_role_name(written);
-        let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "role \"{}\" does not exist",
-                resolved.as_str()
-            ));
-        };
-        member_slots[index] = slot;
-    }
     for &(role, grantor) in &*role_slots {
         if let Err(error) = storage.lock_role_memberships(role, txn.txid) {
             return sql_fail(error);
         }
         for &member in &*member_slots {
+            if member == crate::storage::PredefinedRole::DatabaseOwner.slot() {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "role \"{}\" cannot be a member of any role",
+                    storage.role_name(member, txn.txid).as_str()
+                ));
+            }
             if role == member || storage.role_is_member_of(role, member, txn.txid) {
                 return sql_fail(sql_err!(
                     sqlstate::INVALID_GRANT_OPERATION,
@@ -10005,12 +10290,10 @@ pub fn revoke_role(
         if let Err(error) = storage.lock_role_memberships(role, txn.txid) {
             return sql_fail(error);
         }
-        if !current_superuser && !storage.role_can_admin(current_slot, role, txn.txid) {
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "admin option for role \"{}\" is required",
-                role_name.as_str()
-            ));
+        if let Err(error) =
+            require_role_membership_authority(storage, current_slot, role, false, txn.txid)
+        {
+            return sql_fail(error);
         }
         for member_name in members {
             let member_name = resolve_role_name(member_name);
@@ -12675,11 +12958,29 @@ fn materialize_public_acl_default(
     } else {
         storage.object_default_public_privileges(object)
     };
-    // PostgreSQL's initial ACL places PUBLIC before the owner when present.
-    for (grantee, privileges) in [
+    // PostgreSQL's initial ACL places PUBLIC before the owner when present,
+    // and initdb's predefined-role grants (at most one per routine) after it.
+    let initial = [
         (crate::storage::PUBLIC_ROLE, public_privileges),
         (owner, owner_privileges),
-    ] {
+    ];
+    let role_grants = crate::storage::PredefinedRole::ALL
+        .into_iter()
+        .filter(|_| !acl_defined)
+        .map(|role| {
+            (
+                role.slot() as u16,
+                storage.object_default_role_privileges(object, role.slot()),
+            )
+        });
+    let mut ordered =
+        [(0u16, crate::storage::PrivilegeSet::NONE); 2 + crate::storage::PREDEFINED_ROLE_COUNT];
+    let mut count = 0;
+    for entry in initial.into_iter().chain(role_grants) {
+        ordered[count] = entry;
+        count += 1;
+    }
+    for (grantee, privileges) in ordered[..count].iter().copied() {
         if privileges.0 == 0 {
             continue;
         }
@@ -14719,11 +15020,15 @@ pub(crate) fn drop_schema(
                 let definition = storage.operator_family_for(*family, txn.txid);
                 let _ = write!(out, "operator family ");
                 write_rel(out, &definition.schema, &definition.name);
+                // User-defined operator classes and families are btree only.
+                let _ = write!(out, " for access method btree");
             }
             SchemaObject::OperatorClass(class) => {
                 let definition = storage.operator_class_for(*class, txn.txid);
                 let _ = write!(out, "operator class ");
                 write_rel(out, &definition.schema, &definition.name);
+                // User-defined operator classes and families are btree only.
+                let _ = write!(out, " for access method btree");
             }
             SchemaObject::Statistics(statistics) => {
                 let definition = storage
@@ -16062,10 +16367,40 @@ pub fn create_subscription(
             ));
         }
     };
-    if !storage.role(role).attributes_to(txn.txid).superuser {
+    // PostgreSQL 18.6 CreateSubscription: pg_create_subscription, CREATE on
+    // the database, and for non-superusers a password in the connection.
+    if !storage.role_has_privileges_of(
+        role,
+        crate::storage::PredefinedRole::CreateSubscription.slot(),
+        txn.txid,
+    ) {
+        return sql_fail(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to create subscription"
+            ),
+            format_args!(
+                "Only roles with privileges of the \"pg_create_subscription\" role may create subscriptions."
+            ),
+        ));
+    }
+    if !storage.has_current_database_create_privilege(role, txn.txid) {
         return sql_fail(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
-            "must be superuser to create subscriptions"
+            "permission denied for database {}",
+            storage.current_database_name(txn.txid).as_str()
+        ));
+    }
+    let superuser = storage.role(role).attributes_to(txn.txid).superuser;
+    if !options.behavior.password_required && !superuser {
+        return sql_fail(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "password_required=false is superuser-only"
+            ),
+            format_args!(
+                "Subscriptions with the password_required option set to false may only be created or modified by the superuser."
+            ),
         ));
     }
     if options.behavior.two_phase {
@@ -16082,6 +16417,19 @@ pub fn create_subscription(
         Ok(connection) => connection,
         Err(error) => return sql_fail(error),
     };
+    if options.behavior.password_required
+        && !superuser
+        && !crate::pg::replication_client::connection_names_password(connection.as_str())
+            .unwrap_or(false)
+    {
+        return sql_fail(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
+                "password is required"
+            ),
+            format_args!("Non-superusers must provide a password in the connection string."),
+        ));
+    }
     let resolve_slot_name = |slot: crate::sql::ast::SubscriptionSlotName<'_>| match slot {
         crate::sql::ast::SubscriptionSlotName::Default => {
             crate::storage::ReplicationSlotName::parse(name.as_str())
@@ -27764,6 +28112,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     guc,
                     names,
                     *if_exists,
+                    context.arena,
                     responder,
                 ),
                 Stmt::GrantRole {
@@ -44962,28 +45311,12 @@ fn alter_builtin_routine(
             "aggregate routine attributes cannot be altered with this command"
         ));
     }
-    let fixed_attribute_error = |storage: &Storage| {
-        routine_lookup::signature_error(
-            storage,
-            txn.txid,
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "STRICT, SECURITY and SET of built-in function ",
-            identity,
-            " cannot be changed",
-        )
-    };
-    if actions.iter().any(|action| {
-        matches!(
-            action,
-            AlterRoutineAction::SetConfig { .. } | AlterRoutineAction::ResetConfig(_)
-        )
-    }) {
-        return sql_fail(fixed_attribute_error(storage));
-    }
     let state = storage.builtin_routine_state(routine, txn.txid);
     let mut attributes = state.attributes.attributes;
-    let mut configs = [crate::storage::RoutineConfig::EMPTY; 0];
-    let mut config_count = 0;
+    let mut configs =
+        [crate::storage::RoutineConfig::EMPTY; crate::storage::MAX_BUILTIN_ROUTINE_CONFIGS];
+    let mut config_count = state.attributes.configs().len();
+    configs[..config_count].copy_from_slice(state.attributes.configs());
     if let Err(error) = apply_routine_definition_actions(
         storage,
         txn.txid,
@@ -44997,15 +45330,11 @@ fn alter_builtin_routine(
     ) {
         return sql_fail(error);
     }
-    // pos3ql runs built-ins by their fixed implementations, so it cannot honor
-    // changed null handling, caller identity or per-call settings.
-    let initial = state.attributes.attributes;
-    if attributes.strict != initial.strict
-        || attributes.security_definer != initial.security_definer
-    {
-        return sql_fail(fixed_attribute_error(storage));
-    }
-    let image = match crate::storage::BuiltinRoutineAttributes::new(routine, attributes) {
+    let image = match crate::storage::BuiltinRoutineAttributes::new(
+        routine,
+        attributes,
+        &configs[..config_count],
+    ) {
         Ok(image) => image,
         Err(error) => return sql_fail(error),
     };
@@ -48985,10 +49314,19 @@ fn stage_comment(
     identity: CommentIdentity,
     text: Option<&str>,
 ) -> Result<(), SqlError> {
-    let stored_text = match text {
-        Some("") | None => None,
-        Some(text) => Some(crate::storage::comment_stackstr(text)?),
+    // Removing the description PostgreSQL ships for a built-in routine keeps
+    // an empty row that hides it; every other removal deletes the row.
+    let text = match text {
+        Some("") | None
+            if identity.class == crate::storage::CommentClass::Routine
+                && super::catalog::builtin_routine_description(identity.subid as i32).is_some() =>
+        {
+            Some("")
+        }
+        Some("") => None,
+        text => text,
     };
+    let stored_text = text.map(crate::storage::comment_stackstr).transpose()?;
     let Some((slot, prior)) = storage.set_comment(
         identity.class,
         identity.schema,
@@ -51506,6 +51844,97 @@ fn routine_uses_selected_type(
     }
 }
 
+/// PostgreSQL's report of the routines a dropped type takes with it: one
+/// line per routine, as a `DETAIL` of the refusal without `CASCADE` and as
+/// `drop cascades to` notices with it.
+fn report_type_dependent_routines(
+    storage: &Storage,
+    txid: u32,
+    selected: &[bool],
+    (schema, name): (&SqlName, &SqlName),
+    cascade: bool,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+    let in_path = |schema: &str| {
+        storage.path().entries().iter().any(|entry| match entry {
+            crate::storage::PathEntry::Schema(slot) => {
+                storage.schema_def_for(*slot as usize, txid).name.as_str() == schema
+            }
+            crate::storage::PathEntry::Catalog => schema == "pg_catalog",
+            crate::storage::PathEntry::InformationSchema => schema == "information_schema",
+            crate::storage::PathEntry::Toast => schema == "pg_toast",
+        })
+    };
+    let mut type_text = crate::util::StackStr::<192>::new();
+    if !in_path(schema.as_str()) {
+        write_identifier(&mut type_text, schema.as_str());
+        let _ = type_text.write_char('.');
+    }
+    write_identifier(&mut type_text, name.as_str());
+    let mut detail =
+        crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let mut count = 0usize;
+    for (slot, _) in selected
+        .iter()
+        .enumerate()
+        .filter(|(_, selected)| **selected)
+    {
+        let routine = storage.routine_for(slot, txid);
+        let _ = write!(
+            detail,
+            "{}{}function ",
+            if count == 0 { "" } else { "\n" },
+            if cascade { "drop cascades to " } else { "" }
+        );
+        let routine_schema = routine.schema_for(txid);
+        if !in_path(routine_schema.as_str()) {
+            write_identifier(&mut detail, routine_schema.as_str());
+            let _ = detail.write_char('.');
+        }
+        write_identifier(&mut detail, routine.name_for(txid).as_str());
+        let suffix = routine_dependency_suffix(storage, txid, &routine)?;
+        let _ = write!(detail, "{}", suffix.as_str());
+        if !cascade {
+            let _ = write!(detail, " depends on type {}", type_text.as_str());
+        }
+        count += 1;
+    }
+    if detail.is_truncated() || type_text.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "type dependency report exceeds its fixed buffer"
+        ));
+    }
+    if !cascade {
+        crate::sql::eval::stash_diagnostic(
+            Some(detail),
+            Some(crate::util::StackStr::from_str(
+                "Use DROP ... CASCADE to drop the dependent objects too.",
+            )),
+        );
+        return Err(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop type {} because other objects depend on it",
+            type_text.as_str()
+        ));
+    }
+    let wire_full = |_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "response buffer full");
+    if count == 1 {
+        responder
+            .notice(sqlstate::SUCCESSFUL_COMPLETION, detail.as_str())
+            .map_err(wire_full)
+    } else {
+        crate::sql::eval::stash_diagnostic(Some(detail), None);
+        responder
+            .notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(128, "drop cascades to {} other objects", count).as_str(),
+            )
+            .map_err(wire_full)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drop_type_dependent_routines(
     storage: &mut Storage,
@@ -51516,6 +51945,7 @@ fn drop_type_dependent_routines(
     selected_composite: Option<usize>,
     cascade: bool,
     arena: &Arena,
+    responder: &mut Responder,
 ) -> Result<(), SqlError> {
     macro_rules! uses {
         ($result:expr) => {
@@ -51645,12 +52075,28 @@ fn drop_type_dependent_routines(
     if !selected.iter().any(|selected| *selected) {
         return Ok(());
     }
-    if !cascade {
-        return Err(sql_err!(
-            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-            "cannot drop type because routine objects depend on it"
-        ));
-    }
+    let (type_schema, type_name) = if let Some(slot) = selected_composite {
+        let definition = storage.composite_for(slot, txn.txid);
+        (definition.schema, definition.name)
+    } else if let Some(slot) = selected_enum {
+        let definition = storage.enum_for(slot, txn.txid);
+        (definition.schema, definition.name)
+    } else {
+        let slot = selected_domains
+            .iter()
+            .position(|selected| *selected)
+            .expect("a dropped type is selected");
+        let definition = storage.domain_for(slot, txn.txid);
+        (definition.schema, definition.name)
+    };
+    report_type_dependent_routines(
+        storage,
+        txn.txid,
+        selected,
+        (&type_schema, &type_name),
+        cascade,
+        responder,
+    )?;
 
     loop {
         let mut changed = false;
@@ -51886,6 +52332,7 @@ fn drop_domain_selection(
             None,
             cascade,
             arena,
+            responder,
         )?;
         apply_type_drop_to_stored_queries(
             storage,
@@ -53370,7 +53817,17 @@ fn drop_composite_type(
         txn.txid,
         "type",
     )?;
-    drop_type_dependent_routines(storage, wal, txn, &[], None, Some(slot), cascade, arena)?;
+    drop_type_dependent_routines(
+        storage,
+        wal,
+        txn,
+        &[],
+        None,
+        Some(slot),
+        cascade,
+        arena,
+        responder,
+    )?;
 
     let StoredDependencyClosure {
         views: dependent_views,
@@ -58136,7 +58593,12 @@ pub fn create_statistics(
         if stored_keys[..position].contains(&stored_keys[position]) {
             return sql_fail(sql_err!(
                 sqlstate::DUPLICATE_COLUMN,
-                "duplicate column or expression in statistics definition"
+                "{} in statistics definition",
+                if matches!(stored_keys[position], ExtendedStatisticsKey::Column(_)) {
+                    "duplicate column name"
+                } else {
+                    "duplicate expression"
+                }
             ));
         }
     }
@@ -65759,8 +66221,11 @@ pub(crate) fn resolve_parameter_input_type(
         return Ok(ParameterInputType::Builtin(ColType::Text));
     }
     if let Some((kind, creation, array)) = crate::storage::NamedTypeKind::from_oid(oid) {
-        let target = crate::storage::TypeDefinitionTarget::by_creation(storage, kind, creation)?;
+        // Enum and composite parameters, relation row types included, take
+        // their identity from the result lookup below.
         if kind == crate::storage::NamedTypeKind::Domain {
+            let target =
+                crate::storage::TypeDefinitionTarget::by_creation(storage, kind, creation)?;
             let definition = storage
                 .read_domain_definition(target, txid)?
                 .ok_or_else(unknown_type)?;
@@ -68364,6 +68829,14 @@ pub(crate) fn merge<'a>(
             txn.txid,
         )
     {
+        return sql_fail(error);
+    }
+    if let Err(error) = super::query::require_dml_builtin_execute(
+        &Stmt::Merge(*statement),
+        storage,
+        txn.txid,
+        arena,
+    ) {
         return sql_fail(error);
     }
     if let Err(error) = storage.lock_table(
@@ -72496,6 +72969,14 @@ where
     ) {
         return sql_fail(error);
     }
+    if let Err(error) = super::query::require_dml_builtin_execute(
+        &Stmt::Insert(*statement),
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        return sql_fail(error);
+    }
     let checks = match parse_checks(def, arena) {
         Ok(c) => c,
         Err(e) => return sql_fail(e),
@@ -74119,6 +74600,14 @@ pub(crate) fn update<'a>(
     {
         return sql_fail(error);
     }
+    if let Err(error) = super::query::require_dml_builtin_execute(
+        &Stmt::Update(*statement),
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.lock_table(
         txn.txid,
         table_index,
@@ -75452,6 +75941,15 @@ pub(crate) fn delete<'a>(
     ) {
         return sql_fail(error);
     }
+    if let Err(error) = super::query::require_dml_builtin_execute(
+        &Stmt::Delete(*statement),
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        return sql_fail(error);
+    }
+
     if let Err(error) = storage.lock_table(
         txn.txid,
         table_index,

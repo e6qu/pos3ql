@@ -104,7 +104,7 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 156 | Index-presence hint | Ten-byte table position, then a strict 0/1 flag. |
 | 157 | Catalog reservation | Eight-byte nonzero creation-counter reservation, kept even when a transaction creates and removes all its images. |
 | 158 | Inherited trigger change | Flags byte, then expected/replacement images: four-byte clone stamp, ten-byte trigger position, ten-byte table position, one-byte enabled mode. |
-| 159 | Built-in routine attributes | Four-byte database identifier, four-byte built-in routine OID, then strict, volatility, parallel, security-definer and leakproof bytes and cost and rows as IEEE-754 bits. Strictness and security must equal PostgreSQL's initial values. Owner and privileges use the object owner and ACL kinds with the routine OID. |
+| 159 | Built-in routine attributes | Four-byte database identifier, four-byte built-in routine OID, then strict, volatility, parallel, security-definer and leakproof bytes, cost and rows as IEEE-754 bits, a settings count (at most 16) and each `SET` setting's name and value, each after a one-byte length. Owner and privileges use the object owner and ACL kinds with the routine OID. |
 
 Other payload rules:
 
@@ -161,10 +161,10 @@ inserts a missing writer.
 | `nsp` | Creation stamp, database-owner flag (`0`/`1`), hexadecimal name. Stamp zero is an initial public schema. |
 | `pub` | Creation stamp after the owner, before the flags. |
 | `pacl` | Parameter permissions; an empty row differs from removal. |
-| `brtn` | Built-in routine attributes in the preceding `dbctx` database: OID, five attribute codes, cost and rows bits. `own` and `acl` records for class 20 name the routine OID. |
+| `brtn` | Built-in routine attributes in the preceding `dbctx` database: OID, five attribute codes, cost and rows bits, then the journal record's settings bytes in hex (at most 6,180 characters). `own` and `acl` records for class 20 name the routine OID. |
 | `ptx` | Prepared transaction; owner as decimal role identifier. |
-| `rol` | Role identifier, catalog slot, encoded name and attributes. |
-| `rmem` | Position, stamp, role/member/grantor identifiers, option flags. |
+| `rol` | Role identifier, catalog slot, encoded name and attributes. Never written for the predefined roles, which are bootstrap facts. |
+| `rmem` | Position, stamp, role/member/grantor identifiers, option flags. Every live membership is listed, so restoring a manifest first removes the initdb memberships a fresh catalog starts with. |
 | `dacl` | Position, group stamp, owner, schema stamp (`-` global), recipient (`PUBLIC` for everyone), class, privileges, grant options. |
 | `trg` / `trgs` | Declared trigger position and stamp / inherited stamp, declared-trigger position and stamp, child-table position and stamp, enabled mode. |
 | `pol` | Position and creation stamp first. |
@@ -245,6 +245,8 @@ rather than collections that grow with catalog churn.
 | Object | Identifier |
 |---|---|
 | Bootstrap administrator role | 10 |
+| Predefined roles (catalog slots 1–16) | PostgreSQL 18.6's OIDs (`pg_database_owner` 6171, `pg_monitor` 3373, …) |
+| Initdb role memberships of `pg_monitor` | 10,308–10,310; journal and manifest stamps 10,000,000–10,000,002 at positions 0–2 |
 | User roles | 16,385–2,147,483,647 (`54000` on exhaustion) |
 | Built-in tablespaces | 1663, 1664 |
 | Initial `public` schema | 2200 |
@@ -293,7 +295,9 @@ Identity rules by object family:
 - **Comments** on statistics, publications, foreign wrappers and foreign servers
   are keyed by database and creation stamp; PostgreSQL's `objsubid` is unchanged.
 - **Role memberships.** One identifier per grant from one grantor; changing ADMIN,
-  INHERIT or SET keeps it; revoke-and-regrant reserves a new one. Grantor
+  INHERIT or SET keeps it; revoke-and-regrant reserves a new one. The three
+  initdb memberships keep reserved stamps above the catalog creation range,
+  which recovery accepts only at their own positions. Grantor
   selection follows PostgreSQL 18.6
   ([`user.c`](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/user.c#L2040-L2140)).
   Journal images hold the position, three four-byte identifiers and a flags byte;

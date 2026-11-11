@@ -398,6 +398,9 @@ pub struct Parser<'a> {
     routine_name: Option<&'a str>,
     /// Local variables and record fields captured by a procedural OPEN.
     named_parameters: &'a [NamedParameter<'a>],
+    /// `$n.field` selections, kept so a parameter whose type stays undetermined
+    /// reports PostgreSQL's `unknown` composite error.
+    parameter_fields: core::cell::RefCell<ArenaList<'a, (u32, &'a str)>>,
 }
 
 /// One step of an assignment target after its column: a field of a
@@ -1029,6 +1032,7 @@ impl<'a> Parser<'a> {
             routine_parameters: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
             routine_name: None,
             named_parameters: &[],
+            parameter_fields: core::cell::RefCell::new(ArenaList::new(arena)),
         };
         parser.note_token_source()?;
         Ok(parser)
@@ -1124,6 +1128,11 @@ impl<'a> Parser<'a> {
             cursor: None,
             raw: true,
         })
+    }
+
+    /// The `$n.field` selections parsed so far.
+    pub(crate) fn parameter_fields(&self) -> &'a [(u32, &'a str)] {
+        self.parameter_fields.borrow().as_slice()
     }
 
     pub(crate) fn capture_type_inputs(&mut self) {
@@ -1388,6 +1397,24 @@ impl<'a> Parser<'a> {
             .is_some_and(|routine| routine == qualifier)
             .then(|| self.routine_parameter(name))
             .flatten()
+            .or_else(|| self.routine_parameter_field(qualifier))
+    }
+
+    /// `parameter.field` in a SQL-language routine body; the qualifier names
+    /// the parameter and the reference's column name is the field.
+    pub(super) fn routine_parameter_field(
+        &self,
+        parameter: &str,
+    ) -> Option<(u32, crate::sql::ast::ParameterSource)> {
+        self.routine_parameters
+            .iter()
+            .position(|candidate| candidate.is_some_and(|candidate| candidate == parameter))
+            .map(|index| {
+                (
+                    index as u32 + 1,
+                    crate::sql::ast::ParameterSource::SqlRoutineField,
+                )
+            })
     }
 
     fn column_default_expression(&mut self) -> Result<&'a Expr<'a>, ParseError> {
@@ -9860,6 +9887,15 @@ impl<'a> Parser<'a> {
                     },
                 })
                 .map_err(|_| self.arena_full("column source map exceeds SQL arena"))?;
+        }
+        if let Expr::Field { base, field } = e
+            && let Expr::Param(index) = base
+            && field != "*"
+        {
+            self.parameter_fields
+                .borrow_mut()
+                .push((*index, field))
+                .map_err(|_| self.arena_full("parameter field list exceeds SQL arena"))?;
         }
         let expression = self
             .arena

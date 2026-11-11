@@ -2004,7 +2004,7 @@ pub(crate) fn dispatch<'a>(
                     ));
                 }
                 let value = eval_full(args[0], arena, params, row, hooks)?;
-                let line_feeds = if args.len() == 2 {
+                let line_feeds = if name == "row_to_json" && args.len() == 2 {
                     match eval_full(args[1], arena, params, row, hooks)? {
                         Datum::Bool(line_feeds) => line_feeds,
                         Datum::Null => return Ok(Datum::Null),
@@ -2012,6 +2012,8 @@ pub(crate) fn dispatch<'a>(
                             return Err(crate::sql::eval::function_argument_mismatch(name, &other));
                         }
                     }
+                } else if args.len() == 2 {
+                    return Err(arity_err(name, args.len()));
                 } else {
                     false
                 };

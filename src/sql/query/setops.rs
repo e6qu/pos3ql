@@ -83,6 +83,10 @@ pub fn set_query<'a>(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = require_set_equality_execute(storage, txid, arena, body, &columns[..n_cols])
+    {
+        return sql_fail(error);
+    }
     let mut target = [ColType::Bool; MAX_PROJ];
     for (c, col) in columns[..n_cols].iter().enumerate() {
         let Some((ctype, _)) = exec::catalog_column_type(storage, txid, col.type_oid) else {
@@ -244,6 +248,7 @@ pub(crate) fn set_query_into_rows<'a>(
         crate::sql::exec::DescriptionTarget::Sql,
         None,
     )?;
+    require_set_equality_execute(storage, txid, arena, body, &columns[..column_count])?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for (column, desc) in columns[..column_count].iter().enumerate() {
         target[column] = exec::catalog_column_type(storage, txid, desc.type_oid)
@@ -377,6 +382,29 @@ fn reject_missing_ordering(type_oid: i32) -> Result<(), SqlError> {
             "could not identify an ordering operator for type {}",
             ctype.name()
         ));
+    }
+    Ok(())
+}
+
+/// Duplicate-removing set operations call each output type's `=` function,
+/// which PostgreSQL's executor checks for EXECUTE.
+fn require_set_equality_execute(
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    tree: &SetTree<'_>,
+    columns: &[ColDesc<'_>],
+) -> Result<(), SqlError> {
+    use crate::sql::eval::CatalogAccess;
+    let catalog = super::storage_catalog(storage, arena, txid);
+    if !catalog.builtin_routine_privileges_present() || !set_tree_requires_equality(tree) {
+        return Ok(());
+    }
+    for column in columns {
+        let oid = catalog
+            .domain_base_type(column.type_oid)
+            .map_or(column.type_oid, ColType::oid);
+        crate::sql::eval::require_builtin_operator_types_execute(&catalog, "=", Some(oid), oid)?;
     }
     Ok(())
 }
@@ -725,6 +753,7 @@ pub(crate) fn external_set_body_into<'a>(
         crate::sql::exec::DescriptionTarget::Sql,
         outer,
     )?;
+    require_set_equality_execute(storage, txid, arena, tree, &columns[..column_count])?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for column in 0..column_count {
         target[column] = exec::catalog_column_type(storage, txid, columns[column].type_oid)
@@ -1698,6 +1727,7 @@ pub(super) fn materialize_set_body_tied<'a>(
         crate::sql::exec::DescriptionTarget::Sql,
         outer,
     )?;
+    require_set_equality_execute(storage, txid, arena, tree, &columns[..n])?;
     let mut tgt = [ColType::Bool; MAX_PROJ];
     for c in 0..n {
         tgt[c] = exec::catalog_column_type(storage, txid, columns[c].type_oid)

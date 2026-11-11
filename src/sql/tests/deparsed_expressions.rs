@@ -228,3 +228,63 @@ fn object_definitions_deparse_conditions_and_wrap_view_targets() {
         assert_eq!(rows(&mut engine, &mut budget, sql), [expected], "{sql}");
     }
 }
+
+/// `IS [NOT] DISTINCT FROM` and `IS [NOT] TRUE/FALSE` print as PostgreSQL's
+/// DistinctExpr and BooleanTest nodes, plain and pretty.
+#[test]
+fn distinct_and_boolean_tests_print_postgresql_nodes() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE tested(a integer, b integer, c boolean, \
+         CONSTRAINT d1 CHECK (a IS DISTINCT FROM b), \
+         CONSTRAINT d2 CHECK (a IS NOT DISTINCT FROM 1), \
+         CONSTRAINT d3 CHECK (c IS NOT TRUE OR a > 0), \
+         CONSTRAINT d4 CHECK (NOT c IS FALSE))",
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_constraintdef(oid), pg_get_constraintdef(oid, true) \
+             FROM pg_constraint WHERE conrelid = 'tested'::regclass ORDER BY conname"
+        ),
+        [
+            "CHECK ((a IS DISTINCT FROM b))|CHECK (a IS DISTINCT FROM b)",
+            "CHECK ((NOT (a IS DISTINCT FROM 1)))|CHECK (NOT a IS DISTINCT FROM 1)",
+            "CHECK (((c IS NOT TRUE) OR (a > 0)))|CHECK (c IS NOT TRUE OR a > 0)",
+            "CHECK ((NOT (c IS FALSE)))|CHECK (NOT c IS FALSE)",
+        ]
+    );
+}
+
+/// `pg_get_function_sqlbody` prints a SQL-standard body: a `RETURN`
+/// expression and a `BEGIN ATOMIC` select list in analyzed form, one
+/// statement per line, and NULL for a quoted body.
+#[test]
+fn sql_standard_bodies_print_one_analyzed_statement_per_line() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE lines(a integer); \
+         CREATE FUNCTION r(x integer) RETURNS integer LANGUAGE sql RETURN x * 2; \
+         CREATE FUNCTION s(x integer, y text) RETURNS text LANGUAGE sql \
+           BEGIN ATOMIC SELECT x * 2, y || 'z'; INSERT INTO lines VALUES (x); SELECT y; END; \
+         CREATE FUNCTION q(x integer) RETURNS integer LANGUAGE sql AS 'SELECT x'",
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_function_sqlbody('r(integer)'::regprocedure), \
+                    pg_get_function_sqlbody('s(integer, text)'::regprocedure), \
+                    pg_get_function_sqlbody('q(integer)'::regprocedure) IS NULL",
+        ),
+        [
+            "RETURN (x * 2)|BEGIN ATOMIC\n SELECT (x * 2),\n     (y || 'z'::text);\n \
+          INSERT INTO lines VALUES (x);\n SELECT y AS y;\nEND|t"
+        ]
+    );
+}

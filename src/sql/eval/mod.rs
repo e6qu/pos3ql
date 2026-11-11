@@ -162,6 +162,14 @@ pub fn stash_object_diagnostic(detail: Option<&str>, objects: ErrorObjects) {
     });
 }
 
+/// Returns `error` after stashing its `DETAIL` line.
+pub fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> SqlError {
+    let mut text = StackStr::<MAX_DIAGNOSTIC_DETAIL_BYTES>::new();
+    let _ = core::fmt::Write::write_fmt(&mut text, detail);
+    stash_diagnostic(Some(text), None);
+    error
+}
+
 pub fn take_diagnostic() -> Option<Diagnostic> {
     PENDING_DIAGNOSTIC.with(|d| d.borrow_mut().take())
 }
@@ -381,6 +389,7 @@ pub mod sqlstate {
     pub const OBJECT_IN_USE: &str = "55006";
     pub const WARNING_PRIVILEGE_NOT_GRANTED: &str = "01007";
     pub const RESERVED_NAME: &str = "42939";
+    pub const INVALID_AUTHORIZATION_SPECIFICATION: &str = "28000";
     pub const INVALID_SCHEMA_DEFINITION: &str = "42P15";
     pub const DUPLICATE_CURSOR: &str = "42P03";
     pub const INVALID_CURSOR_DEFINITION: &str = "42P11";
@@ -798,14 +807,20 @@ pub(crate) fn expression_type_identity<'a>(
         if let Some(ctype) = super::types::ColType::from_sql_name(type_name) {
             return Ok(ExpressionTypeIdentity::Known(ctype.oid()));
         }
-        return hooks
-            .catalog
-            .and_then(|catalog| catalog.user_type_oid(type_name))
+        let Some(catalog) = hooks.catalog else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "evaluated user-type cast has no catalog identity"
+            ));
+        };
+        return catalog
+            .user_type_oid(type_name)
             .map(ExpressionTypeIdentity::Known)
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "evaluated user-type cast has no catalog identity"
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}\" does not exist",
+                    type_name
                 )
             });
     }
@@ -2188,6 +2203,26 @@ pub trait CatalogAccess {
     fn sequence_state_by_oid(&self, _oid: i32) -> Option<(i64, bool)> {
         None
     }
+    /// `pg_describe_object` text of a `pg_default_acl` row, if it exists.
+    fn default_acl_description<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a crate::mem::arena::Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// The name of a visible database.
+    fn database_name_by_oid(&self, _oid: i32) -> Option<crate::storage::SqlName> {
+        None
+    }
+    /// The relation and column a visible `pg_attrdef` OID belongs to.
+    fn attribute_default_column(&self, _oid: i32) -> Option<(i32, i32)> {
+        None
+    }
+    /// The source and target types of the cast with this `pg_cast` OID.
+    fn cast_type_oids(&self, _oid: i32) -> Option<(i32, i32)> {
+        None
+    }
     /// Whether this OID names a relation visible to the current query.
     fn relation_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a type visible to the current query.
@@ -2246,6 +2281,14 @@ pub trait CatalogAccess {
         Ok(None)
     }
     /// The canonical SQL definition for a function OID, if this catalog owns it.
+    /// `pg_get_function_sqlbody` of a routine's SQL-standard body.
+    fn function_sqlbody<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
     fn function_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
@@ -2469,6 +2512,16 @@ pub trait CatalogAccess {
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
+    /// `pg_has_role`: whether `role` (the current role when absent) is a
+    /// member of, has the privileges of, or may SET ROLE to `target`.
+    fn has_role_privilege(
+        &self,
+        _role: Option<&str>,
+        _target: PrivilegeObject<'_>,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
     fn has_type_privilege(
         &self,
         _role: Option<&str>,
@@ -2497,6 +2550,37 @@ pub trait CatalogAccess {
     /// routine in the current database.
     fn require_builtin_routine_execute(&self, _oid: i32) -> Result<(), SqlError> {
         Ok(())
+    }
+    /// Whether any built-in routine has a catalog row that can carry a
+    /// privilege. Without one every built-in is executable by `PUBLIC`, so
+    /// operator and cast evaluation can skip resolving their functions.
+    fn builtin_routine_privileges_present(&self) -> bool {
+        false
+    }
+    /// Whether any routine, built-in or user-defined, can deny `EXECUTE`,
+    /// so a plan's routine calls must be checked before it runs.
+    fn routine_privileges_present(&self) -> bool {
+        self.builtin_routine_privileges_present()
+    }
+    /// Checks the current role's `EXECUTE` privilege on a selected
+    /// user-defined routine.
+    fn require_stored_routine_execute(&self, _oid: i32) -> Result<(), SqlError> {
+        Ok(())
+    }
+    /// Checks `EXECUTE` on the routines a subquery's plan calls, its outer
+    /// references resolving against `outer`. `EXISTS` discards its select
+    /// list, so `exists` skips it.
+    fn require_subquery_routine_execute<'a>(
+        &self,
+        _select: &super::ast::Select<'a>,
+        _outer: &dyn ColumnLookup<'a>,
+        _exists: bool,
+    ) -> Result<(), SqlError> {
+        Ok(())
+    }
+    /// The `proisstrict` of a built-in routine in the current database.
+    fn builtin_routine_strict(&self, oid: i32) -> Option<bool> {
+        super::catalog::builtin_callable_by_oid(oid).map(|routine| routine.catalog.strict)
     }
     fn has_database_privilege(
         &self,
@@ -3502,6 +3586,475 @@ fn eval_binary_expression<'a>(
     .value)
 }
 
+/// PostgreSQL checks `EXECUTE` on the function behind every built-in
+/// operator it evaluates (`1 + 1` calls `int4pl`, `a = 1` calls `int4eq`).
+fn require_builtin_operator_execute<'a>(
+    name: &str,
+    left: Option<&Expr<'a>>,
+    right: &Expr<'a>,
+    row: &dyn ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(), SqlError> {
+    let Some(catalog) = hooks.catalog else {
+        return Ok(());
+    };
+    if !catalog.builtin_routine_privileges_present() {
+        return Ok(());
+    }
+    let null_constant = left.is_some_and(is_null_constant) || is_null_constant(right);
+    let left = left
+        .map(|left| operator_input_type(left, row, hooks, catalog))
+        .transpose()?;
+    let right = operator_input_type(right, row, hooks, catalog)?;
+    if null_constant
+        && super::catalog::builtin_operator_procedure(name, left, Some(right))
+            .and_then(|procedure| catalog.builtin_routine_strict(procedure))
+            == Some(true)
+    {
+        // PostgreSQL's planner folds a strict function with a constant NULL
+        // input to NULL without calling, or checking, the function.
+        return Ok(());
+    }
+    require_builtin_operator_types_execute(catalog, name, left, right)
+}
+
+/// The fields of a `ROW(...)` or `(a, b)` constructor.
+fn row_constructor_fields<'a>(expression: &Expr<'a>) -> Option<&'a [&'a Expr<'a>]> {
+    match expression {
+        Expr::Call {
+            kind: super::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if name.eq_ignore_ascii_case("row") => Some(*args),
+        _ => None,
+    }
+}
+
+/// A NULL literal, possibly cast or collated.
+fn is_null_constant(expression: &Expr<'_>) -> bool {
+    match expression {
+        Expr::Null => true,
+        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => is_null_constant(operand),
+        _ => false,
+    }
+}
+
+/// Checks `EXECUTE` on each built-in function `expression` itself calls
+/// (operators, casts, membership tests, pattern matches, simple `CASE` and
+/// `IS DISTINCT FROM` comparisons, and built-in routine calls), not its
+/// children. Evaluation runs it per node; [`require_expression_builtin_execute`]
+/// runs it over a whole expression before execution, as PostgreSQL's executor
+/// checks every function when it initializes a plan.
+pub(crate) fn require_node_builtin_execute<'a>(
+    expression: &Expr<'a>,
+    row: &dyn ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(), SqlError> {
+    let Some(catalog) = hooks.catalog else {
+        return Ok(());
+    };
+    if !catalog.builtin_routine_privileges_present() {
+        return Ok(());
+    }
+    match expression {
+        Expr::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } => {
+            if let (Some(left_fields), Some(right_fields)) =
+                (row_constructor_fields(left), row_constructor_fields(right))
+            {
+                // PostgreSQL expands `ROW(a, b) = ROW(c, d)` and `<>` into
+                // per-field comparisons; an ordering comparison calls the
+                // fields' btree support functions, which it does not check.
+                if let Some(name @ ("=" | "<>")) = operator.operator_name()
+                    && left_fields.len() == right_fields.len()
+                {
+                    for (left, right) in left_fields.iter().zip(right_fields.iter()) {
+                        require_builtin_operator_execute(name, Some(left), right, row, hooks)?;
+                    }
+                }
+            } else if let Some(name) = operator.operator_name() {
+                require_builtin_operator_execute(name, Some(left), right, row, hooks)?;
+            }
+        }
+        Expr::Unary {
+            operator, operand, ..
+        } => {
+            let name = match operator {
+                UnaryOp::Neg => "-",
+                UnaryOp::BitNot => "~",
+                UnaryOp::TextSearchNot => "!!",
+                UnaryOp::SquareRoot => "|/",
+                UnaryOp::CubeRoot => "||/",
+                UnaryOp::AbsoluteValue => "@",
+                UnaryOp::Not => return Ok(()),
+            };
+            require_builtin_operator_execute(name, None, operand, row, hooks)?;
+        }
+        // `x IN (...)` is `x = ANY (...)`; `x NOT IN (...)` is `x <> ALL (...)`.
+        Expr::InList {
+            operand,
+            list,
+            negated,
+        } => {
+            for item in *list {
+                require_builtin_operator_execute(
+                    if *negated { "<>" } else { "=" },
+                    Some(operand),
+                    item,
+                    row,
+                    hooks,
+                )?;
+            }
+        }
+        Expr::Like {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+            ..
+        } => require_builtin_operator_execute(
+            match (negated, case_insensitive) {
+                (false, false) => "~~",
+                (true, false) => "!~~",
+                (false, true) => "~~*",
+                (true, true) => "!~~*",
+            },
+            Some(operand),
+            pattern,
+            row,
+            hooks,
+        )?,
+        Expr::Match {
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+        } => require_builtin_operator_execute(
+            match (negated, case_insensitive) {
+                (false, false) => "~",
+                (true, false) => "!~",
+                (false, true) => "~*",
+                (true, true) => "!~*",
+            },
+            Some(operand),
+            pattern,
+            row,
+            hooks,
+        )?,
+        Expr::Case { operand, whens, .. } => {
+            if let Some(operand) = operand {
+                for (condition, _) in *whens {
+                    require_builtin_operator_execute("=", Some(operand), condition, row, hooks)?;
+                }
+            }
+            if let Some((left, right, _)) = expression.distinct_from_operands() {
+                require_builtin_operator_execute("=", Some(left), right, row, hooks)?;
+            }
+        }
+        Expr::AnyAll {
+            operand,
+            operator,
+            array,
+            ..
+        } => {
+            if let Some(name) = operator.operator_name() {
+                require_builtin_quantified_execute(name, operand, array, row, hooks)?;
+            }
+        }
+        Expr::InSubquery {
+            operand, select, ..
+        } => require_builtin_subquery_operator_execute("=", operand, select, row, hooks)?,
+        Expr::QuantifiedSubquery {
+            operand,
+            operator,
+            select,
+            ..
+        } => {
+            if let Some(name) = operator.operator_name() {
+                require_builtin_subquery_operator_execute(name, operand, select, row, hooks)?;
+            }
+        }
+        Expr::Cast {
+            operand,
+            type_name,
+            type_mod,
+            ..
+        } => {
+            let base = |oid: i32| catalog.domain_base_type(oid).map_or(oid, ColType::oid);
+            let target = ColType::from_sql_name(type_name)
+                .map(ColType::oid)
+                .or_else(|| catalog.user_type_oid(type_name));
+            if let Some(target) = target {
+                let source = expression_type_identity(operand, row, hooks)?.routine_argument_oid();
+                require_builtin_cast_execute(catalog, base(source), base(target), *type_mod)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Checks [`require_node_builtin_execute`] for `expression` and, before it
+/// runs, for its children and built-in routine calls. Subquery bodies are
+/// checked when they run. Only a privilege failure is reported here: an
+/// expression whose types or routine cannot be resolved before execution
+/// reports that error when it is evaluated, in PostgreSQL's order.
+pub(crate) fn require_expression_builtin_execute<'a>(
+    expression: &Expr<'a>,
+    row: &dyn ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(), SqlError> {
+    match require_expression_builtin_execute_tree(expression, row, hooks) {
+        Err(error) if error.sqlstate == sqlstate::INSUFFICIENT_PRIVILEGE => Err(error),
+        _ => Ok(()),
+    }
+}
+
+fn require_expression_builtin_execute_tree<'a>(
+    expression: &Expr<'a>,
+    row: &dyn ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(), SqlError> {
+    let Some(catalog) = hooks.catalog else {
+        return Ok(());
+    };
+    if !catalog.routine_privileges_present() {
+        return Ok(());
+    }
+    // PostgreSQL's planner folds constant boolean logic and drops `CASE`
+    // arms with constant conditions before the executor checks anything.
+    match expression {
+        Expr::Binary {
+            operator: BinaryOp::And,
+            left,
+            right,
+            ..
+        } if matches!(left, Expr::Bool(false)) || matches!(right, Expr::Bool(false)) => {
+            return Ok(());
+        }
+        Expr::Binary {
+            operator: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } if matches!(left, Expr::Bool(true)) || matches!(right, Expr::Bool(true)) => {
+            return Ok(());
+        }
+        Expr::Case {
+            operand: None,
+            whens,
+            otherwise,
+            origin: super::ast::CaseOrigin::Written,
+        } => {
+            for (condition, result) in *whens {
+                if matches!(condition, Expr::Bool(false)) {
+                    continue;
+                }
+                require_expression_builtin_execute_tree(condition, row, hooks)?;
+                require_expression_builtin_execute_tree(result, row, hooks)?;
+                if matches!(condition, Expr::Bool(true)) {
+                    return Ok(());
+                }
+            }
+            return otherwise.map_or(Ok(()), |otherwise| {
+                require_expression_builtin_execute_tree(otherwise, row, hooks)
+            });
+        }
+        _ => {}
+    }
+    super::query::walk_children(expression, &mut |child| {
+        require_expression_builtin_execute_tree(child, row, hooks)
+    })?;
+    require_node_builtin_execute(expression, row, hooks)?;
+    match expression {
+        Expr::Subquery(select) | Expr::ArraySubquery(select) => {
+            catalog.require_subquery_routine_execute(select, row, false)?
+        }
+        Expr::RowSubquery { select, .. }
+        | Expr::InSubquery { select, .. }
+        | Expr::QuantifiedSubquery { select, .. } => {
+            catalog.require_subquery_routine_execute(select, row, false)?
+        }
+        Expr::Exists(select) => catalog.require_subquery_routine_execute(select, row, true)?,
+        _ => {}
+    }
+    if let Expr::Call {
+        over: Some(window), ..
+    } = expression
+    {
+        // A window's partitioning and peer detection call each key type's
+        // `=` function.
+        let keys = window
+            .partition_by
+            .iter()
+            .copied()
+            .chain(window.order_by.iter().map(|order| order.expression));
+        for key in keys {
+            require_builtin_operator_execute("=", Some(key), key, row, hooks)?;
+        }
+    }
+    if let Expr::Call {
+        kind,
+        name,
+        bound_oid,
+        args,
+        argument_names,
+        variadic,
+        star: false,
+        ..
+    } = expression
+    {
+        if *kind == super::ast::CallKind::SqlSyntax {
+            if *name == "nullif" && args.len() == 2 {
+                require_builtin_operator_execute("=", Some(args[0]), args[1], row, hooks)?;
+            } else if let Some((schema, operator)) = super::ast::catalog_operator_call(name)
+                && schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+            {
+                match args {
+                    [operand] => {
+                        require_builtin_operator_execute(operator, None, operand, row, hooks)?
+                    }
+                    [left, right] => {
+                        require_builtin_operator_execute(operator, Some(left), right, row, hooks)?
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
+        if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+            return Ok(());
+        }
+        let mut types = [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (output, argument) in types.iter_mut().zip(*args) {
+            *output = expression_type_identity(argument, row, hooks)?.routine_argument_oid();
+        }
+        match catalog.resolve_routine_call(
+            name,
+            *kind,
+            *bound_oid,
+            argument_names,
+            *variadic,
+            &types[..args.len()],
+        )? {
+            Some(RoutineCallTarget::Builtin { oid, .. }) => {
+                catalog.require_builtin_routine_execute(oid)?
+            }
+            Some(RoutineCallTarget::Stored { oid, .. }) => {
+                catalog.require_stored_routine_execute(oid)?
+            }
+            Some(RoutineCallTarget::Operator { .. }) | None => {}
+        }
+    }
+    Ok(())
+}
+
+/// The base type an operator input resolves against; domains use their base.
+fn operator_input_type<'a>(
+    expression: &Expr<'a>,
+    row: &dyn ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+    catalog: &dyn CatalogAccess,
+) -> Result<i32, SqlError> {
+    let oid = expression_type_identity(expression, row, hooks)?.routine_argument_oid();
+    Ok(catalog.domain_base_type(oid).map_or(oid, ColType::oid))
+}
+
+/// `operand op ANY/ALL (array)` calls `op` between the operand and the array's
+/// element type; an unknown array literal takes the operand's type.
+fn require_builtin_quantified_execute<'a>(
+    name: &str,
+    operand: &Expr<'a>,
+    array: &Expr<'a>,
+    row: &dyn ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(), SqlError> {
+    let Some(catalog) = hooks.catalog else {
+        return Ok(());
+    };
+    if !catalog.builtin_routine_privileges_present() {
+        return Ok(());
+    }
+    let left = operator_input_type(operand, row, hooks, catalog)?;
+    let right = match ColType::from_oid(operator_input_type(array, row, hooks, catalog)?) {
+        Some(ColType::Array(element)) => element.to_coltype().oid(),
+        _ => left,
+    };
+    require_builtin_operator_types_execute(catalog, name, Some(left), right)
+}
+
+/// `operand op ANY/ALL (subquery)` and `IN (subquery)` call `op` between the
+/// operand and the subquery's output column type.
+fn require_builtin_subquery_operator_execute<'a>(
+    name: &str,
+    operand: &Expr<'a>,
+    select: &'a super::ast::Select<'a>,
+    row: &dyn ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(), SqlError> {
+    let Some(catalog) = hooks.catalog else {
+        return Ok(());
+    };
+    if !catalog.builtin_routine_privileges_present() {
+        return Ok(());
+    }
+    let left = operator_input_type(operand, row, hooks, catalog)?;
+    let Some(right) = catalog.subquery_type(&Expr::Subquery(select), row)? else {
+        return Ok(());
+    };
+    let right = catalog.domain_base_type(right).map_or(right, ColType::oid);
+    require_builtin_operator_types_execute(catalog, name, Some(left), right)
+}
+
+/// The operator form of [`require_builtin_operator_execute`] once both input
+/// types are known, for grouping and set-operation equality.
+pub(crate) fn require_builtin_operator_types_execute(
+    catalog: &dyn CatalogAccess,
+    name: &str,
+    left: Option<i32>,
+    right: i32,
+) -> Result<(), SqlError> {
+    if !catalog.builtin_routine_privileges_present() {
+        return Ok(());
+    }
+    match super::catalog::builtin_operator_procedure(name, left, Some(right)) {
+        Some(procedure) => catalog.require_builtin_routine_execute(procedure),
+        None => Ok(()),
+    }
+}
+
+/// A conversion PostgreSQL performs by calling a cast or length-coercion
+/// function (`2.5::integer` calls `int4(numeric)`) requires `EXECUTE` on it.
+/// Type input from an unknown literal and binary-coercible casts call none.
+fn require_builtin_cast_execute(
+    catalog: &dyn CatalogAccess,
+    source: i32,
+    target: i32,
+    type_mod: i32,
+) -> Result<(), SqlError> {
+    if !catalog.builtin_routine_privileges_present() || source == super::types::oid::UNKNOWN {
+        return Ok(());
+    }
+    let mut result = Ok(());
+    let mut check = |procedure| {
+        if result.is_ok() {
+            result = catalog.require_builtin_routine_execute(procedure);
+        }
+    };
+    if source != target {
+        super::catalog::builtin_function_cast_procedure(source, target).map(&mut check);
+    }
+    if type_mod >= 0 {
+        super::catalog::builtin_function_cast_procedure(target, target).map(&mut check);
+    }
+    result
+}
+
 fn eval_binary_values<'a>(
     expression: BinaryExpression<'_, 'a>,
     mut l: Datum<'a>,
@@ -3547,6 +4100,9 @@ fn eval_binary_values<'a>(
         )? {
             return Ok(value);
         }
+    }
+    if let Some(name) = operator.operator_name() {
+        require_builtin_operator_execute(name, Some(left), right, row, hooks)?;
     }
     if comparison_collation.is_some() {
         validate_enum_operator_types(operator, left, right, row, hooks, arena)?;
@@ -4548,13 +5104,25 @@ fn eval_full_inner<'a>(
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                     || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
             {
-                params.get(index as usize - 1).copied().ok_or_else(|| {
+                let value = params.get(index as usize - 1).copied().ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_PARAMETER,
                         "there is no parameter ${}",
                         index
                     )
-                })
+                })?;
+                if source != crate::sql::ast::ParameterSource::SqlRoutineField {
+                    return Ok(value);
+                }
+                match materialize_named_composite(value, hooks, arena)? {
+                    Datum::Null => Ok(Datum::Null),
+                    Datum::Record(fields) | Datum::Composite { fields, .. } => fields
+                        .iter()
+                        .find(|field| field.name.eq_ignore_ascii_case(name))
+                        .map(|field| field.value)
+                        .ok_or(error),
+                    _ => Err(error),
+                }
             }
             Err(error) => Err(error),
         },
@@ -4593,6 +5161,7 @@ fn eval_full_inner<'a>(
         Expr::Unary {
             operator, operand, ..
         } => {
+            require_node_builtin_execute(expression, row, hooks)?;
             // The prefix arithmetic operators compute exactly what their
             // functions do, so they run the same code rather than a second copy.
             if let Some(function) = operator.arithmetic_function() {
@@ -4741,6 +5310,7 @@ fn eval_full_inner<'a>(
                     return Ok(value);
                 }
             }
+            require_node_builtin_execute(expression, row, hooks)?;
             if let Some(target @ (ColType::Int2 | ColType::Int2Vector | ColType::OidVector)) =
                 ColType::from_sql_name(type_name)
             {
@@ -5026,6 +5596,7 @@ fn eval_full_inner<'a>(
             list,
             negated,
         } => {
+            require_node_builtin_execute(expression, row, hooks)?;
             let v = eval_full(operand, arena, params, row, hooks)?;
             if v.is_null() {
                 return Ok(Datum::Null);
@@ -5077,6 +5648,7 @@ fn eval_full_inner<'a>(
             case_insensitive,
             escape,
         } => {
+            require_node_builtin_execute(expression, row, hooks)?;
             let v = eval_full(operand, arena, params, row, hooks)?;
             let p = eval_full(pattern, arena, params, row, hooks)?;
             let binary = matches!(v, Datum::Bytea(_));
@@ -5143,6 +5715,7 @@ fn eval_full_inner<'a>(
             negated,
             case_insensitive,
         } => {
+            require_node_builtin_execute(expression, row, hooks)?;
             let v = eval_full(operand, arena, params, row, hooks)?;
             let p = eval_full(pattern, arena, params, row, hooks)?;
             match (v, p) {
@@ -5176,6 +5749,7 @@ fn eval_full_inner<'a>(
             } else {
                 case_result_type(whens, &otherwise, row)
             };
+            require_node_builtin_execute(expression, row, hooks)?;
             let scrutinee = match operand {
                 Some(operator) => Some(eval_full(operator, arena, params, row, hooks)?),
                 None => None,
@@ -5245,6 +5819,7 @@ fn eval_full_inner<'a>(
         Expr::InSubquery {
             operand, negated, ..
         } => {
+            require_node_builtin_execute(expression, row, hooks)?;
             let Some(subs) = hooks.subs else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -5340,6 +5915,7 @@ fn eval_full_inner<'a>(
             all,
             ..
         } => {
+            require_node_builtin_execute(expression, row, hooks)?;
             let Some(subs) = hooks.subs else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -5844,6 +6420,7 @@ fn eval_full_inner<'a>(
             array,
             all,
         } => {
+            require_node_builtin_execute(expression, row, hooks)?;
             let collation = resolve_comparison_collation(operand, array, row, hooks.catalog)?;
             let lhs = eval_full(operand, arena, params, row, hooks)?;
             let mut array = eval_full(array, arena, params, row, hooks)?;
@@ -6349,6 +6926,19 @@ fn expression_collation<'a>(
                                 static_type(expression, row).is_some_and(ColType::is_collatable),
                             )
                         })
+                    }
+                    // A composite field keeps its type's default collation.
+                    super::ast::ParameterSource::SqlRoutineField => {
+                        let collatable =
+                            static_type(expression, row).is_some_and(ColType::is_collatable);
+                        DerivedCollation::implicit(
+                            if collatable {
+                                Collation::Default
+                            } else {
+                                Collation::None
+                            },
+                            collatable,
+                        )
                     }
                     super::ast::ParameterSource::PlpgsqlCursor => None,
                 })
@@ -7619,6 +8209,19 @@ fn call<'a>(
     } else {
         args
     };
+    if let Some((oid, _)) = builtin
+        && let Some(catalog) = hooks.catalog
+        && catalog.builtin_routine_strict(oid) == Some(true)
+        && super::catalog::builtin_callable_by_oid(oid)
+            .is_some_and(|routine| !routine.catalog.strict)
+        && args.iter().any(|argument| is_null_constant(argument))
+    {
+        // `ALTER FUNCTION ... STRICT` made `pg_proc` mark this built-in
+        // strict: PostgreSQL's planner folds a call with a constant NULL
+        // input to NULL, while execution keeps the built-in's own null
+        // handling, so a later NULL still reaches it.
+        return Ok(Datum::Null);
+    }
     // Only a declared variadic handler unpacks the selected final input.
     let variadic = variadic
         && builtin.is_none_or(|(oid, _)| {
@@ -7691,6 +8294,11 @@ fn call<'a>(
         && let Some(result) = builtin_operator_function(oid, args, arena, params, row, hooks)
     {
         return result;
+    }
+    if let Some((oid, _)) = builtin
+        && let Some(expression) = builtin_function_expression(oid, args, arena)?
+    {
+        return eval_full(expression, arena, params, row, hooks);
     }
     let arity = |n: usize| -> Result<(), SqlError> {
         if args.len() != n || star {
@@ -8659,8 +9267,181 @@ fn call<'a>(
                 .map_err(|_| arena_full())?;
             Ok(Datum::Record(fields))
         }
-        _ => undefined_function(written_name, args, row, hooks),
+        _ => match builtin {
+            Some((oid, _)) => Err(unsupported_builtin_function(oid, hooks)),
+            None => undefined_function(written_name, args, row, hooks),
+        },
     }
+}
+
+/// A listed built-in routine pos3ql cannot run: it exists in `pg_proc`, so
+/// it is not missing, but calling it is unsupported.
+fn unsupported_builtin_function(oid: i32, hooks: &EvalHooks<'_, '_>) -> SqlError {
+    use core::fmt::Write;
+    let Some(signature) = super::catalog::builtin_callable_by_oid(oid) else {
+        return sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "selected builtin function {} has no declaration",
+            oid
+        );
+    };
+    let mut message = crate::util::StackStr::<192>::new();
+    let _ = write!(message, "function {}(", signature.name);
+    for (index, &argument) in signature.arguments.iter().enumerate() {
+        if index != 0 {
+            let _ = message.write_str(", ");
+        }
+        let name = hooks
+            .catalog
+            .and_then(|catalog| catalog.type_name_fixed(argument).ok().flatten())
+            .or_else(|| super::exec::builtin_type_name_fixed(argument));
+        match name {
+            Some(name) => {
+                let _ = message.write_str(name.as_str());
+            }
+            None => {
+                let _ = write!(message, "{argument}");
+            }
+        }
+    }
+    let _ = message.write_str(") is not supported");
+    SqlError {
+        sqlstate: SqlState::known(sqlstate::FEATURE_NOT_SUPPORTED),
+        message,
+    }
+}
+
+/// A built-in called by name that implements an operator or cast runs as that
+/// operator or cast over its arguments converted to the declared input types:
+/// `texteq(a, b)` is `a::text = b::text`, `int4um(x)` is `-x::integer`,
+/// `int4(n)` is `n::numeric::integer` and `int4in(s)` is `s::text::integer`.
+fn builtin_function_expression<'a>(
+    oid: i32,
+    args: &[&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    let Some(signature) = super::catalog::builtin_callable_by_oid(oid) else {
+        return Ok(None);
+    };
+    if args.len() != signature.arguments.len() || signature.variadic_element.is_some() {
+        return Ok(None);
+    }
+    let converted = |argument: &'a Expr<'a>, oid: i32| -> Result<Option<&'a Expr<'a>>, SqlError> {
+        // A polymorphic input (`anyarray`) has no conversion to apply; such a
+        // routine runs by its name.
+        let Some(declared) = ColType::from_oid(oid).filter(|declared| !declared.is_pseudo()) else {
+            return Ok(None);
+        };
+        arena
+            .alloc(Expr::Cast {
+                source_position: super::ast::SourcePosition::UNKNOWN,
+                operand: argument,
+                type_name: declared.name(),
+                type_mod: -1,
+                binding: super::ast::CastBinding::Builtin,
+            })
+            .map(|cast| Some(&*cast))
+            .map_err(|_| arena_full())
+    };
+    let expression =
+        if let Some((name, left, right)) = super::catalog::builtin_operator_of_procedure(oid) {
+            match (args, left) {
+                ([left_argument, right_argument], left) if left != 0 => {
+                    let (Some(left), Some(right)) = (
+                        converted(left_argument, left)?,
+                        converted(right_argument, right)?,
+                    ) else {
+                        return Ok(None);
+                    };
+                    let negated = name.starts_with('!');
+                    match name.trim_start_matches('!') {
+                        "~~" | "~~*" => Expr::Like {
+                            operand: left,
+                            pattern: right,
+                            negated,
+                            case_insensitive: name.ends_with('*'),
+                            escape: None,
+                        },
+                        "~" | "~*" => Expr::Match {
+                            operand: left,
+                            pattern: right,
+                            negated,
+                            case_insensitive: name.ends_with('*'),
+                        },
+                        _ => {
+                            let Some(operator) = BinaryOp::from_operator_name(name) else {
+                                return Ok(None);
+                            };
+                            Expr::Binary {
+                                source_position: super::ast::SourcePosition::UNKNOWN,
+                                operator,
+                                left,
+                                right,
+                            }
+                        }
+                    }
+                }
+                ([operand], 0) => {
+                    let Some(operand) = converted(operand, right)? else {
+                        return Ok(None);
+                    };
+                    let operator = match name {
+                        "+" => return Ok(Some(operand)),
+                        "-" => UnaryOp::Neg,
+                        "~" => UnaryOp::BitNot,
+                        "|/" => UnaryOp::SquareRoot,
+                        "||/" => UnaryOp::CubeRoot,
+                        "@" => UnaryOp::AbsoluteValue,
+                        "!!" => UnaryOp::TextSearchNot,
+                        _ => return Ok(None),
+                    };
+                    Expr::Unary {
+                        source_position: super::ast::SourcePosition::UNKNOWN,
+                        operator,
+                        operand,
+                    }
+                }
+                _ => return Ok(None),
+            }
+        } else if super::catalog::builtin_procedure_is_cast(oid)
+            && let [argument] = args
+        {
+            let (Some(operand), Some(target)) = (
+                converted(argument, signature.arguments[0])?,
+                ColType::from_oid(signature.result_oid),
+            ) else {
+                return Ok(None);
+            };
+            Expr::Cast {
+                source_position: super::ast::SourcePosition::UNKNOWN,
+                operand,
+                type_name: target.name(),
+                type_mod: -1,
+                binding: super::ast::CastBinding::Builtin,
+            }
+        } else if let Some(target) = super::catalog::builtin_input_function_type(oid)
+            && let [argument] = args
+        {
+            let (Some(operand), Some(target)) = (
+                converted(argument, super::types::oid::TEXT)?,
+                ColType::from_oid(target),
+            ) else {
+                return Ok(None);
+            };
+            Expr::Cast {
+                source_position: super::ast::SourcePosition::UNKNOWN,
+                operand,
+                type_name: target.name(),
+                type_mod: -1,
+                binding: super::ast::CastBinding::Builtin,
+            }
+        } else {
+            return Ok(None);
+        };
+    arena
+        .alloc(expression)
+        .map(|expression| Some(&*expression))
+        .map_err(|_| arena_full())
 }
 
 /// Best-effort common CASE result type. ELSE participates first, and unknown
@@ -10466,7 +11247,7 @@ pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, 
     regtype_of_oid_with_catalog(o, None, arena)
 }
 
-fn regtype_of_oid_with_catalog<'a>(
+pub(crate) fn regtype_of_oid_with_catalog<'a>(
     o: i64,
     catalog: Option<&dyn CatalogAccess>,
     arena: &'a Arena,
@@ -10491,6 +11272,9 @@ fn regtype_of_oid_with_catalog<'a>(
         && crate::storage::NamedTypeKind::from_oid(referenced_oid).is_none()
     {
         ctype.name()
+    } else if let Some(name) = super::catalog::intrinsic_type_name(referenced_oid) {
+        // A pseudo-type or catalog row type a built-in routine declares.
+        name
     } else {
         return arena
             .alloc_str_display(unsigned)

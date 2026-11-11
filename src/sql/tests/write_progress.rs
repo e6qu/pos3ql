@@ -12,6 +12,8 @@ struct ColdTable {
     engine: Engine,
     writer: ConfiguredTransactionSession,
     other: ConfiguredTransactionSession,
+    /// Waits during which the writer's transaction kept the write's rows.
+    kept_waits: usize,
 }
 
 /// `cold_items` (`id`, `code`) holds rows 1..=40 only in saved objects; GET
@@ -26,6 +28,7 @@ fn cold_table(label: &str, mode: crate::config::TransactionMode, setup: &str) ->
     config.object_store_bucket = name;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
+    config.max_tables = 16;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let server = HttpObjectServer::start(&mut config);
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -41,8 +44,17 @@ fn cold_table(label: &str, mode: crate::config::TransactionMode, setup: &str) ->
         true,
     );
     assert!(crate::mem::guard::forbid_alloc(|| engine.checkpoint()).unwrap());
-    let table = engine.storage.find_table("public", "cold_items").unwrap();
-    {
+    // `cold_items` and the other `cold_` tables a setup may create.
+    for name in [
+        "cold_items",
+        "cold_more",
+        "cold_extra",
+        "cold_gone",
+        "cold_pairs",
+    ] {
+        let Some(table) = engine.storage.find_table("public", name) else {
+            continue;
+        };
         engine.storage.finish_row_cleanup(
             RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
             RowCleanupTarget::Table(table),
@@ -59,6 +71,7 @@ fn cold_table(label: &str, mode: crate::config::TransactionMode, setup: &str) ->
         engine,
         writer,
         other,
+        kept_waits: 0,
     }
 }
 
@@ -137,6 +150,7 @@ impl ColdTable {
                 break;
             };
             assert_eq!(wait, StatementWait::ObjectIo, "{sql}");
+            self.kept_waits += usize::from(self.writer.transaction.has_retained_write());
             output_mark.truncate_unsent(&mut self.writer.send);
             self.writer.arena.recycle_front();
             completed_statements = completed;
@@ -184,6 +198,7 @@ impl ColdTable {
             engine,
             writer,
             other,
+            ..
         } = self;
         drop((other, writer, engine, server));
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -558,6 +573,310 @@ fn write_rows_keep_progress_across_routine_calls() {
                 ),
                 ["11|40"],
                 "{mode:?} extended={extended}"
+            );
+            cold.finish();
+        }
+    }
+}
+
+/// Orders whose rows check foreign keys against three cold tables, with
+/// BEFORE and AFTER row triggers that write and call a sequence, and
+/// transition tables.
+const ORDER_SETUP: &str = "CREATE TABLE hot_log(stage text); CREATE SEQUENCE numbers; \
+     CREATE TABLE audit(stage text, n bigint); \
+     CREATE TABLE cold_more(id integer PRIMARY KEY); \
+     INSERT INTO cold_more SELECT generate_series(1, 40); \
+     CREATE TABLE cold_extra(id integer PRIMARY KEY); \
+     INSERT INTO cold_extra SELECT generate_series(1, 40); \
+     CREATE TABLE orders(n bigint DEFAULT nextval('numbers'), \
+     item integer REFERENCES cold_items, more integer REFERENCES cold_more, \
+     extra integer REFERENCES cold_extra, note text); \
+     CREATE FUNCTION audit_order() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+     INSERT INTO audit VALUES (TG_OP || '-' || NEW.note, nextval('numbers')); \
+     NEW.note := NEW.note || '+'; RETURN NEW; END$$; \
+     CREATE TRIGGER audit_order BEFORE INSERT OR UPDATE ON orders \
+     FOR EACH ROW EXECUTE FUNCTION audit_order(); \
+     CREATE FUNCTION after_order() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+     INSERT INTO audit VALUES ('after-' || NEW.note, nextval('numbers')); \
+     RETURN NULL; END$$; \
+     CREATE TRIGGER after_order AFTER INSERT OR UPDATE ON orders \
+     FOR EACH ROW EXECUTE FUNCTION after_order(); \
+     CREATE FUNCTION changed_orders() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+     INSERT INTO audit SELECT TG_OP || '-changed-' || count(*), nextval('numbers') \
+     FROM changed; RETURN NULL; END$$; \
+     CREATE TRIGGER changed_inserts AFTER INSERT ON orders \
+     REFERENCING NEW TABLE AS changed \
+     FOR EACH STATEMENT EXECUTE FUNCTION changed_orders(); \
+     CREATE TRIGGER changed_updates AFTER UPDATE ON orders \
+     REFERENCING NEW TABLE AS changed \
+     FOR EACH STATEMENT EXECUTE FUNCTION changed_orders()";
+
+/// Storage waits inside a write's rows, several rows in: a foreign key check
+/// of a later row reads the cold parent table. The write keeps its earlier
+/// rows, lets another client run, and continues at the waiting row: sequence
+/// defaults, BEFORE ROW trigger bodies with their own writes and sequence
+/// calls, AFTER ROW triggers, transition tables of AFTER STATEMENT triggers
+/// and `RETURNING` rows each happen once, with PostgreSQL 18.6's
+/// values; both transaction modes, both protocols, implicit and explicit
+/// transactions.
+#[test]
+fn write_rows_resume_after_storage_waits() {
+    let statements: &[(&str, &[&str])] = &[
+        (
+            "INSERT INTO orders(item, note) SELECT CASE WHEN g >= 4 THEN g END, 'o' || g \
+             FROM generate_series(1, 6) g RETURNING n, item, note",
+            &[
+                "1|NULL|o1+",
+                "3|NULL|o2+",
+                "5|NULL|o3+",
+                "7|4|o4+",
+                "9|5|o5+",
+                "11|6|o6+",
+            ],
+        ),
+        (
+            "UPDATE orders SET more = CASE WHEN n > 3 THEN n + 1 END, note = 'u' \
+             WHERE item IS NULL RETURNING n, more, note",
+            &["1|NULL|u+", "3|NULL|u+", "5|6|u+"],
+        ),
+        (
+            "INSERT INTO orders(extra, note) VALUES (NULL, 'v1'), (NULL, 'v2'), (8, 'v3'), \
+             (9, 'v4') RETURNING n, extra, note",
+            &["27|NULL|v1+", "29|NULL|v2+", "31|8|v3+", "33|9|v4+"],
+        ),
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for (extended, explicit) in [(false, false), (true, false), (false, true)] {
+            let mut cold = cold_table(
+                &format!("row-waits-{extended}-{explicit}"),
+                mode,
+                ORDER_SETUP,
+            );
+            if explicit {
+                cold.writer.success(&mut cold.engine, "BEGIN", true);
+            }
+            for &(sql, returned) in statements {
+                let context = format!("{mode:?} extended={extended} explicit={explicit}: {sql}");
+                let kept = cold.kept_waits;
+                let waits = cold.run(sql, extended, other_client_progresses);
+                assert!(waits > 0, "{context}: a later row must wait");
+                assert!(cold.kept_waits > kept, "{context}: the wait must keep rows");
+                let output = cold.writer.send.readable().to_vec();
+                assert!(
+                    error_sqlstates(&output).is_empty(),
+                    "{context}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                assert_eq!(data_rows(&output), returned, "{context}");
+            }
+            if explicit {
+                cold.writer.success(&mut cold.engine, "COMMIT", true);
+            }
+            let context = format!("{mode:?} extended={extended} explicit={explicit}");
+            assert_eq!(
+                cold.rows("SELECT string_agg(stage || ':' || n, ',' ORDER BY n) FROM audit"),
+                [
+                    "INSERT-o1:2,INSERT-o2:4,INSERT-o3:6,INSERT-o4:8,INSERT-o5:10,INSERT-o6:12,\
+                     after-o1+:13,after-o2+:14,after-o3+:15,after-o4+:16,after-o5+:17,\
+                     after-o6+:18,INSERT-changed-6:19,UPDATE-u:20,UPDATE-u:21,UPDATE-u:22,\
+                     after-u+:23,after-u+:24,after-u+:25,UPDATE-changed-3:26,INSERT-v1:28,\
+                     INSERT-v2:30,INSERT-v3:32,INSERT-v4:34,after-v1+:35,after-v2+:36,\
+                     after-v3+:37,after-v4+:38,INSERT-changed-4:39"
+                ],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows("SELECT count(*), sum(n) FROM orders"),
+                ["10|156"],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows("SELECT count(*) FROM hot_log"),
+                ["3"],
+                "{context}"
+            );
+            cold.finish();
+        }
+    }
+}
+
+/// Storage waits inside the rows of multi-step writes, a `MERGE` and a
+/// `DELETE` whose trigger reads a cold table: a rule's original statement
+/// and action, a data-modifying `WITH` and its main statement, and `MERGE`'s
+/// update and insert actions keep their finished steps and rows across the
+/// waits, and each row, trigger write and `RETURNING` row happens once, as in
+/// PostgreSQL 18.6; both transaction modes and both protocols.
+#[test]
+fn write_steps_resume_after_storage_waits() {
+    let statements: &[(&str, &[&str])] = &[
+        (
+            "INSERT INTO links SELECT g, CASE WHEN g >= 3 THEN g END, 'r' || g \
+             FROM generate_series(1, 4) g RETURNING id, more",
+            &["1|NULL", "2|NULL", "3|3", "4|4"],
+        ),
+        (
+            "WITH gone AS (DELETE FROM links WHERE id <= 2 RETURNING id, note) \
+             INSERT INTO gone_log SELECT note || '-gone', id + 10 FROM gone RETURNING note, more",
+            &["r1-gone|11", "r2-gone|12"],
+        ),
+        (
+            "MERGE INTO pairs p USING generate_series(1, 6) g ON p.id = g \
+             WHEN MATCHED THEN UPDATE SET more = g + 20 \
+             WHEN NOT MATCHED THEN INSERT VALUES (g, g + 30, 'm' || g) \
+             RETURNING p.id, p.more, p.note",
+            &[
+                "1|21|p1", "2|22|p2", "3|33|m3", "4|34|m4", "5|35|m5", "6|36|m6",
+            ],
+        ),
+        (
+            "DELETE FROM links WHERE id >= 3 RETURNING id, note",
+            &["3|r3", "4|r4"],
+        ),
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for extended in [false, true] {
+            let mut cold = cold_table(
+                &format!("row-steps-{extended}"),
+                mode,
+                "CREATE TABLE hot_log(stage text); \
+                 CREATE TABLE cold_more(id integer PRIMARY KEY); \
+                 INSERT INTO cold_more SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_extra(id integer PRIMARY KEY); \
+                 INSERT INTO cold_extra SELECT generate_series(1, 40); \
+                 CREATE TABLE links(id int, more int REFERENCES cold_more, note text); \
+                 CREATE TABLE log(note text, more int REFERENCES cold_extra); \
+                 CREATE TABLE cold_gone(id integer PRIMARY KEY); \
+                 INSERT INTO cold_gone SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_pairs(id integer PRIMARY KEY); \
+                 INSERT INTO cold_pairs SELECT generate_series(1, 40); \
+                 CREATE TABLE gone_log(note text, more int REFERENCES cold_gone); \
+                 CREATE TABLE pairs(id int, more int REFERENCES cold_pairs, note text); \
+                 CREATE RULE log_links AS ON INSERT TO links \
+                 DO ALSO INSERT INTO log VALUES (NEW.note, NEW.id); \
+                 CREATE FUNCTION check_delete() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                 DECLARE seen bigint; BEGIN IF OLD.id >= 3 THEN \
+                 SELECT count(*) INTO seen FROM cold_items; \
+                 INSERT INTO log VALUES ('deleting-' || OLD.id || '-' || seen, NULL); \
+                 END IF; RETURN OLD; END$$; \
+                 CREATE TRIGGER links_delete BEFORE DELETE ON links \
+                 FOR EACH ROW EXECUTE FUNCTION check_delete()",
+            );
+            cold.rows("INSERT INTO pairs VALUES (1, NULL, 'p1'), (2, NULL, 'p2')");
+            for &(sql, returned) in statements {
+                let context = format!("{mode:?} extended={extended}: {sql}");
+                let kept = cold.kept_waits;
+                let waits = cold.run(sql, extended, other_client_progresses);
+                assert!(waits > 0, "{context}: a row must wait");
+                assert!(cold.kept_waits > kept, "{context}: the wait must keep rows");
+                let output = cold.writer.send.readable().to_vec();
+                assert!(
+                    error_sqlstates(&output).is_empty(),
+                    "{context}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                let mut rows = data_rows(&output);
+                rows.sort();
+                assert_eq!(rows, returned, "{context}");
+            }
+            let context = format!("{mode:?} extended={extended}");
+            assert_eq!(
+                cold.rows(
+                    "SELECT string_agg(note || ':' || coalesce(more::text, '-'), ',' \
+                     ORDER BY note) FROM log"
+                ),
+                ["deleting-3-40:-,deleting-4-40:-,r1:1,r2:2,r3:3,r4:4"],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows(
+                    "SELECT count(*), coalesce(sum(id), 0) FROM links; \
+                     SELECT count(*), sum(more) FROM pairs; \
+                     SELECT string_agg(note || ':' || more, ',' ORDER BY note) FROM gone_log"
+                ),
+                ["0|0", "6|181", "r1-gone:11,r2-gone:12"],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows("SELECT count(*) FROM hot_log"),
+                ["4"],
+                "{context}"
+            );
+            cold.finish();
+        }
+    }
+}
+
+/// The same writes in a procedure, a `DO` body and a dynamic `EXECUTE`: a
+/// storage wait inside their rows keeps the rows their frame already changed
+/// and continues at the waiting row, with PostgreSQL 18.6's values; both
+/// transaction modes and both protocols.
+#[test]
+fn procedural_write_rows_resume_after_storage_waits() {
+    let statements = [
+        "CALL fill()",
+        "DO $$BEGIN UPDATE orders SET more = CASE WHEN n > 3 THEN n + 1 END, note = 'u' \
+         WHERE item IS NULL; END$$",
+        "DO $$BEGIN EXECUTE 'INSERT INTO orders(extra, note) VALUES (NULL, ''v1''), \
+         (NULL, ''v2''), (8, ''v3''), (9, ''v4'')'; END$$",
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for extended in [false, true] {
+            let mut cold = cold_table(
+                &format!("procedural-row-waits-{extended}"),
+                mode,
+                &format!(
+                    "{ORDER_SETUP}; CREATE PROCEDURE fill() LANGUAGE plpgsql AS $$BEGIN \
+                     INSERT INTO orders(item, note) SELECT CASE WHEN g >= 4 THEN g END, \
+                     'o' || g FROM generate_series(1, 6) g; END$$"
+                ),
+            );
+            for sql in statements {
+                let context = format!("{mode:?} extended={extended}: {sql}");
+                let kept = crate::sql::exec::KEPT_ROW_WAITS.load(Ordering::Relaxed);
+                let waits = cold.run(sql, extended, other_client_progresses);
+                assert!(waits > 0, "{context}: a later row must wait");
+                assert!(
+                    crate::sql::exec::KEPT_ROW_WAITS.load(Ordering::Relaxed) > kept,
+                    "{context}: the wait must keep the earlier rows"
+                );
+                let output = cold.writer.send.readable().to_vec();
+                assert!(
+                    error_sqlstates(&output).is_empty(),
+                    "{context}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            let context = format!("{mode:?} extended={extended}");
+            assert_eq!(
+                cold.rows("SELECT string_agg(stage || ':' || n, ',' ORDER BY n) FROM audit"),
+                [
+                    "INSERT-o1:2,INSERT-o2:4,INSERT-o3:6,INSERT-o4:8,INSERT-o5:10,INSERT-o6:12,\
+                     after-o1+:13,after-o2+:14,after-o3+:15,after-o4+:16,after-o5+:17,\
+                     after-o6+:18,INSERT-changed-6:19,UPDATE-u:20,UPDATE-u:21,UPDATE-u:22,\
+                     after-u+:23,after-u+:24,after-u+:25,UPDATE-changed-3:26,INSERT-v1:28,\
+                     INSERT-v2:30,INSERT-v3:32,INSERT-v4:34,after-v1+:35,after-v2+:36,\
+                     after-v3+:37,after-v4+:38,INSERT-changed-4:39"
+                ],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows("SELECT count(*), sum(n), sum(more), sum(extra) FROM orders"),
+                ["10|156|6|17"],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows("SELECT count(*) FROM hot_log"),
+                ["3"],
+                "{context}"
             );
             cold.finish();
         }

@@ -737,7 +737,8 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | `statistics_bytes`, `statistics_leases` | Column statistics (starter 1 MiB, 1,024) |
 | `index_statistics_slots` | Index counters (starter 4,096) |
 | `definition_image_slots` | Schema pins held by executing statements |
-| `execution_control_bytes`, `execution_control_leases` | PL/pgSQL source images, locals, loop frames, saved outputs, caught errors |
+| `execution_control_bytes`, `execution_control_leases` | PL/pgSQL source images, locals, loop frames, saved outputs, caught errors, and the step records of a running multi-step write |
+| `write_step_levels` (optional, default 4, at most 64) | Levels of multi-step statements (rule actions on tables with rules, rules on `WITH` targets) nested in one another's steps whose progress a write keeps; a routine call after rows changed one level deeper fails with `54000` naming the setting |
 | `routine_input_slots` | Per-backend routine plan instances |
 | `max_prepared`, `prepared_bytes` | Prepared statements per namespace and bytes per statement, shared with bound portals |
 | `cursor_bytes`, `cursor_query_bytes` | See [cursors](#cursor-capacity) |

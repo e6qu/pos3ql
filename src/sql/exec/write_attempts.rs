@@ -83,7 +83,8 @@ pub(super) type WriteAttempt<'f, 'a, T> = dyn FnMut(
 
 /// Runs a PL/pgSQL `INSERT`, `UPDATE` or `DELETE`, static or dynamic, whose
 /// expressions can call routines. A `retained` frame keeps the invocation log
-/// in `status.write_calls` across a wait.
+/// in `status.write_calls` across a wait, and the rows the write changed in
+/// `status.write_progress`: the next run continues at the unfinished row.
 pub(super) fn execute_procedural_write<'a, T>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     status: &mut TriggerExecutionStatus<'a>,
@@ -101,13 +102,18 @@ pub(super) fn execute_procedural_write<'a, T>(
     } else {
         query::RoutineExecution::StatementReplay
     };
-    let calls = status
+    let mut calls = status
         .write_calls
         .take()
         .unwrap_or_else(|| query::RoutineInvocationState::new(owner, policy));
     calls.require_arena(owner)?;
     let replay = sequence::begin_replay_cursor()?;
-    let mut progress = RowProgress::new();
+    let mut progress = match status.write_progress.take() {
+        Some(progress) => progress,
+        None if retained => RowProgress::retained(context.storage())?,
+        None => RowProgress::new(context.storage())?,
+    };
+    let mut kept = false;
     let result = loop {
         sequence::rewind_replay_cursor(replay)?;
         calls.begin_attempt();
@@ -144,12 +150,15 @@ pub(super) fn execute_procedural_write<'a, T>(
         let mark = context.txn.statement_mark(wal, lock);
         progress.begin_attempt(wal, lock);
         let output = context.responder.mark();
+        progress.note_start(mark, output);
         let front = arena.mark();
         let effects = WriteAttemptEffects::capture(context)?.ok_or_else(host_changed)?;
         let outcome = query::with_routine_invocation_scope(
             Some(query::RoutineInvocationContext::new(&calls, owner)),
             || attempt(context, status, Some(&mut progress)),
         );
+        // Whatever ended the attempt, no resumable row runs past it.
+        query::set_resumable_row(false);
         let handed_off = status.pending_write.is_some();
         match outcome {
             Err(error)
@@ -221,6 +230,10 @@ pub(super) fn execute_procedural_write<'a, T>(
             {
                 break Err(retained_progress_required());
             }
+            Err(wait) if retained && !handed_off && is_wait(&wait) => {
+                kept = keep_waiting_rows(context, &mut progress, &mut calls, &wait, owner, policy)?;
+                break Err(wait);
+            }
             outcome => break outcome,
         }
     };
@@ -229,6 +242,60 @@ pub(super) fn execute_procedural_write<'a, T>(
         && result.as_ref().is_err_and(control_flow::is_execution_wait)
     {
         status.write_calls = Some(calls);
+        if kept {
+            status.write_progress = Some(progress);
+        }
     }
     result
+}
+
+/// Waits after which a retained frame's write kept its earlier rows.
+#[cfg(test)]
+pub(crate) static KEPT_ROW_WAITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// A storage or lock wait of a retained frame's write. When the write changed
+/// rows, only its unfinished row rolls back and `true` keeps the progress for
+/// the statement's next run; where the rows cannot resume, the write rolls
+/// back to its first start and keeps fresh progress, so it runs again from
+/// there. A routine body that waited keeps its partial work. `false` leaves
+/// the rollback of the whole statement to the caller.
+fn keep_waiting_rows(
+    context: &mut TriggerExecContext<'_, '_, '_>,
+    progress: &mut RowProgress,
+    calls: &mut query::RoutineInvocationState,
+    wait: &SqlError,
+    owner: &Arena,
+    policy: query::RoutineExecution,
+) -> Result<bool, SqlError> {
+    if calls.suspended.borrow().is_some() {
+        return Ok(true);
+    }
+    if !progress.changed_rows() {
+        return Ok(false);
+    }
+    let unfinished = if progress.stops_for(wait) {
+        progress.unfinished_row(context.txn).ok().flatten()
+    } else {
+        None
+    };
+    let PlpgsqlExecHost::Routine { engine, .. } = &mut context.host else {
+        return Err(host_changed());
+    };
+    match unfinished {
+        Some(row) => {
+            engine.rollback_waiting_statement(context.txn, row.mark);
+            context.responder.truncate_to(row.output)?;
+            #[cfg(test)]
+            KEPT_ROW_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        None => {
+            let (start, output) = progress.first_start().ok_or_else(host_changed)?;
+            engine.rollback_waiting_statement(context.txn, start);
+            context.responder.truncate_to(output)?;
+            *progress = progress.restarted(&engine.storage)?;
+            *calls = query::RoutineInvocationState::new(owner, policy);
+        }
+    }
+    Ok(true)
 }

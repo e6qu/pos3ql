@@ -65,21 +65,66 @@ impl HttpObjectServer {
                 Budget::new(crate::object_store::Client::budget_bytes(&fixture_config));
             let mut backing =
                 crate::object_store::Client::new(&fixture_config, &mut fixture_budget).unwrap();
+            // Requests are served in the order their heads arrive: the engine
+            // may open a read and finish a synchronous one before it sends
+            // the first read's request.
+            let mut waiting: Vec<(std::net::TcpStream, Box<[u8; 8192]>, usize)> = Vec::new();
             while !server_stop.load(Ordering::Acquire) {
-                let mut stream = match listener.accept() {
-                    Ok((stream, _)) => stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(1));
-                        continue;
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(true).unwrap();
+                            waiting.push((stream, Box::new([0u8; 8192]), 0));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("accept object read: {error}"),
                     }
-                    Err(error) => panic!("accept object read: {error}"),
+                }
+                let head_end = |request: &[u8]| {
+                    request
+                        .windows(4)
+                        .position(|bytes| bytes == b"\r\n\r\n")
+                        .map(|at| at + 4)
                 };
-                let mut request = [0u8; 8192];
-                let Some((received, header_end)) =
-                    crate::test_wait::read_request_head(&mut stream, &mut request, &server_stop)
-                else {
+                let mut ready = None;
+                let mut index = 0;
+                while index < waiting.len() {
+                    let (stream, request, received) = &mut waiting[index];
+                    if head_end(&request[..*received]).is_none() {
+                        assert!(
+                            *received < request.len(),
+                            "fixture request headers are too large"
+                        );
+                        match stream.read(&mut request[*received..]) {
+                            // A restarted statement abandons its read.
+                            Ok(0) => {
+                                waiting.swap_remove(index);
+                                continue;
+                            }
+                            Ok(count) => *received += count,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(error) => panic!("read request headers: {error}"),
+                        }
+                    }
+                    if let Some(end) = head_end(&request[..*received]) {
+                        ready = Some((index, end));
+                        break;
+                    }
+                    index += 1;
+                }
+                let Some((index, header_end)) = ready else {
+                    std::thread::sleep(Duration::from_millis(1));
                     continue;
                 };
+                let (mut stream, request, received) = waiting.swap_remove(index);
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(crate::test_wait::HANG))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(crate::test_wait::HANG))
+                    .unwrap();
+                let request = *request;
                 let headers = std::str::from_utf8(&request[..header_end]).unwrap();
                 let mut words = headers.lines().next().unwrap().split_whitespace();
                 let method = words.next().unwrap();

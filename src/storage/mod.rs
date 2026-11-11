@@ -15984,6 +15984,9 @@ pub struct Storage {
     row_versions: RowVersionPools,
     pub(crate) row_work: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     pub(crate) execution_control: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    /// Step records a write leases from `execution_control` for its
+    /// multi-step progress (`write_step_levels`).
+    pub(crate) write_step_levels: usize,
     metadata_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     statistics_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     /// Client result output queued behind slow readers.
@@ -22324,6 +22327,7 @@ impl Storage {
             row_versions,
             row_work,
             execution_control,
+            write_step_levels: config.write_step_levels,
             metadata_pool,
             statistics_pool,
             result_spool,

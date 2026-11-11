@@ -1691,6 +1691,53 @@ thread_local! {
     /// Counts effects in both storage modes, so a caller can tell whether a
     /// statement attempt may still be discarded and run again.
     static STATEMENT_EFFECT_EPOCH: Cell<u64> = const { Cell::new(0) };
+    static UNREPLAYABLE_EFFECT_EPOCH: Cell<u64> = const { Cell::new(0) };
+    /// A resumable write row is running: a wait inside it rolls back the
+    /// row and replays its sequence values and routine results.
+    static RESUMABLE_ROW: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Changes whenever a statement starts an effect that a later attempt
+/// cannot replay, such as a volatile built-in function's result.
+pub(crate) fn unreplayable_effect_epoch() -> u64 {
+    UNREPLAYABLE_EFFECT_EPOCH.with(Cell::get)
+}
+
+/// [`protect_statement_effects`] for an effect a later attempt would
+/// compute again differently.
+pub(crate) fn protect_unreplayable_effect() {
+    UNREPLAYABLE_EFFECT_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+    protect_statement_effects();
+}
+
+/// [`protect_statement_effects`] for an effect that a resumable write row
+/// rolls back or replays when a wait rolls the row back: a sequence call, a
+/// trigger body, a nested write. Inside such a row it leaves reads yielding.
+pub(crate) fn protect_replayable_effect() {
+    if RESUMABLE_ROW.with(Cell::get) {
+        STATEMENT_EFFECT_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+    } else {
+        protect_statement_effects();
+    }
+}
+
+/// Marks whether a resumable write row is running. The row's owner clears
+/// it when the row phase or its attempt ends.
+pub(crate) fn set_resumable_row(running: bool) {
+    RESUMABLE_ROW.with(|row| row.set(running));
+}
+
+/// A resumable write row starts: a wait inside it rolls back to here, and
+/// the effects before it are kept or replayed, so its reads yield again
+/// until its own first effect that a rollback cannot undo.
+pub(crate) fn reopen_statement_reads() {
+    set_resumable_row(true);
+    ACTIVE_READ_EFFECTS.with(|active| {
+        if let Some(reads) = active.get() {
+            // As in `protect_statement_effects`, the scope's borrow pins it.
+            unsafe { reads.as_ref() }.deactivate();
+        }
+    });
 }
 
 /// Changes whenever any statement starts an effect.

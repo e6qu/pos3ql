@@ -63313,86 +63313,111 @@ fn row_lock_deadlock_aborts_one_explicit_transaction_and_wakes_the_other() {
 
 #[test]
 fn unique_key_writer_waits_then_rechecks_the_committed_outcome() {
-    let (mut engine, mut budget) = test_engine();
-    let mut owner = TxnState::new(&mut budget, 256).unwrap();
-    let mut waiter = TxnState::new(&mut budget, 256).unwrap();
-    run_txn(
+    // The waiting statement resumes in its own connection memory, as a
+    // parked protocol message does.
+    let config = test_config("unique-key-wait");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut owner = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut waiter = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    owner.success(
         &mut engine,
-        &mut budget,
-        &mut owner,
-        "CREATE TABLE unique_wait (id int primary key)",
+        "CREATE TABLE unique_wait (id int primary key); BEGIN; \
+         INSERT INTO unique_wait VALUES (1)",
+        true,
     );
-    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
-    run_txn(
-        &mut engine,
-        &mut budget,
-        &mut owner,
-        "INSERT INTO unique_wait VALUES (1)",
-    );
-    let blocked = run_txn(
-        &mut engine,
-        &mut budget,
-        &mut waiter,
-        "INSERT INTO unique_wait VALUES (1)",
-    );
-    assert!(blocked.is_empty(), "{blocked}");
-    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
-    let duplicate = run_txn(
-        &mut engine,
-        &mut budget,
-        &mut waiter,
-        "INSERT INTO unique_wait VALUES (1)",
-    );
-    assert!(duplicate.contains("23505"), "{duplicate}");
+    let sql = "INSERT INTO unique_wait VALUES (1)";
+    let ExecutionStatus::Blocked {
+        completed_statements,
+        output_mark,
+        ..
+    } = waiter.execute_status(&mut engine, sql, true)
+    else {
+        panic!("the insert must wait for the uncommitted key");
+    };
+    owner.success(&mut engine, "COMMIT", true);
+    output_mark.truncate_unsent(&mut waiter.send);
+    waiter.arena.recycle_front();
+    let status = crate::mem::guard::forbid_alloc(|| {
+        engine.execute_simple_from(
+            sql,
+            completed_statements,
+            &waiter.arena,
+            &mut waiter.transaction,
+            &mut waiter.pool,
+            &mut waiter.cursors,
+            &waiter.guc,
+            &mut Responder::new(&mut waiter.send),
+            waiter.connection_id,
+            false,
+        )
+    })
+    .unwrap();
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert_eq!(error_sqlstates(waiter.send.readable()), ["23505"]);
+    drop((owner, waiter, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
 }
 
+/// A write parked on a unique conflict keeps the rows before the waiting one,
+/// as PostgreSQL does while it waits, and rolls back only the waiting row.
 #[test]
-fn parked_statement_rewinds_partial_rows_before_replay() {
-    let (mut engine, mut budget) = test_engine();
-    let mut owner = TxnState::new(&mut budget, 256).unwrap();
-    let mut waiter = TxnState::new(&mut budget, 256).unwrap();
-    run_txn(
+fn parked_statement_keeps_finished_rows_and_rewinds_the_waiting_row() {
+    let config = test_config("parked-statement-rows");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut owner = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut waiter = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    owner.success(
         &mut engine,
-        &mut budget,
-        &mut owner,
-        "CREATE TABLE replay_rows (id int primary key)",
+        "CREATE TABLE replay_rows (id int primary key); BEGIN; INSERT INTO replay_rows VALUES (2)",
+        true,
     );
-    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
-    run_txn(
-        &mut engine,
-        &mut budget,
-        &mut owner,
-        "INSERT INTO replay_rows VALUES (2)",
+    let sql = "INSERT INTO replay_rows VALUES (1), (2)";
+    let ExecutionStatus::Blocked {
+        completed_statements,
+        output_mark,
+        ..
+    } = waiter.execute_status(&mut engine, sql, true)
+    else {
+        panic!("the insert must wait for the uncommitted key");
+    };
+    assert_eq!(
+        engine
+            .storage
+            .resident_rows(engine.storage.find_table("public", "replay_rows").unwrap())
+            .iter()
+            .filter(|(_, state)| {
+                state
+                    .pending_last()
+                    .is_some_and(|pending| pending.txid == waiter.transaction.txid)
+            })
+            .count(),
+        1,
+        "the parked statement keeps its first row and no part of the waiting one"
     );
-    let blocked = run_txn(
-        &mut engine,
-        &mut budget,
-        &mut waiter,
-        "INSERT INTO replay_rows VALUES (1), (2)",
-    );
-    assert!(blocked.is_empty(), "{blocked}");
-    assert!(
-        {
-            let storage = &engine.storage;
-            storage
-                .resident_rows(engine.storage.find_table("public", "replay_rows").unwrap())
-                .iter()
-                .all(|(_, state)| {
-                    state
-                        .pending_last()
-                        .is_none_or(|pending| pending.txid != waiter.txid)
-                })
-        },
-        "the parked statement must leave no partial pending row"
-    );
-    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
-    let resumed = run_txn(
-        &mut engine,
-        &mut budget,
-        &mut waiter,
-        "INSERT INTO replay_rows VALUES (1), (2)",
-    );
-    assert!(resumed.contains("INSERT 0 2"), "{resumed}");
+    owner.success(&mut engine, "ROLLBACK", true);
+    output_mark.truncate_unsent(&mut waiter.send);
+    waiter.arena.recycle_front();
+    let status = crate::mem::guard::forbid_alloc(|| {
+        engine.execute_simple_from(
+            sql,
+            completed_statements,
+            &waiter.arena,
+            &mut waiter.transaction,
+            &mut waiter.pool,
+            &mut waiter.cursors,
+            &waiter.guc,
+            &mut Responder::new(&mut waiter.send),
+            waiter.connection_id,
+            false,
+        )
+    })
+    .unwrap();
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert_eq!(command_tags(waiter.send.readable()), ["INSERT 0 2"]);
+    drop((owner, waiter, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
 }
 
 #[test]

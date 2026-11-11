@@ -98,16 +98,16 @@ of writes in a PL/pgSQL or SQL-language function called from a query, which
 run on the engine (DDL and routine calls included) and restart the statement
 on a wait; multi-step
 statements nested in another's step (a rule action whose target has rules),
-which keep their own steps up to four levels deep.
+which keep their own steps up to `write_step_levels` levels deep.
 The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
 
 **Remaining:**
 
-- **Functions:** writes inside a procedure body still read storage
-  synchronously, as do PL/pgSQL cursor reads (`OPEN`, `FETCH` and cursor
-  `FOR` loops), whose lock waits already park. A top-level `SELECT` that the retained reader cannot hold
+- **Functions:** a wait inside a write in a function called from a query
+  restarts the statement. PL/pgSQL cursor reads (`OPEN`, `FETCH` and cursor
+  `FOR` loops) read storage synchronously; their lock waits already park. A top-level `SELECT` that the retained reader cannot hold
   (`DISTINCT` over routine output, grouping sets, groupings whose keys or aggregate inputs call
   routines, subqueries, sorts in object-store mode or over non-volatile
   routine output, joins it would probe through an index) restarts once for
@@ -117,24 +117,26 @@ is owned.
   after the sort), retained groupings, and cursors ordered by source columns,
   hand each call off on its row. Removing the restart needs those shapes retained (above): the
   general executor cannot run a routine body inside expression evaluation.
-- **Write phases:** a write yields only before its first row change, `VALUES`
-  row or trigger body; after that, row changes, index maintenance, constraint
-  checks, BEFORE/INSTEAD and statement triggers, partition routing, transition
-  tables, rules and `RETURNING` read synchronously, and so do DDL, COPY,
-  replication apply and deferred triggers. A routine call inside the rows
-  already keeps the changed rows within the running statement (row progress:
-  the next attempt selects the rows again under the original command and
-  continues at the unfinished row), also for views and rules written from
-  PL/pgSQL and SQL-language bodies. Move that progress into a
-  startup-reserved owner so a storage or lock wait in the row phase also
-  resumes at its row instead of restarting the statement. Extend row
+- **Write phases:** a write keeps its changed rows across storage and lock
+  waits and continues at the unfinished row, at top level and in `CALL` and
+  `DO` bodies (see the
+  [execution model](docs/architecture.md#execution-model)). Remaining: a
+  write whose scan ran a volatile built-in reads its rows synchronously.
+  Reads after a write's last row (statement-level and `AFTER` triggers,
+  foreign key checks queued as constraint events, transition tables, the
+  next step's selection) read synchronously: the write completion advances
+  its event cursor before an event runs, so yielding there first needs the
+  completion to run the waiting event again instead of skipping it.
+  `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
+  triggers read synchronously. A routine call inside the rows
+  keeps the changed rows (row progress), also for views and rules written
+  from PL/pgSQL and SQL-language bodies. Extend row
   progress to foreign tables and to data-modifying `WITH` inside routine
   bodies: a routine call after their first row change fails with `0A000`
   (`SQL row expression requires retained write progress`), because
   restarting would hide the earlier rows from the call. Multi-step
-  statements nested more than four deep fail the same way with `54000`
-  (`multi-step statements nest deeper than the 4 levels write progress
-  keeps`), the fixed per-statement capacity. `INSERT ... SELECT` materializes its source
+  statements nested deeper than `write_step_levels` fail the same way with
+  `54000` naming that setting. `INSERT ... SELECT` materializes its source
   before writing. Volatile user routine calls in its output list (also a
   rule action's `VALUES` over several rows) run as each row is inserted, as
   in PostgreSQL; calls in its `WHERE`, join conditions, subqueries,

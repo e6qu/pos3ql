@@ -854,7 +854,7 @@ impl SqlExecution {
             .unwrap_or_else(|| query::RoutineInvocationState::new(owner, self.policy));
         calls.require_arena(owner)?;
         let replay = sequence::begin_replay_cursor()?;
-        let mut progress = super::RowProgress::new();
+        let mut progress = super::RowProgress::new(context.storage())?;
         let result = loop {
             sequence::rewind_replay_cursor(replay)?;
             calls.begin_attempt();

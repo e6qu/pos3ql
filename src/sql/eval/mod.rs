@@ -8820,8 +8820,12 @@ fn call<'a>(
                 .unwrap_or(written_name)
         })
     };
-    if super::ast::is_volatile_function(name) {
-        super::query::protect_statement_effects();
+    // Sequence calls replay from the statement's log, so they protect
+    // themselves as replayable effects.
+    if super::ast::is_volatile_function(name)
+        && !matches!(name, "nextval" | "setval" | "currval" | "lastval")
+    {
+        super::query::protect_unreplayable_effect();
     }
     if let Some((oid, _)) = builtin
         && let Some(result) = builtin_operator_function(oid, args, arena, params, row, hooks)

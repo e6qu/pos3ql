@@ -5775,6 +5775,10 @@ impl Engine {
         } else {
             None
         };
+        if resume_statement && resumed.is_none() {
+            // A write's progress belongs to the statement that waited.
+            txn.release_retained_write();
+        }
         if let Some(lease) = resumed.as_ref().and_then(|state| state.lease.as_ref()) {
             lease.validate_storage(&self.storage)?;
         }
@@ -12327,7 +12331,7 @@ impl Engine {
                             txn.pending_procedure = None;
                             txn.release_suspended_statement();
                             procedure_timed_out = true;
-                        } else if txn.pending_write_completion.is_some() && !lock_timeout_expired {
+                        } else if txn.retains_statement_progress() && !lock_timeout_expired {
                             self.storage.preserve_advisory_statement();
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
@@ -12378,6 +12382,7 @@ impl Engine {
                             );
                         } else if txn.owns_statement_mark(statement_mark) {
                             txn.procedure_restart = false;
+                            txn.release_retained_write();
                             if txn.suspended_statement_context().is_none() {
                                 txn.suspend_statement(
                                     None,
@@ -13106,7 +13111,7 @@ impl Engine {
                                         txn.pending_procedure = None;
                                         txn.release_suspended_statement();
                                         procedure_timed_out = true;
-                                    } else if txn.pending_write_completion.is_some()
+                                    } else if txn.retains_statement_progress()
                                         && !lock_timeout_expired
                                     {
                                         self.storage.preserve_advisory_statement();
@@ -13153,6 +13158,7 @@ impl Engine {
                                         );
                                     } else if txn.owns_statement_mark(statement_mark) {
                                         txn.procedure_restart = false;
+                                        txn.release_retained_write();
                                         if txn.suspended_statement_context().is_none() {
                                             txn.suspend_statement(
                                                 None,
@@ -14512,9 +14518,8 @@ impl Engine {
         mut progress: Option<&mut exec::RowProgress>,
     ) -> Result<&'a [&'a [u8]], SqlError> {
         use crate::sql::exec::encode_projected_pub;
-        if progress
-            .as_deref_mut()
-            .is_some_and(|progress| !progress.claim_steps())
+        if let Some(claimed) = progress.as_deref_mut()
+            && !claimed.claim_steps()?
         {
             progress = None;
         }
@@ -14600,8 +14605,8 @@ impl Engine {
         match outcome {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                if e.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
-                    && let Some(progress) = progress
+                if let Some(progress) = progress
+                    && progress.stops_for(&e)
                 {
                     progress.keep_steps(&[], rows, arena, &storage.row_work)?;
                 }
@@ -14639,7 +14644,10 @@ impl Engine {
         let calls = invocations.write_query_child(arena);
         // Rows an attempt changed before a call stay changed, so the call sees
         // them; the next attempt continues at the unfinished row.
-        let mut progress = exec::RowProgress::new();
+        let mut progress = match exec::RowProgress::new(&self.storage) {
+            Ok(progress) => progress,
+            Err(error) => return Ok(Err(error)),
+        };
         loop {
             if let Err(error) = sequence::rewind_replay_cursor(replay) {
                 return Ok(Err(error));
@@ -15309,9 +15317,14 @@ impl Engine {
         // The original statement and each rule action are steps: one an
         // earlier attempt finished keeps its row count instead of running again.
         let mut progress = progress;
-        let level = progress
+        let level = match progress
             .as_deref_mut()
-            .and_then(exec::RowProgress::claim_step_level);
+            .map(exec::RowProgress::claim_step_level)
+            .transpose()
+        {
+            Ok(level) => level.flatten(),
+            Err(error) => return Ok(Err(error)),
+        };
         let mut progress = progress.filter(|_| level.is_some());
         let level = level.unwrap_or(0);
         let resumed = match progress
@@ -16788,14 +16801,60 @@ impl Engine {
         {
             return Ok(Err(error));
         }
-        let invocations = query::RoutineInvocationState::new(
-            arena,
-            crate::sql::query::RoutineExecution::StatementReplay,
-        );
-        let replay = match sequence::begin_replay_cursor() {
-            Ok(replay) => replay,
-            Err(error) => return Ok(Err(error)),
+        // A write that waited inside its rows continues with the progress
+        // its transaction kept.
+        let exec::RetainedWrite {
+            mut progress,
+            invocations,
+            replay,
+        } = match txn.take_retained_write() {
+            Some(write) => write,
+            None => match sequence::begin_replay_cursor()
+                .and_then(|replay| Ok((replay, exec::RowProgress::retained(&self.storage)?)))
+            {
+                Ok((replay, progress)) => exec::RetainedWrite {
+                    progress,
+                    invocations: query::RoutineInvocationState::new(
+                        arena,
+                        crate::sql::query::RoutineExecution::StatementReplay,
+                    ),
+                    replay,
+                },
+                Err(error) => return Ok(Err(error)),
+            },
         };
+        if let Err(error) = invocations.require_arena(arena) {
+            return Ok(Err(error));
+        }
+        if invocations.suspended.borrow().is_some() {
+            // A call's body waited after the write stopped for it: it
+            // continues where it waited, then the write runs again.
+            match self.resume_pending_function(
+                &invocations,
+                arena,
+                arena,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            )? {
+                Ok(()) => {}
+                Err(error) => {
+                    return self.retain_waiting_write(
+                        txn,
+                        responder,
+                        arena,
+                        error,
+                        exec::RetainedWrite {
+                            progress,
+                            invocations,
+                            replay,
+                        },
+                    );
+                }
+            }
+        }
         let direct_relation = match statement {
             Stmt::Insert(insert) => Some(insert.table),
             Stmt::Update(update) => Some(update.table),
@@ -16838,8 +16897,6 @@ impl Engine {
             .storage
             .read_snapshot()
             .min(txn.command_id().saturating_add(1));
-        let mut progress = exec::RowProgress::new();
-        let mut statement_start = None;
         loop {
             if let Err(error) = sequence::rewind_replay_cursor(replay) {
                 return Ok(Err(error));
@@ -16854,7 +16911,7 @@ impl Engine {
             let effects = txn.transaction_effect_mark();
             progress.begin_attempt(wal, lock);
             // AFTER triggers of a write that kept rows belong to its first attempt.
-            let start = *statement_start.get_or_insert(statement_mark);
+            let (start, _) = progress.note_start(statement_mark, output_mark);
             let boundary = completion_handoff.then_some(txn::WriteCompletionBoundary {
                 mark: if progress.changed_rows() {
                     start
@@ -16924,6 +16981,8 @@ impl Engine {
                 )
             };
             txn.write_completion_boundary = prior_handoff;
+            // Whatever ended the attempt, no resumable row runs past it.
+            query::set_resumable_row(false);
             let outcome = outcome?;
             if txn.pending_write_completion.is_some() {
                 self.dml_scratch.clear();
@@ -16934,6 +16993,19 @@ impl Engine {
             let Err(error) = outcome else {
                 return Ok(outcome);
             };
+            if exec::is_wait(&error) {
+                return self.retain_waiting_write(
+                    txn,
+                    responder,
+                    arena,
+                    error,
+                    exec::RetainedWrite {
+                        progress,
+                        invocations,
+                        replay,
+                    },
+                );
+            }
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                 return Ok(Err(error));
             }
@@ -16979,9 +17051,78 @@ impl Engine {
                 guc,
                 responder,
             )? {
+                if exec::is_wait(&error) {
+                    return self.retain_waiting_write(
+                        txn,
+                        responder,
+                        arena,
+                        error,
+                        exec::RetainedWrite {
+                            progress,
+                            invocations,
+                            replay,
+                        },
+                    );
+                }
                 return Ok(Err(error));
             }
         }
+    }
+
+    /// A storage or lock wait of a top-level write. A write that changed rows
+    /// hands its progress to its transaction for the statement's next run:
+    /// only the unfinished row rolls back, or, where the rows cannot resume
+    /// (an effect before them would differ when they are selected again),
+    /// the statement rolls back to its first start and runs again from
+    /// there. A routine body that waited keeps its partial work and
+    /// continues. A write that changed nothing rolls back with its statement.
+    fn retain_waiting_write(
+        &mut self,
+        txn: &mut TxnState,
+        responder: &mut Responder,
+        arena: &Arena,
+        wait: SqlError,
+        mut write: exec::RetainedWrite,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        if write.invocations.suspended.borrow().is_some() {
+            txn.retain_write(write);
+            return Ok(Err(wait));
+        }
+        let Some((start, start_output)) = write.progress.first_start() else {
+            return Ok(Err(wait));
+        };
+        if !write.progress.changed_rows() {
+            return Ok(Err(wait));
+        }
+        let unfinished = if write.progress.stops_for(&wait) {
+            write.progress.unfinished_row(txn).ok().flatten()
+        } else {
+            None
+        };
+        self.dml_scratch.clear();
+        let Some(row) = unfinished else {
+            self.rollback_waiting_statement(txn, start);
+            if let Err(error) = responder.truncate_to(start_output) {
+                // Rows already sent cannot be withdrawn for another run.
+                return Ok(Err(error));
+            }
+            write.progress = match write.progress.restarted(&self.storage) {
+                Ok(progress) => progress,
+                Err(error) => return Ok(Err(error)),
+            };
+            write.invocations = query::RoutineInvocationState::new(
+                arena,
+                crate::sql::query::RoutineExecution::StatementReplay,
+            );
+            txn.retain_write(write);
+            return Ok(Err(wait));
+        };
+        self.rollback_waiting_statement(txn, row.mark);
+        if let Err(error) = responder.truncate_to(row.output) {
+            return Ok(Err(error));
+        }
+        txn.retain_write(write);
+        Ok(Err(wait))
     }
 
     /// Runs a suspended mutable function and records its typed result in the
@@ -18660,7 +18801,14 @@ impl Engine {
         // stops for a call after it, the next attempt keeps the main
         // statement's rows and output instead of running it again. A
         // statement nested in another's step keeps no steps of its own.
-        let mut progress = progress.and_then(|progress| progress.claim_steps().then_some(progress));
+        let mut progress = match progress {
+            Some(progress) => match progress.claim_steps() {
+                Ok(true) => Some(progress),
+                Ok(false) => None,
+                Err(error) => return Ok(Err(error)),
+            },
+            None => None,
+        };
         let output_mark = match progress.as_deref_mut() {
             Some(progress) => progress.statement_output(responder.mark()),
             None => responder.mark(),
@@ -30525,7 +30673,7 @@ impl<'a> RuleSteps<'a> {
         pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     ) -> SqlError {
         match progress {
-            Some(progress) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION => {
+            Some(progress) if progress.stops_for(&error) => {
                 match progress.keep_steps_at(self.level, self.finished.as_slice(), &[], arena, pool)
                 {
                     Ok(()) => error,

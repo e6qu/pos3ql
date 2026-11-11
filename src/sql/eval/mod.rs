@@ -3953,8 +3953,8 @@ fn array_subscripts<'a>(
                 slice: false,
             },
             Expr::Slice { lower, upper, .. } => ReadSubscript {
-                lower: lower.map(&bound).transpose()?,
-                upper: upper.map(&bound).transpose()?,
+                lower: lower.map(bound).transpose()?,
+                upper: upper.map(bound).transpose()?,
                 slice: true,
             },
             _ => unreachable!("the chain holds subscripts"),

@@ -14011,7 +14011,7 @@ impl Engine {
     /// reach sibling queries and the main query only through these relations.
     /// Returns `None` when the statement has no data-modifying query.
     #[allow(clippy::too_many_arguments)]
-    fn bind_dml_ctes<'a>(
+    pub(crate) fn bind_dml_ctes<'a>(
         &mut self,
         with: &'a [ast::Cte<'a>],
         main: query::CteReader<'_>,
@@ -17979,7 +17979,7 @@ impl Engine {
     /// result while it has not reached the client, as PostgreSQL reports it
     /// before completing the command.
     #[allow(clippy::too_many_arguments)]
-    fn finish_dml_ctes<'a>(
+    pub(crate) fn finish_dml_ctes<'a>(
         &mut self,
         with: &'a [ast::Cte<'a>],
         main: query::CteReader<'_>,

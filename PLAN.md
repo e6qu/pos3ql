@@ -290,10 +290,13 @@ target and expression count errors are positioned. Under
 variable could win. A materialized
 ordinary `WITH` query that calls a volatile function runs before the main
 query; PostgreSQL runs it when its rows are first read, as it now runs a
-data-changing one. A data-changing `WITH` inside a routine body fails
-(`WITH x AS (INSERT ...) SELECT ... INTO v` in PL/pgSQL is rejected as an
-unsupported body, `RETURN QUERY` reports the query unknown and a SQL-language
-function reports an internal error). An `IN`, `ANY` or `ALL` subquery that
+data-changing one. PL/pgSQL `SELECT ... INTO`, `PERFORM` and `RETURN QUERY` run a
+data-changing `WITH`, but other routine positions do not: a PL/pgSQL
+`WITH ... INSERT/UPDATE/DELETE` statement and `FOR ... IN WITH ...` are
+rejected as an unsupported body, `EXECUTE` and a cursor's query report the
+`WITH` name unknown, a SQL-language function fails, and
+a trigger function rejects it with `0A000`. These need the routine's write
+path to run the `WITH` writes under the main statement's snapshot. An `IN`, `ANY` or `ALL` subquery that
 calls a volatile function runs before the expression containing it, where
 PostgreSQL runs it when evaluation reaches it. FROM-list items separated by
 commas run as one left-deep join chain, so a `RIGHT` or `FULL` join after a

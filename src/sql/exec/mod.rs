@@ -21083,7 +21083,10 @@ fn parse_trigger_select_into<'a>(
     statement: &'a str,
     arena: &'a Arena,
 ) -> Result<Option<TriggerSelectInto<'a>>, SqlError> {
-    if strip_trigger_keyword(statement, "select").is_none() {
+    let selects = strip_trigger_keyword(statement, "select").is_some()
+        || (strip_trigger_keyword(statement, "with").is_some()
+            && plpgsql_with_main_keyword(statement, arena)? == Some("select"));
+    if !selects {
         return Ok(None);
     }
     let Some(into_at) = trigger_top_level_keyword(statement, "into", arena)? else {
@@ -21096,6 +21099,103 @@ fn parse_trigger_select_into<'a>(
         targets: into.targets,
         strict: into.strict,
     }))
+}
+
+/// The statement a `WITH` clause introduces: the first of its keywords
+/// outside the parenthesized `WITH` queries.
+fn plpgsql_with_main_keyword(
+    statement: &str,
+    arena: &Arena,
+) -> Result<Option<&'static str>, SqlError> {
+    let mut main = None;
+    for keyword in [
+        "select", "insert", "update", "delete", "merge", "values", "table",
+    ] {
+        if let Some(at) = trigger_top_level_keyword(statement, keyword, arena)?
+            && main.is_none_or(|(_, first)| at < first)
+        {
+            main = Some((keyword, at));
+        }
+    }
+    Ok(main.map(|(keyword, _)| keyword))
+}
+
+/// The rows of data-modifying `WITH` queries, by query name.
+type MaterializedWithQueries<'a> = &'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)];
+
+/// Runs the data-modifying `WITH` queries `query` reads before it runs, as a
+/// top-level statement does, and binds their rows in place of the queries.
+/// Returns the query to run and the rows for [`finish_plpgsql_dml_ctes`].
+fn bind_plpgsql_dml_ctes<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    query: &'a Select<'a>,
+) -> Result<(&'a Select<'a>, MaterializedWithQueries<'a>), SqlError> {
+    if !query.with.iter().any(|cte| cte.dml.is_some()) {
+        return Ok((query, &[]));
+    }
+    let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "data-modifying WITH queries are not supported in trigger functions"
+        ));
+    };
+    let materialized = engine
+        .bind_dml_ctes(
+            query.with,
+            super::query::CteReader::Select(query),
+            context.txn,
+            context.arena,
+            context.params,
+            guc,
+            context.responder,
+        )?
+        .unwrap_or(&[]);
+    let arena = context.arena;
+    let mut kept = ArenaList::new(arena);
+    for cte in query.with.iter().filter(|cte| cte.dml.is_none()) {
+        kept.push(*cte)
+            .map_err(|_| super::query::arena_full_pub())?;
+    }
+    let stripped = arena
+        .alloc(Select {
+            with: kept.as_slice(),
+            ..*query
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let bound = super::query::bind_materialized_relations(
+        stripped,
+        materialized,
+        context.storage(),
+        context.txn.txid,
+        arena,
+    )?;
+    Ok((bound, materialized))
+}
+
+/// Runs the data-modifying `WITH` queries of `query` that nothing read.
+fn finish_plpgsql_dml_ctes<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    query: &'a Select<'a>,
+    materialized: MaterializedWithQueries<'a>,
+) -> Result<(), SqlError> {
+    if !query.with.iter().any(|cte| cte.dml.is_some()) {
+        return Ok(());
+    }
+    let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
+        return Ok(());
+    };
+    let output_mark = context.responder.mark();
+    engine.finish_dml_ctes(
+        query.with,
+        super::query::CteReader::Select(query),
+        materialized,
+        output_mark,
+        context.txn,
+        context.arena,
+        context.params,
+        guc,
+        context.responder,
+    )
 }
 
 /// The `INTO [STRICT] target, ...` clause of a static PL/pgSQL statement.
@@ -21895,6 +21995,18 @@ fn parse_trigger_for_header<'a>(
             arena,
         )?;
         return Ok(Some((variable, TriggerForSource::DynamicQuery(query))));
+    }
+    if strip_trigger_keyword(source, "with").is_some() {
+        if plpgsql_with_main_keyword(source, arena)? != Some("select") {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "FOR loops over a WITH query whose main statement is not SELECT are not supported"
+            ));
+        }
+        return Ok(Some((
+            variable,
+            TriggerForSource::Query(parse_plpgsql_query(source, source, arena)?),
+        )));
     }
     if strip_trigger_keyword(source, "select").is_some() {
         return Ok(Some((
@@ -31414,6 +31526,8 @@ fn execute_trigger_step_in<'a>(
                     .map_err(|_| super::query::arena_full_pub())?
             }),
             TriggerStatement::ReturnQuery(query) => execute_trigger_statement(|| {
+                let written = query;
+                let (query, dml_ctes) = bind_plpgsql_dml_ctes(context, query)?;
                 let query = match transition_relations {
                     Some(relations) => super::query::bind_materialized_relations(
                         query,
@@ -31441,7 +31555,7 @@ fn execute_trigger_step_in<'a>(
                 let txid = context.txn.txid;
                 let rows = execute_procedural_query(
                     context,
-                    invocation.fresh_snapshots,
+                    invocation.fresh_snapshots && dml_ctes.is_empty(),
                     None,
                     |storage, sequence| {
                         let mut rows = ArenaList::new(arena);
@@ -31467,6 +31581,7 @@ fn execute_trigger_step_in<'a>(
                         ProceduralQueryRows::complete(rows.as_slice(), result)
                     },
                 )?;
+                finish_plpgsql_dml_ctes(context, written, dml_ctes)?;
                 for row in rows.rows {
                     let mut values = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
                     let width = decode_projected_row_into(row, arena, &mut values)?;
@@ -32262,15 +32377,17 @@ fn execute_trigger_step_in<'a>(
                 for (index, target) in statement.targets.iter().enumerate() {
                     targets[index] = trigger_local_index(locals, *target)?;
                 }
+                let written = statement.query;
+                let (query, dml_ctes) = bind_plpgsql_dml_ctes(context, statement.query)?;
                 let query = match transition_relations {
                     Some(relations) => super::query::bind_materialized_relations(
-                        statement.query,
+                        query,
                         relations,
                         context.storage(),
                         context.txn.txid,
                         context.arena,
                     )?,
-                    None => statement.query,
+                    None => query,
                 };
                 let transition = TriggerTransition {
                     definition,
@@ -32323,7 +32440,9 @@ fn execute_trigger_step_in<'a>(
                 };
                 let (selected, row_count) = execute_procedural_query(
                     context,
-                    invocation.fresh_snapshots,
+                    // The main query reads the snapshot its WITH writes ran
+                    // under, so it does not see their changes.
+                    invocation.fresh_snapshots && dml_ctes.is_empty(),
                     continuation,
                     |storage, sequence| {
                         let mut selected = [Datum::Null; MAX_COLUMNS];
@@ -32399,6 +32518,7 @@ fn execute_trigger_step_in<'a>(
                         Ok((selected, row_count))
                     },
                 )?;
+                finish_plpgsql_dml_ctes(context, written, dml_ctes)?;
                 status.set_rows(row_count as u64)?;
                 // Checking the row count and storing the row happen after the
                 // query, outside its context.
@@ -33001,6 +33121,8 @@ fn execute_trigger_step_in<'a>(
                         params: context.params,
                         responder: context.responder,
                     };
+                    let written = query;
+                    let (query, dml_ctes) = bind_plpgsql_dml_ctes(&mut context, query)?;
                     let query = match transition_relations {
                         Some(relations) => super::query::bind_materialized_relations(
                             query,
@@ -33031,9 +33153,9 @@ fn execute_trigger_step_in<'a>(
                     } else {
                         None
                     };
-                    execute_procedural_query(
+                    let row_count = execute_procedural_query(
                         &mut context,
-                        invocation.fresh_snapshots,
+                        invocation.fresh_snapshots && dml_ctes.is_empty(),
                         continuation,
                         |storage, sequence| {
                             let mut row_count = 0u64;
@@ -33057,7 +33179,9 @@ fn execute_trigger_step_in<'a>(
                             )?;
                             Ok(row_count)
                         },
-                    )
+                    )?;
+                    finish_plpgsql_dml_ctes(&mut context, written, dml_ctes)?;
+                    Ok(row_count)
                 });
                 status.set_rows(row_count.map_err(|_| super::query::arena_full_pub())??)?;
 
@@ -34253,6 +34377,9 @@ fn execute_trigger_step_in<'a>(
                             };
                             let values = match program.source {
                                 TriggerForSource::Query(query) => {
+                                    let written = query;
+                                    let (query, dml_ctes) =
+                                        bind_plpgsql_dml_ctes(&mut context, query)?;
                                     let query = match transition_relations {
                                         Some(relations) => {
                                             super::query::bind_materialized_relations(
@@ -34280,9 +34407,9 @@ fn execute_trigger_step_in<'a>(
                                     let arena = context.arena;
                                     let params = context.params;
                                     let txid = context.txn.txid;
-                                    execute_procedural_query(
+                                    let rows = execute_procedural_query(
                                         &mut context,
-                                        invocation.fresh_snapshots,
+                                        invocation.fresh_snapshots && dml_ctes.is_empty(),
                                         None,
                                         |storage, sequence| {
                                             if locals[target].ctype == ColType::Record {
@@ -34297,7 +34424,9 @@ fn execute_trigger_step_in<'a>(
                                                 )
                                             }
                                         },
-                                    )?
+                                    )?;
+                                    finish_plpgsql_dml_ctes(&mut context, written, dml_ctes)?;
+                                    rows
                                 }
                                 TriggerForSource::DynamicQuery(_) => match dynamic {
                                     Some(query) => materialize_plpgsql_dynamic_for_query(

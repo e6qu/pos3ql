@@ -37,6 +37,7 @@ pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
 mod partition_ancestry;
+mod plpgsql_data_modifying_with;
 mod plpgsql_row_variables;
 mod polymorphic_resolution;
 mod predefined_roles;

@@ -253,6 +253,8 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             input_owner: super::super::super::type_input_plans::Owner::Backend,
             input_collation: crate::sql::ast::Collation::None,
             input_sites: program.input_sites,
+            variable_conflict: crate::sql::guc::VariableConflict::Error,
+            fresh_snapshots: true,
             materialized_relations: Some(relations),
             nargs: 1,
             when: "BEFORE",

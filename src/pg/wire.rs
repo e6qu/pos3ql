@@ -132,6 +132,20 @@ impl<'a> MsgOut<'a> {
         self.u8(0)
     }
 
+    /// [`Self::cstr`] for formatted text, written straight into the message.
+    pub fn cstr_display(&mut self, value: &dyn core::fmt::Display) -> &mut Self {
+        struct Text<'m, 'b>(&'m mut MsgOut<'b>);
+        impl core::fmt::Write for Text<'_, '_> {
+            fn write_str(&mut self, text: &str) -> core::fmt::Result {
+                debug_assert!(!text.as_bytes().contains(&0));
+                self.0.bytes(text.as_bytes());
+                Ok(())
+            }
+        }
+        let _ = core::fmt::Write::write_fmt(&mut Text(self), format_args!("{value}"));
+        self.u8(0)
+    }
+
     pub fn finish(self) -> Result<(), WireFull> {
         if !self.ok {
             return Err(WireFull);

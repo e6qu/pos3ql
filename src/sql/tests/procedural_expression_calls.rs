@@ -100,29 +100,44 @@ fn procedural_writes_call_procedural_functions() {
     }
 }
 
-// Static PL/pgSQL data changes with RETURNING are not supported yet; the
-// statement fails loudly instead of reading `INTO` as a syntax error.
+// Static PL/pgSQL data changes with RETURNING assign the returned row to
+// their INTO targets; without INTO the returned rows have no destination, as
+// in PostgreSQL 18.
 #[test]
-fn procedural_writes_reject_returning_loudly() {
+fn procedural_writes_return_into_targets() {
     let config = test_config("procedural-write-returning");
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, "CREATE TABLE t(a int)", true);
-    for body in [
-        "INSERT INTO t VALUES (1) RETURNING a",
-        "UPDATE t SET a = 2 RETURNING a INTO r",
-        "DELETE FROM t RETURNING a INTO STRICT r",
-    ] {
-        let output = session.execute(
+    session.success(
+        &mut engine,
+        "CREATE TABLE t(a int); CREATE TABLE seen(v text)",
+        true,
+    );
+    let output = session.execute(
+        &mut engine,
+        "DO $$BEGIN INSERT INTO t VALUES (1) RETURNING a; END$$",
+        true,
+    );
+    assert_eq!(error_sqlstates(&output), ["42601"]);
+    assert!(String::from_utf8_lossy(&output).contains("query has no destination for result data"));
+    session.success(
+        &mut engine,
+        "DO $$DECLARE r int; k text; BEGIN \
+         INSERT INTO t VALUES (1) RETURNING a INTO r; INSERT INTO seen VALUES (r); \
+         UPDATE t SET a = 2 RETURNING a INTO r; INSERT INTO seen VALUES (r); \
+         MERGE INTO t USING (VALUES (2)) s(a) ON t.a = s.a \
+           WHEN MATCHED THEN UPDATE SET a = 3 RETURNING merge_action(), t.a INTO k, r; \
+         INSERT INTO seen VALUES (k || r); \
+         DELETE FROM t RETURNING a INTO STRICT r; INSERT INTO seen VALUES (r); END$$",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
             &mut engine,
-            &format!("DO $$DECLARE r int; BEGIN {body}; END$$"),
-            true,
-        );
-        assert_eq!(error_sqlstates(&output), ["0A000"], "{body}");
-        assert!(
-            String::from_utf8_lossy(&output).contains("RETURNING in a static PL/pgSQL"),
-            "{body}"
-        );
-    }
+            "SELECT v FROM seen; SELECT count(*) FROM t",
+            true
+        )),
+        ["1", "2", "UPDATE3", "3", "0"]
+    );
 }

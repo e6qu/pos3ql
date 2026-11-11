@@ -15,11 +15,14 @@ pub(crate) mod commit;
 mod concurrent_index;
 #[cfg(all(test, not(miri)))]
 pub(crate) use concurrent_index::CommitPhase as IndexCommitPhaseForTests;
+pub(crate) mod array_assignment;
 pub mod copy;
 pub mod cursor;
 pub mod datetime;
 pub mod encoding;
 pub(crate) mod enum_values;
+pub(crate) mod error_context;
+pub(crate) mod error_position;
 pub mod eval;
 pub(crate) mod event_trigger;
 pub mod exec;
@@ -8586,6 +8589,7 @@ impl Engine {
         boundary: exec::TriggerQueueBoundary,
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
+        let _settings = guc::enter_settings_scope(guc);
         exec::fire_constraint_triggers(
             &mut self.storage,
             txn,
@@ -9165,11 +9169,14 @@ impl Engine {
                         .iter()
                         .any(|metadata| metadata.name.as_str() == *column)
                     {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column \"{}\" of relation \"{}\" does not exist",
+                        return Err(crate::sql::error_position::at_reference(
+                            sql_err!(
+                                sqlstate::UNDEFINED_COLUMN,
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                column,
+                                target.table.name
+                            ),
                             column,
-                            target.table.name
                         ));
                     }
                 }
@@ -11651,6 +11658,10 @@ impl Engine {
                     return Ok(ExecutionStatus::Complete);
                 }
             };
+            if let Err(e) = parser.record_source_copies() {
+                report_parse_error(responder, &e, text)?;
+                return Ok(ExecutionStatus::Complete);
+            }
             parser.capture_type_inputs();
             // One Query message owns an implicit transaction until an explicit
             // BEGIN boundary. PostgreSQL commits preceding simple-query commands
@@ -11691,10 +11702,20 @@ impl Engine {
                     }
                 };
             let mut statement_count = 0usize;
+            // A statement that fails parse analysis runs no later statement,
+            // but PostgreSQL still parses the whole text first, so a syntax
+            // error after it wins.
+            parser.defer_analysis_errors();
+            let mut rejected = None;
             loop {
                 let source_start = parser.source_position();
                 let input_start = parser.string_literals().len();
                 match parser.next_stmt() {
+                    Ok(Some(_)) if rejected.is_some() => {}
+                    Err(_) if parser.analysis_error_reported() && rejected.is_some() => {}
+                    Err(error) if parser.analysis_error_reported() => {
+                        rejected = Some((error, parser.take_rejected_statement()));
+                    }
                     Ok(Some(statement)) => {
                         debug_assert!(statement_count < statements.len());
                         statements[statement_count] = Some((
@@ -11713,12 +11734,19 @@ impl Engine {
                             cursors.on_rollback();
                             self.rollback_txn(txn, guc);
                         }
+                        if resume_statement == 0 {
+                            emit_parse_notices(parser.take_warnings(), text, responder, true)?;
+                        }
                         report_parse_error(responder, &error, text)?;
                         return Ok(ExecutionStatus::Complete);
                     }
                 }
             }
-            emit_parse_warnings(&mut parser, responder)?;
+            // A resumed request already reported its notices.
+            if resume_statement == 0 {
+                emit_parse_warnings(&mut parser, responder)?;
+            }
+            let source_copies = parser.source_copies();
             let routine_transaction_context = if !txn.is_transaction_block() && statement_count == 1
             {
                 exec::PlpgsqlTransactionContext::NonAtomic
@@ -11936,17 +11964,29 @@ impl Engine {
                             source,
                             source_bindings,
                             || {
-                                self.execute_stmt(
-                                    statement,
-                                    arena,
-                                    NO_PARAMS,
-                                    txn,
-                                    sqlprep,
-                                    cursors,
-                                    guc,
-                                    routine_transaction_context,
-                                    responder,
-                                    StatementTimeoutEntry::Nested,
+                                error_position::with_statement_source(
+                                    text,
+                                    source_copies,
+                                    statement.is_analyzed_query(),
+                                    if source_bindings.is_empty() {
+                                        0
+                                    } else {
+                                        *source_start
+                                    },
+                                    || {
+                                        self.execute_stmt(
+                                            statement,
+                                            arena,
+                                            NO_PARAMS,
+                                            txn,
+                                            sqlprep,
+                                            cursors,
+                                            guc,
+                                            routine_transaction_context,
+                                            responder,
+                                            StatementTimeoutEntry::Nested,
+                                        )
+                                    },
                                 )
                             },
                         )
@@ -12192,6 +12232,29 @@ impl Engine {
                 }
                 txn.compact_completed_constraints();
             }
+            if let Some((error, statement)) = &rejected {
+                // PostgreSQL finds some analysis errors before the deferred
+                // one: an unknown type, the FROM clause, and earlier output
+                // columns.
+                let earlier = statement.as_ref().and_then(|(statement, type_name)| {
+                    error_position::with_statement_source(text, source_copies, true, 0, || {
+                        self.analysis_error_before(
+                            statement, *type_name, error, text, txn.txid, arena,
+                        )
+                    })
+                });
+                if txn.is_explicit() {
+                    txn.failed = true;
+                } else {
+                    cursors.on_rollback();
+                    self.rollback_txn(txn, guc);
+                }
+                match earlier {
+                    Some(earlier) => responder.error(earlier.sqlstate, earlier.message.as_str())?,
+                    None => report_parse_error(responder, error, text)?,
+                }
+                return Ok(ExecutionStatus::Complete);
+            }
             if !executed_any {
                 responder.empty_query_response()?;
             }
@@ -12405,6 +12468,10 @@ impl Engine {
                         return Ok(ExtendedExecutionStatus::Complete(false));
                     }
                 };
+                if let Err(e) = parser.record_source_copies() {
+                    report_parse_error(responder, &e, text)?;
+                    return Ok(ExtendedExecutionStatus::Complete(false));
+                }
                 let source_bindings = match type_inputs::decode(bound_inputs, arena) {
                     Ok(bindings) => bindings,
                     Err(error) => {
@@ -12580,18 +12647,27 @@ impl Engine {
                                             Err(reason) => responder.decline_promotion(reason),
                                         }
                                     }
+                                    let source_copies = parser.source_copies();
                                     let mut execute = |responder: &mut Responder<'_>| {
-                                        self.execute_stmt(
-                                            &statement,
-                                            arena,
-                                            params,
-                                            txn,
-                                            sqlprep,
-                                            cursors,
-                                            guc,
-                                            routine_transaction_context,
-                                            responder,
-                                            StatementTimeoutEntry::Nested,
+                                        error_position::with_statement_source(
+                                            text,
+                                            source_copies,
+                                            statement.is_analyzed_query(),
+                                            0,
+                                            || {
+                                                self.execute_stmt(
+                                                    &statement,
+                                                    arena,
+                                                    params,
+                                                    txn,
+                                                    sqlprep,
+                                                    cursors,
+                                                    guc,
+                                                    routine_transaction_context,
+                                                    responder,
+                                                    StatementTimeoutEntry::Nested,
+                                                )
+                                            },
                                         )
                                     };
                                     let executed = if streamable {
@@ -13141,6 +13217,9 @@ impl Engine {
                     Ok(parser) => parser,
                     Err(error) => return Ok(Err(parse_error_to_sql(&error))),
                 };
+                if let Err(error) = parser.record_source_copies() {
+                    return Ok(Err(parse_error_to_sql(&error)));
+                }
                 guc.refresh_identities(&self.storage, txn.txid);
                 eval::funcs::system::set_session_user(guc.session_identity());
                 eval::funcs::system::set_current_user(guc.current_identity());
@@ -13153,12 +13232,20 @@ impl Engine {
                 loop {
                     match parser.next_stmt() {
                         Ok(Some(statement)) => {
-                            if let Err(error) = query::capture_contextual_type_inputs(
-                                &parser,
-                                &statement,
-                                &self.storage,
-                                txn.txid,
-                                arena,
+                            if let Err(error) = error_position::with_statement_source(
+                                text,
+                                parser.source_copies(),
+                                statement.is_analyzed_query(),
+                                0,
+                                || {
+                                    query::capture_contextual_type_inputs(
+                                        &parser,
+                                        &statement,
+                                        &self.storage,
+                                        txn.txid,
+                                        arena,
+                                    )
+                                },
                             ) {
                                 return Ok(Err(error));
                             }
@@ -13488,6 +13575,9 @@ impl Engine {
                 Ok(parser) => parser,
                 Err(error) => return Ok(Err(parse_error_to_sql(&error))),
             };
+            if let Err(error) = parser.record_source_copies() {
+                return Ok(Err(parse_error_to_sql(&error)));
+            }
             parser.set_type_inputs(bindings);
             let statement = match parser.next_stmt() {
                 Ok(Some(statement)) => statement,
@@ -13529,9 +13619,17 @@ impl Engine {
                             planner_inputs::with_parameters(
                                 (!params.is_empty()).then_some(params),
                                 || {
-                                    self.prepare_planner_inputs(
-                                        &statement, None, arena, txn, sqlprep, cursors, guc,
-                                        responder,
+                                    error_position::with_statement_source(
+                                        text,
+                                        parser.source_copies(),
+                                        statement.is_analyzed_query(),
+                                        0,
+                                        || {
+                                            self.prepare_planner_inputs(
+                                                &statement, None, arena, txn, sqlprep, cursors,
+                                                guc, responder,
+                                            )
+                                        },
                                     )
                                 },
                             )
@@ -16629,6 +16727,9 @@ impl Engine {
                     Err(error) => return Ok(Err(error)),
                 };
                 let parsed = (|| {
+                    // A syntax error points into the CREATE text the body
+                    // was written in.
+                    let written_body = body;
                     let body = arena.alloc_str(body).map_err(|_| eval::arena_full())?;
                     let name = arena
                         .alloc_str(routine.name.name)
@@ -16640,11 +16741,16 @@ impl Engine {
                                 &declaration.arguments[..declaration.argument_count],
                             )
                         })
-                        .map_err(|error| parse_error_to_sql(&error))?;
+                        .map_err(|error| error_position::body_parse_error(&error, written_body))?;
                     parser.capture_type_inputs();
+                    // PostgreSQL analyses each statement of a body whose
+                    // parameters have concrete types.
+                    let analyse = !declaration.arguments[..declaration.argument_count]
+                        .iter()
+                        .any(|argument| argument.polymorphic_type().is_some());
                     while let Some(statement) = parser
                         .next_stmt()
-                        .map_err(|error| parse_error_to_sql(&error))?
+                        .map_err(|error| error_position::body_parse_error(&error, written_body))?
                     {
                         query::capture_contextual_type_inputs(
                             &parser,
@@ -16653,6 +16759,21 @@ impl Engine {
                             txn.txid,
                             arena,
                         )?;
+                        if analyse {
+                            let statement =
+                                arena.alloc(statement).map_err(|_| eval::arena_full())?;
+                            error_position::with_internal_source(body, || {
+                                query::analyse_routine_statement(
+                                    statement,
+                                    &self.storage,
+                                    txn.txid,
+                                    arena,
+                                )
+                            })
+                            .map_err(|error| {
+                                error_position::body_analysis_error(error, body, written_body)
+                            })?;
+                        }
                     }
                     Ok((body, parser))
                 })();
@@ -16729,14 +16850,17 @@ impl Engine {
         )
     }
 
+    /// The backend's instance of a PL/pgSQL routine, and the
+    /// `plpgsql.variable_conflict` value it was first compiled under.
     fn plpgsql_instance_owner(
         &self,
         routine: &crate::storage::RoutineDef,
         input_collation: ast::Collation,
         txn: &TxnState,
         sqlprep: &mut SqlPreparedPool,
+        guc: &GucState,
         arena: &Arena,
-    ) -> Result<type_input_plans::Owner, SqlError> {
+    ) -> Result<(type_input_plans::Owner, guc::VariableConflict), SqlError> {
         use type_input_plans::{InputImage, Lookup, Owner};
         use type_inputs::RoutineInputKind;
         arena
@@ -16782,7 +16906,10 @@ impl Engine {
                 }
                 match sqlprep.routine_inputs.find(admission.key)? {
                     Some(Lookup::Ready(plan, InputImage::Runtime(bytes))) if bytes.is_empty() => {
-                        Ok(Owner::Nested(plan))
+                        let conflict = sqlprep
+                            .routine_inputs
+                            .compiled_variable_conflict(plan, guc.plpgsql_variable_conflict())?;
+                        Ok((Owner::Nested(plan), conflict))
                     }
                     _ => Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -17499,11 +17626,12 @@ impl Engine {
             };
         }
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
-            let instance = match self.plpgsql_instance_owner(
+            let (instance, conflict) = match self.plpgsql_instance_owner(
                 routine,
                 pending.input_collation,
                 txn,
                 sqlprep,
+                guc,
                 arena,
             ) {
                 Ok(owner) => owner,
@@ -17524,6 +17652,7 @@ impl Engine {
                     &environment,
                     execution,
                     suspended,
+                    conflict,
                 )
             }));
         }
@@ -17888,6 +18017,7 @@ impl Engine {
         responder: &mut Responder,
         mut capture: Option<&mut exec::ProcedureOutputs<'a>>,
         mut retention: Option<&mut Option<exec::SuspendedProcedure>>,
+        caller_statement: Option<&str>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         // A saved body resumes in place of a new call: its settings, timer and
         // statistics entry already belong to the first attempt.
@@ -18017,14 +18147,15 @@ impl Engine {
             {
                 return Ok(Err(error));
             }
-            let executed = (|| {
+            let mut run = || {
                 if routine.language == crate::storage::RoutineLanguage::PlPgSql {
                     let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-                    let instance = match self.plpgsql_instance_owner(
+                    let (instance, conflict) = match self.plpgsql_instance_owner(
                         routine,
                         input_collation,
                         txn,
                         sqlprep,
+                        guc,
                         arena,
                     ) {
                         Ok(owner) => owner,
@@ -18054,6 +18185,7 @@ impl Engine {
                             &environment,
                             timed.take(),
                             retention.as_deref_mut(),
+                            conflict,
                         )
                     });
                     let output_count = match executed {
@@ -18411,7 +18543,23 @@ impl Engine {
                         responder.command_complete("CALL").map(|_| Ok(()))
                     })
                 })
-            })();
+            };
+            // A static PL/pgSQL `CALL` runs its procedure as an SQL statement
+            // of the calling block, which names it in the body's error context.
+            let executed = match caller_statement {
+                Some(text) => {
+                    let frame = error_context::QueryFrame::new(
+                        text,
+                        error_context::QueryMode::Statement,
+                        false,
+                    );
+                    error_context::with_frame(&frame, || match run() {
+                        Ok(Err(error)) => Ok(Err(error_context::capture(error))),
+                        other => other,
+                    })
+                }
+                None => run(),
+            };
             if let Some((total, own)) = timed.and_then(statistics::FunctionTiming::finish)
                 && matches!(executed, Ok(Ok(())))
                 && let Err(error) = statistics::record_completed_call(
@@ -19855,6 +20003,7 @@ impl Engine {
                     responder,
                     None,
                     reset_workspace.then_some(&mut saved),
+                    None,
                 );
                 txn.pending_procedure = saved;
                 outcome
@@ -24293,6 +24442,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "max_locks_per_transaction",
     "max_prepared_transactions",
     "password_encryption",
+    "plpgsql.variable_conflict",
     "row_security",
     "search_path",
     "server_encoding",
@@ -24317,38 +24467,132 @@ fn emit_parse_warnings(
     parser: &mut parser::Parser,
     responder: &mut Responder,
 ) -> Result<(), WireFull> {
-    let messages = parser.take_warnings();
-    for message in messages {
-        responder.warning(eval::sqlstate::INVALID_PARAMETER_VALUE, message.as_str())?;
+    let text = parser.text();
+    emit_parse_notices(parser.take_warnings(), text, responder, false)
+}
+
+/// Reports `notices` raised while parsing `text`; with `raw_only`, just those
+/// PostgreSQL's raw parser raises, which precede a later syntax error.
+fn emit_parse_notices(
+    notices: &[parser::ParseNotice<'_>],
+    text: &str,
+    responder: &mut Responder,
+    raw_only: bool,
+) -> Result<(), WireFull> {
+    for notice in notices.iter().filter(|notice| notice.raw || !raw_only) {
+        responder.parse_notice(
+            notice.warning,
+            notice.sqlstate,
+            notice.message,
+            notice
+                .cursor
+                .map(|at| crate::pg::respond::CursorPosition::in_text(text, at)),
+        )?;
     }
     Ok(())
 }
 
 /// Reports a failure parsing `text`, with PostgreSQL's cursor position when it
 /// reports one.
+impl Engine {
+    /// The analysis error PostgreSQL reports instead of `deferred`, an error
+    /// it would find later in the same statement: `type "x" does not exist`
+    /// for a modifier on an unknown type, a missing relation in the FROM
+    /// clause, or an output column before the deferred error's position.
+    fn analysis_error_before<'a>(
+        &self,
+        statement: &'a Stmt<'a>,
+        type_name: Option<&str>,
+        deferred: &ParseError,
+        text: &str,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Option<SqlError> {
+        let deferred_at = deferred
+            .cursor
+            .map(|cursor| crate::pg::respond::CursorPosition::in_text(text, cursor).get());
+        let described = match statement {
+            Stmt::Select(select) => {
+                let mark = arena.mark();
+                let mut columns = [ColDesc::new("", 0, 0); exec::MAX_PROJ];
+                let described = query::describe_select(
+                    select,
+                    &self.storage,
+                    txid,
+                    arena,
+                    &mut columns,
+                    exec::DescriptionTarget::Sql,
+                    None,
+                );
+                // Only the verdict leaves; the description is discarded.
+                unsafe { arena.rewind_to(mark) };
+                described
+                    .err()
+                    .filter(|error| error.sqlstate.internal_control().is_none())
+            }
+            _ => None,
+        };
+        // The FROM clause is analysed first.
+        if described
+            .as_ref()
+            .is_some_and(|error| error.sqlstate == eval::sqlstate::UNDEFINED_TABLE)
+        {
+            return described;
+        }
+        if let Some(type_name) = type_name
+            && let Err(error) = exec::resolve_routine_type(&self.storage, txid, type_name)
+            && error.sqlstate == eval::sqlstate::UNDEFINED_OBJECT
+        {
+            let error = sql_err!(
+                eval::sqlstate::UNDEFINED_OBJECT,
+                "type \"{}\" does not exist",
+                type_name
+            );
+            if let Some(deferred_at) = deferred_at {
+                error_position::restore_position(&error, deferred_at);
+            }
+            return Some(error);
+        }
+        // An output column written before the deferred error is analysed
+        // before it.
+        let error = described?;
+        let position = error_position::take_position(&error)?;
+        error_position::restore_position(&error, position);
+        deferred_at
+            .is_some_and(|deferred_at| position < deferred_at)
+            .then_some(error)
+    }
+}
+
 pub(crate) fn report_parse_error(
     responder: &mut Responder,
     e: &ParseError,
     text: &str,
 ) -> Result<(), WireFull> {
-    if let Some(hint) = e.hint {
-        eval::stash_diagnostic(None, Some(crate::util::StackStr::from_str(hint)));
+    if e.hint.is_some() || e.detail.is_some() {
+        eval::stash_diagnostic(
+            e.detail.map(crate::util::StackStr::from_str),
+            e.hint.map(crate::util::StackStr::from_str),
+        );
     }
-    match e.cursor {
-        Some(at) => responder.error_at(
-            e.sqlstate,
-            e.message.as_str(),
-            crate::pg::respond::CursorPosition::in_text(text, at),
-        ),
-        None => responder.error(e.sqlstate, e.message.as_str()),
-    }
+    let message = e.render(text);
+    responder.error_display(
+        e.sqlstate,
+        &message,
+        e.cursor
+            .map(|at| crate::pg::respond::CursorPosition::in_text(text, at)),
+    )
 }
 
 pub(crate) fn parse_error_to_sql(error: &ParseError) -> SqlError {
-    SqlError {
-        sqlstate: SqlState::known(error.sqlstate),
-        message: stack_format!(192, "{}", error.message.as_str()),
+    let sql_error = error_position::full_message_error(error.sqlstate, |message| {
+        let _ = message.write_str(error.message.as_str());
+        Ok(())
+    });
+    if let Some(cursor) = error.cursor {
+        error_position::internal_parse_cursor(&sql_error, cursor);
     }
+    sql_error
 }
 
 /// Rewrites a CREATE SCHEMA element to create inside the new schema. An

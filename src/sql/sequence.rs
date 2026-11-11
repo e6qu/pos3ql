@@ -60,6 +60,7 @@ struct StatementEffectError {
     message: crate::util::StackStr<192>,
     detail: Option<ArenaSliceHandle<u8>>,
     hint: Option<ArenaSliceHandle<u8>>,
+    objects: super::eval::ErrorObjects,
 }
 
 #[derive(Clone, Copy)]
@@ -1095,6 +1096,9 @@ fn retain_effect_error(
             .retain_slice_with(value.len(), |at| value.as_bytes()[at])
             .map_err(|_| effect_full())
     };
+    let objects = diagnostic
+        .map(|diagnostic| diagnostic.objects)
+        .unwrap_or_default();
     let (detail, hint) = match diagnostic {
         Some(diagnostic) => (
             diagnostic
@@ -1114,10 +1118,11 @@ fn retain_effect_error(
             message: error.message,
             detail,
             hint,
+            objects,
         })
         .map_err(|_| effect_full())?;
     if let Some(diagnostic) = diagnostic {
-        super::eval::stash_diagnostic(diagnostic.detail, diagnostic.hint);
+        super::eval::stash_full_diagnostic(diagnostic);
     }
     Ok(saved)
 }
@@ -1149,8 +1154,12 @@ fn restore_effect_error(
     } else {
         None
     };
-    if detail.is_some() || hint.is_some() {
-        super::eval::stash_diagnostic(detail, hint);
+    if detail.is_some() || hint.is_some() || !saved.objects.is_empty() {
+        super::eval::stash_full_diagnostic(super::eval::Diagnostic {
+            detail,
+            hint,
+            objects: saved.objects,
+        });
     }
     Ok(SqlError {
         sqlstate: saved.state,

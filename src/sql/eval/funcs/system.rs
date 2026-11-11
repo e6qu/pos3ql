@@ -18,7 +18,6 @@ use crate::stack_format;
 
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, cast_to, eval_full, sqlstate, text_arg,
-    type_mismatch,
 };
 
 /// A catalog OID accepted by identity predicates.  Keeping conversion at the
@@ -98,7 +97,7 @@ fn advisory_key<'a>(
             Datum::Int2(value) => Ok(Some(i64::from(value))),
             Datum::Int4(value) => Ok(Some(i64::from(value))),
             Datum::Int8(value) => Ok(Some(value)),
-            other => Err(type_mismatch(name, &other)),
+            other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
         }
     };
     match args {
@@ -912,7 +911,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int4(value) => i64::from(value),
                     Datum::Int8(value) => value,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let block = u64::try_from(block).map_err(|_| {
                     sql_err!(
@@ -957,7 +958,9 @@ pub(crate) fn dispatch<'a>(
                         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
                     })?,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let catalog = hooks.catalog.ok_or_else(|| {
                     sql_err!(
@@ -1002,7 +1005,9 @@ pub(crate) fn dispatch<'a>(
                         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
                     })?,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 if args.len() == 2 {
                     let timeout = match eval_full(args[1], arena, params, row, hooks)? {
@@ -1010,7 +1015,9 @@ pub(crate) fn dispatch<'a>(
                         Datum::Int4(value) => i64::from(value),
                         Datum::Int8(value) => value,
                         Datum::Null => return Ok(Datum::Null),
-                        other => return Err(type_mismatch(name, &other)),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
                     };
                     if timeout < 0 {
                         return Err(sql_err!(
@@ -1238,7 +1245,9 @@ pub(crate) fn dispatch<'a>(
                 let snapshot = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Snapshot { value, legacy } if legacy == expected_legacy => value,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let value = if name.ends_with("xmin") {
                     snapshot.xmin()
@@ -1275,12 +1284,16 @@ pub(crate) fn dispatch<'a>(
                         })?
                     }
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let snapshot = match eval_full(args[1], arena, params, row, hooks)? {
                     Datum::Snapshot { value, legacy } if legacy == expected_legacy => value,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 Ok(Datum::Bool(snapshot.visible(transaction_id)))
             }
@@ -1302,7 +1315,9 @@ pub(crate) fn dispatch<'a>(
                         )
                     })?,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 Ok(hooks
                     .catalog
@@ -1322,7 +1337,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int4(oid) => Some(oid),
                     Datum::RegObject { referenced_oid, .. } => Some(referenced_oid),
                     Datum::Null => return Ok(Datum::Null),
-                    value => return Err(type_mismatch(name, &value)),
+                    value => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &value));
+                    }
                 };
                 let Some(catalog) = hooks.catalog else {
                     return Ok(Datum::Null);
@@ -1399,7 +1416,10 @@ pub(crate) fn dispatch<'a>(
                         Datum::Int4(value) => Ok(Some(value as u32)),
                         Datum::RegObject { referenced_oid, .. } => Ok(Some(referenced_oid as u32)),
                         Datum::Null => Ok(None),
-                        other => Err(type_mismatch("pg_get_acl", &other)),
+                        other => Err(crate::sql::eval::function_argument_mismatch(
+                            "pg_get_acl",
+                            &other,
+                        )),
                     }
                 };
                 let Some(classid) = oid(eval_full(args[0], arena, params, row, hooks)?)? else {
@@ -1411,7 +1431,12 @@ pub(crate) fn dispatch<'a>(
                 let objsubid = match eval_full(args[2], arena, params, row, hooks)? {
                     Datum::Int4(value) => value,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch("pg_get_acl", &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "pg_get_acl",
+                            &other,
+                        ));
+                    }
                 };
                 let catalog = hooks.catalog.ok_or_else(|| {
                     sql_err!(
@@ -1597,7 +1622,9 @@ pub(crate) fn dispatch<'a>(
                         _ => unreachable!("boolean cast returns its declared type"),
                     },
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let schemas = session_schemas();
                 let mut elems = [Datum::Null; crate::storage::MAX_PATH_ENTRIES];
@@ -2305,7 +2332,9 @@ pub(crate) fn dispatch<'a>(
                             match CatalogOid::parse(value)? {
                                 Some(oid) => Ok(Datum::Oid(oid.0 as u32)),
                                 None if value.is_null() => Ok(Datum::Null),
-                                None => Err(type_mismatch("rule identity must be oid", &value)),
+                                None => {
+                                    Err(crate::sql::eval::function_argument_mismatch(name, &value))
+                                }
                             }
                         } else {
                             super::super::cast_to(value, ColType::Bool, arena)
@@ -2520,7 +2549,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Text(written) => written,
                     Datum::Bpchar(written) => written.trim_end_matches(' '),
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 if matches!(name, "to_regtype" | "to_regtypemod")
                     && let Some(identity) =
@@ -2620,7 +2651,10 @@ pub(crate) fn dispatch<'a>(
                             .map_or("", crate::storage::PgEncoding::name),
                     )),
                     Datum::Null => Ok(Datum::Null),
-                    other => Err(type_mismatch("pg_encoding_to_char", &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(
+                        "pg_encoding_to_char",
+                        &other,
+                    )),
                 }
             }
             "pg_char_to_encoding" => {

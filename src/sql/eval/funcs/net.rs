@@ -10,7 +10,7 @@ use crate::util::StackStr;
 
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, bad_text, cast_to, eval_full,
-    int_arg, sqlstate, type_mismatch,
+    int_arg, sqlstate,
 };
 
 /// Handles the network-address family. Returns `None` if `name` is not one of
@@ -183,7 +183,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Macaddr8(bytes) => {
                         let _ = net::format_mac(&bytes, &mut buf);
                     }
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 }
                 text(buf.as_str())
             }
@@ -220,7 +222,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Macaddr(bytes) => bytes,
                     Datum::Macaddr8(bytes) => bytes,
-                    _ => return Err(type_mismatch(name, &value)),
+                    _ => return Err(crate::sql::eval::function_argument_mismatch(name, &value)),
                 };
                 Ok(Datum::Bytea(
                     arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?,

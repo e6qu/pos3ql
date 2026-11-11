@@ -1432,9 +1432,13 @@ fn routine_arguments_run_once_and_preserve_strict_null_effects() {
         "SELECT dispatch_missing({})",
         vec!["nextval('dispatch_effects')"; 24].join(",")
     );
+    // The whole signature is reported, and no argument runs.
     let rejected = session.execute(&mut engine, &oversized, true);
-    assert_eq!(error_sqlstates(&rejected), ["54000"]);
-    assert!(String::from_utf8_lossy(&rejected).contains("192 bytes"));
+    assert_eq!(error_sqlstates(&rejected), ["42883"]);
+    assert!(String::from_utf8_lossy(&rejected).contains(&format!(
+        "function dispatch_missing({}) does not exist",
+        vec!["bigint"; 24].join(", ")
+    )));
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT last_value FROM dispatch_effects", true)),
         ["18"]
@@ -2200,26 +2204,33 @@ fn search_path_sql_capacity_errors_preserve_the_selected_value() {
         "SELECT set_config('search_path','GUC_RAW,public',false)",
         true,
     );
-    for name in [
-        "a".repeat(64),
-        "a".repeat(65),
-        "é".repeat(32),
-        format!("{}a", "é".repeat(32)),
+    // PostgreSQL's scanner truncates a long identifier to 63 bytes, at a
+    // character boundary, with a NOTICE; the setting takes the truncated name.
+    for (name, truncated) in [
+        ("a".repeat(64), "a".repeat(63)),
+        ("a".repeat(65), "a".repeat(63)),
+        ("é".repeat(32), format!("\"{}\"", "é".repeat(31))),
+        (
+            format!("{}a", "é".repeat(32)),
+            format!("\"{}\"", "é".repeat(31)),
+        ),
     ] {
         for sql in [
             format!("SET search_path TO {name}"),
             format!("SET search_path TO \"{name}\""),
         ] {
-            assert_eq!(
-                error_sqlstates(&session.execute(&mut engine, &sql, true)),
-                ["42622"]
-            );
+            assert!(error_sqlstates(&session.execute(&mut engine, &sql, true)).is_empty());
             assert_eq!(
                 data_rows(&session.success(&mut engine, "SHOW search_path", true)),
-                ["GUC_RAW,public"]
+                core::slice::from_ref(&truncated)
             );
         }
     }
+    session.success(
+        &mut engine,
+        "SELECT set_config('search_path','GUC_RAW,public',false)",
+        true,
+    );
     for value in ["a".repeat(129), "é".repeat(64), "é".repeat(65)] {
         assert_eq!(
             error_sqlstates(&session.execute(

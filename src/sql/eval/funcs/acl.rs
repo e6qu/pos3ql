@@ -4,7 +4,7 @@ use crate::sql::ast::Expr;
 use crate::sql::types::{ArrElem, ColType, Datum};
 use crate::sql_err;
 
-use super::super::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate, type_mismatch};
+use super::super::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch<'a>(
@@ -69,12 +69,12 @@ pub(crate) fn dispatch<'a>(
                     })?;
                     crate::sql::acl::from_text(value, catalog, arena).map(Datum::AclItem)
                 }
-                other => Err(type_mismatch(name, &other)),
+                other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
             },
             "aclitemout" => match left {
                 Datum::Text(value) => Ok(Datum::Text(value)),
                 Datum::AclItem(item) => Ok(Datum::Text(item.text())),
-                other => Err(type_mismatch(name, &other)),
+                other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
             },
             "hash_aclitem" | "hash_aclitem_extended" => {
                 let hash = match left {
@@ -91,7 +91,7 @@ pub(crate) fn dispatch<'a>(
                         })?;
                         crate::sql::acl::hash_value(crate::sql::acl::parse(value)?, catalog, arena)?
                     }
-                    _ => return Err(type_mismatch(name, &left)),
+                    _ => return Err(crate::sql::eval::function_argument_mismatch(name, &left)),
                 };
                 if name == "hash_aclitem" {
                     Ok(Datum::Int4(hash as i32))
@@ -103,7 +103,9 @@ pub(crate) fn dispatch<'a>(
                         Datum::Oid(seed) => i64::from(seed),
                         Datum::Int8(seed) => seed,
                         Datum::Null => return Ok(Datum::Null),
-                        other => return Err(type_mismatch(name, &other)),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
                     };
                     match seed {
                         0 => Ok(Datum::Int8(i64::from(hash))),
@@ -128,15 +130,15 @@ pub(crate) fn dispatch<'a>(
                     (Datum::Text(left), Datum::Text(right)) => Ok(Datum::Bool(
                         crate::sql::acl::parse(left)?.equivalent(crate::sql::acl::parse(right)?),
                     )),
-                    (left, _) => Err(type_mismatch(name, &left)),
+                    (left, _) => Err(crate::sql::eval::function_argument_mismatch(name, &left)),
                 }
             }
             "aclcontains" => {
                 let Datum::Array { element, raw } = left else {
-                    return Err(type_mismatch(name, &left));
+                    return Err(crate::sql::eval::function_argument_mismatch(name, &left));
                 };
                 if element != ArrElem::AclItem {
-                    return Err(type_mismatch(name, &left));
+                    return Err(crate::sql::eval::function_argument_mismatch(name, &left));
                 }
                 let right = eval_full(args[1], arena, params, row, hooks)?;
                 let right = match right {
@@ -151,7 +153,9 @@ pub(crate) fn dispatch<'a>(
                         crate::sql::acl::from_text(value, catalog, arena)?
                     }
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 crate::sql::acl::validate_array_shape(raw)?;
                 for value in crate::sql::array::elements(raw, element) {
@@ -203,7 +207,10 @@ fn make_aclitem<'a>(
             .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID is out of range")),
         Datum::Int8(value) => u32::try_from(value)
             .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID is out of range")),
-        _ => Err(type_mismatch("makeaclitem", &value)),
+        _ => Err(crate::sql::eval::function_argument_mismatch(
+            "makeaclitem",
+            &value,
+        )),
     };
     let grantee = eval_full(args[0], arena, params, row, hooks)?;
     let grantor = eval_full(args[1], arena, params, row, hooks)?;
@@ -215,10 +222,16 @@ fn make_aclitem<'a>(
     let grantee_oid = oid(grantee)?;
     let grantor_oid = oid(grantor)?;
     let Datum::Text(privilege) = privilege else {
-        return Err(type_mismatch("makeaclitem", &privilege));
+        return Err(crate::sql::eval::function_argument_mismatch(
+            "makeaclitem",
+            &privilege,
+        ));
     };
     let Datum::Bool(grantable) = grantable else {
-        return Err(type_mismatch("makeaclitem", &grantable));
+        return Err(crate::sql::eval::function_argument_mismatch(
+            "makeaclitem",
+            &grantable,
+        ));
     };
     let role = |oid: u32| -> Result<&'a str, SqlError> {
         let name = hooks

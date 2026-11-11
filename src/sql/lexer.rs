@@ -10,6 +10,7 @@
 
 use super::eval::sqlstate;
 use crate::mem::arena::Arena;
+use crate::sql::parser::PARSE_MESSAGE_BYTES;
 use crate::util::StackStr;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -97,9 +98,9 @@ impl LexError {
 
     /// The message as PostgreSQL's `scanner_yyerror` reports it for `text`,
     /// the input this error's offsets index.
-    pub fn render(&self, text: &str) -> StackStr<96> {
+    pub fn render(&self, text: &str) -> StackStr<PARSE_MESSAGE_BYTES> {
         if let Some(invalid) = self.invalid_bytes {
-            let mut message = crate::stack_format!(96, "{}", self.message);
+            let mut message = crate::stack_format!(PARSE_MESSAGE_BYTES, "{}", self.message);
             for (index, byte) in invalid.bytes[..usize::from(invalid.len)].iter().enumerate() {
                 let separator = if index == 0 { ": " } else { " " };
                 let _ = core::fmt::Write::write_fmt(
@@ -115,9 +116,21 @@ impl LexError {
         // PostgreSQL's scanner_yyerror: a location at the end of the input
         // has no text to echo.
         if self.at == text.len() {
-            return crate::stack_format!(96, "{} at end of input", self.message);
+            return crate::stack_format!(PARSE_MESSAGE_BYTES, "{} at end of input", self.message);
         }
-        crate::stack_format!(96, "{} at or near \"{}\"", self.message, near)
+        crate::stack_format!(
+            PARSE_MESSAGE_BYTES,
+            "{} at or near \"{}\"",
+            self.message,
+            near
+        )
+    }
+
+    /// The query text this error echoes as `at or near "..."`, if any.
+    pub fn echo(&self, text: &str) -> Option<(usize, usize)> {
+        let end = self.near_end?;
+        (self.invalid_bytes.is_none() && self.at < text.len() && text.get(self.at..end).is_some())
+            .then_some((self.at, end))
     }
 }
 
@@ -161,12 +174,18 @@ fn is_sql_whitespace(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C')
 }
 
+/// PostgreSQL's `NAMEDATALEN - 1`: the longest identifier, in bytes.
+pub(crate) const MAX_IDENTIFIER_BYTES: usize = 63;
+
 #[derive(Clone)]
 pub struct Lexer<'a> {
     text: &'a str,
     arena: &'a Arena,
     at: usize,
     token_start: usize,
+    /// The full spelling of the most recently returned identifier when the
+    /// scanner truncated it to [`MAX_IDENTIFIER_BYTES`].
+    truncated_identifier: Option<&'a str>,
 }
 
 /// An opaque lexer position, for bounded lookahead (`mark` / `reset`).
@@ -195,7 +214,29 @@ impl<'a> Lexer<'a> {
             arena,
             at: 0,
             token_start: 0,
+            truncated_identifier: None,
         }
+    }
+
+    /// The full identifier PostgreSQL's scanner reports in its `identifier
+    /// "..." will be truncated to "..."` NOTICE, when the most recently
+    /// returned token was cut to [`MAX_IDENTIFIER_BYTES`].
+    pub fn truncated_identifier(&self) -> Option<&'a str> {
+        self.truncated_identifier
+    }
+
+    /// PostgreSQL's `truncate_identifier`: cut at the last whole character
+    /// that fits (`pg_mbcliplen`), recording the original for the NOTICE.
+    fn truncate_identifier(&mut self, word: &'a str) -> &'a str {
+        if word.len() <= MAX_IDENTIFIER_BYTES {
+            return word;
+        }
+        let mut end = MAX_IDENTIFIER_BYTES;
+        while !word.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.truncated_identifier = Some(word);
+        &word[..end]
     }
 
     /// Byte offset where the most recently returned token began.
@@ -214,6 +255,7 @@ impl<'a> Lexer<'a> {
         if self.at == 0 && self.text.as_bytes().contains(&0) {
             return Err(self.encoding_error(0, InvalidBytes::NUL));
         }
+        self.truncated_identifier = None;
         self.skip_ws_and_comments()?;
         self.token_start = self.at;
         let rest = self.rest();
@@ -308,6 +350,11 @@ impl<'a> Lexer<'a> {
         let start = self.at;
         let rest = self.rest();
 
+        // U&'...' strings and U&"..." identifiers with Unicode escapes.
+        if let [b'u' | b'U', b'&', quote @ (b'\'' | b'"'), ..] = rest.as_bytes() {
+            return self.unicode_escaped(start, *quote == b'"');
+        }
+
         // E'...' escape-string syntax.
         if (rest.starts_with('e') || rest.starts_with('E')) && rest[1..].starts_with('\'') {
             self.at += 1;
@@ -339,12 +386,190 @@ impl<'a> Lexer<'a> {
                 .map_err(|_| self.arena_full(start))?;
             folded.make_ascii_lowercase();
             // ASCII case folding preserves UTF-8 validity.
-            Ok(Tok::Ident(unsafe {
-                core::str::from_utf8_unchecked(folded)
-            }))
+            let folded = unsafe { core::str::from_utf8_unchecked(folded) };
+            Ok(Tok::Ident(self.truncate_identifier(folded)))
         } else {
-            Ok(Tok::Ident(word))
+            Ok(Tok::Ident(self.truncate_identifier(word)))
         }
+    }
+
+    /// Scans a `U&'...'` string constant or `U&"..."` identifier starting at
+    /// `start`, with an optional `UESCAPE 'c'` clause, decoding escapes as
+    /// PostgreSQL's `str_udeescape` does. The token spans the whole clause.
+    fn unicode_escaped(&mut self, start: usize, identifier: bool) -> Result<Tok<'a>, LexError> {
+        self.at = start + 2;
+        let body = if identifier {
+            self.quoted_body()?
+        } else {
+            match self.plain_string()? {
+                Tok::Str(body) => body,
+                _ => unreachable!("the string scanner returns a string"),
+            }
+        };
+        let escape = self.uescape_clause()?;
+        self.token_start = start;
+        let decoded = self.decode_unicode_escapes(body, escape, start)?;
+        Ok(if identifier {
+            Tok::QuotedIdent(self.truncate_identifier(decoded))
+        } else {
+            Tok::Str(decoded)
+        })
+    }
+
+    /// Consumes `UESCAPE 'c'` after a Unicode-escape token and returns the
+    /// escape character, or leaves the input untouched and returns `\`.
+    fn uescape_clause(&mut self) -> Result<u8, LexError> {
+        let resume = self.at;
+        self.skip_ws_and_comments()?;
+        let bytes = self.rest().as_bytes();
+        let keyword = bytes.len() >= 7
+            && bytes[..7].eq_ignore_ascii_case(b"uescape")
+            && !self.text[self.at + 7..]
+                .chars()
+                .next()
+                .is_some_and(is_identifier_continue);
+        if !keyword {
+            self.at = resume;
+            return Ok(b'\\');
+        }
+        self.at += 7;
+        self.skip_ws_and_comments()?;
+        let literal_start = self.at;
+        // PostgreSQL requires a plain string constant (SCONST) here; another
+        // Unicode-escape token is rejected without being decoded.
+        let token = if let [b'u' | b'U', b'&', quote @ (b'\'' | b'"'), ..] = self.rest().as_bytes()
+        {
+            self.token_start = literal_start;
+            self.at += 2;
+            if *quote == b'"' {
+                self.quoted_body()?;
+            } else {
+                self.plain_string()?;
+            }
+            None
+        } else {
+            match self.next_token()? {
+                Tok::Str(value) => Some(value),
+                _ => None,
+            }
+        };
+        let near_end = if literal_start == self.text.len() {
+            literal_start
+        } else {
+            self.at
+        };
+        let error = |message| LexError {
+            at: literal_start,
+            message,
+            kind: LexErrorKind::Syntax,
+            near_end: Some(near_end),
+            hint: None,
+            invalid_bytes: None,
+        };
+        let value = token.ok_or(error("UESCAPE must be followed by a simple string literal"))?;
+        // PostgreSQL's check_uescapechar.
+        match value.as_bytes() {
+            [escape]
+                if !(escape.is_ascii_hexdigit()
+                    || matches!(escape, b'+' | b'\'' | b'"')
+                    || is_sql_whitespace(char::from(*escape))) =>
+            {
+                Ok(*escape)
+            }
+            _ => Err(error("invalid Unicode escape character")),
+        }
+    }
+
+    /// PostgreSQL's `str_udeescape`. Error positions follow PostgreSQL: the
+    /// offset into the dequoted text plus the three bytes of `U&'`.
+    fn decode_unicode_escapes(
+        &self,
+        body: &'a str,
+        escape: u8,
+        start: usize,
+    ) -> Result<&'a str, LexError> {
+        let bytes = body.as_bytes();
+        if !bytes.contains(&escape) {
+            return Ok(body);
+        }
+        let error = |offset: usize, message, hint| LexError {
+            at: start + 3 + offset,
+            message,
+            kind: LexErrorKind::Syntax,
+            near_end: None,
+            hint,
+            invalid_bytes: None,
+        };
+        let invalid_pair = |offset| error(offset, "invalid Unicode surrogate pair", None);
+        let hex = |from: usize, count: usize| -> Option<u32> {
+            let digits = bytes.get(from..from + count)?;
+            digits.iter().try_fold(0u32, |value, byte| {
+                hex_digit(*byte).map(|digit| (value << 4) | u32::from(digit))
+            })
+        };
+        // An escape is never shorter than the UTF-8 it decodes to.
+        let out = self
+            .arena
+            .alloc_slice_with(bytes.len(), |_| 0u8)
+            .map_err(|_| self.arena_full(start))?;
+        let mut pair_first: Option<u32> = None;
+        let mut read = 0;
+        let mut written = 0;
+        while read < bytes.len() {
+            if bytes[read] != escape {
+                if pair_first.is_some() {
+                    return Err(invalid_pair(read));
+                }
+                out[written] = bytes[read];
+                written += 1;
+                read += 1;
+                continue;
+            }
+            if bytes.get(read + 1) == Some(&escape) {
+                if pair_first.is_some() {
+                    return Err(invalid_pair(read));
+                }
+                out[written] = escape;
+                written += 1;
+                read += 2;
+                continue;
+            }
+            let (value, length) = if let Some(value) = hex(read + 1, 4) {
+                (value, 5)
+            } else if bytes.get(read + 1) == Some(&b'+')
+                && let Some(value) = hex(read + 2, 6)
+            {
+                (value, 8)
+            } else {
+                return Err(error(
+                    read,
+                    "invalid Unicode escape",
+                    Some(r"Unicode escapes must be \XXXX or \+XXXXXX."),
+                ));
+            };
+            if value == 0 || value > 0x10_FFFF {
+                return Err(error(read, "invalid Unicode escape value", None));
+            }
+            let low_surrogate = (0xDC00..=0xDFFF).contains(&value);
+            let codepoint = match pair_first.take() {
+                Some(high) if low_surrogate => 0x10000 + ((high - 0xD800) << 10) + (value - 0xDC00),
+                Some(_) => return Err(invalid_pair(read)),
+                None if low_surrogate => return Err(invalid_pair(read)),
+                None => value,
+            };
+            read += length;
+            if (0xD800..=0xDBFF).contains(&codepoint) {
+                pair_first = Some(codepoint);
+                continue;
+            }
+            let character = char::from_u32(codepoint).expect("surrogates are paired above");
+            written += character.encode_utf8(&mut out[written..]).len();
+        }
+        if pair_first.is_some() {
+            return Err(invalid_pair(bytes.len()));
+        }
+        // Escapes decode to whole UTF-8 characters between copied ones.
+        Ok(unsafe { core::str::from_utf8_unchecked(&out[..written]) })
     }
 
     /// PostgreSQL's numeric scanner rules, applied as flex does: the longest
@@ -846,6 +1071,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn quoted_ident(&mut self) -> Result<Tok<'a>, LexError> {
+        let body = self.quoted_body()?;
+        Ok(Tok::QuotedIdent(self.truncate_identifier(body)))
+    }
+
+    /// The text of a `"..."` identifier with `""` undoubled, untruncated.
+    fn quoted_body(&mut self) -> Result<&'a str, LexError> {
         let start = self.at;
         self.at += 1;
         let bytes = self.text.as_bytes();
@@ -874,8 +1105,9 @@ impl<'a> Lexer<'a> {
         let raw = &self.text[self.at..i];
         self.at = i + 1;
         if raw.is_empty() {
+            // The echo starts at the token, which includes a `U&` prefix.
             return Err(LexError {
-                at: start,
+                at: self.token_start,
                 message: "zero-length delimited identifier",
                 kind: LexErrorKind::Syntax,
                 near_end: Some(start + 2),
@@ -884,7 +1116,7 @@ impl<'a> Lexer<'a> {
             });
         }
         if !has_escape {
-            return Ok(Tok::QuotedIdent(raw));
+            return Ok(raw);
         }
         let out = self
             .arena
@@ -900,10 +1132,7 @@ impl<'a> Lexer<'a> {
             r += 1;
             w += 1;
         }
-        let out = &out[..w];
-        Ok(Tok::QuotedIdent(unsafe {
-            core::str::from_utf8_unchecked(out)
-        }))
+        Ok(unsafe { core::str::from_utf8_unchecked(&out[..w]) })
     }
 
     fn dollar(&mut self) -> Result<Tok<'a>, LexError> {
@@ -1265,6 +1494,104 @@ mod tests {
     }
 
     #[test]
+    fn unicode_escape_strings_and_identifiers_decode_as_postgresql_does() {
+        // Results from PostgreSQL 18.6.
+        for (sql, expected) in [
+            (r"U&'\0041'", r#"Str("A")"#),
+            (r"u&'d\0061t\+000061'", r#"Str("data")"#),
+            (r"U&'a''b'", r#"Str("a'b")"#),
+            (r"U&'\\x'", r#"Str("\\x")"#),
+            (r"U&'d!0061t!+000061' UESCAPE '!'", r#"Str("data")"#),
+            (r"U&'d!0061t' uescape /* c */ E'!'", r#"Str("dat")"#),
+            (r"U&'x' UESCAPE $$!$$", r#"Str("x")"#),
+            (r"U&'!!' UESCAPE '!'", r#"Str("!")"#),
+            (r"U&'\D83D\DE00'", r#"Str("😀")"#),
+            ("U&'\\0041'\n'\\0042'", r#"Str("AB")"#),
+            (r#"U&"\0061bc""#, r#"QuotedIdent("abc")"#),
+            (r#"U&"a""b""#, r#"QuotedIdent("a\"b")"#),
+        ] {
+            assert_eq!(lex_all(sql), [expected], "{sql}");
+        }
+        // `U&` must touch the quote; `UESCAPE` is otherwise an identifier.
+        assert_eq!(
+            lex_all("U& 'x'"),
+            [r#"Ident("u")"#, r#"Op("&")"#, r#"Str("x")"#]
+        );
+        assert_eq!(lex_all(r"U&'x' 'y'"), [r#"Str("x")"#, r#"Str("y")"#]);
+    }
+
+    #[test]
+    fn unicode_escape_errors_match_postgresql_messages_and_cursors() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "unicode escapes", 1 << 16).unwrap();
+        let hint = Some(r"Unicode escapes must be \XXXX or \+XXXXXX.");
+        // Messages, SQLSTATEs and cursor byte offsets from PostgreSQL 18.6,
+        // which measures from the dequoted text plus the three bytes of `U&'`.
+        for (sql, message, cursor, hint) in [
+            (r"U&'\D83D'", "invalid Unicode surrogate pair", 8, None),
+            (r"U&'\D83Dx'", "invalid Unicode surrogate pair", 8, None),
+            (r"U&'\DE00'", "invalid Unicode surrogate pair", 3, None),
+            (r"U&'\D83D\0041'", "invalid Unicode surrogate pair", 8, None),
+            (r"U&'\00'", "invalid Unicode escape", 3, hint),
+            (r"U&'\'", "invalid Unicode escape", 3, hint),
+            (r"U&'\+00004x'", "invalid Unicode escape", 3, hint),
+            (r"U&'\0000'", "invalid Unicode escape value", 3, None),
+            (r"U&'\+110000'", "invalid Unicode escape value", 3, None),
+            (r"U&'a''b\0000'", "invalid Unicode escape value", 6, None),
+            (r#"U&"ab\00""#, "invalid Unicode escape", 5, hint),
+            (r"U&'x!' UESCAPE '!'", "invalid Unicode escape", 4, hint),
+            (
+                r"U&'x' UESCAPE '+'",
+                "invalid Unicode escape character at or near \"'+'\"",
+                14,
+                None,
+            ),
+            (
+                r"U&'x' UESCAPE 'ab'",
+                "invalid Unicode escape character at or near \"'ab'\"",
+                14,
+                None,
+            ),
+            (
+                r"U&'x' UESCAPE U&'!'",
+                "UESCAPE must be followed by a simple string literal at or near \"U&'!'\"",
+                14,
+                None,
+            ),
+            (
+                r"U&'x' UESCAPE 1",
+                "UESCAPE must be followed by a simple string literal at or near \"1\"",
+                14,
+                None,
+            ),
+            (
+                r"U&'x' UESCAPE",
+                "UESCAPE must be followed by a simple string literal at end of input",
+                13,
+                None,
+            ),
+            (
+                r#"U&"""#,
+                "zero-length delimited identifier at or near \"U&\"\"\"",
+                0,
+                None,
+            ),
+            (
+                "U&'abc",
+                "unterminated quoted string at or near \"U&'abc\"",
+                0,
+                None,
+            ),
+        ] {
+            let error = Lexer::new(sql, &arena).next_token().unwrap_err();
+            assert_eq!(error.render(sql).as_str(), message, "{sql}");
+            assert_eq!(error.kind.sqlstate(), "42601", "{sql}");
+            assert_eq!(error.cursor(), Some(cursor), "{sql}");
+            assert_eq!(error.hint, hint, "{sql}");
+        }
+    }
+
+    #[test]
     fn identifiers_follow_postgresql_character_classes_and_ascii_folding() {
         assert_eq!(
             lex_all("ÄB straße ‘x’ $tæg$body$tæg$"),
@@ -1280,8 +1607,15 @@ mod tests {
             lex_all("a\u{a0}b\x0Bc"),
             ["Ident(\"a\\u{a0}b\")", "Ident(\"c\")"]
         );
+        // PostgreSQL truncates identifiers to 63 bytes at a character
+        // boundary and the parser reports the original in a NOTICE.
         let long = "A".repeat(200);
-        assert_eq!(lex_all(&long), [format!("Ident({:?})", "a".repeat(200))]);
+        assert_eq!(lex_all(&long), [format!("Ident({:?})", "a".repeat(63))]);
+        let wide = "é".repeat(40);
+        assert_eq!(
+            lex_all(&format!("\"{wide}\"")),
+            [format!("QuotedIdent({:?})", "é".repeat(31))]
+        );
     }
 
     #[test]

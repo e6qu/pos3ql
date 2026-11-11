@@ -33,6 +33,10 @@ struct SqlSource {
     owner: type_input_plans::Owner,
     input_source: type_inputs::Source,
     stored: Option<StoredSource>,
+    /// Whether the routine's declaration lets PostgreSQL inline a body that
+    /// is a single plain `SELECT` of one expression into its caller, which
+    /// then reports no context line for it.
+    inlinable: bool,
 }
 
 struct ParsedSource<'a> {
@@ -246,6 +250,34 @@ impl SqlResult {
     }
 }
 
+/// Whether PostgreSQL's `inline_function` would replace a call of this body
+/// by its expression: one `SELECT` of one expression with no other clause,
+/// subquery or set-returning call.
+fn inlined_by_postgresql(program: &query::RoutineFunctionProgram<'_>) -> bool {
+    let query::RoutineFunctionResult::Query(query::RoutineQuery::Select(select)) = program.result
+    else {
+        return false;
+    };
+    let [crate::sql::ast::SelectItem::Expr { expression, .. }] = select.items else {
+        return false;
+    };
+    program.preceding.is_empty()
+        && !select.distinct
+        && select.distinct_on.is_empty()
+        && select.from.is_none()
+        && select.where_clause.is_none()
+        && select.group_by.is_empty()
+        && select.grouping_sets.is_empty()
+        && select.having.is_none()
+        && select.order_by.is_empty()
+        && select.limit.is_none()
+        && select.offset.is_none()
+        && select.with.is_empty()
+        && select.set_body.is_none()
+        && select.locking.is_empty()
+        && !expression.contains_subquery()
+}
+
 pub(crate) struct SuspendedSqlFunction {
     state: MutableSlice<SqlExecution>,
 }
@@ -407,9 +439,23 @@ impl SqlExecution {
                     depth: context.txn.trigger_depth(),
                 });
         }
-        let result = type_input_plans::with_owner(self.source.owner, || {
-            type_inputs::with_source(self.source.input_source, parsed.text, parsed.inputs, || {
-                self.execute_body(parsed, arguments, context)
+        let name = self.source.name;
+        let frame = crate::sql::error_context::SqlFunctionFrame {
+            name: name.as_str(),
+            body: parsed.text,
+            statement: core::cell::Cell::new(0),
+            inlined: self.source.inlinable && inlined_by_postgresql(&parsed.program),
+        };
+        let result = crate::sql::error_context::within(&frame, || {
+            crate::sql::error_position::with_internal_source(parsed.text, || {
+                type_input_plans::with_owner(self.source.owner, || {
+                    type_inputs::with_source(
+                        self.source.input_source,
+                        parsed.text,
+                        parsed.inputs,
+                        || self.execute_body(parsed, arguments, context, &frame),
+                    )
+                })
             })
         });
         context.txn.write_completion_boundary = prior;
@@ -421,8 +467,10 @@ impl SqlExecution {
         parsed: &ParsedSource<'a>,
         arguments: &'a [Datum<'a>],
         context: &mut TriggerExecContext<'_, 'a, '_>,
+        frame: &crate::sql::error_context::SqlFunctionFrame<'_>,
     ) -> Result<FunctionOutput<'a>, SqlError> {
         while !self.finished_body {
+            frame.statement.set(self.step + 1);
             self.enter_step()?;
             let final_step = self.step == parsed.program.preceding.len();
             let mut command = if let Some(command) = self.command.take() {
@@ -513,6 +561,7 @@ impl SqlExecution {
                 let txid = context.txn.txid;
                 execute_procedural_query(
                     context,
+                    false,
                     (self.policy == query::RoutineExecution::Retained)
                         .then_some(&mut self.pending_query),
                     |storage, sequences| {
@@ -1027,6 +1076,11 @@ pub(in crate::sql) fn execute_sql_function<'a>(
                 owner: body_inputs.owner,
                 input_source: body_inputs.source,
                 stored,
+                inlinable: !routine.attributes.security_definer
+                    && !routine.attributes.strict
+                    && routine.config_count == 0
+                    && !routine.kind.is_set_returning()
+                    && routine.kind.function_result() != Some(ColType::Record),
             },
             arguments,
             result,

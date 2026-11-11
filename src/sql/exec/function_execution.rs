@@ -88,6 +88,7 @@ impl ReturnBinding {
         execution: &execution_frame::ExecutionFrame<'_, 'a>,
         flow: Option<TriggerFlow<'a>>,
         result_type: ColType,
+        (storage, txid): (&crate::storage::Storage, u32),
         arena: &'a Arena,
     ) -> Result<FunctionOutput<'a>, SqlError> {
         let output = match (self, flow) {
@@ -146,7 +147,13 @@ impl ReturnBinding {
         }?;
         match output {
             FunctionOutput::Scalar(value) => Ok(FunctionOutput::Scalar(cast_to(
-                detach_routine_datum(value, arena)?,
+                super::plpgsql_conversion_input(
+                    detach_routine_datum(value, arena)?,
+                    storage.routine_type_oid(result_type, None, txid),
+                    storage,
+                    txid,
+                    arena,
+                )?,
                 result_type,
                 arena,
             )?)),
@@ -185,7 +192,7 @@ fn convert_result<'a>(
     }
     let arena = context.arena;
     let txid = context.txn.txid;
-    execute_procedural_query(context, check, |storage, sequences| {
+    execute_procedural_query(context, false, check, |storage, sequences| {
         coerce_routine_argument(value, result, storage, txid, arena, Some(sequences))
     })
     .map(FunctionOutput::Scalar)
@@ -218,6 +225,8 @@ struct FunctionBinding {
     kind: PlpgsqlProgramKind,
     input_owner: super::super::type_input_plans::Owner,
     input_collation: crate::sql::ast::Collation,
+    variable_conflict: super::super::guc::VariableConflict,
+    fresh_snapshots: bool,
     parameters: SharedSlice<RoutineArgumentDef>,
     inputs: local_values::SavedValues,
     returns: ReturnBinding,
@@ -350,6 +359,8 @@ impl FunctionBinding {
             input_owner: self.input_owner,
             input_collation: self.input_collation,
             input_sites,
+            variable_conflict: self.variable_conflict,
+            fresh_snapshots: self.fresh_snapshots,
             materialized_relations: None,
             nargs: i32::try_from(self.parameters.len()).expect("bounded routine argument count"),
             when: "",
@@ -464,6 +475,7 @@ impl SuspendedFunctionState {
             .map(|sources| sources.enter())
             .transpose()?;
         let environment = self.binding.environment.enter(context.txn)?;
+        let invocation = self.binding.invocation(&[], arena)?;
         let pending = self.conversion.as_mut().ok_or_else(changed)?;
         let value = pending.value.read(0, arena)?;
         admission.commit();
@@ -472,7 +484,8 @@ impl SuspendedFunctionState {
             FunctionOutput::Scalar(value),
             self.binding.result_type,
             Some(&mut pending.check),
-        );
+        )
+        .map_err(|error| control_flow::routine_exit_error(context, invocation, error));
         admission.preserve_caller_inputs()?;
         Ok(self.finish_conversion(result, &environment, context))
     }
@@ -571,12 +584,15 @@ impl SuspendedFunctionState {
         }
         match result {
             Ok(flow) => {
-                let output = match self.binding.returns.finish(
-                    &execution,
-                    flow,
-                    self.binding.result_type.ctype,
-                    arena,
-                ) {
+                let output = match control_flow::at_routine_exit(context, invocation, || {
+                    self.binding.returns.finish(
+                        &execution,
+                        flow,
+                        self.binding.result_type.ctype,
+                        (context.storage(), context.txn.txid),
+                        arena,
+                    )
+                }) {
                     Ok(output) => output,
                     Err(error) => {
                         self.binding.environment.complete();
@@ -585,7 +601,10 @@ impl SuspendedFunctionState {
                 };
                 let mut check = None;
                 let result =
-                    convert_result(context, output, self.binding.result_type, Some(&mut check));
+                    convert_result(context, output, self.binding.result_type, Some(&mut check))
+                        .map_err(|error| {
+                            control_flow::routine_exit_error(context, invocation, error)
+                        });
                 if matches!(&result, Err(error) if control_flow::is_execution_wait(error)) {
                     match PendingConversion::new(output, check, &context.storage().row_work) {
                         Ok(pending) => self.conversion = Some(pending),
@@ -708,6 +727,7 @@ pub(crate) fn execute<'a>(
     environment: &CallEnvironment,
     policy: super::super::query::RoutineExecution,
     suspended: &mut Option<SuspendedFunction>,
+    compiled_conflict: super::super::guc::VariableConflict,
 ) -> Result<FunctionOutput<'a>, SqlError> {
     let inputs = arena
         .alloc_slice_copy(inputs)
@@ -844,8 +864,14 @@ pub(crate) fn execute<'a>(
         .map(|sources| sources.enter())
         .transpose()?;
     let returns = ReturnBinding::select(routine, kind, locals, &engine.storage, transaction.txid)?;
-    let invocation = TriggerInvocation::function(routine, kind, collation, arena)?
-        .with_input_sites(program.input_sites);
+    let invocation = TriggerInvocation::function(
+        routine,
+        kind,
+        collation,
+        program.variable_conflict(compiled_conflict),
+        arena,
+    )?
+    .with_input_sites(program.input_sites);
     let mut execution = execution_frame::ExecutionFrame::new(
         arena,
         &code,
@@ -912,12 +938,23 @@ pub(crate) fn execute<'a>(
     match result {
         Ok(flow) => {
             let result = declared_result(routine)?;
-            let output = returns.finish(&execution, flow, result.ctype, arena)?;
+            let output = control_flow::at_routine_exit(&context, invocation, || {
+                returns.finish(
+                    &execution,
+                    flow,
+                    result.ctype,
+                    (context.storage(), context.txn.txid),
+                    arena,
+                )
+            })?;
             if policy == super::super::query::RoutineExecution::StatementReplay {
-                return convert_result(&mut context, output, result, None);
+                return convert_result(&mut context, output, result, None).map_err(|error| {
+                    control_flow::routine_exit_error(&context, invocation, error)
+                });
             }
             let mut check = None;
-            let converted = convert_result(&mut context, output, result, Some(&mut check));
+            let converted = convert_result(&mut context, output, result, Some(&mut check))
+                .map_err(|error| control_flow::routine_exit_error(&context, invocation, error));
             match converted {
                 Err(error) if control_flow::is_execution_wait(&error) => {
                     let conversion =
@@ -926,7 +963,7 @@ pub(crate) fn execute<'a>(
                         &context,
                         routine,
                         kind,
-                        invocation.input_owner,
+                        invocation,
                         collation,
                         inputs,
                         returns,
@@ -950,7 +987,7 @@ pub(crate) fn execute<'a>(
                 &context,
                 routine,
                 kind,
-                invocation.input_owner,
+                invocation,
                 collation,
                 inputs,
                 returns,
@@ -975,7 +1012,7 @@ fn suspend_call(
     context: &TriggerExecContext<'_, '_, '_>,
     routine: &crate::storage::RoutineDef,
     kind: PlpgsqlProgramKind,
-    input_owner: super::super::type_input_plans::Owner,
+    invocation: TriggerInvocation<'_>,
     collation: crate::sql::ast::Collation,
     inputs: &[Datum<'_>],
     returns: ReturnBinding,
@@ -1006,8 +1043,10 @@ fn suspend_call(
                 oid: crate::storage::routine_oid(routine),
                 version: routine.version,
                 kind,
-                input_owner,
+                input_owner: invocation.input_owner,
                 input_collation: collation,
+                variable_conflict: invocation.variable_conflict,
+                fresh_snapshots: invocation.fresh_snapshots,
                 parameters,
                 inputs: saved_inputs,
                 returns,

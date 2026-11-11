@@ -125,6 +125,10 @@ struct Slot {
     // again when its caller later restores the former search path.
     invalidated: bool,
     input_attempt: Option<super::sequence::StatementInputAttempt>,
+    /// A PL/pgSQL instance keeps the `plpgsql.variable_conflict` value in
+    /// effect when this backend first compiled it, as PostgreSQL's function
+    /// cache does.
+    variable_conflict: Option<super::guc::VariableConflict>,
 }
 
 impl Slot {
@@ -134,6 +138,7 @@ impl Slot {
         self.validity = None;
         self.invalidated = false;
         self.input_attempt = None;
+        self.variable_conflict = None;
     }
 }
 
@@ -160,6 +165,7 @@ impl RoutineInputPlans {
                     validity: None,
                     invalidated: false,
                     input_attempt: None,
+                    variable_conflict: None,
                 })
                 .expect("startup reserved every routine-input control");
         }
@@ -475,6 +481,7 @@ impl RoutineInputPlans {
             validity: None,
             invalidated: false,
             input_attempt: None,
+            variable_conflict: None,
         };
         PlanId {
             slot: index,
@@ -879,6 +886,17 @@ impl RoutineInputPlans {
             };
             self.retire(owner);
         }
+    }
+
+    /// Records the conflict rule a PL/pgSQL instance compiled with; the first
+    /// recording wins for the instance's lifetime.
+    pub(crate) fn compiled_variable_conflict(
+        &mut self,
+        plan: PlanId,
+        current: super::guc::VariableConflict,
+    ) -> Result<super::guc::VariableConflict, SqlError> {
+        let slot = self.slot_mut(plan)?;
+        Ok(*slot.variable_conflict.get_or_insert(current))
     }
 
     fn slot(&self, id: PlanId) -> Result<&Slot, SqlError> {

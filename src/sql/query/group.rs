@@ -1304,7 +1304,7 @@ fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
         Ok(super::ResolvedColumn::Table(t, _)) => Some(scope.names[t]),
         _ => qualifier,
     };
-    match table {
+    let error = match table {
         Some(table) => sql_err!(
             sqlstate::GROUPING_ERROR,
             "column \"{}.{}\" must appear in the GROUP BY clause or be used in an aggregate function",
@@ -1316,7 +1316,8 @@ fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
             "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
             name
         ),
-    }
+    };
+    crate::sql::error_position::column_reference(error, qualifier, name)
 }
 
 /// The first column reference in `expression` that no grouping key covers, or

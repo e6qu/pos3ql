@@ -1697,6 +1697,18 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
         Expr::WholeRow(t) => t,
         Expr::Exists(_) => "exists",
         Expr::ArraySubquery(_) | Expr::Array(_) => "array",
+        // A subscripted scalar subquery keeps the subquery's name, as
+        // PostgreSQL names any indirection after its argument.
+        Expr::Subscript { .. } | Expr::Slice { .. } => {
+            let mut base = expression;
+            while let Expr::Subscript { base: inner, .. } | Expr::Slice { base: inner, .. } = base {
+                base = inner;
+            }
+            match base {
+                Expr::Subquery(_) => derived_name(base),
+                _ => "?column?",
+            }
+        }
         // A scalar subquery is named by its single output column.
         Expr::Subquery(select) => {
             let mut select = *select;
@@ -1909,20 +1921,24 @@ fn routine_lookup_error(
     failure: FunctionLookupFailure,
     columns: &dyn ColTypeResolver,
 ) -> SqlError {
-    let format = || -> Result<crate::util::StackStr<192>, SqlError> {
-        use core::fmt::Write;
-        if argument_names.len() > argument_oids.len() {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "function diagnostic argument mapping changed"
-            ));
-        }
-        let mut message = crate::util::StackStr::<192>::new();
-        let noun = if failure == FunctionLookupFailure::NotProcedure {
-            ""
-        } else {
-            noun
-        };
+    if argument_names.len() > argument_oids.len() {
+        return sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "function diagnostic argument mapping changed"
+        );
+    }
+    let state = match failure {
+        FunctionLookupFailure::Missing => sqlstate::UNDEFINED_FUNCTION,
+        FunctionLookupFailure::Ambiguous => sqlstate::AMBIGUOUS_FUNCTION,
+        FunctionLookupFailure::NotProcedure => sqlstate::WRONG_OBJECT_TYPE,
+    };
+    // PostgreSQL's "is not a procedure" message names the routine bare.
+    let noun = if failure == FunctionLookupFailure::NotProcedure {
+        ""
+    } else {
+        noun
+    };
+    crate::sql::error_position::full_message_error(state, |message| {
         let _ = write!(message, "{}{}(", noun, name);
         for (index, type_oid) in argument_oids.iter().copied().enumerate() {
             if index != 0 {
@@ -1945,25 +1961,8 @@ fn routine_lookup_error(
             FunctionLookupFailure::Ambiguous => ") is not unique",
             FunctionLookupFailure::NotProcedure => ") is not a procedure",
         });
-        if message.is_truncated() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "function diagnostic exceeds SQL error message capacity (192 bytes)"
-            ));
-        }
-        Ok(message)
-    };
-    match format() {
-        Ok(message) => SqlError {
-            message,
-            sqlstate: crate::sql::eval::SqlState::known(match failure {
-                FunctionLookupFailure::Missing => sqlstate::UNDEFINED_FUNCTION,
-                FunctionLookupFailure::Ambiguous => sqlstate::AMBIGUOUS_FUNCTION,
-                FunctionLookupFailure::NotProcedure => sqlstate::WRONG_OBJECT_TYPE,
-            }),
-        },
-        Err(error) => error,
-    }
+        Ok(())
+    })
 }
 
 pub trait ColTypeResolver {
@@ -4964,6 +4963,14 @@ pub fn infer_type_res(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
+    infer_type_unpositioned(expression, columns)
+        .map_err(|error| crate::sql::error_position::expression_error(error, expression))
+}
+
+fn infer_type_unpositioned(
+    expression: &Expr,
+    columns: &dyn ColTypeResolver,
+) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
     let selected = selected_call(expression, columns)?;
     if let Expr::Call {
@@ -5358,9 +5365,15 @@ pub fn infer_type_res(
                 for (condition, _) in *whens {
                     let condition_oid = infer_type_res(condition, columns)?.0;
                     if !matches!(condition_oid, oid::BOOL | oid::UNKNOWN) {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "argument of CASE/WHEN must be type boolean"
+                        let type_name = ColType::from_oid(condition_oid)
+                            .map_or("unknown", |ctype| ctype.name());
+                        return Err(crate::sql::error_position::at_expression(
+                            sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "argument of CASE/WHEN must be type boolean, not type {}",
+                                type_name
+                            ),
+                            condition,
                         ));
                     }
                 }
@@ -5445,6 +5458,12 @@ pub fn infer_type_res(
             .subquery_type(expression)?
             .unwrap_or((oid::UNKNOWN, -2)),
         Expr::RowSubquery { .. } => (oid::UNKNOWN, -2),
+        Expr::RecordFieldIndex {
+            base: Expr::RowSubquery { .. },
+            ..
+        } => columns
+            .subquery_type(expression)?
+            .unwrap_or((oid::UNKNOWN, -2)),
         Expr::RecordFieldIndex { base, index } => {
             record_field_index_metadata(base, usize::from(*index), columns)?
                 .map_or((oid::UNKNOWN, -2), |metadata| {
@@ -5511,6 +5530,24 @@ pub fn infer_type_res(
             )?
             .element,
         )),
+        Expr::Subscript { base, .. }
+            if {
+                // A subscript list holding a slice is a slice throughout.
+                let mut node = &**base;
+                let mut sliced = false;
+                while let Expr::Subscript { base, .. } | Expr::Slice { base, .. } = node {
+                    sliced |= matches!(node, Expr::Slice { .. });
+                    node = base;
+                }
+                sliced
+            } =>
+        {
+            let mut node = &**base;
+            while let Expr::Subscript { base, .. } | Expr::Slice { base, .. } = node {
+                node = base;
+            }
+            infer_type_res(node, columns)?
+        }
         Expr::Subscript { base, .. } => {
             // A catalog-backed column retains its array element identity here:
             // a domain element has a structural base `ColType`, but its Result
@@ -5556,7 +5593,13 @@ pub fn infer_type_res(
         }
         // An array slice keeps the array type (unlike a subscript, which yields
         // the element type).
-        Expr::Slice { base, .. } => infer_type_res(base, columns)?,
+        Expr::Slice { base, .. } => {
+            let mut node = &**base;
+            while let Expr::Subscript { base, .. } | Expr::Slice { base, .. } = node {
+                node = base;
+            }
+            infer_type_res(node, columns)?
+        }
         // `(record).field`: the field's type from the record's shape.
         Expr::Field { base, field } => match record_field_metadata(base, field, columns) {
             Ok(meta) => (meta.type_oid, meta.ctype.typlen()),
@@ -5794,17 +5837,33 @@ pub fn infer_type_res(
             "__json_serialize_bytea" => of(ColType::Bytea),
             name if name.starts_with("__json_exists_") => of(ColType::Bool),
             "__json_value" => of(ColType::Text),
-            "__jsonb_subscript_set" => {
+            "__jsonb_subscript_set" | "__array_subscript_set" => {
                 let base = args
                     .first()
                     .map(|base| infer_type_res(base, columns))
                     .transpose()?;
-                if base.is_some_and(|(oid, _)| {
-                    matches!(ColType::from_oid(oid), Some(ColType::Array(_)))
-                }) {
-                    return Err(crate::sql::eval::array_element_assignment_unsupported());
+                // An INSERT target starts from NULL: the array of the
+                // assigned element, or the assigned slice's array type.
+                if matches!(args.first(), Some(Expr::Null)) {
+                    let (value_oid, value_length) = args
+                        .get(1)
+                        .map(|value| infer_type_res(value, columns))
+                        .transpose()?
+                        .unwrap_or_else(|| of(ColType::Text));
+                    let value_type = ColType::from_oid(value_oid);
+                    if *name == "__array_subscript_set"
+                        || matches!(value_type, Some(ColType::Array(_)))
+                    {
+                        (value_oid, value_length)
+                    } else {
+                        let element = value_type
+                            .and_then(crate::sql::types::ArrElem::from_coltype)
+                            .unwrap_or(crate::sql::types::ArrElem::Text);
+                        (element.array_oid(), -1)
+                    }
+                } else {
+                    base.unwrap_or_else(|| of(ColType::Jsonb))
                 }
-                base.unwrap_or_else(|| of(ColType::Jsonb))
             }
             name if name.starts_with("__json_query_") => {
                 if name.ends_with("_jsonb") {
@@ -6325,6 +6384,22 @@ pub fn infer_type_res(
                 }
             }
             "xmlagg" => of(ColType::Xml),
+            "json_agg"
+            | "json_agg_strict"
+            | "json_object_agg"
+            | "json_object_agg_strict"
+            | "json_object_agg_unique"
+            | "json_object_agg_unique_strict"
+            | "__json_arrayagg_absent_json"
+            | "__json_arrayagg_null_json" => of(ColType::Json),
+            "jsonb_agg"
+            | "jsonb_agg_strict"
+            | "jsonb_object_agg"
+            | "jsonb_object_agg_strict"
+            | "jsonb_object_agg_unique"
+            | "jsonb_object_agg_unique_strict"
+            | "__json_arrayagg_absent_jsonb"
+            | "__json_arrayagg_null_jsonb" => of(ColType::Jsonb),
             "array_agg" => {
                 // Element type from the argument; the result is elem[].
                 let elem = args

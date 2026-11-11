@@ -9,6 +9,198 @@ use numeric_loops::NumericLoopWorkspace;
 use program::ProgramLayout;
 pub(super) use program::{CompiledProgram, ProgramSource};
 
+/// What a PL/pgSQL invocation is doing, for its error context line.
+#[derive(Clone, Copy)]
+pub(super) enum ProceduralActivity<'s> {
+    /// Function entry or exit: `PL/pgSQL function f()`.
+    Routine,
+    /// `... line N at NAME`, where `source` slices the program text.
+    Statement { source: &'s str, name: &'static str },
+    /// `... [line N] TEXT`, for a phase of the call outside any statement.
+    Phase {
+        source: Option<&'s str>,
+        text: &'static str,
+    },
+}
+
+/// A PL/pgSQL invocation's error context frame (`plpgsql_exec_error_callback`).
+pub(super) struct ProceduralFrame<'p, 's> {
+    signature: &'p str,
+    program: Option<&'p CompiledProgram<'s>>,
+    activity: core::cell::Cell<ProceduralActivity<'s>>,
+}
+
+impl<'p, 's> ProceduralFrame<'p, 's> {
+    pub(super) fn new(
+        signature: &'p str,
+        program: Option<&'p CompiledProgram<'s>>,
+        activity: ProceduralActivity<'s>,
+    ) -> Self {
+        Self {
+            signature,
+            program,
+            activity: core::cell::Cell::new(activity),
+        }
+    }
+
+    pub(super) fn set(&self, activity: ProceduralActivity<'s>) {
+        self.activity.set(activity);
+    }
+
+    fn line(&self, source: &str) -> Option<usize> {
+        self.program.and_then(|program| program.line_of(source))
+    }
+}
+
+impl crate::sql::error_context::Frame for ProceduralFrame<'_, '_> {
+    fn write_line(&self, out: &mut dyn core::fmt::Write, _positioned: bool) -> core::fmt::Result {
+        write!(out, "PL/pgSQL function {}", self.signature)?;
+        match self.activity.get() {
+            ProceduralActivity::Routine => Ok(()),
+            ProceduralActivity::Statement { source, name } => match self.line(source) {
+                Some(line) => write!(out, " line {line} at {name}"),
+                None => Ok(()),
+            },
+            ProceduralActivity::Phase { source, text } => {
+                match source.and_then(|source| self.line(source)) {
+                    Some(line) => write!(out, " line {line} {text}"),
+                    None => write!(out, " {text}"),
+                }
+            }
+        }
+    }
+
+    fn assignment(&self) -> Option<&str> {
+        match self.activity.get() {
+            ProceduralActivity::Statement {
+                source,
+                name: "assignment",
+            } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// The function a PL/pgSQL invocation names in its context lines, as
+/// PostgreSQL's `format_procedure` writes it: `f(integer)`, schema-qualified
+/// when not visible, or `inline_code_block` for `DO`.
+pub(super) fn procedural_signature<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    invocation: TriggerInvocation<'_>,
+) -> Result<&'a str, SqlError> {
+    if matches!(invocation.program_kind, PlpgsqlProgramKind::Anonymous) {
+        return Ok("inline_code_block");
+    }
+    if let Some(signature) = crate::sql::catalog::routine_name_by_oid(
+        context.storage(),
+        context.txn.txid,
+        invocation.routine_oid,
+        true,
+        context.arena,
+    )? {
+        return Ok(signature);
+    }
+    // A trigger function whose catalog row this transaction cannot see is
+    // named as it was invoked; trigger functions take no arguments.
+    context
+        .arena
+        .alloc_str_display(format_args!(
+            "{}.{}()",
+            invocation.routine_schema, invocation.routine_name
+        ))
+        .map_err(|_| super::super::query::arena_full_pub())
+}
+
+/// Records the context of an error raised finishing a function call: the
+/// missing RETURN (`PL/pgSQL function f()`) or the conversion of its result.
+pub(super) fn at_routine_exit<T>(
+    context: &TriggerExecContext<'_, '_, '_>,
+    invocation: TriggerInvocation<'_>,
+    run: impl FnOnce() -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    run().map_err(|error| routine_exit_error(context, invocation, error))
+}
+
+/// Adds the routine-exit context line to `error`; waits and other internal
+/// control pass through unchanged so a resumed call reports them later.
+pub(super) fn routine_exit_error(
+    context: &TriggerExecContext<'_, '_, '_>,
+    invocation: TriggerInvocation<'_>,
+    error: SqlError,
+) -> SqlError {
+    if error.sqlstate.internal_control().is_some() {
+        return error;
+    }
+    let signature = match procedural_signature(context, invocation) {
+        Ok(signature) => signature,
+        Err(signature_error) => return signature_error,
+    };
+    let activity = if error.sqlstate == sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT {
+        ProceduralActivity::Routine
+    } else {
+        ProceduralActivity::Phase {
+            source: None,
+            text: "while casting return value to function's return type",
+        }
+    };
+    let frame = ProceduralFrame::new(signature, None, activity);
+    crate::sql::error_context::with_frame(&frame, || crate::sql::error_context::capture(error))
+}
+
+/// PostgreSQL's name for a statement in a context line (`plpgsql_stmt_typename`).
+pub(super) fn statement_name(statement: TriggerStatement<'_>) -> &'static str {
+    match statement {
+        TriggerStatement::Null => "NULL",
+        TriggerStatement::TransactionControl(PlpgsqlTransactionCommand::Commit(_)) => "COMMIT",
+        TriggerStatement::TransactionControl(PlpgsqlTransactionCommand::Rollback(_)) => "ROLLBACK",
+        TriggerStatement::Assign(_) | TriggerStatement::LocalAssign(_) => "assignment",
+        TriggerStatement::SelectInto(_)
+        | TriggerStatement::Utility { .. }
+        | TriggerStatement::Dml { .. } => "SQL statement",
+        TriggerStatement::DynamicQuery(_) | TriggerStatement::DynamicSelectInto(_) => "EXECUTE",
+        TriggerStatement::CursorOpen(_) => "OPEN",
+        TriggerStatement::CursorMotion(motion) if motion.move_only => "MOVE",
+        TriggerStatement::CursorMotion(_) => "FETCH",
+        TriggerStatement::CursorClose(_) => "CLOSE",
+        TriggerStatement::Perform(_) => "PERFORM",
+        TriggerStatement::Call { .. } => "CALL",
+        TriggerStatement::Assert(_) => "ASSERT",
+        TriggerStatement::Raise(_) => "RAISE",
+        TriggerStatement::GetDiagnostics(_) => "GET DIAGNOSTICS",
+        TriggerStatement::GetStackedDiagnostics(_) => "GET STACKED DIAGNOSTICS",
+        TriggerStatement::Exception(_) => "statement block",
+        // A nested BEGIN ... END block is an always-selected branch.
+        TriggerStatement::If(program)
+            if matches!(
+                program.branches,
+                [TriggerBranch {
+                    condition: None,
+                    ..
+                }]
+            ) =>
+        {
+            "statement block"
+        }
+        TriggerStatement::If(_) => "IF",
+        TriggerStatement::Case(_) => "CASE",
+        TriggerStatement::For(program) => match program.source {
+            TriggerForSource::Numeric { .. } => "FOR with integer loop variable",
+            TriggerForSource::Query(_) => "FOR over SELECT rows",
+            TriggerForSource::DynamicQuery(_) => "FOR over EXECUTE statement",
+            TriggerForSource::Array { .. } => "FOREACH over array",
+        },
+        TriggerStatement::While(_) => "WHILE",
+        TriggerStatement::Loop(_) => "LOOP",
+        TriggerStatement::LoopControl(TriggerLoopControl::Exit { .. }) => "EXIT",
+        TriggerStatement::LoopControl(TriggerLoopControl::Continue { .. }) => "CONTINUE",
+        TriggerStatement::ReturnNext(_) => "RETURN NEXT",
+        TriggerStatement::ReturnQuery(_) | TriggerStatement::ReturnDynamicQuery(_) => {
+            "RETURN QUERY"
+        }
+        TriggerStatement::Return(_) => "RETURN",
+    }
+}
+
 #[expect(
     clippy::large_enum_variant,
     reason = "entry transfers loop and subtransaction owners without heap allocation"
@@ -450,6 +642,18 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
         self.push(entry, source);
     }
 
+    /// The context activity of the statement `source` names.
+    fn source_activity(&self, source: FrameSource) -> ProceduralActivity<'syntax> {
+        let FrameSource::Statement(index) = source else {
+            return ProceduralActivity::Routine;
+        };
+        let block = self.program.block(index.block);
+        ProceduralActivity::Statement {
+            source: block.sources[index.statement],
+            name: statement_name(block.statements[index.statement]),
+        }
+    }
+
     fn source_statement(&self, source: FrameSource) -> TriggerStatement<'syntax> {
         let FrameSource::Statement(source) = source else {
             unreachable!("frame has no enclosing statement")
@@ -491,6 +695,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
         error: SqlError,
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
+        let error = crate::sql::error_context::capture(error);
         let cleanup = self.state.slots[..self.state.active]
             .iter()
             .flatten()
@@ -754,6 +959,25 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
         program: &CompiledProgram<'a>,
         seeded: &[Datum<'a>],
     ) -> Result<(), SqlError> {
+        if self.initialization == execution_frame::Initialization::Complete {
+            return Ok(());
+        }
+        let signature = procedural_signature(context, invocation)?;
+        let frame = ProceduralFrame::new(signature, Some(program), ProceduralActivity::Routine);
+        crate::sql::error_context::within(&frame, || {
+            self.initialize_locals(&frame, context, invocation, transition, program, seeded)
+        })
+    }
+
+    fn initialize_locals(
+        &mut self,
+        context_frame: &ProceduralFrame<'_, 'a>,
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+        invocation: TriggerInvocation<'a>,
+        transition: TriggerTransition<'_, '_, 'a>,
+        program: &CompiledProgram<'a>,
+        seeded: &[Datum<'a>],
+    ) -> Result<(), SqlError> {
         use execution_frame::Initialization;
         let frames = self
             .status
@@ -778,6 +1002,16 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                 return Ok(());
             }
             let local = self.locals[index];
+            context_frame.set(match index.checked_sub(declaration_start) {
+                Some(declaration) => ProceduralActivity::Phase {
+                    source: Some(program.declarations[declaration].source),
+                    text: "during statement block local variable initialization",
+                },
+                None => ProceduralActivity::Phase {
+                    source: None,
+                    text: "while storing call arguments into local variables",
+                },
+            });
             if matches!(self.initialization, Initialization::Value(_)) {
                 let value = if let Some(value) = seeded.get(index).copied() {
                     Some(value)
@@ -822,7 +1056,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                 initialize_phase(&mut self.status, context, |context, continuation| {
                     let txid = context.txn.txid;
                     let arena = context.arena;
-                    execute_procedural_query(context, continuation, |storage, sequences| {
+                    execute_procedural_query(context, false, continuation, |storage, sequences| {
                         coerce_plpgsql_local(local, value, storage, txid, arena, sequences)
                     })
                 })?;
@@ -836,6 +1070,39 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
     )]
     pub(super) fn execute_block(
         &mut self,
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+        definition: crate::storage::RelationDefinition<'_>,
+        invocation: TriggerInvocation<'a>,
+        old: Option<&[Datum<'a>]>,
+        new: &mut Option<&mut [Datum<'a>]>,
+        before: bool,
+        transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
+        program: &CompiledProgram<'a>,
+    ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
+        let signature = procedural_signature(context, invocation)?;
+        let frame = ProceduralFrame::new(signature, Some(program), ProceduralActivity::Routine);
+        crate::sql::error_context::with_frame(&frame, || {
+            self.run_statements(
+                &frame,
+                context,
+                definition,
+                invocation,
+                old,
+                new,
+                before,
+                transition_relations,
+                program,
+            )
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the interpreter retains the complete typed firing context"
+    )]
+    fn run_statements(
+        &mut self,
+        context_frame: &ProceduralFrame<'_, 'a>,
         context: &mut TriggerExecContext<'_, 'a, '_>,
         definition: crate::storage::RelationDefinition<'_>,
         invocation: TriggerInvocation<'a>,
@@ -899,6 +1166,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                                 TriggerFlow::Return(_) => {}
                             }
                         }
+                        context_frame.set(frames.source_activity(frames.last().source));
                         if let Continuation::Protected {
                             boundary,
                             releasing,
@@ -983,12 +1251,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                         outcome = Err(error.publish());
                         break;
                     };
-                    match catch_diagnostic(
-                        context,
-                        invocation,
-                        error,
-                        &mut frames.state.diagnostics,
-                    ) {
+                    match catch_diagnostic(context, error, &mut frames.state.diagnostics) {
                         Ok(()) => frames.push(
                             FrameEntry::new(handler.block, EntryState::Handler),
                             FrameSource::Handler,
@@ -1018,6 +1281,11 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                     .get(frames.last().next)
                     .copied()
                 {
+                    context_frame.set(ProceduralActivity::Statement {
+                        source: frames.program.block(frames.last().block).sources
+                            [frames.last().next],
+                        name: statement_name(statement),
+                    });
                     let invocation = bind_exception_variables(
                         invocation,
                         frames.diagnostic(),
@@ -1043,6 +1311,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                     )
                     .map(Some);
                 }
+                context_frame.set(frames.source_activity(frames.last().source));
                 match frames.last().continuation {
                     Continuation::Loop => {
                         frames.last_mut().next = 0;
@@ -1310,7 +1579,6 @@ fn bind_exception_variables<'a>(
 
 fn catch_diagnostic(
     context: &mut TriggerExecContext<'_, '_, '_>,
-    invocation: TriggerInvocation<'_>,
     error: PendingError,
     buffers: &mut DiagnosticBuffers,
 ) -> Result<(), SqlError> {
@@ -1321,7 +1589,7 @@ fn catch_diagnostic(
         super::super::sequence::record_caught_cancellation(context.seq_session());
     }
     let _ = crate::sql::eval::take_diagnostic();
-    error.catch(buffers, invocation.context().as_str())
+    error.catch(buffers)
 }
 
 #[cfg(test)]

@@ -82,10 +82,10 @@ waits; `INSERT ... SELECT`, `UPDATE`, `DELETE` and `MERGE`, at top level and
 in `CALL` and `DO` bodies, yielding on storage reads while they select and lock
 rows and restarting from their start; routine calls inside the rows of an
 `INSERT`, `UPDATE`, `DELETE` or `MERGE` (expressions, join conditions, row
-triggers, `RETURNING`) at top level, in PL/pgSQL statements and `EXECUTE`,
-and in SQL-language bodies, which keep the rows already changed so the call
-sees them, as in PostgreSQL; `MERGE` as a static PL/pgSQL statement and
-through `EXECUTE`.
+triggers, `RETURNING`) at top level, in PL/pgSQL statements (including static
+`RETURNING ... INTO`) and `EXECUTE`, and in SQL-language bodies, which keep
+the rows already changed so the call sees them, as in PostgreSQL; `MERGE` as a
+static PL/pgSQL statement and through `EXECUTE`.
 The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
@@ -111,10 +111,8 @@ is owned.
   expression requires retained write progress`), at top level and inside a
   routine, because restarting would hide the earlier rows from the call. `INSERT ... SELECT` evaluates its whole source before writing, so a
   volatile call in the source does not see rows inserted earlier by the same
-  statement. A static PL/pgSQL `INSERT`, `UPDATE`, `DELETE` or `MERGE` with
-  `RETURNING` (with or without `INTO`) fails with `0A000`, and a static
-  `MERGE` source subquery cannot read routine variables (`42703`); dynamic `EXECUTE
-  ... INTO` already assigns returned values. Triggers fired inside a write run
+  statement. A static PL/pgSQL `MERGE` source subquery cannot read routine
+  variables (`42703`). Triggers fired inside a write run
   without the engine's utility
   executor, so DDL there (PL/pgSQL `CREATE TABLE`, or a SQL procedure that a
   BEFORE trigger calls) fails with `0A000`.
@@ -304,29 +302,44 @@ statement runs. Expressions are shown as stored, not deparsed: `pg_get_expr`,
 `pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
 `text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
 the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
-than one deparsed statement per line. Syntax and scanner errors in a client's
-query report PostgreSQL's wording and cursor position (the `P` field that psql shows as `LINE 1:` and a caret), but
-other errors do not yet: PostgreSQL also points at the unknown relation, column,
-type, function or failed constant (`SELECT * FROM missing_table` reports
-position 15), maps a syntax error inside a SQL function body to its place in the
-`CREATE FUNCTION` text, and reports dynamic SQL failures (`EXECUTE 'SELEC 1'`)
-with an internal query and position (`q`, `p`) plus a `CONTEXT` line, which
-pos3ql does not send. An echoed token longer than the 96-byte parser message is
-cut short. The scanner does not read Unicode-escape literals (`U&'\0041'`,
-`U&"\0041"`, `UESCAPE`), so `SELECT U&'\0041'` fails as an unknown column
-`u`, and an identifier longer than 63 bytes is rejected (`name ... is longer
-than 63 bytes`) where PostgreSQL truncates it with a `NOTICE`. Assigning to an
-array element or slice (`UPDATE t SET a[1] = 9`) fails with `0A000`. A slice
-followed by an index (`a[1:1][1]`) indexes the slice where PostgreSQL treats the
-whole list as a slice, and a subscripted scalar subquery is named `?column?`
-where PostgreSQL names it after the subquery's column.
-Checks the parser makes where PostgreSQL checks later
-still fail with `42601` and `syntax error: <description>`: type modifiers
-(`numeric(2000)` is `22023` `NUMERIC precision 2000 must be between 1 and
-1000` in PostgreSQL), COPY targets and options, storage parameters, sequence,
-role and large-object values, and SQL/JSON result types. An unsupported cast
-reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
-`42846` `cannot cast type integer to timestamp without time zone`.
+than one deparsed statement per line. Errors in a client's query report
+PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
+caret) for syntax errors and for unknown relations, columns, types, functions
+and operators, failed constant input and non-boolean conditions, except a
+folded or quoted identifier in a statement that waited for typed inputs and a
+constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
+`INSERT has more target columns than expressions` without its position; other
+target and expression count errors are positioned. An error raised while
+PostgreSQL inlines a SQL function's body
+(`SQL function "f" during inlining`) has no context line. Under
+`#variable_conflict use_variable` a variable that is also a column fails with
+`0A000`: aggregate inputs and grouping keys bind names to columns before the
+variable could win. PostgreSQL fixes a function's `plpgsql.variable_conflict`
+when its creating session validates it at `CREATE FUNCTION`; pos3ql reads it
+at the backend's first call of a function or top-level `CALL`, and at every
+call of a trigger function or of a procedure called from PL/pgSQL. PL/pgSQL `#print_strict_params` and `#option
+dump` fail with `0A000`, so `STRICT` errors carry no `parameters:` detail, and
+a block label (`<<outer>>`) is rejected, so `outer.x` cannot name a block's
+variable. A constant compared with a column inside a subquery of an `INSERT`, `UPDATE` or `DELETE`
+(`DELETE FROM t WHERE a IN (SELECT a FROM u WHERE a = 'q')`) is checked only
+when a row is compared, so an empty table succeeds where PostgreSQL rejects
+`'q'`; a `SELECT`'s subqueries are checked at every level. Assigning a composite
+column's field (`UPDATE t SET pair.x = 1`) is a syntax error; PostgreSQL
+assigns the field. A PL/pgSQL subscripted assignment converts its element
+with an explicit cast, so `x[1] := true` for an integer array stores 1 where
+PostgreSQL rejects the boolean while analysing the assignment. A
+data-changing `WITH` query that the main query does not read runs before it,
+so a volatile function the main query calls sees its rows; PostgreSQL runs it
+after the main query.
+Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
+options, storage parameters, sequence, database and large-object values,
+SQL/JSON result types) are reported when the statement would run. In a
+`SELECT`, an unknown relation, a modifier's unknown type and an output column
+written before the failing modifier are reported first, as PostgreSQL's
+analysis order finds them; in other statements the modifier error comes first.
+COPY to or from a server file or program,
+`COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
+RETURNING` a non-JSON, non-string type are rejected with `0A000`.
 A SQL-language procedure called from a trigger fired inside a write (a BEFORE
 row trigger, a deferred constraint trigger at `COMMIT`) runs queries, data
 changes and nested `CALL`, but rejects DDL and other utility statements with

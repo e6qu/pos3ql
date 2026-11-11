@@ -4382,8 +4382,9 @@ pub enum TypeMod {
     Length(usize),
     /// `bit(n)` / `varbit(n)`: a bit count without a header.
     BitLength(usize),
-    /// `numeric(p, s)`.
-    NumericPS { precision: u16, scale: u16 },
+    /// `numeric(p, s)`: PostgreSQL allows a scale from -1000 to 1000, so it
+    /// may be negative (round to tens) or exceed the precision.
+    NumericPS { precision: u16, scale: i16 },
     /// `timestamp(p)` / `timestamptz(p)` / `time(p)` / `timetz(p)`:
     /// fractional-second digits, 0..=6.
     TemporalPrecision(u8),
@@ -4424,9 +4425,10 @@ impl TypeMod {
             ColType::Numeric => {
                 if atttypmod >= 4 {
                     let packed = atttypmod - 4;
+                    // PostgreSQL's NUMERIC_TYPMOD_SCALE: an 11-bit signed field.
                     TypeMod::NumericPS {
                         precision: ((packed >> 16) & 0xFFFF) as u16,
-                        scale: (packed & 0xFFFF) as u16,
+                        scale: (((packed & 0x7FF) ^ 1024) - 1024) as i16,
                     }
                 } else {
                     TypeMod::None
@@ -4464,7 +4466,7 @@ impl TypeMod {
             TypeMod::Length(n) => n as i32 + 4,
             TypeMod::BitLength(n) => n as i32,
             TypeMod::NumericPS { precision, scale } => {
-                (((precision as i32) << 16) | (scale as i32)) + 4
+                (((precision as i32) << 16) | (i32::from(scale) & 0x7FF)) + 4
             }
             TypeMod::TemporalPrecision(p) => i32::from(p),
             TypeMod::IntervalMod { range, precision } => {
@@ -5551,6 +5553,20 @@ mod tests {
                 TypeMod::NumericPS {
                     precision: 6,
                     scale: 2,
+                },
+            ),
+            (
+                ColType::Numeric,
+                TypeMod::NumericPS {
+                    precision: 5,
+                    scale: -2,
+                },
+            ),
+            (
+                ColType::Numeric,
+                TypeMod::NumericPS {
+                    precision: 3,
+                    scale: 1000,
                 },
             ),
             (ColType::Timestamp, TypeMod::TemporalPrecision(3)),

@@ -311,30 +311,47 @@ resolved one. Expressions are shown as stored, not deparsed: `pg_get_expr`,
 `pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
 `text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
 the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
-than one deparsed statement per line. Syntax and scanner errors in a client's
-query report PostgreSQL's wording and cursor position (the `P` field that psql shows as `LINE 1:` and a caret), but
-other errors do not yet: PostgreSQL also points at the unknown relation, column,
-type, function or failed constant (`SELECT * FROM missing_table` reports
-position 15), maps a syntax error inside a SQL function body to its place in the
-`CREATE FUNCTION` text, and reports dynamic SQL failures (`EXECUTE 'SELEC 1'`)
-with an internal query and position (`q`, `p`) plus a `CONTEXT` line, which
-pos3ql does not send. An echoed token longer than the 96-byte parser message is
-cut short. The scanner does not read Unicode-escape literals (`U&'\0041'`,
-`U&"\0041"`, `UESCAPE`), so `SELECT U&'\0041'` fails as an unknown column
-`u`, and an identifier longer than 63 bytes is rejected (`name ... is longer
-than 63 bytes`) where PostgreSQL truncates it with a `NOTICE`. Assigning to an
-array element or slice (`UPDATE t SET a[1] = 9`) fails with `0A000`. A slice
-followed by an index (`a[1:1][1]`) indexes the slice where PostgreSQL treats the
-whole list as a slice, and a subscripted scalar subquery is named `?column?`
-where PostgreSQL names it after the subquery's column. `pg_sleep` and its
+than one deparsed statement per line. Errors in a client's query report
+PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
+caret) for syntax errors and for unknown relations, columns, types, functions
+and operators, failed constant input and non-boolean conditions, except a
+folded or quoted identifier in a statement that waited for typed inputs and a
+constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
+`INSERT has more target columns than expressions` without its position; other
+target and expression count errors are positioned. At
+`CREATE FUNCTION`, a SQL body's queries are analysed for their relations,
+output columns, functions and types, and a data-changing statement only for
+its target relation, so an unknown column in an `UPDATE ... SET` list is
+found when the function runs. An error raised while PostgreSQL inlines a SQL function's body
+(`SQL function "f" during inlining`) has no context line. Under
+`#variable_conflict use_variable` a variable that is also a column fails with
+`0A000`: aggregate inputs and grouping keys bind names to columns before the
+variable could win. PostgreSQL fixes a function's `plpgsql.variable_conflict`
+when its creating session validates it at `CREATE FUNCTION`; pos3ql reads it
+at the backend's first call. A function-qualified parameter (`f.a` in function `f`)
+fails as a missing FROM-clause entry, and PL/pgSQL `INSERT`, `UPDATE` and
+`DELETE ... RETURNING ... INTO` fail with a syntax error at `INTO`. A constant compared
+with a column inside a subquery (`SELECT (SELECT a FROM t WHERE a = 'q')`) is
+checked only when a row is compared, so an empty table returns NULL where
+PostgreSQL rejects `'q'`; the outer query's conditions, output list and joins
+and an `UPDATE` or `DELETE` condition are checked before any row is read. Assignment
+coercion is not analysed: a value of a type without an assignment cast to its
+target converts when the row is written, so `UPDATE t SET m[1] = 'x'::text`
+on an empty table succeeds and `INSERT INTO t (m[1:2]) SELECT '{1,2}' UNION
+ALL SELECT '{3,4}'` stores the text where PostgreSQL reports `42804`
+(`subscripted assignment to "m" requires type integer[] but expression is of
+type text`); fixing it needs PostgreSQL's assignment-cast rules for every
+target type. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
-Checks the parser makes where PostgreSQL checks later
-still fail with `42601` and `syntax error: <description>`: type modifiers
-(`numeric(2000)` is `22023` `NUMERIC precision 2000 must be between 1 and
-1000` in PostgreSQL), COPY targets and options, storage parameters, sequence,
-role and large-object values, and SQL/JSON result types. An unsupported cast
-reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
-`42846` `cannot cast type integer to timestamp without time zone`.
+Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
+options, storage parameters, sequence, database and large-object values,
+SQL/JSON result types) are reported when the statement would run. In a
+`SELECT`, an unknown relation, a modifier's unknown type and an output column
+written before the failing modifier are reported first, as PostgreSQL's
+analysis order finds them; in other statements the modifier error comes first.
+COPY to or from a server file or program,
+`COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
+RETURNING` a non-JSON, non-string type are rejected with `0A000`.
 PL/pgSQL `CALL`, written directly or run with `EXECUTE`, fails with `0A000`
 (`CALL is not supported in PL/pgSQL`); supporting it needs output parameters
 assigned to the caller's variables, PostgreSQL's transaction-control rules for

@@ -616,7 +616,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             }
             Datum::Date(d) => Datum::Timestamp(date_to_timestamp(d)?),
             Datum::Text(s) => Datum::Timestamp(crate::sql::datetime::parse_timestamp(s, false)?),
-            _ => return Err(cast_unsupported(&v, "timestamp")),
+            _ => return Err(cast_unsupported(&v, "timestamp without time zone")),
         },
         ColType::Timestamptz => match v {
             Datum::Timestamptz(_) => v,
@@ -778,7 +778,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 element,
                 raw: crate::sql::array::parse_literal(s, element, arena)?,
             },
-            _ => return Err(cast_unsupported(&v, "array")),
+            _ => return Err(cast_unsupported(&v, target.name())),
         },
         ColType::Uuid => match v {
             Datum::Uuid(_) => v,
@@ -1387,9 +1387,15 @@ pub(crate) fn parse_int_bounded(
 
 /// Parses PostgreSQL's unsigned four-byte object identifier. Keeping this
 /// separate from `int4` preserves the valid upper half of the OID domain.
+/// Like PostgreSQL's `uint32in_subr`, a negative value down to `-2^31` wraps
+/// (`'-1'::oid` is 4294967295).
 pub(crate) fn parse_oid(s: &str) -> Result<u32, SqlError> {
     match classify_int_literal(s) {
-        IntLiteral::Value(value) if (0..=i64::from(u32::MAX)).contains(&value) => Ok(value as u32),
+        IntLiteral::Value(value)
+            if (i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&value) =>
+        {
+            Ok(value as u32)
+        }
         IntLiteral::Value(_) | IntLiteral::Overflow => Err(out_of_range(s.trim(), "oid")),
         IntLiteral::Malformed => Err(bad_text(s, "oid")),
     }

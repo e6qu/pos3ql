@@ -4410,9 +4410,28 @@ pub(crate) struct Chained<'r, 'a> {
     pub(crate) inner: &'r dyn ColumnLookup<'a>,
     pub(crate) outer: Option<&'r dyn ColumnLookup<'a>>,
 }
+impl Chained<'_, '_> {
+    /// Whether the inner row's column named `qualifier.name` answers a
+    /// reference, rather than an enclosing PL/pgSQL variable of that name.
+    fn inner_column_wins(&self, qualifier: Option<&str>, name: &str) -> bool {
+        crate::sql::eval::column_precedes_variable_quietly(self.outer, qualifier, name)
+    }
+}
+
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        self.inner
+            .procedural_variable(qualifier, name)
+            .or_else(|| self.outer?.procedural_variable(qualifier, name))
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
-        if self.inner.col_type(qualifier, name).is_some() {
+        if self.inner.col_type(qualifier, name).is_some() && self.inner_column_wins(qualifier, name)
+        {
             self.inner.column_type_mod(qualifier, name)
         } else {
             self.outer
@@ -4452,6 +4471,15 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
                         outer.resolve_column_type(qualifier, name)
                     }
                     _ => Err(error),
+                }
+            }
+            Ok(ctype) => {
+                if crate::sql::eval::column_precedes_variable(self.outer, qualifier, name)? {
+                    Ok(ctype)
+                } else {
+                    self.outer
+                        .expect("a variable answers only through an enclosing scope")
+                        .resolve_column_type(qualifier, name)
                 }
             }
             result => result,
@@ -4512,7 +4540,15 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
 
     fn lookup(&self, q: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         match self.inner.lookup(q, name) {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                if crate::sql::eval::column_precedes_variable(self.outer, q, name)? {
+                    Ok(v)
+                } else {
+                    self.outer
+                        .expect("a variable answers only through an enclosing scope")
+                        .lookup(q, name)
+                }
+            }
             Err(e)
                 if !matches!(
                     e.sqlstate.as_str(),
@@ -4539,7 +4575,8 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
         match self.inner.resolve_column_type(q, name) {
-            Ok(_) => self.inner.column_user_type(q, name),
+            Ok(_) if self.inner_column_wins(q, name) => self.inner.column_user_type(q, name),
+            Ok(_) => self.outer.and_then(|outer| outer.column_user_type(q, name)),
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),
@@ -4555,7 +4592,8 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
 
     fn column_type_oid(&self, q: Option<&str>, name: &str) -> Option<i32> {
         match self.inner.resolve_column_type(q, name) {
-            Ok(_) => self.inner.column_type_oid(q, name),
+            Ok(_) if self.inner_column_wins(q, name) => self.inner.column_type_oid(q, name),
+            Ok(_) => self.outer.and_then(|outer| outer.column_type_oid(q, name)),
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),
@@ -4571,7 +4609,12 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
 
     fn collation(&self, q: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         match self.inner.resolve_column_type(q, name) {
-            Ok(_) => self.inner.collation(q, name),
+            Ok(_) if self.inner_column_wins(q, name) => self.inner.collation(q, name),
+            Ok(_) => self
+                .outer
+                .map_or(crate::sql::ast::Collation::None, |outer| {
+                    outer.collation(q, name)
+                }),
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),

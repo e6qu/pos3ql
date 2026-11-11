@@ -290,8 +290,10 @@ fn routine_identity_errors_quote_postgresql_signatures() {
              text, text, text, text, text, text, text, text, text, text, text)",
             &[(
                 'E',
-                "54000",
-                "function diagnostic exceeds SQL error message capacity (192 bytes)",
+                "42883",
+                "function f(text, text, text, text, text, text, text, text, text, text, text, \
+                 text, text, text, text, text, text, text, text, text, text, text, text, text, \
+                 text, text, text, text, text, text, text, text, text, text, text) does not exist",
             )],
         ),
     ]);

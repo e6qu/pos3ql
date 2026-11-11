@@ -1579,11 +1579,15 @@ impl<'a> Parser<'a> {
         if self.eat_ident("group")? {
             return self.create_role(false);
         }
+        let global_at = self.peek_at;
         let temporary_scope = if self.eat_ident("global")? {
-            self.warn(stack_format!(
-                96,
-                "GLOBAL is deprecated in temporary table creation"
-            ))?;
+            self.notice(super::ParseNotice {
+                warning: true,
+                sqlstate: sqlstate::WARNING,
+                message: "GLOBAL is deprecated in temporary table creation",
+                cursor: Some(global_at),
+                raw: true,
+            })?;
             Some("GLOBAL")
         } else if self.eat_ident("local")? {
             Some("LOCAL")
@@ -1624,13 +1628,15 @@ impl<'a> Parser<'a> {
             Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "access method \"{}\" is not supported for user-defined operator objects",
                     method
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             })
         }
     }
@@ -1882,12 +1888,14 @@ impl<'a> Parser<'a> {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(
-                        96,
+                        super::PARSE_MESSAGE_BYTES,
                         "custom selectivity functions are not supported by the bounded planner"
                     ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             } else {
                 return Err(self.err_here("invalid CREATE OPERATOR option"));
@@ -1959,12 +1967,14 @@ impl<'a> Parser<'a> {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "btree ordering operators are not supported in a search operator class"
                             ),
                             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     }
                     self.expect_ident("search")?;
@@ -2036,45 +2046,53 @@ impl<'a> Parser<'a> {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "operator attribute \"commutator\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     } else if self.eat_ident("negator")? {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "operator attribute \"negator\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     } else if self.eat_ident("hashes")? {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "operator attribute \"hashes\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     } else if self.eat_ident("merges")? {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "operator attribute \"merges\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     } else if self.eat_ident("restrict")? {
                         self.expect_op("=")?;
@@ -2086,12 +2104,14 @@ impl<'a> Parser<'a> {
                             return Err(ParseError {
                                 at: self.peek_at,
                                 message: stack_format!(
-                                    96,
+                                    super::PARSE_MESSAGE_BYTES,
                                     "custom selectivity functions are not supported by the bounded planner"
                                 ),
                                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                                 cursor: None,
                                 hint: None,
+                                near: None,
+                                detail: None,
                             });
                         }
                         selectivity_reset.restrict = true;
@@ -2105,12 +2125,14 @@ impl<'a> Parser<'a> {
                             return Err(ParseError {
                                 at: self.peek_at,
                                 message: stack_format!(
-                                    96,
+                                    super::PARSE_MESSAGE_BYTES,
                                     "custom selectivity functions are not supported by the bounded planner"
                                 ),
                                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                                 cursor: None,
                                 hint: None,
+                                near: None,
+                                detail: None,
                             });
                         }
                         selectivity_reset.join = true;
@@ -2141,12 +2163,14 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "btree ordering operators are not supported in a search operator family"
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 self.expect_ident("search")?;
@@ -2339,10 +2363,16 @@ impl<'a> Parser<'a> {
         {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "invalid extension version name: {}", version),
+                message: stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "invalid extension version name: {}",
+                    version
+                ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         self.advance()?;
@@ -2464,17 +2494,9 @@ impl<'a> Parser<'a> {
         let spelled = if written.schema.is_none() && !written.array {
             written.name
         } else {
-            let text = stack_format!(
-                264,
-                "{}{}{}{}",
-                written.schema.unwrap_or(""),
-                if written.schema.is_some() { "." } else { "" },
-                written.name,
-                if written.array { "[]" } else { "" }
-            );
             self.arena
-                .alloc_str(text.as_str())
-                .map_err(|_| self.err_here("type name too long"))?
+                .alloc_str_display(written)
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?
         };
         Ok((
             RoutineArgumentType {
@@ -2579,10 +2601,15 @@ impl<'a> Parser<'a> {
         }
         Err(ParseError {
             at: self.peek_at,
-            message: stack_format!(96, "unsupported extension member object kind"),
+            message: stack_format!(
+                super::PARSE_MESSAGE_BYTES,
+                "unsupported extension member object kind"
+            ),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
             cursor: None,
             hint: None,
+            near: None,
+            detail: None,
         })
     }
 
@@ -2642,23 +2669,31 @@ impl<'a> Parser<'a> {
                 } else {
                     return Err(ParseError {
                         at: self.peek_at,
-                        message: stack_format!(96, "unrecognized statistics kind \"{}\"", kind),
+                        message: stack_format!(
+                            super::PARSE_MESSAGE_BYTES,
+                            "unrecognized statistics kind \"{}\"",
+                            kind
+                        ),
                         sqlstate: sqlstate::SYNTAX_ERROR,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 };
                 if !fresh {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "statistics kind \"{}\" specified more than once",
                             kind
                         ),
                         sqlstate: sqlstate::SYNTAX_ERROR,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 if !self.eat_op(",")? {
@@ -2805,10 +2840,16 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -2833,10 +2874,16 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             };
             if core::mem::replace(target, true) {
@@ -2987,10 +3034,16 @@ impl<'a> Parser<'a> {
             {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "database option {} is not supported", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "database option {} is not supported",
+                        option
+                    ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             } else if option.eq_ignore_ascii_case("collation_version") {
                 if options
@@ -3014,10 +3067,7 @@ impl<'a> Parser<'a> {
                     return Err(self.err_here("ALLOW_CONNECTIONS specified more than once"));
                 }
             } else if option.eq_ignore_ascii_case("connection_limit") {
-                let value = i32::try_from(self.seq_int()?)
-                    .ok()
-                    .filter(|value| *value >= -1)
-                    .ok_or_else(|| self.err_here("connection limit is out of range"))?;
+                let value = self.database_connection_limit()?;
                 if options.connection_limit.replace(value).is_some() {
                     return Err(self.err_here("CONNECTION LIMIT specified more than once"));
                 }
@@ -3072,10 +3122,7 @@ impl<'a> Parser<'a> {
                         return Err(self.err_here("ALLOW_CONNECTIONS specified more than once"));
                     }
                 } else if option.eq_ignore_ascii_case("connection_limit") {
-                    let value = i32::try_from(self.seq_int()?)
-                        .ok()
-                        .filter(|value| *value >= -1)
-                        .ok_or_else(|| self.err_here("connection limit is out of range"))?;
+                    let value = self.database_connection_limit()?;
                     if connection_limit.replace(value).is_some() {
                         return Err(self.err_here("CONNECTION LIMIT specified more than once"));
                     }
@@ -3309,10 +3356,15 @@ impl<'a> Parser<'a> {
         if or_replace && constraint {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "CREATE OR REPLACE CONSTRAINT TRIGGER is not supported"),
+                message: stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "CREATE OR REPLACE CONSTRAINT TRIGGER is not supported"
+                ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         let name = self.col_ident("trigger name")?;
@@ -3340,13 +3392,15 @@ impl<'a> Parser<'a> {
                             return Err(ParseError {
                                 at: self.peek_at,
                                 message: stack_format!(
-                                    96,
+                                    super::PARSE_MESSAGE_BYTES,
                                     "column \"{}\" specified more than once",
                                     column
                                 ),
                                 sqlstate: sqlstate::DUPLICATE_COLUMN,
                                 cursor: None,
                                 hint: None,
+                                near: None,
+                                detail: None,
                             });
                         }
                         self.push(&mut update_columns, column)?;
@@ -3623,10 +3677,15 @@ impl<'a> Parser<'a> {
             WrittenMode::Out => {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "only input parameters can have default values"),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "only input parameters can have default values"
+                    ),
                     sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
             WrittenMode::InOut => RoutineArgumentMode::InOut { default_text },
@@ -3673,12 +3732,14 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "VARIADIC parameter must be the last input parameter"
                         ),
                         sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 if argument.mode.is_input() {
@@ -3688,12 +3749,14 @@ impl<'a> Parser<'a> {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "input parameters after one with a default value must also have defaults"
                             ),
                             sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     }
                 }
@@ -3703,13 +3766,15 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "target lists can have at most {} entries",
                             crate::storage::MAX_COLUMNS
                         ),
                         sqlstate: sqlstate::TOO_MANY_COLUMNS,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 arguments[count] = argument;
@@ -3737,12 +3802,14 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "OUT and INOUT arguments cannot be used with RETURNS TABLE"
                         ),
                         sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 self.expect_op("(")?;
@@ -3756,13 +3823,15 @@ impl<'a> Parser<'a> {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "target lists can have at most {} entries",
                                 columns.len()
                             ),
                             sqlstate: sqlstate::TOO_MANY_COLUMNS,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     }
                     columns[column_count] = RoutineResultColumn {
@@ -3832,13 +3901,15 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "routine language \"{}\" is not supported",
                             unsupported
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 });
             } else if self.eat_ident("as")? {
@@ -3851,12 +3922,14 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "native-library routine bodies are not supported"
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 body = Some(crate::sql::ast::RoutineBody::String(source));
@@ -4016,26 +4089,41 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("window")? {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "user-defined window functions are not supported"),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "user-defined window functions are not supported"
+                    ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             } else if self.eat_ident("transform")? {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "routine transforms are not supported"),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "routine transforms are not supported"
+                    ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             } else if self.eat_ident("support")? {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "planner support functions are not supported"),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "planner support functions are not supported"
+                    ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             } else if self.eat_ident("set")? {
                 let config_name = self.configuration_parameter_name()?;
@@ -4075,10 +4163,15 @@ impl<'a> Parser<'a> {
         }) {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "SQL-standard bodies require LANGUAGE SQL"),
+                message: stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "SQL-standard bodies require LANGUAGE SQL"
+                ),
                 sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         if !function
@@ -4106,20 +4199,28 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "ROWS is not applicable when function does not return a set"
                 ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
-        if matches!(
-            kind,
-            RoutineCreateKind::Trigger | RoutineCreateKind::EventTrigger
-        ) && language != crate::sql::ast::RoutineLanguage::PlPgSql
+        // PostgreSQL's SQL-function validator rejects these pseudo-types.
+        if language == crate::sql::ast::RoutineLanguage::Sql
+            && let Some(result) = match kind {
+                RoutineCreateKind::Trigger => Some("trigger"),
+                RoutineCreateKind::EventTrigger => Some("event_trigger"),
+                _ => None,
+            }
         {
-            return Err(self.unexpected("trigger functions require LANGUAGE plpgsql"));
+            return Err(self.invalid_function_definition_owned(stack_format!(
+                super::PARSE_MESSAGE_BYTES,
+                "SQL functions cannot return type {result}"
+            )));
         }
         if language == crate::sql::ast::RoutineLanguage::PlPgSql
             && !matches!(
@@ -4134,10 +4235,15 @@ impl<'a> Parser<'a> {
         {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "PL/pgSQL function execution is not supported"),
+                message: stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "PL/pgSQL function execution is not supported"
+                ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         Ok(Stmt::CreateRoutine(CreateRoutine {
@@ -4301,6 +4407,32 @@ impl<'a> Parser<'a> {
         Err(self.syntax_error_here())
     }
 
+    /// PostgreSQL's `SignedIconst`: an `int4` integer constant with an optional
+    /// sign; anything else is a syntax error at the number.
+    fn signed_integer_constant(&mut self) -> Result<i32, ParseError> {
+        let negative = match self.peeked {
+            Tok::Op("-") => {
+                self.advance()?;
+                true
+            }
+            Tok::Op("+") => {
+                self.advance()?;
+                false
+            }
+            _ => false,
+        };
+        let Tok::Num(raw) = self.peeked else {
+            return Err(self.syntax_error_here());
+        };
+        let Some(value) =
+            crate::sql::eval::parse_int_literal(raw).and_then(|value| i32::try_from(value).ok())
+        else {
+            return Err(self.syntax_error_here());
+        };
+        self.advance()?;
+        Ok(if negative { -value } else { value })
+    }
+
     fn role_options(&mut self) -> Result<RoleOptions<'a>, ParseError> {
         let mut options = RoleOptions::EMPTY;
         while self.role_option(&mut options, false)? {}
@@ -4342,28 +4474,19 @@ impl<'a> Parser<'a> {
             self.set_role_option(&mut options.bypass_row_level_security, false)?;
         } else if self.eat_ident("connection")? {
             self.expect_ident("limit")?;
-            let negative = self.eat_op("-")?;
-            let Tok::Num(raw) = self.peeked else {
-                return Err(self.syntax_error_here());
-            };
-            let parsed = raw
-                .parse::<i32>()
-                .map_err(|_| self.unexpected("connection limit is out of range"))?;
-            self.advance()?;
-            self.set_role_option(
-                &mut options.connection_limit,
-                if negative { -parsed } else { parsed },
-            )?;
+            let limit = self.signed_integer_constant()?;
+            self.set_role_option(&mut options.connection_limit, limit)?;
         } else if allow_sysid && self.eat_ident("sysid")? {
-            let negative = self.eat_op("-")?;
             let Tok::Num(raw) = self.peeked else {
                 return Err(self.syntax_error_here());
             };
-            let parsed = raw
-                .parse::<i32>()
-                .map_err(|_| self.unexpected("SYSID is out of range"))?;
+            let Some(sysid) = crate::sql::eval::parse_int_literal(raw)
+                .and_then(|value| i32::try_from(value).ok())
+            else {
+                return Err(self.syntax_error_here());
+            };
             self.advance()?;
-            self.set_role_option(&mut options.sysid, if negative { -parsed } else { parsed })?;
+            self.set_role_option(&mut options.sysid, sysid)?;
         } else if self.eat_ident("password")? {
             let password = self.role_password_spec()?;
             self.set_role_option(&mut options.password, password)?;
@@ -4375,10 +4498,15 @@ impl<'a> Parser<'a> {
             self.expect_ident("password")?;
             return Err(ParseError {
                 at: self.peek_at,
-                message: crate::stack_format!(96, "UNENCRYPTED PASSWORD is no longer supported"),
+                message: crate::stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "UNENCRYPTED PASSWORD is no longer supported"
+                ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         } else if self.eat_ident("valid")? {
             self.expect_ident("until")?;
@@ -4416,13 +4544,15 @@ impl<'a> Parser<'a> {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: crate::stack_format!(
-                        96,
+                        super::PARSE_MESSAGE_BYTES,
                         "SCRAM verifier salt exceeds {} bytes",
                         crate::pg::auth::SCRAM_SALT_MAX
                     ),
                     sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
         }
@@ -4605,10 +4735,15 @@ impl<'a> Parser<'a> {
                     DomainNullability::NotNull { .. } => {
                         return Err(ParseError {
                             at: self.peek_at,
-                            message: stack_format!(96, "redundant NOT NULL constraint definition"),
+                            message: stack_format!(
+                                super::PARSE_MESSAGE_BYTES,
+                                "redundant NOT NULL constraint definition"
+                            ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     }
                     DomainNullability::Unspecified => {}
@@ -4618,12 +4753,14 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "not-null constraints for domains cannot be marked NO INHERIT"
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 nullability = DomainNullability::NotNull { name: cname };
@@ -4643,12 +4780,14 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "check constraints for domains cannot be marked NO INHERIT"
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 self.push(&mut checks, check)?;
@@ -5127,23 +5266,99 @@ impl<'a> Parser<'a> {
         Ok(o)
     }
 
-    /// A signed integer literal for a sequence option. Parses through `i128` so
-    /// `MINVALUE -9223372036854775808` (i64::MIN) is representable.
+    /// A sequence option value: PostgreSQL's `NumericOnly`, converted to
+    /// `bigint` when the statement runs, so a bad value is an analysis error.
     pub(super) fn seq_int(&mut self) -> Result<i64, ParseError> {
-        let negative = self.eat_op("-")?;
-        if !negative {
-            let _ = self.eat_op("+")?;
-        }
-        match self.peeked {
-            Tok::Num(text) => {
-                let magnitude: i128 = text.parse().map_err(|_| self.syntax_error_here())?;
-                self.advance()?;
-                let value = if negative { -magnitude } else { magnitude };
-                i64::try_from(value)
-                    .map_err(|_| self.unexpected("sequence option value out of range for bigint"))
+        let at = self.peek_at;
+        let (text, _) = self.numeric_only()?;
+        match crate::sql::eval::parse_int_bounded(text, i64::MIN, i64::MAX, "bigint") {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.analysis_error(ParseError {
+                    at,
+                    message: stack_format!(super::PARSE_MESSAGE_BYTES, "{}", error.message),
+                    sqlstate: if error.sqlstate == sqlstate::NUMERIC_OUT_OF_RANGE {
+                        sqlstate::NUMERIC_OUT_OF_RANGE
+                    } else {
+                        sqlstate::INVALID_TEXT_REPRESENTATION
+                    },
+                    cursor: None,
+                    hint: None,
+                    near: None,
+                    detail: None,
+                })?;
+                Ok(0)
             }
-            _ => Err(self.syntax_error_here()),
         }
+    }
+
+    /// PostgreSQL's `NumericOnly`: a numeric constant with an optional sign,
+    /// as text, and whether it is an integer constant (ICONST) that fits
+    /// `int4`.
+    pub(super) fn numeric_only(&mut self) -> Result<(&'a str, bool), ParseError> {
+        let sign = match self.peeked {
+            Tok::Op(sign @ ("-" | "+")) => {
+                self.advance()?;
+                sign
+            }
+            _ => "",
+        };
+        let Tok::Num(text) = self.peeked else {
+            return Err(self.syntax_error_here());
+        };
+        self.advance()?;
+        let integer = crate::sql::eval::parse_int_literal(text)
+            .is_some_and(|value| i32::try_from(value).is_ok());
+        if sign.is_empty() {
+            return Ok((text, integer));
+        }
+        let signed = self
+            .arena
+            .alloc_str_display(format_args!("{sign}{text}"))
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        Ok((signed, integer))
+    }
+
+    /// `CONNECTION LIMIT` of `CREATE`/`ALTER DATABASE`, checked as PostgreSQL's
+    /// `defGetInt32` and connection-limit checks do when the statement runs.
+    fn database_connection_limit(&mut self) -> Result<i32, ParseError> {
+        let at = self.peek_at;
+        let value = match self.peeked {
+            Tok::Ident("default") => {
+                self.advance()?;
+                return Ok(-1);
+            }
+            Tok::Str(_) | Tok::Ident(_) | Tok::QuotedIdent(_) => {
+                self.advance()?;
+                None
+            }
+            _ => match self.numeric_only()? {
+                (text, true) => crate::sql::eval::parse_int_literal(text).map(|value| value as i32),
+                (_, false) => None,
+            },
+        };
+        let error = |sqlstate, message: core::fmt::Arguments<'_>| ParseError {
+            at,
+            message: stack_format!(super::PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        let failure = match value {
+            None => error(
+                sqlstate::SYNTAX_ERROR,
+                format_args!("connection_limit requires an integer value"),
+            ),
+            Some(limit) if limit < -1 => error(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format_args!("invalid connection limit: {limit}"),
+            ),
+            Some(limit) => return Ok(limit),
+        };
+        self.analysis_error(failure)?;
+        Ok(-1)
     }
 
     /// The tail of a `GENERATED` column clause ("generated" consumed): either
@@ -5411,12 +5626,14 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "CREATE SCHEMA IF NOT EXISTS cannot include schema elements"
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         Ok(Stmt::CreateSchema {
@@ -5487,13 +5704,15 @@ impl<'a> Parser<'a> {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(
-                        96,
+                        super::PARSE_MESSAGE_BYTES,
                         "index access method \"{}\" is not supported",
                         method
                     ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
         } else {
@@ -5665,13 +5884,15 @@ impl<'a> Parser<'a> {
                 options.values_per_range = Some(value.ok_or_else(|| ParseError {
                     at: self.peek_at,
                     message: stack_format!(
-                        96,
+                        super::PARSE_MESSAGE_BYTES,
                         "value {} out of bounds for option \"values_per_range\"",
                         raw
                     ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 })?);
             } else if option.eq_ignore_ascii_case("n_distinct_per_range") {
                 if options.n_distinct_per_range.is_some() {
@@ -5694,13 +5915,15 @@ impl<'a> Parser<'a> {
                         .ok_or_else(|| ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "value {} out of bounds for option \"n_distinct_per_range\"",
                                 value
                             ),
                             sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         })?,
                 );
             } else if option.eq_ignore_ascii_case("false_positive_rate") {
@@ -5726,13 +5949,15 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "value {} out of bounds for option \"false_positive_rate\"",
                             raw
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 options.false_positive_rate = Some(raw);
@@ -5751,18 +5976,30 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 options.siglen = Some(value.ok_or_else(|| ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "value {} out of bounds for option \"siglen\"", raw),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "value {} out of bounds for option \"siglen\"",
+                        raw
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 })?);
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -5784,23 +6021,8 @@ impl<'a> Parser<'a> {
                 if options.fillfactor.is_some() {
                     return Err(self.err_here("parameter \"fillfactor\" specified more than once"));
                 }
-                let Tok::Num(raw) = self.peeked else {
-                    return Err(self.unexpected("fillfactor must be an integer"));
-                };
-                let value = raw
-                    .parse::<u8>()
-                    .map_err(|_| self.unexpected("fillfactor is out of range"))?;
-                self.advance()?;
-                if !(10..=100).contains(&value) {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(96, "fillfactor must be between 10 and 100"),
-                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                        cursor: None,
-                        hint: None,
-                    });
-                }
-                options.fillfactor = Some(value);
+                let value = self.integer_reloption("fillfactor", 10, 100)?;
+                options.fillfactor = Some(value as u8);
             } else if option.eq_ignore_ascii_case("deduplicate_items") {
                 if options.deduplicate_items.is_some() {
                     return Err(
@@ -5814,35 +6036,8 @@ impl<'a> Parser<'a> {
                         self.err_here("parameter \"pages_per_range\" specified more than once")
                     );
                 }
-                let Tok::Num(raw) = self.peeked else {
-                    return Err(self.unexpected("pages_per_range must be an integer"));
-                };
-                let value = raw.parse::<u32>().map_err(|_| ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(
-                        96,
-                        "value {} out of bounds for option \"pages_per_range\"",
-                        raw
-                    ),
-                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                    cursor: None,
-                    hint: None,
-                })?;
-                self.advance()?;
-                if !(1..=131_072).contains(&value) {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(
-                            96,
-                            "value {} out of bounds for option \"pages_per_range\"",
-                            value
-                        ),
-                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                        cursor: None,
-                        hint: None,
-                    });
-                }
-                options.pages_per_range = Some(value);
+                let value = self.integer_reloption("pages_per_range", 1, 131_072)?;
+                options.pages_per_range = Some(value as u32);
             } else if option.eq_ignore_ascii_case("autosummarize") {
                 if options.autosummarize.is_some() {
                     return Err(
@@ -5868,13 +6063,15 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "invalid value for enum option \"buffering\": {}",
                             raw
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 });
                 self.advance()?;
@@ -5889,42 +6086,21 @@ impl<'a> Parser<'a> {
                         "parameter \"gin_pending_list_limit\" specified more than once",
                     ));
                 }
-                let Tok::Num(raw) = self.peeked else {
-                    return Err(self.unexpected("gin_pending_list_limit must be an integer"));
-                };
-                let value = raw.parse::<u32>().map_err(|_| ParseError {
+                let value = self.integer_reloption("gin_pending_list_limit", 64, i32::MAX)?;
+                options.gin_pending_list_limit = Some(value as u32);
+            } else {
+                return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(
-                        96,
-                        "invalid value for integer option \"gin_pending_list_limit\": {}",
-                        raw
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
                     ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
-                })?;
-                self.advance()?;
-                if !(64..=i32::MAX as u32).contains(&value) {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(
-                            96,
-                            "value {} out of bounds for option \"gin_pending_list_limit\"",
-                            value
-                        ),
-                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                        cursor: None,
-                        hint: None,
-                    });
-                }
-                options.gin_pending_list_limit = Some(value);
-            } else {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
-                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                    cursor: None,
-                    hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -5979,10 +6155,16 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             };
             if core::mem::replace(flag, true) {
@@ -5993,6 +6175,68 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(names)
+    }
+
+    /// An integer storage parameter value, checked as PostgreSQL's
+    /// `parse_one_reloption` checks it: `parse_int` (decimal, octal, hex or a
+    /// rounded fraction), then the option's bounds.
+    fn integer_reloption(
+        &mut self,
+        name: &str,
+        minimum: i32,
+        maximum: i32,
+    ) -> Result<i32, ParseError> {
+        let text = self.reloption_value()?;
+        let error = |message: core::fmt::Arguments<'_>, detail| ParseError {
+            at: self.peek_at,
+            message: stack_format!(super::PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail,
+        };
+        let Some(value) = parse_int_option(text) else {
+            return Err(error(
+                format_args!("invalid value for integer option \"{name}\": {text}"),
+                None,
+            ));
+        };
+        if !(minimum..=maximum).contains(&value) {
+            let detail = match name {
+                "fillfactor" => "Valid values are between \"10\" and \"100\".",
+                "pages_per_range" => "Valid values are between \"1\" and \"131072\".",
+                _ => "Valid values are between \"64\" and \"2147483647\".",
+            };
+            return Err(error(
+                format_args!("value {text} out of bounds for option \"{name}\""),
+                Some(detail),
+            ));
+        }
+        Ok(value)
+    }
+
+    /// PostgreSQL's `def_arg` for a storage parameter, as the text
+    /// `defGetString` gives it.
+    fn reloption_value(&mut self) -> Result<&'a str, ParseError> {
+        let text = match self.peeked {
+            Tok::Num(text) | Tok::Str(text) | Tok::Ident(text) | Tok::QuotedIdent(text) => text,
+            Tok::Op("-") => {
+                let Tok::Num(text) = self.lookahead(1)? else {
+                    return Err(self.syntax_error_here());
+                };
+                self.advance()?;
+                let text = self
+                    .arena
+                    .alloc_str_display(format_args!("-{text}"))
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+                self.advance()?;
+                return Ok(text);
+            }
+            _ => return Err(self.syntax_error_here()),
+        };
+        self.advance()?;
+        Ok(text)
     }
 
     pub(super) fn relation_storage_options(
@@ -6009,30 +6253,21 @@ impl<'a> Parser<'a> {
                 if options.fillfactor.is_some() {
                     return Err(self.err_here("parameter \"fillfactor\" specified more than once"));
                 }
-                let Tok::Num(raw) = self.peeked else {
-                    return Err(self.unexpected("fillfactor must be an integer"));
-                };
-                let value = raw
-                    .parse::<u8>()
-                    .map_err(|_| self.unexpected("fillfactor is out of range"))?;
-                self.advance()?;
-                if !(10..=100).contains(&value) {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(96, "fillfactor must be between 10 and 100"),
-                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                        cursor: None,
-                        hint: None,
-                    });
-                }
-                options.fillfactor = Some(value);
+                let value = self.integer_reloption("fillfactor", 10, 100)?;
+                options.fillfactor = Some(value as u8);
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -6053,10 +6288,16 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             };
             if core::mem::replace(flag, true) {
@@ -6191,13 +6432,15 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: start,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "rules cannot contain {} commands",
                             rule_action_name(&statement)
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 let source = self.text[start..self.peek_at].trim();
@@ -8086,7 +8329,7 @@ impl<'a> Parser<'a> {
             // a cast reports it once. Faithfully duplicated.
             for w in warnings_before..self.warnings.len() {
                 let again = self.warnings.as_slice()[w];
-                self.warn(again)?;
+                self.notice(again)?;
             }
             let mut not_null = false;
             let mut null_clause = None;
@@ -8762,4 +9005,90 @@ impl<'a> Parser<'a> {
             cascade,
         }))
     }
+}
+
+/// PostgreSQL's `parse_int` for an option without units: `strtol` with base
+/// 0 (decimal, `0x` hexadecimal or `0` octal), or a decimal fraction or
+/// exponent rounded half to even, surrounded by optional whitespace.
+fn parse_int_option(text: &str) -> Option<i32> {
+    let is_space = |byte: u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C');
+    let bytes = text.as_bytes();
+    let mut at = bytes
+        .iter()
+        .position(|byte| !is_space(*byte))
+        .unwrap_or(bytes.len());
+    let start = at;
+    let negative = match bytes.get(at) {
+        Some(b'-') => {
+            at += 1;
+            true
+        }
+        Some(b'+') => {
+            at += 1;
+            false
+        }
+        _ => false,
+    };
+    let (radix, digits_at) = match (bytes.get(at), bytes.get(at + 1), bytes.get(at + 2)) {
+        (Some(b'0'), Some(b'x' | b'X'), Some(digit)) if digit.is_ascii_hexdigit() => (16, at + 2),
+        (Some(b'0'), _, _) => (8, at),
+        _ => (10, at),
+    };
+    let mut end = digits_at;
+    let mut value: i128 = 0;
+    let mut overflow = false;
+    while let Some(digit) = bytes
+        .get(end)
+        .and_then(|byte| char::from(*byte).to_digit(radix))
+    {
+        value = value * i128::from(radix) + i128::from(digit);
+        overflow |= value > i128::from(i64::MAX);
+        end += 1;
+    }
+    let mut rounded = if negative { -value } else { value };
+    if matches!(bytes.get(end), Some(b'.' | b'e' | b'E')) || overflow {
+        // strtod: digits, an optional fraction and an optional exponent.
+        let mut float_end = at;
+        while bytes.get(float_end).is_some_and(u8::is_ascii_digit) {
+            float_end += 1;
+        }
+        let integer_digits = float_end - at;
+        if bytes.get(float_end) == Some(&b'.') {
+            float_end += 1;
+            while bytes.get(float_end).is_some_and(u8::is_ascii_digit) {
+                float_end += 1;
+            }
+        }
+        if float_end - at == usize::from(integer_digits == 0) {
+            return None;
+        }
+        if matches!(bytes.get(float_end), Some(b'e' | b'E')) {
+            let mut exponent = float_end + 1;
+            if matches!(bytes.get(exponent), Some(b'+' | b'-')) {
+                exponent += 1;
+            }
+            if bytes.get(exponent).is_some_and(u8::is_ascii_digit) {
+                while bytes.get(exponent).is_some_and(u8::is_ascii_digit) {
+                    exponent += 1;
+                }
+                float_end = exponent;
+            }
+        }
+        let parsed: f64 = text[start..float_end].parse().ok()?;
+        if !parsed.is_finite() {
+            return None;
+        }
+        let parsed = parsed.round_ties_even();
+        if parsed.abs() > 1e30 {
+            return None;
+        }
+        rounded = parsed as i128;
+        end = float_end;
+    } else if end == digits_at && radix != 8 {
+        return None;
+    }
+    if !bytes[end..].iter().all(|byte| is_space(*byte)) {
+        return None;
+    }
+    i32::try_from(rounded).ok()
 }

@@ -13,8 +13,10 @@ mod builtin_argument_binding;
 mod canonical_sequences;
 mod catalog_identity_lookup;
 mod client_catalog;
+mod compatibility_diagnostics;
 mod constraint_index_identity;
 mod cursor_execution;
+mod error_report_fields;
 mod foreign_parent_admission;
 mod function_progress;
 mod geometric_casts;
@@ -45349,7 +45351,7 @@ fn trigger_exception_diagnostic_surface_is_typed_and_scoped() {
     assert_eq!(
         data_rows(&output),
         [
-            "ZX123|typed failure|typed detail|typed hint|PL/pgSQL function public.trigger_diagnostic_surface()|PL/pgSQL function public.trigger_diagnostic_surface()|||||"
+            "ZX123|typed failure|typed detail|typed hint|PL/pgSQL function trigger_diagnostic_surface() line 6 at RAISE|PL/pgSQL function trigger_diagnostic_surface() line 9 at GET DIAGNOSTICS|||||"
         ],
         "{}",
         String::from_utf8_lossy(&output)
@@ -47784,7 +47786,10 @@ fn sql_procedure_call_is_typed_durable_and_catalogued() {
         let failing_created = run_with(
             &mut engine,
             &mut budget,
-            "CREATE PROCEDURE log_then_fail(value integer) LANGUAGE SQL AS \
+            // PostgreSQL rejects the missing relation at CREATE unless body
+            // checks are off.
+            "SET check_function_bodies = off; \
+             CREATE PROCEDURE log_then_fail(value integer) LANGUAGE SQL AS \
              'INSERT INTO procedure_log VALUES ($1); INSERT INTO missing_log VALUES ($1)'",
         );
         assert!(
@@ -82199,28 +82204,23 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
 }
 
 #[test]
-fn array_element_assignment_is_rejected_instead_of_treated_as_jsonb() {
+fn array_element_assignment_is_not_treated_as_jsonb() {
     let config = test_config("array-element-assignment");
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE element_targets (a int[], j jsonb); \
-         INSERT INTO element_targets VALUES ('{1,2}', '{}'), (NULL, NULL)",
+        "CREATE TABLE element_targets (id int, a int[], j jsonb); \
+         INSERT INTO element_targets VALUES (1, '{1,2}', '{}'), (2, NULL, NULL)",
     );
-    for statement in [
-        "UPDATE element_targets SET a[1] = 9 WHERE a IS NOT NULL",
-        "UPDATE element_targets SET a[1] = 9 WHERE a IS NULL",
-    ] {
-        let output = run_with(&mut engine, &mut budget, statement);
-        assert_eq!(error_sqlstates(&output), ["0A000"], "{statement}");
-        assert!(
-            String::from_utf8_lossy(&output)
-                .contains("assignment to array elements and slices is not supported"),
-            "{statement}"
-        );
-    }
+    // A NULL array column takes the shape of its subscripts, as in PostgreSQL.
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE element_targets SET a[1] = 9; SELECT a FROM element_targets ORDER BY id",
+    );
+    assert_eq!(data_rows(&output), ["{9,2}", "{9}"]);
     let output = run_with(
         &mut engine,
         &mut budget,

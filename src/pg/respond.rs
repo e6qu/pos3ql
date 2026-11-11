@@ -40,6 +40,11 @@ impl CursorPosition {
     pub fn get(self) -> usize {
         self.0.get()
     }
+
+    /// A one-based character position.
+    pub fn from_position(position: usize) -> Option<Self> {
+        core::num::NonZeroUsize::new(position).map(Self)
+    }
 }
 
 /// Per-column result wire format requested by Bind: text (`false`) or binary
@@ -2309,7 +2314,33 @@ impl<'b> Responder<'b> {
         if !self.render_context().min_message_level.allows(level) {
             return Ok(());
         }
-        self.write_notice_response(severity, sqlstate.as_ref(), message, diagnostic.as_ref())
+        self.write_notice_response(
+            severity,
+            sqlstate.as_ref(),
+            message,
+            diagnostic.as_ref(),
+            None,
+        )
+    }
+
+    /// A NOTICE or WARNING raised while parsing a statement, with the cursor
+    /// position PostgreSQL reports for it, subject to `client_min_messages`.
+    pub fn parse_notice(
+        &mut self,
+        warning: bool,
+        sqlstate: &str,
+        message: &str,
+        cursor: Option<CursorPosition>,
+    ) -> Result<(), WireFull> {
+        let (level, severity) = if warning {
+            (crate::sql::guc::MessageLevel::Warning, "WARNING")
+        } else {
+            (crate::sql::guc::MessageLevel::Notice, "NOTICE")
+        };
+        if !self.render_context().min_message_level.allows(level) {
+            return Ok(());
+        }
+        self.write_notice_response(severity, sqlstate, message, None, cursor)
     }
 
     fn diagnostic_unfiltered<S: AsRef<str>>(
@@ -2319,7 +2350,13 @@ impl<'b> Responder<'b> {
         message: &str,
     ) -> Result<(), WireFull> {
         let diagnostic = crate::sql::eval::take_diagnostic();
-        self.write_notice_response(severity, sqlstate.as_ref(), message, diagnostic.as_ref())
+        self.write_notice_response(
+            severity,
+            sqlstate.as_ref(),
+            message,
+            diagnostic.as_ref(),
+            None,
+        )
     }
 
     fn write_notice_response(
@@ -2328,6 +2365,7 @@ impl<'b> Responder<'b> {
         sqlstate: &str,
         message: &str,
         diagnostic: Option<&crate::sql::eval::Diagnostic>,
+        cursor: Option<CursorPosition>,
     ) -> Result<(), WireFull> {
         self.control(|buffer| {
             let mut m = MsgOut::begin(buffer, wire::MSG_NOTICE_RESPONSE);
@@ -2349,6 +2387,20 @@ impl<'b> Responder<'b> {
                     m.cstr(h.as_str());
                 }
             }
+            if crate::sql::error_context::is_active() {
+                m.u8(b'W');
+                m.cstr_display(&crate::sql::error_context::Live);
+            }
+            if let Some(d) = diagnostic {
+                for (code, value) in d.objects.fields() {
+                    m.u8(code);
+                    m.cstr(value);
+                }
+            }
+            if let Some(cursor) = cursor {
+                m.u8(b'P');
+                m.cstr(stack_format!(20, "{}", cursor.get()).as_str());
+            }
             m.u8(0);
             m.finish()
         })
@@ -2357,7 +2409,7 @@ impl<'b> Responder<'b> {
     /// ErrorResponse with the fields every client expects: severity (twice,
     /// localized and not), SQLSTATE, and message.
     pub fn error<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
-        self.error_severity("ERROR", sqlstate.as_ref(), message, None)
+        self.error_severity("ERROR", sqlstate.as_ref(), &message, None)
     }
 
     /// [`Self::error`] with the cursor position PostgreSQL reports for it.
@@ -2367,48 +2419,94 @@ impl<'b> Responder<'b> {
         message: &str,
         cursor: CursorPosition,
     ) -> Result<(), WireFull> {
-        self.error_severity("ERROR", sqlstate.as_ref(), message, Some(cursor))
+        self.error_severity("ERROR", sqlstate.as_ref(), &message, Some(cursor))
+    }
+
+    /// [`Self::error`] with formatted text and an optional cursor position.
+    pub fn error_display(
+        &mut self,
+        sqlstate: &str,
+        message: &dyn core::fmt::Display,
+        cursor: Option<CursorPosition>,
+    ) -> Result<(), WireFull> {
+        self.error_severity("ERROR", sqlstate, message, cursor)
     }
 
     pub fn fatal<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
-        self.error_severity("FATAL", sqlstate.as_ref(), message, None)
+        self.error_severity("FATAL", sqlstate.as_ref(), &message, None)
     }
 
     fn error_severity(
         &mut self,
         severity: &str,
         sqlstate: &str,
-        message: &str,
+        message: &dyn core::fmt::Display,
         cursor: Option<CursorPosition>,
     ) -> Result<(), WireFull> {
         let diagnostic = crate::sql::eval::take_diagnostic();
-        self.control(|buffer| {
-            let mut m = MsgOut::begin(buffer, wire::MSG_ERROR_RESPONSE);
-            m.u8(b'S');
-            m.cstr(severity);
-            m.u8(b'V');
-            m.cstr(severity);
-            m.u8(b'C');
-            m.cstr(sqlstate);
-            m.u8(b'M');
-            m.cstr(message);
-            if let Some(d) = &diagnostic {
-                if let Some(detail) = &d.detail {
-                    m.u8(b'D');
-                    m.cstr(detail.as_str());
-                }
-                if let Some(h) = &d.hint {
-                    m.u8(b'H');
-                    m.cstr(h.as_str());
-                }
-            }
-            // PostgreSQL sends the cursor after detail and hint.
-            if let Some(cursor) = cursor {
-                m.u8(b'P');
-                m.cstr(stack_format!(20, "{}", cursor.get()).as_str());
-            }
-            m.u8(0);
-            m.finish()
+        // An analysis error positions its subject in the statement text.
+        let annotation = crate::sql::error_position::take_annotation(sqlstate, message);
+        let cursor = cursor.or_else(|| annotation.position.and_then(CursorPosition::from_position));
+        let analysis_hint = annotation
+            .hint
+            .filter(|_| diagnostic.as_ref().is_none_or(|d| d.hint.is_none()));
+        crate::sql::error_position::with_full_message(sqlstate, message, |full_message| {
+            crate::sql::error_context::with_reported(sqlstate, message, |reported| {
+                self.control(|buffer| {
+                    let mut m = MsgOut::begin(buffer, wire::MSG_ERROR_RESPONSE);
+                    m.u8(b'S');
+                    m.cstr(severity);
+                    m.u8(b'V');
+                    m.cstr(severity);
+                    m.u8(b'C');
+                    m.cstr(sqlstate);
+                    m.u8(b'M');
+                    match full_message {
+                        Some(full_message) => m.cstr(full_message),
+                        None => m.cstr_display(message),
+                    };
+                    if let Some(d) = &diagnostic {
+                        if let Some(detail) = &d.detail {
+                            m.u8(b'D');
+                            m.cstr(detail.as_str());
+                        }
+                        if let Some(h) = &d.hint {
+                            m.u8(b'H');
+                            m.cstr(h.as_str());
+                        }
+                    }
+                    if let Some(hint) = analysis_hint {
+                        m.u8(b'H');
+                        m.cstr(hint);
+                    }
+                    // PostgreSQL's field order: context and object names, then
+                    // the cursor and internal query.
+                    if let Some(reported) = &reported
+                        && !reported.context.is_empty()
+                    {
+                        m.u8(b'W');
+                        m.cstr(reported.context);
+                    }
+                    if let Some(d) = &diagnostic {
+                        for (code, value) in d.objects.fields() {
+                            m.u8(code);
+                            m.cstr(value);
+                        }
+                    }
+                    if let Some(cursor) = cursor {
+                        m.u8(b'P');
+                        m.cstr(stack_format!(20, "{}", cursor.get()).as_str());
+                    }
+                    if let Some((query, position)) = reported.as_ref().and_then(|r| r.internal) {
+                        m.u8(b'p');
+                        m.cstr(stack_format!(20, "{}", position).as_str());
+                        m.u8(b'q');
+                        m.cstr(query);
+                    }
+                    m.u8(0);
+                    m.finish()
+                })
+            })
         })
     }
 

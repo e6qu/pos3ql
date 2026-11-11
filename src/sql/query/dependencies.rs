@@ -28,6 +28,51 @@ struct CollectionContext<'a> {
     path: &'a PathContext,
     transition: Option<&'a dyn ColTypeResolver>,
     bindings: Option<crate::storage::StoredQueryDependencyView<'a>>,
+    /// The query levels enclosing a subquery, which its outer references name.
+    enclosing: Option<&'a dyn EnclosingColumns>,
+}
+
+/// The columns of the query levels around a subquery.
+trait EnclosingColumns {
+    /// Marks the enclosing column `qualifier.name` names; Ok(false) when no
+    /// level resolves it.
+    fn mark(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+        dependencies: &mut StoredQueryDependencies,
+    ) -> Result<bool, SqlError>;
+}
+
+/// A query level around a subquery. A level without a schema (one reading a
+/// derived table, function or view) records its own references by relation,
+/// so a reference that resolves nowhere may belong to it.
+struct EnclosingLevel<'s, 'd> {
+    scope: Option<&'s super::QueryScope<'d>>,
+    parent: Option<&'s dyn EnclosingColumns>,
+}
+
+impl EnclosingColumns for EnclosingLevel<'_, '_> {
+    fn mark(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+        dependencies: &mut StoredQueryDependencies,
+    ) -> Result<bool, SqlError> {
+        let Some(scope) = self.scope else {
+            return Ok(true);
+        };
+        if let Ok(resolved) =
+            crate::sql::error_position::preserving_pending(|| scope.find_column(qualifier, name))
+        {
+            mark_resolved_column(scope, resolved, dependencies)?;
+            return Ok(true);
+        }
+        match self.parent {
+            Some(parent) => parent.mark(qualifier, name, dependencies),
+            None => Ok(false),
+        }
+    }
 }
 
 impl<'a> CollectionContext<'a> {
@@ -39,6 +84,7 @@ impl<'a> CollectionContext<'a> {
             path,
             transition: None,
             bindings,
+            enclosing: None,
         }
     }
 
@@ -47,6 +93,7 @@ impl<'a> CollectionContext<'a> {
             path,
             transition: Some(transition),
             bindings: None,
+            enclosing: None,
         }
     }
 
@@ -1234,11 +1281,14 @@ pub(crate) fn validate_dml_assignment_casts(
         };
         let assign = |name: &str, expression: &Expr<'_>| -> Result<(), SqlError> {
             let index = target.column_index(name).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" of relation \"{}\" does not exist",
+                crate::sql::error_position::at_reference(
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        target_name
+                    ),
                     name,
-                    target_name
                 )
             })?;
             validate_assignment_expression(
@@ -1704,19 +1754,25 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
             let ordinal = index;
             let index = match name {
                 Some(name) => target.column_index(name).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
+                    crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            name,
+                            target_name
+                        ),
                         name,
-                        target_name
                     )
                 })?,
                 None => index,
             };
             let column = target.columns().get(index).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "INSERT has more expressions than target columns"
+                crate::sql::error_position::at_expression(
+                    sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "INSERT has more expressions than target columns"
+                    ),
+                    expression,
                 )
             })?;
             let assignment = AssignmentInput {
@@ -2041,6 +2097,46 @@ fn collect_select<'a>(
             )?;
             visible_ctes.push(cte.name)?;
         }
+        // A level reading only tables has a schema its subqueries' outer
+        // references resolve in.
+        let level_scope = match select.from.as_ref() {
+            Some(from) => {
+                let mut all_tables = true;
+                for source in
+                    core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table))
+                {
+                    if source.subquery.is_some()
+                        || source.is_function_source()
+                        || (source.schema.is_none() && visible_ctes.contains(source.table))
+                        || !matches!(
+                            context.resolve_relation(storage, txid, source.schema, source.table)?,
+                            Some(ResolvedRelation::Table(_))
+                        )
+                    {
+                        all_tables = false;
+                        break;
+                    }
+                }
+                if all_tables {
+                    let bound = context.bound_from(from, storage, txid, visible_ctes, arena)?;
+                    let bound = arena.alloc(bound).map_err(|_| arena_full())?;
+                    Some(super::QueryScope::resolve_schema(
+                        storage, bound, txid, arena, None,
+                    )?)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        let level = EnclosingLevel {
+            scope: level_scope.as_ref(),
+            parent: context.enclosing,
+        };
+        let nested = CollectionContext {
+            enclosing: Some(&level),
+            ..context
+        };
 
         for item in select.items {
             match item {
@@ -2052,7 +2148,7 @@ fn collect_select<'a>(
                         visible_ctes,
                         dependencies,
                         arena,
-                        context,
+                        nested,
                     )?;
                 }
                 SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
@@ -2066,7 +2162,7 @@ fn collect_select<'a>(
                 visible_ctes,
                 dependencies,
                 arena,
-                context,
+                nested,
             )?;
         }
         for expression in select
@@ -2085,7 +2181,7 @@ fn collect_select<'a>(
                 visible_ctes,
                 dependencies,
                 arena,
-                context,
+                nested,
             )?;
         }
         if let Some(tree) = select.set_body {
@@ -2127,36 +2223,18 @@ fn collect_select<'a>(
                         visible_ctes,
                         dependencies,
                         arena,
-                        context,
+                        nested,
                     )?;
                 }
             }
-            let sources =
-                core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
-            let mut all_tables = true;
-            for source in sources {
-                if source.subquery.is_some()
-                    || source.is_function_source()
-                    || (source.schema.is_none() && visible_ctes.contains(source.table))
-                    || !matches!(
-                        context.resolve_relation(storage, txid, source.schema, source.table)?,
-                        Some(ResolvedRelation::Table(_))
-                    )
-                {
-                    all_tables = false;
-                    break;
-                }
-            }
-            if all_tables {
-                let bound = context.bound_from(&from, storage, txid, visible_ctes, arena)?;
-                let scope = super::QueryScope::resolve_schema(storage, &bound, txid, arena, None)?;
+            if let Some(scope) = level_scope.as_ref() {
                 for item in select.items {
                     match item {
                         SelectItem::Expr { expression, .. }
                         | SelectItem::RecordStar(expression) => {
                             record_column_references(
                                 expression,
-                                &scope,
+                                scope,
                                 dependencies,
                                 context,
                                 ReferenceScope::Query,
@@ -2167,7 +2245,7 @@ fn collect_select<'a>(
                                 for column in 0..scope.defs.get(table).expect("resolved").n_columns
                                 {
                                     mark_resolved_column(
-                                        &scope,
+                                        scope,
                                         super::ResolvedColumn::Table(table, column),
                                         dependencies,
                                     )?;
@@ -2177,7 +2255,7 @@ fn collect_select<'a>(
                         SelectItem::TableWildcard(name) => {
                             for index in 0..scope.qualified_star_columns(name)? {
                                 mark_resolved_column(
-                                    &scope,
+                                    scope,
                                     scope.qualified_star_entry(name, index)?,
                                     dependencies,
                                 )?;
@@ -2199,7 +2277,7 @@ fn collect_select<'a>(
                 {
                     record_column_references(
                         expression,
-                        &scope,
+                        scope,
                         dependencies,
                         context,
                         ReferenceScope::Query,
@@ -3639,10 +3717,18 @@ fn record_relation_column_references<'a>(
         n_sources += 1;
     }
     let sources = &sources[..n_sources];
+    let merged = |name: &str| {
+        from.joins.iter().any(|join| {
+            join.natural
+                || join
+                    .using
+                    .is_some_and(|using| using.columns.contains(&name))
+        })
+    };
     for item in select.items {
         match item {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                record_relation_expression(expression, sources, dependencies)?
+                record_relation_expression(expression, sources, &merged, dependencies)?
             }
             SelectItem::TableWildcard(name) => {
                 for source in sources.iter().filter(|source| source.exposed == *name) {
@@ -3672,7 +3758,7 @@ fn record_relation_column_references<'a>(
         .chain(select.offset)
         .chain(from.joins.iter().filter_map(|join| join.on))
     {
-        record_relation_expression(expression, sources, dependencies)?;
+        record_relation_expression(expression, sources, &merged, dependencies)?;
     }
     Ok(())
 }
@@ -3707,10 +3793,13 @@ fn visit_column_dependencies<'a>(
     }
 }
 
+/// `merged` says whether a `USING` or `NATURAL` join merged the sources'
+/// columns of an unqualified name into one, which the first source supplies.
 fn find_relation_column(
     sources: &[RelationSource<'_>],
     qualifier: Option<&str>,
     name: &str,
+    merged: &dyn Fn(&str) -> bool,
 ) -> Result<Option<(usize, usize)>, SqlError> {
     let mut found = None;
     for (source_index, source) in sources.iter().enumerate() {
@@ -3724,6 +3813,9 @@ fn find_relation_column(
             .position(|column| *column == name)
         {
             if found.is_some() {
+                if qualifier.is_none() && merged(name) {
+                    continue;
+                }
                 return Err(sql_err!(
                     sqlstate::AMBIGUOUS_COLUMN,
                     "column reference \"{}\" is ambiguous",
@@ -3739,6 +3831,7 @@ fn find_relation_column(
 fn record_relation_expression(
     expression: &Expr<'_>,
     sources: &[RelationSource<'_>],
+    merged: &dyn Fn(&str) -> bool,
     dependencies: &mut StoredQueryDependencies,
 ) -> Result<(), SqlError> {
     visit_column_dependencies(expression, &mut |reference| {
@@ -3769,7 +3862,7 @@ fn record_relation_expression(
                 Expr::Column {
                     qualifier: None,
                     name,
-                } if find_relation_column(sources, None, name)?.is_some() => (None, *name),
+                } if find_relation_column(sources, None, name, merged)?.is_some() => (None, *name),
                 Expr::Column {
                     qualifier: None,
                     name,
@@ -3778,7 +3871,9 @@ fn record_relation_expression(
             },
             _ => unreachable!("dependency walk selects references"),
         };
-        if let Some((source_index, column)) = find_relation_column(sources, qualifier, name)? {
+        if let Some((source_index, column)) =
+            find_relation_column(sources, qualifier, name, merged)?
+        {
             let source = &sources[source_index];
             return dependencies.mark_referenced_column(source.class, source.slot, column);
         }
@@ -3951,6 +4046,17 @@ fn record_column_references(
                 ) && context.outer_column(qualifier, name) =>
             {
                 Ok(())
+            }
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) =>
+            {
+                match context.enclosing {
+                    Some(enclosing) if enclosing.mark(qualifier, name, dependencies)? => Ok(()),
+                    _ => Err(error),
+                }
             }
             Err(error) => Err(error),
         }

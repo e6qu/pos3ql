@@ -1334,10 +1334,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     Datum::Json { text, .. } | Datum::Text(text) => text,
                     Datum::Null => return Ok(&[]),
                     other => {
-                        return Err(crate::sql::eval::type_mismatch_pub(
-                            "populate_recordset requires JSON",
-                            &other,
-                        ));
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
                     }
                 };
                 let crate::sql::json::Json::Array(items) = crate::sql::json::parse(source, arena)?
@@ -1981,10 +1978,7 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             Datum::Json { text, .. } | Datum::Text(text) => text,
             Datum::Null => return Ok(0),
             other => {
-                return Err(crate::sql::eval::type_mismatch_pub(
-                    "populate_recordset requires JSON",
-                    &other,
-                ));
+                return Err(crate::sql::eval::function_argument_mismatch(name, &other));
             }
         };
         match crate::sql::json::parse(source, arena)? {
@@ -2528,12 +2522,10 @@ pub(crate) fn describe_derived_definition<'a>(
     // supply no more names than the derived table has columns.
     if let Some(aliases) = col_alias {
         if aliases.len() > n_cols {
-            return Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "table \"{}\" has {} columns available but {} columns specified",
+            return Err(super::scope::derived_alias_mismatch(
                 exposed,
                 n_cols,
-                aliases.len()
+                aliases.len(),
             ));
         }
         for (i, alias) in aliases.iter().enumerate() {
@@ -3913,12 +3905,10 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     if let Some(aliases) = tref.col_alias
         && aliases.len() > n_out
     {
-        return Err(sql_err!(
-            sqlstate::INVALID_COLUMN_REFERENCE,
-            "table \"{}\" has {} columns available but {} columns specified",
+        return Err(super::scope::derived_alias_mismatch(
             name,
             n_out,
-            aliases.len()
+            aliases.len(),
         ));
     }
     let mut columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
@@ -6292,10 +6282,7 @@ fn json_to_record_rows<'a, C: ColumnLookup<'a>>(
                 .map_err(|_| arena_full());
         }
         other => {
-            return Err(crate::sql::eval::type_mismatch_pub(
-                "JSON record conversion requires JSON",
-                &other,
-            ));
+            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
         }
     };
     let parsed = crate::sql::json::parse(source, arena)?;
@@ -6414,10 +6401,7 @@ fn populate_record_rows<'a, C: ColumnLookup<'a>>(
         Datum::Json { text, .. } | Datum::Text(text) => text,
         Datum::Null => return Ok(&[]),
         other => {
-            return Err(crate::sql::eval::type_mismatch_pub(
-                "populate_record requires JSON",
-                &other,
-            ));
+            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
         }
     };
     let parsed = crate::sql::json::parse(source, arena)?;

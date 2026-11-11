@@ -16,7 +16,7 @@ use crate::{sql_err, stack_format};
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, compare_datums, datum_f64,
     datum_numeric, eval_full, int_arg, log_domain_check, num_f64, overflow, sqlstate,
-    type_mismatch, width_bucket_f64, width_bucket_numeric,
+    width_bucket_f64, width_bucket_numeric,
 };
 
 unsafe extern "C" {
@@ -462,7 +462,7 @@ pub(crate) fn dispatch<'a>(
                         },
                         ..n
                     })),
-                    other => Err(type_mismatch("abs", &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch("abs", &other)),
                 }
             }
             "floor" | "ceil" | "ceiling" | "trunc" | "round" => {
@@ -485,7 +485,9 @@ pub(crate) fn dispatch<'a>(
                         Datum::Int2(x) => Numeric::from_i64(x as i64, arena)?,
                         Datum::Int4(x) => Numeric::from_i64(x as i64, arena)?,
                         Datum::Int8(x) => Numeric::from_i64(x, arena)?,
-                        other => return Err(type_mismatch(name, &other)),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
                     };
                     let result = if n >= 0 {
                         v.round_scale(n as usize, mode, arena)?
@@ -523,7 +525,7 @@ pub(crate) fn dispatch<'a>(
                         b[3..].fill(0);
                         Ok(Datum::Macaddr8(b))
                     }
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "sign" => {
@@ -548,7 +550,7 @@ pub(crate) fn dispatch<'a>(
                         };
                         Ok(Datum::Numeric(Numeric::parse(s, arena)?))
                     }
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "sqrt" | "exp" | "ln" => {
@@ -728,7 +730,7 @@ pub(crate) fn dispatch<'a>(
                     _ => None,
                 };
                 let (Some((x, wl)), Some((y, wr))) = (int_of(&a), int_of(&b)) else {
-                    return Err(type_mismatch(name, &a));
+                    return Err(crate::sql::eval::function_argument_mismatch(name, &a));
                 };
                 if y == 0 {
                     return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
@@ -763,7 +765,9 @@ pub(crate) fn dispatch<'a>(
                     (Datum::Int4(x), Datum::Int8(y)) => (x as i64, y, true),
                     (Datum::Int8(x), Datum::Int4(y)) => (x, y as i64, true),
                     (Datum::Int8(x), Datum::Int8(y)) => (x, y, true),
-                    (other, _) => return Err(type_mismatch(name, &other)),
+                    (other, _) => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let range = || {
                     sql_err!(
@@ -892,7 +896,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Numeric(n) if n.is_special() => Ok(Datum::Null),
                     Datum::Numeric(n) => Ok(Datum::Int4(n.dscale as i32)),
                     Datum::Int4(_) | Datum::Int8(_) => Ok(Datum::Int4(0)),
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "min_scale" => {
@@ -902,7 +906,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Numeric(n) if n.is_special() => Ok(Datum::Null),
                     Datum::Numeric(n) => Ok(Datum::Int4(n.min_scale() as i32)),
                     Datum::Int4(_) | Datum::Int8(_) => Ok(Datum::Int4(0)),
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "trim_scale" => {
@@ -915,7 +919,7 @@ pub(crate) fn dispatch<'a>(
                         arena,
                     )?)),
                     d @ (Datum::Int4(_) | Datum::Int8(_)) => Ok(d),
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "cbrt" | "sin" | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "sinh" | "cosh"
@@ -1058,7 +1062,7 @@ pub(crate) fn dispatch<'a>(
                         let b = datum_numeric(name, b, arena)?;
                         Ok(Datum::Numeric(random_numeric(&a, &b, arena)?))
                     }
-                    (other, _) => Err(type_mismatch(name, &other)),
+                    (other, _) => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "random_normal" => {

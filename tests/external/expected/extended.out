@@ -45,6 +45,8 @@ SELECT v FROM t_ext WHERE id = $1 \parse find_by_id
 -- extended-protocol errors recover after Sync
 SELECT * FROM t_missing WHERE id = $1 \bind 1 \g
 psql:tests/external/sql/extended.sql:19: ERROR:  relation "t_missing" does not exist
+LINE 1: SELECT * FROM t_missing WHERE id = $1 
+                      ^
 SELECT 'recovered';
  ?column?  
 -----------

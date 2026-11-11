@@ -65,6 +65,12 @@ fn sql_prepare_records_inferred_parameter_types() {
             "wrong number of parameters for prepared statement \"mixed\"",
         ),
         (
+            "CREATE DOMAIN prepared_positive AS integer CHECK (VALUE > 0); \
+             PREPARE checked AS SELECT $1::prepared_positive; EXECUTE checked(-1)",
+            "23514",
+            "prepared_positive",
+        ),
+        (
             "EXECUTE rounded('abc')",
             "22P02",
             "invalid input syntax for type double precision: \"abc\"",

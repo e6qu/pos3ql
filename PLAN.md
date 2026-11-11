@@ -266,7 +266,11 @@ Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: `ALTER`, `COMMENT ON`
 and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
 with `0A000` where PostgreSQL changes the catalog entry; `information_schema`
-domains such as `cardinal_number` do not exist. A SQL function whose earlier
+domains such as `cardinal_number` do not exist. SQL-level `PREPARE` records
+parameter types by representation: a parameter whose use selects a domain is
+listed in `pg_prepared_statements` as the domain's base type, one cast to an
+enum or composite type (`$1::mood`) as `text`, and `PREPARE q(positive)` with
+a user-defined type fails with `42704`; PostgreSQL records the user type. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final
@@ -300,9 +304,14 @@ reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
 A trigger fired inside a write (a BEFORE row trigger, a deferred constraint
 trigger at `COMMIT`) can `CALL` only PL/pgSQL procedures; a SQL-language
 procedure fails with `0A000` because that trigger runs without the engine's
-statement executor. A procedure called from PL/pgSQL that waits for storage or a lock runs again from its
-start when its statement resumes (finished effects replay from the statement
-journal) instead of resuming at a saved position inside the procedure. A table's or view's row type cannot
+statement executor. A procedure that waits for storage or a lock, at the
+top level or called from PL/pgSQL, runs again from its start when its
+statement resumes (finished effects replay from the statement journal)
+instead of resuming at a saved position, so a wait after the procedure's own
+`COMMIT` or `ROLLBACK` fails with `0A000` where PostgreSQL waits. Fixing it
+needs a statement-owned saved procedure frame (like the saved write completion
+a trigger frame uses) whose rollback boundary moves to each transaction the
+procedure starts. A table's or view's row type cannot
 appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
 where PostgreSQL accepts it. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current

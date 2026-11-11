@@ -181,7 +181,10 @@ Domains and checked inputs:
   `double precision` in `pg_prepared_statements`, so `EXECUTE q(2.5)` returns
   2. A parameter that is never used (`SELECT $2::int` leaves `$1` unused) or
   only passed where any type is accepted (`pg_typeof($1)`) fails with `42P18`;
-  an otherwise untyped one is `text`.
+  an otherwise untyped one is `text`. A parameter whose use selects a domain
+  is recorded as the domain's base type, one cast to an enum or composite
+  type (`$1::mood`) as `text`, and a declared user-defined type
+  (`PREPARE q(positive)`) fails with `42704`.
 - SQL functions are validated at `CREATE`, then each backend checks and keeps
   the first call's inputs for that definition and argument types. PL/pgSQL keeps
   one instance per resolved argument types and collation. Views, rules,

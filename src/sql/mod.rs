@@ -10092,14 +10092,22 @@ impl Engine {
                 for (index, target) in all.iter_mut().enumerate() {
                     *target = match types.get(index) {
                         Some(declared) => *declared,
-                        None => ColType::from_oid(parameter_oids[index]).ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "parameter ${} has unsupported type OID {}",
-                                index + 1,
-                                parameter_oids[index]
-                            )
-                        })?,
+                        // Prepared parameters keep representation types: a
+                        // domain parameter is recorded as its base type, and
+                        // the statement's own casts still check the domain.
+                        None => ColType::from_oid(parameter_oids[index])
+                            .or_else(|| {
+                                self.storage
+                                    .domain_base_type_for_oid(parameter_oids[index], txn.txid)
+                            })
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "PREPARE cannot record parameter ${} of user-defined type OID {}",
+                                    index + 1,
+                                    parameter_oids[index]
+                                )
+                            })?,
                     };
                 }
                 Ok(all)

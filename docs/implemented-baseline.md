@@ -395,10 +395,14 @@ Evaluation order follows PostgreSQL:
   handler sees the original table. Cursors opened inside the failed block close;
   older cursors keep their position. See the
   [PostgreSQL reference results](https://github.com/e6qu/pos3ql/tree/854feb372391d1c87f3d5b261e85a78430d96449/tests/external/reference/2026-11-05-procedural-subtransactions).
-- `CALL` works inside `DO` blocks, procedures and functions, assigning output
-  parameters to the argument variables. A procedure called from a `DO` block
-  may `COMMIT`; when it waits for a lock, storage or `pg_sleep`, the statement
-  resumes without repeating finished inserts or sequence values.
+- `CALL` works inside `DO` blocks, procedures, functions and trigger
+  functions, assigning output parameters to the argument variables. A
+  procedure called from a `DO` block may `COMMIT`. When a called procedure
+  waits for a lock, storage or `pg_sleep`, the statement resumes without
+  repeating finished inserts, sequence values or `pg_stat_user_functions`
+  calls; the procedure runs again from its start and replays those finished
+  effects. A wait after the procedure's own `COMMIT` or `ROLLBACK` fails with
+  `0A000` (`a non-atomic routine cannot suspend after transaction control`).
 - `pg_sleep(1)` releases the SQL worker while it waits, so other connections
   keep running; `statement_timeout` and cancel requests end the sleep.
 - DDL succeeds only after its end-of-command event triggers. A failing hook for

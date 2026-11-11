@@ -2271,6 +2271,11 @@ pub(crate) fn bound_parameter_type_oid(index: u32) -> Option<i32> {
     })
 }
 
+/// Whether statement parameter `$index` is bound (its type may be unknown).
+pub(crate) fn bound_parameter_exists(index: u32) -> bool {
+    index >= 1 && BOUND_PARAMETER_TYPES.with(|types| (index as usize) <= types.get().len)
+}
+
 pub(crate) fn bound_parameter_context_active() -> bool {
     matches!(PARAMETER_CONTEXT.with(Cell::get), ParameterContext::Bound)
 }
@@ -3805,6 +3810,18 @@ pub fn record_field_metadata(
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "row expansion via \"*\" is not supported here"
+        ));
+    }
+    // Outside a routine, the parameters are the ones bound to the statement;
+    // a simple query has none (`SELECT ($1).a`).
+    if let Expr::Param(index) = base
+        && bound_parameter_context_active()
+        && !bound_parameter_exists(*index)
+    {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_PARAMETER,
+            "there is no parameter ${}",
+            index
         ));
     }
     // A bare unknown literal cannot be coerced out of a ROW(...) — but only

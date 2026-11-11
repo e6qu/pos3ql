@@ -455,6 +455,26 @@ pub(crate) fn ident_needs_quotes(s: &str) -> bool {
     !valid || crate::sql::parser::keyword_needs_quotes(s)
 }
 
+/// PostgreSQL's `quote_identifier`: the name as written when it round-trips
+/// bare, otherwise double-quoted with embedded quotes doubled.
+pub(crate) fn quote_identifier(name: &str) -> crate::util::StackStr<132> {
+    use core::fmt::Write as _;
+    let mut out = crate::util::StackStr::new();
+    if !ident_needs_quotes(name) {
+        let _ = out.write_str(name);
+        return out;
+    }
+    let _ = out.write_char('"');
+    for c in name.chars() {
+        if c == '"' {
+            let _ = out.write_char('"');
+        }
+        let _ = out.write_char(c);
+    }
+    let _ = out.write_char('"');
+    out
+}
+
 /// Double-quotes an identifier into the arena, doubling embedded quotes. The
 /// buffer lives here rather than on the huge `call()` frame.
 pub(crate) fn quote_ident_str<'a>(s: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {

@@ -20,7 +20,12 @@ pub(crate) use runtime_input_validity::{
 mod catalog_identities;
 mod catalog_keys;
 mod catalog_sources;
+mod predefined_roles;
 pub(crate) use catalog_identities::{CatalogCreation, CatalogIdentity};
+pub(crate) use predefined_roles::{
+    INITDB_MEMBERSHIP_BASE, INITDB_MEMBERSHIPS, PREDEFINED_ROLE_COUNT, PredefinedRole,
+    initdb_membership, membership_identity_valid,
+};
 mod builtin_routines;
 pub(crate) use builtin_routines::{
     BuiltinRoutineAttributes, BuiltinRoutineEntry, BuiltinRoutineOid,
@@ -13794,8 +13799,12 @@ impl Iterator for DefaultAclIter<'_> {
 /// therefore follows the same transaction/WAL/manifest lifecycle as schemas;
 /// it never lives in a process-global authentication side table.
 /// Role slots use `u16::MAX` for PUBLIC, leaving indices 0..65534 available.
-pub(crate) const MAX_ROLE_CATALOG_SLOTS: usize = u16::MAX as usize;
-pub(crate) const MAX_ROLE_MEMBERSHIP_CATALOG_SLOTS: usize = u16::MAX as usize;
+/// Largest `max_roles`: with the predefined roles, every slot stays below the
+/// PUBLIC sentinel.
+pub(crate) const MAX_ROLE_CATALOG_SLOTS: usize = u16::MAX as usize - PREDEFINED_ROLE_COUNT;
+/// Largest `max_role_memberships`; the initdb memberships take extra slots.
+pub(crate) const MAX_ROLE_MEMBERSHIP_CATALOG_SLOTS: usize =
+    u16::MAX as usize - INITDB_MEMBERSHIPS.len();
 pub(crate) const MAX_ROLE_SETTING_CATALOG_SLOTS: usize = u16::MAX as usize;
 pub(crate) const MAX_SYSTEM_SETTINGS: usize = 32;
 pub(crate) const ROLE_SETTING_VALUE_MAX: usize = 256;
@@ -13960,22 +13969,31 @@ pub struct RoleMembership {
 }
 
 impl RoleMembership {
-    pub(crate) fn creation_to(self, txid: u32) -> CatalogIdentity {
+    /// The creation identity: a catalog stamp, or an initdb membership's
+    /// reserved identity (see [`membership_identity_valid`]).
+    pub(crate) fn creation_to(self, txid: u32) -> u64 {
         let created_at = self
             .pending
             .filter(|pending| pending.txid == txid)
             .map_or(self.created_at, |pending| pending.created_at);
-        CatalogIdentity::parse(created_at)
-            .expect("admitted role membership has a checked creation identity")
+        assert!(
+            membership_identity_valid(created_at),
+            "admitted role membership has a checked creation identity"
+        );
+        created_at
     }
 
     pub(crate) fn position(self, slot: usize, txid: u32) -> CatalogPosition {
-        CatalogPosition::new(slot, self.creation_to(txid).created_at())
+        CatalogPosition::new(slot, self.creation_to(txid))
             .expect("admitted role membership has a checked catalog position")
     }
 
     pub(crate) fn oid(self, txid: u32) -> i32 {
-        860_000_000 + self.creation_to(txid).get() as i32
+        let created_at = self.creation_to(txid);
+        match initdb_membership(created_at) {
+            Some((_, initdb)) => initdb.oid,
+            None => 860_000_000 + created_at as i32,
+        }
     }
 
     pub fn visible_to(&self, txid: u32) -> bool {
@@ -19004,16 +19022,56 @@ impl Storage {
         let target_role = self.session_role_slot(target.role.source(), txid);
         let target_superuser =
             target_role.is_some_and(|role| self.role(role).attributes_to(txid).superuser);
-        if target.pid != self.current_connection_id()
-            && !current_superuser
-            && (target_superuser
-                || !target_role
-                    .is_some_and(|role| self.role_is_member_of(current_role, role, txid)))
-        {
-            return Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "must be a member of the role whose process is being signaled or a superuser"
-            ));
+        // PostgreSQL 18.6 pg_signal_backend: only a superuser signals a
+        // superuser's backend; otherwise the caller needs the privileges of
+        // the backend's role or of pg_signal_backend.
+        if !current_superuser {
+            let denied = if terminate {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied to terminate process"
+                )
+            } else {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied to cancel query"
+                )
+            };
+            if target_superuser || target_role.is_none() {
+                return Err(crate::sql::eval::with_detail(
+                    denied,
+                    if terminate {
+                        format_args!(
+                            "Only roles with the SUPERUSER attribute may terminate processes of roles with the SUPERUSER attribute."
+                        )
+                    } else {
+                        format_args!(
+                            "Only roles with the SUPERUSER attribute may cancel queries of roles with the SUPERUSER attribute."
+                        )
+                    },
+                ));
+            }
+            if !target_role
+                .is_some_and(|role| self.role_has_privileges_of(current_role, role, txid))
+                && !self.role_has_privileges_of(
+                    current_role,
+                    PredefinedRole::SignalBackend.slot(),
+                    txid,
+                )
+            {
+                return Err(crate::sql::eval::with_detail(
+                    denied,
+                    if terminate {
+                        format_args!(
+                            "Only roles with privileges of the role whose process is being terminated or with privileges of the \"pg_signal_backend\" role may terminate this process."
+                        )
+                    } else {
+                        format_args!(
+                            "Only roles with privileges of the role whose query is being canceled or with privileges of the \"pg_signal_backend\" role may cancel this query."
+                        )
+                    },
+                ));
+            }
         }
         let signal = if terminate {
             BackendSignal::Terminate(pid)
@@ -21142,16 +21200,21 @@ impl Storage {
                 .max_extension_scripts
                 .saturating_mul(size_of::<ExtensionScript>()),
             config.extension_script_bytes,
-            config.max_roles.saturating_mul(size_of::<RoleDef>()),
             config
-                .max_role_memberships
+                .role_catalog_slots()
+                .saturating_mul(size_of::<RoleDef>()),
+            config
+                .role_membership_catalog_slots()
                 .saturating_mul(size_of::<RoleMembership>()),
             config
                 .max_role_settings
                 .saturating_mul(size_of::<RoleSetting>()),
             config.query_workspace_slots.saturating_mul(
-                size_of::<Mutex<FixedVec<bool>>>()
-                    .saturating_add(config.max_roles.saturating_mul(size_of::<bool>())),
+                size_of::<Mutex<FixedVec<bool>>>().saturating_add(
+                    config
+                        .role_catalog_slots()
+                        .saturating_mul(size_of::<bool>()),
+                ),
             ),
             MAX_SYSTEM_SETTINGS.saturating_mul(size_of::<SystemSetting>()),
             2usize
@@ -21826,44 +21889,63 @@ impl Storage {
                 .push(CommentEntry::empty())
                 .expect("sized to max_comments");
         }
-        let mut roles = FixedVec::new(budget, "roles", config.max_roles)?;
-        for slot in 0..config.max_roles {
+        let role_slots = config.role_catalog_slots();
+        let mut roles = FixedVec::new(budget, "roles", role_slots)?;
+        for slot in 0..role_slots {
+            let predefined = PredefinedRole::from_slot(slot);
             roles
-                .push(RoleDef {
-                    lifetime: if slot == 0 {
-                        Some(RoleOid::BOOTSTRAP)
-                    } else {
-                        None
-                    },
-                    name: if slot == 0 {
-                        SqlName::parse("postgres").expect("bootstrap role name fits")
-                    } else {
-                        SqlName::EMPTY
-                    },
-                    attributes: if slot == 0 {
-                        RoleAttributes::BOOTSTRAP
-                    } else {
-                        RoleAttributes::ORDINARY
-                    },
-                    live: slot == 0,
-                    pending: None,
+                .push(if slot == 0 {
+                    RoleDef {
+                        lifetime: Some(RoleOid::BOOTSTRAP),
+                        name: SqlName::parse("postgres").expect("bootstrap role name fits"),
+                        attributes: RoleAttributes::BOOTSTRAP,
+                        live: true,
+                        pending: None,
+                    }
+                } else if let Some(predefined) = predefined {
+                    RoleDef {
+                        lifetime: Some(predefined.role_oid()),
+                        name: SqlName::parse(predefined.name()).expect("predefined role name fits"),
+                        attributes: RoleAttributes::ORDINARY,
+                        live: true,
+                        pending: None,
+                    }
+                } else {
+                    RoleDef {
+                        lifetime: None,
+                        name: SqlName::EMPTY,
+                        attributes: RoleAttributes::ORDINARY,
+                        live: false,
+                        pending: None,
+                    }
                 })
-                .expect("sized to max_roles");
+                .expect("sized to the role catalog");
         }
-        let mut role_memberships =
-            FixedVec::new(budget, "role_memberships", config.max_role_memberships)?;
-        for _ in 0..config.max_role_memberships {
+        let membership_slots = config.role_membership_catalog_slots();
+        let mut role_memberships = FixedVec::new(budget, "role_memberships", membership_slots)?;
+        for slot in 0..membership_slots {
             role_memberships
-                .push(RoleMembership {
-                    created_at: 0,
-                    role: 0,
-                    member: 0,
-                    grantor: 0,
-                    options: RoleMembershipOptions::DEFAULT,
-                    live: false,
-                    pending: None,
+                .push(match INITDB_MEMBERSHIPS.get(slot) {
+                    Some(initdb) => RoleMembership {
+                        created_at: INITDB_MEMBERSHIP_BASE + slot as u64,
+                        role: initdb.role.slot() as u16,
+                        member: initdb.member.slot() as u16,
+                        grantor: BOOTSTRAP_ROLE,
+                        options: RoleMembershipOptions::DEFAULT,
+                        live: true,
+                        pending: None,
+                    },
+                    None => RoleMembership {
+                        created_at: 0,
+                        role: 0,
+                        member: 0,
+                        grantor: 0,
+                        options: RoleMembershipOptions::DEFAULT,
+                        live: false,
+                        pending: None,
+                    },
                 })
-                .expect("sized to max_role_memberships");
+                .expect("sized to the role membership catalog");
         }
         let mut role_settings = FixedVec::new(budget, "role_settings", config.max_role_settings)?;
         for _ in 0..config.max_role_settings {
@@ -21877,9 +21959,10 @@ impl Storage {
             config.query_workspace_slots,
         )?;
         for _ in 0..config.query_workspace_slots {
-            let mut scratch = FixedVec::new(budget, "role_graph_scratch", config.max_roles)?;
-            for _ in 0..config.max_roles {
-                scratch.push(false).expect("sized to max_roles");
+            let mut scratch =
+                FixedVec::new(budget, "role_graph_scratch", config.role_catalog_slots())?;
+            for _ in 0..config.role_catalog_slots() {
+                scratch.push(false).expect("sized to the role catalog");
             }
             role_graph_scratch
                 .push(Mutex::new(scratch))
@@ -29263,6 +29346,19 @@ impl Storage {
             return;
         }
         out[member] = true;
+        // The current database's owner is implicitly a member of
+        // pg_database_owner, which cannot have explicit members.
+        let database_owner = self
+            .database_slot_by_oid(current_database(), txid)
+            .map(|slot| {
+                self.object_owner(
+                    AccessObject {
+                        class: AccessClass::Database,
+                        slot: slot as u16,
+                    },
+                    txid,
+                )
+            });
         let catalog = self
             .role_catalog
             .lock()
@@ -29282,6 +29378,13 @@ impl Storage {
                     out[role] = true;
                     changed = true;
                 }
+            }
+            if let Some(owner) = database_owner
+                && out.get(owner).copied().unwrap_or(false)
+                && !out[PredefinedRole::DatabaseOwner.slot()]
+            {
+                out[PredefinedRole::DatabaseOwner.slot()] = true;
+                changed = true;
             }
             if !changed {
                 break;
@@ -29321,6 +29424,33 @@ impl Storage {
             };
         }
         default_public_object_privileges(object.class)
+    }
+
+    /// Privileges initdb grants predefined role `role` on `object` before any
+    /// `GRANT` or `REVOKE` (`EXECUTE` on `pg_ls_waldir()` for `pg_monitor`).
+    pub(crate) fn object_default_role_privileges(
+        &self,
+        object: AccessObject,
+        role: usize,
+    ) -> PrivilegeSet {
+        if object.class != AccessClass::BuiltinRoutine {
+            return PrivilegeSet::NONE;
+        }
+        let Some(predefined) = PredefinedRole::from_slot(role) else {
+            return PrivilegeSet::NONE;
+        };
+        let granted = self
+            .builtin_routine_entry(usize::from(object.slot))
+            .routine
+            .is_some_and(|routine| {
+                crate::sql::catalog::builtin_routine_initial_grantees(routine.get())
+                    .any(|grantee| grantee == predefined)
+            });
+        if granted {
+            PrivilegeSet::EXECUTE
+        } else {
+            PrivilegeSet::NONE
+        }
     }
 
     pub(crate) fn role_has_privileges_of(&self, member: usize, target: usize, txid: u32) -> bool {
@@ -29372,9 +29502,50 @@ impl Storage {
                 if slot == usize::from(owner) && !owner_defined {
                     effective = effective.union(all_object_privileges(object.class));
                 }
+                if !acl_defined {
+                    effective = effective.union(self.object_default_role_privileges(object, slot));
+                }
             }
         }
+        effective = effective.union(Self::predefined_role_privileges(object.class, &roles));
         effective.contains(privilege)
+    }
+
+    /// Privileges PostgreSQL 18.6 adds for predefined roles whatever an
+    /// object's ACL says (`pg_class_aclmask`, `pg_namespace_aclmask`):
+    /// `pg_read_all_data` reads every relation and uses every schema,
+    /// `pg_write_all_data` writes every relation and uses every schema, and
+    /// `pg_maintain` maintains every relation. `held` is the set of roles
+    /// whose privileges the checked role has.
+    fn predefined_role_privileges(class: AccessClass, held: &[bool]) -> PrivilegeSet {
+        let holds = |role: PredefinedRole| held.get(role.slot()).copied().unwrap_or(false);
+        let mut granted = PrivilegeSet::NONE;
+        match class {
+            AccessClass::Table
+            | AccessClass::View
+            | AccessClass::MaterializedView
+            | AccessClass::Sequence => {
+                if holds(PredefinedRole::ReadAllData) {
+                    granted = granted.union(PrivilegeSet::SELECT);
+                }
+                if holds(PredefinedRole::WriteAllData) {
+                    granted = granted
+                        .union(PrivilegeSet::INSERT)
+                        .union(PrivilegeSet::UPDATE)
+                        .union(PrivilegeSet::DELETE);
+                }
+                if holds(PredefinedRole::Maintain) {
+                    granted = granted.union(PrivilegeSet::MAINTAIN);
+                }
+            }
+            AccessClass::Schema
+                if holds(PredefinedRole::ReadAllData) || holds(PredefinedRole::WriteAllData) =>
+            {
+                granted = granted.union(PrivilegeSet::USAGE);
+            }
+            _ => {}
+        }
+        granted
     }
 
     pub(crate) fn require_schema_create(&self, schema: &str, txid: u32) -> Result<(), SqlError> {
@@ -29769,7 +29940,7 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many roles (limit {})",
-                catalog.roles.len()
+                catalog.roles.len() - PREDEFINED_ROLE_COUNT
             ));
         };
         let prior = catalog.roles[slot].pending;
@@ -29970,6 +30141,14 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "stored role has an invalid bootstrap slot"
+            ));
+        }
+        if PredefinedRole::from_slot(slot).is_some()
+            || PredefinedRole::from_oid(oid.get()).is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role replaces a predefined role"
             ));
         }
         if catalog.roles.iter().any(|role| {
@@ -30200,7 +30379,7 @@ impl Storage {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many role memberships (limit {})",
-                        catalog.memberships.len()
+                        catalog.memberships.len() - INITDB_MEMBERSHIPS.len()
                     )
                 })?,
         };
@@ -30219,7 +30398,7 @@ impl Storage {
             self.catalog_sequence
                 .next_bounded(MAX_CATALOG_CREATION, "role membership")?
         } else {
-            catalog.memberships[slot].creation_to(txid).created_at()
+            catalog.memberships[slot].creation_to(txid)
         };
         if existing.is_none() {
             catalog.memberships[slot].role = role as u16;
@@ -30278,7 +30457,7 @@ impl Storage {
         grantor_oid: RoleOid,
         options: RoleMembershipOptions,
     ) -> Result<usize, SqlError> {
-        CatalogIdentity::require(identity.created_at())?;
+        Self::require_membership_identity(identity)?;
         let mut catalog = self
             .role_catalog
             .lock()
@@ -30366,8 +30545,41 @@ impl Storage {
             live: true,
             pending: None,
         };
-        self.catalog_sequence.observe(identity.created_at());
+        if initdb_membership(identity.created_at()).is_none() {
+            self.catalog_sequence.observe(identity.created_at());
+        }
         Ok(slot)
+    }
+
+    /// A stored membership identity is a catalog stamp, or an initdb
+    /// membership's reserved identity at that membership's own position.
+    pub(crate) fn require_membership_identity(identity: CatalogPosition) -> Result<(), SqlError> {
+        match initdb_membership(identity.created_at()) {
+            Some((slot, _)) if slot == identity.slot() => Ok(()),
+            Some(_) => Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored initdb role membership is at another position"
+            )),
+            None => CatalogIdentity::require(identity.created_at()).map(|_| ()),
+        }
+    }
+
+    /// A checkpoint lists every live membership, so restoring one replaces
+    /// the initdb memberships a fresh catalog starts with.
+    pub(crate) fn clear_initdb_role_memberships(&self) {
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        for slot in 0..INITDB_MEMBERSHIPS.len() {
+            let membership = &mut catalog.memberships[slot];
+            if membership.pending.is_none() && initdb_membership(membership.created_at).is_some() {
+                membership.live = false;
+                membership.role = 0;
+                membership.member = 0;
+                membership.grantor = 0;
+            }
+        }
     }
 
     pub(crate) fn role_settings(&self) -> impl Iterator<Item = (usize, RoleSetting)> + '_ {
@@ -30660,7 +30872,7 @@ impl Storage {
     }
 
     pub(crate) fn remove_role_membership(&self, identity: CatalogPosition) -> Result<(), SqlError> {
-        CatalogIdentity::require(identity.created_at())?;
+        Self::require_membership_identity(identity)?;
         let mut catalog = self
             .role_catalog
             .lock()

@@ -71,6 +71,14 @@ pub fn stash_diagnostic(
     PENDING_DIAGNOSTIC.with(|d| *d.borrow_mut() = Some(Diagnostic { detail, hint }));
 }
 
+/// Returns `error` after stashing its `DETAIL` line.
+pub fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> SqlError {
+    let mut text = StackStr::<MAX_DIAGNOSTIC_DETAIL_BYTES>::new();
+    let _ = core::fmt::Write::write_fmt(&mut text, detail);
+    stash_diagnostic(Some(text), None);
+    error
+}
+
 pub fn take_diagnostic() -> Option<Diagnostic> {
     PENDING_DIAGNOSTIC.with(|d| d.borrow_mut().take())
 }
@@ -274,6 +282,7 @@ pub mod sqlstate {
     pub const OBJECT_IN_USE: &str = "55006";
     pub const WARNING_PRIVILEGE_NOT_GRANTED: &str = "01007";
     pub const RESERVED_NAME: &str = "42939";
+    pub const INVALID_AUTHORIZATION_SPECIFICATION: &str = "28000";
     pub const INVALID_SCHEMA_DEFINITION: &str = "42P15";
     pub const DUPLICATE_CURSOR: &str = "42P03";
     pub const INVALID_CURSOR_DEFINITION: &str = "42P11";
@@ -2000,6 +2009,18 @@ pub trait CatalogAccess {
     fn sequence_state_by_oid(&self, _oid: i32) -> Option<(i64, bool)> {
         None
     }
+    /// `pg_describe_object` text of a `pg_default_acl` row, if it exists.
+    fn default_acl_description<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a crate::mem::arena::Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// The relation and column a visible `pg_attrdef` OID belongs to.
+    fn attribute_default_column(&self, _oid: i32) -> Option<(i32, i32)> {
+        None
+    }
     /// Whether this OID names a relation visible to the current query.
     fn relation_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a type visible to the current query.
@@ -2285,6 +2306,16 @@ pub trait CatalogAccess {
         &self,
         _role: Option<&str>,
         _schema: PrivilegeObject<'_>,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
+    /// `pg_has_role`: whether `role` (the current role when absent) is a
+    /// member of, has the privileges of, or may SET ROLE to `target`.
+    fn has_role_privilege(
+        &self,
+        _role: Option<&str>,
+        _target: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)

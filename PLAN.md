@@ -271,15 +271,14 @@ built-in function fails with `0A000` where PostgreSQL changes the catalog
 entry (every built-in name lookup must consult a renamed or moved row); a routine signature naming `cstring` or `"any"` cannot be written
 (`GRANT ... ON FUNCTION int4in(cstring)` fails with `42883`) because those
 pseudo-types are not pos3ql column types, and `pg_type` lists 182 of
-PostgreSQL's 621 built-in types; PostgreSQL's predefined roles
-(`pg_monitor`) do not exist, so their initdb `EXECUTE` grants are absent; a
+PostgreSQL's 621 built-in types; a
 listed built-in that is neither implemented nor an operator, cast or input
 function fails with `0A000` when called; `DROP ROLE`'s `DETAIL` and
-`pg_shdepend` omit objects in other databases, row-security policies
-(`target of policy`) and default privileges, and order owners by OID rather
-than catalog insertion; `pg_describe_object` still schema-qualifies visible
-operators, collations and other objects that are not relations, functions
-or types; built-in operators, types and other
+`pg_shdepend` omit objects in other databases (PostgreSQL adds `2 objects in
+database other`) and order owners by OID rather than catalog insertion;
+`pg_describe_object` of a built-in operator class or family is empty, and
+`pg_cast` lacks PostgreSQL's built-in casts; `pg_attrdef` OIDs derive from
+table slots rather than creation identities; built-in operators, types and other
 catalog objects have no shipped `pg_description` text (built-in routines
 do). A parameter typed from a called
 built-in (`PREPARE q AS SELECT round($1)`) is not recorded as that type:
@@ -335,15 +334,18 @@ called from PL/pgSQL that waits for storage or a lock runs again from its
 start when its statement resumes (finished effects replay from the statement
 journal) instead of resuming at a saved position inside the procedure. Relation row types: a `PREPARE` parameter
 of a table's row type (`PREPARE q(t) AS SELECT $1.a`) fails with `42704`
-(`type "t" does not exist`); a field of an undeclared parameter in a simple
-query (`SELECT ($1).a`) reports `42703` where PostgreSQL reports `42P02`
-(`there is no parameter $1`); values and columns of a
+(`type "t" does not exist`); a field of a parameter whose type a client
+leaves unspecified (`SELECT ($1).a` through the extended protocol) reports
+`42809` with type `text` where PostgreSQL names type `unknown`; values and columns of a
 view's row type, and dropping a relation through `DROP SCHEMA`, `DROP
 MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
 column uses its row type, fail with `0A000`; a `DROP TABLE ... CASCADE` that
 reaches both columns and routines, or names several tables, reports one notice
 per table or dependency kind where PostgreSQL reports one for the statement, and a routine's dependency on a row type is described as depending on the
-table. Values and columns of a view's row type need the view's column types,
+table; `DROP TYPE ... CASCADE` drops routines whose signatures use the type
+without a `drop cascades to function f(t)` notice, and without `CASCADE`
+reports `cannot drop type because routine objects depend on it` where
+PostgreSQL names the type and lists the routines in its `DETAIL`. Values and columns of a view's row type need the view's column types,
 which pos3ql derives from the view's query on each use instead of storing them
 as PostgreSQL's `pg_attribute` rows do. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current

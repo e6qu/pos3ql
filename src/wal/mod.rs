@@ -12057,7 +12057,7 @@ fn decode_op_inner<'a>(
         }),
         KIND_UPSERT_ROLE_MEMBERSHIP => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
-            crate::storage::CatalogIdentity::parse(identity.created_at())?;
+            crate::storage::Storage::require_membership_identity(identity).ok()?;
             let mut take_role = || {
                 let oid = crate::storage::RoleOid::parse(i32::from_le_bytes(
                     payload.get(at..at + 4)?.try_into().ok()?,
@@ -12087,7 +12087,7 @@ fn decode_op_inner<'a>(
         }),
         KIND_DROP_ROLE_MEMBERSHIP => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
-            crate::storage::CatalogIdentity::parse(identity.created_at())?;
+            crate::storage::Storage::require_membership_identity(identity).ok()?;
             (at == payload.len()).then_some(WalOp::DropRoleMembership { identity })
         }),
         KIND_SET_ROLE_SETTING => decode_large_op(|| {

@@ -185,9 +185,9 @@ Functions and expressions:
   cast (`texteq('a', 'b')` is `'a' = 'b'`), and another listed routine
   pos3ql does not run fails with `0A000`. Server administration functions
   keep initdb's ACL: `pg_reload_conf()` and `pg_read_file(text)` are
-  executable only by superusers and roles granted `EXECUTE`. pos3ql has no
-  predefined roles (`pg_monitor`, `pg_read_all_stats`), so their initdb
-  grants are not listed in `proacl`. `GRANT`, `has_function_privilege`,
+  executable only by superusers and roles granted `EXECUTE`, and initdb's
+  grants to predefined roles (`pg_monitor` may run `pg_ls_waldir()`) are
+  kept in `proacl` and `pg_init_privs`. `GRANT`, `has_function_privilege`,
   `proacl`, `pg_get_function_arguments`, `pg_get_function_result` and psql's
   `\df+` follow PostgreSQL, including the description PostgreSQL ships for
   each built-in routine
@@ -200,17 +200,44 @@ Functions and expressions:
   (`'int4in(cstring)'::regprocedure`, `GRANT ... ON FUNCTION
   int4in(cstring)`) is not recognized (`42883`). Dropping a built-in fails
   with `2BP01`, as in PostgreSQL.
+- PostgreSQL 18.6's predefined roles exist from the start, with their
+  OIDs, and initdb's memberships of `pg_monitor` in `pg_read_all_settings`,
+  `pg_read_all_stats` and `pg_stat_scan_tables`. Like PostgreSQL, pos3ql
+  rejects creating, altering or renaming a role whose name starts with `pg_`
+  (`42939`) and dropping a predefined role (`2BP01`); `pg_database_owner` has
+  only its implicit member, the current database's owner. Their privileges
+  apply where pos3ql has the feature: `pg_read_all_data` reads every table,
+  view and sequence and uses every schema, `pg_write_all_data` inserts,
+  updates and deletes everywhere, `pg_maintain` may `VACUUM`, `ANALYZE`,
+  `REINDEX`, `REFRESH MATERIALIZED VIEW` and `LOCK` every table,
+  `pg_checkpoint` may run `CHECKPOINT`, `pg_signal_backend` may cancel or
+  terminate other non-superuser sessions, and `pg_read_all_stats` sees every
+  session's `pg_stat_activity` details. For example, after
+  `GRANT pg_read_all_data TO reporting`, the `reporting` role can
+  `SELECT` from any table without per-table grants. pos3ql has no server
+  files, superuser-only settings, reserved connections or autovacuum workers,
+  so `pg_read_server_files`, `pg_write_server_files`,
+  `pg_execute_server_program`, `pg_read_all_settings`,
+  `pg_use_reserved_connections` and `pg_signal_autovacuum_worker` grant
+  nothing more. `VACUUM` and `ANALYZE` skip a table the role may not
+  maintain with PostgreSQL's `permission denied to analyze "t", skipping it`
+  warning. The predefined roles are not counted in `max_roles`.
 - `DROP ROLE` of a role that still owns objects or holds privileges fails
   with `2BP01` and PostgreSQL's `DETAIL` list (`owner of table t`,
   `privileges for function upper(text)`, `privileges for column b of table
-  t`), at most 100 lines and then `and N other objects`. `pg_shdepend` holds
-  the same rows: owners other than the bootstrap superuser and every grantee
-  or grantor in an ACL other than the owner. `pg_describe_object` names a
-  relation, function or type without its schema when the search path finds
-  it (`table t`, `function lower(text)`). Limits: owners are listed in object
-  OID order and privileges in grant order, where PostgreSQL lists catalog
-  insertion order; objects in other databases, row-security policies and
-  default privileges are not listed.
+  t`, `target of policy p on table t`, `owner of default privileges on new
+  relations belonging to role r`), at most 100 lines and then `and N other
+  objects`. `pg_shdepend` holds the same rows: owners other than the
+  bootstrap superuser and predefined roles, every grantee or grantor in an
+  ACL other than the owner, the roles a policy names, and default-privilege
+  owners and grantees. `pg_describe_object` names objects as PostgreSQL does,
+  without their schema when the search path finds them (`table t`,
+  `function lower(text)`, `operator <<<(integer,integer)`, `collation c`,
+  `constraint c on table t`, `trigger tg on table t`, `default value for
+  column a of table t`). Limits: owners are listed in object OID order and
+  privileges in grant order, where PostgreSQL lists catalog insertion order;
+  objects in other databases are not counted; a built-in operator class or
+  family has an empty description.
 - Array and `CASE` result types follow declarations, including subqueries and
   nulls: `ARRAY[(SELECT NULL::date)]` is `date[]`; mixing integer and bigint
   gives `bigint[]`; an empty constructor needs a type (`ARRAY[]::integer[]`).

@@ -3246,7 +3246,7 @@ pub enum LockWait {
 }
 
 /// PostgreSQL's table-level lock modes, weakest to strongest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TableLockMode {
     AccessShare,
     RowShare,

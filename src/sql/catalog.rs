@@ -10685,20 +10685,7 @@ fn foreign_mapping_options_visible(
         && storage.has_object_privilege(server, current, crate::storage::PrivilegeSet::USAGE, txid)
 }
 
-const PG_DATABASE_OWNER_OID: i32 = 6_171;
-const PREDEFINED_ROLES: &[(i32, &str)] = &[(PG_DATABASE_OWNER_OID, "pg_database_owner")];
-
-pub(crate) fn predefined_role_name(oid: i32) -> Option<&'static str> {
-    PREDEFINED_ROLES
-        .iter()
-        .find_map(|(candidate, name)| (*candidate == oid).then_some(*name))
-}
-
-pub(crate) fn predefined_role_oid(name: &str) -> Option<i32> {
-    PREDEFINED_ROLES
-        .iter()
-        .find_map(|(oid, candidate)| (*candidate == name).then_some(*oid))
-}
+const PG_DATABASE_OWNER_OID: i32 = crate::storage::PredefinedRole::DatabaseOwner.oid();
 
 pub(crate) fn user_name_by_oid<'a>(
     catalog: &dyn super::eval::CatalogAccess,
@@ -10971,31 +10958,49 @@ fn builtin_acl<'a>(values: &[&str], arena: &'a Arena) -> Result<Datum<'a>, SqlEr
     })
 }
 
-/// An initdb ACL. pos3ql does not create PostgreSQL's predefined roles
-/// (`pg_monitor`, `pg_read_all_stats`), so their grants are not listed.
+/// An initdb ACL. Its roles are the bootstrap superuser and predefined
+/// roles, which cannot be dropped; a renamed bootstrap superuser is shown
+/// by its current name, as PostgreSQL stores ACL items by role OID.
 fn builtin_initial_acl<'a>(
     storage: &Storage,
     txid: u32,
     items: &[&str],
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let mut present = [""; 4];
-    let mut count = 0;
-    for item in items {
-        let grantee = item.split_once('=').map_or("", |(grantee, _)| grantee);
-        if grantee.is_empty() || storage.find_role_visible(grantee, txid).is_some() {
-            if count == present.len() {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "built-in initial ACL has more than {} entries",
-                    present.len()
-                ));
+    use core::fmt::Write;
+    let bootstrap = storage.role_name(usize::from(crate::storage::BOOTSTRAP_ROLE), txid);
+    let datums = arena
+        .alloc_slice_with(items.len(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    for (datum, item) in datums.iter_mut().zip(items) {
+        let (grantee, rest) = item.split_once('=').unwrap_or(("", item));
+        let (privileges, grantor) = rest.split_once('/').unwrap_or((rest, ""));
+        let rename = |name: &str| {
+            if name == "postgres" {
+                super::types::acl_identifier(bootstrap.as_str())
+            } else {
+                super::types::acl_identifier(name)
             }
-            present[count] = item;
-            count += 1;
-        }
+        };
+        let mut rendered = StackStr::<256>::new();
+        let _ = write!(
+            rendered,
+            "{}={}/{}",
+            if grantee.is_empty() {
+                StackStr::new()
+            } else {
+                rename(grantee)
+            }
+            .as_str(),
+            privileges,
+            rename(grantor).as_str()
+        );
+        *datum = text(rendered.as_str(), arena)?;
     }
-    builtin_acl(&present[..count], arena)
+    Ok(Datum::Array {
+        element: super::types::ArrElem::AclItem,
+        raw: super::array::build(datums, arena)?,
+    })
 }
 
 fn pg_init_privs<'a>(
@@ -11505,13 +11510,6 @@ pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str)
 }
 
 pub(crate) fn role_oid_by_written(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
-    if let Some(oid) = PREDEFINED_ROLES.iter().find_map(|(_, name)| {
-        identifier_spelling_matches(written, name)
-            .then(|| predefined_role_oid(name))
-            .flatten()
-    }) {
-        return Some(oid);
-    }
     (0..storage.role_count()).find_map(|slot| {
         let oid = storage.role_oid(slot);
         let visible = storage.role_slot_by_oid(oid, txid)?;
@@ -13382,6 +13380,22 @@ pub(crate) fn builtin_routine_initial_acl(oid: i32) -> Option<&'static [&'static
     acls.binary_search_by_key(&oid, |(candidate, _)| *candidate)
         .ok()
         .map(|index| acls[index].1)
+}
+
+/// The predefined roles initdb grants `EXECUTE` on built-in routine `oid`
+/// (`pg_monitor` on `pg_ls_waldir()`), in `proacl` order.
+pub(crate) fn builtin_routine_initial_grantees(
+    oid: i32,
+) -> impl Iterator<Item = crate::storage::PredefinedRole> {
+    builtin_routine_initial_acl(oid)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let grantee = item.split_once('=')?.0;
+            crate::storage::PredefinedRole::ALL
+                .into_iter()
+                .find(|role| role.name() == grantee)
+        })
 }
 
 /// Whether `PUBLIC` may execute built-in routine `oid` before any `GRANT` or
@@ -25131,6 +25145,48 @@ fn pg_attribute<'a>(
     finish(def, &out[..n], arena)
 }
 
+/// The relation and attribute number a `pg_attrdef` OID names, when that
+/// column has a default visible to `txid`.
+pub(crate) fn attribute_default_column(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Option<(i32, i32)> {
+    let width = crate::storage::MAX_RELATION_COLUMNS as i32;
+    let (offset, view) = if (400_000_000..600_000_000).contains(&oid) {
+        (oid - 400_000_000, false)
+    } else if oid >= 600_000_000 {
+        (oid - 600_000_000, true)
+    } else {
+        return None;
+    };
+    let slot = usize::try_from(offset / width).ok()?;
+    let attribute = offset % width + 1;
+    if view {
+        let (_, definition) = storage
+            .views_visible_to(txid)
+            .find(|(candidate, _)| *candidate == slot)?;
+        let columns = definition.columns_for(txid);
+        let column = usize::try_from(attribute - 1).ok()?;
+        (column < columns.len() && columns.default_at_ref(column).is_some())
+            .then(|| (view_oid(storage, slot), attribute))
+    } else {
+        if slot >= storage.table_count() || !storage.table_slot_visible_to(slot, txid) {
+            return None;
+        }
+        let table = storage.table_def(slot, txid);
+        table
+            .columns()
+            .iter()
+            .enumerate()
+            .any(|(index, column)| {
+                i32::from(table.attribute_number(index)) == attribute
+                    && column.default.expression().is_some()
+            })
+            .then(|| (user_table_oid(storage, slot), attribute))
+    }
+}
+
 fn pg_attrdef<'a>(
     storage: &Storage,
     txid: u32,
@@ -29791,8 +29847,15 @@ fn pg_stat_activity<'a>(
             .alloc_slice_with(activities.len(), |_| &[] as &[Datum])
             .map_err(|_| arena_full())?;
         let current_role = storage.current_role_slot(txid);
-        let see_all =
-            current_role.is_some_and(|role| storage.role(role).attributes_to(txid).superuser);
+        // PostgreSQL's HAS_PGSTAT_PERMISSIONS: the privileges of the
+        // backend's role or of pg_read_all_stats.
+        let see_all = current_role.is_some_and(|role| {
+            storage.role_has_privileges_of(
+                role,
+                crate::storage::PredefinedRole::ReadAllStats.slot(),
+                txid,
+            )
+        });
         let mut count = 0usize;
         let mut found_error = None;
         for &activity in activities {
@@ -29809,7 +29872,12 @@ fn pg_stat_activity<'a>(
             let role_name = role.map(|role| role.name());
             let visible = activity.pid == storage.current_connection_id()
                 || see_all
-                || (current_role.is_some() && current_role == activity_role);
+                || current_role
+                    .zip(activity_role)
+                    .is_some_and(|(current, role)| {
+                        storage.role_has_privileges_of(current, role, txid)
+                    });
+            let shown = |value: Datum<'a>| if visible { value } else { Datum::Null };
             let query = if visible {
                 activity.query.as_str()
             } else {
@@ -29830,23 +29898,23 @@ fn pg_stat_activity<'a>(
                         None => Datum::Null,
                     },
                     text(activity.application_name.as_str(), arena)?,
-                    activity.client_addr.map_or(Datum::Null, Datum::Inet),
+                    shown(activity.client_addr.map_or(Datum::Null, Datum::Inet)),
                     Datum::Null,
-                    Datum::Int4(activity.client_port),
-                    Datum::Timestamptz(activity.backend_start),
-                    activity.xact_start.map_or(Datum::Null, Datum::Timestamptz),
-                    activity.query_start.map_or(Datum::Null, Datum::Timestamptz),
-                    Datum::Timestamptz(activity.state_change),
-                    activity.wait_event_type.map_or(Datum::Null, Datum::Text),
-                    activity.wait_event.map_or(Datum::Null, Datum::Text),
-                    Datum::Text(activity.state.as_str()),
+                    shown(Datum::Int4(activity.client_port)),
+                    shown(Datum::Timestamptz(activity.backend_start)),
+                    shown(activity.xact_start.map_or(Datum::Null, Datum::Timestamptz)),
+                    shown(activity.query_start.map_or(Datum::Null, Datum::Timestamptz)),
+                    shown(Datum::Timestamptz(activity.state_change)),
+                    shown(activity.wait_event_type.map_or(Datum::Null, Datum::Text)),
+                    shown(activity.wait_event.map_or(Datum::Null, Datum::Text)),
+                    shown(Datum::Text(activity.state.as_str())),
                     activity
                         .backend_xid
                         .map_or(Datum::Null, |xid| Datum::Int4(xid as i32)),
                     Datum::Null,
                     Datum::Null,
                     text(query, arena)?,
-                    Datum::Text("client backend"),
+                    shown(Datum::Text("client backend")),
                 ];
                 row(&values, arena)
             })();
@@ -30914,17 +30982,30 @@ const OWNED_ACCESS_CLASSES: [crate::storage::AccessClass; 16] = {
 /// bootstrap superuser and `PUBLIC` are never recorded, and an ACL records
 /// each grantee and grantor other than the object's owner. Owners come first
 /// in object-creation (OID) order, then privileges in grant order.
+/// PostgreSQL records no `pg_shdepend` row for a pinned role: the bootstrap
+/// superuser and the predefined roles (OIDs below `FirstUnpinnedObjectId`).
+fn role_is_pinned(role: u16) -> bool {
+    role == crate::storage::BOOTSTRAP_ROLE
+        || crate::storage::PredefinedRole::from_slot(usize::from(role)).is_some()
+}
+
 pub(crate) fn shared_dependencies<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a [SharedDependency], SqlError> {
-    use crate::storage::{AccessObject, BOOTSTRAP_ROLE, PUBLIC_ROLE};
+    use crate::storage::{AccessObject, PUBLIC_ROLE};
     let capacity = OWNED_ACCESS_CLASSES
         .iter()
         .map(|class| storage.access_class_slots(*class))
         .sum::<usize>()
         + 2 * (storage.acl_entry_count() + storage.column_acl_entry_count());
+    let policy_roles = storage
+        .policies_with_slots_visible_to(txid)
+        .map(|(slot, _)| storage.policy_roles(slot, txid).len())
+        .sum::<usize>();
+    let default_acls = storage.snapshot_default_acl_grants(txid, arena)?;
+    let capacity = capacity + policy_roles + 2 * default_acls.len();
     let rows = arena
         .alloc_slice_with(capacity, |_| SharedDependency {
             class: 0,
@@ -30945,7 +31026,7 @@ pub(crate) fn shared_dependencies<'a>(
                 continue;
             }
             let owner = storage.object_owner(object, txid) as u16;
-            if owner == BOOTSTRAP_ROLE {
+            if role_is_pinned(owner) {
                 continue;
             }
             let Some((class, oid)) = access_object_catalog_identity(storage, txid, object) else {
@@ -30963,7 +31044,7 @@ pub(crate) fn shared_dependencies<'a>(
     }
     rows[..count].sort_unstable_by_key(|row| (row.object as u32, row.class));
     let mut push = |rows: &mut [SharedDependency], row: SharedDependency| {
-        if row.role == PUBLIC_ROLE || row.role == BOOTSTRAP_ROLE || rows[..count].contains(&row) {
+        if row.role == PUBLIC_ROLE || role_is_pinned(row.role) || rows[..count].contains(&row) {
             return;
         }
         rows[count] = row;
@@ -31036,7 +31117,111 @@ pub(crate) fn shared_dependencies<'a>(
             }
         }
     }
+    // A policy depends on each role it names (`target of policy p on table t`).
+    for (slot, policy) in storage.policies_with_slots_visible_to(txid) {
+        for role in storage.policy_roles(slot, txid).iter().copied() {
+            push(
+                rows,
+                SharedDependency {
+                    class: 3256,
+                    object: crate::storage::policy_oid(&policy),
+                    sub: 0,
+                    role,
+                    kind: b'r',
+                },
+            );
+        }
+    }
+    // A default-privileges row depends on its owner and its grantees, in
+    // creation order.
+    let groups = arena
+        .alloc_slice_copy(default_acls)
+        .map_err(|_| arena_full())?;
+    groups.sort_unstable_by_key(|image| {
+        (
+            image.identity.creation.get(),
+            image.grantee.map_or(0, |role| role.get() as u32),
+        )
+    });
+    for (index, image) in groups.iter().enumerate() {
+        let first = index == 0 || groups[index - 1].identity != image.identity;
+        let slot_of = |oid: crate::storage::RoleOid| storage.role_slot_by_oid(oid.get(), txid);
+        if first && let Some(owner) = slot_of(image.identity.owner) {
+            push(
+                rows,
+                SharedDependency {
+                    class: 826,
+                    object: image.identity.oid(),
+                    sub: 0,
+                    role: owner as u16,
+                    kind: b'o',
+                },
+            );
+        }
+        if image.privileges.0 != 0
+            && image.grantee != Some(image.identity.owner)
+            && let Some(grantee) = image.grantee.and_then(slot_of)
+        {
+            push(
+                rows,
+                SharedDependency {
+                    class: 826,
+                    object: image.identity.oid(),
+                    sub: 0,
+                    role: grantee as u16,
+                    kind: b'a',
+                },
+            );
+        }
+    }
     Ok(&rows[..count])
+}
+
+/// PostgreSQL's `getObjectDescription` of a `pg_default_acl` row
+/// (`default privileges on new relations belonging to role r in schema s`).
+pub(crate) fn default_acl_description(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &Arena,
+) -> Result<Option<StackStr<320>>, SqlError> {
+    use core::fmt::Write;
+    let images = storage.snapshot_default_acl_grants(txid, arena)?;
+    let Some(image) = images.iter().find(|image| image.identity.oid() == oid) else {
+        return Ok(None);
+    };
+    let owner = storage
+        .role_name_by_oid(image.identity.owner, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "default privilege owner identity is unavailable"
+            )
+        })?;
+    let objects = match image.identity.class {
+        crate::storage::DefaultPrivilegeClass::Table => "relations",
+        crate::storage::DefaultPrivilegeClass::Sequence => "sequences",
+        crate::storage::DefaultPrivilegeClass::Function => "functions",
+        crate::storage::DefaultPrivilegeClass::Type => "types",
+        crate::storage::DefaultPrivilegeClass::Schema => "schemas",
+    };
+    let mut text = StackStr::<320>::new();
+    let _ = write!(
+        text,
+        "default privileges on new {} belonging to role {}",
+        objects,
+        owner.as_str()
+    );
+    if let Some(schema) = image.identity.schema {
+        let name = schema_name_by_oid(storage, txid, schema.oid()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "default privilege schema identity is unavailable"
+            )
+        })?;
+        let _ = write!(text, " in schema {}", name.as_str());
+    }
+    Ok(Some(text))
 }
 
 fn pg_shdepend<'a>(
@@ -32286,31 +32471,9 @@ fn pg_authid<'a>(
     }
     let def = schema::require("pg_authid", false);
     let output = arena
-        .alloc_slice_with(storage.role_count() + PREDEFINED_ROLES.len(), |_| {
-            &[] as &[Datum]
-        })
+        .alloc_slice_with(storage.role_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
-    for &(oid, name) in PREDEFINED_ROLES {
-        output[count] = row(
-            &[
-                Datum::Int4(oid),
-                text(name, arena)?,
-                Datum::Bool(false),
-                Datum::Bool(true),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Int4(-1),
-                Datum::Null,
-                Datum::Null,
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
     for slot in 0..storage.role_count() {
         let role = storage.role(slot);
         if !role.visible_to(txid) {

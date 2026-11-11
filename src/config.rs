@@ -139,9 +139,11 @@ pub struct Config {
     pub max_enum_labels_per_type: usize,
     /// Fixed number of named composite type catalog slots across all databases.
     pub max_composites: usize,
-    /// Fixed number of cluster-wide role catalog slots, including `postgres`.
+    /// Fixed number of cluster-wide role catalog slots, including `postgres`
+    /// but not PostgreSQL's 16 predefined roles, which are always present.
     pub max_roles: usize,
-    /// Fixed number of cluster-wide role-membership catalog slots.
+    /// Fixed number of cluster-wide role-membership catalog slots, not
+    /// counting the three memberships initdb grants to `pg_monitor`.
     pub max_role_memberships: usize,
     /// Fixed number of per-role and per-database setting catalog slots.
     pub max_role_settings: usize,
@@ -415,6 +417,18 @@ impl Drop for TestDataDirCleanup {
 }
 
 impl Config {
+    /// Role catalog slots: `max_roles` (including `postgres`) plus
+    /// PostgreSQL's predefined roles, which are always present.
+    pub fn role_catalog_slots(&self) -> usize {
+        self.max_roles + crate::storage::PREDEFINED_ROLE_COUNT
+    }
+
+    /// Role membership slots: `max_role_memberships` plus the memberships
+    /// initdb grants among predefined roles.
+    pub fn role_membership_catalog_slots(&self) -> usize {
+        self.max_role_memberships + crate::storage::INITDB_MEMBERSHIPS.len()
+    }
+
     /// Explicit development fixture; the server requires a configuration file.
     pub fn default_dev() -> Self {
         Self {
@@ -3250,23 +3264,30 @@ sql_arena_bytes = 4096
             ))
             .unwrap();
         }
-        for name in [
-            "max_roles",
-            "max_role_memberships",
-            "max_role_settings",
-            "max_acl_entries",
-            "max_column_acl_entries",
-            "max_default_acl_entries",
-            "max_parameter_acl_entries",
-            "max_builtin_routine_entries",
+        for (name, maximum) in [
+            ("max_roles", crate::storage::MAX_ROLE_CATALOG_SLOTS),
+            (
+                "max_role_memberships",
+                crate::storage::MAX_ROLE_MEMBERSHIP_CATALOG_SLOTS,
+            ),
+            ("max_role_settings", 65535),
+            ("max_acl_entries", 65535),
+            ("max_column_acl_entries", 65535),
+            ("max_default_acl_entries", 65535),
+            ("max_parameter_acl_entries", 65535),
+            ("max_builtin_routine_entries", 65535),
         ] {
             let error = Config::parse(&format!(
-                "{name} = 65536\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\n"
+                "{name} = {}\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\n",
+                maximum + 1
             ))
             .unwrap_err();
-            assert!(error.message.contains("65535-slot"), "{name}: {error}");
+            assert!(
+                error.message.contains(&format!("{maximum}-slot")),
+                "{name}: {error}"
+            );
             Config::parse(&format!(
-                "{name} = 65535\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\n"
+                "{name} = {maximum}\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\n"
             ))
             .unwrap();
         }

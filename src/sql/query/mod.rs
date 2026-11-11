@@ -3892,6 +3892,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                             usize::from(crate::storage::BOOTSTRAP_ROLE),
                             self.txid,
                         )
+                        || super::catalog::builtin_routine_initial_grantees(oid).any(|grantee| {
+                            self.storage
+                                .role_has_privileges_of(role, grantee.slot(), self.txid)
+                        })
                 }
             };
             if !allowed {
@@ -5485,6 +5489,20 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::sequence_state_by_oid(self.storage, oid, self.txid)
     }
 
+    fn attribute_default_column(&self, oid: i32) -> Option<(i32, i32)> {
+        super::catalog::attribute_default_column(self.storage, self.txid, oid)
+    }
+
+    fn default_acl_description<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::default_acl_description(self.storage, self.txid, oid, arena)?
+            .map(|text| arena.alloc_str(text.as_str()).map_err(|_| arena_full()))
+            .transpose()
+    }
+
     fn relation_is_visible(&self, oid: i32) -> Option<bool> {
         super::catalog::relation_oid_visibility(self.storage, self.txid, oid)
     }
@@ -5677,8 +5695,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             Ok(Some(
                 arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
             ))
-        } else if let Some(name) = super::catalog::predefined_role_name(oid) {
-            Ok(Some(arena.alloc_str(name).map_err(|_| arena_full())?))
         } else {
             Ok(None)
         }
@@ -5688,7 +5704,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage
             .find_role_visible(name, self.txid)
             .map(|slot| self.storage.role_oid(slot))
-            .or_else(|| super::catalog::predefined_role_oid(name))
     }
 
     fn written_role_oid(&self, name: &str) -> Option<i32> {
@@ -6031,6 +6046,91 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         .map(Some)
     }
 
+    fn has_role_privilege(
+        &self,
+        role: Option<&str>,
+        target: super::eval::PrivilegeObject<'_>,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        use super::eval::PrivilegeObject;
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let target = match target {
+            PrivilegeObject::Oid(oid) => match self.storage.role_slot_by_oid(oid, self.txid) {
+                Some(slot) => slot,
+                None => return Ok(None),
+            },
+            PrivilegeObject::Name(name) => self
+                .storage
+                .find_role_visible(name, self.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "role \"{}\" does not exist",
+                        name
+                    )
+                })?,
+        };
+        // PostgreSQL 18.6 convert_role_priv_string and pg_role_aclcheck.
+        #[derive(Clone, Copy)]
+        enum RolePrivilege {
+            Member,
+            Usage,
+            Set,
+            Admin,
+        }
+        let mut requested = [None; 4];
+        for item in privileges.split(',') {
+            let item = item.trim_matches(|c: char| c.is_ascii_whitespace());
+            let privilege = [
+                ("MEMBER", RolePrivilege::Member),
+                ("USAGE", RolePrivilege::Usage),
+                ("SET", RolePrivilege::Set),
+            ]
+            .into_iter()
+            .find_map(|(name, privilege)| {
+                if item.eq_ignore_ascii_case(name) {
+                    return Some(privilege);
+                }
+                let rest = item
+                    .get(..name.len())?
+                    .eq_ignore_ascii_case(name)
+                    .then(|| &item[name.len()..])?;
+                (rest.eq_ignore_ascii_case(" WITH GRANT OPTION")
+                    || rest.eq_ignore_ascii_case(" WITH ADMIN OPTION"))
+                .then_some(RolePrivilege::Admin)
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unrecognized privilege type: \"{}\"",
+                    item
+                )
+            })?;
+            requested[privilege as usize] = Some(privilege);
+        }
+        let superuser = self.storage.role(role).attributes_to(self.txid).superuser;
+        Ok(Some(requested.into_iter().flatten().any(
+            |privilege| match privilege {
+                RolePrivilege::Admin => {
+                    superuser
+                        || (role != target && self.storage.role_can_admin(role, target, self.txid))
+                }
+                RolePrivilege::Member => {
+                    superuser || self.storage.role_is_member_of(role, target, self.txid)
+                }
+                RolePrivilege::Usage => {
+                    self.storage.role_has_privileges_of(role, target, self.txid)
+                }
+                RolePrivilege::Set => {
+                    superuser || self.storage.role_can_set(role, target, self.txid)
+                }
+            },
+        )))
+    }
+
     fn has_schema_privilege(
         &self,
         role: Option<&str>,
@@ -6268,9 +6368,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             None => {
                 if let Some(public) = super::catalog::intrinsic_routine_public_execute(oid) {
                     let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
+                    let granted =
+                        super::catalog::builtin_routine_initial_grantees(oid).any(|grantee| {
+                            self.storage
+                                .role_has_privileges_of(role, grantee.slot(), self.txid)
+                        });
                     return Ok(Some(requested.allows(
                         PrivilegeSet::NONE,
-                        |_| owner || public,
+                        |_| owner || public || granted,
                         |_| owner,
                     )));
                 }

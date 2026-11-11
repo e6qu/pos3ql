@@ -72,8 +72,12 @@ impl RoleOid {
     pub(crate) const USER_FLOOR: u64 = 16_384;
 
     pub(crate) fn parse(value: i32) -> Option<Self> {
-        (value == 10 || value > Self::USER_FLOOR as i32)
-            .then(|| Self(NonZeroU32::new(value as u32).expect("a valid role OID is nonzero")))
+        (value == 10
+            || value > Self::USER_FLOOR as i32
+            || super::PredefinedRole::ALL
+                .iter()
+                .any(|role| role.oid() == value))
+        .then(|| Self(NonZeroU32::new(value as u32).expect("a valid role OID is nonzero")))
     }
 
     pub(crate) fn get(self) -> i32 {
@@ -313,10 +317,11 @@ impl Storage {
 
     pub(crate) fn lock_role_for_drop(&self, slot: usize, transaction: u32) -> Result<(), SqlError> {
         let source = self.role(slot).oid();
-        if source == RoleOid::BOOTSTRAP {
+        if source == RoleOid::BOOTSTRAP || super::PredefinedRole::from_slot(slot).is_some() {
             return Err(crate::sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop role because it is required by the database system"
+                "cannot drop role {} because it is required by the database system",
+                self.role(slot).name_to(transaction).as_str()
             ));
         }
         if transaction != 0 {

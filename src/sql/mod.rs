@@ -3989,7 +3989,7 @@ impl Engine {
                 .saturating_mul(size_of::<(u64, RowHome)>()),
             (config.max_connections as usize).saturating_mul(config.wal_buffer_bytes),
             config
-                .max_roles
+                .role_catalog_slots()
                 .saturating_mul(size_of::<RoleConnections>()),
             config.max_databases.saturating_mul(size_of::<u16>()),
             notify::NotifyState::budget_bytes(
@@ -4278,14 +4278,15 @@ impl Engine {
                 .push(0)
                 .expect("sized to max_databases");
         }
-        let mut role_connections = FixedVec::new(budget, "role_connections", config.max_roles)?;
-        for _ in 0..config.max_roles {
+        let mut role_connections =
+            FixedVec::new(budget, "role_connections", config.role_catalog_slots())?;
+        for _ in 0..config.role_catalog_slots() {
             role_connections
                 .push(RoleConnections {
                     source: crate::storage::SessionRole::Unauthenticated,
                     count: 0,
                 })
-                .expect("sized to max_roles");
+                .expect("sized to the role catalog");
         }
         let mut logical_decoding_truncates = FixedVec::new(
             budget,
@@ -9202,18 +9203,36 @@ impl Engine {
         Ok(())
     }
 
-    fn lock_maintenance_targets(
+    /// PostgreSQL's `vacuum_is_permitted_for_relation`: VACUUM and ANALYZE
+    /// need the MAINTAIN privilege (owners and pg_maintain have it).
+    fn maintenance_permitted(&self, slot: usize, txid: u32) -> bool {
+        self.storage.current_role_slot(txid).is_some_and(|role| {
+            self.storage.has_object_privilege(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Table,
+                    slot: slot as u16,
+                },
+                role,
+                crate::storage::PrivilegeSet::MAINTAIN,
+                txid,
+            )
+        })
+    }
+
+    /// The tables a VACUUM or ANALYZE processes, in order: every visible
+    /// table, or each target and (unless ONLY) its descendants.
+    fn for_each_maintenance_slot(
         &self,
         targets: &[ast::MaintenanceTarget<'_>],
         txid: u32,
-        mode: ast::TableLockMode,
+        mut visit: impl FnMut(usize) -> Result<(), SqlError>,
     ) -> Result<(), SqlError> {
         if targets.is_empty() {
             for slot in 0..self.storage.table_count() {
                 if self.storage.table_slot_visible_to(slot, txid)
                     && self.storage.relation_visible_to_current_session(slot, txid)
                 {
-                    self.storage.lock_table(txid, slot, mode, false)?;
+                    visit(slot)?;
                 }
             }
             return Ok(());
@@ -9227,11 +9246,55 @@ impl Engine {
                         || (target.inheritance == ast::RelationInheritance::Descendants
                             && self.storage.relation_descends_from(slot, root, txid)))
                 {
-                    self.storage.lock_table(txid, slot, mode, false)?;
+                    visit(slot)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Warns once per table the current role may not maintain, as
+    /// PostgreSQL does before skipping it.
+    fn warn_maintenance_denials(
+        &self,
+        targets: &[ast::MaintenanceTarget<'_>],
+        txid: u32,
+        verb: &str,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let mut wire = Ok(());
+        let result = self.for_each_maintenance_slot(targets, txid, |slot| {
+            if wire.is_ok() && !self.maintenance_permitted(slot, txid) {
+                let name = self.storage.table_def(slot, txid).name;
+                wire = responder.warning(
+                    sqlstate::WARNING,
+                    stack_format!(
+                        160,
+                        "permission denied to {} \"{}\", skipping it",
+                        verb,
+                        name.as_str()
+                    )
+                    .as_str(),
+                );
+            }
+            Ok(())
+        });
+        wire?;
+        Ok(result)
+    }
+
+    fn lock_maintenance_targets(
+        &self,
+        targets: &[ast::MaintenanceTarget<'_>],
+        txid: u32,
+        mode: ast::TableLockMode,
+    ) -> Result<(), SqlError> {
+        self.for_each_maintenance_slot(targets, txid, |slot| {
+            if self.maintenance_permitted(slot, txid) {
+                self.storage.lock_table(txid, slot, mode, false)?;
+            }
+            Ok(())
+        })
     }
 
     fn analyze_targets(
@@ -9248,6 +9311,7 @@ impl Engine {
                     && self
                         .storage
                         .relation_visible_to_current_session(slot, txn.txid)
+                    && self.maintenance_permitted(slot, txn.txid)
                 {
                     txn.record_statistics(slot as u32)?;
                     self.work.reset();
@@ -9286,6 +9350,7 @@ impl Engine {
                     || (slot != root
                         && (target.inheritance == ast::RelationInheritance::Only
                             || !self.storage.relation_descends_from(slot, root, txn.txid)))
+                    || !self.maintenance_permitted(slot, txn.txid)
                 {
                     continue;
                 }
@@ -9343,6 +9408,7 @@ impl Engine {
             for slot in 0..self.storage.table_count() {
                 if self.storage.table_slot_visible_to(slot, txid)
                     && self.storage.relation_visible_to_current_session(slot, txid)
+                    && self.maintenance_permitted(slot, txid)
                 {
                     self.work.reset();
                     self.storage
@@ -9361,6 +9427,7 @@ impl Engine {
                     && (slot == root
                         || (target.inheritance == ast::RelationInheritance::Descendants
                             && self.storage.relation_descends_from(slot, root, txid)))
+                    && self.maintenance_permitted(slot, txid)
                 {
                     self.work.reset();
                     self.storage
@@ -9378,6 +9445,28 @@ impl Engine {
         txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if txn.checkpoint_request.is_none()
+            && !self
+                .storage
+                .current_role_slot(txn.txid)
+                .is_some_and(|role| {
+                    self.storage.role_has_privileges_of(
+                        role,
+                        crate::storage::PredefinedRole::Checkpoint.slot(),
+                        txn.txid,
+                    )
+                })
+        {
+            return Ok(Err(crate::sql::eval::with_detail(
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied to execute CHECKPOINT command"
+                ),
+                format_args!(
+                    "Only roles with privileges of the \"pg_checkpoint\" role may execute this command."
+                ),
+            )));
+        }
         if self.commit_progress == CommitProgressMode::Reactor
             && let Some(checkpointer) = self.ckpt.as_mut()
         {
@@ -9432,6 +9521,9 @@ impl Engine {
         } else {
             ast::TableLockMode::ShareUpdateExclusive
         };
+        if let Err(error) = self.warn_maintenance_denials(targets, txn.txid, "vacuum", responder)? {
+            return Ok(Err(error));
+        }
         if let Err(error) = self.lock_maintenance_targets(targets, txn.txid, mode) {
             return Ok(Err(error));
         }
@@ -9465,6 +9557,11 @@ impl Engine {
         txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) =
+            self.warn_maintenance_denials(targets, txn.txid, "analyze", responder)?
+        {
+            return Ok(Err(error));
+        }
         if let Err(error) = self.lock_maintenance_targets(
             targets,
             txn.txid,
@@ -9733,6 +9830,55 @@ impl Engine {
         }
     }
 
+    /// PostgreSQL 18.6 `LockTableAclCheck`: MAINTAIN, UPDATE, DELETE or
+    /// TRUNCATE permit any mode; SELECT also permits ACCESS SHARE and INSERT
+    /// also permits ROW EXCLUSIVE and weaker modes.
+    fn require_lock_table_privilege(
+        &self,
+        slot: usize,
+        mode: ast::TableLockMode,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        use crate::storage::PrivilegeSet;
+        let mut accepted = [
+            PrivilegeSet::MAINTAIN,
+            PrivilegeSet::UPDATE,
+            PrivilegeSet::DELETE,
+            PrivilegeSet::TRUNCATE,
+            PrivilegeSet::NONE,
+            PrivilegeSet::NONE,
+        ];
+        if mode <= ast::TableLockMode::AccessShare {
+            accepted[4] = PrivilegeSet::SELECT;
+        }
+        if mode <= ast::TableLockMode::RowExclusive {
+            accepted[5] = PrivilegeSet::INSERT;
+        }
+        let object = self.storage.table_access_object(slot, txid);
+        let permitted = self.storage.current_role_slot(txid).is_some_and(|role| {
+            accepted.into_iter().any(|privilege| {
+                privilege.0 != 0
+                    && self
+                        .storage
+                        .has_object_privilege(object, role, privilege, txid)
+            })
+        });
+        if permitted {
+            return Ok(());
+        }
+        let kind = if object.class == crate::storage::AccessClass::MaterializedView {
+            "materialized view"
+        } else {
+            "table"
+        };
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for {} {}",
+            kind,
+            self.storage.table_def(slot, txid).name.as_str()
+        ))
+    }
+
     pub(crate) fn execute_lock_table_statement(
         &mut self,
         tables: &[ast::QualName<'_>],
@@ -9755,6 +9901,9 @@ impl Engine {
             };
         }
         for &slot in &slots[..tables.len()] {
+            if let Err(error) = self.require_lock_table_privilege(slot, mode, txn.txid) {
+                return Ok(Err(error));
+            }
             if let Err(error) = self.storage.lock_table(txn.txid, slot, mode, nowait) {
                 return Ok(Err(error));
             }

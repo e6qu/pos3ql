@@ -549,9 +549,7 @@ pub(super) fn stage_catalog_record(
                 ));
             }
             let member = storage.role_membership(slot);
-            if !member.visible_to(txid)
-                || member.creation_to(txid).created_at() != identity.created_at()
-            {
+            if !member.visible_to(txid) || member.creation_to(txid) != identity.created_at() {
                 return Err(sql_err!(
                     sqlstate::DATA_EXCEPTION,
                     "prepared membership selects another lifetime"

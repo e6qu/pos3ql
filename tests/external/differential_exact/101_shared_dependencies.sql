@@ -43,7 +43,8 @@ SELECT pg_describe_object('pg_class'::regclass, 'sd_hidden'::regclass, 0),
 RESET search_path;
 ALTER FUNCTION lower(text) OWNER TO postgres;
 DROP TABLE sd_t;
-DROP TYPE sd_type CASCADE;
+DROP FUNCTION sd_schema.sd_g(sd_type);
+DROP TYPE sd_type;
 DROP FUNCTION sd_f(integer);
 DROP SEQUENCE sd_seq;
 DROP SCHEMA sd_schema CASCADE;

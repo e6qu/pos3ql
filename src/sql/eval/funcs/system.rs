@@ -639,14 +639,220 @@ pub(crate) fn describe_object_text<'a>(
     sub_id: i32,
     arena: &'a crate::mem::arena::Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    if class_id == 826 {
+        if sub_id != 0 {
+            return Ok(None);
+        }
+        return catalog.default_acl_description(object_id, arena);
+    }
+    if class_id == 2604 {
+        let Some((relation, column)) = catalog.attribute_default_column(object_id) else {
+            return Ok(None);
+        };
+        let Some(column) = describe_object_text(catalog, 1259, relation, column, arena)? else {
+            return Ok(None);
+        };
+        return described(stack_format!(1024, "default value for {}", column), arena).map(Some);
+    }
     let object = catalog.catalog_object(class_id, object_id, sub_id)?;
     if object.identity.is_empty() {
         return Ok(None);
+    }
+    if class_id == 3256 {
+        return policy_description(catalog, object, arena).map(Some);
+    }
+    if let Some(text) = attached_object_description(catalog, object, arena)? {
+        return Ok(Some(text));
+    }
+    if let Some(text) = schema_object_description(catalog, class_id, object_id, object, arena)? {
+        return Ok(Some(text));
     }
     if let Some(text) = visible_object_description(catalog, class_id, object_id, object, arena)? {
         return Ok(Some(text));
     }
     describe_catalog_object(object, arena).map(Some)
+}
+
+fn described(
+    description: crate::util::StackStr<1024>,
+    arena: &crate::mem::arena::Arena,
+) -> Result<&str, SqlError> {
+    if description.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "catalog object description exceeds static capacity"
+        ));
+    }
+    arena
+        .alloc_str(description.as_str())
+        .map_err(|_| arena_full())
+}
+
+/// A relation's own description (`table t`, `view v`), naming it without
+/// its schema when the search path finds it.
+fn relation_description<'a>(
+    catalog: &dyn super::super::CatalogAccess,
+    schema: &str,
+    name: &str,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let qualified = stack_format!(
+        264,
+        "{}.{}",
+        crate::sql::types::acl_identifier(schema).as_str(),
+        crate::sql::types::acl_identifier(name).as_str()
+    );
+    let Some(relation) = catalog.reloid(qualified.as_str())? else {
+        return Ok(None);
+    };
+    describe_object_text(catalog, 1259, relation, 0, arena)
+}
+
+/// PostgreSQL describes constraints, triggers and rules by name followed by
+/// their relation's description (`trigger tg on table t`).
+fn attached_object_description<'a>(
+    catalog: &dyn super::super::CatalogAccess,
+    object: crate::sql::event_trigger::EventObject,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let kind = match object.object_type.as_str() {
+        "table constraint" => "constraint",
+        "trigger" => "trigger",
+        "rule" => "rule",
+        _ => return Ok(None),
+    };
+    if object.address_name_count != 3 {
+        return Ok(None);
+    }
+    let Some(relation) = relation_description(
+        catalog,
+        object.address_names[0].as_str(),
+        object.address_names[1].as_str(),
+        arena,
+    )?
+    else {
+        return Ok(None);
+    };
+    described(
+        stack_format!(
+            1024,
+            "{} {} on {}",
+            kind,
+            object.address_names[2].as_str(),
+            relation
+        ),
+        arena,
+    )
+    .map(Some)
+}
+
+/// Schema-qualified objects other than relations, functions and types are
+/// named without their schema when the search path finds them, with
+/// `quote_identifier` quoting (`collation "C"`, `operator <<<(integer,integer)`).
+fn schema_object_description<'a>(
+    catalog: &dyn super::super::CatalogAccess,
+    class_id: i32,
+    object_id: i32,
+    object: crate::sql::event_trigger::EventObject,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    use core::fmt::Write;
+    let visible = match class_id {
+        2617 => catalog.operator_is_visible(object_id),
+        3456 => catalog.collation_is_visible(object_id),
+        2607 => catalog.conversion_is_visible(object_id),
+        3381 => catalog.statistics_object_is_visible(object_id),
+        3600 => catalog.text_search_dictionary_is_visible(object_id),
+        3602 => catalog.text_search_configuration_is_visible(object_id),
+        _ => return Ok(None),
+    };
+    let (Some(visible), 2) = (visible, object.address_name_count) else {
+        return Ok(None);
+    };
+    let schema = object.address_names[0].as_str();
+    let name = object.address_names[1].as_str();
+    let mut text = crate::util::StackStr::<1024>::new();
+    let _ = write!(text, "{} ", object.object_type.as_str());
+    if !visible {
+        let _ = write!(
+            text,
+            "{}.",
+            super::super::args::quote_identifier(schema).as_str()
+        );
+    }
+    if class_id == 2617 {
+        // format_operator: the operator name is never quoted.
+        let _ = write!(text, "{}(", name);
+        for (index, argument) in object.address_args[..2].iter().enumerate() {
+            let separator = if index == 0 { "" } else { "," };
+            let argument = argument.as_str();
+            let _ = write!(
+                text,
+                "{separator}{}",
+                if argument.is_empty() {
+                    "NONE"
+                } else {
+                    argument
+                }
+            );
+        }
+        let _ = text.write_char(')');
+    } else {
+        let _ = write!(
+            text,
+            "{}",
+            super::super::args::quote_identifier(name).as_str()
+        );
+    }
+    described(text, arena).map(Some)
+}
+
+/// PostgreSQL's `policy p on table t`: the policy name as stored, then the
+/// table as `regclass` output names it.
+fn policy_description<'a>(
+    catalog: &dyn super::super::CatalogAccess,
+    object: crate::sql::event_trigger::EventObject,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<&'a str, SqlError> {
+    let qualified = stack_format!(
+        264,
+        "{}.{}",
+        crate::sql::types::acl_identifier(object.address_names[0].as_str()).as_str(),
+        crate::sql::types::acl_identifier(object.address_names[1].as_str()).as_str()
+    );
+    let table = match super::super::regobject_cast(
+        Datum::Text(
+            arena
+                .alloc_str(qualified.as_str())
+                .map_err(|_| arena_full())?,
+        ),
+        ColType::Regclass,
+        Some(catalog),
+        arena,
+    )? {
+        Datum::RegObject { name, .. } => name,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "policy table has no regclass name"
+            ));
+        }
+    };
+    let description = stack_format!(
+        1024,
+        "policy {} on table {}",
+        object.address_names[2].as_str(),
+        table
+    );
+    if description.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "catalog object description exceeds static capacity"
+        ));
+    }
+    arena
+        .alloc_str(description.as_str())
+        .map_err(|_| arena_full())
 }
 
 /// PostgreSQL's `getObjectDescription` names functions, types and relations
@@ -797,6 +1003,7 @@ pub(crate) const CATALOG_PREDICATES: &[(&str, CatalogPredicateKind)] = &[
     ("has_server_privilege", CatalogPredicateKind::Privilege),
     ("has_largeobject_privilege", CatalogPredicateKind::Privilege),
     ("has_parameter_privilege", CatalogPredicateKind::Privilege),
+    ("pg_has_role", CatalogPredicateKind::Privilege),
     ("pg_table_is_visible", CatalogPredicateKind::Object),
     ("pg_type_is_visible", CatalogPredicateKind::Object),
     ("pg_function_is_visible", CatalogPredicateKind::Object),
@@ -1862,6 +2069,7 @@ pub(crate) fn dispatch<'a>(
                         | "has_foreign_data_wrapper_privilege"
                         | "has_server_privilege"
                         | "has_largeobject_privilege"
+                        | "pg_has_role"
                 ) {
                     let target = match object {
                         Datum::Text(name) => super::super::PrivilegeObject::Name(name),
@@ -1897,6 +2105,7 @@ pub(crate) fn dispatch<'a>(
                         "has_largeobject_privilege" => {
                             cat.has_largeobject_privilege(role, target, privilege)?
                         }
+                        "pg_has_role" => cat.has_role_privilege(role, target, privilege)?,
                         _ => unreachable!("typed object privilege function was classified"),
                     };
                     return Ok(answer.map_or(Datum::Null, Datum::Bool));

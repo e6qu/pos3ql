@@ -4153,6 +4153,7 @@ impl Checkpointer {
             .map_err(|_| CheckpointSetupError::Corrupt("invalid role identity allocator"))?;
         storage.restore_next_large_object_oid(metadata.next_large_object_oid);
         storage.clear_schemas_for_restore();
+        storage.clear_initdb_role_memberships();
         let lines = text.lines().skip(1);
         let mut database_identities = Vec::with_capacity(storage.database_count());
         let mut system_setting_names = Vec::with_capacity(crate::storage::MAX_SYSTEM_SETTINGS);
@@ -5197,7 +5198,8 @@ impl Checkpointer {
                 }
                 Some("rmem") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
+                    let identity =
+                        parse_membership_position(&mut words, metadata.catalog_sequence)?;
                     let role_oid =
                         |word, name| -> Result<crate::storage::RoleOid, CheckpointSetupError> {
                             crate::storage::RoleOid::parse(parse_field(word, name)?).ok_or(
@@ -10231,7 +10233,10 @@ impl Checkpointer {
 
         // Roles are durable catalog authority. Parsed verifier material crosses
         // this object-backed manifest; plaintext passwords never do.
-        for (slot, role) in storage.live_roles() {
+        for (slot, role) in storage
+            .live_roles()
+            .filter(|(slot, _)| crate::storage::PredefinedRole::from_slot(*slot).is_none())
+        {
             use core::fmt::Write;
             let attributes = role.attributes;
             let mut name = StackStr::<130>::new();
@@ -19193,6 +19198,26 @@ fn parse_catalog_position(
     }
     crate::storage::CatalogPosition::new(slot, created_at)
         .map_err(|_| CheckpointSetupError::Corrupt("invalid catalog source identity"))
+}
+
+/// A membership position: a catalog source position, or an initdb
+/// membership's reserved identity at its own position.
+fn parse_membership_position(
+    words: &mut core::str::Split<'_, char>,
+    catalog_sequence: u64,
+) -> Result<crate::storage::CatalogPosition, CheckpointSetupError> {
+    let slot: usize = parse_field(words.next(), "catalog source slot")?;
+    let created_at: u64 = parse_field(words.next(), "catalog source creation")?;
+    if crate::storage::initdb_membership(created_at).is_none() && created_at > catalog_sequence {
+        return Err(CheckpointSetupError::Corrupt(
+            "catalog source exceeds saved identity allocator",
+        ));
+    }
+    let position = crate::storage::CatalogPosition::new(slot, created_at)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid catalog source identity"))?;
+    crate::storage::Storage::require_membership_identity(position)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid role membership identity"))?;
+    Ok(position)
 }
 
 #[inline(never)]

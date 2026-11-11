@@ -170,23 +170,36 @@ pub(crate) struct SqlFunctionFrame<'a> {
     pub(crate) body: &'a str,
     /// One-based index of the running statement; zero before the first.
     pub(crate) statement: Cell<usize>,
-    /// PostgreSQL inlines this body into its caller's query: the call has no
-    /// frame of its own.
-    pub(crate) inlined: bool,
+    pub(crate) inlining: SqlFunctionInlining,
+}
+
+/// How PostgreSQL's planner treats a SQL-language function call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlFunctionInlining {
+    /// The body runs as its own statements.
+    Executed,
+    /// The body is inlined into its caller's query: the call has no frame.
+    Inlined,
+    /// The body is inlined with constant arguments and folded while it is
+    /// inlined: `SQL function "f" during inlining`.
+    Folded,
 }
 
 impl Frame for SqlFunctionFrame<'_> {
     fn query(&self) -> Option<&str> {
-        (!self.inlined).then_some(self.body)
+        (self.inlining != SqlFunctionInlining::Inlined).then_some(self.body)
     }
 
     fn write_line(&self, out: &mut dyn Write, _positioned: bool) -> fmt::Result {
-        if self.inlined {
-            return Ok(());
-        }
-        match self.statement.get() {
-            0 => write!(out, "SQL function \"{}\" during startup", self.name),
-            statement => write!(
+        match (self.inlining, self.statement.get()) {
+            (SqlFunctionInlining::Inlined, _) => Ok(()),
+            (SqlFunctionInlining::Folded, _) => {
+                write!(out, "SQL function \"{}\" during inlining", self.name)
+            }
+            (SqlFunctionInlining::Executed, 0) => {
+                write!(out, "SQL function \"{}\" during startup", self.name)
+            }
+            (SqlFunctionInlining::Executed, statement) => write!(
                 out,
                 "SQL function \"{}\" statement {}",
                 self.name, statement

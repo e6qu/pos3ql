@@ -17863,6 +17863,7 @@ impl Engine {
             &environment,
             execution,
             suspended,
+            pending.constant_arguments,
         ))
     }
 

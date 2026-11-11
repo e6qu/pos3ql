@@ -284,14 +284,10 @@ and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
 constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
 `INSERT has more target columns than expressions` without its position; other
-target and expression count errors are positioned. An error raised while
-PostgreSQL inlines a SQL function's body
-(`SQL function "f" during inlining`) has no context line. Under
+target and expression count errors are positioned. Under
 `#variable_conflict use_variable` a variable that is also a column fails with
 `0A000`: aggregate inputs and grouping keys bind names to columns before the
-variable could win. A `STRICT` failure of a dynamic `EXECUTE` that waited
-for storage omits its `parameters:` detail. PL/pgSQL errors found while compiling a body (an unknown label, a duplicate
-declaration) have no cursor position. A materialized
+variable could win. A materialized
 ordinary `WITH` query that calls a volatile function runs before the main
 query; PostgreSQL runs it when its rows are first read, as it now runs a
 data-changing one. A data-changing `WITH` inside a routine body fails
@@ -306,7 +302,11 @@ columns. A four-part column name (`a.b.c.d`) is a syntax error where
 PostgreSQL reports `cross-database references are not implemented`.
 `SELECT ... INTO` a composite PL/pgSQL variable from one composite column
 reports a field-count error where PostgreSQL assigns the column to the first
-field. `pg_sleep` and its
+field. An `INSERT ... SELECT *` assignment error has no position where PostgreSQL
+points at the `*` (a qualified `t.*` is positioned), and `UPDATE t SET (a,
+b) = (SELECT * FROM s)` does not check the subquery's column types against
+the targets. A PL/pgSQL variable declared with a table's row type (`r t;`) is
+rejected as a routine argument type. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,

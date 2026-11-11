@@ -181,6 +181,7 @@ fn pending_calls_own_nested_arguments_and_types_after_scratch_release_and_arena_
                     }])
                     .unwrap();
                 PendingRoutineInvocation {
+                    constant_arguments: false,
                     target: PendingRoutineTarget::Stored(
                         original
                             .retain(OwnedRoutineCallContract::capture(&routine, &original).unwrap())
@@ -263,6 +264,7 @@ fn pending_call_argument_exhaustion_and_borrow_failures_preserve_the_owner() {
         ));
         drop(borrowed);
         let pending = PendingRoutineInvocation {
+            constant_arguments: false,
             target: PendingRoutineTarget::Intrinsic(42),
             arguments: source.freeze_retained_slice(mutable).unwrap(),
             argument_count: 1,

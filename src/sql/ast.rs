@@ -3425,6 +3425,31 @@ impl PartialEq for MaterializedCteSource<'_> {
     }
 }
 
+impl Expr<'_> {
+    /// Whether PostgreSQL's planner folds this expression to a constant, as
+    /// it does a literal, a parameter of a custom plan, and operators and
+    /// casts over them.
+    pub(crate) fn folds_to_constant(&self) -> bool {
+        match self {
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::Param(_)
+            | Expr::BoundLiteral { .. } => true,
+            Expr::Unary { operand, .. }
+            | Expr::Cast { operand, .. }
+            | Expr::Collate { operand, .. } => operand.folds_to_constant(),
+            Expr::Binary { left, right, .. } => {
+                left.folds_to_constant() && right.folds_to_constant()
+            }
+            _ => false,
+        }
+    }
+}
+
 impl<'a> MaterializedCte<'a> {
     pub(crate) fn rows(&self) -> &'a [&'a [u8]] {
         match self.source {

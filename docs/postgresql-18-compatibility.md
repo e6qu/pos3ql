@@ -100,9 +100,10 @@ Syntax and errors:
   PG_EXCEPTION_CONTEXT` return the same text, and `RAISE;` re-raises the
   caught error with its original context. A call PostgreSQL inlines into its
   caller's query (a SQL function whose body is one `SELECT expression`) adds
-  no line; when PostgreSQL would fail while inlining it (`SELECT f(0)` for a
-  body `SELECT 1/$1`), pos3ql reports no `SQL function "f" during inlining`
-  line. A longer context than 64 KiB is reported as a `54000` error.
+  no line when its arguments vary; with constant arguments the body is folded
+  while it is inlined, so `SELECT f(0)` for a body `SELECT 1/$1` reports
+  `SQL function "f" during inlining`, or `SQL function "f" statement 1` when
+  `f` is `IMMUTABLE` and PostgreSQL runs it while planning. A longer context than 64 KiB is reported as a `54000` error.
 - Constraint violations carry PostgreSQL's `DETAIL` and object fields:
   `Failing row contains (null, x).` with the schema, table and column of a
   not-null violation; `Key (id)=(1) already exists.` with the constraint of a

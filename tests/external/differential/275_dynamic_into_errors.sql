@@ -85,8 +85,9 @@ BEGIN
 
 END$$;
 CREATE FUNCTION into_edge_parent() RETURNS trigger LANGUAGE plpgsql AS $$
+#print_strict_params on
 DECLARE invalid record; empty_row record;
-    error_code text; strict_code text; empty_code text;
+    error_code text; strict_code text; empty_code text; strict_detail text;
     changed bigint; strict_count bigint; note text:=repeat('p',8192);
 BEGIN
     INSERT INTO into_edge_audit VALUES('parent-before',0,note,NULL,NULL,NULL);
@@ -100,10 +101,11 @@ BEGIN
     END;
     EXECUTE 'SELECT 77 AS kept' INTO invalid;
     BEGIN
-        EXECUTE 'UPDATE into_edge_stock SET amount=amount+1 RETURNING id' INTO STRICT invalid;
+        EXECUTE 'UPDATE into_edge_stock SET amount=amount+$1 RETURNING id' INTO STRICT invalid
+            USING 1;
         RAISE EXCEPTION 'STRICT accepted multiple rows';
     EXCEPTION WHEN SQLSTATE 'P0003' THEN
-        GET STACKED DIAGNOSTICS strict_code=RETURNED_SQLSTATE;
+        GET STACKED DIAGNOSTICS strict_code=RETURNED_SQLSTATE, strict_detail=PG_EXCEPTION_DETAIL;
         GET DIAGNOSTICS strict_count=ROW_COUNT;
     END;
     BEGIN
@@ -121,7 +123,7 @@ BEGIN
     PERFORM into_edge_empty();
     PERFORM into_edge_fetch();
     PERFORM 1 WHERE false;
-    INSERT INTO into_edge_audit VALUES('parent-after',changed,note||'!',error_code||'/'||strict_code||'/'||empty_code,
+    INSERT INTO into_edge_audit VALUES('parent-after',changed,note||'!',error_code||'/'||strict_code||'/'||empty_code||'/'||strict_detail,
         empty_row.id IS NULL,pg_typeof(empty_row.id)::text);
     RETURN NEW;
 END$$;

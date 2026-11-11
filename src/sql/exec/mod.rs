@@ -818,6 +818,7 @@ mod sql_function_execution;
 pub(super) use function_execution::execute as execute_plpgsql_function;
 pub(super) use function_execution::{FunctionOutput, SuspendedFunction};
 pub(super) use sql_function_execution::execute_sql_function;
+pub(crate) use sql_function_execution::sql_function_inlining;
 mod trigger_firing;
 mod write_completion;
 pub(super) use write_completion::SuspendedWriteCompletion;
@@ -20137,25 +20138,32 @@ fn parse_trigger_loop_control<'a>(
             None => ((!tail.is_empty()).then_some(tail), None),
         },
     };
+    // PostgreSQL positions these at the label, or at the statement.
     let unwind = match label {
-        Some(label) => {
-            let label = parse_plpgsql_identifier(label, arena)?.name;
+        Some(written) => {
+            let label = parse_plpgsql_identifier(written, arena)?.name;
             let unwind = targets
                 .iter()
                 .rev()
                 .position(|target| target.label == Some(label))
                 .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "there is no label \"{}\" attached to any block or loop enclosing this statement",
-                        label.as_str()
+                    crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "there is no label \"{}\" attached to any block or loop enclosing this statement",
+                            label.as_str()
+                        ),
+                        written,
                     )
                 })?;
             if !is_exit && !targets[targets.len() - 1 - unwind].is_loop {
-                return Err(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "block label \"{}\" cannot be used in CONTINUE",
-                    label.as_str()
+                return Err(crate::sql::error_position::at_reference(
+                    sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "block label \"{}\" cannot be used in CONTINUE",
+                        label.as_str()
+                    ),
+                    written,
                 ));
             }
             unwind
@@ -20165,17 +20173,20 @@ fn parse_trigger_loop_control<'a>(
             .rev()
             .position(|target| target.is_loop)
             .ok_or_else(|| {
-                if is_exit {
-                    sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "EXIT cannot be used outside a loop, unless it has a label"
-                    )
-                } else {
-                    sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "CONTINUE cannot be used outside a loop"
-                    )
-                }
+                crate::sql::error_position::at_reference(
+                    if is_exit {
+                        sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "EXIT cannot be used outside a loop, unless it has a label"
+                        )
+                    } else {
+                        sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "CONTINUE cannot be used outside a loop"
+                        )
+                    },
+                    segment.trim_start(),
+                )
             })?,
     };
     let condition = match condition.map(str::trim) {
@@ -20199,18 +20210,26 @@ fn check_plpgsql_end_label(
     let Some(end) = end else {
         return Ok(());
     };
+    let written = end;
     let end = parse_plpgsql_identifier(end, arena)?.name;
+    // PostgreSQL positions these at the end label.
     match block {
-        None => Err(sql_err!(
-            sqlstate::SYNTAX_ERROR,
-            "end label \"{}\" specified for unlabeled block",
-            end.as_str()
+        None => Err(crate::sql::error_position::at_reference(
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "end label \"{}\" specified for unlabeled block",
+                end.as_str()
+            ),
+            written,
         )),
-        Some(label) if label != end => Err(sql_err!(
-            sqlstate::SYNTAX_ERROR,
-            "end label \"{}\" differs from block's label \"{}\"",
-            end.as_str(),
-            label.as_str()
+        Some(label) if label != end => Err(crate::sql::error_position::at_reference(
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "end label \"{}\" differs from block's label \"{}\"",
+                end.as_str(),
+                label.as_str()
+            ),
+            written,
         )),
         Some(_) => Ok(()),
     }
@@ -21170,8 +21189,12 @@ fn parse_plpgsql_program<'a>(
     arena: &'a Arena,
     program_kind: PlpgsqlProgramKind,
 ) -> Result<ParsedTriggerProgram<'a>, SqlError> {
-    let (mut program, sites) = super::plpgsql_inputs::capture(body, arena, || {
-        parse_plpgsql_program_inner(body, arena, program_kind)
+    // A compile error points into the body where the statement wrote it, as
+    // PostgreSQL's do; a body from the catalog is not in the statement.
+    let (mut program, sites) = crate::sql::error_position::with_analysis_in(body, || {
+        super::plpgsql_inputs::capture(body, arena, || {
+            parse_plpgsql_program_inner(body, arena, program_kind)
+        })
     })?;
     program.input_sites = sites;
     Ok(program)
@@ -21190,10 +21213,18 @@ fn parse_plpgsql_declarations<'a>(
             .iter()
             .any(|prior: &ParsedTriggerLocalDecl<'_>| prior.name == local.name)
         {
-            return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "duplicate declaration at or near \"{}\"",
-                local.name.as_str()
+            // PostgreSQL positions this at the second declaration's name.
+            let written = declaration.trim_start();
+            let name = written
+                .find(char::is_whitespace)
+                .map_or(written, |end| &written[..end]);
+            return Err(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "duplicate declaration at or near \"{}\"",
+                    local.name.as_str()
+                ),
+                name,
             ));
         }
         locals.push(local)?;
@@ -27863,8 +27894,12 @@ fn execute_trigger_step_in<'a>(
                         "nested write lost its returned values"
                     )
                 })?;
-                let (values, returned) = match output {
-                    write_completion::NestedWriteOutput::Rows { values, rows } => (values, rows),
+                let (values, returned, arguments) = match output {
+                    write_completion::NestedWriteOutput::Rows {
+                        values,
+                        rows,
+                        arguments,
+                    } => (values, rows, arguments),
                     write_completion::NestedWriteOutput::NoResult => {
                         status.set_row_count(rows)?;
                         return Err(sql_err!(
@@ -27880,13 +27915,13 @@ fn execute_trigger_step_in<'a>(
                     ));
                 }
                 let selected = values.decode(context.arena)?;
-                // The resumed write keeps its rows, not its `USING` values.
+                let arguments = arguments.decode(context.arena)?;
                 finish_dynamic_into(
                     context,
                     locals,
                     local_values,
                     statement,
-                    &[],
+                    arguments,
                     selected,
                     rows,
                     status,
@@ -29245,6 +29280,7 @@ fn execute_trigger_step_in<'a>(
                                     pending.save_output(
                                         values,
                                         row_count as u64,
+                                        query.arguments,
                                         &context.storage().row_work,
                                     )?;
                                 }
@@ -29800,6 +29836,7 @@ fn execute_trigger_step_in<'a>(
                     pending.save_output(
                         Some(returning.values(context.arena)?),
                         returned,
+                        &[],
                         &context.storage().row_work,
                     )?;
                 }
@@ -29951,6 +29988,7 @@ fn execute_trigger_step_in<'a>(
                     pending.save_output(
                         Some(returning.values(context.arena)?),
                         returned,
+                        &[],
                         &context.storage().row_work,
                     )?;
                 }
@@ -30101,6 +30139,7 @@ fn execute_trigger_step_in<'a>(
                     pending.save_output(
                         Some(returning.values(context.arena)?),
                         returned,
+                        &[],
                         &context.storage().row_work,
                     )?;
                 }
@@ -31096,6 +31135,7 @@ fn finish_resumed_static_write<'a>(
         Some(write_completion::NestedWriteOutput::Rows {
             values,
             rows: returned,
+            ..
         }) if returned == rows => values.decode(context.arena)?,
         _ => {
             return Err(sql_err!(

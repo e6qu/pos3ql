@@ -942,6 +942,8 @@ pub(crate) enum InvocationSite {
 #[derive(Clone, Copy)]
 pub(crate) struct PendingRoutineInvocation {
     pub target: PendingRoutineTarget,
+    /// Every argument the call site wrote folds to a constant.
+    pub constant_arguments: bool,
     arguments: crate::mem::arena::FrozenArenaSliceHandle<u8>,
     pub argument_count: usize,
     pub source_position: Option<InvocationSite>,
@@ -1456,6 +1458,7 @@ impl<'scope, 'arena> RoutineInvocationContext<'scope, 'arena> {
 }
 
 thread_local! {
+    static CALL_ARGUMENTS_CONSTANT: Cell<bool> = const { Cell::new(false) };
     static INVOCATION_LOG_IDS: Cell<u64> = const { Cell::new(1) };
     static ACTIVE_ROUTINE_INVOCATIONS: Cell<Option<(*const (), *const ())>> = const { Cell::new(None) };
 }
@@ -1469,6 +1472,26 @@ impl Drop for RoutineInvocationScope {
     fn drop(&mut self) {
         ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.set(self.0));
     }
+}
+
+/// Runs a routine call whose written arguments PostgreSQL's planner folds
+/// to constants or not. An IMMUTABLE function called with constants runs at
+/// plan time, and a constant inlined body is folded while it is inlined, so
+/// the function's error context depends on it. Calls made while evaluating
+/// the arguments restore this call's value when they return.
+pub(crate) fn with_call_arguments<R>(constant: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CALL_ARGUMENTS_CONSTANT.with(|current| current.set(self.0));
+        }
+    }
+    let _restore = Restore(CALL_ARGUMENTS_CONSTANT.with(|current| current.replace(constant)));
+    run()
+}
+
+pub(crate) fn call_arguments_constant() -> bool {
+    CALL_ARGUMENTS_CONSTANT.with(Cell::get)
 }
 
 pub(crate) fn with_routine_invocation_scope<R>(
@@ -1691,6 +1714,7 @@ impl RoutineInvocationState {
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
         self.pending.set(Some(PendingRoutineInvocation {
+            constant_arguments: false,
             plan_owner: super::type_input_plans::owner()?,
             source_position: None,
             input_collation: super::ast::Collation::None,
@@ -1814,6 +1838,7 @@ impl RoutineInvocationState {
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
         self.pending.set(Some(PendingRoutineInvocation {
+            constant_arguments: call_arguments_constant(),
             plan_owner: super::type_input_plans::owner()?,
             source_position,
             input_collation,
@@ -1865,6 +1890,7 @@ impl RoutineInvocationState {
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
         self.pending.set(Some(PendingRoutineInvocation {
+            constant_arguments: call_arguments_constant(),
             plan_owner: super::type_input_plans::owner()?,
             source_position: input_progress::invocation_site(),
             input_collation: super::ast::Collation::None,
@@ -1927,6 +1953,7 @@ impl RoutineInvocationState {
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
         self.pending.set(Some(PendingRoutineInvocation {
+            constant_arguments: call_arguments_constant(),
             plan_owner: super::type_input_plans::owner()?,
             source_position: source_position.map(InvocationSite::Expression),
             input_collation,
@@ -3835,73 +3862,54 @@ impl StorageCatalog<'_, '_, '_, '_> {
             self.storage
                 .ensure_function_statistics(crate::storage::routine_oid(routine))?;
         }
-        let output = super::sequence::with_statement_context(|context| {
-            if program_access == RoutineProgramAccess::Sequences && context.is_none() {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "SQL sequence functions require an active statement session"
-                ));
-            }
-            let live_sequences = context.map(|(_, session)| {
-                super::sequence::SeqEval::new(self.storage, session, self.txid)
-            });
-            let sequences = live_sequences
-                .as_ref()
-                .map(|sequences| sequences as &dyn SequenceAccess);
-            let mut parameters = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-            for (slot, argument) in arguments.iter().enumerate() {
-                let encoded =
-                    crate::sql::exec::encode_projected_pub(&[*argument], self.routine_workspace)?;
-                parameters[slot] = crate::sql::exec::decode_projected_col_record(
-                    encoded,
-                    0,
-                    self.routine_workspace,
-                )?;
-            }
-            for step in function_program.preceding {
-                let RoutinePrelude::Statement(statement) = step else {
-                    let RoutinePrelude::Forbidden(statement) = step else {
-                        unreachable!("routine prelude has two variants");
-                    };
-                    return Err(routine_forbidden_statement_error(statement));
-                };
-                let query = match statement {
-                    Stmt::Select(query) => RoutineQuery::Select(query),
-                    Stmt::SetQuery(query) => RoutineQuery::Set(query),
-                    _ => unreachable!("mutable routine prelude was rejected above"),
-                };
-                execute_bound_routine_query(
-                    &query,
-                    self.storage,
-                    slot,
-                    routine,
-                    self.txid,
-                    self.routine_workspace,
-                    &parameters[..arguments.len()],
-                    true,
-                    sequences,
-                    &mut |_| Ok(()),
-                )?;
-            }
-            let mut result = None;
-            let result_query = match function_program.result {
-                RoutineFunctionResult::Query(result_query) => result_query,
-                RoutineFunctionResult::DataModification(_) => {
+        let frame = crate::sql::error_context::SqlFunctionFrame {
+            name: routine.name.as_str(),
+            body: routine.body.as_str(),
+            statement: core::cell::Cell::new(0),
+            inlining: super::exec::sql_function_inlining(
+                routine,
+                &function_program,
+                call_arguments_constant(),
+            ),
+        };
+        let output = crate::sql::error_context::within(&frame, || {
+            super::sequence::with_statement_context(|context| {
+                if program_access == RoutineProgramAccess::Sequences && context.is_none() {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
-                        "data-modifying SQL function results require a resumable query executor"
+                        "SQL sequence functions require an active statement session"
                     ));
                 }
-                RoutineFunctionResult::Void(statement) => {
+                let live_sequences = context.map(|(_, session)| {
+                    super::sequence::SeqEval::new(self.storage, session, self.txid)
+                });
+                let sequences = live_sequences
+                    .as_ref()
+                    .map(|sequences| sequences as &dyn SequenceAccess);
+                let mut parameters = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                for (slot, argument) in arguments.iter().enumerate() {
+                    let encoded = crate::sql::exec::encode_projected_pub(
+                        &[*argument],
+                        self.routine_workspace,
+                    )?;
+                    parameters[slot] = crate::sql::exec::decode_projected_col_record(
+                        encoded,
+                        0,
+                        self.routine_workspace,
+                    )?;
+                }
+                for (index, step) in function_program.preceding.iter().enumerate() {
+                    frame.statement.set(index + 1);
+                    let RoutinePrelude::Statement(statement) = step else {
+                        let RoutinePrelude::Forbidden(statement) = step else {
+                            unreachable!("routine prelude has two variants");
+                        };
+                        return Err(routine_forbidden_statement_error(statement));
+                    };
                     let query = match statement {
                         Stmt::Select(query) => RoutineQuery::Select(query),
                         Stmt::SetQuery(query) => RoutineQuery::Set(query),
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "data-modifying SQL functions require a resumable query executor"
-                            ));
-                        }
+                        _ => unreachable!("mutable routine prelude was rejected above"),
                     };
                     execute_bound_routine_query(
                         &query,
@@ -3915,56 +3923,91 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         sequences,
                         &mut |_| Ok(()),
                     )?;
-                    return Ok(Some(Datum::Text("")));
                 }
-                RoutineFunctionResult::Forbidden(statement) => {
-                    return Err(routine_forbidden_statement_error(statement));
-                }
-                RoutineFunctionResult::Empty => return Ok(Some(Datum::Text(""))),
-            };
-            execute_bound_routine_query(
-                result_query,
-                self.storage,
-                slot,
-                routine,
-                self.txid,
-                self.routine_workspace,
-                &parameters[..arguments.len()],
-                true,
-                sequences,
-                &mut |values| {
-                    if result.is_none() {
-                        result = Some(result_shape.capture(
-                            values,
-                            || {
-                                RoutineResultContract::stored(
-                                    self.storage,
-                                    self.txid,
-                                    routine,
-                                    arena,
-                                )
-                                .map(RoutineResultContract::name)
-                            },
-                            arena,
-                        )?);
+                frame.statement.set(function_program.preceding.len() + 1);
+                let mut result = None;
+                let result_query = match function_program.result {
+                    RoutineFunctionResult::Query(result_query) => result_query,
+                    RoutineFunctionResult::DataModification(_) => {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "data-modifying SQL function results require a resumable query executor"
+                        ));
                     }
-                    Ok(())
-                },
-            )?;
-            let result = result.unwrap_or(Datum::Null);
-            let Some(result_contract) = result_contract else {
-                return Ok(Some(result));
-            };
-            if result_contract.polymorphic_type().is_some() {
-                Ok(Some(result))
-            } else {
-                if matches!(result_type, ColType::Composite(_)) {
-                    self.coerce_result(result, result_contract, arena, sequences)
-                        .map(Some)
+                    RoutineFunctionResult::Void(statement) => {
+                        let query = match statement {
+                            Stmt::Select(query) => RoutineQuery::Select(query),
+                            Stmt::SetQuery(query) => RoutineQuery::Set(query),
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "data-modifying SQL functions require a resumable query executor"
+                                ));
+                            }
+                        };
+                        execute_bound_routine_query(
+                            &query,
+                            self.storage,
+                            slot,
+                            routine,
+                            self.txid,
+                            self.routine_workspace,
+                            &parameters[..arguments.len()],
+                            true,
+                            sequences,
+                            &mut |_| Ok(()),
+                        )?;
+                        return Ok(Some(Datum::Text("")));
+                    }
+                    RoutineFunctionResult::Forbidden(statement) => {
+                        return Err(routine_forbidden_statement_error(statement));
+                    }
+                    RoutineFunctionResult::Empty => return Ok(Some(Datum::Text(""))),
+                };
+                execute_bound_routine_query(
+                    result_query,
+                    self.storage,
+                    slot,
+                    routine,
+                    self.txid,
+                    self.routine_workspace,
+                    &parameters[..arguments.len()],
+                    true,
+                    sequences,
+                    &mut |values| {
+                        if result.is_none() {
+                            result = Some(result_shape.capture(
+                                values,
+                                || {
+                                    RoutineResultContract::stored(
+                                        self.storage,
+                                        self.txid,
+                                        routine,
+                                        arena,
+                                    )
+                                    .map(RoutineResultContract::name)
+                                },
+                                arena,
+                            )?);
+                        }
+                        Ok(())
+                    },
+                )?;
+                let result = result.unwrap_or(Datum::Null);
+                let Some(result_contract) = result_contract else {
+                    return Ok(Some(result));
+                };
+                if result_contract.polymorphic_type().is_some() {
+                    Ok(Some(result))
                 } else {
-                    super::eval::cast_to(result, result_type, arena).map(Some)
+                    if matches!(result_type, ColType::Composite(_)) {
+                        self.coerce_result(result, result_contract, arena, sequences)
+                            .map(Some)
+                    } else {
+                        super::eval::cast_to(result, result_type, arena).map(Some)
+                    }
                 }
-            }
+            })
         });
         if let Some((total, own)) = timed.finish()
             && output.is_ok()
@@ -5065,110 +5108,118 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
-        let (oid, mapping, variadic, bound_strict) = match target {
-            super::eval::RoutineCallTarget::Builtin { .. } => {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "builtin target must execute through expression evaluation"
-                ));
-            }
-            super::eval::RoutineCallTarget::Stored {
-                oid,
-                argument_mapping,
-                variadic,
-                bound_strict,
-            } => (oid, argument_mapping, variadic, bound_strict),
-            super::eval::RoutineCallTarget::Operator { schema, name } => {
-                let collations = arena
-                    .alloc_slice_with(arguments.len(), |_| super::ast::Collation::None)
-                    .map_err(|_| arena_full())?;
-                let mut derived = None;
-                for (output, expression) in collations.iter_mut().zip(arguments) {
-                    let argument = argument_collation(expression)?;
-                    *output = argument_collation(super::eval::coercion_source(expression))?.map_or(
-                        super::ast::Collation::None,
-                        super::eval::DerivedCollation::input_collation,
-                    );
-                    derived = super::eval::merge_derived_collations(derived, argument)?;
-                }
-                let input_collation = derived.map_or(
-                    super::ast::Collation::None,
-                    super::eval::DerivedCollation::input_collation,
-                );
-                let values = arena
-                    .alloc_slice_with(arguments.len(), |_| Datum::Null)
-                    .map_err(|_| arena_full())?;
-                for (value, expression) in values.iter_mut().zip(arguments) {
-                    *value = evaluate(expression)?;
-                }
-                return self
-                    .execute_catalog_operator(
-                        schema,
-                        name,
-                        values,
-                        argument_type_oids,
-                        input_collation,
-                        collations,
-                        super::eval::OperatorNulls::RoutineStrictness,
-                        arena,
-                    )?
-                    .map(|evaluation| evaluation.value)
+        with_call_arguments(
+            arguments
+                .iter()
+                .all(|argument| argument.folds_to_constant()),
+            || {
+                let (oid, mapping, variadic, bound_strict) = match target {
+                    super::eval::RoutineCallTarget::Builtin { .. } => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "builtin target must execute through expression evaluation"
+                        ));
+                    }
+                    super::eval::RoutineCallTarget::Stored {
+                        oid,
+                        argument_mapping,
+                        variadic,
+                        bound_strict,
+                    } => (oid, argument_mapping, variadic, bound_strict),
+                    super::eval::RoutineCallTarget::Operator { schema, name } => {
+                        let collations = arena
+                            .alloc_slice_with(arguments.len(), |_| super::ast::Collation::None)
+                            .map_err(|_| arena_full())?;
+                        let mut derived = None;
+                        for (output, expression) in collations.iter_mut().zip(arguments) {
+                            let argument = argument_collation(expression)?;
+                            *output = argument_collation(super::eval::coercion_source(expression))?
+                                .map_or(
+                                    super::ast::Collation::None,
+                                    super::eval::DerivedCollation::input_collation,
+                                );
+                            derived = super::eval::merge_derived_collations(derived, argument)?;
+                        }
+                        let input_collation = derived.map_or(
+                            super::ast::Collation::None,
+                            super::eval::DerivedCollation::input_collation,
+                        );
+                        let values = arena
+                            .alloc_slice_with(arguments.len(), |_| Datum::Null)
+                            .map_err(|_| arena_full())?;
+                        for (value, expression) in values.iter_mut().zip(arguments) {
+                            *value = evaluate(expression)?;
+                        }
+                        return self
+                            .execute_catalog_operator(
+                                schema,
+                                name,
+                                values,
+                                argument_type_oids,
+                                input_collation,
+                                collations,
+                                super::eval::OperatorNulls::RoutineStrictness,
+                                arena,
+                            )?
+                            .map(|evaluation| evaluation.value)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_FUNCTION,
+                                    "operator does not exist: {}",
+                                    name
+                                )
+                            });
+                    }
+                };
+                let slot = self
+                    .storage
+                    .routine_slot_by_oid(oid, self.txid)
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_FUNCTION,
-                            "operator does not exist: {}",
-                            name
+                            "function with OID {} does not exist",
+                            oid
                         )
-                    });
-            }
-        };
-        let slot = self
-            .storage
-            .routine_slot_by_oid(oid, self.txid)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "function with OID {} does not exist",
-                    oid
-                )
-            })?;
-        let mut declared = self.storage.routine_for(slot, self.txid);
-        if let Some(strict) = bound_strict {
-            declared.attributes.strict = strict;
-        }
-        let Some(completed) = self.prepare_routine_inputs(
-            slot,
-            &mut declared,
-            RoutineCallInputs {
-                arguments,
-                argument_type_oids,
-                argument_collation,
-                mapping: &mapping,
-                variadic,
-                context: RoutineInputContext::Scalar,
+                    })?;
+                let mut declared = self.storage.routine_for(slot, self.txid);
+                if let Some(strict) = bound_strict {
+                    declared.attributes.strict = strict;
+                }
+                let Some(completed) = self.prepare_routine_inputs(
+                    slot,
+                    &mut declared,
+                    RoutineCallInputs {
+                        arguments,
+                        argument_type_oids,
+                        argument_collation,
+                        mapping: &mapping,
+                        variadic,
+                        context: RoutineInputContext::Scalar,
+                    },
+                    evaluate,
+                    arena,
+                )?
+                else {
+                    return Ok(Datum::Null);
+                };
+                let routine = &declared;
+                self.execute_routine(
+                    slot,
+                    routine,
+                    &completed.values[..declared.argument_count],
+                    completed.input_collation,
+                    super::eval::RoutineCallAccess::Caller,
+                    input_progress::invocation_site(),
+                    arena,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "resolved routine has no scalar result"
+                    )
+                })
             },
-            evaluate,
-            arena,
-        )?
-        else {
-            return Ok(Datum::Null);
-        };
-        let routine = &declared;
-        self.execute_routine(
-            slot,
-            routine,
-            &completed.values[..declared.argument_count],
-            completed.input_collation,
-            super::eval::RoutineCallAccess::Caller,
-            input_progress::invocation_site(),
-            arena,
-        )?
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "resolved routine has no scalar result"
-            )
-        })
+        )
     }
 
     fn call_routine_oid<'a>(

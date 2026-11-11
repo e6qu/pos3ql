@@ -1657,7 +1657,7 @@ fn retained_nested_write_completion_keeps_dynamic_returned_records_and_bindings(
             include_str!("../../../tests/external/differential/275_dynamic_into_errors.sql"),
             "SELECT 40+2; SELECT last_value FROM into_edge_sequence",
             ["42", "1"],
-            "0|3|0|1|1|42601/P0003/P0002|1|8193|t|integer",
+            "0|3|0|1|1|42601/P0003/P0002/parameters: $1 = '1'|1|8193|t|integer",
         ),
     ] {
         let (setup, remainder) = fixture.split_once("-- Waitable write\n").unwrap();

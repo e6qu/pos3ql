@@ -3443,17 +3443,24 @@ fn eval_binary_values<'a>(
     {
         let left_oid = expression_type_identity(left, row, hooks)?.routine_argument_oid();
         let right_oid = expression_type_identity(right, row, hooks)?.routine_argument_oid();
-        if let Some(value) = catalog.call_operator(
-            name,
-            [l, r],
-            [left_oid, right_oid],
-            routine_input_collation(&[left, right], row, hooks.catalog)?,
-            [
-                coercion_input_collation(left, row, hooks.catalog)?,
-                coercion_input_collation(right, row, hooks.catalog)?,
-            ],
-            nulls,
-            arena,
+        let input_collation = routine_input_collation(&[left, right], row, hooks.catalog)?;
+        let argument_collations = [
+            coercion_input_collation(left, row, hooks.catalog)?,
+            coercion_input_collation(right, row, hooks.catalog)?,
+        ];
+        if let Some(value) = crate::sql::query::with_call_arguments(
+            left.folds_to_constant() && right.folds_to_constant(),
+            || {
+                catalog.call_operator(
+                    name,
+                    [l, r],
+                    [left_oid, right_oid],
+                    input_collation,
+                    argument_collations,
+                    nulls,
+                    arena,
+                )
+            },
         )? {
             return Ok(value);
         }

@@ -151,6 +151,31 @@ pub(crate) fn at_reference(error: SqlError, subject: &str) -> SqlError {
 
 /// The byte offset of `subject` in the installed statement text: a token the
 /// parser copied, or a slice of the text itself.
+/// A slice inside a token the lexer copied verbatim, such as a word of a
+/// dollar-quoted function body: the copy's text appears in the statement
+/// just after the token's opening delimiter.
+fn within_copy(
+    copies: &[SourceCopy],
+    source: Source,
+    address: usize,
+    len: usize,
+) -> Option<(usize, Source)> {
+    const MAX_DELIMITER: usize = 64;
+    let text = unsafe { core::slice::from_raw_parts(source.text, source.len) };
+    copies.iter().find_map(|copy| {
+        if copy.len == NODE || address < copy.address || address + len > copy.address + copy.len {
+            return None;
+        }
+        // The copy lives in the statement arena for the statement's duration.
+        let copied = unsafe { core::slice::from_raw_parts(copy.address as *const u8, copy.len) };
+        (0..=MAX_DELIMITER)
+            .find(|delimiter| {
+                text.get(copy.at + delimiter..copy.at + delimiter + copy.len) == Some(copied)
+            })
+            .map(|delimiter| (copy.at + delimiter + (address - copy.address), source))
+    })
+}
+
 fn locate(subject: &str) -> Option<(usize, Source)> {
     let source = SOURCE.with(Cell::get);
     if source.text.is_null() {
@@ -168,7 +193,7 @@ fn locate(subject: &str) -> Option<(usize, Source)> {
     }
     let start = source.text as usize;
     if address < start || address + subject.len() > start + source.len {
-        return None;
+        return within_copy(copies, source, address, subject.len());
     }
     let at = address - start;
     // A quoted token parsed without a copy map (a routine's query) is a
@@ -280,6 +305,19 @@ pub(crate) fn at_node(error: SqlError, expression: &crate::sql::ast::Expr<'_>) -
         .flatten();
     record(&error, position, None);
     error
+}
+
+/// Marks `error` as being about a select-list item: `t.*` at its
+/// qualifier. A bare `*` keeps no source text, so it has no position.
+pub(crate) fn at_item(error: SqlError, item: &crate::sql::ast::SelectItem<'_>) -> SqlError {
+    use crate::sql::ast::SelectItem;
+    match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            at_expression(error, expression)
+        }
+        SelectItem::TableWildcard(qualifier) => at_reference(error, qualifier),
+        SelectItem::Wildcard => error,
+    }
 }
 
 /// The query of a sublink expression.

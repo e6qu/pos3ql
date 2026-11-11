@@ -1490,7 +1490,11 @@ fn validate_insert_projection(
                     Some(expression) => {
                         crate::sql::error_position::at_expression(error, expression)
                     }
-                    None => error,
+                    // A column a star expanded is reported at the star.
+                    None => match star_item(written) {
+                        Some(item) => crate::sql::error_position::at_item(error, item),
+                        None => error,
+                    },
                 }
             })?;
         }
@@ -1534,7 +1538,11 @@ fn validate_insert_projection(
                     Some(expression) => {
                         crate::sql::error_position::at_expression(error, expression)
                     }
-                    None => error,
+                    // A column a star expanded is reported at the star.
+                    None => match star_item(select) {
+                        Some(item) => crate::sql::error_position::at_item(error, item),
+                        None => error,
+                    },
                 },
             )
         },
@@ -2142,6 +2150,27 @@ pub(crate) fn undefined_set_target(
     } else {
         error
     }
+}
+
+/// The first `*` or `t.*` item of a query's first select list, which every
+/// output column without its own expression in a common `SELECT *` comes
+/// from.
+fn star_item<'s>(select: &'s Select<'s>) -> Option<&'s SelectItem<'s>> {
+    let mut select = select;
+    while let Some(body) = select.set_body {
+        let mut tree = body;
+        while let crate::sql::ast::SetTree::Op { left, .. } = tree {
+            tree = left;
+        }
+        let crate::sql::ast::SetTree::Select(first) = tree else {
+            return None;
+        };
+        select = first;
+    }
+    select
+        .items
+        .iter()
+        .find(|item| matches!(item, SelectItem::Wildcard | SelectItem::TableWildcard(_)))
 }
 
 /// Whether an assigned value writes through a field or subscript.

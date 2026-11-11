@@ -14185,6 +14185,7 @@ impl Engine {
                     guc,
                     responder,
                     Some(&mut sink),
+                    None,
                     self.work.connection_id(),
                 ),
             };
@@ -14229,6 +14230,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
+        progress: Option<&mut exec::RowProgress>,
         connection_id: i32,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) =
@@ -14276,6 +14278,7 @@ impl Engine {
                     guc,
                     responder,
                     capture,
+                    progress,
                 );
             }
         };
@@ -14298,6 +14301,7 @@ impl Engine {
                     guc,
                     responder,
                     capture,
+                    progress,
                 );
             }
         };
@@ -14357,6 +14361,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                progress,
             );
         }
         let rule_owner = match u16::try_from(storage.object_owner(target.access_object(), txn.txid))
@@ -14702,6 +14707,7 @@ impl Engine {
                     guc,
                     responder,
                     capture.take(),
+                    None,
                 )
             })?;
             if outcome.is_err() {
@@ -14873,6 +14879,7 @@ impl Engine {
                     guc,
                     responder,
                     capture.take(),
+                    None,
                 )
             })?;
             if outcome.is_err() {
@@ -14925,6 +14932,7 @@ impl Engine {
                         guc,
                         responder,
                         capture,
+                        None,
                         connection_id,
                     )
                 }),
@@ -14940,6 +14948,7 @@ impl Engine {
                         params,
                         guc,
                         responder,
+                        None,
                         None,
                         connection_id,
                     )
@@ -15013,6 +15022,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
+        progress: Option<&mut exec::RowProgress>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) =
             query::validate_dml_assignment_casts(statement, storage, txn.txid, arena, None)
@@ -15059,6 +15069,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                progress,
             );
         };
         let event = match statement {
@@ -15085,6 +15096,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                progress,
             );
         }
         if let Err(error) = exec::fire_view_statement_triggers(
@@ -15112,6 +15124,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                None,
             )
         })?;
         let affected = responder.take_affected_rows().unwrap_or(0);
@@ -15199,6 +15212,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
+        progress: Option<&mut exec::RowProgress>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let authorization = match match statement {
             Stmt::Insert(insert) => storage
@@ -15344,6 +15358,7 @@ impl Engine {
                     None,
                     None,
                     exec::InsertSource::Statement,
+                    progress,
                 )
             }
             Stmt::Update(update) => {
@@ -15435,6 +15450,7 @@ impl Engine {
                     responder,
                     capture,
                     None,
+                    progress,
                 )
             }
             Stmt::Delete(delete) => {
@@ -15513,6 +15529,7 @@ impl Engine {
                     responder,
                     capture,
                     None,
+                    progress,
                 )
             }
             _ => Ok(Err(sql_err!(
@@ -15992,6 +16009,8 @@ impl Engine {
                         .is_none()
                 })
             });
+        let mut progress = exec::RowProgress::new();
+        let mut statement_start = None;
         loop {
             if let Err(error) = sequence::rewind_replay_cursor(replay) {
                 return Ok(Err(error));
@@ -16000,10 +16019,17 @@ impl Engine {
             invocations.begin_attempt();
             let attempt_arena_mark = arena.mark();
             let output_mark = responder.mark();
-            let statement_mark =
-                txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let (wal, lock) = (self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let statement_mark = txn.statement_mark(wal, lock);
+            progress.begin_attempt(wal, lock);
+            // AFTER triggers of a write that kept rows belong to its first attempt.
+            let start = *statement_start.get_or_insert(statement_mark);
             let boundary = completion_handoff.then_some(txn::WriteCompletionBoundary {
-                mark: statement_mark,
+                mark: if progress.changed_rows() {
+                    start
+                } else {
+                    statement_mark
+                },
                 command: txn.command_id(),
                 depth: txn.trigger_depth(),
             });
@@ -16025,6 +16051,7 @@ impl Engine {
                                     guc,
                                     responder,
                                     None,
+                                    Some(&mut progress),
                                     self.work.connection_id(),
                                 )?
                             }
@@ -16060,7 +16087,14 @@ impl Engine {
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                 return Ok(Err(error));
             }
-            self.rollback_waiting_statement(txn, statement_mark);
+            let unfinished = match progress.unfinished_row() {
+                Ok(unfinished) => unfinished,
+                Err(error) => return Ok(Err(error)),
+            };
+            // A write that kept rows undoes only its unfinished row.
+            let (rollback, output_mark) =
+                unfinished.map_or((statement_mark, output_mark), |row| (row.mark, row.output));
+            self.rollback_waiting_statement(txn, rollback);
             self.dml_scratch.clear();
             if let Err(error) = responder.truncate_to(output_mark) {
                 // Rows already sent cannot be withdrawn for another attempt.
@@ -17534,6 +17568,7 @@ impl Engine {
                 guc,
                 responder,
                 None,
+                None,
                 self.work.connection_id(),
             ),
             Stmt::Merge(_) => Self::execute_merge(
@@ -17610,6 +17645,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                None,
                 self.work.connection_id(),
             ),
             Stmt::Merge(_) => Self::execute_merge(
@@ -20777,6 +20813,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                None,
                 self.work.connection_id(),
             ),
             Stmt::Merge(_) => Self::execute_merge(

@@ -460,3 +460,106 @@ fn procedural_writes_call_procedural_functions_after_waits() {
         }
     }
 }
+
+/// Routine calls in a write's rows, after its cold scan yields: each call
+/// sees the rows the write already changed, runs once, and the write keeps
+/// its `RETURNING` rows and sequence order, at top level, in `DO`, dynamic
+/// `EXECUTE` and SQL-language bodies; both protocols and transaction modes.
+/// Expected values from PostgreSQL 18.6.
+#[test]
+fn write_rows_keep_progress_across_routine_calls() {
+    // Statement, whether it may yield before its first effect, and its
+    // returned rows. `VALUES` rows and a top-level call start with an effect;
+    // after the first statement, its transaction's own rows can be cached.
+    let statements: &[(&str, bool, &[&str])] = &[
+        (
+            "UPDATE cold_items SET code = code || mark('u') WHERE id <= 3 RETURNING id, code",
+            true,
+            &["1|c1!", "2|c2!", "3|c3!"],
+        ),
+        (
+            "DELETE FROM cold_items WHERE id > 38 RETURNING id, mark('d')",
+            true,
+            &["39|!", "40|!"],
+        ),
+        (
+            "INSERT INTO cold_items VALUES (41, 'n' || mark('i')), (42, 'n' || mark('i')) \
+             RETURNING id, code",
+            false,
+            &["41|n!", "42|n!"],
+        ),
+        (
+            "DO $$BEGIN UPDATE cold_items SET code = code || mark('p') WHERE id BETWEEN 5 AND 6; \
+             EXECUTE 'UPDATE cold_items SET code = code || mark($1) WHERE id BETWEEN 7 AND 8' \
+             USING 'e'; END$$",
+            true,
+            &[],
+        ),
+        ("SELECT bump()", false, &["c10!", "c11!"]),
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for extended in [false, true] {
+            let mut cold = cold_table(
+                "row-progress",
+                mode,
+                "CREATE TABLE hot_log(stage text); CREATE SEQUENCE marks; \
+                 CREATE FUNCTION mark(label text) RETURNS text LANGUAGE plpgsql AS $$ \
+                 DECLARE changed bigint; total bigint; BEGIN \
+                 SELECT count(*) FILTER (WHERE code LIKE '%!'), count(*) INTO changed, total \
+                 FROM cold_items; \
+                 INSERT INTO hot_log VALUES (label || changed || '/' || total || '#' || \
+                 nextval('marks')); RETURN '!'; END$$; \
+                 CREATE FUNCTION bump() RETURNS SETOF text LANGUAGE sql AS $$UPDATE cold_items \
+                 SET code = code || mark('s') WHERE id BETWEEN 10 AND 11 RETURNING code$$",
+            );
+            cold.writer.success(&mut cold.engine, "BEGIN", true);
+            for &(sql, yields, returned) in statements {
+                let context = format!("{mode:?} extended={extended}: {sql}");
+                let waits = cold.run_held(sql, extended, yields, other_client_progresses);
+                if !yields || sql.starts_with("UPDATE") {
+                    assert_eq!(waits > 0, yields, "{context}");
+                }
+                let output = cold.writer.send.readable().to_vec();
+                assert!(
+                    error_sqlstates(&output).is_empty(),
+                    "{context}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                assert_eq!(data_rows(&output), returned, "{context}");
+            }
+            cold.writer.success(&mut cold.engine, "COMMIT", true);
+            let mut stages = cold.rows("SELECT stage FROM hot_log WHERE stage <> 'other'");
+            stages.sort();
+            assert_eq!(
+                stages,
+                [
+                    "d3/38#5",
+                    "d3/39#4",
+                    "e7/40#10",
+                    "e8/40#11",
+                    "i3/38#6",
+                    "i4/39#7",
+                    "p5/40#8",
+                    "p6/40#9",
+                    "s10/40#13",
+                    "s9/40#12",
+                    "u0/40#1",
+                    "u1/40#2",
+                    "u2/40#3",
+                ],
+                "{mode:?} extended={extended}"
+            );
+            assert_eq!(
+                cold.rows(
+                    "SELECT count(*) FILTER (WHERE code LIKE '%!'), count(*) FROM cold_items"
+                ),
+                ["11|40"],
+                "{mode:?} extended={extended}"
+            );
+            cold.finish();
+        }
+    }
+}

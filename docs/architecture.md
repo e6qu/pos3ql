@@ -84,6 +84,22 @@ first effect: index maintenance, constraint checks, triggers and `RETURNING`
 then read synchronously until the statement ends. A `BEFORE STATEMENT` trigger
 therefore makes the whole scan synchronous.
 
+**Routine calls keep a write's changed rows.** A row expression, row trigger
+or `RETURNING` item of `INSERT`, `UPDATE` or `DELETE` that calls a PL/pgSQL or
+data-modifying function ends the write attempt, because the call runs on the
+engine. Before the first row change the attempt rolls back and runs again,
+replaying the call's saved result. After it, the write keeps its changed rows:
+only the unfinished row rolls back, the call runs and sees the earlier rows'
+changes, and the next attempt selects its rows again under the same command,
+skips the changed ones and continues at that row, or at its `RETURNING`
+values when the call was there. Statement triggers, transition rows,
+sequence values and returned rows each happen once. A wait or error inside
+such a call still rolls the whole statement back.
+
+**Example:** `UPDATE items SET total = running_total()`, where
+`running_total()` sums `items`, gives each row the sum including the rows
+updated before it, as in PostgreSQL.
+
 **Example:** `UPDATE orders SET status = 'late' WHERE due < now()` over cold
 `orders` yields while it downloads the blocks it scans; other clients run
 meanwhile. Each wait discards only the scan, and the rows change once.
@@ -142,6 +158,7 @@ BY id` sorts first, so its output queues in the spool instead.
 | Result streams (see above): each row before its first effect | Yields; delivered rows are kept |
 | Writes (`INSERT ... SELECT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`), also in a `CALL` or `DO` body: selecting and locking rows before the first row change, `VALUES` row or trigger body | Yields; the statement restarts from its start (see above) |
 | Writes after their first row change, `VALUES` row or trigger body: index maintenance, constraint checks, triggers, `RETURNING` | Blocks until the statement ends |
+| Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`): row expressions, row triggers, `RETURNING` | Run on the engine between attempts; the write keeps its changed rows and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
 | DDL and `COPY FROM` | Blocks for the whole statement |
 | Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |
 | Statements after the first effect inside a `CALL` or `DO` body | Blocks |
@@ -195,7 +212,9 @@ Further rules that apply to every saved owner:
   call's receipt instead of taking another hold.
 - **Unsupported restarts fail loudly.** A path that cannot save its progress
   returns `0A000` and rolls back rather than repeat a write — for example
-  `SQL row expression requires retained write progress`, or an unsaved volatile
+  `SQL row expression requires retained write progress` for a routine call
+  after a SQL-language function's `MERGE` or data-modifying `WITH`, or a
+  foreign table's write, changed rows; or an unsaved volatile
   value such as `random()`. Contexts with no resumable executor reject advisory
   unlocks with `0A000`.
 - **Typed wait markers.** Internal waits use a typed marker, not a SQLSTATE.

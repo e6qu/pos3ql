@@ -44216,7 +44216,7 @@ fn table_routine_final_query_resumes_nested_mutable_scalar_routine() {
 }
 
 #[test]
-fn data_modifying_routine_result_resumes_nested_mutable_scalar_routine() {
+fn data_modifying_routine_result_rejects_rows_its_nested_call_updated() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
@@ -44236,12 +44236,9 @@ fn data_modifying_routine_result_resumes_nested_mutable_scalar_routine() {
          SELECT value FROM routine_dml_nested WHERE id = 1; \
          ROLLBACK",
     );
-    assert_eq!(
-        data_rows(&output),
-        ["41", "41"],
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
+    // PostgreSQL 18.6: the call updated the row its caller updates next.
+    assert_eq!(error_sqlstates(&output), ["27000"]);
+    assert!(data_rows(&output).is_empty());
 }
 
 #[test]
@@ -44275,7 +44272,7 @@ fn table_routine_returns_results_after_completed_nested_writes() {
 }
 
 #[test]
-fn void_routine_result_resumes_nested_mutable_scalar_routine() {
+fn void_routine_result_rejects_rows_its_nested_call_updated() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
@@ -44295,12 +44292,9 @@ fn void_routine_result_resumes_nested_mutable_scalar_routine() {
          SELECT value FROM routine_void_nested WHERE id = 1; \
          ROLLBACK",
     );
-    assert_eq!(
-        data_rows(&output),
-        ["NULL", "41"],
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
+    // PostgreSQL 18.6: the call updated the row its caller updates next.
+    assert_eq!(error_sqlstates(&output), ["27000"]);
+    assert!(data_rows(&output).is_empty());
 }
 
 #[test]
@@ -44332,7 +44326,7 @@ fn mutable_routine_writes_obey_enclosing_savepoint_rollback() {
 }
 
 #[test]
-fn nested_sql_writes_reject_unowned_row_restarts_without_partial_changes() {
+fn nested_sql_writes_keep_rows_and_report_postgresql_row_conflicts() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -44355,7 +44349,13 @@ fn nested_sql_writes_reject_unowned_row_restarts_without_partial_changes() {
                 UPDATE routine_retry_rows SET value=CASE WHEN id=2 THEN read_retry_row(1) ELSE value+10 END RETURNING value $$; \
              CREATE FUNCTION all_retry_rows() RETURNS SETOF integer LANGUAGE SQL AS $$ \
                 UPDATE routine_retry_rows SET value=bump_retry_row(id) RETURNING value $$", true);
-        for name in ["update_retry_rows", "observe_retry_rows", "all_retry_rows"] {
+        // PostgreSQL 18.6: a call that updates a row the write changes next
+        // fails with 27000; a call that reads an earlier row sees its change.
+        for (name, sqlstates, rows) in [
+            ("update_retry_rows", &["27000"][..], &[][..]),
+            ("observe_retry_rows", &[], &["50", "50"][..]),
+            ("all_retry_rows", &["27000"], &[]),
+        ] {
             let output = session.execute(
                 &mut engine,
                 &format!("BEGIN; SELECT value FROM {name}() AS result(value) ORDER BY value"),
@@ -44363,15 +44363,11 @@ fn nested_sql_writes_reject_unowned_row_restarts_without_partial_changes() {
             );
             assert_eq!(
                 error_sqlstates(&output),
-                ["0A000"],
-                "{}",
+                sqlstates,
+                "{name}: {}",
                 String::from_utf8_lossy(&output)
             );
-            assert!(
-                String::from_utf8_lossy(&output)
-                    .contains("SQL row expression requires retained write progress")
-            );
-            assert!(data_rows(&output).is_empty());
+            assert_eq!(data_rows(&output), rows, "{name}");
             assert_eq!(
                 data_rows(&session.success(
                     &mut engine,
@@ -100711,3 +100707,4 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
 }
 
 mod relation_input_granularity;
+mod row_progress;

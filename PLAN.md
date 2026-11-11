@@ -80,7 +80,11 @@ client output that never blocks the worker on a slow reader; large
 single-table results resuming row by row across client, storage and lock
 waits; `INSERT ... SELECT`, `UPDATE`, `DELETE` and `MERGE`, at top level and
 in `CALL` and `DO` bodies, yielding on storage reads while they select and lock
-rows and restarting from their start. The
+rows and restarting from their start; routine calls inside the rows of an
+`INSERT`, `UPDATE` or `DELETE` (expressions, row triggers, `RETURNING`) at top
+level, in PL/pgSQL statements and `EXECUTE`, and in SQL-language bodies,
+which keep the rows already changed so the call sees them, as in PostgreSQL.
+The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
 
@@ -94,18 +98,24 @@ is owned.
   row or trigger body; after that, row changes, index maintenance, constraint
   checks, BEFORE/INSTEAD and statement triggers, partition routing, transition
   tables, rules and `RETURNING` read synchronously, and so do DDL, COPY,
-  replication apply and deferred triggers. Save write progress instead: the
-  selected row set and the next row to change in a startup-reserved owner, so a
-  row-phase wait resumes at that row without repeating earlier rows, triggers
-  or `RETURNING` output. Keep the original command and rollback boundary.
-  Replace the current explicit rejection of row progress in multirow updates
-  (`SQL row expression requires retained write progress`) with that saved
-  progress: a child statement must see earlier changed rows before the next row
-  is written, and each operation keeps its own transition table and firing
-  order. Triggers fired inside a write run without the engine's utility
+  replication apply and deferred triggers. A routine call inside the rows
+  already keeps the changed rows within the running statement (row progress:
+  the next attempt selects the rows again under the original command and
+  continues at the unfinished row). Move that progress into a startup-reserved
+  owner so a storage or lock wait in the row phase also resumes at its row
+  instead of restarting the statement. Extend row progress to `MERGE`, rules,
+  data-modifying `WITH`, `INSTEAD OF` view triggers and foreign tables: a
+  routine call after their first row change still restarts a top-level
+  statement, so the call does not see the earlier rows, and fails with
+  `0A000` (`SQL row expression requires retained write progress`) inside a
+  routine. `INSERT ... SELECT` evaluates its whole source before writing, so a
+  volatile call in the source does not see rows inserted earlier by the same
+  statement. A static PL/pgSQL `INSERT`, `UPDATE` or `DELETE` with
+  `RETURNING` (with or without `INTO`) fails with `0A000`; dynamic `EXECUTE
+  ... INTO` already assigns returned values. Triggers fired inside a write run
+  without the engine's utility
   executor, so DDL there (PL/pgSQL `CREATE TABLE`, or a SQL procedure that a
-  BEFORE trigger calls) fails with `0A000`; running the row phase from the
-  engine with saved progress gives them that executor.
+  BEFORE trigger calls) fails with `0A000`.
 - **Results and cursors:** resume more large results row by row; only
   single-table `SELECT` from a simple Query or an unpaged `Execute` does today.
   Remaining: paged and named portals (`Execute` with a row limit still buffers

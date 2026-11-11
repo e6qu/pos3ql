@@ -440,6 +440,14 @@ impl RoutineInputs {
     pub(super) fn begin_attempt(&self) {
         self.next.set(0);
     }
+
+    pub(super) fn position(&self) -> usize {
+        self.next.get()
+    }
+
+    pub(super) fn seek(&self, position: usize) {
+        self.next.set(position);
+    }
 }
 
 struct InputAttempt<'statement, 'query> {

@@ -99,3 +99,30 @@ fn procedural_writes_call_procedural_functions() {
         );
     }
 }
+
+// Static PL/pgSQL data changes with RETURNING are not supported yet; the
+// statement fails loudly instead of reading `INTO` as a syntax error.
+#[test]
+fn procedural_writes_reject_returning_loudly() {
+    let config = test_config("procedural-write-returning");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE t(a int)", true);
+    for body in [
+        "INSERT INTO t VALUES (1) RETURNING a",
+        "UPDATE t SET a = 2 RETURNING a INTO r",
+        "DELETE FROM t RETURNING a INTO STRICT r",
+    ] {
+        let output = session.execute(
+            &mut engine,
+            &format!("DO $$DECLARE r int; BEGIN {body}; END$$"),
+            true,
+        );
+        assert_eq!(error_sqlstates(&output), ["0A000"], "{body}");
+        assert!(
+            String::from_utf8_lossy(&output).contains("RETURNING in a static PL/pgSQL"),
+            "{body}"
+        );
+    }
+}

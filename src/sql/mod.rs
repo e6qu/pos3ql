@@ -20846,6 +20846,7 @@ impl Engine {
                 guc,
                 names,
                 *if_exists,
+                arena,
                 responder,
             ),
             Stmt::SetRole { role, local, reset } => {

@@ -630,6 +630,77 @@ fn identify_object_record<'a>(
     Ok(Datum::Record(fields))
 }
 
+/// `pg_describe_object(class, object, sub)`: PostgreSQL's
+/// `getObjectDescription`, or `None` for an object that does not exist.
+pub(crate) fn describe_object_text<'a>(
+    catalog: &dyn super::super::CatalogAccess,
+    class_id: i32,
+    object_id: i32,
+    sub_id: i32,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let object = catalog.catalog_object(class_id, object_id, sub_id)?;
+    if object.identity.is_empty() {
+        return Ok(None);
+    }
+    if let Some(text) = visible_object_description(catalog, class_id, object_id, object, arena)? {
+        return Ok(Some(text));
+    }
+    describe_catalog_object(object, arena).map(Some)
+}
+
+/// PostgreSQL's `getObjectDescription` names functions, types and relations
+/// as their `regprocedure`, `regtype` and `regclass` output does: without a
+/// schema when the search path finds them (`function lower(text)`, `table
+/// t`, `column a of table t`).
+fn visible_object_description<'a>(
+    catalog: &dyn super::super::CatalogAccess,
+    class_id: i32,
+    object_id: i32,
+    object: crate::sql::event_trigger::EventObject,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let target = match class_id {
+        1255 => ColType::Regprocedure,
+        1247 => ColType::Regtype,
+        1259 => ColType::Regclass,
+        _ => return Ok(None),
+    };
+    let name = match if target == ColType::Regtype {
+        super::super::regtype_of_oid_with_catalog(i64::from(object_id), Some(catalog), arena)?
+    } else {
+        super::super::regobject_cast(Datum::Oid(object_id as u32), target, Some(catalog), arena)?
+    } {
+        Datum::RegObject { name, .. } | Datum::Regtype { name, .. } => name,
+        _ => return Ok(None),
+    };
+    let description = match class_id {
+        1255 => stack_format!(1024, "function {}", name),
+        1247 => stack_format!(1024, "type {}", name),
+        _ => match object.object_type.as_str().strip_suffix(" column") {
+            Some(kind) if object.address_name_count == 3 => stack_format!(
+                1024,
+                "column {} of {} {}",
+                crate::sql::types::acl_identifier(object.address_names[2].as_str()).as_str(),
+                kind,
+                name
+            ),
+            Some(_) => return Ok(None),
+            None => stack_format!(1024, "{} {}", object.object_type.as_str(), name),
+        },
+    };
+    if description.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "catalog object description exceeds static capacity"
+        ));
+    }
+    arena
+        .alloc_str(description.as_str())
+        .map(Some)
+        .map_err(|_| arena_full())
+}
+
 fn describe_catalog_object(
     object: crate::sql::event_trigger::EventObject,
     arena: &crate::mem::arena::Arena,
@@ -1902,14 +1973,13 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
-                let object = catalog.catalog_object(class_id, object_id, sub_id)?;
                 if name == "pg_describe_object" {
-                    if object.identity.is_empty() {
-                        Ok(Datum::Null)
-                    } else {
-                        Ok(Datum::Text(describe_catalog_object(object, arena)?))
-                    }
+                    Ok(
+                        describe_object_text(catalog, class_id, object_id, sub_id, arena)?
+                            .map_or(Datum::Null, Datum::Text),
+                    )
                 } else {
+                    let object = catalog.catalog_object(class_id, object_id, sub_id)?;
                     identify_object_record(object, name == "pg_identify_object_as_address", arena)
                 }
             }

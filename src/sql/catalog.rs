@@ -22942,7 +22942,8 @@ fn pg_extension<'a>(
     finish(def, out, arena)
 }
 
-fn extension_dependency_catalog_identity(
+/// The `pg_class`/`pg_proc`/... identity of an access-controlled object.
+fn access_object_catalog_identity(
     storage: &Storage,
     txid: u32,
     object: crate::storage::AccessObject,
@@ -23896,7 +23897,7 @@ fn pg_depend<'a>(
     }
     for (_, dependency) in storage.extension_dependencies_visible_to(txid) {
         let Some((class, object)) =
-            extension_dependency_catalog_identity(storage, txid, dependency.object)
+            access_object_catalog_identity(storage, txid, dependency.object)
         else {
             continue;
         };
@@ -30687,102 +30688,195 @@ fn pg_wait_events<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     finish(definition, &rows, arena)
 }
 
+/// A `pg_shdepend` row of the current database: a role owns (`o`) or is
+/// named in the ACL of (`a`) an object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SharedDependency {
+    pub class: i32,
+    pub object: i32,
+    pub sub: i32,
+    pub role: u16,
+    pub kind: u8,
+}
+
+/// Object classes whose owner `pg_shdepend` records.
+const OWNED_ACCESS_CLASSES: [crate::storage::AccessClass; 16] = {
+    use crate::storage::AccessClass;
+    [
+        AccessClass::Schema,
+        AccessClass::Table,
+        AccessClass::View,
+        AccessClass::MaterializedView,
+        AccessClass::Sequence,
+        AccessClass::Domain,
+        AccessClass::Enum,
+        AccessClass::Composite,
+        AccessClass::Routine,
+        AccessClass::BuiltinRoutine,
+        AccessClass::Statistics,
+        AccessClass::Extension,
+        AccessClass::EventTrigger,
+        AccessClass::ForeignDataWrapper,
+        AccessClass::ForeignServer,
+        AccessClass::LargeObject,
+    ]
+};
+
+/// The current database's `pg_shdepend` rows. As in PostgreSQL, the
+/// bootstrap superuser and `PUBLIC` are never recorded, and an ACL records
+/// each grantee and grantor other than the object's owner. Owners come first
+/// in object-creation (OID) order, then privileges in grant order.
+pub(crate) fn shared_dependencies<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [SharedDependency], SqlError> {
+    use crate::storage::{AccessObject, BOOTSTRAP_ROLE, PUBLIC_ROLE};
+    let capacity = OWNED_ACCESS_CLASSES
+        .iter()
+        .map(|class| storage.access_class_slots(*class))
+        .sum::<usize>()
+        + 2 * (storage.acl_entry_count() + storage.column_acl_entry_count());
+    let rows = arena
+        .alloc_slice_with(capacity, |_| SharedDependency {
+            class: 0,
+            object: 0,
+            sub: 0,
+            role: 0,
+            kind: 0,
+        })
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    for class in OWNED_ACCESS_CLASSES {
+        for slot in 0..storage.access_class_slots(class) {
+            let object = AccessObject {
+                class,
+                slot: slot as u16,
+            };
+            if !storage.access_object_visible_to(object, txid) {
+                continue;
+            }
+            let owner = storage.object_owner(object, txid) as u16;
+            if owner == BOOTSTRAP_ROLE {
+                continue;
+            }
+            let Some((class, oid)) = access_object_catalog_identity(storage, txid, object) else {
+                continue;
+            };
+            rows[count] = SharedDependency {
+                class,
+                object: oid,
+                sub: 0,
+                role: owner,
+                kind: b'o',
+            };
+            count += 1;
+        }
+    }
+    rows[..count].sort_unstable_by_key(|row| (row.object as u32, row.class));
+    let mut push = |rows: &mut [SharedDependency], row: SharedDependency| {
+        if row.role == PUBLIC_ROLE || row.role == BOOTSTRAP_ROLE || rows[..count].contains(&row) {
+            return;
+        }
+        rows[count] = row;
+        count += 1;
+    };
+    // PostgreSQL records ACL dependencies as privileges are granted.
+    let granted = arena
+        .alloc_slice_with(storage.acl_entry_count(), |_| (u64::MAX, 0usize))
+        .map_err(|_| arena_full())?;
+    let mut granted_count = 0;
+    for (slot, entry) in storage.acl_entries() {
+        if storage.acl_entry_visible(slot, txid)
+            && storage.access_object_visible_to(entry.object, txid)
+            && granted_count < granted.len()
+        {
+            let order = storage
+                .object_acl_order(slot, txid)
+                .map_or(u64::MAX, core::num::NonZeroU64::get);
+            granted[granted_count] = (order, slot);
+            granted_count += 1;
+        }
+    }
+    granted[..granted_count].sort_unstable();
+    for &(_, slot) in &granted[..granted_count] {
+        let entry = storage.acl_entry(slot);
+        let Some((class, oid)) = access_object_catalog_identity(storage, txid, entry.object) else {
+            continue;
+        };
+        let owner = storage.object_owner(entry.object, txid) as u16;
+        let (grantee, grantor) = storage.acl_identity(slot, txid);
+        for role in [grantee, grantor] {
+            if role != owner {
+                push(
+                    rows,
+                    SharedDependency {
+                        class,
+                        object: oid,
+                        sub: 0,
+                        role,
+                        kind: b'a',
+                    },
+                );
+            }
+        }
+    }
+    for (slot, entry) in storage.column_acl_entries() {
+        let relation = entry.target.relation();
+        if storage.column_acl_state(slot, txid).0.0 == 0
+            || !storage.access_object_visible_to(relation, txid)
+        {
+            continue;
+        }
+        let Some((class, oid)) = access_object_catalog_identity(storage, txid, relation) else {
+            continue;
+        };
+        let owner = storage.object_owner(relation, txid) as u16;
+        let (grantee, grantor) = storage.column_acl_identity(slot, txid);
+        for role in [grantee, grantor] {
+            if role != owner {
+                push(
+                    rows,
+                    SharedDependency {
+                        class,
+                        object: oid,
+                        sub: i32::from(entry.target.column()) + 1,
+                        role,
+                        kind: b'a',
+                    },
+                );
+            }
+        }
+    }
+    Ok(&rows[..count])
+}
+
 fn pg_shdepend<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_shdepend", false);
-    let capacity = storage
-        .table_count()
-        .checked_add(storage.view_count())
-        .and_then(|count| count.checked_add(storage.sequence_count()))
-        .and_then(|count| count.checked_add(storage.routine_count()))
-        .and_then(|count| count.checked_add(storage.schema_count()))
-        .ok_or_else(|| catalog_capacity_exceeded("pg_shdepend"))?;
+    let dependencies = shared_dependencies(storage, txid, arena)?;
     let rows = arena
-        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .alloc_slice_with(dependencies.len(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let database = Datum::Oid(storage.current_database_oid().get() as u32);
-    let mut count = 0usize;
-    let mut append =
-        |class: i32, oid: i32, object: crate::storage::AccessObject| -> Result<(), SqlError> {
-            rows[count] = row(
-                &[
-                    database,
-                    Datum::Oid(class as u32),
-                    Datum::Oid(oid as u32),
-                    Datum::Int4(0),
-                    Datum::Oid(1260),
-                    Datum::Oid(storage.role_oid(storage.object_owner(object, txid)) as u32),
-                    Datum::Char(b'o'),
-                ],
-                arena,
-            )?;
-            count += 1;
-            Ok(())
-        };
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let class = storage
-            .matview_slot_for_table(slot, txid)
-            .map_or(crate::storage::AccessClass::Table, |_| {
-                crate::storage::AccessClass::MaterializedView
-            });
-        let object_slot = storage.matview_slot_for_table(slot, txid).unwrap_or(slot);
-        append(
-            PG_CLASS_OID,
-            user_table_oid(storage, slot),
-            crate::storage::AccessObject {
-                class,
-                slot: object_slot as u16,
-            },
+    for (output, dependency) in rows.iter_mut().zip(dependencies) {
+        *output = row(
+            &[
+                database,
+                Datum::Oid(dependency.class as u32),
+                Datum::Oid(dependency.object as u32),
+                Datum::Int4(dependency.sub),
+                Datum::Oid(1260),
+                Datum::Oid(storage.role_oid(usize::from(dependency.role)) as u32),
+                Datum::Char(dependency.kind),
+            ],
+            arena,
         )?;
     }
-    for (slot, _) in storage.views_visible_to(txid) {
-        append(
-            PG_CLASS_OID,
-            view_oid(storage, slot),
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::View,
-                slot: slot as u16,
-            },
-        )?;
-    }
-    for slot in 0..storage.sequence_count() {
-        if storage.sequence_slot_visible_to(slot, txid) {
-            append(
-                PG_CLASS_OID,
-                sequence_oid(storage, slot),
-                crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Sequence,
-                    slot: slot as u16,
-                },
-            )?;
-        }
-    }
-    for slot in 0..storage.routine_count() {
-        if storage.routine_slot_visible_to(slot, txid) {
-            append(
-                PG_PROC_OID,
-                crate::storage::routine_oid(&storage.routine_for(slot, txid)),
-                Storage::routine_access_object(slot),
-            )?;
-        }
-    }
-    for (slot, _) in storage.visible_schemas(txid) {
-        append(
-            PG_NAMESPACE_OID,
-            namespace_oid_for_slot(storage, slot),
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Schema,
-                slot: slot as u16,
-            },
-        )?;
-    }
-    finish(definition, &rows[..count], arena)
+    finish(definition, rows, arena)
 }
 
 fn pg_timezone_names<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {

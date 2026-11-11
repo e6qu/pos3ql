@@ -276,11 +276,12 @@ pseudo-types are not pos3ql column types, and `pg_type` lists 182 of
 PostgreSQL's 621 built-in types; PostgreSQL's predefined roles
 (`pg_monitor`) do not exist, so their initdb `EXECUTE` grants are absent; a
 listed built-in that is neither implemented nor an operator, cast or input
-function fails with `0A000` when called; `DROP ROLE` reports dependent objects without PostgreSQL's `DETAIL` list
-(`owner of function lower(text)`), `pg_shdepend` lacks privilege rows and
-the owners of schemas, types and built-in routines, and `pg_describe_object`
-schema-qualifies names that PostgreSQL prints unqualified when they are
-visible (`table public.t` for `table t`); built-in operators, types and other
+function fails with `0A000` when called; `DROP ROLE`'s `DETAIL` and
+`pg_shdepend` omit objects in other databases, row-security policies
+(`target of policy`) and default privileges, and order owners by OID rather
+than catalog insertion; `pg_describe_object` still schema-qualifies visible
+operators, collations and other objects that are not relations, functions
+or types; built-in operators, types and other
 catalog objects have no shipped `pg_description` text (built-in routines
 do). A parameter typed from a called
 built-in (`PREPARE q AS SELECT round($1)`) is not recorded as that type:

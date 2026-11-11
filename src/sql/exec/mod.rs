@@ -9316,6 +9316,75 @@ pub fn rename_role(
     sql_ok()
 }
 
+/// PostgreSQL's `DETAIL` for a role that objects still depend on: one line
+/// per object in the current database (`owner of table t`, `privileges for
+/// function f(integer)`), at most 100, then a count of the rest.
+fn role_dependency_detail(
+    storage: &Storage,
+    role: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<
+    Option<crate::util::StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>>,
+    SqlError,
+> {
+    use core::fmt::Write;
+    const MAX_REPORTED_DEPENDENCIES: usize = 100;
+    let mark = arena.mark();
+    let result = (|| {
+        let catalog = super::query::storage_catalog(storage, arena, txid);
+        let mut detail =
+            crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+        let mut reported = 0usize;
+        let mut unreported = 0usize;
+        for dependency in super::catalog::shared_dependencies(storage, txid, arena)? {
+            if usize::from(dependency.role) != role {
+                continue;
+            }
+            let Some(description) = super::eval::funcs::system::describe_object_text(
+                &catalog,
+                dependency.class,
+                dependency.object,
+                dependency.sub,
+                arena,
+            )?
+            else {
+                continue;
+            };
+            let prefix = match dependency.kind {
+                b'o' => "owner of ",
+                _ => "privileges for ",
+            };
+            let separator = if reported == 0 { "" } else { "\n" };
+            if reported == MAX_REPORTED_DEPENDENCIES
+                || detail.len() + separator.len() + prefix.len() + description.len()
+                    > crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES - 64
+            {
+                unreported += 1;
+                continue;
+            }
+            let _ = write!(detail, "{separator}{prefix}{description}");
+            reported += 1;
+        }
+        if unreported != 0 {
+            let _ = write!(
+                detail,
+                "\nand {} other object{} (see server log for list)",
+                unreported,
+                if unreported == 1 { "" } else { "s" }
+            );
+        }
+        Ok((reported != 0).then_some(detail))
+    })();
+    // The detail was copied out of the workspace.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "DROP ROLE reads session identities and describes dependents"
+)]
 pub fn drop_role(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -9323,6 +9392,7 @@ pub fn drop_role(
     guc: &crate::sql::guc::GucState,
     names: &[&str],
     if_exists: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     if let Err(error) = require_create_role(storage, txn.txid) {
@@ -9462,6 +9532,11 @@ pub fn drop_role(
             Err(error) => return sql_fail(error),
         };
         if dependency.is_some() {
+            match role_dependency_detail(storage, slot, txn.txid, arena) {
+                Ok(Some(detail)) => super::eval::stash_diagnostic(Some(detail), None),
+                Ok(None) => {}
+                Err(error) => return sql_fail(error),
+            }
             return sql_fail(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                 "role \"{}\" cannot be dropped because some objects depend on it",
@@ -25225,6 +25300,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     guc,
                     names,
                     *if_exists,
+                    context.arena,
                     responder,
                 ),
                 Stmt::GrantRole {

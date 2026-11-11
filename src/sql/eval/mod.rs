@@ -10559,7 +10559,7 @@ pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, 
     regtype_of_oid_with_catalog(o, None, arena)
 }
 
-fn regtype_of_oid_with_catalog<'a>(
+pub(crate) fn regtype_of_oid_with_catalog<'a>(
     o: i64,
     catalog: Option<&dyn CatalogAccess>,
     arena: &'a Arena,

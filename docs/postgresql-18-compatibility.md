@@ -195,6 +195,17 @@ Functions and expressions:
   (`'int4in(cstring)'::regprocedure`, `GRANT ... ON FUNCTION
   int4in(cstring)`) is not recognized (`42883`). Dropping a built-in fails
   with `2BP01`, as in PostgreSQL.
+- `DROP ROLE` of a role that still owns objects or holds privileges fails
+  with `2BP01` and PostgreSQL's `DETAIL` list (`owner of table t`,
+  `privileges for function upper(text)`, `privileges for column b of table
+  t`), at most 100 lines and then `and N other objects`. `pg_shdepend` holds
+  the same rows: owners other than the bootstrap superuser and every grantee
+  or grantor in an ACL other than the owner. `pg_describe_object` names a
+  relation, function or type without its schema when the search path finds
+  it (`table t`, `function lower(text)`). Limits: owners are listed in object
+  OID order and privileges in grant order, where PostgreSQL lists catalog
+  insertion order; objects in other databases, row-security policies and
+  default privileges are not listed.
 - Array and `CASE` result types follow declarations, including subqueries and
   nulls: `ARRAY[(SELECT NULL::date)]` is `date[]`; mixing integer and bigint
   gives `bigint[]`; an empty constructor needs a type (`ARRAY[]::integer[]`).

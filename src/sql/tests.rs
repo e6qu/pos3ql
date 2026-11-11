@@ -61,6 +61,7 @@ mod stored_relation_sources;
 mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
+mod type_dependent_routines;
 mod type_input_binding;
 mod type_input_positions;
 mod virtual_search_path;

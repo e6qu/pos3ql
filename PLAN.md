@@ -336,10 +336,9 @@ MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
 column uses its row type, fail with `0A000`; a `DROP TABLE ... CASCADE` that
 reaches both columns and routines, or names several tables, reports one notice
 per table or dependency kind where PostgreSQL reports one for the statement, and a routine's dependency on a row type is described as depending on the
-table; `DROP TYPE ... CASCADE` drops routines whose signatures use the type
-without a `drop cascades to function f(t)` notice, and without `CASCADE`
-reports `cannot drop type because routine objects depend on it` where
-PostgreSQL names the type and lists the routines in its `DETAIL`. Values and columns of a view's row type need the view's column types,
+table; a `DROP TYPE` or `DROP DOMAIN` whose type both routines and other
+objects (columns, views, casts) use reports the routines separately from
+those objects where PostgreSQL reports them together. Values and columns of a view's row type need the view's column types,
 which pos3ql derives from the view's query on each use instead of storing them
 as PostgreSQL's `pg_attribute` rows do. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current

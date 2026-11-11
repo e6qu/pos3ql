@@ -46932,6 +46932,97 @@ fn routine_uses_selected_type(
     }
 }
 
+/// PostgreSQL's report of the routines a dropped type takes with it: one
+/// line per routine, as a `DETAIL` of the refusal without `CASCADE` and as
+/// `drop cascades to` notices with it.
+fn report_type_dependent_routines(
+    storage: &Storage,
+    txid: u32,
+    selected: &[bool],
+    (schema, name): (&SqlName, &SqlName),
+    cascade: bool,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+    let in_path = |schema: &str| {
+        storage.path().entries().iter().any(|entry| match entry {
+            crate::storage::PathEntry::Schema(slot) => {
+                storage.schema_def_for(*slot as usize, txid).name.as_str() == schema
+            }
+            crate::storage::PathEntry::Catalog => schema == "pg_catalog",
+            crate::storage::PathEntry::InformationSchema => schema == "information_schema",
+            crate::storage::PathEntry::Toast => schema == "pg_toast",
+        })
+    };
+    let mut type_text = crate::util::StackStr::<192>::new();
+    if !in_path(schema.as_str()) {
+        write_identifier(&mut type_text, schema.as_str());
+        let _ = type_text.write_char('.');
+    }
+    write_identifier(&mut type_text, name.as_str());
+    let mut detail =
+        crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let mut count = 0usize;
+    for (slot, _) in selected
+        .iter()
+        .enumerate()
+        .filter(|(_, selected)| **selected)
+    {
+        let routine = storage.routine_for(slot, txid);
+        let _ = write!(
+            detail,
+            "{}{}function ",
+            if count == 0 { "" } else { "\n" },
+            if cascade { "drop cascades to " } else { "" }
+        );
+        let routine_schema = routine.schema_for(txid);
+        if !in_path(routine_schema.as_str()) {
+            write_identifier(&mut detail, routine_schema.as_str());
+            let _ = detail.write_char('.');
+        }
+        write_identifier(&mut detail, routine.name_for(txid).as_str());
+        let suffix = routine_dependency_suffix(storage, txid, &routine)?;
+        let _ = write!(detail, "{}", suffix.as_str());
+        if !cascade {
+            let _ = write!(detail, " depends on type {}", type_text.as_str());
+        }
+        count += 1;
+    }
+    if detail.is_truncated() || type_text.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "type dependency report exceeds its fixed buffer"
+        ));
+    }
+    if !cascade {
+        crate::sql::eval::stash_diagnostic(
+            Some(detail),
+            Some(crate::util::StackStr::from_str(
+                "Use DROP ... CASCADE to drop the dependent objects too.",
+            )),
+        );
+        return Err(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop type {} because other objects depend on it",
+            type_text.as_str()
+        ));
+    }
+    let wire_full = |_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "response buffer full");
+    if count == 1 {
+        responder
+            .notice(sqlstate::SUCCESSFUL_COMPLETION, detail.as_str())
+            .map_err(wire_full)
+    } else {
+        crate::sql::eval::stash_diagnostic(Some(detail), None);
+        responder
+            .notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(128, "drop cascades to {} other objects", count).as_str(),
+            )
+            .map_err(wire_full)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drop_type_dependent_routines(
     storage: &mut Storage,
@@ -46942,6 +47033,7 @@ fn drop_type_dependent_routines(
     selected_composite: Option<usize>,
     cascade: bool,
     arena: &Arena,
+    responder: &mut Responder,
 ) -> Result<(), SqlError> {
     macro_rules! uses {
         ($result:expr) => {
@@ -47071,12 +47163,28 @@ fn drop_type_dependent_routines(
     if !selected.iter().any(|selected| *selected) {
         return Ok(());
     }
-    if !cascade {
-        return Err(sql_err!(
-            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-            "cannot drop type because routine objects depend on it"
-        ));
-    }
+    let (type_schema, type_name) = if let Some(slot) = selected_composite {
+        let definition = storage.composite_for(slot, txn.txid);
+        (definition.schema, definition.name)
+    } else if let Some(slot) = selected_enum {
+        let definition = storage.enum_for(slot, txn.txid);
+        (definition.schema, definition.name)
+    } else {
+        let slot = selected_domains
+            .iter()
+            .position(|selected| *selected)
+            .expect("a dropped type is selected");
+        let definition = storage.domain_for(slot, txn.txid);
+        (definition.schema, definition.name)
+    };
+    report_type_dependent_routines(
+        storage,
+        txn.txid,
+        selected,
+        (&type_schema, &type_name),
+        cascade,
+        responder,
+    )?;
 
     loop {
         let mut changed = false;
@@ -47312,6 +47420,7 @@ fn drop_domain_selection(
             None,
             cascade,
             arena,
+            responder,
         )?;
         apply_type_drop_to_stored_queries(
             storage,
@@ -48791,7 +48900,17 @@ fn drop_composite_type(
         txn.txid,
         "type",
     )?;
-    drop_type_dependent_routines(storage, wal, txn, &[], None, Some(slot), cascade, arena)?;
+    drop_type_dependent_routines(
+        storage,
+        wal,
+        txn,
+        &[],
+        None,
+        Some(slot),
+        cascade,
+        arena,
+        responder,
+    )?;
 
     let StoredDependencyClosure {
         views: dependent_views,

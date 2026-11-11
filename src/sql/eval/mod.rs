@@ -56,7 +56,7 @@ pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 64 * 192;
 #[derive(Clone, Copy)]
 pub struct Diagnostic {
     pub detail: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
-    pub hint: Option<StackStr<128>>,
+    pub hint: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
     pub objects: ErrorObjects,
 }
 
@@ -143,7 +143,7 @@ pub fn stash_diagnostic(
 ) {
     stash_full_diagnostic(Diagnostic {
         detail,
-        hint,
+        hint: hint.map(|hint| StackStr::from_str(hint.as_str())),
         objects: ErrorObjects::default(),
     });
 }
@@ -526,6 +526,18 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
+
+    /// The `plpgsql.variable_conflict` rule of the PL/pgSQL variable this
+    /// scope or an enclosing one names `qualifier.name`, or None when no
+    /// variable answers to it. A scope that puts a relation's columns in front
+    /// of an enclosing scope asks this before letting a column win.
+    fn procedural_variable(
+        &self,
+        _qualifier: Option<&str>,
+        _name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        None
+    }
 
     /// Declared size/precision, or the registered shape of a record column.
     fn column_type_mod(&self, _qualifier: Option<&str>, _name: &str) -> i32 {
@@ -1181,6 +1193,14 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 /// A reference to a lookup is itself a lookup, so `&dyn ColumnLookup` can be
 /// passed to the generic `eval`/`where_passes` helpers.
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        (**self).procedural_variable(qualifier, name)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         (**self).column_type_mod(qualifier, name)
     }
@@ -1289,6 +1309,57 @@ pub fn qualifier_answers_target(
 }
 
 pub struct NoColumns;
+
+/// Which meaning a name has when a relation in front of `outer` has a column
+/// of that name and a PL/pgSQL variable in `outer` may share it, as
+/// PostgreSQL's `plpgsql.variable_conflict` decides: Ok(true) for the column,
+/// Ok(false) for the variable, and PostgreSQL's ambiguity error otherwise.
+pub(crate) fn column_precedes_variable(
+    outer: Option<&dyn ColumnLookup<'_>>,
+    qualifier: Option<&str>,
+    name: &str,
+) -> Result<bool, SqlError> {
+    use crate::sql::guc::VariableConflict;
+    match outer.and_then(|outer| outer.procedural_variable(qualifier, name)) {
+        None | Some(VariableConflict::UseColumn) => Ok(true),
+        Some(VariableConflict::UseVariable) => Ok(false),
+        Some(VariableConflict::Error) => Err(ambiguous_procedural_reference(qualifier, name)),
+    }
+}
+
+/// [`column_precedes_variable`] for a lookup that cannot report an error:
+/// an ambiguous name reads as the column, and the lookup that reports errors
+/// for the same reference raises the ambiguity.
+pub(crate) fn column_precedes_variable_quietly(
+    outer: Option<&dyn ColumnLookup<'_>>,
+    qualifier: Option<&str>,
+    name: &str,
+) -> bool {
+    outer.and_then(|outer| outer.procedural_variable(qualifier, name))
+        != Some(crate::sql::guc::VariableConflict::UseVariable)
+}
+
+/// PostgreSQL's report of a name that is both a PL/pgSQL variable and a
+/// column, positioned at the reference.
+pub(crate) fn ambiguous_procedural_reference(qualifier: Option<&str>, name: &str) -> SqlError {
+    stash_diagnostic(
+        Some(StackStr::from_str(
+            "It could refer to either a PL/pgSQL variable or a table column.",
+        )),
+        None,
+    );
+    crate::sql::error_position::column_reference(
+        sql_err!(
+            sqlstate::AMBIGUOUS_COLUMN,
+            "column reference \"{}{}{}\" is ambiguous",
+            qualifier.unwrap_or(""),
+            if qualifier.is_some() { "." } else { "" },
+            name
+        ),
+        qualifier,
+        name,
+    )
+}
 
 pub(crate) fn empty_scope_column_error(qualifier: Option<&str>, name: &str) -> SqlError {
     match qualifier {

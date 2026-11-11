@@ -181,6 +181,8 @@ struct FunctionBinding {
     kind: PlpgsqlProgramKind,
     input_owner: super::super::type_input_plans::Owner,
     input_collation: crate::sql::ast::Collation,
+    variable_conflict: super::super::guc::VariableConflict,
+    fresh_snapshots: bool,
     parameters: SharedSlice<RoutineArgumentDef>,
     inputs: local_values::SavedValues,
     returns: ReturnBinding,
@@ -282,6 +284,8 @@ impl FunctionBinding {
             input_owner: self.input_owner,
             input_collation: self.input_collation,
             input_sites,
+            variable_conflict: self.variable_conflict,
+            fresh_snapshots: self.fresh_snapshots,
             materialized_relations: None,
             nargs: i32::try_from(self.parameters.len()).expect("bounded routine argument count"),
             when: "",
@@ -556,6 +560,7 @@ pub(crate) fn execute<'a>(
     environment: &CallEnvironment,
     policy: super::super::query::RoutineExecution,
     suspended: &mut Option<SuspendedFunction>,
+    compiled_conflict: super::super::guc::VariableConflict,
 ) -> Result<FunctionOutput<'a>, SqlError> {
     let inputs = arena
         .alloc_slice_copy(inputs)
@@ -692,8 +697,14 @@ pub(crate) fn execute<'a>(
         .map(|sources| sources.enter())
         .transpose()?;
     let returns = ReturnBinding::select(routine, kind, locals, &engine.storage, transaction.txid)?;
-    let invocation = TriggerInvocation::function(routine, kind, collation, arena)?
-        .with_input_sites(program.input_sites);
+    let invocation = TriggerInvocation::function(
+        routine,
+        kind,
+        collation,
+        program.variable_conflict(compiled_conflict),
+        arena,
+    )?
+    .with_input_sites(program.input_sites);
     let mut execution = execution_frame::ExecutionFrame::new(
         arena,
         &code,
@@ -796,6 +807,8 @@ pub(crate) fn execute<'a>(
                         kind,
                         input_owner: invocation.input_owner,
                         input_collation: collation,
+                        variable_conflict: invocation.variable_conflict,
+                        fresh_snapshots: invocation.fresh_snapshots,
                         parameters,
                         inputs: saved_inputs,
                         returns,

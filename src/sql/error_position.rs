@@ -543,7 +543,7 @@ std::thread_local! {
 /// error carries the message's start; the complete text is kept beside it
 /// and reported in its place, as for a positioned error.
 pub(crate) fn full_message_error(
-    sqlstate: &'static str,
+    sqlstate: impl Into<crate::sql::eval::SqlState>,
     write: impl FnOnce(&mut dyn core::fmt::Write) -> Result<(), SqlError>,
 ) -> SqlError {
     FULL_MESSAGE.with(|full| {
@@ -566,6 +566,29 @@ pub(crate) fn full_message_error(
             full.message_hash = message_hash(&error.message);
         }
         error
+    })
+}
+
+/// Keeps `text`, a complete message saved from an earlier report, for
+/// `error`, whose inline message is its start.
+pub(crate) fn keep_full_message(error: &SqlError, text: &str) {
+    FULL_MESSAGE.with(|full| {
+        let mut full = full.borrow_mut();
+        full.text.clear();
+        let _ = core::fmt::Write::write_str(&mut full.text, text);
+        full.sqlstate = Some(error.sqlstate);
+        full.message_hash = message_hash(&error.message);
+    })
+}
+
+/// Runs `read` with the complete message kept for `error`, if any, keeping
+/// it for the error's report.
+pub(crate) fn peek_full_message<R>(error: &SqlError, read: impl FnOnce(Option<&str>) -> R) -> R {
+    FULL_MESSAGE.with(|full| {
+        let full = full.borrow();
+        let matches = full.sqlstate.is_some_and(|state| state == error.sqlstate)
+            && full.message_hash == message_hash(&error.message);
+        read(matches.then_some(full.text.as_str()))
     })
 }
 

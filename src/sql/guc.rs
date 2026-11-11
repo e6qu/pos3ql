@@ -132,6 +132,24 @@ impl Drop for EvalScope {
     }
 }
 
+/// Publishes the session's settings, without a transaction, to work a
+/// transaction boundary runs, such as constraint triggers fired at COMMIT.
+pub(crate) struct SettingsScope {
+    prior: *const GucState,
+}
+
+impl Drop for SettingsScope {
+    fn drop(&mut self) {
+        ACTIVE_GUC.with(|active| active.set(self.prior));
+    }
+}
+
+pub(crate) fn enter_settings_scope(guc: &GucState) -> SettingsScope {
+    SettingsScope {
+        prior: ACTIVE_GUC.with(|active| active.replace(guc as *const GucState)),
+    }
+}
+
 pub fn enter_eval_scope(guc: &GucState, txn: &mut super::txn::TxnState) -> EvalScope {
     let pointer = guc as *const GucState;
     let prior = ACTIVE_GUC.with(|active| active.replace(pointer));
@@ -261,6 +279,22 @@ pub(crate) fn active_planner_settings() -> PlannerSettings {
         }
         // SAFETY: `enter_eval_scope` owns the pointer's dynamic extent.
         unsafe { &*pointer }.planner_settings()
+    })
+}
+
+/// The session's `plpgsql.variable_conflict`, for a trigger function compiled
+/// while a statement runs.
+pub(crate) fn active_plpgsql_variable_conflict() -> Result<VariableConflict, SqlError> {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "PL/pgSQL compilation has no session settings"
+            ));
+        }
+        // SAFETY: `enter_eval_scope` owns the pointer's dynamic extent.
+        Ok(unsafe { &*pointer }.plpgsql_variable_conflict())
     })
 }
 
@@ -713,6 +747,36 @@ struct GucValues {
     default_transaction_deferrable: bool,
     password_encryption: PasswordEncryption,
     track_functions: TrackFunctions,
+    plpgsql_variable_conflict: VariableConflict,
+}
+
+/// `plpgsql.variable_conflict` and a PL/pgSQL body's `#variable_conflict`:
+/// what a name that is both a PL/pgSQL variable and a table column means in a
+/// statement the body runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VariableConflict {
+    /// Report the reference as ambiguous (42702), PostgreSQL's default.
+    Error,
+    UseVariable,
+    UseColumn,
+}
+
+impl VariableConflict {
+    pub(crate) const NAMES: [&'static str; 3] = ["error", "use_variable", "use_column"];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::UseVariable => "use_variable",
+            Self::UseColumn => "use_column",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        [Self::Error, Self::UseVariable, Self::UseColumn]
+            .into_iter()
+            .find(|mode| value.eq_ignore_ascii_case(mode.as_str()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -808,7 +872,8 @@ impl GucValues {
             default_transaction_read_only,
             default_transaction_deferrable,
             password_encryption,
-            track_functions
+            track_functions,
+            plpgsql_variable_conflict
         )
     }
 
@@ -840,6 +905,7 @@ impl GucValues {
             default_transaction_deferrable: false,
             password_encryption: PasswordEncryption::ScramSha256,
             track_functions: TrackFunctions::None,
+            plpgsql_variable_conflict: VariableConflict::Error,
         };
         let _ = write!(values.datestyle, "ISO, MDY");
         let _ = write!(values.timezone, "UTC");
@@ -882,7 +948,8 @@ const GUC_DEFAULT_TEXT_SEARCH_CONFIG: u32 = 1 << 24;
 const GUC_PASSWORD_ENCRYPTION: u32 = 1 << 25;
 const GUC_LC_MONETARY: u32 = 1 << 26;
 const GUC_TRACK_FUNCTIONS: u32 = 1 << 27;
-const GUC_SETTING_COUNT: usize = 28;
+const GUC_PLPGSQL_VARIABLE_CONFLICT: u32 = 1 << 28;
+const GUC_SETTING_COUNT: usize = 29;
 const GUC_ALL: u32 = (1 << GUC_SETTING_COUNT) - 1;
 
 #[derive(Clone, Copy)]
@@ -984,6 +1051,8 @@ fn guc_bit(name: &str) -> u32 {
         GUC_PASSWORD_ENCRYPTION
     } else if name.eq_ignore_ascii_case("track_functions") {
         GUC_TRACK_FUNCTIONS
+    } else if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
+        GUC_PLPGSQL_VARIABLE_CONFLICT
     } else {
         0
     }
@@ -994,7 +1063,9 @@ pub(crate) fn knows_parameter(name: &str) -> bool {
 }
 
 pub(crate) fn requires_set_privilege(name: &str) -> bool {
-    name.eq_ignore_ascii_case("event_triggers") || name.eq_ignore_ascii_case("track_functions")
+    name.eq_ignore_ascii_case("event_triggers")
+        || name.eq_ignore_ascii_case("track_functions")
+        || name.eq_ignore_ascii_case("plpgsql.variable_conflict")
 }
 
 fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
@@ -1040,6 +1111,7 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
     );
     copy!(GUC_PASSWORD_ENCRYPTION, password_encryption);
     copy!(GUC_TRACK_FUNCTIONS, track_functions);
+    copy!(GUC_PLPGSQL_VARIABLE_CONFLICT, plpgsql_variable_conflict);
 }
 
 fn finish_setting_change(
@@ -1674,6 +1746,10 @@ impl GucState {
         self.store.borrow().current.track_functions
     }
 
+    pub(crate) fn plpgsql_variable_conflict(&self) -> VariableConflict {
+        self.store.borrow().current.plpgsql_variable_conflict
+    }
+
     pub(crate) fn transaction_defaults(&self) -> (TransactionIsolation, bool, bool) {
         let values = self.store.borrow().current;
         (
@@ -1734,10 +1810,10 @@ impl GucState {
             let isolation = match parse_transaction_isolation(value) {
                 Some(isolation) => isolation,
                 None => {
-                    return Some(Err(sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "invalid value for parameter \"transaction_isolation\": \"{}\"",
-                        value
+                    return Some(Err(invalid_enum_value(
+                        "transaction_isolation",
+                        value,
+                        "serializable, repeatable read, read committed, read uncommitted",
                     )));
                 }
             };
@@ -2285,6 +2361,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.password_encryption = defaults.password_encryption;
     } else if name.eq_ignore_ascii_case("track_functions") {
         values.track_functions = defaults.track_functions;
+    } else if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
+        values.plpgsql_variable_conflict = defaults.plpgsql_variable_conflict;
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
         // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
@@ -2377,7 +2455,7 @@ fn apply_setting(
         } else if v.eq_ignore_ascii_case("document") {
             true
         } else {
-            return Err(invalid_setting_value("xmloption", v));
+            return Err(invalid_enum_value("xmloption", v, "content, document"));
         };
         return Ok(());
     }
@@ -2402,10 +2480,10 @@ fn apply_setting(
     }
     if name.eq_ignore_ascii_case("intervalstyle") {
         values.intervalstyle = IntervalStyle::parse(v).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid value for parameter \"IntervalStyle\": \"{}\"",
-                v
+            invalid_enum_value(
+                "IntervalStyle",
+                v,
+                "postgres, postgres_verbose, sql_standard, iso_8601",
             )
         })?;
         return Ok(());
@@ -2439,10 +2517,10 @@ fn apply_setting(
         // Filters which NOTICE/WARNING messages reach the client. The
         // default is `notice`; an unrecognized level errors like PostgreSQL.
         values.client_min_messages = MessageLevel::parse(v).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid value for parameter \"client_min_messages\": \"{}\"",
-                v
+            invalid_enum_value(
+                "client_min_messages",
+                v,
+                "debug5, debug4, debug3, debug2, debug1, log, notice, warning, error",
             )
         })?;
         return Ok(());
@@ -2522,11 +2600,7 @@ fn apply_setting(
             values.bytea_escape = true;
             return Ok(());
         }
-        return Err(sql_err!(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "invalid value for parameter \"bytea_output\": \"{}\"",
-            v
-        ));
+        return Err(invalid_enum_value("bytea_output", v, "escape, hex"));
     }
     if name.eq_ignore_ascii_case("row_security") {
         let on = parse_on_off(v).ok_or_else(|| invalid_setting_value("row_security", v))?;
@@ -2539,10 +2613,10 @@ fn apply_setting(
     }
     if name.eq_ignore_ascii_case("default_transaction_isolation") {
         values.default_transaction_isolation = parse_transaction_isolation(v).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid value for parameter \"default_transaction_isolation\": \"{}\"",
-                v
+            invalid_enum_value(
+                "default_transaction_isolation",
+                v,
+                "serializable, repeatable read, read committed, read uncommitted",
             )
         })?;
         return Ok(());
@@ -2563,10 +2637,10 @@ fn apply_setting(
         } else if v.eq_ignore_ascii_case("md5") {
             PasswordEncryption::Md5
         } else {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid value for parameter \"password_encryption\": \"{}\"",
-                v
+            return Err(invalid_enum_value(
+                "password_encryption",
+                v,
+                "md5, scram-sha-256",
             ));
         };
         return Ok(());
@@ -2579,8 +2653,18 @@ fn apply_setting(
         } else if v.eq_ignore_ascii_case("all") {
             TrackFunctions::All
         } else {
-            return Err(invalid_setting_value("track_functions", v));
+            return Err(invalid_enum_value("track_functions", v, "none, pl, all"));
         };
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
+        values.plpgsql_variable_conflict = VariableConflict::parse(v).ok_or_else(|| {
+            invalid_enum_value(
+                "plpgsql.variable_conflict",
+                v,
+                "error, use_variable, use_column",
+            )
+        })?;
         return Ok(());
     }
     // Read-only parameters cannot be assigned.
@@ -2728,6 +2812,10 @@ fn owned_setting(values: &GucValues, name: &str) -> Option<StackStr<256>> {
         }))
     } else if name.eq_ignore_ascii_case("track_functions") {
         Some(StackStr::from_str(values.track_functions.as_str()))
+    } else if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
+        Some(StackStr::from_str(
+            values.plpgsql_variable_conflict.as_str(),
+        ))
     } else if name.eq_ignore_ascii_case("seed") {
         Some(StackStr::from_str("unavailable"))
     } else {
@@ -3263,6 +3351,19 @@ fn read_only_parameter_context(name: &str) -> Option<ReadOnlyParameterContext> {
 
 fn is_read_only(name: &str) -> bool {
     read_only_parameter_context(name).is_some()
+}
+
+/// An enumerated setting's rejection, with PostgreSQL's list of its values.
+fn invalid_enum_value(param: &str, v: &str, available: &str) -> SqlError {
+    crate::sql::eval::stash_diagnostic(
+        None,
+        Some(crate::stack_format!(
+            128,
+            "Available values: {}.",
+            available
+        )),
+    );
+    invalid_setting_value(param, v)
 }
 
 fn invalid_setting_value(param: &str, v: &str) -> SqlError {

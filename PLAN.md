@@ -286,22 +286,31 @@ caret) for syntax errors and for unknown relations, columns, types, functions
 and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
 constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
-`INSERT has more target columns than expressions` without its position. At
+`INSERT has more target columns than expressions` without its position; other
+target and expression count errors are positioned. At
 `CREATE FUNCTION`, a SQL body's queries are analysed for their relations,
 output columns, functions and types, and a data-changing statement only for
 its target relation, so an unknown column in an `UPDATE ... SET` list is
 found when the function runs. An error raised while PostgreSQL inlines a SQL function's body
-(`SQL function "f" during inlining`) has no context line, and a PL/pgSQL
-statement naming a variable that is also a column of its table (`UPDATE t SET
-a = 1/(a-15)` in a function with parameter `a`) uses the column where
-PostgreSQL reports `column reference "a" is ambiguous`. A constant compared
+(`SQL function "f" during inlining`) has no context line. Under
+`#variable_conflict use_variable` a variable that is also a column fails with
+`0A000`: aggregate inputs and grouping keys bind names to columns before the
+variable could win. PostgreSQL fixes a function's `plpgsql.variable_conflict`
+when its creating session validates it at `CREATE FUNCTION`; pos3ql reads it
+at the backend's first call. A function-qualified parameter (`f.a` in function `f`)
+fails as a missing FROM-clause entry, and PL/pgSQL `INSERT`, `UPDATE` and
+`DELETE ... RETURNING ... INTO` fail with a syntax error at `INTO`. A constant compared
 with a column inside a subquery (`SELECT (SELECT a FROM t WHERE a = 'q')`) is
 checked only when a row is compared, so an empty table returns NULL where
 PostgreSQL rejects `'q'`; the outer query's conditions, output list and joins
-and an `UPDATE` or `DELETE` condition are checked before any row is read. An
-`INSERT ... SELECT` into a subscripted array target accepts a text column
-(`INSERT INTO t (m[1:2]) SELECT '{1,2}' UNION ALL SELECT '{3,4}'`) where
-PostgreSQL requires the array type. `pg_sleep` and its
+and an `UPDATE` or `DELETE` condition are checked before any row is read. Assignment
+coercion is not analysed: a value of a type without an assignment cast to its
+target converts when the row is written, so `UPDATE t SET m[1] = 'x'::text`
+on an empty table succeeds and `INSERT INTO t (m[1:2]) SELECT '{1,2}' UNION
+ALL SELECT '{3,4}'` stores the text where PostgreSQL reports `42804`
+(`subscripted assignment to "m" requires type integer[] but expression is of
+type text`); fixing it needs PostgreSQL's assignment-cast rules for every
+target type. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,

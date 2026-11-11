@@ -31744,6 +31744,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "server_version_num" => crate::pg::REPORTED_SERVER_VERSION_NUM,
             "synchronize_seqscans" => "on",
             "track_functions" => "none",
+            "plpgsql.variable_conflict" => "error",
             "TimeZone" => "UTC",
             "transaction_isolation" => "read committed",
             "transaction_deferrable" | "transaction_read_only" => "off",
@@ -31772,6 +31773,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "bytea_output"
                 | "password_encryption"
                 | "track_functions"
+                | "plpgsql.variable_conflict"
                 | "xmloption"
         ) {
             "enum"
@@ -31802,7 +31804,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "max_connections" | "max_locks_per_transaction" | "max_prepared_transactions"
         ) {
             "postmaster"
-        } else if matches!(name, "event_triggers" | "track_functions") {
+        } else if matches!(
+            name,
+            "event_triggers" | "track_functions" | "plpgsql.variable_conflict"
+        ) {
             "superuser"
         } else {
             "user"
@@ -31846,18 +31851,22 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         let (reset_value, source) = crate::sql::eval::funcs::system::session_setting_metadata(name)
             .unwrap_or((value, "default"));
         let (boot, vartype, context, unit) = metadata(name);
-        let enum_values = if name == "track_functions" {
-            let values = [
-                text("none", arena)?,
-                text("pl", arena)?,
-                text("all", arena)?,
-            ];
+        let enum_names: &[&str] = match name {
+            "track_functions" => &["none", "pl", "all"],
+            "plpgsql.variable_conflict" => &crate::sql::guc::VariableConflict::NAMES,
+            _ => &[],
+        };
+        let enum_values = if enum_names.is_empty() {
+            Datum::Null
+        } else {
+            let mut values = [Datum::Null; 3];
+            for (value, name) in values.iter_mut().zip(enum_names) {
+                *value = text(name, arena)?;
+            }
             Datum::Array {
                 element: super::types::ArrElem::Text,
-                raw: super::array::build(&values, arena)?,
+                raw: super::array::build(&values[..enum_names.len()], arena)?,
             }
-        } else {
-            Datum::Null
         };
         output[count] = row(
             &[
@@ -31869,14 +31878,21 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                     text(unit, arena)?
                 },
                 text(
-                    if name == "track_functions" {
-                        "Statistics / Monitoring"
-                    } else {
-                        "Client Connection Defaults"
+                    match name {
+                        "track_functions" => "Statistics / Monitoring",
+                        "plpgsql.variable_conflict" => "Customized Options",
+                        _ => "Client Connection Defaults",
                     },
                     arena,
                 )?,
-                text("", arena)?,
+                text(
+                    if name == "plpgsql.variable_conflict" {
+                        "Sets handling of conflicts between PL/pgSQL variable names and table column names."
+                    } else {
+                        ""
+                    },
+                    arena,
+                )?,
                 Datum::Null,
                 text(context, arena)?,
                 text(vartype, arena)?,

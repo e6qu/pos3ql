@@ -8586,6 +8586,7 @@ impl Engine {
         boundary: exec::TriggerQueueBoundary,
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
+        let _settings = guc::enter_settings_scope(guc);
         exec::fire_constraint_triggers(
             &mut self.storage,
             txn,
@@ -16636,14 +16637,17 @@ impl Engine {
         )
     }
 
+    /// The backend's instance of a PL/pgSQL routine, and the
+    /// `plpgsql.variable_conflict` value it was first compiled under.
     fn plpgsql_instance_owner(
         &self,
         routine: &crate::storage::RoutineDef,
         input_collation: ast::Collation,
         txn: &TxnState,
         sqlprep: &mut SqlPreparedPool,
+        guc: &GucState,
         arena: &Arena,
-    ) -> Result<type_input_plans::Owner, SqlError> {
+    ) -> Result<(type_input_plans::Owner, guc::VariableConflict), SqlError> {
         use type_input_plans::{InputImage, Lookup, Owner};
         use type_inputs::RoutineInputKind;
         arena
@@ -16689,7 +16693,10 @@ impl Engine {
                 }
                 match sqlprep.routine_inputs.find(admission.key)? {
                     Some(Lookup::Ready(plan, InputImage::Runtime(bytes))) if bytes.is_empty() => {
-                        Ok(Owner::Nested(plan))
+                        let conflict = sqlprep
+                            .routine_inputs
+                            .compiled_variable_conflict(plan, guc.plpgsql_variable_conflict())?;
+                        Ok((Owner::Nested(plan), conflict))
                     }
                     _ => Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -17406,11 +17413,12 @@ impl Engine {
             };
         }
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
-            let instance = match self.plpgsql_instance_owner(
+            let (instance, conflict) = match self.plpgsql_instance_owner(
                 routine,
                 pending.input_collation,
                 txn,
                 sqlprep,
+                guc,
                 arena,
             ) {
                 Ok(owner) => owner,
@@ -17431,6 +17439,7 @@ impl Engine {
                     &environment,
                     execution,
                     suspended,
+                    conflict,
                 )
             }));
         }
@@ -17843,11 +17852,12 @@ impl Engine {
             timezone::set_session(guc.timezone());
             if routine.language == crate::storage::RoutineLanguage::PlPgSql {
                 let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-                let instance = match self.plpgsql_instance_owner(
+                let (instance, conflict) = match self.plpgsql_instance_owner(
                     routine,
                     input_collation,
                     txn,
                     sqlprep,
+                    guc,
                     arena,
                 ) {
                     Ok(owner) => owner,
@@ -17874,6 +17884,7 @@ impl Engine {
                         arena,
                         responder,
                         &mut output_values,
+                        conflict,
                     )
                 }) {
                     Ok(count) => count,
@@ -24043,6 +24054,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "max_locks_per_transaction",
     "max_prepared_transactions",
     "password_encryption",
+    "plpgsql.variable_conflict",
     "row_security",
     "search_path",
     "server_encoding",

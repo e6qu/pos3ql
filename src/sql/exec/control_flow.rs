@@ -1047,7 +1047,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                 initialize_phase(&mut self.status, context, |context, continuation| {
                     let txid = context.txn.txid;
                     let arena = context.arena;
-                    execute_procedural_query(context, continuation, |storage, sequences| {
+                    execute_procedural_query(context, false, continuation, |storage, sequences| {
                         coerce_plpgsql_local(local, value, storage, txid, arena, sequences)
                     })
                 })?;

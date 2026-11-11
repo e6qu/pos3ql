@@ -125,6 +125,20 @@ Syntax and errors:
   to its type (`WHERE id = 'abc'` fails even on an empty table), and
   `CREATE FUNCTION` checks a SQL body's queries and target relations unless
   `check_function_bodies` is off (always for a `BEGIN ATOMIC` body).
+- A name in a PL/pgSQL statement that is both a variable and a column is
+  ambiguous, as in PostgreSQL: with parameter `a`, `UPDATE t SET b = 1/(a-15)`
+  fails with `42702` (`column reference "a" is ambiguous`, detail `It could
+  refer to either a PL/pgSQL variable or a table column.`) before any row is
+  read, at any query level. `#variable_conflict use_column` at the start of
+  the body, or the superuser setting `plpgsql.variable_conflict =
+  use_column`, reads the column instead. The setting is read when a backend
+  first runs the function, and a body's option overrides it. `use_variable`
+  works for names that are not columns; a name that is also a column fails
+  with `0A000` instead of reading the variable. The setting exists from
+  startup, as if PL/pgSQL were preloaded.
+- Each query of a volatile PL/pgSQL function, procedure, trigger or `DO` block
+  sees the rows its earlier statements changed; a stable or immutable
+  function reads its caller's snapshot.
 - A PL/pgSQL condition of another type converts through its text form as in
   PostgreSQL: `IF 1` is true and `IF 5` fails with `invalid input syntax for
   type boolean`.
@@ -327,7 +341,8 @@ why none of these numbers is a throughput rate.
 | Connection startup option word | 256 bytes | `54000` |
 | Timeout settings | 2,147,483,647 ms | `22023`; enabling a disabled-only timeout is `0A000` |
 | Simultaneously tracked function calls (`track_functions`) per SQL worker | 1,024 | `54000` |
-| Error message text | 27,824 bytes | `54000` |
+| Error message text, including a `RAISE` message | 27,824 bytes | `54000` |
+| `RAISE ... USING DETAIL` or `HINT` text | 12,288 bytes each | `54000` |
 | Transaction identities and command counters | 32-bit, checked | `54000` before reuse |
 | JSON nesting / jsonpath depth | 1,000 / 128 | see [SQL/JSON](sql-json.md) |
 | XML nesting, XPath work, constructor output | see [SQL/XML](sql-xml.md) | program-limit error |

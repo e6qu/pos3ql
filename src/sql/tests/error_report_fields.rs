@@ -786,3 +786,205 @@ fn statements_are_analysed_as_postgresql_analyses_them() {
         }
     });
 }
+
+/// `plpgsql.variable_conflict` and `#variable_conflict`: a name that is both a
+/// PL/pgSQL variable and a column is ambiguous by default, reported while the
+/// statement is analysed (no row needs to be read), at every query level.
+#[test]
+fn procedural_variable_column_conflicts_follow_postgresql() {
+    with_engine("procedural-variable-conflicts", |engine, budget| {
+        let setup = "CREATE TABLE vc (a int, b int); INSERT INTO vc VALUES (1, 2), (20, 3); \
+             CREATE FUNCTION vc_update(a int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN \
+             UPDATE vc SET b = 1/(a-15) WHERE false; RETURN 1; END $$; \
+             CREATE FUNCTION vc_column(a int) RETURNS int LANGUAGE plpgsql AS $$ \
+             #variable_conflict use_column\nBEGIN UPDATE vc SET b = a WHERE a = 1; \
+             RETURN 0; END $$; \
+             CREATE FUNCTION vc_group() RETURNS int LANGUAGE plpgsql AS $$ DECLARE b int := 5; \
+             c int; BEGIN c := (SELECT count(*) FROM vc GROUP BY b LIMIT 1); RETURN c; END $$; \
+             CREATE FUNCTION vc_variable() RETURNS int LANGUAGE plpgsql AS $$ \
+             /* c */ # Variable_Conflict USE_VARIABLE -- x\n\
+             DECLARE b int := 5; BEGIN RETURN (SELECT max(b) FROM vc); END $$; \
+             CREATE FUNCTION vc_free() RETURNS int LANGUAGE plpgsql AS $$ DECLARE c int; \
+             BEGIN SELECT a INTO c FROM vc JOIN vc u USING (a) WHERE u.b = 3; RETURN c; END $$; \
+             CREATE VIEW vc_outer AS SELECT (SELECT max(b) FROM vc u WHERE u.a = vc.a) AS m FROM vc";
+        let output = run_with(engine, budget, setup);
+        assert_eq!(reports(&output), Vec::<String>::new());
+        assert_reports(
+            engine,
+            budget,
+            &[(
+                "SELECT vc_update(3)",
+                &[
+                    "E|C=42702|M=column reference \"a\" is ambiguous|D=It could refer to either a PL/pgSQL variable or a table column.|W=PL/pgSQL function vc_update(integer) line 1 at SQL statement|p=22|q=UPDATE vc SET b = 1/(a-15) WHERE false",
+                ],
+            )],
+        );
+        let cases: &[(&str, &[&str])] = &[
+            ("SELECT vc_column(99)", &["data|0", "SELECT 1"]),
+            ("SELECT b FROM vc WHERE a = 1", &["data|1", "SELECT 1"]),
+            (
+                "SELECT vc_group()",
+                &[
+                    "ERROR 42702 column reference \"b\" is ambiguous detail: It could refer to either a PL/pgSQL variable or a table column.",
+                ],
+            ),
+            (
+                "SELECT vc_variable()",
+                &[
+                    "ERROR 0A000 #variable_conflict use_variable is not supported for \"b\", which is also a column",
+                ],
+            ),
+            ("SELECT vc_free()", &["data|20", "SELECT 1"]),
+            (
+                "SELECT m FROM vc_outer ORDER BY m",
+                &["data|1", "data|3", "SELECT 2"],
+            ),
+            (
+                "ALTER TABLE vc DROP COLUMN a",
+                &[
+                    "ERROR 2BP01 cannot drop column a of table vc because other objects depend on it hint: Use DROP ... CASCADE to drop the dependent objects too. detail: view vc_outer depends on column a of table vc",
+                ],
+            ),
+            (
+                "CREATE FUNCTION vc_bad() RETURNS int LANGUAGE plpgsql AS $$ #variable_conflict bogus\nBEGIN RETURN 1; END $$",
+                &["ERROR 42601 syntax error at or near \"bogus\" @80"],
+            ),
+            (
+                "CREATE FUNCTION vc_bad() RETURNS int LANGUAGE plpgsql AS $$ #nonsense BEGIN RETURN 1; END $$",
+                &["ERROR 42601 syntax error at or near \"nonsense\" @62"],
+            ),
+            (
+                "SET plpgsql.variable_conflict = bogus",
+                &[
+                    "ERROR 22023 invalid value for parameter \"plpgsql.variable_conflict\": \"bogus\" hint: Available values: error, use_variable, use_column.",
+                ],
+            ),
+            (
+                "SET plpgsql.variable_conflict = use_column; SHOW plpgsql.variable_conflict; \
+                 SELECT vc_group()",
+                &["SET", "data|use_column", "SHOW", "data|1", "SELECT 1"],
+            ),
+            (
+                "SELECT enumvals, context, category FROM pg_settings \
+                 WHERE name = 'plpgsql.variable_conflict'",
+                &[
+                    "data|{error,use_variable,use_column}|superuser|Customized Options",
+                    "SELECT 1",
+                ],
+            ),
+            (
+                "SET xmloption = bogus",
+                &[
+                    "ERROR 22023 invalid value for parameter \"xmloption\": \"bogus\" hint: Available values: content, document.",
+                ],
+            ),
+        ];
+        for (sql, expected) in cases {
+            let output = run_with(engine, budget, sql);
+            assert_eq!(transcript(&output), *expected, "{sql}");
+        }
+    });
+}
+
+/// A `RAISE` message, hint or detail longer than an inline error message is
+/// reported whole, caught whole by a handler and re-raised whole; a message
+/// beyond the full-message bound fails with `54000`.
+#[test]
+fn long_raise_messages_are_reported_whole() {
+    with_engine("long-raise-messages", |engine, budget| {
+        let long = "x".repeat(600);
+        let hint = "h".repeat(300);
+        let cases: Vec<(String, Vec<String>)> = vec![
+            (
+                "DO $$ BEGIN RAISE EXCEPTION '%', repeat('x', 600) USING HINT = repeat('h', 300); END $$"
+                    .to_string(),
+                vec![format!("ERROR P0001 {long} hint: {hint}")],
+            ),
+            (
+                "DO $$ BEGIN RAISE NOTICE 'n %', repeat('x', 600); END $$".to_string(),
+                vec![format!("NOTICE 00000 n {long}"), "DO".to_string()],
+            ),
+            (
+                "DO $$ DECLARE m text; BEGIN RAISE EXCEPTION '%', repeat('x', 600); \
+                 EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS m = MESSAGE_TEXT; \
+                 RAISE NOTICE '% %', length(m), length(SQLERRM); END $$"
+                    .to_string(),
+                vec!["NOTICE 00000 600 600".to_string(), "DO".to_string()],
+            ),
+            (
+                "DO $$ BEGIN BEGIN RAISE EXCEPTION '%', repeat('x', 600); \
+                 EXCEPTION WHEN OTHERS THEN RAISE; END; END $$"
+                    .to_string(),
+                vec![format!("ERROR P0001 {long}")],
+            ),
+            (
+                "DO $$ BEGIN RAISE EXCEPTION '%', repeat('x', 30000); END $$".to_string(),
+                vec!["ERROR 54000 error message exceeds 27824 bytes".to_string()],
+            ),
+        ];
+        for (sql, expected) in &cases {
+            let output = run_with(engine, budget, sql);
+            assert_eq!(&transcript(&output), expected, "{sql}");
+        }
+    });
+}
+
+/// Each query of a volatile PL/pgSQL function sees the rows its earlier
+/// statements changed, as PostgreSQL's per-statement snapshots do.
+#[test]
+fn volatile_procedural_queries_see_earlier_statements() {
+    with_engine("procedural-statement-snapshots", |engine, budget| {
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE TABLE seen (a int, b int); INSERT INTO seen VALUES (1, 2); \
+             CREATE FUNCTION seen_update(x int) RETURNS int LANGUAGE plpgsql AS $$ \
+             DECLARE r int; BEGIN UPDATE seen SET b = x WHERE a = 1; \
+             SELECT b INTO r FROM seen WHERE a = 1; \
+             RETURN r + (SELECT count(*) FROM seen) * 1000; END $$",
+        );
+        assert_eq!(reports(&output), Vec::<String>::new());
+        let output = run_with(engine, budget, "SELECT seen_update(97)");
+        assert_eq!(transcript(&output), ["data|1097", "SELECT 1"]);
+    });
+}
+
+/// `INSERT` target and expression counts are analysed as PostgreSQL does,
+/// positioned at the target column or expression without a partner.
+#[test]
+fn insert_target_counts_are_positioned() {
+    with_engine("insert-target-counts", |engine, budget| {
+        let cases: &[(&str, &[&str])] = &[
+            ("CREATE TABLE ic (a int, b int)", &["CREATE TABLE"]),
+            (
+                "INSERT INTO ic (a, b) VALUES (1)",
+                &["ERROR 42601 INSERT has more target columns than expressions @20"],
+            ),
+            (
+                "INSERT INTO ic (a) VALUES (1, 2)",
+                &["ERROR 42601 INSERT has more expressions than target columns @31"],
+            ),
+            (
+                "INSERT INTO ic (a) VALUES (1), (2, 3)",
+                &["ERROR 42601 VALUES lists must all be the same length @33"],
+            ),
+            (
+                "INSERT INTO ic VALUES (1, 2, 3)",
+                &["ERROR 42601 INSERT has more expressions than target columns @30"],
+            ),
+            (
+                "INSERT INTO ic (a, b) SELECT 1",
+                &["ERROR 42601 INSERT has more target columns than expressions @20"],
+            ),
+            (
+                "INSERT INTO ic (a) SELECT 1, 2",
+                &["ERROR 42601 INSERT has more expressions than target columns @30"],
+            ),
+            ("SELECT count(*) FROM ic", &["data|0", "SELECT 1"]),
+        ];
+        for (sql, expected) in cases {
+            let output = run_with(engine, budget, sql);
+            assert_eq!(transcript(&output), *expected, "{sql}");
+        }
+    });
+}

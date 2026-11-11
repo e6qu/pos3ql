@@ -551,6 +551,7 @@ impl SqlExecution {
                 let txid = context.txn.txid;
                 execute_procedural_query(
                     context,
+                    false,
                     (self.policy == query::RoutineExecution::Retained)
                         .then_some(&mut self.pending_query),
                     |storage, sequences| {

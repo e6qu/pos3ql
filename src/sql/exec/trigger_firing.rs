@@ -341,6 +341,8 @@ impl SavedBinding {
             input_owner: input.input_owner,
             input_collation: input.input_collation,
             input_sites: &[],
+            variable_conflict: input.variable_conflict,
+            fresh_snapshots: input.fresh_snapshots,
             materialized_relations: None,
             nargs: input.nargs,
             when: input.when,

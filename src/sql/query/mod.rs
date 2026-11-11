@@ -73,6 +73,10 @@ pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 mod cte;
 pub(crate) use cte::captured_type_oid;
 mod dependencies;
+mod procedural_names;
+pub(crate) use procedural_names::{
+    check_expression as check_procedural_expression, check_statement as check_procedural_statement,
+};
 mod type_inputs;
 pub(crate) use type_inputs::capture_contextual_expression_type_inputs;
 pub(crate) use type_inputs::capture_procedural_statement_type_inputs;

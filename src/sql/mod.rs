@@ -18571,14 +18571,47 @@ impl Engine {
             Ok(materialized) => materialized.unwrap_or(&[]),
             Err(error) => return Ok(Err(error)),
         };
-        let output_mark = responder.mark();
-        let outcome = self.execute_with_main_statement(
-            ctes, statement, dml_mats, params, txn, guc, responder, capture, progress,
-        )?;
-        if outcome.is_err() {
-            return Ok(outcome);
+        // The main statement is a step: when a WITH query nothing read
+        // stops for a call after it, the next attempt keeps the main
+        // statement's rows and output instead of running it again. A
+        // statement nested in another's step keeps no steps of its own.
+        let mut progress = progress.and_then(|progress| progress.claim_steps().then_some(progress));
+        let output_mark = match progress.as_deref_mut() {
+            Some(progress) => progress.statement_output(responder.mark()),
+            None => responder.mark(),
+        };
+        let run_main = match progress.as_deref_mut() {
+            Some(progress) => match progress.begin_step(0, false, txn, responder) {
+                Ok(run) => run,
+                Err(error) => return Ok(Err(error)),
+            },
+            None => true,
+        };
+        if run_main {
+            let outcome = self.execute_with_main_statement(
+                ctes,
+                statement,
+                dml_mats,
+                params,
+                txn,
+                guc,
+                responder,
+                capture,
+                progress.as_deref_mut(),
+            )?;
+            if outcome.is_err() {
+                return Ok(outcome);
+            }
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.finish_step();
+            }
         }
-        Ok(self.finish_dml_ctes(
+        if let Some(progress) = progress.as_deref_mut()
+            && let Err(error) = progress.begin_step(1, false, txn, responder)
+        {
+            return Ok(Err(error));
+        }
+        let finished = self.finish_dml_ctes(
             ctes,
             main,
             dml_mats,
@@ -18588,7 +18621,23 @@ impl Engine {
             params,
             guc,
             responder,
-        ))
+        );
+        if let Err(error) = &finished
+            && error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
+            && let Some(progress) = progress
+            && let Err(kept) = progress.keep_steps(
+                &[exec::StepRecord {
+                    rows: &[],
+                    affected: 0,
+                }],
+                &[],
+                arena,
+                &self.storage.row_work,
+            )
+        {
+            return Ok(Err(kept));
+        }
+        Ok(finished)
     }
 
     /// Runs the data-modifying `WITH` queries nothing read, after the main

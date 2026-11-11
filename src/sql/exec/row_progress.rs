@@ -155,6 +155,8 @@ pub(crate) struct RowProgress {
     started: bool,
     unrestartable: bool,
     steps: StepProgress,
+    /// Where the statement's output began in its first attempt.
+    output: Option<crate::pg::overflow::OutputMark>,
 }
 
 impl RowProgress {
@@ -175,7 +177,17 @@ impl RowProgress {
                 start: None,
                 saved: None,
             },
+            output: None,
         }
+    }
+
+    /// Where the statement's output began: `mark` in the first attempt, and
+    /// that first mark in every later one.
+    pub(crate) fn statement_output(
+        &mut self,
+        mark: crate::pg::overflow::OutputMark,
+    ) -> crate::pg::overflow::OutputMark {
+        *self.output.get_or_insert(mark)
     }
 
     /// Records the journal and lock positions of the attempt about to run;

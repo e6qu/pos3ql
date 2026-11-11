@@ -326,6 +326,54 @@ pub struct Responder<'b> {
     respool: bool,
     /// The setting that bounds `buffer` when there is no output sink.
     buffer_setting: &'static str,
+    /// Set while a `DROP` runs its executors after its dependency report:
+    /// their own cascade notices are checked against it instead of sent.
+    dependency_report: Option<DependencyReport>,
+}
+
+/// One `DROP`'s dependency report while its executors run. The `CASCADE`
+/// notice waits until the executors hold their locks, so a statement that
+/// waits and restarts never sends it twice.
+pub(crate) struct DependencyReport {
+    pub(crate) filter: DependencyReportFilter,
+    /// `drop cascades to ...` lines and their count, not yet sent.
+    pub(crate) notice: Option<(
+        crate::util::StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>,
+        usize,
+    )>,
+}
+
+/// The objects one `DROP`'s dependency report reached, as a fixed bit set of
+/// their descriptions. A lookup can report a false match but never misses an
+/// inserted description.
+#[derive(Clone, Copy)]
+pub(crate) struct DependencyReportFilter {
+    bits: [u64; 64],
+}
+
+impl DependencyReportFilter {
+    pub(crate) const EMPTY: Self = Self { bits: [0; 64] };
+
+    fn positions(description: &str) -> [usize; 2] {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in description.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        [(hash & 0xfff) as usize, ((hash >> 32) & 0xfff) as usize]
+    }
+
+    pub(crate) fn insert(&mut self, description: &str) {
+        for position in Self::positions(description) {
+            self.bits[position / 64] |= 1 << (position % 64);
+        }
+    }
+
+    pub(crate) fn contains(&self, description: &str) -> bool {
+        Self::positions(description)
+            .into_iter()
+            .all(|position| self.bits[position / 64] & (1 << (position % 64)) != 0)
+    }
 }
 
 pub(crate) struct ResultFormatScope<'scope, 'buffer> {
@@ -774,6 +822,7 @@ impl<'b> Responder<'b> {
             spooled: None,
             respool: false,
             buffer_setting: "conn_send_buffer_bytes",
+            dependency_report: None,
         }
     }
 
@@ -800,6 +849,7 @@ impl<'b> Responder<'b> {
             spooled: None,
             respool: false,
             buffer_setting: "conn_send_buffer_bytes",
+            dependency_report: None,
         }
     }
 
@@ -827,6 +877,7 @@ impl<'b> Responder<'b> {
             spooled: None,
             respool: false,
             buffer_setting: "conn_send_buffer_bytes",
+            dependency_report: None,
         }
     }
 
@@ -855,6 +906,7 @@ impl<'b> Responder<'b> {
             spooled: None,
             respool: false,
             buffer_setting: "conn_send_buffer_bytes",
+            dependency_report: None,
         }
     }
 
@@ -2159,6 +2211,7 @@ impl<'b> Responder<'b> {
     }
 
     pub fn command_complete(&mut self, tag: &str) -> Result<(), WireFull> {
+        self.send_dependency_notice()?;
         if self.discard_query_output || self.suppress_command_complete {
             return Ok(());
         }
@@ -2255,6 +2308,47 @@ impl<'b> Responder<'b> {
         let result = operation(self);
         self.suppress_row_description = prior;
         result
+    }
+
+    /// Runs a `DROP`'s executors after its dependency report.
+    pub(crate) fn with_dependency_report<T>(
+        &mut self,
+        report: DependencyReport,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let prior = self.dependency_report.replace(report);
+        let result = operation(self);
+        self.dependency_report = prior;
+        result
+    }
+
+    /// The dependency report covering the running `DROP`, if any.
+    pub(crate) fn dependency_report(&self) -> Option<&DependencyReportFilter> {
+        self.dependency_report.as_ref().map(|report| &report.filter)
+    }
+
+    /// Sends the running `DROP`'s `CASCADE` notice once its executors hold
+    /// their locks: at their first own report or at the command tag.
+    pub(crate) fn send_dependency_notice(&mut self) -> Result<(), WireFull> {
+        let Some((detail, count)) = self
+            .dependency_report
+            .as_mut()
+            .and_then(|report| report.notice.take())
+        else {
+            return Ok(());
+        };
+        if count == 1 {
+            self.notice(
+                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                detail.as_str(),
+            )
+        } else {
+            crate::sql::eval::stash_diagnostic(Some(detail), None);
+            self.notice(
+                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                crate::stack_format!(128, "drop cascades to {} other objects", count).as_str(),
+            )
+        }
     }
 
     /// Runs an internal statement without exposing its row description, rows,

@@ -651,6 +651,11 @@ impl EventObjectRef {
                 name,
             } => {
                 let mut object = primary_object(storage, txid, relation)?;
+                if let ObjectRef::Composite(slot) = relation {
+                    // A composite type's columns belong to its relation.
+                    object.class_id = catalog::PG_CLASS_OID;
+                    object.object_id = catalog::named_composite_relation_oid(storage, slot);
+                }
                 let relation_name = object.object_name.ok_or_else(graph_full)?;
                 let schema = object.schema_name.ok_or_else(graph_full)?;
                 let mut identity = qualified(schema.as_str(), relation_name.as_str())?;
@@ -660,6 +665,7 @@ impl EventObjectRef {
                 object.object_type = StackStr::from_str(match relation {
                     ObjectRef::View(_) => "view column",
                     ObjectRef::MaterializedView(_) => "materialized view column",
+                    ObjectRef::Composite(_) => "composite type column",
                     _ => "table column",
                 });
                 object.object_name = None;
@@ -2576,6 +2582,13 @@ fn relation_column_ref(
             reference,
             *storage.view(slot).columns_for(txid).names().get(index)?,
         ),
+        EventObjectRef::CompositeRelation(slot) => {
+            let composite = storage.composite_for(usize::from(slot), txid);
+            let field = composite
+                .active_fields_for(txid)
+                .find(|field| i32::from(field.attribute_number) == attnum)?;
+            (ObjectRef::Composite(usize::from(slot)), field.name)
+        }
         _ => return None,
     };
     Some(EventObjectRef::RelationColumn {
@@ -2586,26 +2599,37 @@ fn relation_column_ref(
 }
 
 fn type_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<EventObjectRef> {
-    if let Some((kind, _, array)) = crate::storage::NamedTypeKind::from_oid(object_id) {
-        let result = storage.routine_result_for_oid(object_id, txid)?;
-        let reference = crate::storage::TypeReference::from_bound_name(result.user_type?).ok()?;
-        let slot = reference.catalog_slot();
-        return Some(match (kind, array) {
-            (crate::storage::NamedTypeKind::Domain, false) => {
-                EventObjectRef::Primary(ObjectRef::Domain(usize::from(slot)))
-            }
-            (crate::storage::NamedTypeKind::Enum, false) => {
-                EventObjectRef::Primary(ObjectRef::Enum(usize::from(slot)))
-            }
-            (crate::storage::NamedTypeKind::Composite, false) => {
-                EventObjectRef::Primary(ObjectRef::Composite(usize::from(slot)))
-            }
-            (crate::storage::NamedTypeKind::Domain, true) => EventObjectRef::DomainArray(slot),
-            (crate::storage::NamedTypeKind::Enum, true) => EventObjectRef::EnumArray(slot),
-            (crate::storage::NamedTypeKind::Composite, true) => {
-                EventObjectRef::CompositeArray(slot)
-            }
-        });
+    // A named type is found by its creation stamp. Relation row types share
+    // the composite OID band; they match no named composite and resolve below.
+    if let Some((kind, creation, array)) = crate::storage::NamedTypeKind::from_oid(object_id) {
+        use crate::storage::NamedTypeKind;
+        let found = match kind {
+            NamedTypeKind::Domain => (0..storage.domain_count()).find(|slot| {
+                storage.domain_slot_visible_to(*slot, txid)
+                    && storage.domain_for(*slot, txid).creation() == creation
+            }),
+            NamedTypeKind::Enum => (0..storage.enum_count()).find(|slot| {
+                storage.enum_slot_visible_to(*slot, txid)
+                    && storage.enum_for(*slot, txid).creation() == creation
+            }),
+            NamedTypeKind::Composite => storage
+                .composites_with_slots_visible_to(txid)
+                .find(|(_, composite)| composite.creation() == creation)
+                .map(|(slot, _)| slot),
+        };
+        if let Some(slot) = found {
+            let array_slot = u16::try_from(slot).ok()?;
+            return Some(match (kind, array) {
+                (NamedTypeKind::Domain, false) => EventObjectRef::Primary(ObjectRef::Domain(slot)),
+                (NamedTypeKind::Enum, false) => EventObjectRef::Primary(ObjectRef::Enum(slot)),
+                (NamedTypeKind::Composite, false) => {
+                    EventObjectRef::Primary(ObjectRef::Composite(slot))
+                }
+                (NamedTypeKind::Domain, true) => EventObjectRef::DomainArray(array_slot),
+                (NamedTypeKind::Enum, true) => EventObjectRef::EnumArray(array_slot),
+                (NamedTypeKind::Composite, true) => EventObjectRef::CompositeArray(array_slot),
+            });
+        }
     }
     if let Some(slot) = catalog::table_slot_by_row_type_oid(storage, txid, object_id, false) {
         return Some(EventObjectRef::TableRowType(slot as u16));

@@ -224,9 +224,23 @@ impl OidBand {
     }
 
     /// The band holding `oid`, if pos3ql synthesizes it.
-    #[cfg(test)]
     pub(crate) fn of(oid: i32) -> Option<Self> {
         Self::ALL.into_iter().find(|band| band.contains(oid))
+    }
+
+    /// Where `oid` falls in PostgreSQL's single OID counter. Every band's
+    /// ordinal is the catalog creation stamp (four foreign-key triggers share
+    /// one), so stamps order objects of different bands by creation. Built-in
+    /// OIDs precede every synthesized one.
+    pub(crate) fn creation_order(oid: i32) -> u64 {
+        match Self::of(oid) {
+            Some(Self::ForeignKeyTrigger) => {
+                Self::ForeignKeyTrigger.ordinal(oid).expect("band member") / 4
+                    + FIRST_NORMAL_OBJECT_ID as u64
+            }
+            Some(band) => band.ordinal(oid).expect("band member") + FIRST_NORMAL_OBJECT_ID as u64,
+            None => u64::from(oid as u32),
+        }
     }
 }
 

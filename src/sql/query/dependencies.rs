@@ -4662,7 +4662,28 @@ fn collect_table_ref<'a>(
                     referenced_name: SqlName::parse(table.table)?,
                 })?;
             }
-            Some(ResolvedRelation::Catalog) | None => {}
+            Some(ResolvedRelation::Catalog) => {}
+            // Reading a sequence as a relation depends on it, as PostgreSQL
+            // records.
+            None => {
+                let name = crate::sql::types::acl_identifier(table.table);
+                let reference = match table.schema {
+                    Some(schema) => crate::stack_format!(
+                        264,
+                        "{}.{}",
+                        crate::sql::types::acl_identifier(schema).as_str(),
+                        name.as_str()
+                    ),
+                    None => crate::stack_format!(264, "{}", name.as_str()),
+                };
+                collect_sequence(
+                    reference.as_str(),
+                    storage,
+                    txid,
+                    context.path,
+                    dependencies,
+                )?;
+            }
         }
     }
     if let Some(arguments) = table.func_args {

@@ -54,6 +54,25 @@ Schemas and catalogs:
   them. Arrays of these domains work the same way:
   `'{-1}'::information_schema.cardinal_number[]` fails with `23514`, and an
   element of such an array has the domain's type.
+- `pg_type` has PostgreSQL 18.6's 32 columns in its order and lists every
+  `pg_catalog` type exactly, pseudo-types (`cstring`, `"any"`) and catalog row
+  types included. User-defined types carry the routines and storage traits
+  PostgreSQL derives for them (a domain's `domain_recv` and its base type's
+  send routine, an array's `array_subscript_handler`). Of `information_schema`'s
+  types only its domains and their arrays are listed, not its views' row types.
+- `DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`, `FOREIGN TABLE`, `SEQUENCE`,
+  `FUNCTION`, `PROCEDURE`, `ROUTINE`, `TYPE`, `DOMAIN` and `SCHEMA` report
+  dependent objects as PostgreSQL does, from the rows `pg_depend` lists:
+  without `CASCADE`, one `2BP01` error whose `DETAIL` names every dependent
+  (`column b of table orders depends on type amount`, `view totals depends on
+  column b of table orders`); with it, one `drop cascades to ...` notice for
+  the whole statement, in PostgreSQL's order. Indexes, constraints, triggers,
+  policies, rules, owned sequences and partitions go silently, and dropping a
+  part of another object names its owner (`cannot drop type orders because
+  table orders requires it`). A relation of another kind fails with `42809`
+  and the hint naming its own `DROP` (`Use DROP VIEW to remove a view.`). The
+  walk copies every `pg_depend` row into the statement arena; a catalog whose
+  rows do not fit in `sql_arena_bytes` fails the `DROP` with `54000`.
 - `information_schema` views can be queried, but their relation OIDs cannot:
   `'information_schema.columns'::regclass` and `to_regclass(...)` fail with
   `0A000` (`relation OIDs for information_schema views are not supported`).

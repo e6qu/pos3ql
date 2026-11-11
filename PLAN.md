@@ -357,8 +357,10 @@ unsupported case into an explicit error. Known gaps: renaming or moving a
 built-in function fails with `0A000` where PostgreSQL changes the catalog
 entry (every built-in name lookup must consult a renamed or moved row); a routine signature naming `cstring` or `"any"` cannot be written
 (`GRANT ... ON FUNCTION int4in(cstring)` fails with `42883`) because those
-pseudo-types are not pos3ql column types, and `pg_type` lists 182 of
-PostgreSQL's 621 built-in types; a
+pseudo-types are not pos3ql column types, and `pg_type` lists all 473
+`pg_catalog` types but of `information_schema`'s 148 only its domains and their
+arrays (the row types of its views, whose OIDs initdb assigns after importing
+the platform's collations, need the pinned reference image); a
 listed built-in that is neither implemented nor an operator, cast or input
 function fails with `0A000` when called; `DROP ROLE`'s `DETAIL` lists
 owners by OID and privileges by grant order, where PostgreSQL lists
@@ -441,12 +443,18 @@ changes and nested `CALL`, but rejects DDL and other utility statements with
 Relation row types: values and columns of a
 view's row type, and dropping a relation through `DROP SCHEMA`, `DROP
 MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
-column uses its row type, fail with `0A000`; a `DROP TABLE ... CASCADE` that
-reaches both columns and routines, or names several tables, reports one notice
-per table or dependency kind where PostgreSQL reports one for the statement, and a routine's dependency on a row type is described as depending on the
-table; a `DROP TYPE` or `DROP DOMAIN` whose type both routines and other
-objects (columns, views, casts) use reports the routines separately from
-those objects where PostgreSQL reports them together. Values and columns of a view's row type need the view's column types,
+column uses its row type, fail with `0A000`. `DROP` of casts, operators,
+operator classes and families, collations, text search objects, extensions,
+servers, policies, triggers, rules, indexes and `DROP OWNED` still describe
+their dependents with their own code instead of the `pg_depend` walk that
+`DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`, `SEQUENCE`, `FUNCTION`, `TYPE`,
+`DOMAIN` and `SCHEMA` share, and `pg_depend` still lacks PostgreSQL's rows for
+languages, column collations, index columns, TOAST tables, partition keys,
+`NOT NULL` constraints, the key columns of extended statistics, the parsers
+and templates of text search objects, types named only inside
+expressions (a cast in a default or routine body), and the column-level rows
+of rules and of views that read a sequence.
+Values and columns of a view's row type need the view's column types,
 which pos3ql derives from the view's query on each use instead of storing them
 as PostgreSQL's `pg_attribute` rows do. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current

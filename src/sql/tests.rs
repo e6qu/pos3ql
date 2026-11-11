@@ -23,6 +23,7 @@ mod composite_parameter_fields;
 mod constraint_index_identity;
 mod cursor_execution;
 mod deparsed_expressions;
+mod drop_dependency_reports;
 mod error_report_fields;
 mod evaluation_timing;
 mod foreign_parent_admission;
@@ -72,6 +73,7 @@ mod stored_relation_sources;
 mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
+mod type_catalog_rows;
 mod type_dependent_routines;
 mod type_input_binding;
 mod type_input_positions;
@@ -16628,7 +16630,8 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
             &mut replay_budget,
             "SELECT count(*) FROM pg_extension; \
              SELECT count(*) FROM pg_class WHERE relname='typed_values'; \
-             SELECT count(*) FROM pg_depend WHERE deptype IN ('e','x','n')",
+             SELECT count(*) FROM pg_depend \
+             WHERE classid = 'pg_extension'::regclass OR refclassid = 'pg_extension'::regclass",
         )),
         ["0", "0", "0"]
     );
@@ -38385,10 +38388,11 @@ fn collatable_builtin_types_expose_the_default_collation() {
             "SELECT typname, typcollation FROM pg_type \
              WHERE typname IN ('text', 'varchar', 'bpchar', 'name', 'int4') ORDER BY typname",
         )),
+        // PostgreSQL 18 gives `name` the "C" collation (950).
         [
             "bpchar|100",
             "int4|0",
-            "name|100",
+            "name|950",
             "text|100",
             "varchar|100"
         ],
@@ -42866,7 +42870,16 @@ fn configured_dependency_plans_cross_old_catalog_ceiling_and_recover_cold() {
     let depth_restricted = String::from_utf8_lossy(&depth_restricted);
     assert!(depth_restricted.contains("2BP01"), "{depth_restricted}");
     assert!(!depth_restricted.contains("54000"), "{depth_restricted}");
-    assert!(depth_restricted.contains("dp_d_128"), "{depth_restricted}");
+    // PostgreSQL lists the first 100 dependents and counts the rest.
+    assert!(
+        depth_restricted.contains("function dp_d_99() depends on function dp_d_98()"),
+        "{depth_restricted}"
+    );
+    assert!(
+        depth_restricted.contains("and 29 other objects (see server log for list)"),
+        "{depth_restricted}"
+    );
+    assert!(!depth_restricted.contains("dp_d_100"), "{depth_restricted}");
     let depth_cascade = run_with_ddl_capacity(
         &mut engine,
         &mut budget,
@@ -42940,9 +42953,15 @@ fn configured_dependency_plans_cross_old_catalog_ceiling_and_recover_cold() {
     let restricted = String::from_utf8_lossy(&restricted);
     assert!(restricted.contains("2BP01"), "{restricted}");
     assert!(!restricted.contains("54000"), "{restricted}");
-    assert!(restricted.contains("dp_v_128"), "{restricted}");
-    assert!(restricted.contains("dp_dep"), "{restricted}");
-    assert!(restricted.contains("dp_rule"), "{restricted}");
+    // PostgreSQL lists the first 100 of the 131 dependents and counts the rest.
+    assert!(
+        restricted.contains("view dp_v_99 depends on table dp_root"),
+        "{restricted}"
+    );
+    assert!(
+        restricted.contains("and 31 other objects (see server log for list)"),
+        "{restricted}"
+    );
 
     let rolled_back = run_with_fixed_memory_and_ddl_capacity(
         &mut engine,
@@ -58123,8 +58142,10 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         "DROP TYPE durable_types.coordinate_renamed",
     );
     assert!(
-        String::from_utf8_lossy(&bytes)
-            .contains("column point of composite type place depends on type coordinate_renamed"),
+        String::from_utf8_lossy(&bytes).contains(
+            "column point of composite type place depends on type \
+                 durable_types.coordinate_renamed"
+        ),
         "{}",
         String::from_utf8_lossy(&bytes)
     );

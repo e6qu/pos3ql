@@ -1578,7 +1578,8 @@ fn attribute_default_oids_follow_default_lifetimes_through_journal_and_checkpoin
     // PostgreSQL stores a new pg_attrdef row (and OID) whenever a default or
     // generation expression is set; renames and unrelated changes keep it.
     const SETUP: &str = "CREATE TABLE ad_t(a int DEFAULT 1, b int GENERATED ALWAYS AS (a * 2) STORED, c text DEFAULT 'x');
-         CREATE VIEW ad_v AS SELECT a FROM ad_t;
+         CREATE TABLE ad_src(a int);
+         CREATE VIEW ad_v AS SELECT a FROM ad_src;
          ALTER VIEW ad_v ALTER a SET DEFAULT 5;
          CREATE TABLE ad_saved(identity oid, relid oid, num int2);
          INSERT INTO ad_saved SELECT oid, adrelid, adnum FROM pg_attrdef;
@@ -16607,7 +16608,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         "DROP TABLE moved_extensions.typed_values CASCADE",
     );
     assert!(
-        String::from_utf8_lossy(&rejected).contains("extension \"typed_ext\" requires it"),
+        String::from_utf8_lossy(&rejected).contains("because extension typed_ext requires it"),
         "{}",
         String::from_utf8_lossy(&rejected)
     );
@@ -16825,7 +16826,7 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
     );
     let member_drop = run_with(&mut engine, &mut budget, "DROP TABLE member_table");
     assert!(
-        String::from_utf8_lossy(&member_drop).contains("extension \"empty_ext\" requires it"),
+        String::from_utf8_lossy(&member_drop).contains("because extension empty_ext requires it"),
         "{}",
         String::from_utf8_lossy(&member_drop)
     );
@@ -16935,7 +16936,7 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
     ] {
         let rejected = run_with(&mut engine, &mut budget, command);
         assert!(
-            String::from_utf8_lossy(&rejected).contains("extension \"empty_ext\" requires it"),
+            String::from_utf8_lossy(&rejected).contains("because extension empty_ext requires it"),
             "{command}: {}",
             String::from_utf8_lossy(&rejected)
         );
@@ -22680,6 +22681,94 @@ fn view_output_columns_are_typed_catalog_identity_and_durable() {
             "dependent output remains stable",
             "current_value"
         ],
+        "{}",
+        String::from_utf8_lossy(&recovered_rows)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn view_column_types_are_recorded_at_creation_and_recovered() {
+    let mut config = test_config("view-column-types");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("view-column-types-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let attributes = "SELECT attname || ':' || format_type(atttypid, atttypmod) || ':' ||
+           attcollation::regcollation::text
+         FROM pg_attribute WHERE attrelid = 'typed_view'::regclass AND attnum > 0
+         ORDER BY attnum;
+         SELECT * FROM typed_view;";
+    let expected = [
+        "total:integer:-",
+        "label:character varying(3):\"default\"",
+        "sorted:text:\"C\"",
+        "kind:typed_mood:-",
+        "6|ab|q|ok",
+    ];
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "CREATE FUNCTION typed_add(int, int) RETURNS int LANGUAGE sql AS 'SELECT coalesce($1, 0) + $2';
+             CREATE AGGREGATE typed_sum(int) (SFUNC = typed_add, STYPE = int);
+             CREATE TYPE typed_mood AS ENUM ('sad', 'ok');
+             CREATE TABLE typed_source (label varchar(3), note text, kind typed_mood);
+             INSERT INTO typed_source VALUES ('ab', 'q', 'ok');
+             CREATE VIEW typed_view AS
+               SELECT (SELECT typed_sum(x) FROM generate_series(1, 3) x) AS total,
+                      label, note COLLATE \"C\" AS sorted, kind
+                 FROM typed_source;
+             {attributes}"
+        ),
+    );
+    assert_eq!(
+        data_rows(&created),
+        expected,
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    drop(engine);
+
+    // The journal alone restores the recorded types.
+    let mut replay_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    let replayed_rows = run_with(&mut replayed, &mut replay_budget, attributes);
+    assert_eq!(
+        data_rows(&replayed_rows),
+        expected,
+        "{}",
+        String::from_utf8_lossy(&replayed_rows)
+    );
+    let refused = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "CREATE OR REPLACE VIEW typed_view AS
+           SELECT 1 AS total, label::varchar(4) AS label, note COLLATE \"C\" AS sorted, kind
+             FROM typed_source;",
+    );
+    assert!(
+        String::from_utf8_lossy(&refused).contains(
+            "cannot change data type of view column \"label\" from character varying(3) to character varying(4)"
+        ),
+        "{}",
+        String::from_utf8_lossy(&refused)
+    );
+    assert!(replayed.checkpoint().unwrap());
+    drop(replayed);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    // The checkpoint manifest restores them after the local disk is lost.
+    let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_rows = run_with(&mut recovered, &mut recovered_budget, attributes);
+    assert_eq!(
+        data_rows(&recovered_rows),
+        expected,
         "{}",
         String::from_utf8_lossy(&recovered_rows)
     );

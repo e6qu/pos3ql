@@ -360,8 +360,7 @@ fn discover_defaults(
                     crate::sql::types::ColDesc::new("", 0, 0)
                 })
                 .map_err(|_| super::arena_full())?;
-            let count =
-                crate::sql::catalog::describe_view(storage, txid, &view, arena, descriptions)?;
+            let count = crate::sql::catalog::describe_view(&view, txid, arena, descriptions)?;
             let description = descriptions
                 .get(index)
                 .filter(|_| index < count)

@@ -2914,13 +2914,9 @@ impl<'d> QueryScope<'d> {
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN, "column does not exist"))
     }
 
-    /// If `name` refers to a set-returning-function scan, the type of its single
-    /// scalar output column — the type a whole-row reference to it carries. A
-    /// storage- or subquery-derived table returns None (its whole-row reference
-    /// is a record).
     /// The declared type of a whole-row reference to a FROM item: a function
-    /// scan's single scalar column, a relation's row type, or an anonymous
-    /// record for every other source.
+    /// scan's single scalar column, a table's or view's row type, or an
+    /// anonymous record for every other source.
     pub fn whole_row_type(&self, name: &str) -> Option<ColType> {
         self.qualified_star_columns(name).ok()?;
         if let Some(scalar) = self.func_scalar_type(name) {
@@ -2931,7 +2927,15 @@ impl<'d> QueryScope<'d> {
             .is_none()
             .then(|| self.entry_index(name).ok())
             .flatten()
-            .and_then(|table| self.row_types[table]);
+            .and_then(|table| {
+                self.row_types[table].or_else(|| {
+                    self.view_accesses[table].map(|view| {
+                        self.storage.relation_row_type_creation(
+                            crate::storage::RowTypeRelation::View(usize::from(view)),
+                        )
+                    })
+                })
+            });
         Some(composite.map_or(ColType::Record, |creation| {
             ColType::Composite(Some(creation))
         }))

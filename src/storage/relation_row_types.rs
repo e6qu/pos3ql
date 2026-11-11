@@ -28,13 +28,24 @@ pub(crate) enum RowTypeRelation {
 pub(crate) enum RowTypeDefinition<'s> {
     Named(TypeDefinitionRead<CompositeDef>),
     Table(TableDefinitionRead<'s>),
+    /// A view's row type: its columns as recorded when it was created or
+    /// replaced, read from the view catalog as one transaction sees them.
+    View(ViewRowType<'s>),
+}
+
+pub(crate) struct ViewRowType<'s> {
+    storage: &'s Storage,
+    slot: usize,
+    txid: u32,
+    name: SqlName,
+    count: usize,
 }
 
 impl RowTypeDefinition<'_> {
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         match self {
             Self::Named(definition) => definition.visible_to(txid),
-            Self::Table(_) => true,
+            Self::Table(_) | Self::View(_) => true,
         }
     }
 
@@ -43,6 +54,7 @@ impl RowTypeDefinition<'_> {
         match self {
             Self::Named(definition) => definition.name,
             Self::Table(definition) => definition.name,
+            Self::View(view) => view.name,
         }
     }
 
@@ -51,6 +63,7 @@ impl RowTypeDefinition<'_> {
         match self {
             Self::Named(definition) => definition.n_fields,
             Self::Table(definition) => usize::from(definition.attributes.count),
+            Self::View(view) => view.count,
         }
     }
 
@@ -58,6 +71,26 @@ impl RowTypeDefinition<'_> {
     pub(crate) fn field(&self, position: usize) -> CompositeFieldDef {
         match self {
             Self::Named(definition) => definition.fields()[position],
+            Self::View(view) => {
+                let (name, column_type) = view
+                    .storage
+                    .view_column(view.slot, view.txid, position)
+                    .expect("view row type field is within its column count");
+                let declared = view
+                    .storage
+                    .routine_result_for_oid(column_type.oid(), view.txid)
+                    .expect("view row type field types were admitted");
+                CompositeFieldDef {
+                    attribute_number: u16::try_from(position + 1).expect("view attribute fits"),
+                    name,
+                    ctype: declared.ctype,
+                    type_mod: column_type.type_mod(),
+                    collation: column_type.collation(),
+                    user_type: declared.user_type,
+                    dropped: false,
+                    not_null: false,
+                }
+            }
             Self::Table(definition) => {
                 let number = u16::try_from(position + 1).expect("relation attribute fits");
                 match definition.attributes.slots.as_ref()[position] {
@@ -88,7 +121,7 @@ impl RowTypeDefinition<'_> {
     pub(crate) fn fields_for(&self, txid: u32) -> impl Iterator<Item = CompositeFieldDef> + '_ {
         let named = match self {
             Self::Named(definition) => Some(definition.fields_for(txid)),
-            Self::Table(_) => None,
+            Self::Table(_) | Self::View(_) => None,
         };
         let count = named.map_or(self.physical_field_count(), <[_]>::len);
         (0..count).map(move |position| {
@@ -164,9 +197,7 @@ impl Storage {
         TypeCreation::parse(created_at).expect("admitted relation stamp is a row type identity")
     }
 
-    /// The field layout of any composite type. A view's columns come from its
-    /// stored query, so only callers that can describe a query accept them;
-    /// every other caller receives an explicit `0A000`.
+    /// The field layout of any composite type.
     pub(crate) fn row_type_definition(
         &self,
         creation: TypeCreation,
@@ -183,11 +214,32 @@ impl Storage {
             Some(RowTypeRelation::Table(slot)) => {
                 Ok(Some(RowTypeDefinition::Table(self.table_def(slot, txid))))
             }
-            Some(RowTypeRelation::View(slot)) => Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "values of the row type of view \"{}\" are not supported",
-                self.view(slot).name_for(txid).as_str()
-            )),
+            Some(RowTypeRelation::View(slot)) => {
+                let (name, count) = self.view_column_shape(slot, txid);
+                for position in 0..count {
+                    let (column, column_type) = self
+                        .view_column(slot, txid, position)
+                        .expect("view column is within its count");
+                    if self
+                        .routine_result_for_oid(column_type.oid(), txid)
+                        .is_none()
+                    {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "column \"{}\" of view \"{}\" has a type that row values do not support",
+                            column.as_str(),
+                            name.as_str()
+                        ));
+                    }
+                }
+                Ok(Some(RowTypeDefinition::View(ViewRowType {
+                    storage: self,
+                    slot,
+                    txid,
+                    name,
+                    count,
+                })))
+            }
             None => Ok(None),
         }
     }

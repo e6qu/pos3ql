@@ -642,7 +642,7 @@ fn default_destination(
         .find_map(|(slot, view)| (super::view_oid(storage, slot) == relation).then_some(view))
         .ok_or_else(unresolved_default)?;
     let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
-    let count = super::describe_view(storage, transaction, &view, arena, &mut columns)?;
+    let count = super::describe_view(&view, transaction, arena, &mut columns)?;
     columns[..count]
         .get(attribute)
         .map(|column| Kind::Assignment(column.type_oid))

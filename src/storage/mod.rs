@@ -5837,6 +5837,18 @@ impl RuleDefinition {
         let start = usize::from(span.start);
         &self.source.as_str()[start..start + usize::from(span.len)]
     }
+
+    /// The rule's condition and action texts.
+    pub(crate) fn fragments(&self) -> impl Iterator<Item = &str> {
+        self.condition
+            .into_iter()
+            .chain(
+                self.actions[..usize::from(self.action_count)]
+                    .iter()
+                    .copied(),
+            )
+            .map(|span| self.text(span))
+    }
 }
 
 #[derive(Clone)]
@@ -5985,12 +5997,114 @@ pub(crate) struct ViewDefinition {
     pub options: ViewOptions,
 }
 
-/// The output relation of a view.  A stored SELECT describes types at the
-/// query boundary, while these names are catalog identity and therefore must
-/// never be recovered by reparsing aliases from the source text.
+/// A view column's type as PostgreSQL's `pg_attribute` row records it when
+/// the view is created. Later uses read this record instead of analyzing the
+/// view's query again, so a column keeps the type it was created with.
+/// User-defined types are identified by their OID, which is a band base plus
+/// the type's durable creation stamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewColumnType {
+    oid: i32,
+    type_mod: i32,
+    collation: Collation,
+    typlen: i16,
+}
+
+impl ViewColumnType {
+    /// Fills array slots past a view's last column; never a column's type.
+    pub(crate) const PLACEHOLDER: Self = Self {
+        oid: 0,
+        type_mod: -1,
+        collation: Collation::None,
+        typlen: 0,
+    };
+    pub(crate) const ENCODED_BYTES: usize = 14;
+    #[cfg(test)]
+    pub(crate) const INT4: Self = Self {
+        oid: 23,
+        type_mod: -1,
+        collation: Collation::None,
+        typlen: 4,
+    };
+
+    pub(crate) fn new(oid: i32, typlen: i16, type_mod: i32, collation: Collation) -> Option<Self> {
+        (oid > 0 && type_mod >= -1 && typlen != 0).then_some(Self {
+            oid,
+            type_mod,
+            collation,
+            typlen,
+        })
+    }
+
+    pub(crate) fn from_description(column: &crate::sql::types::ColDesc<'_>) -> Self {
+        Self::new(
+            column.type_oid,
+            column.typlen,
+            column.type_mod,
+            column.collation,
+        )
+        .expect("a described view column has a concrete type")
+    }
+
+    pub(crate) const fn oid(self) -> i32 {
+        self.oid
+    }
+
+    pub(crate) const fn type_mod(self) -> i32 {
+        self.type_mod
+    }
+
+    pub(crate) const fn typlen(self) -> i16 {
+        self.typlen
+    }
+
+    pub(crate) const fn collation(self) -> Collation {
+        self.collation
+    }
+
+    /// The column as a query sees it: a reference to a view column has the
+    /// column's collation with implicit derivation, as a table column does.
+    pub(crate) fn description(self, name: &str) -> crate::sql::types::ColDesc<'_> {
+        crate::sql::types::ColDesc {
+            name,
+            type_oid: self.oid,
+            typlen: self.typlen,
+            type_mod: self.type_mod,
+            collation: self.collation,
+            collation_derivation: if matches!(self.collation, Collation::None) {
+                crate::sql::types::CollationDerivation::None
+            } else {
+                crate::sql::types::CollationDerivation::Implicit
+            },
+        }
+    }
+
+    pub(crate) fn to_le_bytes(self) -> [u8; Self::ENCODED_BYTES] {
+        let mut bytes = [0; Self::ENCODED_BYTES];
+        bytes[..4].copy_from_slice(&self.oid.to_le_bytes());
+        bytes[4..6].copy_from_slice(&self.typlen.to_le_bytes());
+        bytes[6..10].copy_from_slice(&self.type_mod.to_le_bytes());
+        bytes[10..].copy_from_slice(&self.collation.code().to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn from_le_bytes(bytes: [u8; Self::ENCODED_BYTES]) -> Option<Self> {
+        Self::new(
+            i32::from_le_bytes(bytes[..4].try_into().ok()?),
+            i16::from_le_bytes(bytes[4..6].try_into().ok()?),
+            i32::from_le_bytes(bytes[6..10].try_into().ok()?),
+            Collation::from_code(u32::from_le_bytes(bytes[10..].try_into().ok()?))?,
+        )
+    }
+}
+
+/// The output relation of a view: names are catalog identity and therefore
+/// must never be recovered by reparsing aliases from the source text, and
+/// types are fixed when the view is created or replaced.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewColumns {
     names: [SqlName; MAX_COLUMNS],
+    types: [ViewColumnType; MAX_COLUMNS],
     defaults: [ViewColumnDefault; MAX_VIEW_DEFAULTS],
     count: u16,
     aliases: bool,
@@ -5999,12 +6113,31 @@ pub struct ViewColumns {
 impl ViewColumns {
     pub const EMPTY: Self = Self {
         names: [SqlName::EMPTY; MAX_COLUMNS],
+        types: [ViewColumnType::PLACEHOLDER; MAX_COLUMNS],
         defaults: [ViewColumnDefault::EMPTY; MAX_VIEW_DEFAULTS],
         count: 0,
         aliases: false,
     };
 
-    pub fn from_names(names: &[&str]) -> Result<Self, SqlError> {
+    /// Records each column's type; every column must have exactly one.
+    fn with_types(mut self, types: &[ViewColumnType]) -> Result<Self, SqlError> {
+        if types.len() != self.count as usize {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view has {} columns but {} column types",
+                self.count,
+                types.len()
+            ));
+        }
+        self.types[..types.len()].copy_from_slice(types);
+        Ok(self)
+    }
+
+    pub(crate) fn types(&self) -> &[ViewColumnType] {
+        &self.types[..self.count as usize]
+    }
+
+    pub fn from_names(names: &[&str], types: &[ViewColumnType]) -> Result<Self, SqlError> {
         if names.len() > MAX_RELATION_COLUMNS {
             return Err(sql_err!(
                 sqlstate::TOO_MANY_COLUMNS,
@@ -6026,10 +6159,10 @@ impl ViewColumns {
         }
         output.count = names.len() as u16;
         output.aliases = true;
-        Ok(output)
+        output.with_types(types)
     }
 
-    pub fn from_sql_names(names: &[SqlName]) -> Result<Self, SqlError> {
+    pub fn from_sql_names(names: &[SqlName], types: &[ViewColumnType]) -> Result<Self, SqlError> {
         if names.len() > MAX_RELATION_COLUMNS {
             return Err(sql_err!(
                 sqlstate::TOO_MANY_COLUMNS,
@@ -6050,11 +6183,11 @@ impl ViewColumns {
         }
         output.count = names.len() as u16;
         output.aliases = true;
-        Ok(output)
+        output.with_types(types)
     }
 
-    pub fn from_derived_names(names: &[&str]) -> Result<Self, SqlError> {
-        let mut output = Self::from_names(names)?;
+    pub fn from_derived_names(names: &[&str], types: &[ViewColumnType]) -> Result<Self, SqlError> {
+        let mut output = Self::from_names(names, types)?;
         output.aliases = false;
         Ok(output)
     }
@@ -33171,13 +33304,24 @@ impl Storage {
         let extension_name = catalog.definitions[extension].name;
         drop(catalog);
         let (_, name) = self.access_object_name_to(object, txid);
-        Err(sql_err!(
+        // PostgreSQL's dependency walk names the member and its extension
+        // as `getObjectDescription` does, without quotes.
+        let error = sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-            "cannot drop {} \"{}\" because extension \"{}\" requires it",
+            "cannot drop {} {} because extension {} requires it",
             kind,
             name.as_str(),
             extension_name.as_str()
-        ))
+        );
+        crate::sql::eval::stash_diagnostic(
+            None,
+            Some(crate::stack_format!(
+                128,
+                "You can drop extension {} instead.",
+                extension_name.as_str()
+            )),
+        );
+        Err(error)
     }
 
     pub(crate) fn change_extension_dependency(
@@ -41102,6 +41246,29 @@ impl Storage {
 
     pub(crate) fn view(&self, slot: usize) -> ViewDef {
         self.view_rule_catalog().views[slot].clone()
+    }
+
+    /// A view's name and column count as `txid` sees them, without copying
+    /// its column set.
+    pub(crate) fn view_column_shape(&self, slot: usize, txid: u32) -> (SqlName, usize) {
+        let catalog = self.view_rule_catalog();
+        let view = &catalog.views[slot];
+        (view.name_for(txid), view.columns_for(txid).len())
+    }
+
+    /// One view column's name and recorded type as `txid` sees them.
+    pub(crate) fn view_column(
+        &self,
+        slot: usize,
+        txid: u32,
+        position: usize,
+    ) -> Option<(SqlName, ViewColumnType)> {
+        let catalog = self.view_rule_catalog();
+        let columns = catalog.views[slot].columns_for(txid);
+        Some((
+            *columns.names().get(position)?,
+            *columns.types().get(position)?,
+        ))
     }
 
     pub(crate) fn view_relation_name(&self, oid: i32, txid: u32) -> Option<(SqlName, SqlName)> {

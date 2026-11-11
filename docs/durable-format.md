@@ -92,12 +92,12 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 141 | Trigger create | Current; requires the ten-byte position prefix. Kind 55 remains readable. |
 | 142 | Routine create | Current; 16-bit result counts. Kind 45 remains readable. |
 | 143 | Composite create | Current. Kind 58 remains readable. |
-| 144/145 | View create / view columns | Current; wide column sets; each column default is followed by its four-byte `pg_attrdef` stamp. Kinds 5/126 remain readable. |
+| 144/145 | View create / view columns | Current; 16-bit column count. Each column's name is followed by its type (four-byte type OID, two-byte length, four-byte modifier, four-byte collation code), then its default and the default's four-byte `pg_attrdef` stamp. Kinds 5/126, whose columns have no types, are rejected. |
 | 148 | Composite rename or schema move | Prior name, prior schema, new schema, new name. Preserves current fields. |
 | 149 | Enum create | Current. Kinds 23 and 147 are rejected. |
 | 150 | Extended statistics ANALYZE | Current. Kind 77 enum-dependent hash summaries are retired; counts stay valid. |
 | 151 | Domain with bound checks, defaults or named array base | Kind 21 remains readable. |
-| 152 | Bound view | Previous view kinds remain readable. |
+| 152 | Bound view | Kind 144's layout for a query with bound enum literals. |
 | 153 | Row upsert | Allows tagged enum member cells and legacy cells. Kind 3 remains readable. |
 | 154 | Table with bound default source | Kind 1 remains readable. |
 | 155 | Prepared catalog row | See [prepared transactions](#prepared-transactions). |
@@ -149,7 +149,7 @@ inserts a missing writer.
 | `table2` | Slot, creation stamp, hexadecimal checked-input image, name. Internal large-object page table keeps its reserved slot and stamp zero. |
 | `sq7`, `rtn2` | Sequence / routine slot and creation stamp. |
 | `mv6` | Materialized-view catalog position and backing-table position. |
-| `vw14` | View position and stamp, return-rule position and stamp, encoded query, checked column defaults by ordinal, each with its `pg_attrdef` stamp (zero without a default). |
+| `vw14` | View position and stamp, return-rule position and stamp, encoded query, then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
 | `hidx <table-slot> <0-or-1>` | Required once per table, including tables without indexes. The large-object page table requires `0`. |
 | `col4` | Hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
 | `attributes2` | Entry count and each attribute entry as sixteen hex digits. |

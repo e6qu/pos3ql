@@ -3627,8 +3627,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         let described = arena
             .alloc_slice_with(count, |_| super::types::ColDesc::new("", 0, 0))
             .map_err(|_| arena_full())?;
-        let count =
-            super::catalog::describe_view(self.storage, self.txid, &view, arena, described)?;
+        let count = super::catalog::describe_view(&view, self.txid, arena, described)?;
         for column in &described[..count] {
             let name = arena.alloc_str(column.name).map_err(|_| arena_full())?;
             columns
@@ -5207,8 +5206,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 let columns = arena
                     .alloc_slice_with(width, |_| super::types::ColDesc::new("", 0, 0))
                     .map_err(|_| arena_full())?;
-                let count =
-                    super::catalog::describe_view(self.storage, self.txid, &view, arena, columns)?;
+                let count = super::catalog::describe_view(&view, self.txid, arena, columns)?;
                 for (modifier, column) in modifiers.iter_mut().zip(&columns[..count]) {
                     *modifier = column.type_mod;
                 }
@@ -6095,17 +6093,20 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 .storage
                 .routine_function_result_oid(&routine, self.txid);
         }
-        if bound_oid.is_some() || !argument_names.is_empty() || variadic {
+        if bound_oid.is_none() && (!argument_names.is_empty() || variadic) {
             return None;
         }
-        let (_, _, aggregate) =
-            self.storage
-                .aggregate_for_call_oids(name, argument_type_oids, self.txid)?;
-        self.storage.routine_type_oid(
-            aggregate.result_type.ctype,
-            aggregate.result_type.user_type,
+        let result = super::exec::user_routine_call_result(
+            self.storage,
             self.txid,
-        )
+            name,
+            bound_oid,
+            argument_names,
+            argument_type_oids,
+            variadic,
+        )?;
+        self.storage
+            .routine_type_oid(result.ctype, result.user_type, self.txid)
     }
 
     fn sequence_state_by_oid(&self, oid: i32) -> Option<(i64, bool)> {
@@ -6139,6 +6140,46 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn relation_is_visible(&self, oid: i32) -> Option<bool> {
         super::catalog::relation_oid_visibility(self.storage, self.txid, oid)
+    }
+
+    fn user_mapping_description<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        let Some((_, entry)) = self
+            .storage
+            .foreign_user_mappings(self.txid)
+            .find(|(_, entry)| entry.oid() == oid)
+        else {
+            return Ok(None);
+        };
+        let mapping = entry.definition_for(self.txid);
+        let server = self
+            .storage
+            .foreign_server_by_slot(mapping.server as usize, self.txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "user mapping server is not visible"
+                )
+            })?;
+        let user = match mapping.user {
+            crate::storage::foreign::ForeignMappingUser::Public => {
+                crate::storage::SqlName::parse("public")?
+            }
+            crate::storage::foreign::ForeignMappingUser::Role(slot) => {
+                self.storage.role_name(slot as usize, self.txid)
+            }
+        };
+        arena
+            .alloc_str_display(format_args!(
+                "user mapping for {} on server {}",
+                user.as_str(),
+                server.name.as_str()
+            ))
+            .map(Some)
+            .map_err(|_| arena_full())
     }
 
     fn type_is_visible(&self, oid: i32) -> Option<bool> {
@@ -6511,9 +6552,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 let view = self.storage.view(slot);
                 let mut descriptions = [ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
                 let count = super::catalog::describe_view(
-                    self.storage,
-                    self.txid,
                     &view,
+                    self.txid,
                     self.routine_workspace,
                     &mut descriptions,
                 )?;
@@ -6576,9 +6616,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 let view = self.storage.view(slot);
                 let mut descriptions = [ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
                 let count = super::catalog::describe_view(
-                    self.storage,
-                    self.txid,
                     &view,
+                    self.txid,
                     self.routine_workspace,
                     &mut descriptions,
                 )?;
@@ -7445,9 +7484,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     arena,
                     sequences,
                 ),
-                value => super::exec::coerce_composite_value(
+                value => super::exec::cast_composite_value(
                     value,
-                    Some(self.storage.composite_for(slot, self.txid).creation()),
+                    self.storage.composite_for(slot, self.txid).creation(),
                     self.storage,
                     self.txid,
                     arena,
@@ -7473,9 +7512,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     arena,
                     sequences,
                 ),
-                value => super::exec::coerce_composite_value(
+                value => super::exec::cast_composite_value(
                     value,
-                    Some(creation),
+                    creation,
                     self.storage,
                     self.txid,
                     arena,
@@ -9314,6 +9353,23 @@ pub fn validate_view_columns(columns: &[ColDesc<'_>]) -> Result<(), SqlError> {
                 column.name,
                 type_name
             ));
+        }
+        if matches!(
+            column.collation_derivation,
+            super::types::CollationDerivation::Indeterminate
+        ) {
+            let error = sql_err!(
+                sqlstate::INDETERMINATE_COLLATION,
+                "could not determine which collation to use for view column \"{}\"",
+                column.name
+            );
+            super::eval::stash_diagnostic(
+                None,
+                Some(crate::util::StackStr::from_str(
+                    "Use the COLLATE clause to set the collation explicitly.",
+                )),
+            );
+            return Err(error);
         }
     }
     Ok(())
@@ -14343,7 +14399,9 @@ fn describe_scope_record_star<'q>(
                 Expr::Cast { type_name, .. } => storage
                     .resolve_composite_slot(type_name, txid)
                     .map(|slot| storage.composite_for(slot, txid).creation()),
-                _ => None,
+                _ => super::exec::infer_type_res(base, &resolver)
+                    .ok()
+                    .and_then(|(oid, _)| named_composite_creation(oid)),
             };
             if let Some(slot) = slot {
                 let definition = storage.row_type_definition(slot, txid)?.ok_or_else(|| {
@@ -14783,36 +14841,15 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
                 variadic,
             );
         }
-        let routine = if let Some(oid) = bound_oid {
-            self.storage.function_for_captured_call(
-                oid,
-                argument_names,
-                arguments,
-                variadic,
-                self.txid,
-            )
-        } else if argument_names.is_empty() {
-            self.storage
-                .function_for_call_syntax_oids(name, arguments, variadic, self.txid)
-        } else {
-            self.storage.function_for_named_call_oids(
-                name,
-                argument_names,
-                arguments,
-                variadic,
-                self.txid,
-            )
-        };
-        let result = routine
-            .and_then(|routine| routine.function_result_contract())
-            .or_else(|| {
-                if bound_oid.is_some() {
-                    return None;
-                }
-                self.storage
-                    .aggregate_for_call_oids(name, arguments, self.txid)
-                    .map(|(_, _, aggregate)| aggregate.result_type)
-            })?;
+        let result = super::exec::user_routine_call_result(
+            self.storage,
+            self.txid,
+            name,
+            bound_oid,
+            argument_names,
+            arguments,
+            variadic,
+        )?;
         let ctype = result.ctype;
         Some(super::exec::StaticTypeMeta {
             type_oid: self
@@ -15418,4 +15455,12 @@ fn arena_full() -> SqlError {
 #[track_caller]
 pub fn arena_full_pub() -> SqlError {
     arena_full()
+}
+
+/// The creation identity of a named composite or relation row type OID.
+pub(crate) fn named_composite_creation(oid: i32) -> Option<crate::storage::TypeCreation> {
+    match crate::storage::NamedTypeKind::from_oid(oid) {
+        Some((crate::storage::NamedTypeKind::Composite, creation, false)) => Some(creation),
+        _ => None,
+    }
 }

@@ -120,6 +120,70 @@ pub(crate) fn for_each_dependency(
 
     relation_dependencies(storage, txid, arena, visit)?;
     policy_dependencies(storage, txid, arena, visit)?;
+    // PostgreSQL's foreign-data DDL: a wrapper uses its handler and validator,
+    // a server its wrapper, and user mappings and foreign tables their server.
+    for (_, entry) in storage.foreign_wrappers(txid) {
+        let wrapper = entry.definition_for(txid);
+        for routine in [
+            match wrapper.handler {
+                crate::storage::foreign::ForeignDataHandler::None => None,
+                crate::storage::foreign::ForeignDataHandler::Postgres => {
+                    Some("postgres_fdw_handler")
+                }
+            },
+            match wrapper.validator {
+                crate::storage::foreign::ForeignDataValidator::None => None,
+                crate::storage::foreign::ForeignDataValidator::Postgres => {
+                    Some("postgres_fdw_validator")
+                }
+            },
+        ]
+        .into_iter()
+        .flatten()
+        {
+            push!(
+                PG_FOREIGN_DATA_WRAPPER_OID,
+                entry.oid(),
+                PG_PROC_OID,
+                foreign_routine_oid(storage, txid, routine)?,
+                0,
+                "n",
+            )?;
+        }
+    }
+    for (_, entry) in storage.foreign_servers(txid) {
+        let server = entry.definition_for(txid);
+        push!(
+            PG_FOREIGN_SERVER_OID,
+            entry.oid(),
+            PG_FOREIGN_DATA_WRAPPER_OID,
+            storage.foreign_wrapper_entry(server.wrapper as usize).oid(),
+            0,
+            "n",
+        )?;
+    }
+    for (_, entry) in storage.foreign_user_mappings(txid) {
+        let mapping = entry.definition_for(txid);
+        push!(
+            PG_USER_MAPPING_OID,
+            entry.oid(),
+            PG_FOREIGN_SERVER_OID,
+            storage.foreign_server_entry(mapping.server as usize).oid(),
+            0,
+            "n",
+        )?;
+    }
+    for (_, entry) in storage.foreign_tables(txid) {
+        let table = entry.definition_for(txid);
+        push!(
+            PG_CLASS_OID,
+            user_table_oid(storage, table.table as usize),
+            PG_FOREIGN_SERVER_OID,
+            storage.foreign_server_entry(table.server as usize).oid(),
+            0,
+            "n",
+        )?;
+    }
     for (_, object) in storage.text_search_objects_visible_to(txid) {
         let class = match object.kind() {
             crate::sql::ast::TextSearchObjectKind::Parser => PG_TS_PARSER_OID,
@@ -493,6 +557,14 @@ pub(crate) fn for_each_dependency(
         let Some(index) = storage.index_visible_to(index_slot, txid) else {
             continue;
         };
+        // PostgreSQL's `index_create` records each key column's collation.
+        for collation in index.collations[..index.n_cols].iter().copied() {
+            collation_edge(
+                ObjectAddress::new(PG_CLASS_OID, explicit_index_oid(&index), 0),
+                collation,
+                visit,
+            )?;
+        }
         for position in 0..index.n_cols {
             let Some(crate::storage::IndexOperatorClass::Catalog(class_oid)) =
                 index.resolved_operator_classes[position]
@@ -573,6 +645,31 @@ pub(crate) fn for_each_dependency(
             crate::storage::RuleTarget::View(slot) => view_oid(storage, usize::from(slot)),
         };
         push!(2618, rule.oid(), PG_CLASS_OID, relation_oid, 0, "a")?;
+        // `NEW.x` and `OLD.x` read columns of the rule's own relation.
+        let own = transition_columns(
+            storage,
+            txid,
+            match definition.target {
+                crate::storage::RuleTarget::Table(slot) => {
+                    crate::storage::RowTypeRelation::Table(usize::from(slot))
+                }
+                crate::storage::RuleTarget::View(slot) => {
+                    crate::storage::RowTypeRelation::View(usize::from(slot))
+                }
+            },
+            definition.fragments(),
+            arena,
+        )?;
+        for attribute in own.iter().copied() {
+            push!(
+                2618,
+                rule.oid(),
+                PG_CLASS_OID,
+                relation_oid,
+                i32::from(attribute),
+                "n"
+            )?;
+        }
         for dependency in storage
             .snapshot_rule_dependencies(slot, txid, arena)?
             .entries()
@@ -641,6 +738,30 @@ pub(crate) fn for_each_dependency(
             "n",
         )?;
         push!(2620, trigger_oid, PG_CLASS_OID, relation_oid, 0, "a")?;
+        // The columns a `WHEN` condition reads through `NEW` and `OLD`.
+        if let (Some(when), crate::storage::TriggerTarget::Table(table)) =
+            (trigger.when.as_ref(), trigger.target)
+        {
+            for attribute in transition_columns(
+                storage,
+                txid,
+                crate::storage::RowTypeRelation::Table(usize::from(table)),
+                core::iter::once(when.as_str()),
+                arena,
+            )?
+            .iter()
+            .copied()
+            {
+                push!(
+                    2620,
+                    trigger_oid,
+                    PG_CLASS_OID,
+                    relation_oid,
+                    i32::from(attribute),
+                    "n"
+                )?;
+            }
+        }
         if let crate::storage::TriggerKind::Constraint {
             referenced_table, ..
         } = trigger.kind
@@ -1011,6 +1132,11 @@ fn relation_dependencies(
                     kind: b'n',
                 })?;
             }
+            collation_edge(
+                ObjectAddress::new(PG_CLASS_OID, relation, attribute),
+                column.collation,
+                visit,
+            )?;
             let Some(default) = definition.attribute_default_oid(column_index) else {
                 continue;
             };
@@ -1092,6 +1218,27 @@ fn type_dependencies(
         )?;
         let row_type = view_row_type_oid(storage, view, false);
         visit(internal(row_type, PG_CLASS_OID, view_oid(storage, view)))?;
+        // A view's columns depend on their user-defined types and collations,
+        // as a table's do.
+        let (_, columns) = storage.view_column_shape(view, txid);
+        for position in 0..columns {
+            let Some((_, column_type)) = storage.view_column(view, txid, position) else {
+                break;
+            };
+            let column = ObjectAddress::new(
+                PG_CLASS_OID,
+                view_oid(storage, view),
+                i32::try_from(position + 1).expect("view attribute fits"),
+            );
+            if crate::storage::NamedTypeKind::from_oid(column_type.oid()).is_some() {
+                visit(DependencyEdge {
+                    dependent: column,
+                    referenced: ObjectAddress::new(PG_TYPE_OID, column_type.oid(), 0),
+                    kind: b'n',
+                })?;
+            }
+            collation_edge(column, column_type.collation(), visit)?;
+        }
         visit(internal(
             view_row_type_oid(storage, view, true),
             PG_TYPE_OID,
@@ -1163,6 +1310,11 @@ fn type_dependencies(
             kind: b'i',
         })?;
         for field in definition.active_fields_for(txid) {
+            collation_edge(
+                ObjectAddress::new(PG_CLASS_OID, relation, i32::from(field.attribute_number)),
+                field.collation,
+                visit,
+            )?;
             if let Some(field_type) = user_type_oid(storage, txid, field.ctype, field.user_type) {
                 visit(DependencyEdge {
                     dependent: ObjectAddress::new(
@@ -1390,4 +1542,94 @@ fn policy_dependencies(
         }
     }
     Ok(())
+}
+
+/// Attribute numbers of `relation` that `NEW.column` or `OLD.column` names in
+/// `fragments`, each once, in attribute order.
+fn transition_columns<'a, 'f>(
+    storage: &Storage,
+    txid: u32,
+    relation: crate::storage::RowTypeRelation,
+    fragments: impl Iterator<Item = &'f str>,
+    arena: &'a Arena,
+) -> Result<&'a [u16], SqlError> {
+    let attribute = |name: &str| -> Option<u16> {
+        match relation {
+            crate::storage::RowTypeRelation::Table(slot) => {
+                let definition = storage.table_def(slot, txid);
+                definition
+                    .column_index(name)
+                    .map(|column| definition.attribute_number(column))
+            }
+            crate::storage::RowTypeRelation::View(slot) => {
+                let (_, count) = storage.view_column_shape(slot, txid);
+                (0..count)
+                    .find(|index| {
+                        storage
+                            .view_column(slot, txid, *index)
+                            .is_some_and(|(column, _)| column.as_str() == name)
+                    })
+                    .and_then(|index| u16::try_from(index + 1).ok())
+            }
+        }
+    };
+    let mut found = ColumnSet::EMPTY;
+    for fragment in fragments {
+        let mut lexer = crate::sql::lexer::Lexer::new(fragment, arena);
+        let mut previous = [crate::sql::lexer::Tok::Eof; 2];
+        loop {
+            let token = lexer.next_token().map_err(|_| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "stored trigger or rule text does not scan"
+                )
+            })?;
+            if token == crate::sql::lexer::Tok::Eof {
+                break;
+            }
+            if let (
+                [
+                    crate::sql::lexer::Tok::Ident(pseudo),
+                    crate::sql::lexer::Tok::Op("."),
+                ],
+                crate::sql::lexer::Tok::Ident(column) | crate::sql::lexer::Tok::QuotedIdent(column),
+            ) = (previous, token)
+                && matches!(pseudo, "new" | "old")
+                && let Some(number) = attribute(column)
+            {
+                found.insert(usize::from(number) - 1);
+            }
+            previous = [previous[1], token];
+        }
+    }
+    let count = (0..MAX_COLUMNS)
+        .filter(|column| found.contains(*column))
+        .count();
+    let attributes = arena
+        .alloc_slice_with(count, |_| 0u16)
+        .map_err(|_| arena_full())?;
+    for (slot, column) in attributes
+        .iter_mut()
+        .zip((0..MAX_COLUMNS).filter(|column| found.contains(*column)))
+    {
+        *slot = u16::try_from(column + 1).expect("attribute number fits");
+    }
+    Ok(attributes)
+}
+
+/// The dependency of a column, index or attribute on a user-defined
+/// collation; built-in collations are pinned and have no row.
+fn collation_edge(
+    dependent: ObjectAddress,
+    collation: crate::sql::ast::Collation,
+    visit: &mut dyn FnMut(DependencyEdge) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    if !matches!(collation, crate::sql::ast::Collation::Catalog(_)) {
+        return Ok(());
+    }
+    visit(DependencyEdge {
+        dependent,
+        referenced: ObjectAddress::new(PG_COLLATION_OID, collation.oid(), 0),
+        kind: b'n',
+    })
 }

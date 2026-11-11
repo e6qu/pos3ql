@@ -14621,9 +14621,8 @@ impl Engine {
             crate::storage::RuleTarget::View(slot) => {
                 let mut descriptions = [ColDesc::new("", 0, 0); MAX_PROJ];
                 let count = match catalog::describe_view(
-                    storage,
-                    txn.txid,
                     &storage.view(usize::from(slot)),
+                    txn.txid,
                     arena,
                     &mut descriptions,
                 ) {
@@ -19946,10 +19945,12 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
                 names,
                 *if_exists,
                 *cascade,
                 arena,
+                guc.seq_session(),
                 responder,
             ),
             Stmt::CreateCollation(command) => {

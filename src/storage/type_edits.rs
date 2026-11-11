@@ -543,6 +543,13 @@ impl super::Storage {
             let Some(parent) = parent else {
                 return Ok(false);
             };
+            // A relation row type or information_schema domain is not in the
+            // user type catalog, so no domain is reached through it.
+            if parent.relation_row_type_creation().is_some()
+                || parent.information_schema_domain_binding().is_some()
+            {
+                return Ok(false);
+            }
             let parent = catalog
                 .resolve_source_reference(
                     super::TypeReference::from_bound_name(parent)?,

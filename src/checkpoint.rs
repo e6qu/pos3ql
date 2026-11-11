@@ -19071,6 +19071,7 @@ fn load_view(
     let mut names = [crate::storage::SqlName::EMPTY; crate::storage::MAX_COLUMNS];
     let mut defaults = [ColumnDefault::NONE; crate::storage::MAX_COLUMNS];
     let mut identities = [None; crate::storage::MAX_COLUMNS];
+    let mut types = [crate::storage::ViewColumnType::PLACEHOLDER; crate::storage::MAX_COLUMNS];
     if count == 0 {
         if !encoded_entries.is_empty() {
             return Err(CheckpointSetupError::Corrupt("invalid empty view columns"));
@@ -19081,7 +19082,7 @@ fn load_view(
             let entry = entries
                 .next()
                 .ok_or(CheckpointSetupError::Corrupt("view column missing"))?;
-            let mut fields = entry.splitn(5, '/');
+            let mut fields = entry.split('/');
             names[index] =
                 sql_name(&decode_hex_name(fields.next().ok_or(
                     CheckpointSetupError::Corrupt("view column name missing"),
@@ -19094,6 +19095,22 @@ fn load_view(
                 "view column default expression missing",
             ))?;
             let stamp = parse_field::<u64>(fields.next(), "view column default identity")?;
+            types[index] = crate::storage::ViewColumnType::new(
+                parse_field(fields.next(), "view column type")?,
+                parse_field(fields.next(), "view column type length")?,
+                parse_field(fields.next(), "view column type modifier")?,
+                crate::sql::ast::Collation::from_code(parse_field(
+                    fields.next(),
+                    "view column collation",
+                )?)
+                .ok_or(CheckpointSetupError::Corrupt(
+                    "invalid view column collation",
+                ))?,
+            )
+            .ok_or(CheckpointSetupError::Corrupt("invalid view column type"))?;
+            if fields.next().is_some() {
+                return Err(CheckpointSetupError::Corrupt("trailing view column fields"));
+            }
             identities[index] = match stamp {
                 0 => None,
                 stamp => Some(crate::storage::ConstraintIdentity::parse(stamp).ok_or(
@@ -19127,7 +19144,7 @@ fn load_view(
             return Err(CheckpointSetupError::Corrupt("trailing view columns"));
         }
     }
-    let mut columns = crate::storage::ViewColumns::from_sql_names(&names[..count])
+    let mut columns = crate::storage::ViewColumns::from_sql_names(&names[..count], &types[..count])
         .map(|columns| columns.with_aliases(aliases))
         .map_err(|error| {
             CheckpointSetupError::ObjectStore(format!(
@@ -19516,7 +19533,15 @@ impl core::fmt::Display for ManifestViewColumns {
                     .ok_or(core::fmt::Error)?
                     .created_at(),
             };
-            write!(output, "/{identity}")?;
+            let column_type = self.0.types()[index];
+            write!(
+                output,
+                "/{identity}/{}/{}/{}/{}",
+                column_type.oid(),
+                column_type.typlen(),
+                column_type.type_mod(),
+                column_type.collation().code()
+            )?;
         }
         Ok(())
     }

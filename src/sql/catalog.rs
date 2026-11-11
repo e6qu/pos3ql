@@ -16487,6 +16487,43 @@ pub fn user_type_name_text<'a>(
         .transpose()
 }
 
+/// PostgreSQL's `format_type_with_typemod` spelling, as error messages print
+/// a type: user-defined types by their visible name, built-ins with their
+/// modifier, and `???` for an OID no catalog row describes.
+pub(crate) fn format_type_oid(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    type_mod: i32,
+) -> StackStr<260> {
+    if let Ok(Some(name)) = user_type_name_fixed(storage, txid, oid) {
+        return name;
+    }
+    let mut rendered = StackStr::<260>::new();
+    use core::fmt::Write as _;
+    let _ = rendered.write_str(
+        crate::sql::eval::funcs::system::format_builtin_type(oid, type_mod, false)
+            .as_ref()
+            .map_or("???", |name| name.as_str()),
+    );
+    rendered
+}
+
+/// A collation's catalog name, unquoted, as PostgreSQL's `get_collation_name`.
+pub(crate) fn collation_raw_name(
+    storage: &Storage,
+    txid: u32,
+    collation: crate::sql::ast::Collation,
+) -> SqlName {
+    match collation {
+        crate::sql::ast::Collation::Catalog(_) => storage
+            .collations_visible_to(txid)
+            .find(|(slot, _)| storage.collation(*slot).oid() == collation.oid())
+            .map_or(SqlName::EMPTY, |(_, definition)| definition.name),
+        builtin => SqlName::parse(builtin.name()).unwrap_or(SqlName::EMPTY),
+    }
+}
+
 pub(crate) fn user_type_name_fixed(
     storage: &Storage,
     txid: u32,
@@ -18662,61 +18699,29 @@ fn text<'a>(s: &str, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
         .map_err(|_| arena_full())
 }
 
+/// A view's output columns from its catalog record: the names and types
+/// fixed when it was created or replaced, as PostgreSQL's `pg_attribute`
+/// rows. SQL descriptions, catalogs and wire metadata all read this.
 pub(crate) fn describe_view<'a>(
-    storage: &'a Storage,
-    txid: u32,
-    view: &crate::storage::ViewDef,
-    arena: &'a Arena,
-    out: &mut [super::types::ColDesc<'a>],
-) -> Result<usize, SqlError> {
-    let user = crate::sql::eval::funcs::system::session_user_owned();
-    let slot = storage
-        .views_visible_to(txid)
-        .find_map(|(slot, candidate)| {
-            (candidate.schema == view.schema && candidate.name == view.name).then_some(slot)
-        })
-        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE, "view does not exist"))?;
-    let query = storage.snapshot_view_query(slot, txid, arena)?;
-    let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
-    let dependencies = query.dependencies;
-    let source = arena
-        .alloc_str(query.sql.as_str())
-        .map_err(|_| arena_full())?;
-    let count = super::query::describe_stored_query(
-        source,
-        query.input_source.unwrap_or(source),
-        storage,
-        txid,
-        path,
-        dependencies.view(),
-        arena,
-        out,
-    )?;
-    overlay_view_column_names(view, txid, out, count, arena)
-}
-
-/// A view's body supplies types; its stored output relation supplies names.
-/// Keeping that overlay here makes SQL descriptions, catalogs, and wire
-/// metadata consume exactly the same identity.
-pub(crate) fn overlay_view_column_names<'a>(
     view: &crate::storage::ViewDef,
     txid: u32,
-    out: &mut [super::types::ColDesc<'a>],
-    count: usize,
     arena: &'a Arena,
+    out: &mut [super::types::ColDesc<'a>],
 ) -> Result<usize, SqlError> {
     let columns = view.columns_for(txid);
-    if columns.len() != count {
+    if columns.len() > out.len() {
         return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "view \"{}\" has an invalid output-column definition",
-            view.name.as_str()
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "view \"{}\" has more than {} columns",
+            view.name.as_str(),
+            out.len()
         ));
     }
-    for (column, name) in out[..count].iter_mut().zip(columns.names()) {
-        column.name = arena.alloc_str(name.as_str()).map_err(|_| arena_full())?;
+    for ((column, name), column_type) in out.iter_mut().zip(columns.names()).zip(columns.types()) {
+        let name = arena.alloc_str(name.as_str()).map_err(|_| arena_full())?;
+        *column = column_type.description(name);
     }
-    Ok(count)
+    Ok(columns.len())
 }
 
 fn pg_stats<'a>(
@@ -24069,7 +24074,7 @@ fn pg_attribute<'a>(
     }
     for (slot, view) in storage.views_visible_to(txid) {
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let count = describe_view(storage, txid, &view, arena, &mut columns)?;
+        let count = describe_view(&view, txid, arena, &mut columns)?;
         let defaults = view.columns_for(txid);
         for (attribute, column) in columns[..count].iter().enumerate() {
             if n == out.len() {
@@ -24093,7 +24098,7 @@ fn pg_attribute<'a>(
                         defaults.default_at(attribute),
                         Some(crate::storage::ColumnDefault::None) | None
                     )),
-                    Datum::Int4(0),
+                    Datum::Int4(column.collation.oid()),
                     text("", arena)?,
                     text("", arena)?,
                     text(type_storage(ctype), arena)?,
@@ -24411,7 +24416,7 @@ fn pg_attrdef<'a>(
         });
         let mut descriptions = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
         let described = if has_expression_default {
-            describe_view(storage, txid, &view, arena, &mut descriptions)?
+            describe_view(&view, txid, arena, &mut descriptions)?
         } else {
             0
         };
@@ -32309,18 +32314,14 @@ fn info_column_type_usage<'a>(
     }
     for (_, view) in storage.views_visible_to(txid) {
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let column_count = describe_view(storage, txid, &view, arena, &mut columns)?;
+        let column_count = describe_view(&view, txid, arena, &mut columns)?;
         for column in &columns[..column_count] {
             let (ctype, user_type) = view_column_catalog_type(storage, txid, column.type_oid)?;
             let metadata = ColumnMeta {
                 name: SqlName::EMPTY,
                 ctype,
                 type_mod: column.type_mod,
-                collation: if ctype.is_collatable() {
-                    crate::sql::ast::Collation::Default
-                } else {
-                    crate::sql::ast::Collation::None
-                },
+                collation: column.collation,
                 storage: crate::sql::ast::ColumnStorage::Plain,
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,

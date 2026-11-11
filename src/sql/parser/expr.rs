@@ -257,6 +257,21 @@ impl<'a> Parser<'a> {
                     let index = lower.expect("non-slice subscript has an index");
                     left = self.arena_expr(Expr::Subscript { base: left, index })?;
                 }
+                // PostgreSQL's indirection continues with field selections:
+                // `items[1].price`, `items[1].*`.
+                while self.peeked == Tok::Op(".") {
+                    self.advance()?;
+                    if self.peeked == Tok::Op("*") {
+                        self.advance()?;
+                        left = self.arena_expr(Expr::Field {
+                            base: left,
+                            field: "*",
+                        })?;
+                        break;
+                    }
+                    let field = self.any_ident("field name")?;
+                    left = self.arena_expr(Expr::Field { base: left, field })?;
+                }
                 subscriptable = true;
                 continue;
             }

@@ -934,7 +934,7 @@ pub(crate) use describe::{
     StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
     infer_type_catalog, intrinsic_record_field_meta, record_shape_metadata,
     record_shape_pool_bytes, routine_result_metadata, unify_numeric_tower,
-    visit_array_constructor_conversions, with_temporary_record_shapes,
+    user_routine_call_result, visit_array_constructor_conversions, with_temporary_record_shapes,
 };
 pub(crate) use describe::{
     bound_parameter_context_active, bound_parameter_type_oid, enter_routine_parameter_types,
@@ -6800,25 +6800,44 @@ fn row_type_column_users(
 fn require_row_type_unused(
     storage: &Storage,
     txid: u32,
-    table: usize,
-    dropped_with: impl Fn(&crate::storage::TableDef) -> bool,
+    relation: crate::storage::RowTypeRelation,
+    dropped_with: impl Fn(SqlName) -> bool,
 ) -> Result<(), SqlError> {
-    let relation = storage.table_def(table, txid);
-    let creation =
-        storage.relation_row_type_creation(crate::storage::RowTypeRelation::Table(table));
+    let (_, name) = storage.row_type_relation_name(relation, txid);
+    let creation = storage.relation_row_type_creation(relation);
+    if let Some(domain) = (0..storage.domain_count()).find(|slot| {
+        storage.domain_slot_visible_to(*slot, txid)
+            && !dropped_with(storage.domain_for(*slot, txid).schema)
+            && matches!(
+                storage.domain_for(*slot, txid).base,
+                ColType::Composite(base) | ColType::Array(ArrElem::Composite(base))
+                    if base == Some(creation)
+            )
+    }) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot drop {} because domain \"{}\" uses its row type",
+            name.as_str(),
+            storage.domain_for(domain, txid).name.as_str()
+        ));
+    }
+    let excluded = match relation {
+        crate::storage::RowTypeRelation::Table(table) => Some(table),
+        crate::storage::RowTypeRelation::View(_) => None,
+    };
     row_type_column_users(
         storage,
         txid,
         creation,
-        &[table],
+        excluded.as_slice(),
         |slot, user, column, _| {
-            if dropped_with(&storage.table_def(slot, txid)) {
+            if dropped_with(storage.table_def(slot, txid).schema) {
                 return Ok(());
             }
             Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "cannot drop {} because column \"{}.{}\" uses its row type",
-                relation.name.as_str(),
+                name.as_str(),
                 user.as_str(),
                 column.as_str()
             ))
@@ -6901,13 +6920,153 @@ fn require_row_type_unaltered(storage: &Storage, txid: u32, table: usize) -> Res
     })
 }
 
+/// PostgreSQL refuses to change the type of a column that a view, rule,
+/// trigger, policy or SQL-standard routine body reads; the first such
+/// dependent, oldest first, is named in the `DETAIL`.
+fn require_column_type_unreferenced(
+    storage: &Storage,
+    txid: u32,
+    table: usize,
+    attribute: u16,
+    column: &str,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    use crate::sql::catalog::{
+        PG_CLASS_OID, PG_POLICY_OID, PG_PROC_OID, PG_REWRITE_OID, PG_TRIGGER_OID,
+    };
+    let referenced = crate::sql::catalog::dependencies::ObjectAddress::new(
+        PG_CLASS_OID,
+        crate::sql::catalog::user_table_oid(storage, table),
+        i32::from(attribute),
+    );
+    let mark = arena.mark();
+    let mut first: Option<crate::sql::catalog::dependencies::ObjectAddress> = None;
+    let walked =
+        crate::sql::catalog::dependencies::for_each_dependency(storage, txid, arena, &mut |edge| {
+            if edge.referenced == referenced
+                && matches!(
+                    edge.dependent.class,
+                    PG_REWRITE_OID | PG_TRIGGER_OID | PG_POLICY_OID | PG_PROC_OID
+                )
+                && first.is_none_or(|current| {
+                    crate::storage::OidBand::creation_order(edge.dependent.object)
+                        < crate::storage::OidBand::creation_order(current.object)
+                })
+            {
+                first = Some(edge.dependent);
+            }
+            Ok(())
+        });
+    // SAFETY: the visit kept only copied addresses.
+    unsafe { arena.rewind_to(mark) };
+    walked?;
+    let Some(dependent) = first else {
+        return Ok(());
+    };
+    let usage = match dependent.class {
+        PG_REWRITE_OID => "by a view or rule",
+        PG_TRIGGER_OID => "in a trigger definition",
+        PG_POLICY_OID => "in a policy definition",
+        _ => "by a function or procedure",
+    };
+    let description = dependency_report::describe(storage, txid, dependent, arena)?;
+    let error = crate::sql::eval::with_detail(
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot alter type of a column used {}",
+            usage
+        ),
+        format_args!("{} depends on column \"{}\"", description, column),
+    );
+    // SAFETY: the diagnostic copied the description.
+    unsafe { arena.rewind_to(mark) };
+    Err(error)
+}
+
+/// Domains over a relation's row type or its array type.
+fn row_type_domains<'a>(
+    storage: &Storage,
+    txid: u32,
+    creation: crate::storage::TypeCreation,
+    arena: &'a Arena,
+) -> Result<Option<&'a mut [bool]>, SqlError> {
+    let mut found = false;
+    let selected = dependency_flags(arena, storage.domain_count())?;
+    for (slot, selected) in selected.iter_mut().enumerate() {
+        if storage.domain_slot_visible_to(slot, txid)
+            && matches!(
+                storage.domain_for(slot, txid).base,
+                ColType::Composite(base) | ColType::Array(ArrElem::Composite(base))
+                    if base == Some(creation)
+            )
+        {
+            *selected = true;
+            found = true;
+        }
+    }
+    Ok(found.then_some(selected))
+}
+
+/// Drops the domains over a dropped relation's row type, which the
+/// statement's dependency report already listed. Without the statement state
+/// a domain drop needs, such a domain fails the drop with `0A000`.
+#[allow(clippy::too_many_arguments)]
+fn drop_row_type_domains(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    (relation_kind, relation_name): (&str, SqlName),
+    creation: crate::storage::TypeCreation,
+    cascade: bool,
+    columns: Option<RowTypeColumnCascade<'_>>,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    let Some(selected) = row_type_domains(storage, txn.txid, creation, arena)? else {
+        return Ok(());
+    };
+    if !cascade {
+        return Err(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop {} {} because other objects depend on it",
+            relation_kind,
+            relation_name.as_str()
+        ));
+    }
+    let Some(RowTypeColumnCascade {
+        scratch,
+        seq_session,
+    }) = columns
+    else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "this statement cannot drop domains over the row type of {} {}",
+            relation_kind,
+            relation_name.as_str()
+        ));
+    };
+    drop_domain_selection(
+        storage,
+        wal,
+        txn,
+        scratch,
+        selected,
+        None,
+        true,
+        1,
+        arena,
+        seq_session,
+        responder,
+    )
+}
+
 /// Reports or cascades to other tables' columns of a dropped relation's row type.
 #[allow(clippy::too_many_arguments)]
 fn drop_row_type_columns(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    relation: &crate::storage::TableDef,
+    (relation_kind, relation_name): (&str, SqlName),
     creation: crate::storage::TypeCreation,
     excluded: &[usize],
     cascade: bool,
@@ -6938,7 +7097,7 @@ fn drop_row_type_columns(
                     "column {} of table {} depends on type {}{}",
                     column.as_str(),
                     table.as_str(),
-                    relation.name.as_str(),
+                    relation_name.as_str(),
                     if array { "[]" } else { "" }
                 )
             };
@@ -6968,8 +7127,9 @@ fn drop_row_type_columns(
         );
         return Err(sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-            "cannot drop table {} because other objects depend on it",
-            relation.name.as_str()
+            "cannot drop {} {} because other objects depend on it",
+            relation_kind,
+            relation_name.as_str()
         ));
     }
     let Some(RowTypeColumnCascade {
@@ -6979,8 +7139,9 @@ fn drop_row_type_columns(
     else {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "this statement cannot drop columns of the row type of table {}",
-            relation.name.as_str()
+            "this statement cannot drop columns of the row type of {} {}",
+            relation_kind,
+            relation_name.as_str()
         ));
     };
     dependency_report::send_cascade_lines(responder, detail.as_str(), count)?;
@@ -7285,11 +7446,28 @@ fn drop_table_kind_with_columns(
                         storage,
                         wal,
                         txn,
-                        &def,
+                        ("table", def.name),
                         storage.relation_row_type_creation(crate::storage::RowTypeRelation::Table(
                             index,
                         )),
                         &selected_tables[..selected_table_count],
+                        statement.cascade,
+                        row_type_columns
+                            .as_mut()
+                            .map(RowTypeColumnCascade::reborrow),
+                        arena,
+                        responder,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    if let Err(error) = drop_row_type_domains(
+                        storage,
+                        wal,
+                        txn,
+                        ("table", def.name),
+                        storage.relation_row_type_creation(crate::storage::RowTypeRelation::Table(
+                            index,
+                        )),
                         statement.cascade,
                         row_type_columns
                             .as_mut()
@@ -7396,14 +7574,23 @@ fn drop_table_kind_with_columns(
                         ) {
                             return sql_fail(error);
                         }
-                        if let Err(error) = drop_selected_stored_queries(
+                        if let Err(error) = drop_selected_stored_queries_with_columns(
                             storage,
                             wal,
                             txn,
-                            dependent_views,
-                            dependent_matviews,
-                            dependent_routines,
-                            dependent_rules,
+                            StoredQuerySelectionDrop {
+                                views: dependent_views,
+                                matviews: dependent_matviews,
+                                routines: dependent_routines,
+                                rules: dependent_rules,
+                            },
+                            row_type_columns
+                                .as_mut()
+                                .map(|columns| ViewRowTypeColumnCascade {
+                                    columns: columns.reborrow(),
+                                    arena,
+                                    responder: &mut *responder,
+                                }),
                         ) {
                             return sql_fail(error);
                         }
@@ -12999,8 +13186,7 @@ fn column_privilege_target(
         crate::storage::AccessClass::View => {
             let view = storage.view(relation.slot as usize);
             let mut descriptions = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-            let count =
-                super::catalog::describe_view(storage, txid, &view, arena, &mut descriptions)?;
+            let count = super::catalog::describe_view(&view, txid, arena, &mut descriptions)?;
             let column = descriptions[..count]
                 .iter()
                 .position(|description| description.name == name)
@@ -15613,6 +15799,14 @@ pub(crate) fn drop_schema(
                             view.persistence == crate::storage::RelationPersistence::Temporary,
                         )
                     };
+                    if let Err(error) = require_row_type_unused(
+                        storage,
+                        txn.txid,
+                        crate::storage::RowTypeRelation::View(*v),
+                        |user_schema| user_schema == schema,
+                    ) {
+                        return sql_fail(error);
+                    }
                     if !temporary {
                         let lsn = storage.bump_lsn();
                         if let Err(e) = wal.stage_reserved(
@@ -15764,9 +15958,12 @@ pub(crate) fn drop_schema(
                     ) {
                         return sql_fail(error);
                     }
-                    if let Err(error) = require_row_type_unused(storage, txn.txid, *table, |user| {
-                        user.schema == def.schema
-                    }) {
+                    if let Err(error) = require_row_type_unused(
+                        storage,
+                        txn.txid,
+                        crate::storage::RowTypeRelation::Table(*table),
+                        |user_schema| user_schema == def.schema,
+                    ) {
                         return sql_fail(error);
                     }
                     let dropped = match storage.drop_table_in(*table, txn.txid) {
@@ -16108,9 +16305,12 @@ pub(crate) fn drop_schema(
                             return sql_fail(e);
                         }
                     }
-                    if let Err(error) = require_row_type_unused(storage, txn.txid, *t, |user| {
-                        user.schema == def.schema
-                    }) {
+                    if let Err(error) = require_row_type_unused(
+                        storage,
+                        txn.txid,
+                        crate::storage::RowTypeRelation::Table(*t),
+                        |user_schema| user_schema == def.schema,
+                    ) {
                         return sql_fail(error);
                     }
                     let dropped = match storage.drop_table_in(*t, txn.txid) {
@@ -26033,10 +26233,12 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
                     names,
                     *if_exists,
                     *cascade,
                     context.arena,
+                    guc.seq_session(),
                     responder,
                 ),
                 Stmt::CreateCollation(command) => super::exec::create_collation(
@@ -38174,26 +38376,6 @@ pub(crate) fn check_sql_routine_result(
         Some(result) => {
             let result_oid = type_oid(result.ctype, result.user_type)?;
             match crate::storage::NamedTypeKind::from_oid(result_oid) {
-                Some((crate::storage::NamedTypeKind::Composite, creation, false))
-                    if let Some(crate::storage::RowTypeRelation::View(view)) =
-                        storage.row_type_relation(creation, txid) =>
-                {
-                    // A view's row type is the shape of its stored query.
-                    let view = storage.view(view);
-                    let width = view.columns_for(txid).names().len();
-                    if width > expected.len() {
-                        return Ok(());
-                    }
-                    let columns = arena
-                        .alloc_slice_with(width, |_| ColDesc::new("", 0, 0))
-                        .map_err(|_| arena_full())?;
-                    let count =
-                        crate::sql::catalog::describe_view(storage, txid, &view, arena, columns)?;
-                    for (slot, column) in expected.iter_mut().zip(&columns[..count]) {
-                        *slot = column.type_oid;
-                    }
-                    (Some(result_oid), count)
-                }
                 Some((crate::storage::NamedTypeKind::Composite, creation, false)) => {
                     let mut count = 0;
                     let mut overflow = false;
@@ -41592,6 +41774,13 @@ pub fn drop_routine(
                 let Some(dependent) = dependent else {
                     break;
                 };
+                // The aggregate takes its own views, rules, policies and
+                // routines with it, as the dependency report listed them.
+                if let Err(error) =
+                    drop_routine_stored_dependents(storage, wal, txn, dependent, arena)
+                {
+                    return sql_fail(error);
+                }
                 let definition = storage.routine_for(dependent, txn.txid);
                 let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
                 let signature =
@@ -41799,16 +41988,24 @@ pub fn create_view(
             described_count
         ));
     }
+    let mut column_types = [crate::storage::ViewColumnType::PLACEHOLDER; MAX_COLUMNS];
+    for (slot, description) in column_types.iter_mut().zip(&described[..described_count]) {
+        *slot = crate::storage::ViewColumnType::from_description(description);
+    }
+    let column_types = &column_types[..described_count];
     let mut columns = if columns.is_empty() {
         for (slot, description) in derived_names.iter_mut().zip(&described[..described_count]) {
             *slot = description.name;
         }
-        match crate::storage::ViewColumns::from_derived_names(&derived_names[..described_count]) {
+        match crate::storage::ViewColumns::from_derived_names(
+            &derived_names[..described_count],
+            column_types,
+        ) {
             Ok(columns) => columns,
             Err(error) => return sql_fail(error),
         }
     } else {
-        match crate::storage::ViewColumns::from_names(columns) {
+        match crate::storage::ViewColumns::from_names(columns, column_types) {
             Ok(columns) => columns,
             Err(error) => return sql_fail(error),
         }
@@ -41895,42 +42092,39 @@ pub fn create_view(
                 name.name
             ));
         }
-        let mut prior_description = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let prior_count = match super::catalog::describe_view(
-            storage,
-            txn.txid,
-            &storage.view(slot),
-            arena,
-            &mut prior_description,
-        ) {
-            Ok(count) => count,
-            Err(error) => return sql_fail(error),
-        };
-        if prior_count != prior.len() {
-            return sql_fail(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "view output-column catalog state does not match its definition"
-            ));
-        }
-        for index in 0..prior.len() {
+        for (index, new) in column_types.iter().copied().enumerate().take(prior.len()) {
             if prior.names()[index] != columns.names()[index] {
-                return sql_fail(sql_err!(
+                let error = sql_err!(
                     sqlstate::INVALID_TABLE_DEFINITION,
                     "cannot change name of view column \"{}\" to \"{}\"",
                     prior.names()[index].as_str(),
                     columns.names()[index].as_str()
-                ));
+                );
+                crate::sql::eval::stash_diagnostic(
+                    None,
+                    Some(crate::util::StackStr::from_str(
+                        "Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead.",
+                    )),
+                );
+                return sql_fail(error);
             }
-            let old = prior_description[index];
-            let new = described[index];
-            if old.type_oid != new.type_oid
-                || old.type_mod != new.type_mod
-                || old.collation != new.collation
-            {
+            let old = prior.types()[index];
+            if old.oid() != new.oid() || old.type_mod() != new.type_mod() {
                 return sql_fail(sql_err!(
                     sqlstate::INVALID_TABLE_DEFINITION,
-                    "cannot change data type of view column \"{}\"",
-                    prior.names()[index].as_str()
+                    "cannot change data type of view column \"{}\" from {} to {}",
+                    prior.names()[index].as_str(),
+                    super::catalog::format_type_oid(storage, txn.txid, old.oid(), old.type_mod()),
+                    super::catalog::format_type_oid(storage, txn.txid, new.oid(), new.type_mod())
+                ));
+            }
+            if old.collation() != new.collation() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "cannot change collation of view column \"{}\" from \"{}\" to \"{}\"",
+                    prior.names()[index].as_str(),
+                    super::catalog::collation_raw_name(storage, txn.txid, old.collation()).as_str(),
+                    super::catalog::collation_raw_name(storage, txn.txid, new.collation()).as_str()
                 ));
             }
             columns = match columns.with_default(
@@ -42344,9 +42538,8 @@ pub fn alter_view(
             }
             let mut descriptions = [ColDesc::new("", 0, 0); MAX_PROJ];
             let count = match super::catalog::describe_view(
-                storage,
-                txn.txid,
                 &storage.view(slot),
+                txn.txid,
                 arena,
                 &mut descriptions,
             ) {
@@ -43276,9 +43469,8 @@ fn stored_rule_definition(
         crate::storage::RuleTarget::View(slot) => {
             let mut descriptions = [ColDesc::new("", 0, 0); MAX_PROJ];
             condition_columns.count = super::catalog::describe_view(
-                storage,
-                txn.txid,
                 &storage.view(usize::from(slot)),
+                txn.txid,
                 arena,
                 &mut descriptions,
             )?;
@@ -45900,7 +46092,12 @@ pub fn drop_materialized_view(
             ) {
                 return sql_fail(e);
             }
-            if let Err(error) = require_row_type_unused(storage, txn.txid, idx, |_| false) {
+            if let Err(error) = require_row_type_unused(
+                storage,
+                txn.txid,
+                crate::storage::RowTypeRelation::Table(idx),
+                |_| false,
+            ) {
                 return sql_fail(error);
             }
             let dropped = match storage.drop_table_in(idx, txn.txid) {
@@ -51609,6 +51806,40 @@ fn report_stored_query_dependents(
     Ok(())
 }
 
+/// Drops every stored query and policy that depends on routine `slot`, for a
+/// cascade whose dependency report already listed them.
+fn drop_routine_stored_dependents(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let StoredDependencyClosure {
+        views,
+        matviews,
+        routines,
+        rules,
+    } = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
+        dependency.class == crate::storage::DependencyClass::Routine
+            && dependency.slot as usize == slot
+    })?;
+    routines[slot] = false;
+    drop_policy_dependents(
+        storage,
+        wal,
+        txn,
+        PolicyDependencySelection::Catalog {
+            class: crate::storage::DependencyClass::Routine,
+            slot,
+        },
+        views,
+        matviews,
+        routines,
+    )?;
+    drop_selected_stored_queries(storage, wal, txn, views, matviews, routines, rules)
+}
+
 fn drop_selected_stored_queries(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -51618,6 +51849,51 @@ fn drop_selected_stored_queries(
     routines: &[bool],
     rules: &[bool],
 ) -> Result<(), SqlError> {
+    drop_selected_stored_queries_with_columns(
+        storage,
+        wal,
+        txn,
+        StoredQuerySelectionDrop {
+            views,
+            matviews,
+            routines,
+            rules,
+        },
+        None,
+    )
+}
+
+struct StoredQuerySelectionDrop<'s> {
+    views: &'s [bool],
+    matviews: &'s [bool],
+    routines: &'s [bool],
+    rules: &'s [bool],
+}
+
+/// The statement state a cascaded view drop needs to drop other tables'
+/// columns of the view's row type.
+struct ViewRowTypeColumnCascade<'c, 'b> {
+    columns: RowTypeColumnCascade<'c>,
+    arena: &'c Arena,
+    responder: &'c mut Responder<'b>,
+}
+
+/// Drops selected stored queries; with `columns`, a dropped view also takes
+/// other tables' columns of its row type, otherwise such a column fails the
+/// drop with `0A000`.
+fn drop_selected_stored_queries_with_columns(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    selection: StoredQuerySelectionDrop<'_>,
+    mut columns: Option<ViewRowTypeColumnCascade<'_, '_>>,
+) -> Result<(), SqlError> {
+    let StoredQuerySelectionDrop {
+        views,
+        matviews,
+        routines,
+        rules,
+    } = selection;
     for slot in (0..rules.len()).rev() {
         if !rules[slot] || storage.rule_slot_visible_to(slot, txn.txid).is_none() {
             continue;
@@ -51637,6 +51913,31 @@ fn drop_selected_stored_queries(
     // immediately reusing a just-freed low slot while this plan is executing.
     for slot in (0..storage.view_count()).rev() {
         if views[slot] && storage.view(slot).visible_to(txn.txid) {
+            if let Some(cascade) = columns.as_mut() {
+                drop_row_type_columns(
+                    storage,
+                    wal,
+                    txn,
+                    ("view", storage.view_column_shape(slot, txn.txid).0),
+                    storage.relation_row_type_creation(crate::storage::RowTypeRelation::View(slot)),
+                    &[],
+                    true,
+                    Some(cascade.columns.reborrow()),
+                    cascade.arena,
+                    cascade.responder,
+                )?;
+                drop_row_type_domains(
+                    storage,
+                    wal,
+                    txn,
+                    ("view", storage.view_column_shape(slot, txn.txid).0),
+                    storage.relation_row_type_creation(crate::storage::RowTypeRelation::View(slot)),
+                    true,
+                    Some(cascade.columns.reborrow()),
+                    cascade.arena,
+                    cascade.responder,
+                )?;
+            }
             drop_view_slot(storage, wal, txn, slot)?;
         }
     }
@@ -51772,6 +52073,12 @@ fn drop_view_slot(
             view.persistence == crate::storage::RelationPersistence::Temporary,
         )
     };
+    require_row_type_unused(
+        storage,
+        txn.txid,
+        crate::storage::RowTypeRelation::View(slot),
+        |_| false,
+    )?;
     drop_view_trigger_dependencies(storage, wal, txn, slot)?;
     if !temporary {
         let lsn = storage.bump_lsn();
@@ -51827,7 +52134,12 @@ fn drop_matview_slot(
             name: name.as_str(),
         },
     )?;
-    require_row_type_unused(storage, txn.txid, table, |_| false)?;
+    require_row_type_unused(
+        storage,
+        txn.txid,
+        crate::storage::RowTypeRelation::Table(table),
+        |_| false,
+    )?;
     let dropped = storage.drop_table_in(table, txn.txid)?;
     txn.record_table_drop(storage, dropped)?;
     storage.drop_indexes_for(table, txn.txid);
@@ -53955,14 +54267,16 @@ fn resolve_sequence(
 
 /// DROP VIEW [IF EXISTS].
 #[allow(clippy::too_many_arguments)]
-pub fn drop_view(
+pub(crate) fn drop_view(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
+    scratch: &mut DmlScratch,
     names: &[QualName],
     if_exists: bool,
     cascade: bool,
     arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
     let report = (|| {
@@ -54097,6 +54411,41 @@ pub fn drop_view(
                         view_name.as_str()
                     ));
                 }
+                // Other tables' columns of the view's row type go first, as
+                // PostgreSQL's dependency report lists them.
+                if let Err(error) = drop_row_type_columns(
+                    storage,
+                    wal,
+                    txn,
+                    ("view", view_name),
+                    storage.relation_row_type_creation(crate::storage::RowTypeRelation::View(slot)),
+                    &[],
+                    cascade,
+                    Some(RowTypeColumnCascade {
+                        scratch: &mut *scratch,
+                        seq_session,
+                    }),
+                    arena,
+                    responder,
+                ) {
+                    return sql_fail(error);
+                }
+                if let Err(error) = drop_row_type_domains(
+                    storage,
+                    wal,
+                    txn,
+                    ("view", view_name),
+                    storage.relation_row_type_creation(crate::storage::RowTypeRelation::View(slot)),
+                    cascade,
+                    Some(RowTypeColumnCascade {
+                        scratch: &mut *scratch,
+                        seq_session,
+                    }),
+                    arena,
+                    responder,
+                ) {
+                    return sql_fail(error);
+                }
                 if cascade {
                     if let Err(error) = drop_policy_dependents(
                         storage,
@@ -54109,14 +54458,24 @@ pub fn drop_view(
                     ) {
                         return sql_fail(error);
                     }
-                    if let Err(error) = drop_selected_stored_queries(
+                    if let Err(error) = drop_selected_stored_queries_with_columns(
                         storage,
                         wal,
                         txn,
-                        dependent_views,
-                        dependent_matviews,
-                        dependent_routines,
-                        dependent_rules,
+                        StoredQuerySelectionDrop {
+                            views: dependent_views,
+                            matviews: dependent_matviews,
+                            routines: dependent_routines,
+                            rules: dependent_rules,
+                        },
+                        Some(ViewRowTypeColumnCascade {
+                            columns: RowTypeColumnCascade {
+                                scratch: &mut *scratch,
+                                seq_session,
+                            },
+                            arena,
+                            responder: &mut *responder,
+                        }),
                     ) {
                         return sql_fail(error);
                     }
@@ -66980,25 +67339,7 @@ pub(crate) fn view_trigger_definition<'a>(
 ) -> Result<crate::storage::TableDefView<'a>, SqlError> {
     let view = storage.view(view_slot);
     let mut columns = [ColDesc::new("", 0, 0); MAX_COLUMNS];
-    let user = crate::sql::eval::funcs::system::session_user_owned();
-    let query = storage.snapshot_view_query(view_slot, txid, arena)?;
-    let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
-    let dependencies = query.dependencies;
-    let source = arena
-        .alloc_str(query.sql.as_str())
-        .map_err(|_| super::query::arena_full_pub())?;
-    let n_columns = super::query::describe_stored_query(
-        source,
-        query.input_source.unwrap_or(source),
-        storage,
-        txid,
-        path,
-        dependencies.view(),
-        arena,
-        &mut columns,
-    )?;
-    let n_columns =
-        super::catalog::overlay_view_column_names(&view, txid, &mut columns, n_columns, arena)?;
+    let n_columns = super::catalog::describe_view(&view, txid, arena, &mut columns)?;
     if n_columns > MAX_COLUMNS {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -76135,6 +76476,16 @@ fn alter_table_relation(
                         .attributes
                         .number(original)
                         .expect("original ALTER column has an attribute number");
+                    if let Err(error) = require_column_type_unreferenced(
+                        storage,
+                        txn.txid,
+                        table_index,
+                        attribute,
+                        column,
+                        arena,
+                    ) {
+                        return sql_fail(error);
+                    }
                     invalidated_statistics.insert(usize::from(attribute - 1));
                 }
                 let Some(target) = ColType::from_sql_name(type_name) else {
@@ -79494,6 +79845,9 @@ const COMPOSITE_MEMBER_IDENTITIES: u16 = crate::storage::rowenc::COMPOSITE_MEMBE
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CompositeEncoding {
     Input,
+    /// An explicit cast (`ROW(...)::t`): each field converts as an explicit
+    /// cast to its type would, so `varchar(4)` truncates instead of failing.
+    ExplicitCast,
     Legacy,
     Members,
 }
@@ -79767,6 +80121,27 @@ fn composite_storage_text<'a>(
 /// Converts an anonymous row constructor into one catalog-defined composite.
 /// The catalog field list is the parse boundary: arity, order and each field's
 /// concrete type are established once, before a `Datum::Composite` exists.
+/// `value::composite`: like [`coerce_composite_value`], with each field
+/// converted by an explicit cast.
+pub(crate) fn cast_composite_value<'a>(
+    value: Datum<'a>,
+    slot: crate::storage::TypeCreation,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<Datum<'a>, SqlError> {
+    coerce_composite_value_inner(
+        value,
+        slot,
+        CompositeEncoding::ExplicitCast,
+        storage,
+        txid,
+        arena,
+        sequences,
+    )
+}
+
 pub(crate) fn coerce_composite_value<'a>(
     value: Datum<'a>,
     slot: Option<crate::storage::TypeCreation>,
@@ -79889,7 +80264,13 @@ fn coerce_composite_value_inner<'a>(
             crate::storage::DeclaredColumnType::Builtin { oid }
             | crate::storage::DeclaredColumnType::UserDefined { oid, .. } => oid,
         };
-        out.value = if encoding == CompositeEncoding::Input {
+        out.value = if encoding == CompositeEncoding::ExplicitCast && field.user_type.is_none() {
+            let value = crate::sql::eval::cast_to(input[index].value, field.ctype, arena)?;
+            apply_cast_typmod(value, field.ctype, field.type_mod, arena)?
+        } else if matches!(
+            encoding,
+            CompositeEncoding::Input | CompositeEncoding::ExplicitCast
+        ) {
             let cast =
                 prepare_assignment_cast(input[index].type_oid, &column, storage, txid, arena)?;
             let value = coerce_assignment(
@@ -81315,8 +81696,7 @@ fn view_privilege_definition<'a>(
 ) -> Result<crate::storage::TableDefView<'a>, SqlError> {
     let definition = storage.view(view);
     let mut descriptions = [super::types::ColDesc::new("", 0, 0); MAX_PROJ];
-    let count =
-        super::catalog::describe_view(storage, txid, &definition, arena, &mut descriptions)?;
+    let count = super::catalog::describe_view(&definition, txid, arena, &mut descriptions)?;
     if count > MAX_COLUMNS {
         return Err(sql_err!(
             sqlstate::TOO_MANY_COLUMNS,

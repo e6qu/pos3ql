@@ -334,10 +334,15 @@ reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
 PL/pgSQL `CALL` in a trigger function fails with `0A000`, and a procedure
 called from PL/pgSQL that waits for storage or a lock runs again from its
 start when its statement resumes (finished effects replay from the statement
-journal) instead of resuming at a saved position inside the procedure. Relation row types: values and columns of a
-view's row type, and dropping a relation through `DROP SCHEMA`, `DROP
-MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
-column uses its row type, fail with `0A000`. `DROP` of casts, operator
+journal) instead of resuming at a saved position inside the procedure. Relation row types: a composite
+attribute of one (`CREATE TYPE wrap AS (o orders)`) fails with `42704` and a
+PL/pgSQL variable of one with `0A000`; dropping a relation through `DROP
+SCHEMA`, `DROP MATERIALIZED VIEW`, `DROP FOREIGN TABLE ... CASCADE` or another
+object's cascade while another table's column or a domain uses its row type
+fails with `0A000`. `ALTER COLUMN ... TYPE` is refused for columns that a
+view, policy or SQL-standard routine body reads, but not yet for columns read
+by a trigger's `WHEN` condition, a rule action or a materialized view, whose
+`pg_depend` column rows are missing. `DROP` of casts, operator
 classes and families, collations, extensions, servers, policies, triggers,
 rules, indexes and `DROP OWNED` still describe their dependents with their own
 code instead of the `pg_depend` walk that `DROP TABLE`, `VIEW`, `MATERIALIZED
@@ -347,15 +352,11 @@ dependents); `pg_depend` has no rows
 for foreign servers, foreign tables and user mappings, and still lacks
 PostgreSQL's rows for
 columns using a user-defined collation, TOAST tables, types named only inside
-expressions (a cast in a default or routine body), and the column-level rows
-of rules and of views that read a sequence. A partition key that is an
-expression (`PARTITION BY LIST ((k + v))`) fails with `42601`. A view that
-passes a function-alias column to an aggregate (`CREATE VIEW v AS SELECT
-agg(x) FROM generate_series(1, 3) x`) fails with `42704` because its column
-types are derived from its query on each use.
-Values and columns of a view's row type need the view's column types,
-which pos3ql derives from the view's query on each use instead of storing them
-as PostgreSQL's `pg_attribute` rows do. The
+expressions (a cast in a default or routine body), the columns a trigger's
+`WHEN` condition reads, a materialized view's `_RETURN` rule and its column
+rows, and the column-level rows of rules (`NEW.x`, `INSERT INTO t (e)`) and of
+views that read a sequence. A partition key that is an
+expression (`PARTITION BY LIST ((k + v))`) fails with `42601`. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

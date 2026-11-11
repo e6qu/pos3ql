@@ -570,8 +570,7 @@ pub(crate) fn visit_catalog_rowtype_fields(
                             "view description exceeds the statement arena"
                         )
                     })?;
-                let count =
-                    crate::sql::catalog::describe_view(storage, txid, &view, arena, columns)?;
+                let count = crate::sql::catalog::describe_view(&view, txid, arena, columns)?;
                 for (out, column) in fields.iter_mut().zip(&columns[..count]) {
                     let (ctype, _) =
                         crate::sql::exec::catalog_column_type(storage, txid, column.type_oid)
@@ -848,53 +847,15 @@ impl ColTypeResolver for CatalogCols<'_> {
                 variadic,
             );
         }
-        let routine = if let Some(oid) = bound_oid {
-            self.storage.function_for_captured_call(
-                oid,
-                argument_names,
-                arguments,
-                variadic,
-                self.txid,
-            )
-        } else if argument_names.is_empty() {
-            self.storage
-                .function_for_call_syntax_oids(name, arguments, variadic, self.txid)
-        } else {
-            self.storage.function_for_named_call_oids(
-                name,
-                argument_names,
-                arguments,
-                variadic,
-                self.txid,
-            )
-        };
-        let result = routine
-            .and_then(|routine| routine.function_result_contract())
-            .or_else(|| {
-                // A stored query binds an aggregate call to its OID.
-                if let Some(oid) = bound_oid {
-                    // Its declared result is exact unless polymorphic.
-                    let slot = self.storage.routine_slot_by_oid(oid, self.txid)?;
-                    let crate::storage::RoutineKind::Aggregate(declared) =
-                        self.storage.routine_for(slot, self.txid).kind
-                    else {
-                        return None;
-                    };
-                    if declared.result_type.polymorphic_type().is_none() {
-                        return Some(declared.result_type);
-                    }
-                    let routine = self
-                        .storage
-                        .routine_for_bound_call(slot, arguments, self.txid)?;
-                    let crate::storage::RoutineKind::Aggregate(aggregate) = routine.kind else {
-                        return None;
-                    };
-                    return Some(aggregate.result_type);
-                }
-                self.storage
-                    .aggregate_for_call_oids(name, arguments, self.txid)
-                    .map(|(_, _, aggregate)| aggregate.result_type)
-            })?;
+        let result = user_routine_call_result(
+            self.storage,
+            self.txid,
+            name,
+            bound_oid,
+            argument_names,
+            arguments,
+            variadic,
+        )?;
         let ctype = result.ctype;
         Some(StaticTypeMeta {
             type_oid: self
@@ -1306,7 +1267,9 @@ fn describe_record_star<'q>(
                             .composite_for(slot, txid)
                             .creation()
                     }),
-                _ => None,
+                _ => infer_type_res(base, resolver)
+                    .ok()
+                    .and_then(|(oid, _)| crate::sql::query::named_composite_creation(oid)),
             };
             if let Some(slot) = slot {
                 let storage = storage.expect("checked");
@@ -4037,17 +4000,37 @@ pub fn record_field_metadata(
             found = Some(meta);
         }
     })?;
+    let base_oid = infer_type_res(base, columns).ok().map(|(oid, _)| oid);
     if shape.is_none() {
         // Not a record at all: PostgreSQL names the non-composite type.
-        let type_name = infer_type_res(base, columns)
-            .ok()
-            .and_then(|(oid, _)| coltype_of_oid(oid))
+        if let Some(oid) = base_oid
+            && oid != oid::RECORD
+            && let Some(name) = columns.type_name_fixed(oid)?
+        {
+            return Err(not_composite(field, name.as_str()));
+        }
+        let type_name = base_oid
+            .and_then(coltype_of_oid)
             .map(|t| t.name())
             .unwrap_or("record");
         if type_name == "record" {
             return Err(could_not_identify(field));
         }
         return Err(not_composite(field, type_name));
+    }
+    if found.is_none()
+        && !matches!(base, Expr::WholeRow(_))
+        && !matches!(base, Expr::Column { qualifier: None, name } if columns.is_whole_row(name))
+        && let Some(oid) =
+            base_oid.filter(|oid| crate::sql::query::named_composite_creation(*oid).is_some())
+        && let Some(name) = columns.type_name_fixed(oid)?
+    {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" not found in data type {}",
+            field,
+            name.as_str()
+        ));
     }
     found.ok_or_else(|| match base {
         // A whole-row reference names the missing column with its table; a
@@ -4543,6 +4526,52 @@ pub(crate) fn infer_routine_argument_oid(
         }
         _ => Ok(infer_type_res(expression, columns)?.0),
     }
+}
+
+/// The result contract of a call to a user-defined function or aggregate.
+/// A stored query binds the call to its OID; otherwise the call's name and
+/// argument types select it.
+pub(crate) fn user_routine_call_result(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    name: &str,
+    bound_oid: Option<i32>,
+    argument_names: &[Option<&str>],
+    arguments: &[i32],
+    variadic: bool,
+) -> Option<crate::storage::RoutineResult> {
+    let routine = if let Some(oid) = bound_oid {
+        storage.function_for_captured_call(oid, argument_names, arguments, variadic, txid)
+    } else if argument_names.is_empty() {
+        storage.function_for_call_syntax_oids(name, arguments, variadic, txid)
+    } else {
+        storage.function_for_named_call_oids(name, argument_names, arguments, variadic, txid)
+    };
+    routine
+        .and_then(|routine| routine.function_result_contract())
+        .or_else(|| {
+            // A stored query binds an aggregate call to its OID.
+            if let Some(oid) = bound_oid {
+                // Its declared result is exact unless polymorphic.
+                let slot = storage.routine_slot_by_oid(oid, txid)?;
+                let crate::storage::RoutineKind::Aggregate(declared) =
+                    storage.routine_for(slot, txid).kind
+                else {
+                    return None;
+                };
+                if declared.result_type.polymorphic_type().is_none() {
+                    return Some(declared.result_type);
+                }
+                let routine = storage.routine_for_bound_call(slot, arguments, txid)?;
+                let crate::storage::RoutineKind::Aggregate(aggregate) = routine.kind else {
+                    return None;
+                };
+                return Some(aggregate.result_type);
+            }
+            storage
+                .aggregate_for_call_oids(name, arguments, txid)
+                .map(|(_, _, aggregate)| aggregate.result_type)
+        })
 }
 
 pub(crate) fn routine_result_metadata(

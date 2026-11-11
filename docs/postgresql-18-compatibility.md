@@ -118,13 +118,24 @@ Row types:
   or column using the row type blocks `DROP TABLE orders`; `CASCADE` drops the
   routine or column. Comparing two composite values uses PostgreSQL's record
   ordering, so `ROW(1, NULL)::orders = ROW(1, NULL)::orders` is true.
+- A view's row type has the view's column types, modifiers and collations as
+  they were when the view was created or replaced: `CREATE VIEW totals AS
+  SELECT sum(amount) AS total FROM orders` keeps `total numeric` even if a later
+  query would describe it differently. `CREATE OR REPLACE VIEW` may only add
+  columns, as in PostgreSQL (`cannot change data type of view column "total"
+  from numeric to integer`).
 - While a column uses the row type, `ALTER TABLE orders ADD COLUMN ... DEFAULT`
-  and `ALTER COLUMN ... TYPE` fail with `0A000` as in PostgreSQL. Dropping the
-  relation through `DROP SCHEMA ... CASCADE` or `DROP MATERIALIZED VIEW`, or a
-  `DROP FOREIGN TABLE ... CASCADE`, while another schema's column uses its row
-  type fails with `0A000` instead of dropping that column.
-- Values and columns of a view's row type are rejected with `0A000`; routine
-  signatures may name it.
+  and `ALTER COLUMN ... TYPE` fail with `0A000` as in PostgreSQL, and `ALTER
+  COLUMN ... TYPE` also fails while a view, rule, policy or SQL-standard routine
+  body reads the column. `DROP TABLE` and `DROP VIEW` with `CASCADE` drop
+  other tables' columns and domains of the dropped relation's row type.
+  Dropping a relation through `DROP SCHEMA ... CASCADE`, `DROP MATERIALIZED
+  VIEW`, `DROP FOREIGN TABLE ... CASCADE` or the cascade of another object
+  (`DROP FUNCTION`) while another schema's column or domain uses its row type
+  fails with `0A000` instead of dropping that column or domain.
+- A composite type attribute of a relation's row type (`CREATE TYPE wrap AS
+  (o orders)`) fails with `42704`, and a PL/pgSQL variable of a relation's row
+  type with `0A000`.
 
 Functions and expressions:
 

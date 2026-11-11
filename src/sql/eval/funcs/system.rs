@@ -2883,55 +2883,9 @@ pub(crate) fn dispatch<'a>(
                 if crate::storage::NamedTypeKind::from_oid(o).is_some() {
                     return Ok(Datum::Text("???"));
                 }
-                let Some(coltype) = exec::coltype_of_oid(o) else {
+                let Some(text) = format_builtin_type(o, type_mod, modifier_given) else {
                     return Ok(Datum::Text("???"));
                 };
-                let (base, array) = match coltype {
-                    ColType::Array(element) => (element.to_coltype(), true),
-                    scalar => (scalar, false),
-                };
-                let name = if base == ColType::Bpchar && modifier_given && type_mod < 0 {
-                    "bpchar"
-                } else {
-                    base.name()
-                };
-                // Array typmods describe their elements. Render the base under
-                // that modifier, then attach [] as PostgreSQL does.
-                let mut text = match TypeMod::decode(base, type_mod) {
-                    TypeMod::None => stack_format!(80, "{}", name),
-                    TypeMod::Length(n) | TypeMod::BitLength(n) => {
-                        stack_format!(80, "{}({})", name, n)
-                    }
-                    TypeMod::NumericPS { precision, scale } => {
-                        stack_format!(80, "{}({},{})", name, precision, scale)
-                    }
-                    TypeMod::TemporalPrecision(p) => {
-                        // The precision sits inside the name, before the
-                        // time-zone tail — `timestamp(3) without time zone`. The
-                        // split finds the tail for both spellings, since
-                        // "without" begins "with".
-                        match name.split_once(" with") {
-                            Some((head, tail)) => {
-                                stack_format!(80, "{}({}) with{}", head, p, tail)
-                            }
-                            None => stack_format!(80, "{}({})", name, p),
-                        }
-                    }
-                    TypeMod::IntervalMod { range, precision } => match range.name() {
-                        Some(fields) => match precision {
-                            Some(p) => stack_format!(80, "interval {}({})", fields, p),
-                            None => stack_format!(80, "interval {}", fields),
-                        },
-                        None => match precision {
-                            Some(p) => stack_format!(80, "interval({})", p),
-                            None => stack_format!(80, "interval"),
-                        },
-                    },
-                };
-                if array {
-                    use core::fmt::Write as _;
-                    let _ = text.write_str("[]");
-                }
                 Ok(Datum::Text(
                     arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
                 ))
@@ -3119,4 +3073,63 @@ pub(crate) fn dispatch<'a>(
             _ => unreachable!("dispatch guard admitted an unhandled name"),
         }
     })())
+}
+
+/// PostgreSQL's `format_type` spelling of a built-in type under a modifier;
+/// `None` for an OID that is not a built-in column type.
+/// `modifier_given` distinguishes an explicit `-1` from no modifier, which
+/// makes PostgreSQL spell unconstrained `character` as `bpchar`.
+pub(crate) fn format_builtin_type(
+    o: i32,
+    type_mod: i32,
+    modifier_given: bool,
+) -> Option<crate::util::StackStr<80>> {
+    let coltype = exec::coltype_of_oid(o)?;
+    let (base, array) = match coltype {
+        ColType::Array(element) => (element.to_coltype(), true),
+        scalar => (scalar, false),
+    };
+    let name = if base == ColType::Bpchar && modifier_given && type_mod < 0 {
+        "bpchar"
+    } else {
+        base.name()
+    };
+    // Array typmods describe their elements. Render the base under
+    // that modifier, then attach [] as PostgreSQL does.
+    let mut text = match TypeMod::decode(base, type_mod) {
+        TypeMod::None => stack_format!(80, "{}", name),
+        TypeMod::Length(n) | TypeMod::BitLength(n) => {
+            stack_format!(80, "{}({})", name, n)
+        }
+        TypeMod::NumericPS { precision, scale } => {
+            stack_format!(80, "{}({},{})", name, precision, scale)
+        }
+        TypeMod::TemporalPrecision(p) => {
+            // The precision sits inside the name, before the
+            // time-zone tail — `timestamp(3) without time zone`. The
+            // split finds the tail for both spellings, since
+            // "without" begins "with".
+            match name.split_once(" with") {
+                Some((head, tail)) => {
+                    stack_format!(80, "{}({}) with{}", head, p, tail)
+                }
+                None => stack_format!(80, "{}({})", name, p),
+            }
+        }
+        TypeMod::IntervalMod { range, precision } => match range.name() {
+            Some(fields) => match precision {
+                Some(p) => stack_format!(80, "interval {}({})", fields, p),
+                None => stack_format!(80, "interval {}", fields),
+            },
+            None => match precision {
+                Some(p) => stack_format!(80, "interval({})", p),
+                None => stack_format!(80, "interval"),
+            },
+        },
+    };
+    if array {
+        use core::fmt::Write as _;
+        let _ = text.write_str("[]");
+    }
+    Some(text)
 }

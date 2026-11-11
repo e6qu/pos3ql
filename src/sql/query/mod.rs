@@ -72,6 +72,7 @@ pub(crate) use cte::{
     bind_dml_materialized_relations, bind_materialized_expression, bind_materialized_relations,
     bind_materialized_statement,
 };
+pub(crate) use scope::unreachable_entry;
 pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;

@@ -48904,10 +48904,10 @@ fn stored_rule_definition(
             {
                 // A condition sees OLD and NEW as range-table entries, so
                 // PostgreSQL reports the missing one as an invalid reference.
-                invalid = Some(sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "invalid reference to FROM-clause entry for table \"{}\"",
-                    if old { "old" } else { "new" }
+                invalid = Some(super::error_position::column_reference(
+                    super::query::unreachable_entry(if old { "old" } else { "new" }),
+                    Some(qualifier),
+                    column,
                 ));
             } else if condition_columns.names[..condition_columns.count]
                 .iter()

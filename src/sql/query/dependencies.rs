@@ -1353,7 +1353,7 @@ pub(crate) fn validate_dml_assignment_casts(
         let values_columns = DependencyTypes {
             scope: None,
             excluded: None,
-            hidden: Some(target_name),
+            hidden: Some((target_name, target)),
             ..columns
         };
         let merge_columns = &columns;
@@ -2052,7 +2052,7 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
         let values_columns = DependencyTypes {
             scope: None,
             excluded: None,
-            hidden: Some(target_name),
+            hidden: Some((target_name, target)),
             ..columns
         };
         let values = match statement {
@@ -2862,9 +2862,12 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
         crate::storage::RelationDefinition<'storage>,
         [&'definition str; 2],
     )>,
-    /// The name of an INSERT target its `VALUES` rows cannot reference;
-    /// they read only `transition`.
-    hidden: Option<&'definition str>,
+    /// The INSERT target, by name and definition, that its `VALUES` rows
+    /// cannot reference; they read only `transition`.
+    hidden: Option<(
+        &'definition str,
+        crate::storage::RelationDefinition<'storage>,
+    )>,
     arena: &'storage Arena,
 }
 
@@ -3015,19 +3018,27 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         {
             return transition.resolve(qualifier, name);
         }
-        if let Some(hidden) = self.hidden {
+        if let Some((hidden, definition)) = self.hidden {
             if let Some(metadata) = self
                 .transition
                 .and_then(|columns| columns.column_meta(qualifier, name))
             {
                 return Ok(metadata.ctype);
             }
+            // PostgreSQL names the target the rows cannot reference.
             return Err(match qualifier {
-                Some(qualifier) if qualifier == hidden => sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "invalid reference to FROM-clause entry for table \"{}\"",
-                    qualifier
-                ),
+                Some(qualifier) if qualifier == hidden => {
+                    super::scope::unreachable_entry(qualifier)
+                }
+                None if definition.column_index(name).is_some() => {
+                    crate::sql::error_position::with_detail(
+                        crate::sql::eval::empty_scope_column_error(None, name),
+                        format_args!(
+                            "There is a column named \"{}\" in table \"{}\", but it cannot be referenced from this part of the query.",
+                            name, hidden
+                        ),
+                    )
+                }
                 _ => crate::sql::eval::empty_scope_column_error(qualifier, name),
             });
         }

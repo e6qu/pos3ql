@@ -450,7 +450,7 @@ pub(crate) struct ScopeMember<'d> {
 /// PostgreSQL's error for a FROM item that exists but is out of reach: an
 /// earlier comma-separated item seen from a join condition, or a table
 /// hidden inside an aliased parenthesized join.
-fn unreachable_entry(name: &str) -> SqlError {
+pub(crate) fn unreachable_entry(name: &str) -> SqlError {
     crate::sql::error_position::with_detail(
         sql_err!(
             sqlstate::UNDEFINED_TABLE,

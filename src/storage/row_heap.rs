@@ -1425,7 +1425,7 @@ mod tests {
                 })
             });
             let completed_while_pinned = crate::mem::guard::forbid_alloc(|| {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = crate::test_wait::deadline();
                 while !done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
                     assert_eq!(&*pinned, b"keep");
                     std::thread::yield_now();
@@ -1466,7 +1466,7 @@ mod tests {
                 })
             });
             let initialized_while_pinned = crate::mem::guard::forbid_alloc(|| {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = crate::test_wait::deadline();
                 while !entered.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
                     std::thread::yield_now();
                 }

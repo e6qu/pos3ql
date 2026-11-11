@@ -4507,7 +4507,7 @@ fn relation_publication_retained_definition_does_not_block_another_table() {
             });
             sender.send(()).unwrap();
         });
-        let progress = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        let progress = receiver.recv_timeout(crate::test_wait::HANG);
         assert_eq!(
             selected.identity().existence,
             CatalogDdlState::PendingCreate { txid: 7 }
@@ -5672,7 +5672,7 @@ fn role_catalog_is_synchronized_and_startup_bounded() {
                     admin: true,
                     ..RoleMembershipOptions::DEFAULT
                 };
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = crate::test_wait::deadline();
                 let (membership, _) = loop {
                     match storage.change_role_membership(
                         BOOTSTRAP_ROLE as usize,
@@ -9871,7 +9871,7 @@ fn shared_table_creation_wait_does_not_reserve_row_reads_or_publication() {
             });
             sent.send(result).unwrap();
         });
-        let progress = received.recv_timeout(std::time::Duration::from_secs(5));
+        let progress = received.recv_timeout(crate::test_wait::HANG);
         // Unblock creation before asserting, so scope teardown cannot
         // strand the waiting worker if publication failed.
         drop(creation);
@@ -10071,7 +10071,7 @@ fn table_retirement_waits_for_its_definition_without_reserving_unrelated_tables(
     let storage = &storage;
     std::thread::scope(|scope| {
         scope.spawn(|| crate::mem::guard::forbid_alloc(|| storage.commit_drop(first)));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = crate::test_wait::deadline();
         let mut selected_is_waiting = false;
         loop {
             match storage.tables[first].lifecycle.try_lock() {
@@ -10099,7 +10099,7 @@ fn table_retirement_waits_for_its_definition_without_reserving_unrelated_tables(
             });
             sent.send(()).unwrap();
         });
-        let unrelated = received.recv_timeout(std::time::Duration::from_secs(5));
+        let unrelated = received.recv_timeout(crate::test_wait::HANG);
         // Release the selected definition before any assertion can unwind
         // the scope while its retiring writer is still waiting.
         drop(held);

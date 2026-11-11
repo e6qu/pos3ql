@@ -318,7 +318,7 @@ fn procedure_storage_reads_yield_after_commit() {
         let sql = "CALL cold_reader()";
         let mut waits = 0;
         let mut completed_statements = 0;
-        let mut deadline = Instant::now() + Duration::from_secs(5);
+        let mut deadline = crate::test_wait::deadline();
         writer.send.clear();
         writer.arena.reset();
         loop {
@@ -377,7 +377,7 @@ fn procedure_storage_reads_yield_after_commit() {
                         .to_owned();
                     let body = namespace.borrow().object_bytes(&key).unwrap().to_vec();
                     reply(&mut stream, &request, &body);
-                    deadline = Instant::now() + Duration::from_secs(5);
+                    deadline = crate::test_wait::deadline();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "procedure read did not advance");

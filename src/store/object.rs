@@ -1029,7 +1029,7 @@ mod tests {
     }
 
     fn finish_request_sends(store: &mut OwnedObjectStore) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         for slot in 0..store.async_read_slots() {
             while store.pending_read_wants_write(slot) {
                 assert!(Instant::now() < deadline, "request send did not progress");
@@ -1090,7 +1090,7 @@ mod tests {
                 atomic_read_response(&mut stream, &frame, packed, missing);
                 drop(stream);
                 let before_completion = store.read_capacity_generation();
-                let deadline = Instant::now() + Duration::from_secs(2);
+                let deadline = crate::test_wait::deadline();
                 while !crate::mem::guard::forbid_alloc(|| store.advance_pending_read(0)).unwrap() {
                     assert!(Instant::now() < deadline, "shared response did not arrive");
                     std::thread::yield_now();
@@ -1237,7 +1237,7 @@ mod tests {
         let (mut stream, _) = atomic_read_request(&listener);
         atomic_read_response(&mut stream, &frame, false, false);
         drop(stream);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         while !crate::mem::guard::forbid_alloc(|| cache.advance_pending_read(0)).unwrap() {
             assert!(
                 Instant::now() < deadline,
@@ -1352,7 +1352,7 @@ mod tests {
 
     fn atomic_read_request(listener: &TcpListener) -> (std::net::TcpStream, Vec<u8>) {
         listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
@@ -1369,10 +1369,10 @@ mod tests {
         // BSD sockets inherit the listener's non-blocking mode.
         stream.set_nonblocking(false).unwrap();
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .set_read_timeout(Some(crate::test_wait::HANG))
             .unwrap();
         stream
-            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .set_write_timeout(Some(crate::test_wait::HANG))
             .unwrap();
         let mut request = Vec::new();
         let mut bytes = [0u8; 2048];
@@ -1471,7 +1471,7 @@ mod tests {
             }
             drop(packed);
             response_released
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(crate::test_wait::HANG)
                 .unwrap();
             atomic_read_response(
                 &mut pending,
@@ -1509,7 +1509,7 @@ mod tests {
         assert_eq!(initial, Err(StoreError::NotReady));
         finish_request_sends(&mut store);
         request_started
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(crate::test_wait::HANG)
             .unwrap();
         let fd = store.pending_read_fd(0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
@@ -1556,7 +1556,7 @@ mod tests {
             store.set_read_owner(Some(ReadOwner(1)));
         });
         release.send(()).unwrap();
-        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         crate::mem::guard::forbid_alloc(|| {
             while !store.advance_pending_read(0).unwrap() {
                 assert!(

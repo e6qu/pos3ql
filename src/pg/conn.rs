@@ -10662,7 +10662,7 @@ mod tests {
             0
         );
         client
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(crate::test_wait::HANG))
             .unwrap();
         let config = Config::default_dev();
         let mut budget = Budget::new(256 << 20);
@@ -10711,7 +10711,7 @@ mod tests {
             assert!(scratch[..length].iter().all(|byte| *byte == 0));
             prefix -= length;
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         while !connection.transport_output_empty() {
             assert!(Instant::now() < deadline, "terminal response did not flush");
             assert_eq!(

@@ -20157,7 +20157,7 @@ mod stored_dependency_tests {
 
     #[test]
     fn checkpoint_reads_full_table_capture_and_large_row_output_resume_once() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
         use std::sync::{
             Arc,
@@ -20280,20 +20280,13 @@ mod stored_dependency_tests {
                         }
                         Err(error) => panic!("accept saved-row read: {error}"),
                     };
-                    socket
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    socket
-                        .set_write_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    let mut bytes = Vec::new();
-                    while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
-                        let mut part = [0; 4096];
-                        let n = socket.read(&mut part).unwrap();
-                        assert_ne!(n, 0);
-                        bytes.extend_from_slice(&part[..n]);
-                    }
-                    let headers = core::str::from_utf8(&bytes).unwrap();
+                    let mut bytes = [0; 8192];
+                    let Some((_, head)) =
+                        crate::test_wait::read_request_head(&mut socket, &mut bytes, &server_stop)
+                    else {
+                        break;
+                    };
+                    let headers = core::str::from_utf8(&bytes[..head]).unwrap();
                     assert!(headers.starts_with("GET "));
                     let path = headers
                         .lines()
@@ -20334,7 +20327,7 @@ mod stored_dependency_tests {
                 }
             });
             checkpoint.enable_async_block_reads();
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::test_wait::deadline();
             while requests.load(Ordering::Acquire) == 0 {
                 for slot in 0..checkpoint.block_read_slots() {
                     crate::mem::guard::forbid_alloc(|| checkpoint.advance_pending_block_read(slot))
@@ -20357,7 +20350,7 @@ mod stored_dependency_tests {
                 assert_eq!(checkpoint.table_output.len(), captured);
             }
             release.store(true, Ordering::Release);
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::test_wait::deadline();
             while checkpoint.table_job.is_some() {
                 for slot in 0..checkpoint.block_read_slots() {
                     crate::mem::guard::forbid_alloc(|| checkpoint.advance_pending_block_read(slot))
@@ -20473,11 +20466,11 @@ mod stored_dependency_tests {
         use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
         use std::sync::mpsc;
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         fn request(stream: &mut TcpStream) -> (String, Vec<u8>) {
             stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(crate::test_wait::HANG))
                 .unwrap();
             let mut bytes = Vec::new();
             let mut part = [0u8; 4096];
@@ -20555,7 +20548,7 @@ mod stored_dependency_tests {
                 if case == "read-only" {
                     reply(&mut put, "403 Forbidden", b"");
                     listener.set_nonblocking(true).unwrap();
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     let mut reads = 0;
                     loop {
                         assert!(
@@ -20626,7 +20619,7 @@ mod stored_dependency_tests {
             let result = crate::mem::guard::forbid_alloc(|| {
                 checkpoint.begin_credential_reload(candidate).unwrap();
                 assert!(checkpoint.client.credentials() == Some(installed));
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = crate::test_wait::deadline();
                 loop {
                     assert!(
                         Instant::now() < deadline,

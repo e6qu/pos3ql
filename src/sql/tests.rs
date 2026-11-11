@@ -65052,7 +65052,7 @@ fn index_validation_uniqueness_reuses_own_changed_cached_keys_without_object_ree
         let start = &start;
         let completed = &completed;
         let writer = scope.spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             while !start.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
                 std::thread::yield_now();
             }
@@ -65081,8 +65081,7 @@ fn index_validation_uniqueness_reuses_own_changed_cached_keys_without_object_ree
                         assert!(encoded.is_some());
                         visits += 1;
                         start.store(true, Ordering::Release);
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        let deadline = crate::test_wait::deadline();
                         while !completed.load(Ordering::Acquire)
                             && std::time::Instant::now() < deadline
                         {
@@ -94550,7 +94549,7 @@ fn finish_sliced_cleanup(engine: &mut Engine) -> usize {
 fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     let (mut engine, mut budget, mut config) =
         sliced_cleanup_fixture("metadata-cleanup-cached-orders", false);
@@ -94582,7 +94581,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
     );
     let mut stream = None;
     for (method, response) in [("GET ", empty), ("GET ", orphan.as_str()), ("DELETE ", "")] {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         loop {
             assert!(
                 Instant::now() < deadline,
@@ -94612,7 +94611,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
             };
             accepted.set_nonblocking(false).unwrap();
             accepted
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(crate::test_wait::HANG))
                 .unwrap();
             stream = Some(accepted);
         }
@@ -94674,7 +94673,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
 fn maintenance_metadata_waits_leave_cached_sql_runnable_through_file_deletion() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     let (mut engine, mut budget, mut config) =
         sliced_cleanup_fixture("file-cleanup-cached-orders", false);
@@ -94706,7 +94705,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_file_deletion() 
     );
     let mut stream = None;
     for (method, response) in [("GET ", empty), ("GET ", orphan.as_str()), ("DELETE ", "")] {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         loop {
             assert!(
                 Instant::now() < deadline,
@@ -94736,7 +94735,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_file_deletion() 
             };
             accepted.set_nonblocking(false).unwrap();
             accepted
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(crate::test_wait::HANG))
                 .unwrap();
             stream = Some(accepted);
         }
@@ -95549,7 +95548,7 @@ fn check_cleanup_during_download(
     );
     let _ = engine.replace_read_owner(foreground_owner);
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     let (mut stream, _) = loop {
         engine.advance_pending_block_read(0).unwrap();
         match listener.accept() {
@@ -95564,7 +95563,7 @@ fn check_cleanup_during_download(
     stream.set_nonblocking(false).unwrap();
     engine.advance_pending_block_read(0).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(crate::test_wait::HANG))
         .unwrap();
     let mut request = [0u8; 4096];
     let mut received = 0;
@@ -95632,7 +95631,7 @@ fn check_cleanup_during_download(
     crate::storage::rowenc::decode(&current, &[ColType::Int4, ColType::Text], &mut values).unwrap();
     assert!(matches!(values[1], Datum::Text(value) if value.len() == 8192));
     stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
+        .set_write_timeout(Some(crate::test_wait::HANG))
         .unwrap();
     if fail_read {
         stream
@@ -95646,7 +95645,7 @@ fn check_cleanup_during_download(
         .unwrap();
         stream.write_all(&framed[..framed_len]).unwrap();
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     crate::mem::guard::forbid_alloc(|| {
         loop {
             assert!(Instant::now() < deadline, "released GET did not complete");
@@ -98535,7 +98534,7 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
 fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
     use crate::store::BlockStore;
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use object_reads::{accept, advance, read_request, replace_uncached_blocks, reply};
 
@@ -98667,7 +98666,7 @@ fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
             break;
         }
         reply(&mut stream, &request, &body);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         while engine.block_reads_pending() {
             advance(&mut engine);
             assert!(
@@ -98830,7 +98829,7 @@ fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
         &foreground_request,
         &foreground_body,
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     loop {
         advance(&mut engine);
         let prior = engine.replace_read_owner(Some(foreground_owner));
@@ -98863,7 +98862,7 @@ fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
         assert!(!engine.checkpoint_can_progress());
         reply(stream.as_mut().unwrap(), &request, &body);
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     while engine.ckpt.as_ref().unwrap().retained_output_pending() {
         advance(&mut engine);
         if !engine.ckpt.as_ref().unwrap().retained_output_pending() {
@@ -99986,7 +99985,6 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
     use crate::store::BlockStore;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use std::time::Duration;
 
     for extended in [false, true] {
         let mut config = test_config(if extended {
@@ -100237,7 +100235,7 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
         );
         assert!(engine.pending_block_read_fd(0).is_some());
         hold_response.store(false, Ordering::Release);
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         while !engine.advance_pending_block_read(0).unwrap() {
             assert!(
                 std::time::Instant::now() < deadline,

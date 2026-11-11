@@ -4,7 +4,7 @@ use crate::sql::cursor::CursorScroll;
 use crate::storage::{RowCursor, RowCursorBuffers, SpilledRowRepresentation};
 use crate::store::{BlockStore, StoreError};
 use std::net::TcpListener;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Clone, Copy)]
 enum SavedRows {
@@ -221,7 +221,7 @@ fn cold_cursor_fetch(
     let mut waited_inside_fetch = false;
     let mut wait_positions = Vec::new();
     let fetch = format!("FETCH FORWARD {batch} FROM cold");
-    let mut deadline = Instant::now() + Duration::from_secs(2);
+    let mut deadline = crate::test_wait::deadline();
     session.send.clear();
     session.arena.reset();
     loop {
@@ -275,7 +275,7 @@ fn cold_cursor_fetch(
                 );
                 session.send.clear();
                 session.arena.reset();
-                deadline = Instant::now() + Duration::from_secs(2);
+                deadline = crate::test_wait::deadline();
             }
             ExecutionStatus::Blocked {
                 output_mark, wait, ..
@@ -307,7 +307,7 @@ fn cold_cursor_fetch(
                             .unwrap()
                             .to_vec();
                         reply(&mut stream, &request, &body);
-                        deadline = Instant::now() + Duration::from_secs(2);
+                        deadline = crate::test_wait::deadline();
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(Instant::now() < deadline, "retained FETCH did not advance");
@@ -472,7 +472,7 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
     let mut count = 0;
     let mut tested_wait = false;
     let mut cold_read_before_first_row = false;
-    let mut deadline = Instant::now() + Duration::from_secs(2);
+    let mut deadline = crate::test_wait::deadline();
     loop {
         advance(&mut engine);
         let prior = engine.replace_read_owner(Some(query_owner));
@@ -504,7 +504,7 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
                 assert_eq!(checksum(code.as_bytes()), expected[count]);
                 count += 1;
                 output.reset();
-                deadline = Instant::now() + Duration::from_secs(2);
+                deadline = crate::test_wait::deadline();
             }
             Ok(None) => break,
             Err(error) => {
@@ -609,7 +609,7 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
                         &foreground_request,
                         namespace.borrow().object_bytes(&foreground_key).unwrap(),
                     );
-                    let foreground_deadline = Instant::now() + Duration::from_secs(2);
+                    let foreground_deadline = crate::test_wait::deadline();
                     loop {
                         advance(&mut engine);
                         let prior = engine.replace_read_owner(Some(other_owner));
@@ -640,7 +640,7 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
                 } else {
                     reply(&mut stream, &request, &body);
                 }
-                deadline = Instant::now() + Duration::from_secs(2);
+                deadline = crate::test_wait::deadline();
             }
         }
     }

@@ -550,7 +550,7 @@ mod tests {
     use crate::storage::{RowHome, RowState, SNAPSHOT_ALL};
     use core::mem::size_of;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     fn fixture() -> (Storage, usize) {
         let config = test_config();
@@ -755,7 +755,7 @@ mod tests {
                     assert!(storage.tables[table].rows.test_write().is_ok());
                     assert!(storage.row_versions.test_write().is_ok());
                     start.store(true, Ordering::Release);
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
                         std::thread::yield_now();
                     }
@@ -943,7 +943,7 @@ mod tests {
                             assert!(storage.tables[table].rows.test_write().is_ok());
                             assert!(storage.row_versions.test_write().is_ok());
                             start.store(true, Ordering::Release);
-                            let deadline = Instant::now() + Duration::from_secs(5);
+                            let deadline = crate::test_wait::deadline();
                             while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
                                 std::thread::yield_now();
                             }
@@ -1276,7 +1276,7 @@ mod tests {
                         assert!(storage.tables[table].rows.test_write().is_ok());
                         assert!(storage.row_versions.test_write().is_ok());
                         start.store(true, Ordering::Release);
-                        let deadline = Instant::now() + Duration::from_secs(5);
+                        let deadline = crate::test_wait::deadline();
                         while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
                             std::thread::yield_now();
                         }

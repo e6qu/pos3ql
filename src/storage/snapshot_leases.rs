@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn replication_snapshot_expiration_does_not_wait_for_row_metadata() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
         let (storage, table) = fixture();
         storage.export_replication_snapshot(77, 7).unwrap();
         let finished = AtomicBool::new(false);
@@ -557,7 +557,7 @@ mod tests {
                 });
             });
             start.wait();
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::test_wait::deadline();
             crate::mem::guard::forbid_alloc(|| {
                 while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
                     std::thread::yield_now();
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn statement_snapshot_leases_allow_publication_while_reader_bytes_are_pinned() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         let (storage, table) = fixture();
         let reader = crate::mem::guard::forbid_alloc(|| {
@@ -809,7 +809,7 @@ mod tests {
                 })
             });
             crate::mem::guard::forbid_alloc(|| {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = crate::test_wait::deadline();
                 while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
                     std::thread::yield_now();
                 }

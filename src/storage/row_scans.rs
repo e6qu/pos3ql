@@ -434,7 +434,7 @@ mod tests {
     fn captured_resident_byte_scans_allow_version_release_while_a_callback_waits() {
         use crate::sql::types::Datum;
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
@@ -494,7 +494,7 @@ mod tests {
                     .for_each_overlay(&mut |rowid, home| {
                         if rowid == 1 {
                             start.store(true, Ordering::Release);
-                            let deadline = Instant::now() + Duration::from_secs(5);
+                            let deadline = crate::test_wait::deadline();
                             while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
                                 std::thread::yield_now();
                             }

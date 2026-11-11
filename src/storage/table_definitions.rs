@@ -1281,7 +1281,7 @@ mod tests {
     fn live_definition_ownership_reader_allows_unrelated_publication_and_retirement() {
         let pool = metadata_pool();
         use std::sync::mpsc;
-        use std::time::Duration;
+
         let versions = versions(4);
         let retained_table = TableDefinition::new(definition(1, &pool));
         let other = TableDefinition::new(definition(1, &pool));
@@ -1307,7 +1307,7 @@ mod tests {
                 });
                 sender.send(result.is_ok()).unwrap();
             });
-            let completed_before_release = receiver.recv_timeout(Duration::from_secs(3));
+            let completed_before_release = receiver.recv_timeout(crate::test_wait::HANG);
             assert_eq!(retained.def.n_columns, 2);
             assert_eq!(retained.txid, 7);
             drop(retained);

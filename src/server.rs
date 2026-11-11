@@ -4105,7 +4105,6 @@ mod tests {
         use crate::sql::{Engine, ExecutionIdentity, ExecutionStatus, StatementWait};
         use crate::storage::DatabaseOid;
         use std::net::TcpListener;
-        use std::time::Duration;
 
         fn execute(engine: &mut Engine, connection: &mut Conn, sql: &str) -> ExecutionStatus {
             connection.arena.reset();
@@ -4186,7 +4185,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             client
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(crate::test_wait::HANG))
                 .unwrap();
             let (stream, _) = listener.accept().unwrap();
             stream.set_nonblocking(true).unwrap();

@@ -1088,7 +1088,7 @@ mod tests {
     use super::super::tests::{make_def, test_budget, test_config};
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     fn fixture() -> (Storage, usize, RowLoc) {
         let config = test_config();
@@ -2385,7 +2385,7 @@ mod tests {
                     undo
                 })
             });
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             while !done.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::yield_now();
             }
@@ -2748,7 +2748,7 @@ mod tests {
                     done.store(true, Ordering::Release);
                 });
             });
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             while !done.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::yield_now();
             }

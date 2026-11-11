@@ -428,7 +428,7 @@ fn notifications_wait_for_the_result_in_progress() {
     assert!(conn.queue_notification(9, "jobs", "ready"));
     let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
     let mut response = response;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = crate::test_wait::deadline();
     while !messages(&response).iter().any(|message| message.0 == b'A') {
         assert!(
             Instant::now() < deadline,
@@ -475,7 +475,7 @@ fn tls_backpressure_keeps_ciphertext_queued_instead_of_closing() {
         rustls::pki_types::ServerName::try_from("localhost").unwrap(),
     )
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = crate::test_wait::deadline();
     while client.is_handshaking() || session.is_handshaking() {
         assert!(Instant::now() < deadline, "handshake stalled");
         while client.wants_write() {

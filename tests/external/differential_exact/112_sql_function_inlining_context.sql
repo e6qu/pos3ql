@@ -28,3 +28,7 @@ PREPARE il112_pv(int) AS SELECT il112_v($1);
 EXECUTE il112_pv(0);
 CREATE FUNCTION il112_pl(v int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN il112_i(v); END $$;
 SELECT il112_pl(0);
+-- A volatile call inside the inlined body runs at execution, not inlining.
+CREATE FUNCTION il112_inner(x int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 10 / x; END $$;
+CREATE FUNCTION il112_outer(a int) RETURNS int LANGUAGE sql AS 'SELECT il112_inner(a)';
+SELECT il112_outer(0);

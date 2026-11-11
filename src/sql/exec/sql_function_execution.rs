@@ -40,8 +40,6 @@ struct SqlSource {
     /// PostgreSQL's planner runs an IMMUTABLE function called with constant
     /// arguments instead of inlining it.
     planned_with_constants: bool,
-    /// Every argument the call site wrote folds to a constant.
-    constant_arguments: bool,
 }
 
 impl SqlSource {
@@ -49,12 +47,7 @@ impl SqlSource {
         &self,
         program: &query::RoutineFunctionProgram<'_>,
     ) -> crate::sql::error_context::SqlFunctionInlining {
-        choose_inlining(
-            self.planned_with_constants,
-            self.inlinable,
-            self.constant_arguments,
-            program,
-        )
+        choose_inlining(self.planned_with_constants, self.inlinable, program)
     }
 }
 
@@ -274,9 +267,9 @@ fn inlinable_declaration(routine: &crate::storage::RoutineDef) -> bool {
 
 /// How PostgreSQL's planner treats a call of a SQL-language function, which
 /// decides its error context: an IMMUTABLE function called with constant
-/// arguments runs at plan time, a body of one plain expression is inlined
-/// (and folded while inlined when the arguments are constants), and any
-/// other body runs as its own statements.
+/// arguments runs at plan time, a body of one plain expression is inlined,
+/// and any other body runs as its own statements. A folded body's errors are
+/// raised in planning, so a call that runs is never `during inlining`.
 pub(crate) fn sql_function_inlining(
     routine: &crate::storage::RoutineDef,
     program: &query::RoutineFunctionProgram<'_>,
@@ -285,7 +278,6 @@ pub(crate) fn sql_function_inlining(
     choose_inlining(
         planned_with_constants(routine, constant_arguments),
         inlinable_declaration(routine),
-        constant_arguments,
         program,
     )
 }
@@ -298,14 +290,13 @@ fn planned_with_constants(routine: &crate::storage::RoutineDef, constant_argumen
 fn choose_inlining(
     planned_with_constants: bool,
     inlinable: bool,
-    constant_arguments: bool,
     program: &query::RoutineFunctionProgram<'_>,
 ) -> crate::sql::error_context::SqlFunctionInlining {
     use crate::sql::error_context::SqlFunctionInlining;
+    // A body that fails while folded with constants fails in planning; one
+    // that runs here was inlined and its errors carry no frame.
     if planned_with_constants || !inlinable || !inlined_by_postgresql(program) {
         SqlFunctionInlining::Executed
-    } else if constant_arguments {
-        SqlFunctionInlining::Folded
     } else {
         SqlFunctionInlining::Inlined
     }
@@ -1143,7 +1134,6 @@ pub(in crate::sql) fn execute_sql_function<'a>(
                 stored,
                 inlinable: inlinable_declaration(routine),
                 planned_with_constants: planned_with_constants(routine, constant_arguments),
-                constant_arguments,
             },
             arguments,
             result,

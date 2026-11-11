@@ -229,8 +229,8 @@ Functions and expressions:
   t`, `target of policy p on table t`, `owner of default privileges on new
   relations belonging to role r`), at most 100 lines and then `and N other
   objects`, then `N objects in database d` for each other database.
-  `pg_shdepend` holds the same rows for the current database and for
-  databases themselves: owners other than the bootstrap superuser and
+  `pg_shdepend` holds the same rows for every database (with that
+  database's OID in `dbid`) and for databases themselves: owners other than the bootstrap superuser and
   predefined roles, every grantee or grantor in an
   ACL other than the owner, the roles a policy names, and default-privilege
   owners and grantees. `pg_describe_object` names objects as PostgreSQL does,
@@ -240,9 +240,11 @@ Functions and expressions:
   column a of table t`, `default privileges on new relations belonging to
   role r`), and `pg_identify_object` names default-privilege rows
   (`for role r in schema s on sequences`). Limits: owners are listed in object OID order and
-  privileges in grant order, where PostgreSQL lists catalog insertion order;
-  `pg_shdepend` omits other databases' rows; a built-in operator class or
-  family has an empty description.
+  privileges in grant order, where PostgreSQL lists catalog insertion order.
+  Casts, operator classes and operator families, built-in ones included,
+  are described as `cast from money to numeric` and `operator class int4_ops
+  for access method btree`, and `pg_cast` lists PostgreSQL's 235 built-in
+  casts.
 - Array and `CASE` result types follow declarations, including subqueries and
   nulls: `ARRAY[(SELECT NULL::date)]` is `date[]`; mixing integer and bigint
   gives `bigint[]`; an empty constructor needs a type (`ARRAY[]::integer[]`).

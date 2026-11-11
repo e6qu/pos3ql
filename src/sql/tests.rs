@@ -52,6 +52,7 @@ mod runtime_input_validity;
 mod runtime_plan_invalidation;
 mod sequence_inheritance;
 mod shared_dependencies;
+mod shared_dependency_databases;
 mod shared_row_capacity;
 mod shared_row_work;
 mod shared_statistics;

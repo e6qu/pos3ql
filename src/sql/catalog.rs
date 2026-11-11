@@ -30580,6 +30580,8 @@ fn pg_wait_events<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
 /// named in the ACL of (`a`) an object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SharedDependency {
+    /// The database of the dependent object; `None` in the current one.
+    pub database: Option<crate::storage::DatabaseOid>,
     pub class: i32,
     pub object: i32,
     pub sub: i32,
@@ -30621,47 +30623,24 @@ pub(crate) fn other_database_role_dependencies<'a>(
     role: usize,
     arena: &'a Arena,
 ) -> Result<&'a [(crate::storage::DatabaseOid, usize)], SqlError> {
-    use crate::storage::AccessObject;
     let counts = arena
         .alloc_slice_with(storage.database_count(), |_| {
             (crate::storage::DatabaseOid::POSTGRES, 0usize)
         })
         .map_err(|_| arena_full())?;
     let mut used = 0usize;
-    let mut record = |database: crate::storage::DatabaseOid| {
+    for dependency in shared_dependencies(storage, txid, arena)? {
+        let Some(database) = dependency.database else {
+            continue;
+        };
+        if usize::from(dependency.role) != role {
+            continue;
+        }
         if let Some(entry) = counts[..used].iter_mut().find(|(oid, _)| *oid == database) {
             entry.1 += 1;
         } else if used < counts.len() {
             counts[used] = (database, 1);
             used += 1;
-        }
-    };
-    for class in OWNED_ACCESS_CLASSES {
-        for slot in 0..storage.access_class_slots(class) {
-            let object = AccessObject {
-                class,
-                slot: slot as u16,
-            };
-            if let Some(database) = storage.access_object_in_other_database(object, txid)
-                && matches!(catalog_owner(storage, object, txid), CatalogOwner::Role(owner) if owner == role)
-            {
-                record(database);
-            }
-        }
-    }
-    // `acl_entries` lists only the current database's grants.
-    for slot in 0..storage.acl_entry_count() {
-        let entry = storage.acl_entry(slot);
-        if entry.object.slot == u16::MAX || !storage.acl_entry_visible(slot, txid) {
-            continue;
-        }
-        let Some(database) = storage.access_object_in_other_database(entry.object, txid) else {
-            continue;
-        };
-        let owner = storage.object_owner(entry.object, txid);
-        let (grantee, grantor) = storage.acl_identity(slot, txid);
-        if owner != role && (usize::from(grantee) == role || usize::from(grantor) == role) {
-            record(database);
         }
     }
     let counts = &mut counts[..used];
@@ -30678,6 +30657,22 @@ pub(crate) fn other_database_role_dependencies<'a>(
 fn role_is_pinned(role: u16) -> bool {
     role == crate::storage::BOOTSTRAP_ROLE
         || crate::storage::PredefinedRole::from_slot(usize::from(role)).is_some()
+}
+
+/// The catalog identity of an object in any database. A schema of another
+/// database cannot be found by name from this one.
+fn shared_object_identity(
+    storage: &Storage,
+    txid: u32,
+    object: crate::storage::AccessObject,
+) -> Option<(i32, i32)> {
+    if object.class == crate::storage::AccessClass::Schema {
+        return Some((
+            PG_NAMESPACE_OID,
+            namespace_oid_for_slot(storage, usize::from(object.slot)),
+        ));
+    }
+    access_object_catalog_identity(storage, txid, object)
 }
 
 pub(crate) fn shared_dependencies<'a>(
@@ -30699,6 +30694,7 @@ pub(crate) fn shared_dependencies<'a>(
     let capacity = capacity + policy_roles + 2 * default_acls.len();
     let rows = arena
         .alloc_slice_with(capacity, |_| SharedDependency {
+            database: None,
             class: 0,
             object: 0,
             sub: 0,
@@ -30713,7 +30709,8 @@ pub(crate) fn shared_dependencies<'a>(
                 class,
                 slot: slot as u16,
             };
-            if !storage.access_object_visible_to(object, txid) {
+            let database = storage.access_object_in_other_database(object, txid);
+            if database.is_none() && !storage.access_object_visible_to(object, txid) {
                 continue;
             }
             let CatalogOwner::Role(owner) = catalog_owner(storage, object, txid) else {
@@ -30724,10 +30721,11 @@ pub(crate) fn shared_dependencies<'a>(
             if role_is_pinned(owner) {
                 continue;
             }
-            let Some((class, oid)) = access_object_catalog_identity(storage, txid, object) else {
+            let Some((class, oid)) = shared_object_identity(storage, txid, object) else {
                 continue;
             };
             rows[count] = SharedDependency {
+                database,
                 class,
                 object: oid,
                 sub: 0,
@@ -30737,7 +30735,13 @@ pub(crate) fn shared_dependencies<'a>(
             count += 1;
         }
     }
-    rows[..count].sort_unstable_by_key(|row| (row.object as u32, row.class));
+    rows[..count].sort_unstable_by_key(|row| {
+        (
+            row.database.map_or(0, |database| database.get()),
+            row.object as u32,
+            row.class,
+        )
+    });
     let mut push = |rows: &mut [SharedDependency], row: SharedDependency| {
         if row.role == PUBLIC_ROLE || role_is_pinned(row.role) || rows[..count].contains(&row) {
             return;
@@ -30750,9 +30754,14 @@ pub(crate) fn shared_dependencies<'a>(
         .alloc_slice_with(storage.acl_entry_count(), |_| (u64::MAX, 0usize))
         .map_err(|_| arena_full())?;
     let mut granted_count = 0;
-    for (slot, entry) in storage.acl_entries() {
-        if storage.acl_entry_visible(slot, txid)
-            && storage.access_object_visible_to(entry.object, txid)
+    for slot in 0..storage.acl_entry_count() {
+        let entry = storage.acl_entry(slot);
+        if entry.object.slot != u16::MAX
+            && storage.acl_entry_visible(slot, txid)
+            && (storage.access_object_visible_to(entry.object, txid)
+                || storage
+                    .access_object_in_other_database(entry.object, txid)
+                    .is_some())
             && granted_count < granted.len()
         {
             let order = storage
@@ -30765,9 +30774,10 @@ pub(crate) fn shared_dependencies<'a>(
     granted[..granted_count].sort_unstable();
     for &(_, slot) in &granted[..granted_count] {
         let entry = storage.acl_entry(slot);
-        let Some((class, oid)) = access_object_catalog_identity(storage, txid, entry.object) else {
+        let Some((class, oid)) = shared_object_identity(storage, txid, entry.object) else {
             continue;
         };
+        let database = storage.access_object_in_other_database(entry.object, txid);
         let owner = storage.object_owner(entry.object, txid) as u16;
         let (grantee, grantor) = storage.acl_identity(slot, txid);
         for role in [grantee, grantor] {
@@ -30775,6 +30785,7 @@ pub(crate) fn shared_dependencies<'a>(
                 push(
                     rows,
                     SharedDependency {
+                        database,
                         class,
                         object: oid,
                         sub: 0,
@@ -30802,6 +30813,7 @@ pub(crate) fn shared_dependencies<'a>(
                 push(
                     rows,
                     SharedDependency {
+                        database: None,
                         class,
                         object: oid,
                         sub: i32::from(entry.target.column()) + 1,
@@ -30818,6 +30830,7 @@ pub(crate) fn shared_dependencies<'a>(
             push(
                 rows,
                 SharedDependency {
+                    database: None,
                     class: 3256,
                     object: crate::storage::policy_oid(&policy),
                     sub: 0,
@@ -30845,6 +30858,7 @@ pub(crate) fn shared_dependencies<'a>(
             push(
                 rows,
                 SharedDependency {
+                    database: None,
                     class: 826,
                     object: image.identity.oid(),
                     sub: 0,
@@ -30860,6 +30874,7 @@ pub(crate) fn shared_dependencies<'a>(
             push(
                 rows,
                 SharedDependency {
+                    database: None,
                     class: 826,
                     object: image.identity.oid(),
                     sub: 0,
@@ -30936,6 +30951,8 @@ fn pg_shdepend<'a>(
                 // Shared objects (databases) record database 0.
                 if dependency.class == 1262 {
                     Datum::Oid(0)
+                } else if let Some(other) = dependency.database {
+                    Datum::Oid(other.get() as u32)
                 } else {
                     database
                 },

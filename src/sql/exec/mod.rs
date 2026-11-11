@@ -9478,7 +9478,7 @@ fn role_dependency_detail(
         let mut reported = 0usize;
         let mut unreported = 0usize;
         for dependency in super::catalog::shared_dependencies(storage, txid, arena)? {
-            if usize::from(dependency.role) != role {
+            if usize::from(dependency.role) != role || dependency.database.is_some() {
                 continue;
             }
             let Some(description) = super::eval::funcs::system::describe_object_text(

@@ -146,3 +146,36 @@ fn pretty_definitions_drop_only_redundant_parentheses() {
         ]
     );
 }
+
+/// View and domain defaults are assigned to the view column's and the domain
+/// base type's type, not printed as conditions.
+#[test]
+fn view_and_domain_defaults_deparse_as_assignments() {
+    let (mut engine, mut budget) = test_engine();
+    for sql in [
+        "CREATE TABLE base_rows(n bigint, t text)",
+        "CREATE VIEW shown_rows AS SELECT n, t FROM base_rows",
+        "ALTER VIEW shown_rows ALTER COLUMN n SET DEFAULT 4",
+        "ALTER VIEW shown_rows ALTER COLUMN t SET DEFAULT 'z'",
+        "CREATE DOMAIN small_count AS int DEFAULT 5",
+    ] {
+        rows(&mut engine, &mut budget, sql);
+    }
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef \
+             WHERE adrelid = 'shown_rows'::regclass ORDER BY adnum"
+        ),
+        ["4", "'z'::text"]
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_expr(typdefaultbin, 0) FROM pg_type WHERE typname = 'small_count'"
+        ),
+        ["5"]
+    );
+}

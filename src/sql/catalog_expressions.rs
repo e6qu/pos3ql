@@ -80,7 +80,7 @@ pub(super) fn current<'a>(
                 ("pg_constraint", "conbin") => (Some("conrelid"), Kind::Expression),
                 ("pg_attrdef", "adbin") => (
                     Some("adrelid"),
-                    default_destination(storage, transaction, &table, row)?,
+                    default_destination(storage, transaction, &table, row, arena)?,
                 ),
                 ("pg_index", "indpred") => (Some("indrelid"), Kind::Expression),
                 ("pg_index", "indexprs") => (Some("indrelid"), Kind::List),
@@ -90,7 +90,7 @@ pub(super) fn current<'a>(
                 ("pg_trigger", "tgqual") => (Some("tgrelid"), Kind::Expression),
                 ("pg_partitioned_table", "partexprs") => (Some("partrelid"), Kind::List),
                 ("pg_class", "relpartbound") => (None, Kind::Partition),
-                ("pg_type", "typdefaultbin") => (None, Kind::Expression),
+                ("pg_type", "typdefaultbin") => (None, domain_default_destination(&table, row)?),
                 ("pg_proc", "proargdefaults") => (
                     None,
                     parameter_default_destinations(storage, transaction, &table, row, arena)?,
@@ -599,12 +599,14 @@ pub(super) fn deparse<'a>(
     ))
 }
 
-/// A column default is assigned to its column's declared type.
+/// A column default is assigned to its column's declared type: a table
+/// column's stored type, or a view column's described output type.
 fn default_destination(
     storage: &Storage,
     transaction: u32,
     table: &SynthTable<'_>,
     row: &[Datum<'_>],
+    arena: &Arena,
 ) -> Result<Kind<'static>, SqlError> {
     let field = |name: &str| {
         table
@@ -614,26 +616,59 @@ fn default_destination(
             .transpose()
     };
     let (Some(relation), Some(number)) = (field("adrelid")?, field("adnum")?) else {
-        return Ok(Kind::Expression);
+        return Err(unresolved_default());
     };
-    let Some(slot) = (0..storage.table_count()).find(|&slot| {
+    let attribute = usize::try_from(number)
+        .ok()
+        .and_then(|number| number.checked_sub(1))
+        .ok_or_else(unresolved_default)?;
+    if let Some(slot) = (0..storage.table_count()).find(|&slot| {
         storage.table_slot_visible_to(slot, transaction)
             && super::user_table_oid(storage, slot) == relation
-    }) else {
-        return Ok(Kind::Expression);
-    };
-    let definition = storage.table_def(slot, transaction);
-    let Some(column) = u16::try_from(number)
-        .ok()
-        .and_then(|number| definition.attribute_column(number))
-    else {
-        return Ok(Kind::Expression);
-    };
-    Ok(Kind::Assignment(super::catalog_column_type_oid(
-        storage,
-        &definition.columns()[column],
-        transaction,
-    )?))
+    }) {
+        let definition = storage.table_def(slot, transaction);
+        let column = u16::try_from(number)
+            .ok()
+            .and_then(|number| definition.attribute_column(number))
+            .ok_or_else(unresolved_default)?;
+        return Ok(Kind::Assignment(super::catalog_column_type_oid(
+            storage,
+            &definition.columns()[column],
+            transaction,
+        )?));
+    }
+    let view = storage
+        .views_visible_to(transaction)
+        .find_map(|(slot, view)| (super::view_oid(storage, slot) == relation).then_some(view))
+        .ok_or_else(unresolved_default)?;
+    let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
+    let count = super::describe_view(storage, transaction, &view, arena, &mut columns)?;
+    columns[..count]
+        .get(attribute)
+        .map(|column| Kind::Assignment(column.type_oid))
+        .ok_or_else(unresolved_default)
+}
+
+/// A domain default is assigned to the domain's base type.
+fn domain_default_destination(
+    table: &SynthTable<'_>,
+    row: &[Datum<'_>],
+) -> Result<Kind<'static>, SqlError> {
+    let base = table
+        .def
+        .column_index("typbasetype")
+        .map(|index| super::view_rows::integer(row[index]))
+        .transpose()?
+        .filter(|base| *base != 0)
+        .ok_or_else(unresolved_default)?;
+    Ok(Kind::Assignment(base))
+}
+
+fn unresolved_default() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "catalog default does not name a visible column"
+    )
 }
 
 /// The types of a stored routine's defaulted parameters, in order.

@@ -232,6 +232,20 @@ impl RowProgress {
             Some(start) => {
                 txn.resume_command(start.command);
                 start.point.seek()?;
+                // Calls completed between attempts belong to no attempt: this
+                // attempt's rollback starts after them.
+                let (wal, lock) = self.journal.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "write step progress has no attempt journal position"
+                    )
+                })?;
+                self.steps.start = Some(StepStart {
+                    mark: txn.statement_mark(wal, lock),
+                    output: responder.mark(),
+                    effects: txn.transaction_effect_mark(),
+                    ..start
+                });
             }
             None => {
                 if separate && index != 0 {

@@ -333,7 +333,7 @@ pub(super) fn join_shape<'a>(
     if !from.joins.iter().all(|join| {
         matches!(
             join.kind,
-            JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+            JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left
         )
     }) {
         return Ok(None);
@@ -365,7 +365,7 @@ pub(super) fn join_shape<'a>(
             return Ok(None);
         }
     }
-    let all_cross = from.joins.iter().all(|join| join.kind == JoinKind::Cross);
+    let all_cross = from.joins.iter().all(|join| join.kind.is_cross());
     let order = if all_cross {
         crate::sql::query::plan::join_order(storage, scope, where_clause, arena)?
     } else {
@@ -431,10 +431,12 @@ pub(super) fn join_shape<'a>(
         })
         .map_err(|_| arena_full())?;
     let mut counts = [0usize; MAX_RETAINED_SOURCES];
-    let all_inner = from
-        .joins
-        .iter()
-        .all(|join| matches!(join.kind, JoinKind::Inner | JoinKind::Cross));
+    let all_inner = from.joins.iter().all(|join| {
+        matches!(
+            join.kind,
+            JoinKind::Inner | JoinKind::Cross | JoinKind::Comma
+        )
+    });
     if all_inner && let Some(predicate) = where_clause {
         let mut conjuncts = [predicate; crate::sql::query::plan::MAX_CONJUNCTS];
         let mut count = 0;

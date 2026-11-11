@@ -1118,7 +1118,7 @@ pub(crate) fn view_definition<'a>(
             join.on.is_none()
                 || join.using.is_some()
                 || join.natural
-                || join.kind == crate::sql::ast::JoinKind::Cross
+                || join.kind.is_cross()
                 || plain_table(&join.table).is_none()
         })
         || !select.with.is_empty()

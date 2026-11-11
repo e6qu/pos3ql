@@ -842,3 +842,113 @@ fn retained_joins_apply_using_and_natural_conditions() {
         ["1", "2", "1", "t1|10", "t1|b1", "t2|b2"]
     );
 }
+
+#[test]
+fn grouped_statements_keep_fixed_aggregate_states_per_group() {
+    // 32 KiB of plan_build_bytes holds three groups' states, but not 6000
+    // saved input rows: only the per-group method completes in one scan.
+    let mut config = test_config("grouped-statement-fixed-states");
+    config.plan_build_bytes = 32 * 1024;
+    config.txn_rows = 8 * 1024;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE fixed_source(k int, v int); \
+         INSERT INTO fixed_source SELECT g % 3, g FROM generate_series(1, 6000) g; \
+         CREATE FUNCTION fixed_tag(value bigint) RETURNS text \
+         LANGUAGE sql AS $$SELECT 'n' || $1$$",
+        true,
+    );
+    session.success(&mut engine, "BEGIN", true);
+    // PostgreSQL 18.6 returns these rows. The grouping folds each row into
+    // its group's states, so its input is read once.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT k, fixed_tag(count(*)), sum(v), avg(v)::int, max(v) FROM fixed_source \
+             GROUP BY k ORDER BY k; \
+             SELECT seq_scan FROM pg_stat_xact_user_tables \
+             WHERE relid = 'fixed_source'::regclass",
+            true,
+        )),
+        [
+            "0|n2000|6003000|3002|6000",
+            "1|n2000|5999000|3000|5998",
+            "2|n2000|6001000|3001|5999",
+            "1"
+        ]
+    );
+    // max(text) keeps no fixed state: its input does not fit, and the
+    // general executor reads the source again.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT k, fixed_tag(count(*)), max(v::text) FROM fixed_source \
+             GROUP BY k ORDER BY k; \
+             SELECT seq_scan > 2 FROM pg_stat_xact_user_tables \
+             WHERE relid = 'fixed_source'::regclass",
+            true,
+        )),
+        ["0|n2000|999", "1|n2000|997", "2|n2000|998", "t"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
+fn hash_joins_grow_past_estimates_of_spilled_tables() {
+    // Rows spilled to object storage are estimated, not counted: a build
+    // side larger than the estimate grows its table, and rows still in
+    // memory join with column-block rows, as in PostgreSQL 18.6.
+    let name = "hash-join-spilled-estimate";
+    let mut config = test_config(name);
+    config.row_overlay_slots = 512;
+    config.txn_rows = 512;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("{name}-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE spilled_rows(id int, payload text)",
+        false,
+    );
+    for first in (1..=3000).step_by(500) {
+        session.success(
+            &mut engine,
+            &format!(
+                "INSERT INTO spilled_rows SELECT g, repeat('x', 100) \
+                 FROM generate_series({first}, {}) g",
+                first + 499
+            ),
+            false,
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+    session.success(
+        &mut engine,
+        "CREATE TABLE fresh_rows(id int, tag text); \
+         INSERT INTO fresh_rows SELECT g, 't' FROM generate_series(1, 100) g",
+        false,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*), sum(length(r.payload)) FROM spilled_rows r \
+             JOIN spilled_rows s ON s.id = r.id; \
+             SELECT count(*) FROM spilled_rows r JOIN fresh_rows f ON f.id = r.id; \
+             SELECT count(*) FROM fresh_rows f JOIN spilled_rows r ON r.id = f.id",
+            false,
+        )),
+        ["3000|300000", "100", "100"]
+    );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

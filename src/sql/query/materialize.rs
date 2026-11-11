@@ -657,9 +657,13 @@ fn projected_collations<'a>(
     Ok(collations)
 }
 
+/// Sorts and deduplicates DISTINCT output. The sort is stable, so each
+/// distinct value keeps its first row, as PostgreSQL's hashed DISTINCT does
+/// for values that compare equal but differ (`0` and `-0`, `1.0` and `1.00`).
 fn sort_dedup_collated(
     storage: &Storage,
     txid: u32,
+    arena: &Arena,
     rows: &mut [&[u8]],
     width: usize,
     collations: &[Collation],
@@ -672,7 +676,7 @@ fn sort_dedup_collated(
             )?;
         }
     }
-    rows.sort_unstable_by(|left, right| {
+    crate::mem::arena::stable_sort_via(arena, rows, |left, right| {
         for (index, &collation) in collations.iter().take(width).enumerate() {
             let ordering = compare_materialized_key(
                 storage,
@@ -687,7 +691,8 @@ fn sort_dedup_collated(
             }
         }
         core::cmp::Ordering::Equal
-    });
+    })
+    .map_err(|_| arena_full())?;
     let mut unique = 0;
     for index in 0..rows.len() {
         if index == 0
@@ -1141,7 +1146,7 @@ pub(crate) fn materialized_rows<'a>(
     // row per key in ORDER BY order survives.
     let mut live = rows.len();
     if statement.distinct && n_on == 0 {
-        live = sort_dedup_collated(storage, txid, rows, width, &visible_collations)?;
+        live = sort_dedup_collated(storage, txid, arena, rows, width, &visible_collations)?;
     }
     let rows = &mut rows[..live];
 

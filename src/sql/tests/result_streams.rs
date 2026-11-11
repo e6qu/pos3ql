@@ -102,6 +102,8 @@ enum ColdRequest {
     Copy,
     /// A paged portal of a grouping, which reads its whole input first.
     Grouped,
+    /// A paged portal of a plain DISTINCT, grouped by its output list.
+    Distinct,
 }
 
 #[test]
@@ -124,8 +126,16 @@ fn grouped_paged_portals_yield_on_cold_reads_and_read_each_object_once() {
     cold_result_stream("result-stream-cold-grouped", ColdRequest::Grouped);
 }
 
+#[test]
+fn distinct_paged_portals_yield_on_cold_reads_and_read_each_object_once() {
+    cold_result_stream("result-stream-cold-distinct", ColdRequest::Distinct);
+}
+
 fn cold_result_stream(name: &str, request: ColdRequest) {
-    let paged = matches!(request, ColdRequest::Paged | ColdRequest::Grouped);
+    let paged = matches!(
+        request,
+        ColdRequest::Paged | ColdRequest::Grouped | ColdRequest::Distinct
+    );
     let mut config = test_config(name);
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -199,6 +209,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             ColdRequest::Select => query(sql),
             ColdRequest::Paged => paged_request(sql, 50),
             ColdRequest::Copy => query("COPY cold_orders TO STDOUT"),
+            ColdRequest::Distinct => paged_request("SELECT DISTINCT id, code FROM cold_orders", 50),
             ColdRequest::Grouped => paged_request(
                 "SELECT id, max(code), count(*) FROM cold_orders GROUP BY id",
                 50,
@@ -236,7 +247,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         );
         // A grouping reads its whole input before its first row: its waits
         // come before any row.
-        let grouped = request == ColdRequest::Grouped;
+        let grouped = matches!(request, ColdRequest::Grouped | ColdRequest::Distinct);
         if conn.parked_wait() == Some(StatementWait::ObjectIo)
             && conn.result_stream_active()
             && (grouped || !paged || delivered > 50)
@@ -298,7 +309,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         String::from_utf8_lossy(response[kinds.len() - 2].1)
     );
     match request {
-        ColdRequest::Grouped => {
+        ColdRequest::Grouped | ColdRequest::Distinct => {
             assert_eq!(kinds.iter().filter(|kind| **kind == b's').count(), 3);
             assert_eq!(response[kinds.len() - 2].1, b"SELECT 170\0");
             // The portal opens its stream before running, and the input read

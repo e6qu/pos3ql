@@ -148,8 +148,8 @@ ORDINALITY`), or a **retained join** of up to eight such items or literal
 `VALUES` lists (a nested loop, or a hash join built in `plan_build_bytes`
 where the general executor would hash), optionally with an `ORDER BY` the
 stream sorts itself (local mode), or a **retained grouping** of such a
-source (`GROUP BY`, `HAVING` and aggregates, below); without grouping sets,
-`DISTINCT`, set operations, subqueries, CTEs, row locking or row security, whose read position (one
+source (`GROUP BY`, `HAVING`, aggregates and plain `DISTINCT`, below);
+without grouping sets, `DISTINCT ON`, set operations, subqueries, CTEs, row locking or row security, whose read position (one
 record per resident row of each table plus the query text) fits
 `result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins
 whose `ON`/`USING` conditions are scalar, non-volatile and call no
@@ -299,23 +299,49 @@ keys, `WHERE` and aggregate inputs are non-volatile and call no SQL-language
 routine, its custom aggregates' support functions are builtins (in
 object-store mode, also not combined in parts), and its `ORDER BY`, if any,
 is a prefix of its keys ascending with NULLs last; without grouping sets or
-`DISTINCT`. At its first row it reads its whole input, filters it and saves
-each row's keys and the input columns its aggregates read in two
-`plan_build_bytes` leases; a storage wait keeps those rows and the input
-position. It then orders the rows by key (equal keys keep input order) and
-folds each group with the general executor's aggregate states over that
-group's rows in input order, saving the keys and results in two more leases
-and releasing the input. Transition states never cross a wait: only reading
-input waits, and folding reads saved rows and calls no routine body. Groups
+`DISTINCT ON`. A plain `SELECT DISTINCT` without grouping or aggregates
+groups by its output list the same way: the general executor also returns
+it sorted by that list, and each distinct value keeps its first row's
+spelling (`1` before `1.00`), as PostgreSQL's hashed `DISTINCT` does; the
+general executor's sort is now stable for that reason. At its first row it reads its whole input and filters it; a
+storage wait keeps what was saved and the input position. How it saves its
+input is decided before any row, from the aggregates' kinds and argument
+types:
+
+- **Per group** when every aggregate's transition state has a fixed size or
+  holds one value: `count`, `sum`/`avg` over integers, `money`, floats and
+  `interval`, `min`/`max` of any type, `bool_and`/`bool_or`/`every`, the
+  bitwise aggregates over integers, variance and standard deviation over
+  floats, and the two-argument statistical aggregates, without `DISTINCT` or
+  an aggregate `ORDER BY`. Each group keeps its key and a few bytes per
+  aggregate in `plan_build_bytes`, found through a balanced tree ordered by
+  key; a `min`/`max` of a type passed by reference (text, numeric, arrays)
+  keeps its current value there too, rewritten in place when the new one
+  fits. Each input row folds into its group as it is read, and a group's
+  results are computed as its row is returned: `SELECT k, f(count(*)) FROM t
+  GROUP BY k` holds one record per distinct `k`, however many rows `t` has.
+- **Per input row** otherwise (numeric sums, collecting, ordered-set and
+  custom aggregates, `DISTINCT` or `ORDER BY` inside an aggregate): it saves
+  each row's keys and the input columns its aggregates read, orders them by
+  key (equal keys keep input order), folds each group over its rows and
+  saves its keys and results in two more leases.
+
+Either way a group folds its rows in input order with the general
+executor's aggregate states, each initialized once per aggregate and copied
+for every group (the general executor now does the same). Transition states never cross a wait inside a
+row: only reading input waits, and folding calls no routine body. Groups
 come out in the general executor's order (keys ascending, NULLs last), each
 reporting its first input row's key as PostgreSQL's hashed grouping does
 (the general executor now does too). `HAVING` and the output list run per
 group as its row is returned, so a routine call there hands off on its row.
-An error in an aggregate's input is reported before the first row, as the
-general executor reports it; one in `HAVING` or the output list follows the
-groups already returned, as PostgreSQL's executor returns them. A grouping
-that does not fit `plan_build_bytes` runs in the general executor, as a sort
-does.
+An error in an aggregate's input is reported before the first row; one in
+an aggregate's result (an overflowing `sum`), `HAVING` or the output list
+follows the groups already returned, as PostgreSQL's executor returns them
+(per input row, the results are computed before the first row). A grouping that does not fit
+`plan_build_bytes` runs in the general executor, as a sort does. A top-level
+`SELECT` is run in place only when its output list, `WHERE` or `HAVING` may
+hand a call off to a routine; builtin aggregate calls alone, as in `SELECT
+count(*) FROM t`, stay in the general executor.
 
 **Nodes.** Each node implements one step: `next(row slot) -> Row | End |
 Wait(kind)`. A wait returns up the tree without discarding state; the
@@ -329,8 +355,8 @@ delivered, as streams do now.
 | Filter, projection, `LIMIT`/`OFFSET` | Remaining counts | Node record |
 | Nested-loop join (built: inner, cross and `LEFT`) | Each level's row bytes, position and matched flag | The stream or cursor allocation; the inner source rewinds as scrollable cursors do |
 | Hash join (built: two tables, inner, cross and `LEFT`) | Build-side rows, entries and bucket heads | `plan_build_bytes` / `plan_build_leases`; exhaustion is `54000` naming them |
-| Grouping (built: `GROUP BY`, `HAVING`, aggregates) | Input rows' keys and aggregated columns, then each group's keys and results | `plan_build_bytes` |
-| `DISTINCT` (not built) | Output rows, deduplicated as the general executor orders them | `plan_build_bytes` |
+| Grouping (built: `GROUP BY`, `HAVING`, aggregates) | Each group's key, states and held values; or every input row's keys and aggregated columns, then each group's keys and results | `plan_build_bytes` |
+| `DISTINCT` (built: plain, as a grouping by the output list) | Each distinct output row | `plan_build_bytes` |
 | Sort (built: local mode) | Sort keys, saved output and input columns of every row | `plan_build_bytes`; object-store mode: the external sorter's runs on the block grid (not built) |
 | Set operations | `UNION ALL`: child cursor; others: sorted runs of both inputs with counts | External runs |
 | Scalar, `IN`/`EXISTS` subquery | Per-outer-row child tree, rewound per row, or a cached sorted run when uncorrelated | Node record or external run |

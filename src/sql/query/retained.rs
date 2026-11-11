@@ -1189,7 +1189,7 @@ fn join_clauses_retained(statement: &Select<'_>, self_sorts: bool, groups_itself
     (statement.order_by.is_empty() || self_sorts)
         && statement.with.is_empty()
         && statement.set_body.is_none()
-        && !statement.distinct
+        && (groups_itself || !statement.distinct)
         && statement.distinct_on.is_empty()
         && (groups_itself || statement.group_by.is_empty() && statement.having.is_none())
         && statement.grouping_sets.is_empty()
@@ -2121,7 +2121,6 @@ impl<'a> RetainedSelect<'a> {
             || from.base.sample.is_some()
             || !statement.with.is_empty()
             || statement.set_body.is_some()
-            || statement.distinct
             || !statement.distinct_on.is_empty()
             || !statement.grouping_sets.is_empty()
             || !statement.locking.is_empty()
@@ -2335,9 +2334,11 @@ impl<'a> RetainedSelect<'a> {
                 )
         }) || !statement.with.is_empty()
             || statement.set_body.is_some()
-            || statement.distinct
             || !statement.distinct_on.is_empty()
-            || !groups_itself && (!statement.group_by.is_empty() || statement.having.is_some())
+            || !groups_itself
+                && (statement.distinct
+                    || !statement.group_by.is_empty()
+                    || statement.having.is_some())
             || !statement.grouping_sets.is_empty()
             || statement.with_ties
         {
@@ -2741,7 +2742,7 @@ impl<'a> RetainedSelect<'a> {
         };
         let grouping = match (aggregates, from) {
             (Some(aggregates), Some(from)) => Some(grouping::GroupState::new(
-                storage, statement, from, aggregates, &scope, arena,
+                storage, txid, statement, from, aggregates, &scope, arena,
             )?),
             _ => None,
         };
@@ -3033,7 +3034,7 @@ impl<'a> RetainedSelect<'a> {
         };
         let grouping = aggregates
             .map(|aggregates| {
-                grouping::GroupState::new(storage, statement, from, aggregates, &scope, arena)
+                grouping::GroupState::new(storage, txid, statement, from, aggregates, &scope, arena)
             })
             .transpose()?;
         crate::sql::exec::DescriptionTarget::Wire.finish(
@@ -3202,16 +3203,15 @@ impl<'a> RetainedSelect<'a> {
                 self.grouping
                     .as_mut()
                     .expect("grouped reader")
-                    .finish_input(storage, txid)?;
+                    .finish_input(storage, txid, work)?;
                 break;
             }
             let mark = work.mark();
             let mut grouping = self.grouping.take().expect("grouped reader");
-            let pushed = self
-                .encode_group_input(&grouping, storage, txid, work, params)
-                .and_then(|encoded| encoded.map_or(Ok(()), |row| grouping.push_input(row)));
+            let pushed = self.accept_group_input(&mut grouping, storage, txid, work, params);
             self.grouping = Some(grouping);
-            // SAFETY: the encoded row was copied into the grouping's lease.
+            // SAFETY: the row's keys, states or saved columns were copied
+            // into the grouping's leases.
             unsafe { work.rewind_to(mark) };
             pushed?;
             self.finish_input_row(state_arena);
@@ -3222,16 +3222,15 @@ impl<'a> RetainedSelect<'a> {
         Ok(grouping.advance())
     }
 
-    /// Filters the pending input row and encodes its grouping keys and the
-    /// columns its aggregates read.
-    fn encode_group_input<'work>(
+    /// Filters the pending input row and hands it to the grouping.
+    fn accept_group_input<'work>(
         &'work self,
-        grouping: &grouping::GroupState<'a>,
+        grouping: &mut grouping::GroupState<'a>,
         storage: &'work Storage,
         txid: u32,
         work: &'work Arena,
         params: &[Datum<'work>],
-    ) -> Result<Option<&'work [u8]>, SqlError> {
+    ) -> Result<(), SqlError> {
         self.with_input_row(work, |row| {
             let catalog = StorageCatalog {
                 storage,
@@ -3247,11 +3246,9 @@ impl<'a> RetainedSelect<'a> {
             if let Some(predicate) = self.predicate
                 && !where_passes(predicate, work, params, row, &hooks)?
             {
-                return Ok(None);
+                return Ok(());
             }
-            grouping
-                .encode_input(&self.scope, storage, row, work, params, &hooks)
-                .map(Some)
+            grouping.accept(&self.scope, storage, txid, row, work, params, &hooks)
         })
     }
 

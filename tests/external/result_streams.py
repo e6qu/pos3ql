@@ -5,7 +5,7 @@ Client A sends a large simple Query, then the same result through an unpaged
 extended Execute (Parse/Bind/Execute(0)/Sync) and through a paged portal
 (Execute with a row limit, repeated, then Execute(0)), and stops reading with
 a small receive buffer. The results are a generated series, a scan
-of one table, joins, sorts and groupings (pos3ql resumes them row by row, and evaluates
+of one table, joins, sorts, groupings and DISTINCT (pos3ql resumes them row by row, and evaluates
 a paged portal's rows as each Execute asks for them). --storage-mode names
 the server's mode: object-store mode sorts in external runs, so its sorted
 result spools and is not paged.
@@ -73,6 +73,19 @@ QUERIES = (
     # storage modes; rows must arrive as 1..n, so the key orders them.
     (
         "SELECT id, max(payload) FROM result_stream_rows GROUP BY id ORDER BY id",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+    ),
+    # Fixed-size aggregate states fold per group as the input is read.
+    (
+        "SELECT id, repeat('x', 199 + count(*)::int), sum(id) FROM result_stream_rows "
+        "GROUP BY id ORDER BY id",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+    ),
+    # Plain DISTINCT groups by its output list the same way.
+    (
+        "SELECT DISTINCT id, payload FROM result_stream_rows ORDER BY id",
         TABLE_ROWS,
         ALL_PROTOCOLS,
     ),

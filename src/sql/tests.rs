@@ -54543,8 +54543,8 @@ fn hash_join_matches_nested_loop() {
     assert_eq!(r, ["d"], "LEFT JOIN + WHERE mc2.w IS NULL: {r:?}");
 
     // reltuples is deliberately a planner estimate. A stale underestimate
-    // must exhaust the selected fixed-capacity hash table loudly rather than
-    // changing execution plans at runtime.
+    // sizes the selected hash table, which grows to hold the actual build
+    // rows without changing the plan; PostgreSQL 18.6 returns every match.
     run_with(&mut e, &mut b, "CREATE TABLE stale_build (k int, v text)");
     run_with(&mut e, &mut b, "CREATE TABLE stale_probe (k int, v text)");
     run_with(&mut e, &mut b, "INSERT INTO stale_build VALUES (1, 'one')");
@@ -54559,16 +54559,12 @@ fn hash_join_matches_nested_loop() {
         &mut b,
         "INSERT INTO stale_probe VALUES (1, 'a'), (2, 'b'), (3, 'c')",
     );
-    let result = run_with(
+    let result = data_rows(&run_with(
         &mut e,
         &mut b,
         "SELECT p.v, b.v FROM stale_probe p JOIN stale_build b ON p.k = b.k ORDER BY 1",
-    );
-    assert!(
-        String::from_utf8_lossy(&result).contains("54000"),
-        "stale reltuples must fail loudly: {}",
-        String::from_utf8_lossy(&result)
-    );
+    ));
+    assert_eq!(result, ["a|one", "b|two", "c|three"]);
 }
 
 #[test]

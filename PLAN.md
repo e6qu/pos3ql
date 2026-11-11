@@ -97,7 +97,7 @@ is owned.
 
 - **Functions:** writes inside a procedure body still read storage
   synchronously. A top-level `SELECT` that the retained reader cannot hold
-  (`DISTINCT`, grouping sets, groupings whose keys or aggregate inputs call
+  (`DISTINCT` over routine output, grouping sets, groupings whose keys or aggregate inputs call
   routines, subqueries, sorts in object-store mode or over non-volatile
   routine output, joins it would probe through an index) restarts once for
   each first call of a SQL-language routine, so its work grows with the square
@@ -155,12 +155,12 @@ is owned.
   from one table or builtin set-returning functions with constant arguments,
   or a nested-loop or hash join of up to eight such items and `VALUES` lists,
   with an `ORDER BY` sorted in `plan_build_bytes` in local mode or a
-  `GROUP BY`, `HAVING` and aggregates computed there, including
+  `GROUP BY`, `HAVING`, aggregates and plain `DISTINCT` computed there, including
   paged portals, forward `FETCH` from `NO SCROLL` cursors and
   `COPY ... TO STDOUT` of such a query or one table. Remaining:
   - More retained shapes, by the
     [retained plan tree design](docs/architecture.md#retained-plan-tree-partly-built):
-    index-probed joins, RIGHT and FULL joins, `DISTINCT`, grouping sets,
+    index-probed joins, RIGHT and FULL joins, `DISTINCT ON`, grouping sets,
     subqueries, set operations, sorts in object-store mode (external runs
     with a run reader per stream; a large ordered `SELECT` there still
     spools, and a paged portal of one buffers in `portal_result_bytes`),

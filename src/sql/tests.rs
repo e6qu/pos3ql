@@ -55064,7 +55064,8 @@ fn comment_roundtrip_and_removal() {
         &mut e,
         &mut b,
         "SELECT description FROM pg_description \
-         WHERE description LIKE 'the %' OR description IN ('col a', 'view col') \
+         WHERE description LIKE 'the %' AND description NOT LIKE 'the average %' \
+           AND description NOT LIKE 'the smallest %' OR description IN ('col a', 'view col') \
          ORDER BY description",
     );
     assert_eq!(

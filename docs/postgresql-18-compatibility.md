@@ -168,7 +168,11 @@ Functions and expressions:
   `REVOKE EXECUTE ON FUNCTION int4pl(integer, integer) FROM PUBLIC`,
   `SELECT a + 1 FROM t` fails even when `t` is empty, as PostgreSQL checks
   every function when a plan starts. `GRANT`, `has_function_privilege`,
-  `proacl` and psql's `\df+` follow PostgreSQL. Changes survive restart and
+  `proacl` and psql's `\df+` follow PostgreSQL, including the description
+  PostgreSQL ships for each listed built-in routine
+  (`obj_description('lower(text)'::regprocedure)` is `lowercase`);
+  `COMMENT ON FUNCTION` replaces it and `COMMENT ... IS NULL` removes it in
+  the current database. Changes survive restart and
   are copied by `CREATE DATABASE ... TEMPLATE`. Each changed routine uses one
   of the `max_builtin_routine_entries` rows (default 64); running out fails
   with `54000`. Limits: `SET`/`RESET` settings of a built-in, and renaming or

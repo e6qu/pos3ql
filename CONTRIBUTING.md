@@ -94,6 +94,12 @@ python3 tools/generate-pg18-callable-signatures.py \
   --dsn 'host=127.0.0.1 port=5432 user=postgres' \
   src/sql/catalog_callable_signatures.rs 6381 6388
 
+# Shipped pg_description text of the listed built-in routines (--mode check compares).
+python3 tools/generate-pg18-routine-descriptions.py --mode write \
+  --dsn 'host=127.0.0.1 port=5432 user=postgres' \
+  --signatures src/sql/catalog_callable_signatures.rs \
+  --output src/sql/catalog_routine_descriptions.rs
+
 # Built-in view SQL from retained catalog-metadata.json evidence (--mode check compares).
 python3 tools/generate-pg18-view-definitions.py --mode write \
   --metadata /path/to/catalog-metadata.json --source https://example/evidence \

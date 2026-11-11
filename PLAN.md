@@ -276,9 +276,12 @@ granted, revoked or called by name; a revoked user-defined function is
 checked when it is called rather than when a plan starts, and window
 `PARTITION BY` keys and row comparisons do not check the `=` function of
 each key; `DROP ROLE` reports dependent objects without PostgreSQL's `DETAIL` list
-(`owner of function lower(text)`); built-in functions have no
-`pg_description` text of their own (`obj_description('lower(text)'::regprocedure)`
-is NULL where PostgreSQL returns `lowercase`). A parameter typed from a called
+(`owner of function lower(text)`), `pg_shdepend` lacks privilege rows and
+the owners of schemas, types and built-in routines, and `pg_describe_object`
+schema-qualifies names that PostgreSQL prints unqualified when they are
+visible (`table public.t` for `table t`); built-in operators, types and other
+catalog objects have no shipped `pg_description` text (built-in routines
+do). A parameter typed from a called
 built-in (`PREPARE q AS SELECT round($1)`) is not recorded as that type:
 `pg_prepared_statements.parameter_types` is empty, `pg_typeof($1)` is
 `unknown`, and `round($1)` with `2.5` rounds as `numeric` (3) where

@@ -235,6 +235,17 @@ macro_rules! intrinsic {
 
 #[path = "catalog_callable_signatures.rs"]
 mod callable_signatures;
+#[path = "catalog_routine_descriptions.rs"]
+mod routine_descriptions;
+
+/// The `pg_description` text PostgreSQL 18.6 ships for a built-in routine.
+pub(crate) fn builtin_routine_description(oid: i32) -> Option<&'static str> {
+    let descriptions = routine_descriptions::ROUTINE_DESCRIPTIONS;
+    descriptions
+        .binary_search_by_key(&oid, |(candidate, _)| *candidate)
+        .ok()
+        .map(|index| descriptions[index].1)
+}
 
 /// Catalog properties and executable input declarations share one PG snapshot.
 pub(crate) struct BuiltinCallableCatalog {
@@ -15741,13 +15752,48 @@ fn pg_description<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_description", false);
     let out = arena
-        .alloc_slice_with(storage.comment_capacity(), |_| &[] as &[Datum])
+        .alloc_slice_with(
+            storage.comment_capacity() + routine_descriptions::ROUTINE_DESCRIPTIONS.len(),
+            |_| &[] as &[Datum],
+        )
         .map_err(|_| arena_full())?;
     let mut n = 0;
+    // Shipped built-in routine descriptions, unless a comment replaced or
+    // removed one in this database.
+    let commented = arena
+        .alloc_slice_with(storage.comment_capacity(), |_| u32::MAX)
+        .map_err(|_| arena_full())?;
+    let mut commented_count = 0;
+    for (class, _, _, subid, _) in storage.comments_visible(txid) {
+        if class == crate::storage::CommentClass::Routine && commented_count < commented.len() {
+            commented[commented_count] = subid;
+            commented_count += 1;
+        }
+    }
+    let commented = &mut commented[..commented_count];
+    commented.sort_unstable();
+    for &(oid, description) in routine_descriptions::ROUTINE_DESCRIPTIONS {
+        if commented.binary_search(&(oid as u32)).is_ok() {
+            continue;
+        }
+        out[n] = row(
+            &[
+                Datum::Oid(oid as u32),
+                Datum::Oid(PG_PROC_OID as u32),
+                Datum::Int4(0),
+                text(description, arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
     for (class, schema, name, subid, description) in storage.comments_visible(txid) {
         let schema = schema.as_str();
         let name = name.as_str();
         let description = description.as_str();
+        if description.is_empty() {
+            continue;
+        }
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_description"));
         }
@@ -16440,7 +16486,20 @@ pub fn comment_text_for<'a>(
             found_class = class;
         }
     }
-    Ok(found)
+    Ok(match found {
+        // An empty row hides a built-in routine's shipped description.
+        Some("") => None,
+        Some(text) => Some(text),
+        None => match target {
+            super::eval::DescriptionTarget::Local {
+                catalog: None | Some("pg_proc"),
+                column: 0,
+            } => i32::try_from(oid)
+                .ok()
+                .and_then(builtin_routine_description),
+            _ => None,
+        },
+    })
 }
 
 pub(crate) fn catalog_row_state(

@@ -44054,10 +44054,19 @@ fn stage_comment(
     identity: CommentIdentity,
     text: Option<&str>,
 ) -> Result<(), SqlError> {
-    let stored_text = match text {
-        Some("") | None => None,
-        Some(text) => Some(crate::storage::comment_stackstr(text)?),
+    // Removing the description PostgreSQL ships for a built-in routine keeps
+    // an empty row that hides it; every other removal deletes the row.
+    let text = match text {
+        Some("") | None
+            if identity.class == crate::storage::CommentClass::Routine
+                && super::catalog::builtin_routine_description(identity.subid as i32).is_some() =>
+        {
+            Some("")
+        }
+        Some("") => None,
+        text => text,
     };
+    let stored_text = text.map(crate::storage::comment_stackstr).transpose()?;
     let Some((slot, prior)) = storage.set_comment(
         identity.class,
         identity.schema,

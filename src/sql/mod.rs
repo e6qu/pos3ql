@@ -19353,7 +19353,6 @@ impl Engine {
                             Err(error) => return Ok(Err(parse_error_to_sql(&error))),
                         };
                         parser.set_type_inputs(body_inputs.bindings);
-                        let output_mark = responder.mark();
                         let statements = match arena
                             .alloc_slice_with(parser::statement_capacity(body), |_| None)
                         {
@@ -19366,8 +19365,6 @@ impl Engine {
                                 Ok(Some(statement)) => statement,
                                 Ok(None) => break,
                                 Err(error) => {
-                                    // An error replaces only output the client has not received.
-                                    let _ = responder.truncate_to(output_mark);
                                     return Ok(Err(parse_error_to_sql(&error)));
                                 }
                             };
@@ -19442,6 +19439,14 @@ impl Engine {
                             output_rows = 1;
                             Ok(())
                         };
+                        // Errors name the running statement, as PostgreSQL's
+                        // `SQL function "p" statement N` context does.
+                        let frame = error_context::SqlFunctionFrame {
+                            name: routine_name,
+                            body,
+                            statement: core::cell::Cell::new(0),
+                            inlining: error_context::SqlFunctionInlining::Executed,
+                        };
                         for (index, statement) in statements[..statement_count]
                             .iter()
                             .map(|statement| {
@@ -19449,9 +19454,8 @@ impl Engine {
                             })
                             .enumerate()
                         {
+                            frame.statement.set(index + 1);
                             if let Some(name) = query::routine_statement_forbidden(statement) {
-                                // An error replaces only output the client has not received.
-                                let _ = responder.truncate_to(output_mark);
                                 return Ok(Err(query::routine_forbidden_statement_error(name)));
                             }
                             let statement = match query::bind_stored_routine_statement(
@@ -19486,20 +19490,20 @@ impl Engine {
                                     guc.seq_session(),
                                     txn.txid,
                                 );
-                                if let Err(error) = query::execute_bound_routine_query(
-                                    &output_query,
-                                    &self.storage,
-                                    slot,
-                                    routine,
-                                    txn.txid,
-                                    arena,
-                                    &completed[..declared.argument_count],
-                                    false,
-                                    Some(&sequence),
-                                    &mut |values| store_output(values),
-                                ) {
-                                    // An error replaces only output the client has not received.
-                                    let _ = responder.truncate_to(output_mark);
+                                if let Err(error) = error_context::within(&frame, || {
+                                    query::execute_bound_routine_query(
+                                        &output_query,
+                                        &self.storage,
+                                        slot,
+                                        routine,
+                                        txn.txid,
+                                        arena,
+                                        &completed[..declared.argument_count],
+                                        false,
+                                        Some(&sequence),
+                                        &mut |values| store_output(values),
+                                    )
+                                }) {
                                     return Ok(Err(error));
                                 }
                                 continue;
@@ -19511,39 +19515,38 @@ impl Engine {
                                  values: &[Datum<'_>]| {
                                     store_output(values)
                                 };
-                            match self.execute_routine_stmt(
-                                statement,
-                                arena,
-                                &completed[..declared.argument_count],
-                                txn,
-                                sqlprep,
-                                cursors,
-                                guc,
-                                responder,
-                                final_output.then_some(&mut capture as &mut ReturningCapture<'_>),
-                            ) {
+                            // The body's own results stay internal; its notices
+                            // reach the client as PostgreSQL sends them.
+                            let outcome = error_context::within(&frame, || {
+                                match responder.without_query_output(|responder| {
+                                    self.execute_routine_stmt(
+                                        statement,
+                                        arena,
+                                        &completed[..declared.argument_count],
+                                        txn,
+                                        sqlprep,
+                                        cursors,
+                                        guc,
+                                        responder,
+                                        final_output
+                                            .then_some(&mut capture as &mut ReturningCapture<'_>),
+                                    )
+                                }) {
+                                    Ok(result) => result.map(Ok),
+                                    Err(full) => Ok(Err(full)),
+                                }
+                            });
+                            match outcome {
                                 Ok(Ok(())) => {}
-                                Ok(Err(error)) => {
-                                    // An error replaces only output the client has not received.
-                                    let _ = responder.truncate_to(output_mark);
-                                    return Ok(Err(error));
-                                }
-                                Err(error) => {
-                                    // An error replaces only output the client has not received.
-                                    let _ = responder.truncate_to(output_mark);
-                                    return Err(error);
-                                }
+                                Ok(Err(full)) => return Err(full),
+                                Err(error) => return Ok(Err(error)),
                             }
                         }
                         if output_count != 0 && output_rows == 0 {
-                            let _ = responder.truncate_to(output_mark);
                             return Ok(Err(sql_err!(
                                 sqlstate::INTERNAL_ERROR,
                                 "procedure returned null record"
                             )));
-                        }
-                        if let Err(error) = responder.truncate_to(output_mark) {
-                            return Ok(Err(error));
                         }
                         if let Some(capture) = capture.as_deref_mut() {
                             if let Err(error) = capture.record(

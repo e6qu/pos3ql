@@ -1557,12 +1557,21 @@ impl<'a> Parser<'a> {
             start: self.peek_at,
             end: self.lexer.token_end(),
         };
+        let at = self.peek_at;
         let first = self.any_ident(what)?;
         if self.eat_op(".")? {
             self.record_namespace(source)?;
+            let second = self.any_ident(what)?;
+            if self.eat_op(".")? {
+                let (schema, name) = self.catalog_qualified_name(at, first, second, what)?;
+                return Ok(QualName {
+                    schema: Some(schema),
+                    name,
+                });
+            }
             Ok(QualName {
                 schema: Some(first),
-                name: self.any_ident(what)?,
+                name: second,
             })
         } else {
             Ok(QualName::bare(first))
@@ -2675,6 +2684,10 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 SelectItem::Wildcard(crate::sql::ast::SourcePosition::new(Some(at)))
             } else if let Some(table) = self.table_wildcard()? {
+                // PostgreSQL expands `t.* AS x` like `t.*`, ignoring the label.
+                if self.eat_ident("as")? {
+                    let _ = self.any_ident("alias")?;
+                }
                 SelectItem::TableWildcard(table)
             } else {
                 let expression_start = self.peek_at;
@@ -2727,14 +2740,43 @@ impl<'a> Parser<'a> {
         };
         let mark = self.lexer.mark();
         let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
+        let saved_previous = self.previous_token;
         self.advance()?;
         if self.peeked == Tok::Op(".") {
             self.advance()?;
             if self.peeked == Tok::Op("*") {
                 self.advance()?;
-                return Ok(Some(table));
+                // `t.* IS NULL`, `t.* = u.*`: an operand continues it into an
+                // expression over the whole row.
+                let item_ends = match self.peeked {
+                    Tok::Op("," | ")" | ";") | Tok::Eof => true,
+                    Tok::Ident(word) => matches!(
+                        word,
+                        "as" | "from"
+                            | "into"
+                            | "where"
+                            | "group"
+                            | "having"
+                            | "window"
+                            | "order"
+                            | "limit"
+                            | "offset"
+                            | "fetch"
+                            | "for"
+                            | "union"
+                            | "intersect"
+                            | "except"
+                            | "returning"
+                            | "on"
+                    ),
+                    _ => false,
+                };
+                if item_ends {
+                    return Ok(Some(table));
+                }
             }
         }
+        self.previous_token = saved_previous;
         self.lexer.reset(mark);
         self.peeked = saved_peeked;
         self.peek_at = saved_peek_at;

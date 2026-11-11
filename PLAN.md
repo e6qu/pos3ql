@@ -291,8 +291,9 @@ variable could win. PL/pgSQL `SELECT ... INTO`, `PERFORM` and `RETURN QUERY` run
 data-changing `WITH`, but other routine positions do not: a PL/pgSQL
 `WITH ... INSERT/UPDATE/DELETE` statement and `FOR ... IN WITH ...` are
 rejected as an unsupported body, `EXECUTE` and a cursor's query report the
-`WITH` name unknown, a SQL-language function fails, and
-a trigger function rejects it with `0A000`. These need the routine's write
+`WITH` name unknown, and a trigger function rejects it with `0A000`. A
+SQL-language function's query runs them before reading, as a top-level
+query does. These need the routine's write
 path to run the `WITH` writes under the main statement's snapshot. A `LATERAL` item inside a
 parenthesized join or a derived table can reference only the FROM items
 beside it, so `a JOIN (b JOIN LATERAL (SELECT a.x) s ON true) ON true`
@@ -300,14 +301,12 @@ reports a missing FROM-clause entry for `a` where PostgreSQL accepts it. An
 ungrouped-column error inside an aliased parenthesized join names the alias
 (`j.x`) where PostgreSQL names the member table (`a.x`). A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
-PostgreSQL types it as the table's row type `t`. A
-database-qualified name (`postgres.public.t`) works in column references,
-FROM items and `CREATE` targets but is a syntax error in `DROP` and other
-DDL name lists.
+PostgreSQL types it as the table's row type `t`, and comparing two
+whole-row values (`t.* = t.*`) is row-wise, so NULL fields give NULL where
+PostgreSQL's composite comparison treats them as equal.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. In a PL/pgSQL statement,
-`VALUES (r.*)` does not expand the row variable `r` into its fields, and a
-whole-row star in an expression (`t.* IS NULL`) is a syntax error. Reading
+`VALUES (r.*)` does not expand the row variable `r` into its fields. Reading
 a field of a row variable that was never assigned returns NULL without
 checking that the field exists. A `CONSTANT` assignment error has no cursor
 position. `pg_sleep` and its

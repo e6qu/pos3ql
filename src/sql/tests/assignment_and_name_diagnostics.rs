@@ -1,5 +1,6 @@
 //! Multiple-column assignment arity, `*` positions, database-qualified names
-//! and references to an aliased table's name, compared with PostgreSQL 18.6.
+//! (including DROP lists), whole-row stars inside expressions and references
+//! to an aliased table's name, compared with PostgreSQL 18.6.
 
 use super::compatibility_diagnostics::{diagnostics, with_engine};
 use super::*;
@@ -53,6 +54,19 @@ fn assignment_sources_and_names_report_postgresql_errors() {
                 "SELECT * FROM a.b.c.d",
                 "ERROR 42601 improper qualified name (too many dotted names): a.b.c.d @15",
             ),
+            // DROP lists resolve names when the command runs: no position.
+            (
+                "DROP TABLE foo.public.u",
+                "ERROR 0A000 cross-database references are not implemented: \"foo.public.u\"",
+            ),
+            (
+                "DROP TABLE a.b.c.d",
+                "ERROR 42601 improper relation name (too many dotted names): a.b.c.d",
+            ),
+            (
+                "DROP TYPE a.b.c.d",
+                "ERROR 42601 improper qualified name (too many dotted names): a.b.c.d",
+            ),
         ] {
             assert_eq!(
                 diagnostics(&run_with(engine, budget, sql)),
@@ -66,5 +80,15 @@ fn assignment_sources_and_names_report_postgresql_errors() {
             "SELECT postgres.public.u.a, postgres.public.u.* FROM postgres.public.u",
         );
         assert_eq!(data_rows(&output), ["3|3|q|2024-01-01"]);
+        // `u.*` followed by an operator is one whole-row expression; with a
+        // label it still expands.
+        let output = run_with(engine, budget, "SELECT u.* IS NOT NULL, u.* AS x FROM u");
+        assert_eq!(data_rows(&output), ["t|3|q|2024-01-01"]);
+        run_with(engine, budget, "CREATE TABLE dropped (a int)");
+        run_with(engine, budget, "DROP TABLE postgres.public.dropped");
+        assert_eq!(
+            diagnostics(&run_with(engine, budget, "SELECT * FROM dropped")),
+            ["ERROR 42P01 relation \"dropped\" does not exist @15"]
+        );
     });
 }

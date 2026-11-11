@@ -1,5 +1,6 @@
 //! Data-modifying `WITH` queries in PL/pgSQL `SELECT ... INTO`, `PERFORM`
-//! and `RETURN QUERY`, compared with PostgreSQL 18.6.
+//! and `RETURN QUERY`, and in SQL-language functions, compared with
+//! PostgreSQL 18.6.
 
 use super::compatibility_diagnostics::{diagnostics, with_engine};
 use super::*;
@@ -47,6 +48,35 @@ fn plpgsql_queries_run_data_modifying_with_queries_once() {
         assert_eq!(
             data_rows(&run_with(engine, budget, "SELECT * FROM w ORDER BY id")),
             ["1|u", "2|b"]
+        );
+    });
+}
+
+#[test]
+fn sql_functions_run_data_modifying_with_queries_once() {
+    with_engine("sql-function-data-modifying-with", |engine, budget| {
+        for sql in [
+            "CREATE TABLE f (a int)",
+            "CREATE FUNCTION added(x int) RETURNS SETOF int LANGUAGE sql AS $$ \
+             WITH q AS (INSERT INTO f VALUES (x), (x + 1) RETURNING a) \
+             SELECT a * 10 FROM q ORDER BY 1 $$",
+            "CREATE FUNCTION unread(x int) RETURNS int LANGUAGE sql AS $$ \
+             WITH q AS (DELETE FROM f WHERE a = x RETURNING a) SELECT 7 $$",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        assert_eq!(
+            data_rows(&run_with(engine, budget, "SELECT * FROM added(5)")),
+            ["50", "60"]
+        );
+        // A WITH query nothing reads still runs, after the main query.
+        assert_eq!(
+            data_rows(&run_with(engine, budget, "SELECT unread(5)")),
+            ["7"]
+        );
+        assert_eq!(
+            data_rows(&run_with(engine, budget, "SELECT a FROM f ORDER BY a")),
+            ["6"]
         );
     });
 }

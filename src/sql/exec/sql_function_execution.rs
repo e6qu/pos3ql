@@ -641,6 +641,26 @@ impl SqlExecution {
         context: &mut TriggerExecContext<'_, 'a, '_>,
         capture: bool,
     ) -> Result<(), SqlError> {
+        // Data-modifying WITH queries run before the query that reads them,
+        // under the statement's snapshot, as in a top-level query.
+        if let query::RoutineQuery::Select(select) = query
+            && select.with.iter().any(|cte| cte.dml.is_some())
+        {
+            let params = core::mem::replace(&mut context.params, arguments);
+            let bound = super::bind_plpgsql_dml_ctes(context, select);
+            context.params = params;
+            let (bound, written) = bound?;
+            self.query(
+                &query::RoutineQuery::Select(bound),
+                arguments,
+                context,
+                capture,
+            )?;
+            let params = core::mem::replace(&mut context.params, arguments);
+            let finished = super::finish_plpgsql_dml_ctes(context, select, written);
+            context.params = params;
+            return finished;
+        }
         let arena = context.arena;
         let txid = context.txn.txid;
         let PlpgsqlExecHost::Routine {

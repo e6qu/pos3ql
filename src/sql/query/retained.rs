@@ -1597,38 +1597,6 @@ fn order_keys<'a>(
     Ok(Some(keys))
 }
 
-/// Sorts in place without allocating; the first comparison error stops it.
-fn heap_sort<T: Copy>(
-    items: &mut [T],
-    mut less: impl FnMut(&T, &T) -> Result<bool, SqlError>,
-) -> Result<(), SqlError> {
-    let mut sift = |items: &mut [T], mut root: usize, end: usize| -> Result<(), SqlError> {
-        loop {
-            let mut child = 2 * root + 1;
-            if child >= end {
-                return Ok(());
-            }
-            if child + 1 < end && less(&items[child], &items[child + 1])? {
-                child += 1;
-            }
-            if !less(&items[root], &items[child])? {
-                return Ok(());
-            }
-            items.swap(root, child);
-            root = child;
-        }
-    };
-    let len = items.len();
-    for root in (0..len / 2).rev() {
-        sift(items, root, len)?;
-    }
-    for end in (1..len).rev() {
-        items.swap(0, end);
-        sift(items, 0, end)?;
-    }
-    Ok(())
-}
-
 /// PostgreSQL scans a table, function result or VALUES list backward and
 /// evaluates revisited rows again; other sources are materialized under a
 /// scrollable cursor. Saved outputs are returned when evaluating again cannot
@@ -1819,9 +1787,9 @@ impl<'a> RetainedSelect<'a> {
         Self: 'a,
     {
         let key = |(offset, length): (u32, u32), column: usize| {
-            crate::sql::exec::decode_projected_pub(&bytes(offset, length)[INPUT_HEADER..], column)
+            crate::sql::exec::ProjectedValue::column(&bytes(offset, length)[INPUT_HEADER..], column)
         };
-        heap_sort(entries, |left, right| {
+        crate::util::try_sort_unstable_by(entries, |left, right| {
             for order in self.order {
                 let (left, right) = (key(*left, order.column), key(*right, order.column));
                 let ordering = match (left.is_null(), right.is_null()) {
@@ -1835,8 +1803,8 @@ impl<'a> RetainedSelect<'a> {
                             storage,
                             txid,
                             order.collation,
-                            &left,
-                            &right,
+                            left,
+                            right,
                         )?;
                         if order.descending {
                             compared.reverse()
@@ -1847,12 +1815,12 @@ impl<'a> RetainedSelect<'a> {
                 };
                 if !ordering.is_eq() {
                     // Reversed: the slice holds the last input first.
-                    return Ok(ordering.is_gt());
+                    return Ok(ordering.reverse());
                 }
             }
             // Equal keys keep scan order, as the executor's stable sort
             // does: an earlier input sits at a higher offset.
-            Ok(left.0 < right.0)
+            Ok(left.0.cmp(&right.0))
         })
     }
 

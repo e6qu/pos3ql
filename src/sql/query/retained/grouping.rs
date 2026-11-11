@@ -30,6 +30,9 @@ use super::*;
 use crate::mem::lease_pool::{LeaseError, MutableSlice};
 use crate::sql::ast::{Collation, GroupingSet};
 use crate::sql::query::aggregate::{AggState, FixedState};
+// The materialized grouping's comparator, so both paths form the same groups
+// and keep the same first-row representatives.
+use crate::sql::query::group::compare_group_rows;
 
 /// Aggregate calls by address in the output list, `HAVING` and `ORDER BY`.
 pub(super) type AggregateNodes<'a> = &'a [(*const Expr<'a>, &'a Expr<'a>)];
@@ -574,31 +577,6 @@ fn record<'b>(entries: &MutableSlice<(u32, u32)>, bytes: &'b [u8], index: usize)
     &bytes[start as usize..(start + length) as usize]
 }
 
-fn compare_keys(
-    storage: &Storage,
-    txid: u32,
-    collations: &[Collation],
-    left: &[u8],
-    right: &[u8],
-) -> Result<core::cmp::Ordering, SqlError> {
-    for (column, &collation) in collations.iter().enumerate() {
-        let left = crate::sql::exec::decode_projected_pub(left, column);
-        let right = crate::sql::exec::decode_projected_pub(right, column);
-        let ordering = match (left.is_null(), right.is_null()) {
-            (true, true) => core::cmp::Ordering::Equal,
-            (true, false) => core::cmp::Ordering::Greater,
-            (false, true) => core::cmp::Ordering::Less,
-            (false, false) => {
-                crate::sql::eval::compare_datums_collated(storage, txid, collation, &left, &right)?
-            }
-        };
-        if !ordering.is_eq() {
-            return Ok(ordering);
-        }
-    }
-    Ok(core::cmp::Ordering::Equal)
-}
-
 impl<'a> GroupState<'a> {
     pub(super) fn new(
         storage: &Storage,
@@ -779,7 +757,7 @@ impl<'a> GroupState<'a> {
         let mut node = self.root;
         while node != NO_NODE {
             let existing = record(&self.inputs, self.input_bytes.as_slice(), node as usize);
-            let left = match compare_keys(storage, txid, self.collations, key, existing)? {
+            let left = match compare_group_rows(storage, txid, self.collations, key, existing)? {
                 core::cmp::Ordering::Equal => return Ok(node as usize),
                 ordering => ordering.is_lt(),
             };
@@ -918,14 +896,12 @@ impl<'a> GroupState<'a> {
         }
         let collations = self.collations;
         let bytes = self.input_bytes.as_slice();
-        heap_sort(self.inputs.as_mut_slice(), |left, right| {
+        crate::util::try_sort_unstable_by(self.inputs.as_mut_slice(), |left, right| {
             let left_row = &bytes[left.0 as usize..(left.0 + left.1) as usize];
             let right_row = &bytes[right.0 as usize..(right.0 + right.1) as usize];
             Ok(
-                match compare_keys(storage, txid, collations, left_row, right_row)? {
-                    core::cmp::Ordering::Equal => left.0 < right.0,
-                    ordering => ordering.is_lt(),
-                },
+                compare_group_rows(storage, txid, collations, left_row, right_row)?
+                    .then(left.0.cmp(&right.0)),
             )
         })?;
         self.phase = Phase::Folding { next: 0 };
@@ -959,7 +935,7 @@ impl<'a> GroupState<'a> {
             let mut end = next;
             while end < total {
                 if end > next
-                    && !compare_keys(
+                    && !compare_group_rows(
                         storage,
                         txid,
                         self.collations,

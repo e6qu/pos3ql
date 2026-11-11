@@ -1247,30 +1247,234 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
         current += 1;
     }
 }
-/// Compares two encoded rows' first `width` columns under SQL equality:
-/// column bytes compare directly except bpchar values, which compare by their
-/// stripped text — cross-width padding must not split a DISTINCT group.
-pub(crate) fn compare_projected_prefix(a: &[u8], b: &[u8], width: usize) -> core::cmp::Ordering {
+/// Compares two encoded rows' first `width` columns under SQL equality, NULLs
+/// equal to each other and last: DISTINCT must merge equal values spelled
+/// differently (`1.0` and `1.00`, `'a '::char(3)` and `'a'::char(1)`) and
+/// record values by `record_cmp`. Text compares bytewise, which agrees with
+/// equality under every deterministic collation; callers needing collation
+/// order compare keys with their collation first.
+pub(crate) fn compare_projected_prefix(
+    a: &[u8],
+    b: &[u8],
+    width: usize,
+) -> Result<core::cmp::Ordering, SqlError> {
     let (mut ia, mut ib) = (2usize, 2usize);
     for _ in 0..width {
-        let (ta, tb) = (a[ia], b[ib]);
-        ia += 1;
-        ib += 1;
-        let (da, sa) = decode_projected_value(a, ta, ia);
-        let (db, sb) = decode_projected_value(b, tb, ib);
-        let ord = match (da, db) {
-            (Datum::Bpchar(x), Datum::Bpchar(y)) => {
-                x.trim_end_matches(' ').cmp(y.trim_end_matches(' '))
-            }
-            _ => a[ia - 1..ia + sa].cmp(&b[ib - 1..ib + sb]),
+        let left = ProjectedValue {
+            bytes: a,
+            tag_at: ia,
+        };
+        let right = ProjectedValue {
+            bytes: b,
+            tag_at: ib,
+        };
+        let ord = match (left.is_null(), right.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) => core::cmp::Ordering::Greater,
+            (false, true) => core::cmp::Ordering::Less,
+            (false, false) => compare_projected_values(left, right, &mut |x, y| {
+                crate::sql::eval::compare_datums(x, y)
+            })?,
         };
         if !ord.is_eq() {
-            return ord;
+            return Ok(ord);
         }
-        ia += sa;
-        ib += sb;
+        ia += 1 + decode_projected_value(a, a[ia], ia + 1).1;
+        ib += 1 + decode_projected_value(b, b[ib], ib + 1).1;
     }
-    core::cmp::Ordering::Equal
+    Ok(core::cmp::Ordering::Equal)
+}
+
+/// Orders two whole encoded rows under SQL equality as
+/// [`compare_projected_prefix`] does; the set operations and recursive
+/// UNION sort, merge and deduplicate rows by this order.
+pub(crate) fn compare_projected_rows(a: &[u8], b: &[u8]) -> Result<core::cmp::Ordering, SqlError> {
+    let width = projected_row_width(a);
+    match width.cmp(&projected_row_width(b)) {
+        core::cmp::Ordering::Equal => compare_projected_prefix(a, b, width),
+        different => Ok(different),
+    }
+}
+
+/// One tagged value inside an encoded row or record, located by its tag
+/// byte. Comparators take this instead of a decoded [`Datum`] because the
+/// arena-free decode renders a record as text, which orders `(10)` before
+/// `(9)`; the structural tail kept after that text is what `record_cmp`
+/// needs.
+#[derive(Clone, Copy)]
+pub(crate) struct ProjectedValue<'a> {
+    bytes: &'a [u8],
+    tag_at: usize,
+}
+
+impl<'a> ProjectedValue<'a> {
+    /// Column `col` of an encoded row.
+    pub(crate) fn column(bytes: &'a [u8], col: usize) -> Self {
+        let mut at = 2usize;
+        for _ in 0..col {
+            let tag = bytes[at];
+            at += 1 + decode_projected_value(bytes, tag, at + 1).1;
+        }
+        Self { bytes, tag_at: at }
+    }
+
+    /// The value as the arena-free decode returns it.
+    pub(crate) fn datum(self) -> Datum<'a> {
+        decode_projected_value(self.bytes, self.bytes[self.tag_at], self.tag_at + 1).0
+    }
+
+    pub(crate) fn is_null(self) -> bool {
+        self.bytes[self.tag_at] == 0
+    }
+
+    pub(crate) fn is_record(self) -> bool {
+        self.record_tail().is_some()
+    }
+
+    /// A record value's fields in order, or `None` when this is not a record.
+    pub(crate) fn record_fields(self) -> Option<ProjectedFields<'a>> {
+        let (at, lengths) = self.record_tail()?;
+        Some(ProjectedFields {
+            bytes: self.bytes,
+            remaining: lengths.read(self.bytes, at),
+            at: at + lengths.bytes(),
+            lengths,
+        })
+    }
+
+    /// The structural tail of a record value: its field-count position and
+    /// length width.
+    fn record_tail(self) -> Option<(usize, RecordLengths)> {
+        let at = self.tag_at + 1;
+        let text_len = |from: usize| {
+            u32::from_le_bytes(self.bytes[from..from + 4].try_into().unwrap()) as usize
+        };
+        match self.bytes[self.tag_at] {
+            19 => Some((at + 4 + text_len(at), RecordLengths::Byte)),
+            51 => Some((at + 4 + text_len(at), RecordLengths::TwoBytes)),
+            202 => Some((at + 8 + text_len(at + 4), RecordLengths::Byte)),
+            204 => Some((at + 8 + text_len(at + 4), RecordLengths::TwoBytes)),
+            _ => None,
+        }
+    }
+}
+
+/// The fields of an encoded record: each field's name, type OID and value.
+pub(crate) struct ProjectedFields<'a> {
+    bytes: &'a [u8],
+    remaining: usize,
+    at: usize,
+    lengths: RecordLengths,
+}
+
+impl<'a> Iterator for ProjectedFields<'a> {
+    type Item = (&'a str, i32, ProjectedValue<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let name_len = self.lengths.read(self.bytes, self.at);
+        let name_at = self.at + self.lengths.bytes();
+        let name = core::str::from_utf8(&self.bytes[name_at..name_at + name_len])
+            .expect("projected record name was encoded from valid UTF-8");
+        let type_at = name_at + name_len;
+        let type_oid = i32::from_le_bytes(self.bytes[type_at..type_at + 4].try_into().unwrap());
+        let value = ProjectedValue {
+            bytes: self.bytes,
+            tag_at: type_at + 4,
+        };
+        let tag = self.bytes[value.tag_at];
+        self.at = value.tag_at + 1 + decode_projected_value(self.bytes, tag, value.tag_at + 1).1;
+        Some((name, type_oid, value))
+    }
+}
+
+/// Orders two encoded sort-key values under an `ORDER BY` direction
+/// `(descending, nulls_first)`: NULL placement is absolute, only the value
+/// comparison reverses for DESC. Non-record values compare with `compare`
+/// under `collation`; record values compare with `record_cmp`, their
+/// collatable fields under the default collation (the collation a row type's
+/// attributes carry).
+pub(crate) fn compare_projected_key(
+    collation: crate::sql::ast::Collation,
+    (descending, nulls_first): (bool, bool),
+    left: ProjectedValue<'_>,
+    right: ProjectedValue<'_>,
+    compare: &dyn Fn(
+        crate::sql::ast::Collation,
+        &Datum<'_>,
+        &Datum<'_>,
+    ) -> Result<core::cmp::Ordering, SqlError>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    use core::cmp::Ordering;
+    Ok(match (left.is_null(), right.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) if nulls_first => Ordering::Less,
+        (true, false) => Ordering::Greater,
+        (false, true) if nulls_first => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            let collation = if left.is_record() && right.is_record() {
+                crate::sql::ast::Collation::Default
+            } else {
+                collation
+            };
+            let compared =
+                compare_projected_values(left, right, &mut |x, y| compare(collation, x, y))?;
+            if descending {
+                compared.reverse()
+            } else {
+                compared
+            }
+        }
+    })
+}
+
+/// Orders two non-NULL encoded values. Record values (named composites
+/// included) follow PostgreSQL's `record_cmp`: fields compare left to right
+/// with `leaf`, two NULL fields are equal and a NULL field sorts after any
+/// value, nested records recurse, and dissimilar field types or widths are
+/// errors. Every other value is decoded and handed to `leaf`.
+pub(crate) fn compare_projected_values(
+    left: ProjectedValue<'_>,
+    right: ProjectedValue<'_>,
+    leaf: &mut dyn FnMut(&Datum<'_>, &Datum<'_>) -> Result<core::cmp::Ordering, SqlError>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    let (Some(mut a), Some(mut b)) = (left.record_fields(), right.record_fields()) else {
+        return leaf(&left.datum(), &right.datum());
+    };
+    let mut column = 0usize;
+    loop {
+        let ((_, a_type, x), (_, b_type, y)) = match (a.next(), b.next()) {
+            (Some(x), Some(y)) => (x, y),
+            (None, None) => return Ok(core::cmp::Ordering::Equal),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "cannot compare record types with different numbers of columns"
+                ));
+            }
+        };
+        crate::sql::eval::check_record_field_types(
+            a_type,
+            b_type,
+            column,
+            false,
+            &crate::sql::eval::builtin_record_field_type_name,
+        )?;
+        let ordering = match (x.is_null(), y.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) => core::cmp::Ordering::Greater,
+            (false, true) => core::cmp::Ordering::Less,
+            (false, false) => compare_projected_values(x, y, leaf)?,
+        };
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
+        column += 1;
+    }
 }
 
 /// The byte length of a record's structural tail starting at `at` (the field
@@ -1424,17 +1628,19 @@ fn decode_record_tail<'a>(
 /// DISTINCT over encoded rows: sorts (grouping SQL-equal rows adjacently,
 /// byte order as the tiebreak so the surviving representative is
 /// deterministic) and keeps the first of each run. Returns the live count.
-pub fn sort_dedup_projected(rows: &mut [&[u8]], width: usize) -> usize {
-    rows.sort_unstable_by(|a, b| compare_projected_prefix(a, b, width).then_with(|| a.cmp(b)));
+pub fn sort_dedup_projected(rows: &mut [&[u8]], width: usize) -> Result<usize, SqlError> {
+    crate::util::try_sort_unstable_by(rows, |a, b| {
+        Ok(compare_projected_prefix(a, b, width)?.then_with(|| a.cmp(b)))
+    })?;
     let mut unique = 0usize;
     for i in 0..rows.len() {
-        let same = i > 0 && compare_projected_prefix(rows[i], rows[unique - 1], width).is_eq();
+        let same = i > 0 && compare_projected_prefix(rows[i], rows[unique - 1], width)?.is_eq();
         if !same {
             rows[unique] = rows[i];
             unique += 1;
         }
     }
-    unique
+    Ok(unique)
 }
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]

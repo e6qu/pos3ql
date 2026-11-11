@@ -851,8 +851,7 @@ pub(crate) use subquery::{type_witness, walk_children};
 
 mod window;
 use window::{
-    cmp_key_rows, dedup_window_rows, external_window_into, project_window_rows,
-    rewrite_grouped_windows, window_select,
+    cmp_key_rows, external_window_into, project_window_rows, rewrite_grouped_windows, window_select,
 };
 
 /// Relation count handled by compact `u64` planner proofs. Wider joins execute
@@ -11691,7 +11690,10 @@ pub(crate) fn constant_select_resumable<'a>(
 
     let mut live = out_rows.len();
     if statement.distinct {
-        live = super::exec::sort_dedup_projected(out_rows, width);
+        live = match super::exec::sort_dedup_projected(out_rows, width) {
+            Ok(live) => live,
+            Err(error) => return sql_fail(error),
+        };
     }
     let out_rows = &mut out_rows[..live];
     let mut order_collations = [super::ast::Collation::None; MAX_PROJ];
@@ -11723,44 +11725,30 @@ pub(crate) fn constant_select_resumable<'a>(
                 }
             }
         }
-        out_rows.sort_unstable_by(|a, b| {
-            for (j, ob) in statement.order_by.iter().enumerate() {
-                let ka = super::exec::decode_projected_pub(a, width + j);
-                let kb = super::exec::decode_projected_pub(b, width + j);
-                let ord = match (ka.is_null(), kb.is_null()) {
-                    (true, true) => core::cmp::Ordering::Equal,
-                    (true, false) => {
-                        if ob.nulls_first {
-                            core::cmp::Ordering::Less
-                        } else {
-                            core::cmp::Ordering::Greater
-                        }
+        let sorted = crate::mem::arena::try_stable_sort_via(
+            arena,
+            out_rows,
+            |a, b| {
+                for (j, ob) in statement.order_by.iter().enumerate() {
+                    let ordering = materialize::compare_ordered_key(
+                        storage,
+                        txid,
+                        order_collations[j],
+                        (ob.descending, ob.nulls_first),
+                        super::exec::ProjectedValue::column(a, width + j),
+                        super::exec::ProjectedValue::column(b, width + j),
+                    )?;
+                    if !ordering.is_eq() {
+                        return Ok(ordering);
                     }
-                    (false, true) => {
-                        if ob.nulls_first {
-                            core::cmp::Ordering::Greater
-                        } else {
-                            core::cmp::Ordering::Less
-                        }
-                    }
-                    (false, false) => {
-                        let c = crate::sql::eval::compare_datums_collated(
-                            storage,
-                            txid,
-                            order_collations[j],
-                            &ka,
-                            &kb,
-                        )
-                        .expect("validated FROM-less ORDER BY keys compare without error");
-                        if ob.descending { c.reverse() } else { c }
-                    }
-                };
-                if !ord.is_eq() {
-                    return ord;
                 }
-            }
-            core::cmp::Ordering::Equal
-        });
+                Ok(core::cmp::Ordering::Equal)
+            },
+            |_| arena_full(),
+        );
+        if let Err(error) = sorted {
+            return sql_fail(error);
+        }
     }
 
     let start = (offset as usize).min(out_rows.len());
@@ -12523,7 +12511,7 @@ fn select_into_rows_mode<'a>(
             )?;
             return Ok(());
         }
-        let (proj_rows, sort_keys) = project_window_rows(
+        let mut rows = project_window_rows(
             storage,
             txid,
             statement,
@@ -12539,33 +12527,12 @@ fn select_into_rows_mode<'a>(
         )?;
         // DISTINCT dedups on the projected values; ORDER BY and LIMIT/OFFSET
         // apply here too (a derived table keeps its inner LIMIT).
-        let (proj_rows, sort_keys) = if statement.distinct {
-            dedup_window_rows(proj_rows, sort_keys, arena)?
-        } else {
-            (proj_rows, sort_keys)
-        };
-        let count = proj_rows.len();
-        let order = arena
-            .alloc_slice_with(count, |i| i)
-            .map_err(|_| arena_full())?;
-        if !statement.order_by.is_empty() {
-            for x in 1..count {
-                let mut y = x;
-                while y > 0 {
-                    let c = cmp_key_rows(
-                        sort_keys[order[y - 1]],
-                        sort_keys[order[y]],
-                        statement.order_by,
-                    );
-                    if c == core::cmp::Ordering::Greater {
-                        order.swap(y - 1, y);
-                        y -= 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
+        if statement.distinct {
+            rows = rows.distinct(arena)?;
         }
+        let proj_rows = rows.rows;
+        let count = proj_rows.len();
+        let order = rows.ordered(storage, txid, statement.order_by, arena)?;
         let start = (offset as usize).min(count);
         let n = ((count - start) as u64).min(limit) as usize;
         for &i in &order[start..start + n] {

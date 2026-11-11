@@ -321,12 +321,12 @@ impl<'a> SortState<'a> {
     pub(super) fn finish_fill(&mut self, storage: &Storage, txid: u32) -> Result<(), SqlError> {
         let keys = self.keys;
         let bytes = self.bytes.as_slice();
-        heap_sort(self.entries.as_mut_slice(), |left, right| {
+        crate::util::try_sort_unstable_by(self.entries.as_mut_slice(), |left, right| {
             let left_row = &bytes[left.0 as usize..(left.0 + left.1) as usize];
             let right_row = &bytes[right.0 as usize..(right.0 + right.1) as usize];
             for (column, key) in keys.iter().enumerate() {
-                let left_value = crate::sql::exec::decode_projected_pub(left_row, column);
-                let right_value = crate::sql::exec::decode_projected_pub(right_row, column);
+                let left_value = crate::sql::exec::ProjectedValue::column(left_row, column);
+                let right_value = crate::sql::exec::ProjectedValue::column(right_row, column);
                 let ordering = match (left_value.is_null(), right_value.is_null()) {
                     (true, true) => core::cmp::Ordering::Equal,
                     (true, false) if key.nulls_first => core::cmp::Ordering::Less,
@@ -338,8 +338,8 @@ impl<'a> SortState<'a> {
                             storage,
                             txid,
                             key.collation,
-                            &left_value,
-                            &right_value,
+                            left_value,
+                            right_value,
                         )?;
                         if key.descending {
                             compared.reverse()
@@ -349,10 +349,10 @@ impl<'a> SortState<'a> {
                     }
                 };
                 if !ordering.is_eq() {
-                    return Ok(ordering.is_lt());
+                    return Ok(ordering);
                 }
             }
-            Ok(left.0 < right.0)
+            Ok(left.0.cmp(&right.0))
         })?;
         self.filled = true;
         self.next = 0;

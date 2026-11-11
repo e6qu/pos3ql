@@ -1089,7 +1089,8 @@ use set_rows::PlpgsqlSetResult;
 mod projected;
 use numeric_loops::NumericLoopFrames;
 pub(crate) use projected::{
-    compare_projected_prefix, decode_projected_row_into, encode_projected_by_into,
+    ProjectedValue, compare_projected_key, compare_projected_prefix, compare_projected_rows,
+    compare_projected_values, decode_projected_row_into, encode_projected_by_into,
     encode_projected_into, encode_projected_persistent_pub, pack_projected_rows,
     pack_projected_rows_into, projected_row_len, projected_row_len_by, projected_row_width,
     projected_rows_len, unpack_projected_rows,
@@ -25861,18 +25862,21 @@ where
                 {
                     return Ok(Datum::Null);
                 }
-                // An unassigned `record` has no field list yet.
-                Datum::Null if self.locals[index].ctype == ColType::Record => {
-                    crate::sql::eval::stash_diagnostic(
-                        Some(StackStr::from_str(
-                            "The tuple structure of a not-yet-assigned record is indeterminate.",
-                        )),
-                        None,
-                    );
-                    return Err(sql_err!(
-                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                        "record \"{}\" is not assigned yet",
-                        qualifier
+                Datum::Null
+                    if matches!(
+                        self.locals[index].record_shape,
+                        Some(PlpgsqlRecordShape::Dynamic)
+                    ) =>
+                {
+                    return Err(crate::sql::error_position::with_detail(
+                        sql_err!(
+                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                            "record \"{}\" is not assigned yet",
+                            qualifier
+                        ),
+                        format_args!(
+                            "The tuple structure of a not-yet-assigned record is indeterminate."
+                        ),
                     ));
                 }
                 _ => {

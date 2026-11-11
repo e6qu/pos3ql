@@ -3936,7 +3936,6 @@ fn indexed_candidates_for_plan<'a>(
             candidates[live] = candidate;
             live += 1;
         }
-        let mut comparison_error = None;
         if let Some((knn, origin)) = knn_origin {
             for candidate in &mut candidates[..live] {
                 let key = &encoded[candidate.key_at..candidate.key_at + candidate.key_len];
@@ -3977,26 +3976,16 @@ fn indexed_candidates_for_plan<'a>(
                 }
             });
         } else {
-            candidates[..live].sort_unstable_by(|left, right| {
-                if comparison_error.is_some() {
-                    return core::cmp::Ordering::Equal;
-                }
+            crate::util::try_sort_unstable_by(&mut candidates[..live], |left, right| {
                 let left_key = &encoded[left.key_at..left.key_at + left.key_len];
                 let right_key = &encoded[right.key_at..right.key_at + right.key_len];
-                match compare_ordered_index_keys(
-                    storage, txid, &plan, &ordered, left_key, right_key,
-                ) {
-                    Ok(core::cmp::Ordering::Equal) => left.rowid.cmp(&right.rowid),
-                    Ok(ordering) => ordering,
-                    Err(error) => {
-                        comparison_error = Some(error);
-                        core::cmp::Ordering::Equal
-                    }
-                }
-            });
-        }
-        if let Some(error) = comparison_error {
-            return Err(error);
+                Ok(
+                    compare_ordered_index_keys(
+                        storage, txid, &plan, &ordered, left_key, right_key,
+                    )?
+                    .then_with(|| left.rowid.cmp(&right.rowid)),
+                )
+            })?;
         }
         for (output, candidate) in rowids.iter_mut().zip(candidates[..live].iter()) {
             *output = candidate.rowid;

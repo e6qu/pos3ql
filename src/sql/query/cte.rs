@@ -4556,11 +4556,11 @@ fn external_recursive_tree(
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
-        Ok(if sorted {
-            left.cmp(right)
+        if sorted {
+            crate::sql::exec::compare_projected_rows(left, right)
         } else {
-            core::cmp::Ordering::Equal
-        })
+            Ok(core::cmp::Ordering::Equal)
+        }
     };
     external_set_body_into(
         storage,
@@ -4608,11 +4608,11 @@ fn external_decorate_recursive_run(
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
-        Ok(if sorted {
-            left.cmp(right)
+        if sorted {
+            crate::sql::exec::compare_projected_rows(left, right)
         } else {
-            core::cmp::Ordering::Equal
-        })
+            Ok(core::cmp::Ordering::Equal)
+        }
     };
     storage
         .with_block_store(|blocks| reader.start(blocks, input))
@@ -4654,11 +4654,11 @@ fn external_recursive_noncycle_run(
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
-        Ok(if sorted {
-            left.cmp(right)
+        if sorted {
+            crate::sql::exec::compare_projected_rows(left, right)
         } else {
-            core::cmp::Ordering::Equal
-        })
+            Ok(core::cmp::Ordering::Equal)
+        }
     };
     storage
         .with_block_store(|blocks| reader.start(blocks, input))
@@ -4691,14 +4691,19 @@ fn external_unique_run(
     let mut reader = storage.external_run_reader()?;
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
-    let mut compare = |left: &[u8], right: &[u8]| Ok(left.cmp(right));
+    let mut compare = crate::sql::exec::compare_projected_rows;
     storage
         .with_block_store(|blocks| reader.start(blocks, run))
         .expect("recursive work table has a block store")?;
     while reader.row().is_some() {
         let keep = {
             let context = reader.context().expect("checked");
-            context.previous != Some(context.row)
+            match context.previous {
+                Some(previous) => {
+                    !crate::sql::exec::compare_projected_rows(previous, context.row)?.is_eq()
+                }
+                None => true,
+            }
         };
         if keep {
             let row = reader.row().expect("checked");
@@ -4730,23 +4735,24 @@ fn external_recursive_difference(
     let mut seen_reader = storage.external_run_reader()?;
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
-    let mut compare = |left: &[u8], right: &[u8]| Ok(left.cmp(right));
+    let mut compare = crate::sql::exec::compare_projected_rows;
     storage
         .with_block_store(|blocks| candidate_reader.start(blocks, candidates))
         .expect("recursive work table has a block store")?;
     storage
         .with_block_store(|blocks| seen_reader.start(blocks, seen))
         .expect("recursive work table has a block store")?;
+    let compare_seen = |seen: Option<&[u8]>, candidate: &[u8]| {
+        seen.map(|seen| crate::sql::exec::compare_projected_rows(seen, candidate))
+            .transpose()
+    };
     while let Some(candidate) = candidate_reader.row() {
-        while seen_reader
-            .row()
-            .is_some_and(|seen_row| seen_row < candidate)
-        {
+        while compare_seen(seen_reader.row(), candidate)?.is_some_and(|order| order.is_lt()) {
             storage
                 .with_block_store(|blocks| seen_reader.advance(blocks))
                 .expect("recursive work table has a block store")?;
         }
-        if seen_reader.row() != Some(candidate) {
+        if !compare_seen(seen_reader.row(), candidate)?.is_some_and(|order| order.is_eq()) {
             storage
                 .with_block_store(|blocks| sorter.push_encoded(blocks, candidate, &mut compare))
                 .expect("recursive work table has a block store")?;
@@ -4769,11 +4775,11 @@ fn external_recursive_union(
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
-        Ok(if sorted {
-            left.cmp(right)
+        if sorted {
+            crate::sql::exec::compare_projected_rows(left, right)
         } else {
-            core::cmp::Ordering::Equal
-        })
+            Ok(core::cmp::Ordering::Equal)
+        }
     };
     let mut reader = storage.external_run_reader()?;
     for run in [left, right].into_iter().flatten() {
@@ -5076,8 +5082,6 @@ fn materialize_recursive<'a>(
     }
 
     // Base rows; UNION (without ALL) deduplicates them among themselves.
-    // Projected-row encoding is order-preserving-for-equality, so byte equality
-    // is row equality.
     let (base_rows, _, _) =
         materialize_set_body(storage, txid, base_tree, arena, params, sequences)?;
     const EMPTY: &[u8] = &[];
@@ -5100,7 +5104,7 @@ fn materialize_recursive<'a>(
             .map_err(|_| arena_full())?;
         let mut kept = 0usize;
         for &r in base_rows.iter() {
-            if !deduped[..kept].contains(&r) {
+            if !contains_projected_row(&deduped[..kept], r)? {
                 deduped[kept] = r;
                 kept += 1;
             }
@@ -5205,7 +5209,9 @@ fn materialize_recursive<'a>(
                 .map_err(|_| arena_full())?;
             let mut kept = 0usize;
             for &r in step_rows.iter() {
-                if !all_rows.contains(&r) && !kept_rows[..kept].contains(&r) {
+                if !contains_projected_row(all_rows, r)?
+                    && !contains_projected_row(&kept_rows[..kept], r)?
+                {
                     kept_rows[kept] = r;
                     kept += 1;
                 }
@@ -5233,6 +5239,17 @@ fn materialize_recursive<'a>(
             source: crate::sql::ast::MaterializedCteSource::Inline(all_rows),
         })
         .map_err(|_| arena_full())?)
+}
+
+/// Whether `rows` holds a row equal to `row` under SQL equality; recursive
+/// UNION treats `1.0` and `1.00` as one row.
+fn contains_projected_row(rows: &[&[u8]], row: &[u8]) -> Result<bool, SqlError> {
+    for &candidate in rows {
+        if crate::sql::exec::compare_projected_rows(candidate, row)?.is_eq() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn subst_select<'a>(

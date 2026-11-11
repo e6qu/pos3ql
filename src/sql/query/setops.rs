@@ -9,7 +9,7 @@
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree};
-use crate::sql::eval::{ColumnLookup, SequenceAccess, SqlError, compare_datums_collated, sqlstate};
+use crate::sql::eval::{ColumnLookup, SequenceAccess, SqlError, sqlstate};
 use crate::sql::exec::{self, MAX_PROJ};
 use crate::sql::external::ExternalRun;
 use crate::sql::types::{ColDesc, ColType, CollationDerivation, Datum};
@@ -311,8 +311,12 @@ pub(crate) fn set_query_into_rows<'a>(
     Ok(())
 }
 
-fn byte_order(left: &[u8], right: &[u8]) -> Result<core::cmp::Ordering, SqlError> {
-    Ok(left.cmp(right))
+/// Whether the reader's current row equals `row` under SQL equality.
+fn same_set_row(current: Option<&[u8]>, row: &[u8]) -> Result<bool, SqlError> {
+    Ok(match current {
+        Some(current) => exec::compare_projected_rows(current, row)?.is_eq(),
+        None => false,
+    })
 }
 
 fn insertion_order(_left: &[u8], _right: &[u8]) -> Result<core::cmp::Ordering, SqlError> {
@@ -435,29 +439,14 @@ fn compare_set_order(
     keys: &[(usize, bool, bool)],
 ) -> Result<core::cmp::Ordering, SqlError> {
     for &(index, descending, nulls_first) in keys {
-        let left_value = exec::decode_projected_pub(left, index);
-        let right_value = exec::decode_projected_pub(right, index);
-        let ordering = match (left_value.is_null(), right_value.is_null()) {
-            (true, true) => core::cmp::Ordering::Equal,
-            (true, false) if nulls_first => core::cmp::Ordering::Less,
-            (true, false) => core::cmp::Ordering::Greater,
-            (false, true) if nulls_first => core::cmp::Ordering::Greater,
-            (false, true) => core::cmp::Ordering::Less,
-            (false, false) => {
-                let ordering = compare_datums_collated(
-                    storage,
-                    txid,
-                    columns[index].collation,
-                    &left_value,
-                    &right_value,
-                )?;
-                if descending {
-                    ordering.reverse()
-                } else {
-                    ordering
-                }
-            }
-        };
+        let ordering = super::materialize::compare_ordered_key(
+            storage,
+            txid,
+            columns[index].collation,
+            (descending, nulls_first),
+            exec::ProjectedValue::column(left, index),
+            exec::ProjectedValue::column(right, index),
+        )?;
         if !ordering.is_eq() {
             return Ok(ordering);
         }
@@ -495,7 +484,7 @@ fn external_set_leaf<'a>(
     let mut sorter = context.storage.external_sorter()?;
     sorter.reset();
     let mut compare = if sorted {
-        byte_order as fn(&[u8], &[u8]) -> Result<_, _>
+        exec::compare_projected_rows as fn(&[u8], &[u8]) -> Result<_, _>
     } else {
         insertion_order as fn(&[u8], &[u8]) -> Result<_, _>
     };
@@ -563,7 +552,7 @@ fn external_set_tree<'a>(
     let mut sorter = context.storage.external_sorter()?;
     sorter.reset();
     let mut output_compare = if sorted || merge_inputs {
-        byte_order as fn(&[u8], &[u8]) -> Result<_, _>
+        exec::compare_projected_rows as fn(&[u8], &[u8]) -> Result<_, _>
     } else {
         insertion_order as fn(&[u8], &[u8]) -> Result<_, _>
     };
@@ -603,7 +592,7 @@ fn external_set_tree<'a>(
         while left_reader.row().is_some() {
             let left_length = left_reader.stage_current().expect("current left row");
             let mut left_count = 0u64;
-            while left_reader.row() == Some(left_reader.output(left_length)) {
+            while same_set_row(left_reader.row(), left_reader.output(left_length))? {
                 left_count += 1;
                 context
                     .storage
@@ -611,7 +600,12 @@ fn external_set_tree<'a>(
                     .expect("spill-attached block store")?;
             }
             let left_row = left_reader.output(left_length);
-            while right_reader.row().is_some_and(|row| row < left_row) {
+            while right_reader
+                .row()
+                .map(|row| exec::compare_projected_rows(row, left_row))
+                .transpose()?
+                .is_some_and(|order| order.is_lt())
+            {
                 let right_length = right_reader.stage_current().expect("current right row");
                 if *operator == SetOp::Union {
                     context
@@ -625,7 +619,7 @@ fn external_set_tree<'a>(
                         })
                         .expect("spill-attached block store")?;
                 }
-                while right_reader.row() == Some(right_reader.output(right_length)) {
+                while same_set_row(right_reader.row(), right_reader.output(right_length))? {
                     context
                         .storage
                         .with_block_store(|blocks| right_reader.advance(blocks))
@@ -633,7 +627,7 @@ fn external_set_tree<'a>(
                 }
             }
             let mut right_count = 0u64;
-            while right_reader.row() == Some(left_row) {
+            while same_set_row(right_reader.row(), left_row)? {
                 right_count += 1;
                 context
                     .storage
@@ -670,7 +664,7 @@ fn external_set_tree<'a>(
                         )
                     })
                     .expect("spill-attached block store")?;
-                while right_reader.row() == Some(right_reader.output(right_length)) {
+                while same_set_row(right_reader.row(), right_reader.output(right_length))? {
                     context
                         .storage
                         .with_block_store(|blocks| right_reader.advance(blocks))
@@ -697,7 +691,7 @@ fn external_set_tree<'a>(
                         )
                     })
                     .expect("spill-attached block store")?;
-                while reader.row() == Some(reader.output(right_length)) {
+                while same_set_row(reader.row(), reader.output(right_length))? {
                     context
                         .storage
                         .with_block_store(|blocks| reader.advance(blocks))
@@ -1824,32 +1818,13 @@ fn combine_sets<'a>(
     // UNION ALL preserves order (left rows then right, as scanned); only the
     // distinct set operations sort to merge/dedup.
     if !(operator == SetOp::Union && all) {
-        let mut error = None;
-        crate::mem::arena::stable_sort_via(arena, l, |left, right| {
-            match compare_set_rows(storage, txid, collations, left, right) {
-                Ok(ordering) => ordering,
-                Err(value) => {
-                    error = Some(value);
-                    core::cmp::Ordering::Equal
-                }
-            }
-        })
-        .map_err(|_| arena_full())?;
-        if let Some(error) = error {
-            return Err(error);
-        }
-        crate::mem::arena::stable_sort_via(arena, r, |left, right| {
-            match compare_set_rows(storage, txid, collations, left, right) {
-                Ok(ordering) => ordering,
-                Err(value) => {
-                    error = Some(value);
-                    core::cmp::Ordering::Equal
-                }
-            }
-        })
-        .map_err(|_| arena_full())?;
-        if let Some(error) = error {
-            return Err(error);
+        for rows in [&mut *l, &mut *r] {
+            crate::mem::arena::try_stable_sort_via(
+                arena,
+                rows,
+                |left, right| compare_set_rows(storage, txid, collations, left, right),
+                |_| arena_full(),
+            )?;
         }
     }
     let empty: &[u8] = &[];
@@ -1940,16 +1915,13 @@ fn compare_set_rows(
     right: &[u8],
 ) -> Result<core::cmp::Ordering, SqlError> {
     for (index, &collation) in collations.iter().enumerate() {
-        let left_value = exec::decode_projected_pub(left, index);
-        let right_value = exec::decode_projected_pub(right, index);
-        let ordering = match (left_value.is_null(), right_value.is_null()) {
-            (true, true) => core::cmp::Ordering::Equal,
-            (true, false) => core::cmp::Ordering::Less,
-            (false, true) => core::cmp::Ordering::Greater,
-            (false, false) => {
-                compare_datums_collated(storage, txid, collation, &left_value, &right_value)?
-            }
-        };
+        let ordering = super::materialize::compare_materialized_key(
+            storage,
+            txid,
+            collation,
+            exec::ProjectedValue::column(left, index),
+            exec::ProjectedValue::column(right, index),
+        )?;
         if !ordering.is_eq() {
             return Ok(ordering);
         }
@@ -1988,16 +1960,15 @@ pub(crate) fn set_rows_tie(
             },
             _ => return Ok(false),
         };
-        let va = exec::decode_projected_pub(a, index);
-        let vb = exec::decode_projected_pub(b, index);
-        let equal = match (va.is_null(), vb.is_null()) {
-            (true, true) => true,
-            (false, false) => {
-                compare_datums_collated(storage, txid, columns[index].collation, &va, &vb)?.is_eq()
-            }
-            _ => false,
-        };
-        if !equal {
+        if !super::materialize::compare_materialized_key(
+            storage,
+            txid,
+            columns[index].collation,
+            exec::ProjectedValue::column(a, index),
+            exec::ProjectedValue::column(b, index),
+        )?
+        .is_eq()
+        {
             return Ok(false);
         }
     }
@@ -2057,56 +2028,10 @@ pub(crate) fn sort_set_rows(
         nk += 1;
     }
     let keys = &keys[..nk];
-    let mut err: Option<SqlError> = None;
-    crate::mem::arena::stable_sort_via(arena, rows, |a, b| {
-        if err.is_some() {
-            return core::cmp::Ordering::Equal;
-        }
-        for &(index, descending, nulls_first) in keys {
-            let va = exec::decode_projected_pub(a, index);
-            let vb = exec::decode_projected_pub(b, index);
-            let ord = match (va.is_null(), vb.is_null()) {
-                (true, true) => core::cmp::Ordering::Equal,
-                (true, false) => {
-                    if nulls_first {
-                        core::cmp::Ordering::Less
-                    } else {
-                        core::cmp::Ordering::Greater
-                    }
-                }
-                (false, true) => {
-                    if nulls_first {
-                        core::cmp::Ordering::Greater
-                    } else {
-                        core::cmp::Ordering::Less
-                    }
-                }
-                (false, false) => {
-                    match compare_datums_collated(storage, txid, columns[index].collation, &va, &vb)
-                    {
-                        Ok(o) => {
-                            if descending {
-                                o.reverse()
-                            } else {
-                                o
-                            }
-                        }
-                        Err(e) => {
-                            err = Some(e);
-                            core::cmp::Ordering::Equal
-                        }
-                    }
-                }
-            };
-            if ord != core::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        core::cmp::Ordering::Equal
-    })
-    .map_err(|_| arena_full())?;
-    match err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    crate::mem::arena::try_stable_sort_via(
+        arena,
+        rows,
+        |a, b| compare_set_order(storage, txid, columns, a, b, keys),
+        |_| arena_full(),
+    )
 }

@@ -40,7 +40,9 @@ pub use pattern::{like_match, regex_split_count_pub, regex_split_piece_at_pub, r
 pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring};
 
 pub(crate) use operators::arithmetic;
-pub(crate) use operators::{binary, coerce_unknown, membership_eq};
+pub(crate) use operators::{
+    binary, builtin_record_field_type_name, check_record_field_types, coerce_unknown, membership_eq,
+};
 pub use operators::{
     compare_datums, compare_datums_collated, compare_datums_with_catalog, hash_key,
     hash_key_collated,
@@ -6871,7 +6873,20 @@ fn eval_full_inner<'a>(
                 }
             };
             let mut saw_null = false;
-            for el in super::array::elements(raw, element) {
+            for el in super::array::structured_elements(raw, element, arena) {
+                // Named-composite elements are stored as text; compare their
+                // fields.
+                let el = match (el?, hooks.catalog) {
+                    (
+                        Datum::CompositeText {
+                            slot,
+                            physical_fields,
+                            text,
+                        },
+                        Some(catalog),
+                    ) => catalog.materialize_composite(slot, physical_fields, text, arena)?,
+                    (el, _) => el,
+                };
                 let (left, right) =
                     coerce_enum_literal(lhs, el, is_unknown_literal(operand), false, hooks, arena)?;
                 match quantified_scalar(operator, left, right, collation, hooks.catalog, arena)? {

@@ -4936,6 +4936,23 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage.compare_text(collation, left, right)
     }
 
+    fn table_row_type_oid(&self, slot: usize) -> Option<i32> {
+        Some(super::catalog::table_row_type_oid(
+            self.storage,
+            slot,
+            false,
+        ))
+    }
+
+    fn compare_stored(
+        &self,
+        collation: super::ast::Collation,
+        left: &Datum<'_>,
+        right: &Datum<'_>,
+    ) -> Result<core::cmp::Ordering, SqlError> {
+        super::eval::compare_datums_collated(self.storage, self.txid, collation, left, right)
+    }
+
     fn uses_full_unicode_case_mapping(
         &self,
         collation: super::ast::Collation,
@@ -10529,6 +10546,7 @@ fn over_one_row<'a>(
     let inner = Select {
         distinct: false,
         distinct_on: &[],
+        windows: &[],
         where_clause: None,
         group_by: &[],
         grouping_sets: &[],
@@ -11099,7 +11117,7 @@ pub(crate) fn constant_select_resumable<'a>(
 
     let mut live = out_rows.len();
     if statement.distinct {
-        live = match super::exec::sort_dedup_projected(out_rows, width) {
+        live = match super::exec::sort_dedup_projected(storage, txid, out_rows, width) {
             Ok(live) => live,
             Err(error) => return sql_fail(error),
         };
@@ -11941,7 +11959,7 @@ fn select_into_rows_mode<'a>(
         // DISTINCT dedups on the projected values; ORDER BY and LIMIT/OFFSET
         // apply here too (a derived table keeps its inner LIMIT).
         if statement.distinct {
-            rows = rows.distinct(arena)?;
+            rows = rows.distinct(storage, txid, arena)?;
         }
         let proj_rows = rows.rows;
         let count = proj_rows.len();

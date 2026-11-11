@@ -4438,6 +4438,31 @@ impl Chained<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn check_unassigned_row_field(
+        &self,
+        qualifier: &str,
+        name: &str,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        // The scope that answered the lookup checks its row variable.
+        match self.inner.lookup(Some(qualifier), name) {
+            Ok(_)
+                if crate::sql::eval::column_precedes_variable(
+                    self.outer,
+                    Some(qualifier),
+                    name,
+                )? =>
+            {
+                self.inner
+                    .check_unassigned_row_field(qualifier, name, catalog, arena)
+            }
+            _ => self.outer.map_or(Ok(()), |outer| {
+                outer.check_unassigned_row_field(qualifier, name, catalog, arena)
+            }),
+        }
+    }
+
     fn procedural_variable(
         &self,
         qualifier: Option<&str>,

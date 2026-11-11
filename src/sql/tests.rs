@@ -86600,6 +86600,25 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
             "0|2857", "1|2858", "2|2857", "3|2857", "4|2857", "5|2857", "6|2857",
         ],
     );
+    // Without ORDER BY, rows leave in the last-evaluated window's order with
+    // ties in the earlier windows' order, as PostgreSQL 18.6 returns them.
+    partitioned(
+        &mut engine,
+        &mut budget,
+        "SELECT id, row_number() OVER (ORDER BY id DESC)
+         FROM external_window_rows WHERE grp = 1 AND id <= 50 LIMIT 3",
+        &["50|1", "43|2", "36|3"],
+    );
+    partitioned(
+        &mut engine,
+        &mut budget,
+        "SELECT grp, id, rank() OVER (ORDER BY id DESC), count(*) OVER (PARTITION BY grp)
+         FROM external_window_rows WHERE id <= 9",
+        &[
+            "2|9|1|2", "1|8|2|2", "0|7|3|1", "6|6|4|1", "5|5|5|1", "4|4|6|1", "3|3|7|1", "2|2|8|2",
+            "1|1|9|2",
+        ],
+    );
     let traffic = engine.storage.block_io_stats().saturating_sub(before);
     assert!(
         traffic.object_puts > 0 && traffic.object_gets > 0,

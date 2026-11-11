@@ -279,6 +279,17 @@ pub fn build_shaped<'a>(
     if items.len() != shape.element_count() {
         return Err(invalid_shape());
     }
+    // A named composite enters an array in its durable text form, which only
+    // the catalog can produce; the element's caller must normalize it first.
+    if items
+        .iter()
+        .any(|item| matches!(item, Datum::Composite { .. }))
+    {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "named composite array element was not normalized by the catalog"
+        ));
+    }
     let header = PREFIX + shape.dimension_count() * 6;
     let mut total = header;
     // A record array's elements use the projected encoding, which keeps each

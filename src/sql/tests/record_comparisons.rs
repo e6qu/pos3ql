@@ -253,3 +253,57 @@ fn sorting_grouping_and_set_operations_order_records_by_field_values() {
         );
     });
 }
+
+#[test]
+fn named_composite_arrays_compare_catalog_fields_not_element_text() {
+    with_engine("composite-array-comparisons", |engine, budget| {
+        run_with(engine, budget, "CREATE TYPE cac AS (a int, b numeric)");
+        run_with(engine, budget, "CREATE TABLE cat(id int, x cac[])");
+        run_with(
+            engine,
+            budget,
+            "INSERT INTO cat VALUES (1, ARRAY[ROW(10, 1)::cac]), (2, ARRAY[ROW(9, 1)::cac]), \
+             (3, ARRAY[ROW(9, 1.00)::cac])",
+        );
+        // Text order would put "(10,1)" first and keep 1 and 1.00 apart.
+        assert_eq!(
+            rows(engine, budget, "SELECT id FROM cat ORDER BY x, id"),
+            ["2", "3", "1"]
+        );
+        assert_eq!(
+            rows(
+                engine,
+                budget,
+                "SELECT ARRAY[ROW(10, 1)::cac] < ARRAY[ROW(9, 1)::cac], \
+                 ARRAY[ROW(9, 1.0)::cac] = ARRAY[ROW(9, 1.00)::cac]",
+            ),
+            ["f|t"]
+        );
+        assert_eq!(
+            rows(
+                engine,
+                budget,
+                "SELECT count(DISTINCT x), max(x), min(x) FROM cat"
+            ),
+            ["2|{\"(10,1)\"}|{\"(9,1.00)\"}"]
+        );
+        assert_eq!(
+            rows(
+                engine,
+                budget,
+                "SELECT DISTINCT x, count(*) OVER () FROM cat ORDER BY x"
+            ),
+            ["{\"(9,1)\"}|3", "{\"(10,1)\"}|3"]
+        );
+        assert_eq!(
+            rows(
+                engine,
+                budget,
+                "SELECT array_position(ARRAY[ROW(9, 1.0)::cac], ROW(9, 1)::cac), \
+                 ARRAY[ROW(9, 1.0)::cac] @> ARRAY[ROW(9, 1)::cac], \
+                 array_append(ARRAY[ROW(9, 1.0)::cac], ROW(1, 1)::cac)",
+            ),
+            ["1|t|{\"(9,1.0)\",\"(1,1)\"}"]
+        );
+    });
+}

@@ -14409,7 +14409,7 @@ impl Engine {
             matches!(materialized.source, ast::MaterializedCteSource::Write(_))
         }) {
             for (_, materialized) in bound.iter().rev() {
-                materialized.read_rows(arena)?;
+                materialized.read_rows(arena, None)?;
             }
             return Ok(());
         }

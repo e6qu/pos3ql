@@ -18,6 +18,7 @@ mod compatibility_diagnostics;
 mod constraint_index_identity;
 mod cursor_execution;
 mod error_report_fields;
+mod evaluation_timing;
 mod foreign_parent_admission;
 mod function_progress;
 mod geometric_casts;

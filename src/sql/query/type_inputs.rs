@@ -1243,14 +1243,19 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                                     }
                                     _ => scope.star_entry(index),
                                 };
-                                let expression = Expr::Column {
-                                    qualifier: match entry {
-                                        super::ResolvedColumn::Table(table, _) => {
-                                            Some(scope.names[table])
+                                let expression = match entry {
+                                    super::ResolvedColumn::Table(table, column) => {
+                                        let (qualifier, name) =
+                                            scope.column_reference_name(table, column);
+                                        Expr::Column {
+                                            qualifier: Some(qualifier),
+                                            name,
                                         }
-                                        super::ResolvedColumn::Merged(_) => None,
+                                    }
+                                    super::ResolvedColumn::Merged(_) => Expr::Column {
+                                        qualifier: None,
+                                        name: scope.output_name(entry),
                                     },
-                                    name: scope.output_name(entry),
                                 };
                                 if let Some((target, type_mod, Some(site))) =
                                     targets.and_then(|targets| targets.get(output_index + index))

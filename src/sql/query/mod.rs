@@ -1001,6 +1001,94 @@ struct WriteQueryResult {
     replay: super::sequence::StatementReplayCursor,
 }
 
+/// What a scan needs to run a deferred ordinary `WITH` query.
+#[derive(Clone, Copy)]
+pub(crate) struct DeferredCteRead<'r, 'a> {
+    pub storage: &'a Storage,
+    pub txid: u32,
+    pub params: &'r [Datum<'a>],
+    pub sequences: Option<&'r dyn super::eval::SequenceAccess>,
+}
+
+/// The rows of a read deferred `WITH` query and the arena that holds them.
+#[derive(Clone, Copy)]
+struct DeferredCteRows {
+    owner: usize,
+    address: usize,
+    length: usize,
+}
+
+/// Runs a deferred ordinary `WITH` query on its first read and keeps its rows
+/// in the arena's persistent tail for every later read.
+pub(crate) fn read_deferred_cte<'a>(
+    deferred: super::ast::DeferredCteQuery<'a>,
+    arena: &'a Arena,
+    query: Option<DeferredCteRead<'_, 'a>>,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    let saved = deferred.rows.load(core::sync::atomic::Ordering::Relaxed);
+    if saved != 0 {
+        // SAFETY: a nonzero address names an immutable persistent descriptor
+        // allocated with the rows by the first read.
+        let source = unsafe { &*(saved as *const DeferredCteRows) };
+        if source.owner != core::ptr::from_ref(arena) as usize {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a WITH query was read outside the statement memory that ran it"
+            ));
+        }
+        // SAFETY: the rows live in this arena's persistent tail, which only
+        // a reset reclaims, and a reset needs the arena's unique borrow.
+        return Ok(unsafe {
+            core::slice::from_raw_parts(source.address as *const &'a [u8], source.length)
+        });
+    }
+    let Some(query) = query else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a WITH query was read without its statement context"
+        ));
+    };
+    let (rows, _, _) = setops::materialize_set_body(
+        query.storage,
+        query.txid,
+        deferred.tree,
+        arena,
+        query.params,
+        query.sequences,
+    )?;
+    // A dry run (such as CREATE TABLE AS counting its rows first) previews
+    // sequence values; the run that consumes them must evaluate again.
+    if query
+        .sequences
+        .is_some_and(|sequences| !sequences.has_effects())
+    {
+        return Ok(rows);
+    }
+    const EMPTY: &[u8] = &[];
+    let kept = arena
+        .alloc_persistent_slice_with(rows.len(), |_| EMPTY)
+        .map_err(|_| arena_full())?;
+    for (kept, row) in kept.iter_mut().zip(rows) {
+        let bytes = arena
+            .alloc_persistent_slice_with(row.len(), |index| row[index])
+            .map_err(|_| arena_full())?;
+        *kept = &*bytes;
+    }
+    let kept: &'a [&'a [u8]] = kept;
+    let source = arena
+        .alloc_persistent_slice_with(1, |_| DeferredCteRows {
+            owner: core::ptr::from_ref(arena) as usize,
+            address: kept.as_ptr() as usize,
+            length: kept.len(),
+        })
+        .map_err(|_| arena_full())?;
+    deferred.rows.store(
+        core::ptr::from_ref(&source[0]) as usize,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(kept)
+}
+
 /// Reads a data-modifying `WITH` query's rows for the running statement
 /// attempt, or makes its run the attempt's pending call.
 pub(crate) fn read_write_query<'a>(
@@ -7845,11 +7933,16 @@ fn check_key_types<'a>(
             storage,
             txid,
         )?;
+        const ORDERING_HINT: &str = "Use an explicit ordering operator or modify the query.";
         if let Some(ctype) = noncomparable(target) {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "could not identify an ordering operator for type {}",
-                ctype.name()
+            return Err(crate::sql::error_position::at_expression_with_hint(
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "could not identify an ordering operator for type {}",
+                    ctype.name()
+                ),
+                order.expression,
+                ORDERING_HINT,
             ));
         }
         if unordered_cid(target) {
@@ -7863,10 +7956,14 @@ fn check_key_types<'a>(
             } else {
                 "cid"
             };
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "could not identify an ordering operator for type {}",
-                type_name
+            return Err(crate::sql::error_position::at_expression_with_hint(
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "could not identify an ordering operator for type {}",
+                    type_name
+                ),
+                order.expression,
+                ORDERING_HINT,
             ));
         }
     }
@@ -8176,7 +8273,8 @@ fn resolve_position_target<'a>(
                 if remaining < width {
                     return match scope.star_entry(remaining) {
                         ResolvedColumn::Table(t, c) => {
-                            column_ref(Some(scope.names[t]), scope.defs.column_name(t, c))
+                            let (qualifier, name) = scope.column_reference_name(t, c);
+                            column_ref(Some(qualifier), name)
                         }
                         // The merged column as the star produced it. Its bare
                         // name can be ambiguous with another FROM item's column.
@@ -9747,7 +9845,7 @@ pub(crate) fn lock_clauses_row(
                 clause
                     .of
                     .iter()
-                    .any(|name| scope.table_index(name).ok() == Some(table))
+                    .any(|name| scope.source(name).ok().map(|source| source.table) == Some(table))
             };
             if !targeted {
                 continue;
@@ -10459,6 +10557,7 @@ fn over_one_row<'a>(
             authorization_role: None,
             bound_table: None,
             view_access: None,
+            join_members: None,
         },
         joins: &[],
     };
@@ -12616,9 +12715,9 @@ pub fn describe_select_items<'q>(
             SelectItem::Wildcard(_) => column += scope.map_or(0, QueryScope::star_columns),
             SelectItem::TableWildcard(table) => {
                 if let Some(scope) = scope
-                    && let Ok(table) = scope.table_index(table)
+                    && let Ok(width) = scope.qualified_star_columns(table)
                 {
-                    column += scope.defs.get(table).expect("resolved").n_columns;
+                    column += width;
                 }
             }
             SelectItem::RecordStar(base) => {
@@ -12658,9 +12757,9 @@ fn patch_array_subquery_field_types<'q>(
             SelectItem::Wildcard(_) => column += outer_scope.map_or(0, QueryScope::star_columns),
             SelectItem::TableWildcard(table) => {
                 if let Some(scope) = outer_scope
-                    && let Ok(table) = scope.table_index(table)
+                    && let Ok(width) = scope.qualified_star_columns(table)
                 {
-                    column += scope.defs.get(table).expect("resolved").n_columns;
+                    column += width;
                 }
             }
             SelectItem::RecordStar(base) => {
@@ -13432,25 +13531,18 @@ fn describe_scope_record_star<'q>(
         | Expr::Column {
             qualifier: None,
             name: table,
-        } if scope.table_index(table).is_ok()
+        } if scope.source(table).is_ok()
             && (matches!(base, Expr::WholeRow(_))
                 || scope
                     .find_column(None, table)
                     .is_err_and(|error| error.sqlstate == sqlstate::UNDEFINED_COLUMN)) =>
         {
-            let t = scope.table_index(table)?;
-            for (column, _) in scope
-                .defs
-                .get(t)
-                .expect("resolved")
-                .columns()
-                .iter()
-                .enumerate()
-            {
+            let source = scope.source(table)?;
+            for column in source.first..source.first + source.n_columns {
                 push(
                     describe_scope_column(
                         scope,
-                        ResolvedColumn::Table(t, column),
+                        ResolvedColumn::Table(source.table, column),
                         storage,
                         txid,
                         arena,
@@ -13661,9 +13753,8 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     }
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
-        let t = self.0.table_index(name).ok()?;
-        let def = self.0.defs.get(t)?;
-        Some(&def.columns()[..def.n_columns])
+        let source = self.0.source(name).ok()?;
+        Some(self.0.source_columns(source))
     }
 
     fn whole_row_field(
@@ -14122,12 +14213,12 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
     }
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
-        if let Ok(table) = self.scope.table_index(name) {
-            return Some(self.scope.defs.get(table)?.columns());
+        if let Ok(source) = self.scope.source(name) {
+            return Some(self.scope.source_columns(source));
         }
         let scope = self.outer_scope?;
-        let table = scope.table_index(name).ok()?;
-        Some(scope.defs.get(table)?.columns())
+        let source = scope.source(name).ok()?;
+        Some(scope.source_columns(source))
     }
 
     fn whole_row_field(
@@ -14450,11 +14541,11 @@ fn detached_join_values<'a, 'r>(
     arena: &'r Arena,
 ) -> Result<&'r [Datum<'r>], SqlError> {
     let values = scratch
-        .alloc_slice_with(row.scope.total_columns(), |_| Datum::Null)
+        .alloc_slice_with(row.scope.stored_columns(), |_| Datum::Null)
         .map_err(|_| arena_full())?;
     let mut offset = 0;
     for table in 0..row.scope.n {
-        let width = row.scope.defs.get(table).expect("resolved").n_columns;
+        let width = row.scope.stored_width(table);
         if let Some(source) = row.table_values(table).filter(|source| !source.is_empty()) {
             values[offset..offset + width].copy_from_slice(&source[..width]);
         }
@@ -14484,6 +14575,7 @@ pub(crate) fn dml_target_ref<'a>(target: QualName<'a>, alias: Option<&'a str>) -
         authorization_role: None,
         bound_table: None,
         view_access: None,
+        join_members: None,
     }
 }
 
@@ -14511,7 +14603,7 @@ impl<'a> ReturningJoin<'a> {
         let offsets = arena
             .alloc_slice_with(scope.n, |table| {
                 let start = offset;
-                offset += scope.defs.get(table).expect("resolved").n_columns;
+                offset += scope.stored_width(table);
                 start
             })
             .map_err(|_| arena_full())?;
@@ -14532,7 +14624,7 @@ impl<'a> ReturningJoin<'a> {
         from: &[Datum<'v>],
         arena: &'v Arena,
     ) -> Result<JoinRow<'s, 'v, 'a>, SqlError> {
-        let total = self.scope.total_columns();
+        let total = self.scope.stored_columns();
         if target.len() + from.len() != total {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,

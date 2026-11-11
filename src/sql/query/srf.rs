@@ -1090,6 +1090,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         authorization_role: None,
                         bound_table: None,
                         view_access: None,
+                        join_members: None,
                     })
                     .map_err(|_| arena_full())?;
                 let routine = capture_table_func_routine(
@@ -2212,8 +2213,8 @@ pub(super) fn preserve_projection_type_identities(
         match entry {
             super::ResolvedColumn::Table(table, column) => resolver
                 .column_meta(
-                    Some(scope.names[table]),
-                    scope.defs.column_name(table, column),
+                    Some(scope.column_reference_name(table, column).0),
+                    scope.column_reference_name(table, column).1,
                 )
                 .map(|metadata| metadata.type_oid)
                 .ok_or_else(shape_error),

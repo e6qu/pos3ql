@@ -1563,6 +1563,10 @@ pub(crate) fn next_cached(
 }
 
 impl SequenceAccess for SeqEval<'_> {
+    fn has_effects(&self) -> bool {
+        !self.dry
+    }
+
     fn nextval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::UPDATE))?;

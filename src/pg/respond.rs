@@ -2345,6 +2345,22 @@ impl<'b> Responder<'b> {
                             m.cstr(h.as_str());
                         }
                     }
+                    match &annotation.note {
+                        Some(crate::sql::error_position::AnalysisNote::Detail(detail))
+                            if diagnostic.as_ref().is_none_or(|d| d.detail.is_none()) =>
+                        {
+                            m.u8(b'D');
+                            m.cstr(detail.as_str());
+                        }
+                        Some(crate::sql::error_position::AnalysisNote::Hint(hint))
+                            if analysis_hint.is_none()
+                                && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
+                        {
+                            m.u8(b'H');
+                            m.cstr(hint.as_str());
+                        }
+                        _ => {}
+                    }
                     if let Some(hint) = analysis_hint {
                         m.u8(b'H');
                         m.cstr(hint);

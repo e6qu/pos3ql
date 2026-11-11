@@ -403,6 +403,81 @@ pub struct QueryScope<'d> {
     /// `FromClause::joins` (whose `on` is None for such joins). Filled only
     /// on the executor path (predicate synthesis needs an arena).
     pub join_on: &'d mut [Option<&'d Expr<'d>>],
+    /// Names exposed by unaliased parenthesized joins, each a column window
+    /// of the join's single derived entry.
+    members: &'d [ScopeMember<'d>],
+    /// Per parenthesized join entry, the member column each of its visible
+    /// columns copies (`None` for a merged `USING` column), so a column can
+    /// be named again unambiguously.
+    join_origins: &'d [(usize, &'d [Option<usize>])],
+    /// Internal names for columns whose name repeats within their entry
+    /// (`(SELECT 1 id, 2 id) s`): a NUL byte, which no SQL identifier
+    /// contains, then the column's index. Only re-resolution of an already
+    /// resolved column produces them.
+    positional_names: &'d [(usize, usize, &'d str)],
+    /// Tables inside an aliased parenthesized join, which its alias hides.
+    hidden_members: &'d [&'d str],
+}
+
+/// A table (or `USING` alias) inside an unaliased parenthesized join. Its
+/// columns are `first..first + n_columns` of the join's derived entry, which
+/// keeps them out of unqualified lookup and `SELECT *`.
+#[derive(Clone, Copy)]
+pub(crate) struct ScopeMember<'d> {
+    name: &'d str,
+    table: usize,
+    first: usize,
+    n_columns: usize,
+    /// The `num_nulls(member)` column: nonzero when an outer join inside
+    /// the parenthesized join null-extended this member.
+    presence: Option<usize>,
+    /// The catalog relation an unaliased member names, for three-part
+    /// qualifiers and alias-hiding diagnostics.
+    relation: Option<(&'d str, &'d str)>,
+    aliased: bool,
+    scalar: bool,
+}
+
+/// PostgreSQL's error for a FROM item that exists but is out of reach: an
+/// earlier comma-separated item seen from a join condition, or a table
+/// hidden inside an aliased parenthesized join.
+fn unreachable_entry(name: &str) -> SqlError {
+    crate::sql::error_position::with_detail(
+        sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "invalid reference to FROM-clause entry for table \"{}\"",
+            name
+        ),
+        format_args!(
+            "There is an entry for table \"{}\", but it cannot be referenced from this part of the query.",
+            name
+        ),
+    )
+}
+
+/// Reads a member's `num_nulls(member)` presence column.
+pub(crate) fn member_present(value: Datum<'_>) -> Result<bool, SqlError> {
+    match value {
+        Datum::Int4(nulls) => Ok(nulls == 0),
+        _ => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "parenthesized join member presence is not an integer"
+        )),
+    }
+}
+
+/// A join member's catalog relation (schema, name), whether an alias names
+/// it, and whether it is a scalar function source.
+type MemberRelation<'d> = (Option<(&'d str, &'d str)>, bool, bool);
+
+/// A qualifier's columns: a whole scope entry or a parenthesized join
+/// member's window of one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ScopeSource {
+    pub table: usize,
+    pub first: usize,
+    pub n_columns: usize,
+    pub presence: Option<usize>,
 }
 
 /// Type-only lookup over FROM items already registered in a scope. Table
@@ -585,6 +660,7 @@ impl<'d> QueryScope<'d> {
                     authorization_role: None,
                     bound_table: None,
                     view_access: None,
+                    join_members: None,
                 },
                 joins: &[],
             })
@@ -703,6 +779,366 @@ impl<'d> QueryScope<'d> {
             output,
             n_output: 0,
             join_on,
+            members: &[],
+            join_origins: &[],
+            positional_names: &[],
+            hidden_members: &[],
+        })
+    }
+
+    /// Gives every column whose name repeats within its entry a positional
+    /// internal name (see `positional_names`).
+    fn name_repeated_columns(&mut self, arena: &'d Arena) -> Result<(), SqlError> {
+        let mut names = ArenaList::new(arena);
+        // Catalog relations cannot repeat a column name.
+        for table in (0..self.n).filter(|&table| self.derived[table].is_some()) {
+            let columns = self.defs.get(table).expect("resolved").columns();
+            for (column, meta) in columns.iter().enumerate() {
+                if columns
+                    .iter()
+                    .filter(|other| other.name.as_str() == meta.name.as_str())
+                    .count()
+                    > 1
+                {
+                    let name = crate::stack_format!(16, "\0{}", column);
+                    let name = arena.alloc_str(name.as_str()).map_err(|_| arena_full())?;
+                    names
+                        .push((table, column, name))
+                        .map_err(|_| arena_full())?;
+                }
+            }
+        }
+        self.positional_names = names.as_slice();
+        Ok(())
+    }
+
+    /// A qualifier and name that resolve back to exactly column `column` of
+    /// entry `table`: a parenthesized join's copy of a member column is
+    /// named through that member.
+    pub(crate) fn column_reference_name(&self, table: usize, column: usize) -> (&str, &str) {
+        let origin = self
+            .join_origins
+            .iter()
+            .find(|(entry, _)| *entry == table)
+            .map(|(_, origins)| origins.get(column).copied().flatten().unwrap_or(column));
+        if let Some(stored) = origin
+            && let Some(member) = self.members.iter().find(|member| {
+                member.table == table
+                    && (member.first..member.first + member.n_columns).contains(&stored)
+            })
+        {
+            return (member.name, self.defs.column_name(table, stored));
+        }
+        let name = self
+            .positional_names
+            .iter()
+            .find(|(entry, index, _)| *entry == table && *index == column)
+            .map_or_else(
+                || self.defs.column_name(table, column),
+                |(_, _, name)| *name,
+            );
+        (self.names[table], name)
+    }
+
+    /// Whether `exposed` already names a FROM item or join member.
+    fn name_taken(&self, exposed: &str) -> bool {
+        self.names[..self.n].contains(&exposed)
+            || self.members.iter().any(|member| member.name == exposed)
+    }
+
+    /// PostgreSQL's name for an unaliased derived table or parenthesized
+    /// join, made unique so internal re-resolution of its columns stays
+    /// unambiguous when several coexist.
+    fn unnamed_entry<'a>(
+        &self,
+        tref: &TableRef<'_>,
+        arena: &'a Arena,
+    ) -> Result<&'a str, SqlError> {
+        let base = if tref.join_members.is_some() {
+            "unnamed_join"
+        } else {
+            "unnamed_subquery"
+        };
+        if !self.name_taken(base) {
+            return Ok(base);
+        }
+        for suffix in 2..=self.n + 1 {
+            let candidate = crate::stack_format!(64, "{} {}", base, suffix);
+            if !self.name_taken(candidate.as_str()) {
+                return arena
+                    .alloc_str(candidate.as_str())
+                    .map_err(|_| arena_full());
+            }
+        }
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "no free name for an unaliased FROM item"
+        ))
+    }
+
+    fn duplicate_name(&self, exposed: &str) -> Result<(), SqlError> {
+        if self.name_taken(exposed) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_ALIAS,
+                "table name \"{}\" specified more than once",
+                exposed
+            ));
+        }
+        Ok(())
+    }
+
+    /// An aliased parenthesized join's column aliases are checked against
+    /// the join's columns, which PostgreSQL calls a join expression.
+    fn check_join_alias_width(
+        &self,
+        storage: &Storage,
+        tref: &TableRef<'_>,
+        sub: &crate::sql::ast::Select<'_>,
+        exposed: &str,
+        txid: u32,
+        arena: &'d Arena,
+    ) -> Result<(), SqlError> {
+        let (Some(_), Some(aliases)) = (tref.join_members, tref.col_alias) else {
+            return Ok(());
+        };
+        let definition = super::srf::describe_derived_definition(
+            storage,
+            sub,
+            exposed,
+            None,
+            txid,
+            arena,
+            tref.lateral.then_some(self),
+        )?;
+        if aliases.len() > definition.n_columns {
+            return Err(sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "join expression \"{}\" has {} columns available but {} columns specified",
+                exposed,
+                definition.n_columns,
+                aliases.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records the member names of a parenthesized join just added: exposed
+    /// when it has no alias, otherwise hidden behind it.
+    fn register_join_members<'a>(
+        &mut self,
+        storage: &'a Storage,
+        tref: &'a TableRef<'a>,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError>
+    where
+        'a: 'd,
+    {
+        let Some(members) = tref.join_members else {
+            return Ok(());
+        };
+        if tref.alias.is_none() {
+            return self.add_join_members(storage, tref, members, txid, arena);
+        }
+        let mut hidden = ArenaList::new(arena);
+        for name in self.hidden_members {
+            hidden.push(*name).map_err(|_| arena_full())?;
+        }
+        for member in members {
+            hidden.push(member.name).map_err(|_| arena_full())?;
+        }
+        self.hidden_members = hidden.as_slice();
+        Ok(())
+    }
+
+    /// Registers the members of the unaliased parenthesized join that was
+    /// just added as entry `self.n - 1`, and narrows that entry's visible
+    /// columns to the join's own output.
+    fn add_join_members<'a>(
+        &mut self,
+        storage: &'a Storage,
+        tref: &'a TableRef<'a>,
+        members: &'a [crate::sql::ast::JoinMember<'a>],
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError>
+    where
+        'a: 'd,
+    {
+        let table = self.n - 1;
+        let sub = tref
+            .subquery
+            .expect("a parenthesized join is a derived table");
+        let inner_from = sub
+            .from
+            .as_ref()
+            .expect("a parenthesized join has a FROM clause");
+        let outer_schema = tref.lateral.then_some(super::ScopeSchema(&*self));
+        let inner = QueryScope::resolve_schema(
+            storage,
+            inner_from,
+            txid,
+            arena,
+            outer_schema
+                .as_ref()
+                .map(|schema| schema as &dyn ColumnLookup<'_>),
+        )?;
+        inner.check_join_conditions(inner_from, None, Some(&*self))?;
+        for member in members {
+            self.duplicate_name(member.name)?;
+        }
+        let visible = inner.star_columns();
+        let mut first = visible;
+        let mut scope_members = ArenaList::new(arena);
+        for member in self.members {
+            scope_members.push(*member).map_err(|_| arena_full())?;
+        }
+        let mut n_table_members = 0usize;
+        for member in members {
+            let n_columns = inner.qualified_star_columns(member.name)?;
+            let (relation, aliased, scalar) = if member.using_alias {
+                (None, true, false)
+            } else {
+                n_table_members += 1;
+                inner.member_relation(member.name, arena)?
+            };
+            scope_members
+                .push(ScopeMember {
+                    name: member.name,
+                    table,
+                    first,
+                    n_columns,
+                    presence: None,
+                    relation,
+                    aliased,
+                    scalar,
+                })
+                .map_err(|_| arena_full())?;
+            first += n_columns;
+        }
+        let members_start = self.members.len();
+        let scope_members = scope_members.into_mut_slice().map_err(|_| arena_full())?;
+        let mut presence = first;
+        for (member, written) in scope_members[members_start..].iter_mut().zip(members) {
+            if !written.using_alias {
+                member.presence = Some(presence);
+                presence += 1;
+            }
+        }
+        debug_assert_eq!(presence, first + n_table_members);
+        let mut origins = ArenaList::new(arena);
+        for index in 0..visible {
+            let origin = match inner.star_entry(index) {
+                ResolvedColumn::Merged(_) => None,
+                ResolvedColumn::Table(inner_table, inner_column) => {
+                    let (qualifier, name) = inner.column_reference_name(inner_table, inner_column);
+                    let columns = self
+                        .defs
+                        .get(table)
+                        .expect("join entry is resolved")
+                        .columns;
+                    scope_members[members_start..]
+                        .iter()
+                        .find(|member| member.name == qualifier && member.presence.is_some())
+                        .and_then(|member| {
+                            columns[member.first..member.first + member.n_columns]
+                                .iter()
+                                .position(|column| column.name.as_str() == name)
+                                .map(|offset| member.first + offset)
+                        })
+                }
+            };
+            origins.push(origin).map_err(|_| arena_full())?;
+        }
+        let mut join_origins = ArenaList::new(arena);
+        for origin in self.join_origins {
+            join_origins.push(*origin).map_err(|_| arena_full())?;
+        }
+        join_origins
+            .push((table, origins.as_slice()))
+            .map_err(|_| arena_full())?;
+        self.join_origins = join_origins.as_slice();
+        let definition = self.defs.get(table).expect("join entry is resolved");
+        if definition.columns.len() != presence {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "parenthesized join output has {} columns, expected {}",
+                definition.columns.len(),
+                presence
+            ));
+        }
+        let definition = RelationDefinition {
+            n_columns: visible,
+            ..definition
+        };
+        let definition = retain_query_definition(definition, arena)?;
+        self.defs.set_arena(table, definition);
+        self.members = scope_members;
+        Ok(())
+    }
+
+    /// Relation identity of a name this scope exposes, as a member of an
+    /// enclosing parenthesized join sees it.
+    fn member_relation(
+        &self,
+        name: &str,
+        arena: &'d Arena,
+    ) -> Result<MemberRelation<'d>, SqlError> {
+        if let Some(member) = self.members.iter().find(|member| member.name == name) {
+            return Ok((member.relation, member.aliased, member.scalar));
+        }
+        let table = self.entry_index(name)?;
+        let scalar = self.func_scalar_column(name).is_some();
+        let definition = self.defs.get(table).expect("resolved");
+        if definition.schema.as_str().is_empty() {
+            return Ok((None, true, scalar));
+        }
+        let schema = arena
+            .alloc_str(definition.schema.as_str())
+            .map_err(|_| arena_full())?;
+        let relation_name = arena
+            .alloc_str(definition.name.as_str())
+            .map_err(|_| arena_full())?;
+        Ok((
+            Some((schema, relation_name)),
+            self.names[table] != relation_name,
+            scalar,
+        ))
+    }
+
+    fn member(&self, qualifier: &str) -> Option<&ScopeMember<'d>> {
+        match qualifier.split_once('.') {
+            None => self.members.iter().find(|member| member.name == qualifier),
+            Some((schema, table)) => self
+                .members
+                .iter()
+                .find(|member| !member.aliased && member.relation == Some((schema, table))),
+        }
+    }
+
+    /// A source's visible columns, in its own order.
+    pub(crate) fn source_columns(&self, source: ScopeSource) -> &[ColumnMeta] {
+        &self.defs.get(source.table).expect("resolved").columns
+            [source.first..source.first + source.n_columns]
+    }
+
+    /// The columns a qualifier names: a FROM item, or a member of an
+    /// unaliased parenthesized join.
+    pub(crate) fn source(&self, qualifier: &str) -> Result<ScopeSource, SqlError> {
+        if let Some(member) = self.member(qualifier) {
+            return Ok(ScopeSource {
+                table: member.table,
+                first: member.first,
+                n_columns: member.n_columns,
+                presence: member.presence,
+            });
+        }
+        let table = self.entry_index(qualifier)?;
+        Ok(ScopeSource {
+            table,
+            first: 0,
+            n_columns: self.defs.get(table).expect("resolved").n_columns,
+            presence: None,
         })
     }
 
@@ -762,12 +1198,162 @@ impl<'d> QueryScope<'d> {
                 catalog_scan(&j.table, predicate, false),
             )?;
         }
+        scope.check_join_conditions(from, outer, None)?;
         scope.build_merges(from, arena, Some(arena))?;
+        scope.name_repeated_columns(arena)?;
         Ok(scope)
     }
 
-    /// Registers a materialized recursive CTE's actual output columns and rows.
-    /// `materialize` false = schema only (Describe path).
+    /// PostgreSQL analyses a join's `ON` condition against only the FROM
+    /// items that join combines: earlier comma-separated items and later
+    /// joins are in the query but out of the condition's reach. `hidden` is
+    /// the enclosing FROM clause of a parenthesized join, equally out of
+    /// reach.
+    pub(super) fn check_join_conditions(
+        &self,
+        from: &FromClause<'_>,
+        outer: Option<&dyn ColumnLookup<'_>>,
+        hidden: Option<&QueryScope<'_>>,
+    ) -> Result<(), SqlError> {
+        let mut start = 0;
+        for (index, join) in from.joins.iter().enumerate() {
+            let table = index + 1;
+            if join.kind == crate::sql::ast::JoinKind::Comma {
+                start = table;
+            }
+            if let Some(condition) = join.on {
+                self.check_condition_references(condition, start..table + 1, outer, hidden)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_condition_references(
+        &self,
+        expression: &Expr<'_>,
+        visible: core::ops::Range<usize>,
+        outer: Option<&dyn ColumnLookup<'_>>,
+        hidden: Option<&QueryScope<'_>>,
+    ) -> Result<(), SqlError> {
+        if let Expr::Column { qualifier, name } = expression {
+            self.check_condition_column(*qualifier, name, visible.clone(), outer, hidden)?;
+        }
+        let mut failure = None;
+        let _ = super::subquery::walk_children(expression, &mut |child| {
+            if failure.is_none()
+                && let Err(error) =
+                    self.check_condition_references(child, visible.clone(), outer, hidden)
+            {
+                failure = Some(error);
+            }
+            Ok(())
+        });
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn check_condition_column(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+        visible: core::ops::Range<usize>,
+        outer: Option<&dyn ColumnLookup<'_>>,
+        hidden: Option<&QueryScope<'_>>,
+    ) -> Result<(), SqlError> {
+        let outer_resolves =
+            || outer.is_some_and(|outer| outer.col_type(qualifier, name).is_some());
+        match qualifier {
+            Some(qualifier) => {
+                let table = match self.source(qualifier) {
+                    Ok(source) => Some(source.table),
+                    Err(_) => None,
+                };
+                if table.is_some_and(|table| visible.contains(&table)) || outer_resolves() {
+                    return Ok(());
+                }
+                let invisible = match table {
+                    Some(table) => table < visible.start,
+                    None => hidden.is_some_and(|hidden| hidden.source(qualifier).is_ok()),
+                };
+                if invisible {
+                    return Err(crate::sql::error_position::column_reference(
+                        unreachable_entry(qualifier),
+                        Some(qualifier),
+                        name,
+                    ));
+                }
+                if table.is_some() {
+                    return Err(crate::sql::error_position::column_reference(
+                        sql_err!(
+                            sqlstate::UNDEFINED_TABLE,
+                            "missing FROM-clause entry for table \"{}\"",
+                            qualifier
+                        ),
+                        Some(qualifier),
+                        name,
+                    ));
+                }
+                Ok(())
+            }
+            None => {
+                if visible
+                    .clone()
+                    .any(|table| self.visible_column_owner(table, name).is_some())
+                    || self.using_alias(name).is_some()
+                    || self.source(name).is_ok()
+                    || outer_resolves()
+                {
+                    return Ok(());
+                }
+                let earlier = (0..visible.start)
+                    .find_map(|table| self.visible_column_owner(table, name))
+                    .or_else(|| {
+                        hidden.and_then(|hidden| {
+                            (0..hidden.n).find_map(|table| hidden.visible_column_owner(table, name))
+                        })
+                    });
+                let later = (visible.end..self.n)
+                    .any(|table| self.visible_column_owner(table, name).is_some());
+                let error = sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                );
+                let error = match earlier {
+                    Some(owner) => crate::sql::error_position::with_detail(
+                        error,
+                        format_args!(
+                            "There is a column named \"{}\" in table \"{}\", but it cannot be referenced from this part of the query.",
+                            name, owner
+                        ),
+                    ),
+                    None if later => error,
+                    None => return Ok(()),
+                };
+                Err(crate::sql::error_position::column_reference(
+                    error, None, name,
+                ))
+            }
+        }
+    }
+
+    /// The name of the table (or join member) of entry `table` that has a
+    /// visible column `name`.
+    fn visible_column_owner(&self, table: usize, name: &str) -> Option<&str> {
+        let definition = self.defs.get(table)?;
+        definition.column_index(name)?;
+        self.members
+            .iter()
+            .filter(|member| member.table == table && member.presence.is_some())
+            .find(|member| {
+                definition.columns[member.first..member.first + member.n_columns]
+                    .iter()
+                    .any(|column| column.name.as_str() == name)
+            })
+            .map_or(Some(self.names[table]), |member| Some(member.name))
+    }
+
+    /// Registers a materialized CTE's actual output columns and rows. Without
+    /// `read` the scope is schema only (Describe path).
     fn add_materialized<'a>(
         &mut self,
         storage: &Storage,
@@ -775,18 +1361,14 @@ impl<'d> QueryScope<'d> {
         m: &'a MaterializedCte<'a>,
         txid: u32,
         arena: &'a Arena,
-        materialize: bool,
+        read: Option<super::DeferredCteRead<'_, 'a>>,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
     {
         let exposed = tref.alias.unwrap_or(tref.table);
-        if !exposed.is_empty() && self.names[..self.n].contains(&exposed) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_ALIAS,
-                "table name \"{}\" specified more than once",
-                exposed
-            ));
+        if !exposed.is_empty() {
+            self.duplicate_name(exposed)?;
         }
         let ncols = m.column_names.len();
         if ncols > MAX_COLUMNS {
@@ -846,8 +1428,9 @@ impl<'d> QueryScope<'d> {
         };
         self.names[self.n] = exposed;
         self.defs.set_arena(self.n, def_reference);
+        let materialize = read.is_some();
         self.derived[self.n] = Some(if materialize {
-            m.read_rows(arena)?
+            m.read_rows(arena, read)?
         } else {
             &[]
         });
@@ -895,7 +1478,19 @@ impl<'d> QueryScope<'d> {
             ));
         }
         if let Some(m) = tref.cte {
-            return self.add_materialized(storage, tref, m, txid, arena, true);
+            return self.add_materialized(
+                storage,
+                tref,
+                m,
+                txid,
+                arena,
+                Some(super::DeferredCteRead {
+                    storage,
+                    txid,
+                    params,
+                    sequences,
+                }),
+            );
         }
         if tref.is_function_source() {
             return self.add_table_func(storage, tref, txid, arena, params, sequences, true, outer);
@@ -928,18 +1523,18 @@ impl<'d> QueryScope<'d> {
             }
             return self.add(storage, tref, txid, arena);
         };
-        let exposed = tref.alias.unwrap_or("*SELECT*");
-        if self.names[..self.n].contains(&exposed) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_ALIAS,
-                "table name \"{}\" specified more than once",
-                exposed
-            ));
-        }
+        let exposed = match tref.alias {
+            Some(alias) => {
+                self.duplicate_name(alias)?;
+                alias
+            }
+            None => self.unnamed_entry(tref, arena)?,
+        };
         // A LATERAL subquery's def is typed against the tables to its left
         // (a body may project an outer column); a plain derived table is typed
         // on its own. Its rows are materialized per outer row by the scan, so
         // register an empty placeholder here rather than running it now.
+        self.check_join_alias_width(storage, tref, sub, exposed, txid, arena)?;
         let mut definition = super::srf::describe_derived_definition(
             storage,
             sub,
@@ -962,6 +1557,7 @@ impl<'d> QueryScope<'d> {
             self.slots[self.n] = usize::MAX;
             self.view_accesses[self.n] = tref.view_access;
             self.n += 1;
+            self.register_join_members(storage, tref, txid, arena)?;
             return Ok(());
         }
         let rows: &'a [&'a [u8]];
@@ -1044,6 +1640,7 @@ impl<'d> QueryScope<'d> {
         self.slots[self.n] = usize::MAX;
         self.view_accesses[self.n] = tref.view_access;
         self.n += 1;
+        self.register_join_members(storage, tref, txid, arena)?;
         Ok(())
     }
 
@@ -1063,7 +1660,9 @@ impl<'d> QueryScope<'d> {
         for j in from.joins {
             scope.add_schema(storage, &j.table, txid, arena, outer)?;
         }
+        scope.check_join_conditions(from, outer, None)?;
         scope.build_merges(from, arena, None)?;
+        scope.name_repeated_columns(arena)?;
         Ok(scope)
     }
 
@@ -1097,7 +1696,7 @@ impl<'d> QueryScope<'d> {
             ));
         }
         if let Some(m) = tref.cte {
-            return self.add_materialized(storage, tref, m, txid, arena, false);
+            return self.add_materialized(storage, tref, m, txid, arena, None);
         }
         if tref.is_function_source() {
             let outer_types = outer.map(OuterColumnTypes);
@@ -1133,14 +1732,14 @@ impl<'d> QueryScope<'d> {
             }
             return self.add(storage, tref, txid, arena);
         };
-        let exposed = tref.alias.unwrap_or("*SELECT*");
-        if self.names[..self.n].contains(&exposed) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_ALIAS,
-                "table name \"{}\" specified more than once",
-                exposed
-            ));
-        }
+        let exposed = match tref.alias {
+            Some(alias) => {
+                self.duplicate_name(alias)?;
+                alias
+            }
+            None => self.unnamed_entry(tref, arena)?,
+        };
+        self.check_join_alias_width(storage, tref, sub, exposed, txid, arena)?;
         let mut definition = super::srf::describe_derived_definition(
             storage,
             sub,
@@ -1165,6 +1764,7 @@ impl<'d> QueryScope<'d> {
         self.lateral[self.n] = tref.lateral;
         self.slots[self.n] = usize::MAX;
         self.n += 1;
+        self.register_join_members(storage, tref, txid, arena)?;
         Ok(())
     }
 
@@ -1207,13 +1807,7 @@ impl<'d> QueryScope<'d> {
             crate::sql::catalog::synthesize_definition(Some(namespace), tref.table, arena)?
         };
         let exposed = tref.alias.unwrap_or(tref.table);
-        if self.names[..self.n].contains(&exposed) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_ALIAS,
-                "table name \"{}\" specified more than once",
-                exposed
-            ));
-        }
+        self.duplicate_name(exposed)?;
         let mut definition = synth.def;
         if let Some(aliases) = tref.col_alias {
             if aliases.len() > definition.n_columns {
@@ -1287,13 +1881,7 @@ impl<'d> QueryScope<'d> {
     {
         let sequence = storage.sequence_for(slot, txid);
         let exposed = tref.alias.unwrap_or(tref.table);
-        if self.names[..self.n].contains(&exposed) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_ALIAS,
-                "table name \"{}\" specified more than once",
-                exposed
-            ));
-        }
+        self.duplicate_name(exposed)?;
         if let Some(aliases) = tref.col_alias
             && aliases.len() > 3
         {
@@ -1408,12 +1996,8 @@ impl<'d> QueryScope<'d> {
             table_func_def_outer(tref, storage, txid, arena, params, &columns)?
         };
         let exposed = tref.alias.unwrap_or(tref.table);
-        if !exposed.is_empty() && self.names[..self.n].contains(&exposed) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_ALIAS,
-                "table name \"{}\" specified more than once",
-                exposed
-            ));
+        if !exposed.is_empty() {
+            self.duplicate_name(exposed)?;
         }
         // Every table function is implicitly lateral to preceding FROM items;
         // the keyword is optional for functions in PostgreSQL. Such rows are
@@ -1558,6 +2142,13 @@ impl<'d> QueryScope<'d> {
         // tables of different schemas* (their references then need the
         // three-part spelling); any other duplicate — aliases, the same
         // table twice — is PostgreSQL's 42712.
+        if self.members.iter().any(|member| member.name == exposed) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_ALIAS,
+                "table name \"{}\" specified more than once",
+                exposed
+            ));
+        }
         for t in 0..self.n {
             if self.names[t] != exposed {
                 continue;
@@ -1794,7 +2385,7 @@ impl<'d> QueryScope<'d> {
             // table's columns minus the consumed ones.
             let n_new = self.n_merged - first_new_merge;
             if let Some(alias) = join.using.and_then(|using| using.alias) {
-                if self.names[..self.n].contains(&alias)
+                if self.name_taken(alias)
                     || self.using_aliases[..join_index]
                         .iter()
                         .flatten()
@@ -1964,12 +2555,9 @@ impl<'d> QueryScope<'d> {
         arena: &'a Arena,
     ) -> Result<&'a Expr<'a>, SqlError> {
         let column = |table: usize, column: usize| -> Result<&'a Expr<'a>, SqlError> {
-            let qualifier = arena
-                .alloc_str(self.names[table])
-                .map_err(|_| arena_full())?;
-            let name = arena
-                .alloc_str(self.defs.column_name(table, column))
-                .map_err(|_| arena_full())?;
+            let (qualifier, name) = self.column_reference_name(table, column);
+            let qualifier = arena.alloc_str(qualifier).map_err(|_| arena_full())?;
+            let name = arena.alloc_str(name).map_err(|_| arena_full())?;
             Ok(&*arena
                 .alloc(Expr::Column {
                     qualifier: Some(qualifier),
@@ -2055,7 +2643,7 @@ impl<'d> QueryScope<'d> {
         }
     }
 
-    pub fn table_index(&self, name: &str) -> Result<usize, SqlError> {
+    fn entry_index(&self, name: &str) -> Result<usize, SqlError> {
         let mut found = None;
         for t in 0..self.n {
             if self.entry_answers_to(t, name) {
@@ -2070,6 +2658,9 @@ impl<'d> QueryScope<'d> {
                 }
                 found = Some(t);
             }
+        }
+        if found.is_none() && self.hidden_members.contains(&name) {
+            return Err(unreachable_entry(name));
         }
         found.ok_or_else(|| match name.split_once('.') {
             // A composed qualifier whose table name matches some entry is an
@@ -2096,19 +2687,27 @@ impl<'d> QueryScope<'d> {
                 table
             ),
             // The name of an aliased table is hidden by its alias.
-            None if (0..self.n).any(|index| {
-                self.derived[index].is_none()
-                    && self.names[index] != name
-                    && self
-                        .defs
-                        .get(index)
-                        .is_some_and(|definition| definition.name.as_str() == name)
-            }) =>
+            None if let Some(alias) = (0..self.n)
+                .find(|&index| {
+                    self.derived[index].is_none()
+                        && self.names[index] != name
+                        && self
+                            .defs
+                            .get(index)
+                            .is_some_and(|definition| definition.name.as_str() == name)
+                })
+                .map(|index| self.names[index]) =>
             {
-                sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "invalid reference to FROM-clause entry for table \"{}\"",
-                    name
+                crate::sql::error_position::with_computed_hint(
+                    sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "invalid reference to FROM-clause entry for table \"{}\"",
+                        name
+                    ),
+                    format_args!(
+                        "Perhaps you meant to reference the table alias \"{}\".",
+                        alias
+                    ),
                 )
             }
             None => sql_err!(
@@ -2133,8 +2732,7 @@ impl<'d> QueryScope<'d> {
         if let Some(alias) = self.using_alias(name) {
             return Ok(alias.n_columns);
         }
-        let table = self.table_index(name)?;
-        Ok(self.defs.get(table).expect("resolved").n_columns)
+        Ok(self.source(name)?.n_columns)
     }
 
     /// Resolved column at a qualified-star position.
@@ -2148,9 +2746,9 @@ impl<'d> QueryScope<'d> {
                 .then_some(ResolvedColumn::Merged(alias.first_merged + index))
                 .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN, "column does not exist"));
         }
-        let table = self.table_index(name)?;
-        (index < self.defs.get(table).expect("resolved").n_columns)
-            .then_some(ResolvedColumn::Table(table, index))
+        let source = self.source(name)?;
+        (index < source.n_columns)
+            .then_some(ResolvedColumn::Table(source.table, source.first + index))
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN, "column does not exist"))
     }
 
@@ -2164,7 +2762,12 @@ impl<'d> QueryScope<'d> {
     }
 
     pub(super) fn func_scalar_column(&self, name: &str) -> Option<ResolvedColumn> {
-        let t = self.table_index(name).ok()?;
+        if let Some(member) = self.member(name) {
+            return member
+                .scalar
+                .then_some(ResolvedColumn::Table(member.table, member.first));
+        }
+        let t = self.entry_index(name).ok()?;
         if !self.func_scalar[t] {
             return None;
         }
@@ -2202,9 +2805,45 @@ impl<'d> QueryScope<'d> {
                             )
                         });
                 }
-                let t = self.table_index(q)?;
-                match self.scope_column_index(t, name) {
-                    Some(c) => Ok(ResolvedColumn::Table(t, c)),
+                let source = self.source(q)?;
+                if let Some(position) = name.strip_prefix('\0') {
+                    return position
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|&index| index < source.n_columns)
+                        .map(|index| ResolvedColumn::Table(source.table, source.first + index))
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "positional column is out of range"
+                            )
+                        });
+                }
+                let column = if self.member(q).is_some() {
+                    self.defs.get(source.table).expect("resolved").columns
+                        [source.first..source.first + source.n_columns]
+                        .iter()
+                        .position(|column| column.name.as_str() == name)
+                        .map(|index| source.first + index)
+                } else {
+                    self.scope_column_index(source.table, name)
+                };
+                if column.is_some()
+                    && self
+                        .source_columns(source)
+                        .iter()
+                        .filter(|column| column.name.as_str() == name)
+                        .count()
+                        > 1
+                {
+                    return Err(sql_err!(
+                        crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
+                        "column reference \"{}\" is ambiguous",
+                        name
+                    ));
+                }
+                match column {
+                    Some(c) => Ok(ResolvedColumn::Table(source.table, c)),
                     None => Err(sql_err!(
                         sqlstate::UNDEFINED_COLUMN,
                         "column {}.{} does not exist",
@@ -2244,7 +2883,17 @@ impl<'d> QueryScope<'d> {
                 let mut found = None;
                 for t in 0..self.n {
                     if let Some(c) = self.scope_column_index(t, name) {
-                        if found.is_some() {
+                        let duplicated = || {
+                            self.defs
+                                .get(t)
+                                .expect("resolved")
+                                .columns()
+                                .iter()
+                                .filter(|column| column.name.as_str() == name)
+                                .count()
+                                > 1
+                        };
+                        if found.is_some() || duplicated() {
                             return Err(sql_err!(
                                 crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
                                 "column reference \"{}\" is ambiguous",
@@ -2271,6 +2920,22 @@ impl<'d> QueryScope<'d> {
         (0..self.n)
             .map(|t| self.defs.get(t).expect("resolved").n_columns)
             .sum()
+    }
+
+    /// Width of an entry in flat (table-by-table) row layouts: its visible
+    /// columns, plus the member columns of a parenthesized join.
+    pub(crate) fn stored_width(&self, table: usize) -> usize {
+        let definition = self.defs.get(table).expect("resolved");
+        if self.members.iter().any(|member| member.table == table) {
+            definition.columns.len()
+        } else {
+            definition.n_columns
+        }
+    }
+
+    /// Total width of a flat row over every entry.
+    pub(crate) fn stored_columns(&self) -> usize {
+        (0..self.n).map(|table| self.stored_width(table)).sum()
     }
 
     pub(super) fn row_width(&self, table: usize) -> usize {

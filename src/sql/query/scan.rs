@@ -1050,8 +1050,7 @@ fn pax_column_demand_bounded(
                 Err(error)
                     if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                         && qualifier.is_none()
-                        && (scope.table_index(name).is_ok()
-                            || scope.using_alias(name).is_some()) =>
+                        && (scope.source(name).is_ok() || scope.using_alias(name).is_some()) =>
                 {
                     // A bare local relation name reads its complete row, just
                     // like WholeRow; it is not an unresolved outer column.
@@ -4177,7 +4176,7 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
             }
             JoinRowValues::Flat { values, offsets } => {
                 let start = *offsets.get(table)?;
-                let width = self.scope.defs.get(table).expect("resolved").n_columns;
+                let width = self.scope.stored_width(table);
                 Some(&values[start..start + width])
             }
         }
@@ -4258,7 +4257,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'v>, SqlError> {
-        let table = self.scope.table_index(qualifier)?;
+        let table = self.scope.source(qualifier)?.table;
         let visible = self.scope.defs.get(table).expect("resolved").n_columns;
         self.table_values(table)
             .and_then(|values| values.get(visible + index))
@@ -4334,14 +4333,25 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         if self.scope.using_alias(table).is_some() {
             return Ok(true);
         }
-        let t = self.scope.table_index(table)?;
-        match self.table_present(t) {
-            Some(present) => Ok(present),
-            None => Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "whole-row reference to \"{}\" before its table is joined",
-                table
-            )),
+        let source = self.scope.source(table)?;
+        let present = match self.table_present(source.table) {
+            Some(present) => present,
+            None => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "whole-row reference to \"{}\" before its table is joined",
+                    table
+                ));
+            }
+        };
+        match source.presence.filter(|_| present) {
+            Some(column) => super::scope::member_present(
+                self.table_values(source.table)
+                    .and_then(|values| values.get(column))
+                    .copied()
+                    .unwrap_or(Datum::Null),
+            ),
+            None => Ok(present),
         }
     }
 
@@ -4368,32 +4378,31 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 .map(|fields| Some(&*fields))
                 .map_err(|_| arena_full());
         }
-        let t = self.scope.table_index(table)?;
-        let def = self.scope.defs.get(t).expect("resolved");
+        let source = self.scope.source(table)?;
         if !self.whole_row_present(table)? {
             return Ok(None);
         }
         let vals = self
-            .table_values(t)
+            .table_values(source.table)
             .expect("present source has bound values");
         // Copy field names into the arena so the record does not borrow the
         // catalog (its lifetime is unrelated to the row's `'v`).
-        let cols = def.columns();
+        let cols = self.scope.source_columns(source);
         let mut fields = [crate::sql::types::RecordField {
             name: "",
             type_oid: 0,
             value: Datum::Null,
         }; MAX_COLUMNS];
-        for (i, field) in fields.iter_mut().enumerate().take(def.n_columns) {
+        for (i, field) in fields.iter_mut().enumerate().take(source.n_columns) {
             let name = arena
                 .alloc_str(cols[i].name.as_str())
                 .map_err(|_| arena_full())?;
             field.name = name;
             field.type_oid = cols[i].ctype.oid();
-            field.value = vals.get(i).copied().unwrap_or(Datum::Null);
+            field.value = vals.get(source.first + i).copied().unwrap_or(Datum::Null);
         }
         let out = arena
-            .alloc_slice_copy(&fields[..def.n_columns])
+            .alloc_slice_copy(&fields[..source.n_columns])
             .map_err(|_| arena_full())?;
         Ok(Some(&*out))
     }
@@ -4406,16 +4415,13 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         if let Some(fields) = self.whole_row_fields(table, arena)? {
             return Ok(fields);
         }
-        let table = self.scope.table_index(table)?;
-        let definition = self.scope.defs.get(table).expect("resolved");
-        let columns = definition.columns();
+        let source = self.scope.source(table)?;
+        let columns = self.scope.source_columns(source);
         let fields = arena
-            .alloc_slice_with(definition.n_columns, |index| {
-                crate::sql::types::RecordField {
-                    name: "",
-                    type_oid: columns[index].ctype.oid(),
-                    value: Datum::Null,
-                }
+            .alloc_slice_with(source.n_columns, |index| crate::sql::types::RecordField {
+                name: "",
+                type_oid: columns[index].ctype.oid(),
+                value: Datum::Null,
             })
             .map_err(|_| arena_full())?;
         for (field, column) in fields.iter_mut().zip(columns) {
@@ -7069,7 +7075,7 @@ fn scan_source_mode<'a>(
                 storage,
                 txid,
                 tref,
-                scope.defs.get(t).expect("resolved").n_columns,
+                scope.stored_width(t),
                 arena,
                 params,
                 &chained,
@@ -7606,9 +7612,8 @@ fn scan_source_mode<'a>(
     // A LATERAL item references the tables to its left, so it cannot be the
     // right side of a RIGHT/FULL join (PostgreSQL rejects this too).
     // Joins run as one left-deep chain. That equals PostgreSQL's tree for a
-    // RIGHT or FULL join only within the first comma-separated FROM item: in
-    // `a, b RIGHT JOIN c ON ...` an unmatched `c` row must still pair with
-    // every `a` row.
+    // RIGHT or FULL join only within the first comma-separated FROM item;
+    // the parser runs any later such item as a parenthesized join.
     if let Some(after_comma) = from
         .joins
         .iter()
@@ -7618,8 +7623,8 @@ fn scan_source_mode<'a>(
             .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full))
     {
         return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "RIGHT and FULL joins are supported only in the first FROM item"
+            sqlstate::INTERNAL_ERROR,
+            "RIGHT or FULL join after a comma was not grouped"
         ));
     }
     for j in from.joins {

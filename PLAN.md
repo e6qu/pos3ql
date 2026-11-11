@@ -287,27 +287,20 @@ constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` repor
 target and expression count errors are positioned. Under
 `#variable_conflict use_variable` a variable that is also a column fails with
 `0A000`: aggregate inputs and grouping keys bind names to columns before the
-variable could win. A materialized
-ordinary `WITH` query that calls a volatile function runs before the main
-query; PostgreSQL runs it when its rows are first read, as it now runs a
-data-changing one. PL/pgSQL `SELECT ... INTO`, `PERFORM` and `RETURN QUERY` run a
+variable could win. PL/pgSQL `SELECT ... INTO`, `PERFORM` and `RETURN QUERY` run a
 data-changing `WITH`, but other routine positions do not: a PL/pgSQL
 `WITH ... INSERT/UPDATE/DELETE` statement and `FOR ... IN WITH ...` are
 rejected as an unsupported body, `EXECUTE` and a cursor's query report the
 `WITH` name unknown, a SQL-language function fails, and
 a trigger function rejects it with `0A000`. These need the routine's write
-path to run the `WITH` writes under the main statement's snapshot. An `IN`, `ANY` or `ALL` subquery that
-calls a volatile function runs before the expression containing it, where
-PostgreSQL runs it when evaluation reaches it. FROM-list items separated by
-commas run as one left-deep join chain, so a `RIGHT` or `FULL` join after a
-comma (`FROM a, b RIGHT JOIN c ON ...`) is rejected with `0A000`, a
-parenthesized join (`FROM a JOIN (b JOIN c ON ...) ON ...`) is a syntax error,
-and an `ON` condition can name a table from an earlier comma-separated item
-where PostgreSQL reports `invalid reference to FROM-clause entry`. A
+path to run the `WITH` writes under the main statement's snapshot. A `LATERAL` item inside a
+parenthesized join or a derived table can reference only the FROM items
+beside it, so `a JOIN (b JOIN LATERAL (SELECT a.x) s ON true) ON true`
+reports a missing FROM-clause entry for `a` where PostgreSQL accepts it. An
+ungrouped-column error inside an aliased parenthesized join names the alias
+(`j.x`) where PostgreSQL names the member table (`a.x`). A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
-PostgreSQL types it as the table's row type `t`. A qualifier naming an
-aliased table (`UPDATE t x ... RETURNING t.a`) reports PostgreSQL's
-`invalid reference to FROM-clause entry` without its alias hint. A
+PostgreSQL types it as the table's row type `t`. A
 database-qualified name (`postgres.public.t`) works in column references,
 FROM items and `CREATE` targets but is a syntax error in `DROP` and other
 DDL name lists.

@@ -1469,6 +1469,11 @@ pub trait SequenceAccess {
         value: i64,
         is_called: bool,
     ) -> Result<i64, SqlError>;
+
+    /// False for a dry run that previews values without consuming them.
+    fn has_effects(&self) -> bool {
+        true
+    }
 }
 
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
@@ -2731,11 +2736,25 @@ pub struct DeferredSubquery<'h> {
     pub(crate) node: *const (),
     pub(crate) executor: &'h dyn SubqueryExecution,
     pub(crate) owner: &'h Arena,
-    pub(crate) cache:
-        Option<&'h core::cell::Cell<Option<crate::mem::arena::FrozenArenaSliceHandle<u8>>>>,
+    pub(crate) cache: Option<&'h core::cell::Cell<DeferredSubqueryCache>>,
 }
 
-impl DeferredSubquery<'_> {
+/// An uncorrelated deferred subquery's saved result: length-prefixed
+/// projected rows in `owner`'s retained bytes. A scalar is one row of value
+/// and witness; a list is a row of witness and NULL-seen flag, then its
+/// members in rows of at most [`LIST_CACHE_CHUNK`] values.
+#[derive(Clone, Copy, Default)]
+pub struct DeferredSubqueryCache {
+    pub(crate) bytes: Option<crate::mem::arena::FrozenArenaSliceHandle<u8>>,
+    pub(crate) list: bool,
+    /// A list's comparison collations in `owner`'s persistent tail, as an
+    /// address and length so the cache does not fix the hooks' lifetime.
+    collations: (usize, usize),
+}
+
+const LIST_CACHE_CHUNK: usize = 1024;
+
+impl<'h> DeferredSubquery<'h> {
     fn evaluate<'a>(
         &self,
         expression: &Expr<'a>,
@@ -2743,45 +2762,152 @@ impl DeferredSubquery<'_> {
         params: &[Datum<'a>],
         row: &dyn ColumnLookup<'a>,
         sequences: Option<&dyn SequenceAccess>,
-    ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
-        if let Some(saved) = self.cache.and_then(core::cell::Cell::get) {
-            let bytes = self.owner.retained_slice(saved).map_err(|_| arena_full())?;
+    ) -> Result<SubqueryResult<'a>, SqlError> {
+        if let Some(saved) = self.cache.map(core::cell::Cell::get)
+            && let Some(handle) = saved.bytes
+        {
+            let bytes = self
+                .owner
+                .retained_slice(handle)
+                .map_err(|_| arena_full())?;
             let bytes = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
-            return Ok((
-                crate::sql::exec::decode_projected_col_record(bytes, 0, arena)?,
-                crate::sql::exec::decode_projected_col_record(bytes, 1, arena)?,
-            ));
+            // SAFETY: the collations were copied into `owner`'s persistent
+            // tail, which lives as long as `owner` is not reset.
+            let collations: &[Collation] = unsafe {
+                core::slice::from_raw_parts(
+                    saved.collations.0 as *const Collation,
+                    saved.collations.1,
+                )
+            };
+            return decode_cached_subquery(bytes, saved.list, collations, self.node, arena);
         }
-        let SubqueryResult::Scalar { value, witness } = self
-            .executor
-            .evaluate(expression, arena, params, row, sequences)?
-        else {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "a deferred subquery produced a list"
-            ));
-        };
+        let result = self.executor.evaluate(
+            expression,
+            arena,
+            params,
+            row,
+            sequences,
+            self.cache.is_some(),
+        )?;
         if let Some(cache) = self.cache {
-            let values = [value, witness];
-            let length = crate::sql::exec::projected_row_len(&values)?;
-            let handle = self
-                .owner
-                .retain_slice_with(length, |_| 0u8)
-                .map_err(|_| arena_full())?;
-            let mut bytes = self
-                .owner
-                .retained_slice_mut(handle)
-                .map_err(|_| arena_full())?;
-            crate::sql::exec::encode_projected_into(&values, &mut bytes)?;
-            drop(bytes);
-            cache.set(Some(
+            cache.set(self.save(&result)?);
+        }
+        Ok(result)
+    }
+
+    fn save(&self, result: &SubqueryResult<'_>) -> Result<DeferredSubqueryCache, SqlError> {
+        let header;
+        let (list, members, collations) = match result {
+            SubqueryResult::Scalar { value, witness } => {
+                header = [*value, *witness];
+                (false, &[][..], &[][..])
+            }
+            SubqueryResult::List(list) => {
+                if list.probe.is_some() {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a retained subquery list was spooled"
+                    ));
+                }
+                header = [list.witness, Datum::Bool(list.saw_null)];
+                (true, list.values, list.collations)
+            }
+        };
+        let mut length = 0usize;
+        for chunk in core::iter::once(&header[..]).chain(members.chunks(LIST_CACHE_CHUNK)) {
+            length += 4 + crate::sql::exec::projected_row_len(chunk)?;
+        }
+        let handle = self
+            .owner
+            .retain_slice_with(length, |_| 0u8)
+            .map_err(|_| arena_full())?;
+        let mut bytes = self
+            .owner
+            .retained_slice_mut(handle)
+            .map_err(|_| arena_full())?;
+        let mut at = 0usize;
+        for chunk in core::iter::once(&header[..]).chain(members.chunks(LIST_CACHE_CHUNK)) {
+            let chunk_length = crate::sql::exec::projected_row_len(chunk)?;
+            let prefix = u32::try_from(chunk_length).map_err(|_| arena_full())?;
+            bytes[at..at + 4].copy_from_slice(&prefix.to_le_bytes());
+            at += 4;
+            crate::sql::exec::encode_projected_into(chunk, &mut bytes[at..at + chunk_length])?;
+            at += chunk_length;
+        }
+        drop(bytes);
+        let collations = self
+            .owner
+            .alloc_persistent_slice_with(collations.len(), |index| collations[index])
+            .map_err(|_| arena_full())?;
+        Ok(DeferredSubqueryCache {
+            bytes: Some(
                 self.owner
                     .freeze_retained_slice(handle)
                     .map_err(|_| arena_full())?,
-            ));
-        }
-        Ok((value, witness))
+            ),
+            list,
+            collations: (collations.as_ptr() as usize, collations.len()),
+        })
     }
+}
+
+fn decode_cached_subquery<'a>(
+    bytes: &'a [u8],
+    list: bool,
+    collations: &[Collation],
+    node: *const (),
+    arena: &'a Arena,
+) -> Result<SubqueryResult<'a>, SqlError> {
+    let corrupt = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "retained subquery result is corrupt"
+        )
+    };
+    /// One length-prefixed chunk and the bytes after it.
+    type Chunk<'b> = Option<(&'b [u8], &'b [u8])>;
+    let split = |rest: &'a [u8]| -> Result<Chunk<'a>, SqlError> {
+        let Some(prefix) = rest.get(..4) else {
+            return Ok(None);
+        };
+        let length = u32::from_le_bytes(prefix.try_into().map_err(|_| corrupt())?) as usize;
+        let chunk = rest.get(4..4 + length).ok_or_else(corrupt)?;
+        Ok(Some((chunk, &rest[4 + length..])))
+    };
+    let (header, members) = split(bytes)?.ok_or_else(corrupt)?;
+    let first = crate::sql::exec::decode_projected_col_record(header, 0, arena)?;
+    let second = crate::sql::exec::decode_projected_col_record(header, 1, arena)?;
+    if !list {
+        return Ok(SubqueryResult::Scalar {
+            value: first,
+            witness: second,
+        });
+    }
+    let mut count = 0usize;
+    let mut rest = members;
+    while let Some((chunk, next)) = split(rest)? {
+        count += crate::sql::exec::projected_row_width(chunk);
+        rest = next;
+    }
+    let values = arena
+        .alloc_slice_with(count, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let mut filled = 0usize;
+    let mut rest = members;
+    while let Some((chunk, next)) = split(rest)? {
+        filled += crate::sql::exec::decode_projected_row_into(chunk, arena, &mut values[filled..])?;
+        rest = next;
+    }
+    Ok(SubqueryResult::List(SubqueryList {
+        node,
+        values,
+        probe: None,
+        saw_null: matches!(second, Datum::Bool(true)),
+        witness: first,
+        collations: arena
+            .alloc_slice_copy(collations)
+            .map_err(|_| arena_full())?,
+    }))
 }
 
 pub enum SubqueryResult<'a> {
@@ -2795,6 +2921,8 @@ pub enum SubqueryResult<'a> {
 /// Runs one reached subquery. Returned values own arena-backed bytes or borrow
 /// static data; they never retain the executor's storage or outer-row borrow.
 pub trait SubqueryExecution {
+    /// `retained` asks for a result that can be saved past this row: a list
+    /// is gathered in memory rather than spooled.
     fn evaluate<'a>(
         &self,
         expression: &Expr<'a>,
@@ -2802,6 +2930,7 @@ pub trait SubqueryExecution {
         params: &[Datum<'a>],
         outer: &dyn ColumnLookup<'a>,
         sequences: Option<&dyn SequenceAccess>,
+        retained: bool,
     ) -> Result<SubqueryResult<'a>, SqlError>;
 }
 
@@ -4270,13 +4399,29 @@ fn eval_full_inner<'a>(
             .iter()
             .any(|(node, _, _)| core::ptr::eq(*node, expression))
     }) {
-        let (value, witness) =
-            deferred.evaluate(expression, arena, params, row, hooks.sequences)?;
-        let scalars = [(expression as *const Expr, value, witness)];
-        let values = SubqueryValues {
-            scalars: &scalars,
-            lists: &[],
-            deferred: &[],
+        let result = deferred.evaluate(expression, arena, params, row, hooks.sequences)?;
+        let scalars;
+        let lists;
+        let values = match result {
+            SubqueryResult::Scalar { value, witness } => {
+                scalars = [(expression as *const Expr, value, witness)];
+                SubqueryValues {
+                    scalars: &scalars,
+                    lists: &[],
+                    deferred: &[],
+                }
+            }
+            SubqueryResult::List(list) => {
+                lists = [SubqueryList {
+                    node: (expression as *const Expr).cast(),
+                    ..list
+                }];
+                SubqueryValues {
+                    scalars: &[],
+                    lists: &lists,
+                    deferred: &[],
+                }
+            }
         };
         return eval_full_inner(
             expression,
@@ -4310,7 +4455,7 @@ fn eval_full_inner<'a>(
                     .any(|list| core::ptr::eq(list.node, (expression as *const Expr).cast()))
         })
     {
-        let result = executor.evaluate(expression, arena, params, row, hooks.sequences)?;
+        let result = executor.evaluate(expression, arena, params, row, hooks.sequences, false)?;
         let mut scalars = [(expression as *const Expr, Datum::Null, Datum::Null)];
         let mut lists = [SubqueryList {
             node: core::ptr::null(),
@@ -11534,6 +11679,7 @@ mod tests {
                 _: &[Datum<'a>],
                 _: &dyn ColumnLookup<'a>,
                 _: Option<&dyn SequenceAccess>,
+                _: bool,
             ) -> Result<SubqueryResult<'a>, SqlError> {
                 self.0.set(self.0.get() + 1);
                 match expression {

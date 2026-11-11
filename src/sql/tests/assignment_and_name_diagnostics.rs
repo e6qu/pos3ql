@@ -34,7 +34,8 @@ fn assignment_sources_and_names_report_postgresql_errors() {
             ),
             (
                 "SELECT u.a FROM u x",
-                "ERROR 42P01 invalid reference to FROM-clause entry for table \"u\" @8",
+                "ERROR 42P01 invalid reference to FROM-clause entry for table \"u\" @8 \
+                 hint: Perhaps you meant to reference the table alias \"x\".",
             ),
             (
                 "SELECT a.b.c.d FROM u",

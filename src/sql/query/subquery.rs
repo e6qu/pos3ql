@@ -314,27 +314,24 @@ fn scope_record_witness<'a>(
         Expr::Column {
             qualifier: None,
             name,
-        } if scope.table_index(name).is_ok() => Some(*name),
+        } if scope.source(name).is_ok() => Some(*name),
         _ => None,
     };
     if let Some(table_name) = table_name {
         if scope.func_scalar_column(table_name).is_some() {
             return Ok(None);
         }
-        let table = scope.table_index(table_name)?;
-        let definition = scope
-            .defs
-            .get(table)
-            .expect("whole-row table has a definition");
+        let source = scope.source(table_name)?;
+        let columns = scope.source_columns(source);
         let mut fields = [RecordField {
             name: "",
             type_oid: 0,
             value: Datum::Null,
         }; MAX_PROJ];
         let mut collations = [Collation::None; MAX_PROJ];
-        for (index, column) in definition.columns().iter().enumerate() {
+        for (index, column) in columns.iter().enumerate() {
             fields[index] = RecordField {
-                name: scope.defs.column_name(table, index),
+                name: scope.defs.column_name(source.table, source.first + index),
                 type_oid: storage
                     .routine_type_oid(column.ctype, column.user_type, txid)
                     .ok_or_else(|| {
@@ -348,10 +345,10 @@ fn scope_record_witness<'a>(
             collations[index] = column.collation;
         }
         let fields = arena
-            .alloc_slice_copy(&fields[..definition.n_columns])
+            .alloc_slice_copy(&fields[..columns.len()])
             .map_err(|_| arena_full())?;
         let collations = arena
-            .alloc_slice_copy(&collations[..definition.n_columns])
+            .alloc_slice_copy(&collations[..columns.len()])
             .map_err(|_| arena_full())?;
         return Ok(Some((Datum::Record(&*fields), &*collations)));
     }
@@ -1459,18 +1456,18 @@ fn eval_subquery_nodes<'a>(
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     timing: SubqueryTiming,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    let defers = |node: &Expr<'_>| {
+        matches!(timing, SubqueryTiming::WhereReached) && subquery_has_effects(node, storage, txid)
+    };
     let n_list_nodes = nodes
         .iter()
         .filter(|node| {
             matches!(
                 node,
                 Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. }
-            )
+            ) && !defers(node)
         })
         .count();
-    let defers = |node: &Expr<'_>| {
-        matches!(timing, SubqueryTiming::WhereReached) && subquery_has_effects(node, storage, txid)
-    };
     let n_deferred = nodes.iter().filter(|node| defers(node)).count();
     let scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)] = arena
         .alloc_slice_with(nodes.len() - n_list_nodes - n_deferred, |_| {
@@ -1491,7 +1488,8 @@ fn eval_subquery_nodes<'a>(
         let deferred = arena
             .alloc_slice_with(n_deferred, |_| {
                 let node = entries.next().copied();
-                let cache = match arena.alloc(None) {
+                let cache = match arena.alloc(super::super::eval::DeferredSubqueryCache::default())
+                {
                     Ok(cache) => {
                         let cache: &core::cell::Cell<_> = core::cell::Cell::from_mut(cache);
                         Some(cache)
@@ -1606,7 +1604,7 @@ fn eval_subquery_nodes<'a>(
                     let row_witness = (arity > 1)
                         .then(|| row_subquery_witness(original_select, storage, txid, arena, outer))
                         .transpose()?;
-                    if storage.spill_attached() {
+                    if storage.spill_attached() && !matches!(timing, SubqueryTiming::Retained) {
                         lists[n_lists] = external_list_subquery(
                             node,
                             select,
@@ -1671,6 +1669,9 @@ pub(super) fn subquery_shape_position(error: SqlError, node: &Expr<'_>) -> SqlEr
 enum SubqueryTiming {
     /// Before the expressions that contain them.
     Now,
+    /// Now, gathering a list in memory so its result can be saved for
+    /// later rows instead of spooled.
+    Retained,
     /// One with effects runs where evaluation reaches it.
     WhereReached,
 }
@@ -1683,7 +1684,9 @@ fn subquery_has_effects(node: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
     let (Expr::Subquery(select)
     | Expr::RowSubquery { select, .. }
     | Expr::Exists(select)
-    | Expr::ArraySubquery(select)) = node
+    | Expr::ArraySubquery(select)
+    | Expr::InSubquery { select, .. }
+    | Expr::QuantifiedSubquery { select, .. }) = node
     else {
         return false;
     };
@@ -1941,8 +1944,45 @@ fn correlation_schema<'a>(
     from: &'a crate::sql::ast::FromClause<'a>,
     arena: &'a Arena,
 ) -> Result<Option<QueryScope<'a>>, SqlError> {
-    let references_outer =
-        |table: &crate::sql::ast::TableRef<'_>| table.lateral || table.is_function_source();
+    // A function source can name an outer column only through its
+    // arguments; one whose arguments read no column resolves on its own.
+    fn reads_columns(expression: &Expr<'_>) -> bool {
+        if matches!(
+            expression,
+            Expr::Column { .. }
+                | Expr::WholeRow(_)
+                | Expr::SchemaColumn { .. }
+                | Expr::Subquery(_)
+                | Expr::RowSubquery { .. }
+                | Expr::InSubquery { .. }
+                | Expr::QuantifiedSubquery { .. }
+                | Expr::Exists(_)
+                | Expr::ArraySubquery(_)
+        ) {
+            return true;
+        }
+        let mut found = false;
+        let _ = walk_children(expression, &mut |child| {
+            found |= reads_columns(child);
+            Ok(())
+        });
+        found
+    }
+    let function_reads_columns = |table: &crate::sql::ast::TableRef<'_>| {
+        table
+            .func_args
+            .is_some_and(|arguments| arguments.iter().any(|argument| reads_columns(argument)))
+            || table.rows_from.is_some_and(|functions| {
+                functions.iter().any(|function| {
+                    function.func_args.is_some_and(|arguments| {
+                        arguments.iter().any(|argument| reads_columns(argument))
+                    })
+                })
+            })
+    };
+    let references_outer = |table: &crate::sql::ast::TableRef<'_>| {
+        table.lateral || (table.is_function_source() && function_reads_columns(table))
+    };
     if references_outer(&from.base) || from.joins.iter().any(|join| references_outer(&join.table)) {
         return Ok(None);
     }
@@ -2937,8 +2977,8 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
 
     fn table_columns(&self, name: &str) -> Option<&[crate::storage::ColumnMeta]> {
         let scope = self.scope?;
-        let table = scope.table_index(name).ok()?;
-        Some(scope.defs.get(table)?.columns())
+        let source = scope.source(name).ok()?;
+        Some(scope.source_columns(source))
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
@@ -4076,6 +4116,7 @@ impl super::super::eval::SubqueryExecution for ProceduralSubqueries<'_> {
         params: &[Datum<'a>],
         outer: &dyn ColumnLookup<'a>,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+        retained: bool,
     ) -> Result<super::super::eval::SubqueryResult<'a>, SqlError> {
         // SAFETY: storage remains immutable and live for this call; the
         // result is detached before the borrow can escape.
@@ -4089,7 +4130,11 @@ impl super::super::eval::SubqueryExecution for ProceduralSubqueries<'_> {
             SUBQUERY_DEPTH,
             Some(outer),
             sequences,
-            SubqueryTiming::Now,
+            if retained {
+                SubqueryTiming::Retained
+            } else {
+                SubqueryTiming::Now
+            },
         )?;
         let values = detach_subquery_values(borrowed, arena)?;
         match (values.scalars, values.lists) {

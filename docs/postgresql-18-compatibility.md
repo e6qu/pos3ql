@@ -200,11 +200,15 @@ Syntax and errors:
   a FROM w), f()` the first call of a volatile `f` does not see the new row
   and the second does. One that nothing reads runs after the main query, the
   last written first.
-- A scalar, `EXISTS` or `ARRAY` subquery that calls a volatile function, or
-  any subquery of a statement with a data-changing `WITH`, runs where
-  evaluation reaches it, once when it is uncorrelated, so its notices,
-  sequence values and writes interleave with the rest of the expression as
-  in PostgreSQL.
+- A subquery (scalar, `EXISTS`, `ARRAY`, `IN`, `ANY` or `ALL`) that calls a
+  volatile function or reads a `WITH` query not yet run, or any subquery of a
+  statement with a data-changing `WITH`, runs where evaluation reaches it,
+  once when it is uncorrelated, so its notices, sequence values and writes
+  interleave with the rest of the expression as in PostgreSQL; an untaken
+  `CASE` arm never runs it. Such an `IN`, `ANY` or `ALL` list is held in
+  statement memory rather than spilled.
+- A materialized `WITH` query runs when its rows are first read, as
+  PostgreSQL's CTE scan runs it; one that nothing reads never runs.
 - `UPDATE` and `INSERT` assign through composite fields and array elements:
   `UPDATE t SET pair.x = 1, pair.y = 'a'`, `SET n.inner.x = 3`, `SET
   a[2].x = 5`, `SET bag.arr[1:2] = '{1,2}'` and `INSERT INTO t (pair.x,

@@ -538,6 +538,7 @@ fn analyze_unreferenced_ctes<'a>(
                         authorization_role: None,
                         bound_table: None,
                         view_access: None,
+                        join_members: None,
                     },
                     joins: &[],
                 }),
@@ -962,6 +963,7 @@ fn rule_relation_ref<'a>(
         authorization_role: None,
         bound_table: None,
         view_access: None,
+        join_members: None,
     }
 }
 
@@ -1350,6 +1352,7 @@ pub(crate) fn rule_transition_source<'a>(
                 authorization_role: None,
                 bound_table: None,
                 view_access: None,
+                join_members: None,
             };
             for (column, name) in columns.iter().copied().enumerate() {
                 let expression = input_columns
@@ -1418,6 +1421,7 @@ pub(crate) fn rule_transition_source<'a>(
         authorization_role: None,
         bound_table: None,
         view_access: None,
+        join_members: None,
     };
     Ok(RuleTransitionSource {
         source,
@@ -2691,16 +2695,8 @@ fn with_exec_context<'a, 's, 'e, R>(
                 CteMaterialization::NotMaterialized => volatile,
             };
             if references > 0 && requires_evaluate_once {
-                let relation = materialize_query_cte(
-                    cte.name,
-                    cte.columns,
-                    query,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    sequences,
-                )?;
+                let relation =
+                    materialize_query_cte(cte.name, cte.columns, query, storage, txid, arena)?;
                 materialized
                     .push((cte.name, relation))
                     .map_err(|_| arena_full())?;
@@ -2777,8 +2773,6 @@ fn materialize_query_cte<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
-    params: &[Datum<'a>],
-    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a MaterializedCte<'a>, SqlError> {
     let tree = arena
         .alloc(SetTree::Select(query))
@@ -2826,16 +2820,17 @@ fn materialize_query_cte<'a>(
     let column_collations = arena
         .alloc_slice_with(ncols, |index| described[index].collation)
         .map_err(|_| arena_full())?;
-    let (rows, _, materialized_columns) =
-        materialize_set_body(storage, txid, tree, arena, params, sequences)?;
-    debug_assert_eq!(materialized_columns, ncols);
+    let deferred = crate::sql::ast::DeferredCteQuery {
+        tree,
+        rows: arena.alloc_atomic_usize(0).map_err(|_| arena_full())?,
+    };
     arena
         .alloc(MaterializedCte {
             column_names,
             column_types,
             column_collations,
             definition: None,
-            source: crate::sql::ast::MaterializedCteSource::Inline(rows),
+            source: crate::sql::ast::MaterializedCteSource::Deferred(deferred),
         })
         .map(|relation| &*relation)
         .map_err(|_| arena_full())
@@ -3609,6 +3604,15 @@ pub(super) fn select_contains_function(
             table
                 .subquery
                 .is_some_and(|query| select_contains_function(query, matches))
+                // A WITH query not yet read runs, with its calls, where this
+                // query first reads it.
+                || table.cte.is_some_and(|cte| match cte.source {
+                    crate::sql::ast::MaterializedCteSource::Deferred(deferred) => {
+                        deferred.rows.load(core::sync::atomic::Ordering::Relaxed) == 0
+                            && set_tree_contains_function(deferred.tree, matches)
+                    }
+                    _ => false,
+                })
                 || table.func_args.is_some_and(|arguments| {
                     matches(table.table, arguments.len())
                         || arguments.iter().any(|argument| expression_has_it(argument))
@@ -5834,6 +5838,7 @@ fn subst_tableref<'a>(
             authorization_role: None,
             bound_table: None,
             view_access: None,
+            join_members: None,
         });
     }
     // An unqualified name matching a CTE becomes a derived table over the
@@ -5867,6 +5872,7 @@ fn subst_tableref<'a>(
             authorization_role: None,
             bound_table: None,
             view_access: None,
+            join_members: None,
         });
     }
     // A name resolving to a view (not shadowed by a CTE, and not out-resolved
@@ -6044,6 +6050,7 @@ fn subst_tableref<'a>(
                 authorization_role: None,
                 bound_table: None,
                 view_access: Some(slot as u16),
+                join_members: None,
             });
         }
         let aliases = if view_columns.has_aliases() {
@@ -6078,6 +6085,7 @@ fn subst_tableref<'a>(
             authorization_role: None,
             bound_table: None,
             view_access: Some(slot as u16),
+            join_members: None,
         });
     }
     // Inside a view body, pin a table reference to the schema it resolved to

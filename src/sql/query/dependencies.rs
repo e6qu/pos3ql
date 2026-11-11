@@ -3090,8 +3090,8 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             return Some(columns);
         }
         let scope = self.scope?;
-        let table = scope.table_index(name).ok()?;
-        Some(scope.defs.get(table)?.columns())
+        let source = scope.source(name).ok()?;
+        Some(scope.source_columns(source))
     }
 
     fn whole_row_field(

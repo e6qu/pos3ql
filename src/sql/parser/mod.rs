@@ -3666,6 +3666,7 @@ impl<'a> Parser<'a> {
                 authorization_role: None,
                 bound_table: None,
                 view_access: None,
+                join_members: None,
             };
             let select = Select {
                 items: self.arena_slice(&[SelectItem::Wildcard(
@@ -3796,16 +3797,24 @@ impl<'a> Parser<'a> {
                     authorization_role: None,
                     bound_table: None,
                     view_access: None,
+                    join_members: None,
                 });
             }
             self.lexer.reset(mark);
             self.peeked = saved_peeked;
             self.peek_at = saved_peek_at;
         }
+        if self.peeked == Tok::Op("(")
+            && inheritance == RelationInheritance::Descendants
+            && !lateral
+            && self.parenthesized_join_ahead()?
+        {
+            return self.parenthesized_join();
+        }
         // Derived table: `(SELECT ...) [[AS] alias]`. PostgreSQL 16 and newer
         // permit an omitted alias; the scope layer gives that otherwise
         // unaddressable relation an internal name.
-        if self.peeked == Tok::Op("(") {
+        if self.peeked == Tok::Op("(") && inheritance == RelationInheritance::Descendants {
             self.advance()?;
             let select = self.query_select()?;
             self.expect_op(")")?;
@@ -3851,6 +3860,7 @@ impl<'a> Parser<'a> {
                 authorization_role: None,
                 bound_table: None,
                 view_access: None,
+                join_members: None,
             });
         }
         let parenthesized = inheritance == RelationInheritance::Only && self.eat_op("(")?;
@@ -4016,6 +4026,7 @@ impl<'a> Parser<'a> {
             authorization_role: None,
             bound_table: None,
             view_access: None,
+            join_members: None,
         };
         // PostgreSQL expands only an unqualified FROM UNNEST with multiple
         // positional inputs into independent catalog calls in lockstep.
@@ -4511,11 +4522,314 @@ impl<'a> Parser<'a> {
         Ok(Some(columns.as_slice()))
     }
 
+    /// Whether the `(` in `peeked` opens PostgreSQL's parenthesized
+    /// `joined_table` rather than a query. Looks ahead without consuming.
+    fn parenthesized_join_ahead(&mut self) -> Result<bool, ParseError> {
+        let mark = self.lexer.mark();
+        let join = self.parenthesized_join_tail();
+        self.lexer.reset(mark);
+        join
+    }
+
+    /// Classifies the parenthesized item whose `(` was just lexed and lexes
+    /// through its matching `)`. A query starts with a query keyword; a
+    /// nested parenthesized item followed by anything but a set operation
+    /// or a query's trailing clause is a table reference inside a join.
+    fn parenthesized_join_tail(&mut self) -> Result<bool, ParseError> {
+        let mut depth = 1usize;
+        let join = match self.lex_ahead()? {
+            Tok::Ident("select" | "values" | "with" | "table") => false,
+            Tok::Op("(") => {
+                let inner = self.parenthesized_join_tail()?;
+                match self.lex_ahead()? {
+                    Tok::Op(")") => return Ok(inner),
+                    Tok::Ident(
+                        "union" | "intersect" | "except" | "order" | "limit" | "offset" | "fetch"
+                        | "for",
+                    ) => false,
+                    Tok::Op("(") => {
+                        depth += 1;
+                        true
+                    }
+                    Tok::Eof => return Ok(true),
+                    _ => true,
+                }
+            }
+            Tok::Op(")") | Tok::Eof => return Ok(false),
+            _ => true,
+        };
+        loop {
+            match self.lex_ahead()? {
+                Tok::Op("(") => depth += 1,
+                Tok::Op(")") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(join);
+                    }
+                }
+                Tok::Eof => return Ok(join),
+                _ => {}
+            }
+        }
+    }
+
+    fn lex_ahead(&mut self) -> Result<Tok<'a>, ParseError> {
+        self.lexer
+            .next_token()
+            .map_err(|error| ParseError::lexical(error, self.text))
+    }
+
+    /// `( joined_table ) [[AS] alias [(columns)]]`. With an alias the join is
+    /// an ordinary derived table; without one it exposes its members.
+    fn parenthesized_join(&mut self) -> Result<TableRef<'a>, ParseError> {
+        let star_at = self.peek_at;
+        self.expect_op("(")?;
+        let mut inner = self.join_chain(false)?;
+        if inner.joins.is_empty() {
+            // `((a JOIN b ...))`: a parenthesized join is itself a joined
+            // table; anything else in parentheses is not.
+            match inner.base {
+                TableRef {
+                    alias: None,
+                    join_members: Some(_),
+                    subquery:
+                        Some(Select {
+                            from: Some(from), ..
+                        }),
+                    ..
+                } => inner = *from,
+                _ => return Err(self.syntax_error_here()),
+            }
+        }
+        self.expect_op(")")?;
+        let explicit_as = self.eat_ident("as")?;
+        let alias = match self.peeked {
+            Tok::Ident(word) if explicit_as || !is_column_name_keyword(word) => {
+                Some(self.col_ident("alias")?)
+            }
+            Tok::QuotedIdent(_) => Some(self.col_ident("alias")?),
+            _ if explicit_as => return Err(self.syntax_error_here()),
+            _ => None,
+        };
+        let col_alias = if alias.is_some() {
+            self.column_alias_list()?
+        } else {
+            None
+        };
+        self.joined_table_ref(inner, alias, col_alias, star_at)
+    }
+
+    /// The derived table a parenthesized join runs as (see
+    /// [`TableRef::join_members`]).
+    fn joined_table_ref(
+        &mut self,
+        inner: FromClause<'a>,
+        alias: Option<&'a str>,
+        col_alias: Option<&'a [&'a str]>,
+        star_at: usize,
+    ) -> Result<TableRef<'a>, ParseError> {
+        let star = SelectItem::Wildcard(crate::sql::ast::SourcePosition::new(Some(star_at)));
+        let mut members = ArenaList::new(self.arena);
+        for table in core::iter::once(&inner.base).chain(inner.joins.iter().map(|j| &j.table)) {
+            if table.alias.is_none()
+                && let Some(nested) = table.join_members
+            {
+                for member in nested {
+                    self.push(&mut members, *member)?;
+                }
+            } else if let Some(name) = table
+                .alias
+                .or((table.subquery.is_none() && !table.table.is_empty()).then_some(table.table))
+            {
+                self.push(
+                    &mut members,
+                    JoinMember {
+                        name,
+                        using_alias: false,
+                    },
+                )?;
+            }
+        }
+        for join in inner.joins {
+            if let Some(name) = join.using.and_then(|using| using.alias) {
+                self.push(
+                    &mut members,
+                    JoinMember {
+                        name,
+                        using_alias: true,
+                    },
+                )?;
+            }
+        }
+        let members = members.as_slice();
+        let items = if alias.is_some() {
+            self.arena_slice(&[star])?
+        } else {
+            let mut items = ArenaList::new(self.arena);
+            self.push(&mut items, star)?;
+            for member in members {
+                self.push(&mut items, SelectItem::TableWildcard(member.name))?;
+            }
+            for member in members.iter().filter(|member| !member.using_alias) {
+                let row = self.arena_expr(Expr::WholeRow(member.name))?;
+                let presence = self.plain_call("pg_catalog.num_nulls", &[row])?;
+                self.push(
+                    &mut items,
+                    SelectItem::Expr {
+                        expression: presence,
+                        alias: None,
+                    },
+                )?;
+            }
+            items.as_slice()
+        };
+        let join_members = Some(members);
+        let lateral = core::iter::once(&inner.base)
+            .chain(inner.joins.iter().map(|j| &j.table))
+            .any(|table| table.lateral);
+        let select = self
+            .arena
+            .alloc(Select {
+                items,
+                distinct: false,
+                distinct_on: &[],
+                from: Some(inner),
+                where_clause: None,
+                group_by: &[],
+                grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
+                grouping_sets: &[],
+                having: None,
+                order_by: &[],
+                limit: None,
+                offset: None,
+                with_ties: false,
+                with: &[],
+                set_body: None,
+                locking: &[],
+            })
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        Ok(TableRef {
+            schema: None,
+            table: "",
+            alias,
+            subquery: Some(select),
+            func_args: None,
+            func_argument_names: &[],
+            func_variadic: false,
+            func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+            rows_from: None,
+            col_alias,
+            inheritance: RelationInheritance::Descendants,
+            sample: None,
+            cte: None,
+            with_ordinality: false,
+            lateral,
+            authorization_role: None,
+            bound_table: None,
+            view_access: None,
+            join_members,
+        })
+    }
+
     #[expect(
         clippy::wrong_self_convention,
         reason = "parses the FROM clause; not a conversion"
     )]
     fn from_clause(&mut self) -> Result<FromClause<'a>, ParseError> {
+        self.parse_from_list(false)
+    }
+
+    /// `UPDATE ... FROM` and `DELETE ... USING` lists, which follow their
+    /// target as if after a comma.
+    fn dml_from_clause(&mut self) -> Result<FromClause<'a>, ParseError> {
+        self.parse_from_list(true)
+    }
+
+    fn parse_from_list(&mut self, after_target: bool) -> Result<FromClause<'a>, ParseError> {
+        let from = self.join_chain(true)?;
+        // Joins run left-deep, which equals PostgreSQL's tree except where a
+        // RIGHT or FULL join follows a comma: `a, b RIGHT JOIN c ON ...`
+        // joins `c` to `b` alone, then pairs every result with `a`. Such a
+        // comma-separated item runs as its own parenthesized join.
+        let first_item_end = from
+            .joins
+            .iter()
+            .position(|join| join.kind == JoinKind::Comma)
+            .unwrap_or(from.joins.len());
+        let from = if after_target
+            && from.joins[..first_item_end]
+                .iter()
+                .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full))
+        {
+            let inner = FromClause {
+                base: from.base,
+                joins: self.arena_slice(&from.joins[..first_item_end])?,
+            };
+            FromClause {
+                base: self.joined_table_ref(inner, None, None, 0)?,
+                joins: self.arena_slice(&from.joins[first_item_end..])?,
+            }
+        } else {
+            from
+        };
+        let Some(first_comma) = from
+            .joins
+            .iter()
+            .position(|join| join.kind == JoinKind::Comma)
+        else {
+            return Ok(from);
+        };
+        let needs_group = |items: &[Join<'a>]| {
+            items
+                .iter()
+                .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full))
+        };
+        if !needs_group(&from.joins[first_comma..]) {
+            return Ok(from);
+        }
+        let mut joins = ArenaList::new(self.arena);
+        for join in &from.joins[..first_comma] {
+            self.push(&mut joins, *join)?;
+        }
+        let mut start = first_comma;
+        while start < from.joins.len() {
+            let end = from.joins[start + 1..]
+                .iter()
+                .position(|join| join.kind == JoinKind::Comma)
+                .map_or(from.joins.len(), |offset| start + 1 + offset);
+            let item = &from.joins[start..end];
+            if item.len() > 1 && needs_group(&item[1..]) {
+                let inner = FromClause {
+                    base: item[0].table,
+                    joins: self.arena_slice(&item[1..])?,
+                };
+                let table = self.joined_table_ref(inner, None, None, 0)?;
+                self.push(
+                    &mut joins,
+                    Join {
+                        table,
+                        kind: JoinKind::Comma,
+                        on: None,
+                        using: None,
+                        natural: false,
+                    },
+                )?;
+            } else {
+                for join in item {
+                    self.push(&mut joins, *join)?;
+                }
+            }
+            start = end;
+        }
+        Ok(FromClause {
+            base: from.base,
+            joins: joins.as_slice(),
+        })
+    }
+
+    /// A FROM list (`commas` true) or the join chain inside a parenthesized
+    /// join, where a comma ends the chain.
+    fn join_chain(&mut self, commas: bool) -> Result<FromClause<'a>, ParseError> {
         let base = self.table_ref()?;
         let mut joins = ArenaList::new(self.arena);
         loop {
@@ -4540,7 +4854,7 @@ impl<'a> Parser<'a> {
                     self.expect_ident("join")?;
                     JoinKind::Inner
                 }
-            } else if self.eat_op(",")? {
+            } else if commas && self.eat_op(",")? {
                 JoinKind::Comma
             } else if self.eat_ident("cross")? {
                 self.expect_ident("join")?;
@@ -7728,6 +8042,7 @@ impl<'a> Parser<'a> {
                             authorization_role: None,
                             bound_table: None,
                             view_access: None,
+                            join_members: None,
                         },
                         joins: &[],
                     }),
@@ -8356,7 +8671,7 @@ impl<'a> Parser<'a> {
         self.expect_ident("set")?;
         let assignments = self.assignment_list()?;
         let from = if self.eat_ident("from")? {
-            let fc = self.from_clause()?;
+            let fc = self.dml_from_clause()?;
             Some(
                 &*self
                     .arena
@@ -8962,7 +9277,7 @@ impl<'a> Parser<'a> {
             None
         };
         let using = if self.eat_ident("using")? {
-            let fc = self.from_clause()?;
+            let fc = self.dml_from_clause()?;
             Some(
                 &*self
                     .arena

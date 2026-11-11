@@ -2988,3 +2988,69 @@ fn locking_cursors_reject_repeatable_read_changes_and_bound_sorted_rows() {
         ["10"]
     );
 }
+
+#[test]
+fn ordered_cursors_sort_at_the_first_fetch_and_project_each_row_when_fetched() {
+    let config = test_config("ordered-cursor-projection");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE sorted_calls; CREATE TABLE sorted_rows(id int, g int, v text); \
+         INSERT INTO sorted_rows VALUES (1,2,'a'),(2,1,'b'),(3,2,'c'),(4,1,'d'),(5,3,'e')",
+        true,
+    );
+    // Expected rows come from PostgreSQL 18.6: the output list runs after
+    // the sort, one row per fetch, and equal keys keep scan order.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; DECLARE ordered NO SCROLL CURSOR FOR \
+             SELECT v, nextval('sorted_calls') FROM sorted_rows ORDER BY g, id DESC; \
+             SELECT last_value, is_called FROM sorted_calls; FETCH 2 ordered; \
+             SELECT last_value, is_called FROM sorted_calls; FETCH ALL ordered; COMMIT",
+            true
+        )),
+        ["1|f", "d|1", "b|2", "2|t", "c|3", "a|4", "e|5"]
+    );
+    // A scrollable sorted cursor evaluates a revisited row's output again;
+    // its filter ran once, before the sort.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT setval('sorted_calls', 100, false); BEGIN; \
+             DECLARE scrolled SCROLL CURSOR FOR \
+             SELECT v, nextval('sorted_calls') FROM sorted_rows WHERE id > 1 ORDER BY id; \
+             FETCH NEXT scrolled; FETCH NEXT scrolled; FETCH PRIOR scrolled; \
+             FETCH LAST scrolled; FETCH ABSOLUTE 1 scrolled; COMMIT",
+            true
+        )),
+        ["100", "b|100", "c|101", "b|102", "e|106", "b|107"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; DECLARE by_group CURSOR FOR SELECT v FROM sorted_rows ORDER BY g; \
+             FETCH ALL by_group; FETCH BACKWARD 2 by_group; \
+             DECLARE filtered SCROLL CURSOR FOR \
+             SELECT v FROM sorted_rows WHERE random() < 2 ORDER BY id DESC; \
+             FETCH 2 filtered; FETCH PRIOR filtered; \
+             SELECT is_scrollable FROM pg_cursors WHERE name = 'filtered'; COMMIT",
+            true
+        )),
+        ["b", "d", "a", "c", "e", "e", "c", "e", "d", "e", "t"]
+    );
+    // LIMIT and OFFSET apply after the sort; a held cursor saves its sorted
+    // rows at commit.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; DECLARE windowed NO SCROLL CURSOR FOR              SELECT v FROM sorted_rows ORDER BY id DESC LIMIT 2 OFFSET 1; FETCH ALL windowed;              DECLARE scroll_window SCROLL CURSOR FOR              SELECT v, nextval('sorted_calls') FROM sorted_rows ORDER BY id LIMIT 2 OFFSET 1;              FETCH ALL scroll_window; FETCH PRIOR scroll_window; COMMIT;              DECLARE held CURSOR WITH HOLD FOR SELECT v FROM sorted_rows ORDER BY g DESC, id;              FETCH 2 held; FETCH ALL held; CLOSE held",
+            true
+        )),
+        [
+            "d", "c", "b|109", "c|110", "c|110", "e", "a", "c", "b", "d"
+        ]
+    );
+}

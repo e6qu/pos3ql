@@ -1123,6 +1123,7 @@ fn heap_sort<T: Copy>(
 fn cursor_revisit(
     source: &RetainedSource<'_>,
     eliminated: bool,
+    sorted: bool,
     statement: &Select<'_>,
     columns: &CatalogScopeCols<'_, '_, '_, '_>,
     storage: &Storage,
@@ -1152,7 +1153,11 @@ fn cursor_revisit(
         )
         .map(|properties| properties.volatile)
     };
-    if let Some(predicate) = statement.where_clause
+    // A sort keeps the rows its filter passed; only a projection above it
+    // runs again, as PostgreSQL evaluates a volatile output list after
+    // sorting.
+    if !sorted
+        && let Some(predicate) = statement.where_clause
         && volatile(predicate)?
     {
         return Ok(Revisit::Rescan);
@@ -1301,7 +1306,9 @@ impl<'a> RetainedSelect<'a> {
                     return Ok(ordering.is_gt());
                 }
             }
-            Ok(false)
+            // Equal keys keep scan order, as the executor's stable sort
+            // does: an earlier input sits at a higher offset.
+            Ok(left.0 < right.0)
         })
     }
 
@@ -1725,12 +1732,12 @@ impl<'a> RetainedSelect<'a> {
         {
             return Ok(None);
         }
-        // A cursor locks rows of one table as it fetches them, after sorting
-        // them when ordered; other ordered or locking shapes run at DECLARE.
+        // A cursor over one table sorts its qualifying rows at the first
+        // FETCH when ordered, and locks rows as it fetches them; other
+        // ordered or locking shapes run at DECLARE.
         let locks = !statement.locking.is_empty();
         if (locks || !statement.order_by.is_empty())
             && (mode == RetainedMode::Statement
-                || !locks
                 || literals
                 || generated.is_some()
                 || from.is_none())
@@ -1899,7 +1906,13 @@ impl<'a> RetainedSelect<'a> {
             &[][..]
         };
         let demand = from.filter(|_| table.is_some()).map(|from| {
-            streaming_pax_columns(&scope, from, statement.items, statement.where_clause)
+            streaming_pax_columns_ordered(
+                &scope,
+                from,
+                statement.items,
+                statement.where_clause,
+                statement.order_by,
+            )
         });
         if let Some(demand) = demand {
             scan::admit_sources(storage, &scope, txid, demand)?;
@@ -1929,9 +1942,12 @@ impl<'a> RetainedSelect<'a> {
             arena,
             &mut columns[..width],
         )?;
-        // Sorted inputs are saved whole; their keys need not be projected.
+        // A locking cursor's sorted inputs are saved whole, as a changed
+        // row is filtered and projected again from its newest version.
+        // Other sorted inputs keep the columns the query reads, sort keys
+        // included.
         let decoded_columns = demand
-            .filter(|_| order.is_empty())
+            .filter(|_| order.is_empty() || !locks)
             .and_then(|demand| demand.selected_mask(0))
             .map(|mask| {
                 core::array::from_fn(|column| {
@@ -2077,6 +2093,7 @@ impl<'a> RetainedSelect<'a> {
         let revisit = cursor_revisit(
             &source,
             eliminated,
+            !order.is_empty(),
             statement,
             &CatalogScopeCols {
                 scope: &scope,

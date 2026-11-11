@@ -816,7 +816,13 @@ impl Engine {
         let row = (|| {
             let owner = cursors.plan_owner(slot)?;
             self.storage.set_read_snapshot(source_snapshot);
-            let ready = {
+            // An ordered cursor sorts every qualifying row before its first.
+            self.sort_cursor_inputs(slot, arena, txn, sqlprep, cursors, guc, responder)?;
+            self.storage.set_read_snapshot(source_snapshot);
+            let sorted = cursors.sorted_source(slot);
+            let ready = if sorted {
+                cursors.prepare_sorted_row(slot)?
+            } else {
                 let (work, buffers) = self.work.cursor_parts();
                 let (query, _, _) = cursors.execution_parts(slot);
                 query.prepare_row(
@@ -832,7 +838,7 @@ impl Engine {
             }
             let emitted = self.evaluate_cursor_row(
                 slot,
-                true,
+                !sorted,
                 CursorRowSink::Emit,
                 owner,
                 source_snapshot,
@@ -844,6 +850,9 @@ impl Engine {
                 responder,
             )?;
             cursors.execution_parts(slot).0.finish_row(emitted);
+            if sorted {
+                cursors.finish_sorted_row(slot);
+            }
             if emitted {
                 cursors.record_streamed_row(slot)?;
             }

@@ -1029,6 +1029,13 @@ impl CursorPool {
         Ok(true)
     }
 
+    /// Moves an ordered cursor past the sorted input it just evaluated.
+    pub(crate) fn finish_sorted_row(&mut self, at: usize) {
+        if let Some(next) = self.slots[at].locking.sorted.as_mut() {
+            *next += 1;
+        }
+    }
+
     /// Ends the pending row of a locking cursor.
     pub(crate) fn finish_locked_row(&mut self, at: usize) {
         let locking = &mut self.slots[at].locking;

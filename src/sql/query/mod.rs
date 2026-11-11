@@ -11497,7 +11497,18 @@ pub(super) fn streaming_pax_columns<'a>(
     items: &'a [SelectItem<'a>],
     where_clause: Option<&'a Expr<'a>>,
 ) -> PaxReadDemand {
-    let mut expressions: [&Expr; MAX_PROJ + 1] = [&Expr::Null; MAX_PROJ + 1];
+    streaming_pax_columns_ordered(scope, from, items, where_clause, &[])
+}
+
+/// [`streaming_pax_columns`] plus the columns an `ORDER BY` reads.
+pub(super) fn streaming_pax_columns_ordered<'a>(
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    items: &'a [SelectItem<'a>],
+    where_clause: Option<&'a Expr<'a>>,
+    order_by: &'a [crate::sql::ast::OrderBy<'a>],
+) -> PaxReadDemand {
+    let mut expressions: [&Expr; 2 * MAX_PROJ + 1] = [&Expr::Null; 2 * MAX_PROJ + 1];
     let mut count = 0usize;
     for item in items {
         let expression = match item {
@@ -11511,6 +11522,10 @@ pub(super) fn streaming_pax_columns<'a>(
     }
     if let Some(where_clause) = where_clause {
         expressions[count] = where_clause;
+        count += 1;
+    }
+    for order in order_by.iter().take(MAX_PROJ) {
+        expressions[count] = order.expression;
         count += 1;
     }
     pax_column_demand(scope, from, &expressions[..count])

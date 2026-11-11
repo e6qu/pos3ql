@@ -223,10 +223,11 @@ A cursor over one table, over constant `VALUES` rows, or over
 its query uses only columns, constants, parameters,
 built-in operators and casts, boolean logic, `CASE`, `BETWEEN`, null tests,
 array construction, subscripts, slices, scalar function calls, `LIMIT` and
-`OFFSET`. A row-locking cursor (`FOR UPDATE`, `FOR SHARE` and their variants)
-over one table may also order by its columns. Other cursor queries, including
-other orderings, user-defined operators or row-level security, run when
-declared; see [the plan](../PLAN.md#pause-and-resume-every-query-path).
+`OFFSET`. A cursor over one table, including a row-locking cursor (`FOR
+UPDATE`, `FOR SHARE` and their variants), may also order by its columns. Other
+cursor queries, including orderings by other expressions, user-defined
+operators or row-level security, run when declared; see
+[the plan](../PLAN.md#pause-and-resume-every-query-path).
 
 ```sql
 DECLARE c NO SCROLL CURSOR FOR SELECT id, label FROM orders;
@@ -286,8 +287,15 @@ DECLARE c CURSOR FOR SELECT id, v FROM orders ORDER BY id FOR UPDATE;
 FETCH 1 FROM c;  -- locks only the first row
 ```
 
-An ordered cursor first saves every qualifying row in `cursor_bytes` (a full
-buffer returns `54000` before any row is locked) and sorts them. A `FETCH` that
+An ordered cursor sorts at its first `FETCH`, as PostgreSQL's sort reads its
+whole input then: it saves the columns it reads of every row its filter
+passes in `cursor_bytes` (a full buffer returns `54000` before any row is
+returned or locked) and sorts them, keeping scan order for equal keys. Each
+row's output list is then evaluated when a fetch reaches it, so
+`SELECT v, nextval('s') FROM t ORDER BY id` takes numbers in sorted order, and
+a scrollable ordered cursor evaluates a revisited row's volatile output again
+without running its filter again. A row-locking ordered cursor saves whole
+rows. A `FETCH` that
 meets a row locked by another transaction waits like `SELECT ... FOR UPDATE`;
 `lock_timeout`, `statement_timeout` and cancel end the wait. A row changed by a
 transaction that committed after `DECLARE` is checked again: under `READ

@@ -326,8 +326,9 @@ rows fit; raising `cursor_bytes` does not help there.
   When revisited rows are evaluated again, the history holds each row's input
   columns plus 17 bytes of row identity, and a volatile filter adds the rows it
   rejected; the current fetch's output shares the same bytes.
-- Ordered row-locking cursors save every qualifying row's input columns (plus
-  17 bytes) at the first `FETCH`.
+- Ordered cursors save every qualifying row's input columns (plus 17 bytes)
+  at the first `FETCH`: the columns the query reads, or every column of a
+  row-locking cursor.
 - `WITH HOLD`: the unread suffix (plus history when scrolling) must fit; a
   scrollable cursor whose rows are evaluated again saves its whole result.
 

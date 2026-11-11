@@ -200,6 +200,20 @@ def probe(args, trace):
             owner.execute("CLOSE windowed")
             owner.execute("COMMIT")
 
+            # An ordered cursor sorts at its first fetch and evaluates its
+            # output list per fetched row, again on revisits.
+            owner.execute("SELECT setval('calls',600,false)")
+            owner.execute("BEGIN")
+            owner.execute(
+                "DECLARE ordered SCROLL CURSOR FOR SELECT id, nextval('calls') FROM source_rows ORDER BY id DESC"
+            )
+            rows(owner, "ordered.declare_does_not_project", "SELECT last_value,is_called FROM calls", [(600, False)])
+            rows(owner, "ordered.first", "FETCH NEXT FROM ordered", [(3, 600)])
+            rows(owner, "ordered.second", "FETCH NEXT FROM ordered", [(2, 601)])
+            rows(owner, "ordered.prior_evaluates_projection", "FETCH PRIOR FROM ordered", [(3, 602)])
+            rows(owner, "ordered.last", "FETCH LAST FROM ordered", [(1, 605)])
+            owner.execute("COMMIT")
+
             owner.execute("BEGIN")
             owner.execute("DECLARE rechecked NO SCROLL CURSOR FOR SELECT id FROM source_rows WHERE id < 3 ORDER BY id DESC FOR UPDATE")
             observer.execute("UPDATE source_rows SET id = 10 WHERE id = 2")

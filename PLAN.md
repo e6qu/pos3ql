@@ -100,10 +100,12 @@ is owned.
   spilled generations; and more retained shapes (joins, sorting, grouping, subqueries, set
   operations, and more set-returning functions than `generate_series` and
   one-array `unnest`).
-  Cursors over those shapes still run at `DECLARE`, so a scrollable sorted
-  cursor returns saved values where PostgreSQL evaluates a volatile output
-  list again, and a row-locking cursor over a join, or ordered by an
-  expression that is not a source column, locks its rows at `DECLARE`.
+  Cursors over those shapes still run at `DECLARE`, so a scrollable cursor
+  ordered by an expression that is not a source column returns saved values
+  where PostgreSQL evaluates a volatile output list again, and a row-locking
+  cursor over a join, or ordered by such an expression, locks its rows at
+  `DECLARE`. A large ordered `SELECT` still spools: its sort input has no
+  size estimate to choose a stream before it runs.
   PL/pgSQL `FOR rec IN c LOOP` over a bound cursor is rejected with `0A000`;
   it needs a loop frame that opens, fetches and closes the cursor across
   waits. Saving a held cursor at commit yields during storage waits. Cursors

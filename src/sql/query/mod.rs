@@ -955,6 +955,32 @@ pub(crate) struct PendingRoutineInvocation {
 pub(crate) enum PendingRoutineTarget {
     Stored(crate::mem::arena::ArenaHandle<OwnedRoutineCallContract>),
     Intrinsic(i32),
+    /// A row trigger whose body needs the engine; its arguments are the
+    /// encoded `OLD` values, then the `NEW` values.
+    Trigger(TriggerCall),
+}
+
+/// Where a trigger firing that moves to the engine started.
+#[derive(Clone, Copy)]
+pub(crate) struct DeferredFiring {
+    pub start: InvocationPosition,
+    pub replay: Option<super::sequence::StatementReplayStart>,
+    pub effects: crate::sql::txn::TransactionEffectMark,
+    pub call: TriggerCall,
+}
+
+/// One trigger firing run on the engine between write attempts; a
+/// statement trigger has neither `old` nor `new`. `rows` fingerprints the
+/// firing's `OLD` and `NEW` values, so a firing that ran without the engine
+/// cannot take another firing's saved result.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TriggerCall {
+    pub slot: u16,
+    pub target: crate::storage::TriggerTarget,
+    pub event: u8,
+    pub old: bool,
+    pub new: bool,
+    pub rows: u64,
 }
 
 impl PendingRoutineInvocation {
@@ -1364,6 +1390,8 @@ pub(crate) struct RoutineInvocationState {
     next: Cell<usize>,
     pending: Cell<Option<PendingRoutineInvocation>>,
     pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
+    /// The transaction's effects when the pending trigger firing started.
+    pending_firing: Cell<Option<crate::sql::txn::TransactionEffectMark>>,
     owner: ArenaIdentity,
     results: RefCell<RoutineResults>,
     inputs: input_progress::RoutineInputs,
@@ -1548,6 +1576,7 @@ impl RoutineInvocationState {
             next: Cell::new(0),
             pending: Cell::new(None),
             pending_replay: Cell::new(None),
+            pending_firing: Cell::new(None),
             owner: arena.identity(),
             results: RefCell::new(RoutineResults::new()),
             inputs: input_progress::RoutineInputs::new(),
@@ -1574,6 +1603,7 @@ impl RoutineInvocationState {
     pub(crate) fn begin_attempt(&self) {
         self.next.set(0);
         self.pending.set(None);
+        self.pending_firing.set(None);
         self.inputs.begin_attempt();
     }
 
@@ -1675,6 +1705,91 @@ impl RoutineInvocationState {
             sqlstate::INTERNAL_ROUTINE_INVOCATION,
             "mutable intrinsic invocation is pending"
         ))
+    }
+
+    /// The saved result of `call` when it is the next entry of the log;
+    /// `None` leaves the log where it is, for a firing that runs without
+    /// the engine.
+    pub(crate) fn replay_trigger<'out>(
+        &self,
+        call: TriggerCall,
+        statement_arena: &Arena,
+        output: &'out Arena,
+    ) -> Result<Option<&'out [u8]>, SqlError> {
+        self.require_arena(statement_arena)?;
+        let ordinal = self.next.get();
+        if ordinal >= self.results.borrow().len() {
+            return Ok(None);
+        }
+        let saved =
+            invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?;
+        let OwnedRoutineResult::Trigger(saved_call, row) = saved.value else {
+            return Ok(None);
+        };
+        if saved_call != call {
+            return Ok(None);
+        }
+        self.next.set(ordinal + 1);
+        super::sequence::restore_replay_cursor(
+            saved.replay,
+            super::sequence::ReplayInputPosition::KeepConsumed,
+        )?;
+        row.copy(statement_arena, output).map(Some)
+    }
+
+    /// Replaces whatever the trigger firing left pending with the firing
+    /// itself, so the engine runs the whole trigger body once and the next
+    /// attempt replays its result at the position where the firing started.
+    pub(crate) fn defer_trigger(
+        &self,
+        firing: DeferredFiring,
+        arguments: &[Datum],
+        statement_arena: &Arena,
+    ) -> SqlError {
+        let deferred = (|| {
+            self.require_arena(statement_arena)?;
+            if self.results.borrow().len() != firing.start.calls {
+                // The firing would not be the next entry of the log.
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "a trigger moved to the engine after later routine results"
+                ));
+            }
+            self.pending.set(None);
+            self.seek(firing.start)?;
+            self.inputs
+                .forget_from(firing.start.inputs, statement_arena)?;
+            super::sequence::rewind_replay_cursor(firing.replay)?;
+            self.pending_replay.set(firing.replay);
+            self.pending_firing.set(Some(firing.effects));
+            self.pending.set(Some(PendingRoutineInvocation {
+                plan_owner: super::type_input_plans::owner()?,
+                source_position: None,
+                input_collation: super::ast::Collation::None,
+                access: super::eval::RoutineCallAccess::Caller,
+                target: PendingRoutineTarget::Trigger(firing.call),
+                arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
+                argument_count: arguments.len(),
+            }));
+            Ok(())
+        })();
+        match deferred {
+            Ok(()) => sql_err!(
+                sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                "trigger invocation is pending"
+            ),
+            Err(error) => error,
+        }
+    }
+
+    /// Whether every change the attempt made since `effects` belongs to the
+    /// pending trigger firing, which the engine runs again from its start:
+    /// rolling the attempt back then hides nothing from it.
+    pub(crate) fn pending_firing_started_at(
+        &self,
+        effects: crate::sql::txn::TransactionEffectMark,
+    ) -> bool {
+        self.pending_firing.get() == Some(effects)
     }
 
     pub(crate) fn position(&self) -> InvocationPosition {

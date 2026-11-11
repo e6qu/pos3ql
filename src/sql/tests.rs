@@ -13597,7 +13597,7 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
         (
             "CREATE RULE invalid_returning AS ON INSERT TO rule_defaults \
              DO ALSO INSERT INTO rule_default_log VALUES (NEW.id, NEW.label) RETURNING id",
-            "conditional or non-INSTEAD",
+            "RETURNING lists are not supported in non-INSTEAD rules",
         ),
         (
             "CREATE RULE second_returning AS ON INSERT TO rule_redirect DO INSTEAD \
@@ -13622,12 +13622,12 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
         (
             "CREATE RULE invalid_old AS ON INSERT TO rule_defaults \
              DO ALSO INSERT INTO rule_default_log VALUES (OLD.id, NEW.label)",
-            "cannot reference OLD",
+            "cannot use OLD",
         ),
         (
             "CREATE RULE invalid_new AS ON DELETE TO rule_defaults \
              DO ALSO INSERT INTO rule_default_log VALUES (NEW.id, OLD.label)",
-            "cannot reference NEW",
+            "cannot use NEW",
         ),
         (
             "CREATE RULE conditional_notify AS ON INSERT TO rule_defaults \
@@ -13641,7 +13641,7 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
             "{sql}: {}",
             String::from_utf8_lossy(&rejected)
         );
-        if expected.starts_with("cannot reference") {
+        if expected.starts_with("cannot use") {
             assert_eq!(error_sqlstates(&rejected), ["42P17"], "{sql}");
         }
     }
@@ -100711,5 +100711,6 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
     }
 }
 
+mod engine_triggers;
 mod relation_input_granularity;
 mod row_progress;

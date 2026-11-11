@@ -39,7 +39,11 @@ impl ResultBytes {
         ))
     }
 
-    fn copy<'out>(self, source: &Arena, output: &'out Arena) -> Result<&'out [u8], SqlError> {
+    pub(super) fn copy<'out>(
+        self,
+        source: &Arena,
+        output: &'out Arena,
+    ) -> Result<&'out [u8], SqlError> {
         let bytes = source.retained_slice(self.0).map_err(|_| inactive())?;
         output
             .alloc_slice_copy(bytes)
@@ -80,11 +84,14 @@ impl ResultBytes {
 pub(crate) enum OwnedRoutineResult {
     Scalar(ResultBytes),
     Rows(ResultBytes),
+    /// A row trigger run on the engine: the firing it answers and its
+    /// result row (whether the row is kept, then the returned `NEW`).
+    Trigger(super::TriggerCall, ResultBytes),
 }
 
 impl OwnedRoutineResult {
     pub(super) fn relocate(self, source: &Arena, target: &Arena) -> Result<Self, SqlError> {
-        let (Self::Scalar(bytes) | Self::Rows(bytes)) = self;
+        let (Self::Scalar(bytes) | Self::Rows(bytes) | Self::Trigger(_, bytes)) = self;
         let bytes = source.retained_slice(bytes.0).map_err(|_| inactive())?;
         let copied = target
             .retain_slice_with(bytes.len(), |index| bytes[index])
@@ -97,6 +104,7 @@ impl OwnedRoutineResult {
         Ok(match self {
             Self::Scalar(_) => Self::Scalar(copied),
             Self::Rows(_) => Self::Rows(copied),
+            Self::Trigger(call, _) => Self::Trigger(call, copied),
         })
     }
 
@@ -113,8 +121,15 @@ impl OwnedRoutineResult {
         ResultBytes::capture_scalar(value, arena).map(Self::Scalar)
     }
 
+    pub(crate) fn from_trigger_image(
+        call: super::TriggerCall,
+        image: FrozenArenaSliceHandle<u8>,
+    ) -> Self {
+        Self::Trigger(call, ResultBytes(image))
+    }
+
     pub(super) fn validate(self, arena: &Arena) -> Result<(), SqlError> {
-        let (Self::Scalar(bytes) | Self::Rows(bytes)) = self;
+        let (Self::Scalar(bytes) | Self::Rows(bytes) | Self::Trigger(_, bytes)) = self;
         arena
             .retained_slice(bytes.0)
             .map(|_| ())
@@ -357,6 +372,7 @@ mod ownership_tests {
                             );
                         }
                     }
+                    OwnedRoutineResult::Trigger(..) => panic!("no trigger result was saved"),
                 }
             }
             assert!(results.get(&wrong, 0).is_err());

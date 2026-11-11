@@ -719,6 +719,7 @@ fn collect_statement(
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Merge(_)
     ) {
         let outer = DependencyTypes {
+            hidden: None,
             scope: None,
             excluded: None,
             transition: context.transition,
@@ -1139,6 +1140,7 @@ fn collect_dml_routine_calls_with_output<'a>(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let resolver = DependencyTypes {
+        hidden: None,
         scope,
         excluded,
         storage,
@@ -1277,6 +1279,7 @@ pub(crate) fn validate_dml_assignment_casts(
             catalog: Some(&catalog),
         });
         let columns = DependencyTypes {
+            hidden: None,
             scope: Some(&scope),
             excluded: Some(target),
             transition: transition
@@ -1308,7 +1311,19 @@ pub(crate) fn validate_dml_assignment_casts(
                 txid,
             )
         };
-        let insert_values = |names: &[&str], values: &[&Expr<'_>]| -> Result<(), SqlError> {
+        // An INSERT's VALUES rows read no relation, only the enclosing
+        // routine's variables and trigger rows.
+        let values_columns = DependencyTypes {
+            scope: None,
+            excluded: None,
+            hidden: Some(target_name),
+            ..columns
+        };
+        let merge_columns = &columns;
+        let insert_values = |names: &[&str],
+                             values: &[&Expr<'_>],
+                             columns: &DependencyTypes<'_, '_, '_>|
+         -> Result<(), SqlError> {
             for (index, expression) in values.iter().enumerate() {
                 let column = if names.is_empty() {
                     target.columns().get(index)
@@ -1323,7 +1338,7 @@ pub(crate) fn validate_dml_assignment_casts(
                         expression,
                         names.get(index).copied(),
                         column,
-                        &columns,
+                        columns,
                         storage,
                         txid,
                     )?;
@@ -1347,7 +1362,7 @@ pub(crate) fn validate_dml_assignment_casts(
                     }
                 }
                 for row in insert.rows {
-                    insert_values(insert.columns, row)?;
+                    insert_values(insert.columns, row, &values_columns)?;
                 }
                 if let Some(select) = insert.select {
                     validate_insert_projection(
@@ -1384,7 +1399,7 @@ pub(crate) fn validate_dml_assignment_casts(
                         }
                         crate::sql::ast::MergeActionRef::Insert {
                             columns, values, ..
-                        } => insert_values(columns, values)?,
+                        } => insert_values(columns, values, merge_columns)?,
                         _ => {}
                     }
                 }
@@ -1797,6 +1812,7 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
             catalog: Some(&catalog),
         });
         let columns = DependencyTypes {
+            hidden: None,
             scope: Some(scope),
             excluded: Some(target),
             transition: transition
@@ -1807,6 +1823,26 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
             returning_output: None,
             arena,
         };
+        // An INSERT's VALUES rows, visited first, read no relation, only the
+        // enclosing routine's variables and trigger rows.
+        let values_columns = DependencyTypes {
+            scope: None,
+            excluded: None,
+            hidden: Some(target_name),
+            ..columns
+        };
+        let values = match statement {
+            Stmt::Insert(insert) => insert.rows.iter().map(|row| row.len()).sum::<usize>(),
+            _ => 0,
+        };
+        let resolver = |visited: usize| -> &dyn ColTypeResolver {
+            if visited < values {
+                &values_columns
+            } else {
+                &columns
+            }
+        };
+        let mut visited = 0usize;
         let mut assignments = crate::mem::arena::ArenaList::new(arena);
         for_each_dml_assignment(statement, &mut |name, index, expression, site| {
             let ordinal = index;
@@ -1842,7 +1878,8 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
             if grouped {
                 assignments.push(assignment).map_err(|_| arena_full())
             } else {
-                visit(core::slice::from_ref(&assignment), &columns)
+                visited += 1;
+                visit(core::slice::from_ref(&assignment), resolver(visited - 1))
             }
         })?;
         let assignments = assignments.as_slice();
@@ -1852,7 +1889,7 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
                 .iter()
                 .position(|assignment| assignment.ordinal == 0)
                 .map_or(assignments.len(), |offset| start + 1 + offset);
-            visit(&assignments[start..end], &columns)?;
+            visit(&assignments[start..end], resolver(start))?;
             start = end;
         }
         Ok(())
@@ -1909,6 +1946,7 @@ pub(crate) fn visit_projection_types(
             .map(|from| super::QueryScope::resolve_schema(storage, from, txid, arena, outer))
             .transpose()?;
         let columns = DependencyTypes {
+            hidden: None,
             scope: scope.as_ref(),
             excluded: None,
             transition: transition
@@ -2418,6 +2456,9 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
         crate::storage::RelationDefinition<'storage>,
         [&'definition str; 2],
     )>,
+    /// The name of an INSERT target its `VALUES` rows cannot reference;
+    /// they read only `transition`.
+    hidden: Option<&'definition str>,
     arena: &'storage Arena,
 }
 
@@ -2568,6 +2609,22 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         {
             return transition.resolve(qualifier, name);
         }
+        if let Some(hidden) = self.hidden {
+            if let Some(metadata) = self
+                .transition
+                .and_then(|columns| columns.column_meta(qualifier, name))
+            {
+                return Ok(metadata.ctype);
+            }
+            return Err(match qualifier {
+                Some(qualifier) if qualifier == hidden => sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    qualifier
+                ),
+                _ => crate::sql::eval::empty_scope_column_error(qualifier, name),
+            });
+        }
         if qualifier == Some("excluded")
             && let Some(definition) = self.excluded
         {
@@ -2599,6 +2656,11 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     }
 
     fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
+        if self.hidden.is_some() {
+            return self
+                .transition
+                .and_then(|columns| columns.column_meta(qualifier, name));
+        }
         if let Some((definition, aliases)) = self.returning_output
             && qualifier.is_some_and(|qualifier| aliases.contains(&qualifier))
         {
@@ -2893,6 +2955,7 @@ fn collect_routine_dependencies(
     ctes: CteNames<'_>,
 ) -> Result<(), SqlError> {
     let resolver = DependencyTypes {
+        hidden: None,
         scope: None,
         excluded: None,
         transition: context.transition,
@@ -2912,6 +2975,7 @@ fn collect_routine_dependencies(
             let bound = context.bound_from(from, storage, txid, ctes, arena)?;
             let scope = super::QueryScope::resolve_schema(storage, &bound, txid, arena, None)?;
             let resolver = DependencyTypes {
+                hidden: None,
                 scope: Some(&scope),
                 excluded: None,
                 transition: context.transition,
@@ -2972,6 +3036,7 @@ pub(super) fn stored_routine_dependency_for_call(
         ));
     }
     let resolver = DependencyTypes {
+        hidden: None,
         scope: None,
         excluded: None,
         transition: None,
@@ -3046,6 +3111,7 @@ pub(super) fn stored_operator_dependency_for_call(
         ));
     }
     let resolver = DependencyTypes {
+        hidden: None,
         scope: None,
         excluded: None,
         transition: None,

@@ -14863,16 +14863,22 @@ impl Engine {
         let mut capture = capture;
         // The original statement and each rule action are steps: one an
         // earlier attempt finished keeps its row count instead of running again.
-        let mut progress = progress.and_then(|progress| progress.claim_steps().then_some(progress));
+        let mut progress = progress;
+        let level = progress
+            .as_deref_mut()
+            .and_then(exec::RowProgress::claim_step_level);
+        let mut progress = progress.filter(|_| level.is_some());
+        let level = level.unwrap_or(0);
         let resumed = match progress
             .as_deref()
-            .map(|progress| progress.resumed_steps(arena))
+            .map(|progress| progress.resumed_steps_at(level, arena))
         {
             Some(Ok(resumed)) => resumed.map(|resumed| resumed.finished),
             Some(Err(error)) => return Ok(Err(error)),
             None => None,
         };
         let mut steps = RuleSteps {
+            level,
             finished: crate::mem::arena::ArenaList::new(arena),
             resumed: resumed.unwrap_or(&[]),
             started: false,
@@ -16374,7 +16380,10 @@ impl Engine {
                 Ok(unfinished) => unfinished,
                 Err(error) => return Ok(Err(error)),
             };
-            if unfinished.is_none() && txn.transaction_effect_mark() != effects {
+            if unfinished.is_none()
+                && txn.transaction_effect_mark() != effects
+                && !invocations.pending_firing_started_at(effects)
+            {
                 // Running the call after a rollback would hide the attempt's
                 // changes from it, unlike PostgreSQL.
                 return Ok(Err(exec::retained_progress_required()));
@@ -16439,6 +16448,49 @@ impl Engine {
                     Some(contract) => contract,
                     None => return Ok(Err(query::inactive_pending_call())),
                 },
+                query::PendingRoutineTarget::Trigger(call) => {
+                    let retained = work.with_remaining_retained_bytes(arena, |scratch| {
+                        exec::run_pending_trigger(
+                            self,
+                            call,
+                            pending.arguments(arena)?,
+                            txn,
+                            sqlprep,
+                            cursors,
+                            guc,
+                            responder,
+                            scratch,
+                        )
+                    });
+                    let retained = match retained {
+                        Ok(Ok(retained)) => retained,
+                        Ok(Err(error))
+                            if invocations.execution == query::RoutineExecution::Retained
+                                && matches!(
+                                    error.sqlstate.internal_control(),
+                                    Some(sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT)
+                                ) =>
+                        {
+                            return Ok(Err(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "trigger wait requires a retained body"
+                            )));
+                        }
+                        Ok(Err(error)) => return Ok(Err(error)),
+                        Err(error) => {
+                            return Ok(Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "trigger body exceeds statement memory: {}",
+                                error
+                            )));
+                        }
+                    };
+                    return Ok(invocations.complete(
+                        query::OwnedRoutineResult::from_trigger_image(call, retained),
+                        arena,
+                        work,
+                    ));
+                }
                 query::PendingRoutineTarget::Intrinsic(oid) => {
                     let mut unlock_warning = None;
                     let retained = work.with_remaining_retained_bytes(arena, |scratch| {
@@ -29453,6 +29505,8 @@ fn check_prepared_argument_count(
 
 /// The steps of a statement rewritten by rules, for its row progress.
 struct RuleSteps<'a> {
+    /// The step level the statement claimed.
+    level: usize,
     finished: crate::mem::arena::ArenaList<'a, exec::StepRecord<'a>>,
     resumed: &'a [exec::StepRecord<'a>],
     /// Whether a step ran without progress, so the next is a new command.
@@ -29478,7 +29532,7 @@ impl<'a> RuleSteps<'a> {
             self.started = true;
             return Ok(None);
         };
-        if progress.begin_step(index, true, txn, responder)? {
+        if progress.begin_step_at(self.level, index, true, txn, responder)? {
             return Ok(None);
         }
         let record = *self.resumed.get(index).ok_or_else(|| {
@@ -29501,7 +29555,7 @@ impl<'a> RuleSteps<'a> {
         let Some(progress) = progress else {
             return Ok(());
         };
-        progress.finish_step();
+        progress.finish_step_at(self.level);
         self.finished
             .push(exec::StepRecord {
                 rows: &[],
@@ -29521,7 +29575,8 @@ impl<'a> RuleSteps<'a> {
     ) -> SqlError {
         match progress {
             Some(progress) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION => {
-                match progress.keep_steps(self.finished.as_slice(), &[], arena, pool) {
+                match progress.keep_steps_at(self.level, self.finished.as_slice(), &[], arena, pool)
+                {
                     Ok(()) => error,
                     Err(kept) => kept,
                 }

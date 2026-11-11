@@ -625,8 +625,58 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
                 self.dml(statement, Some(outer))
             }
+            // A procedural CALL's arguments read the block's variables.
+            Stmt::Call { .. } => {
+                let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
+                let columns = RuntimeColumnTypes {
+                    row: outer,
+                    catalog: Some(&catalog),
+                };
+                self.call_statement(statement, &columns, outer)
+            }
             _ => self.statement(statement),
         }
+    }
+
+    /// A `CALL`'s arguments, typed by `columns` and read from `row`.
+    fn call_statement<'a>(
+        &mut self,
+        statement: &'a Stmt<'a>,
+        columns: &dyn ColTypeResolver,
+        row: &dyn ColumnLookup<'a>,
+    ) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
+        let Stmt::Call {
+            name,
+            arguments,
+            argument_names,
+            variadic,
+            ..
+        } = statement
+        else {
+            return Ok(());
+        };
+        let name = match name.schema {
+            Some(schema) => self
+                .arena
+                .alloc_str_display(format_args!("{schema}.{}", name.name))
+                .map_err(|_| super::arena_full())?,
+            None => name.name,
+        };
+        for argument in *arguments {
+            self.expression(argument, columns, row)?;
+        }
+        self.call(
+            name,
+            None,
+            arguments,
+            argument_names,
+            *variadic,
+            true,
+            columns,
+        )
     }
 
     fn input(&mut self, expression: &Expr<'_>, target: i32, type_mod: i32) -> Result<(), SqlError> {
@@ -1427,13 +1477,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 self.statement(statement)
             }
             Stmt::Explain { statement, .. } => self.statement(statement),
-            Stmt::Call {
-                name,
-                arguments,
-                argument_names,
-                variadic,
-                ..
-            } => {
+            Stmt::Call { .. } => {
                 let catalog = crate::sql::exec::CatalogCols {
                     definition: None,
                     alias: None,
@@ -1442,25 +1486,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     txid: self.txid,
                     arena: self.arena,
                 };
-                let name = match name.schema {
-                    Some(schema) => self
-                        .arena
-                        .alloc_str_display(format_args!("{schema}.{}", name.name))
-                        .map_err(|_| super::arena_full())?,
-                    None => name.name,
-                };
-                for argument in *arguments {
-                    self.expression(argument, &catalog, &crate::sql::eval::NoColumns)?;
-                }
-                self.call(
-                    name,
-                    None,
-                    arguments,
-                    argument_names,
-                    *variadic,
-                    true,
-                    &catalog,
-                )
+                self.call_statement(statement, &catalog, &crate::sql::eval::NoColumns)
             }
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
                 self.dml(statement, None)

@@ -426,6 +426,10 @@ pub struct QueryScope<'d> {
     positional_names: &'d [(usize, usize, &'d str)],
     /// Tables inside an aliased parenthesized join, which its alias hides.
     hidden_members: &'d [&'d str],
+    /// Per aliased parenthesized join entry, the hidden member each of its
+    /// columns comes from (`None` for a merged `USING` column), which
+    /// PostgreSQL names in an ungrouped-column error.
+    hidden_origins: &'d [(usize, &'d [Option<&'d str>])],
 }
 
 /// A table (or `USING` alias) inside an unaliased parenthesized join. Its
@@ -842,6 +846,7 @@ impl<'d> QueryScope<'d> {
             join_origins: &[],
             positional_names: &[],
             hidden_members: &[],
+            hidden_origins: &[],
         })
     }
 
@@ -897,6 +902,18 @@ impl<'d> QueryScope<'d> {
                 |(_, _, name)| *name,
             );
         (self.names[table], name)
+    }
+
+    /// The table PostgreSQL names for column `column` of entry `table` in an
+    /// error: a column of an aliased parenthesized join is its member's.
+    pub(crate) fn column_error_name(&self, table: usize, column: usize) -> (&str, &str) {
+        let (qualifier, name) = self.column_reference_name(table, column);
+        let member = self
+            .hidden_origins
+            .iter()
+            .find(|(entry, _)| *entry == table)
+            .and_then(|(_, origins)| origins.get(column).copied().flatten());
+        (member.unwrap_or(qualifier), name)
     }
 
     /// Whether `exposed` already names a FROM item or join member.
@@ -1008,6 +1025,44 @@ impl<'d> QueryScope<'d> {
             hidden.push(member.name).map_err(|_| arena_full())?;
         }
         self.hidden_members = hidden.as_slice();
+        let sub = tref
+            .subquery
+            .expect("a parenthesized join is a derived table");
+        let inner_from = sub
+            .from
+            .as_ref()
+            .expect("a parenthesized join has a FROM clause");
+        let outer_schema = tref.lateral.then_some(super::ScopeSchema(&*self));
+        let inner = QueryScope::resolve_schema(
+            storage,
+            inner_from,
+            txid,
+            arena,
+            outer_schema
+                .as_ref()
+                .map(|schema| schema as &dyn ColumnLookup<'_>),
+        )?;
+        let mut origins = ArenaList::new(arena);
+        for index in 0..inner.star_columns() {
+            origins
+                .push(match inner.star_entry(index) {
+                    ResolvedColumn::Merged(_) => None,
+                    ResolvedColumn::Table(table, column) => Some(
+                        arena
+                            .alloc_str(inner.column_reference_name(table, column).0)
+                            .map_err(|_| arena_full())?,
+                    ),
+                })
+                .map_err(|_| arena_full())?;
+        }
+        let mut hidden_origins = ArenaList::new(arena);
+        for origin in self.hidden_origins {
+            hidden_origins.push(*origin).map_err(|_| arena_full())?;
+        }
+        hidden_origins
+            .push((self.n - 1, origins.as_slice()))
+            .map_err(|_| arena_full())?;
+        self.hidden_origins = hidden_origins.as_slice();
         Ok(())
     }
 

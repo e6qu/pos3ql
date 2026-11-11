@@ -51901,6 +51901,14 @@ impl Storage {
         }
     }
 
+    /// Keeps the running statement's visibility and restores it on drop.
+    pub(crate) fn same_statement_snapshot(&self) -> ReadSnapshotScope {
+        ReadSnapshotScope {
+            previous: execution_visibility(),
+            thread: core::marker::PhantomData,
+        }
+    }
+
     pub(crate) fn dml_expression_snapshot(&self, command: u32) -> ReadSnapshotScope {
         let previous = execution_visibility();
         replace_execution_visibility(VisibilityContext {

@@ -13,6 +13,10 @@
 //! variable's current value as a typed constant, so aggregate inputs,
 //! grouping keys and every other site that binds names to columns see the
 //! variable. `use_column` matches execution's own precedence.
+//!
+//! A `WITH` query or a derived table in FROM runs apart from the row its
+//! statement reads, so every variable it names is bound to its value here,
+//! as PostgreSQL passes variables to the whole statement as parameters.
 
 use crate::mem::arena::{Arena, ArenaFull};
 use crate::sql::ast::{
@@ -85,6 +89,10 @@ struct Check<'a, 's> {
     txid: u32,
     arena: &'a Arena,
     variables: &'s dyn ColumnLookup<'a>,
+    /// Inside a query that runs apart from the statement's row (a `WITH`
+    /// query or a derived table): the earlier `WITH` queries its FROM items
+    /// may name. `None` where the statement's row is in scope.
+    detached: core::cell::Cell<Option<&'a [Cte<'a>]>>,
 }
 
 /// Applies `plpgsql.variable_conflict` to `statement`: reports the first
@@ -104,6 +112,7 @@ pub(crate) fn bind_statement<'a>(
         txid,
         arena,
         variables,
+        detached: core::cell::Cell::new(None),
     }
     .statement(statement)
     .map_err(|Failure(error)| error)
@@ -123,6 +132,7 @@ pub(crate) fn bind_expression<'a>(
         txid,
         arena,
         variables,
+        detached: core::cell::Cell::new(None),
     }
     .expression(expression, &Level::root())
     .map_err(|Failure(error)| error)
@@ -184,6 +194,22 @@ impl<'a: 's, 's> Check<'a, 's> {
                     statement
                 } else {
                     self.arena.alloc(Stmt::Merge(*rebuilt))?
+                }
+            }
+            Stmt::With {
+                ctes,
+                statement: main,
+            } => {
+                let mut changed = false;
+                let rebuilt_ctes = self.ctes(ctes, &Level::root(), &mut changed)?;
+                let rebuilt_main = self.statement(main)?;
+                if !changed && core::ptr::eq(rebuilt_main, *main) {
+                    statement
+                } else {
+                    self.arena.alloc(Stmt::With {
+                        ctes: rebuilt_ctes,
+                        statement: rebuilt_main,
+                    })?
                 }
             }
             _ => statement,
@@ -458,6 +484,17 @@ impl<'a: 's, 's> Check<'a, 's> {
             Some(VariableConflict::UseVariable) if level.has_column(qualifier, name) => {
                 self.variable_value(reference, qualifier, name).map(Some)
             }
+            Some(_) if self.detached.get().is_some() && !level.has_column(qualifier, name) => {
+                self.variable_value(reference, qualifier, name).map(Some)
+            }
+            // A trigger's `NEW` and `OLD` rows are variables too.
+            None if self.detached.get().is_some()
+                && matches!(qualifier, Some("new" | "old"))
+                && self.variables.col_type(qualifier, name).is_some()
+                && !level.has_column(qualifier, name) =>
+            {
+                self.variable_value(reference, qualifier, name).map(Some)
+            }
             _ => Ok(None),
         }
     }
@@ -674,7 +711,9 @@ impl<'a: 's, 's> Check<'a, 's> {
         changed: &mut bool,
     ) -> Bound<&'a [Cte<'a>]> {
         let mut rebuilt: Option<&'a mut [Cte<'a>]> = None;
+        let outer = self.detached.get();
         for (index, cte) in ctes.iter().enumerate() {
+            self.detached.set(Some(&ctes[..index]));
             let new = match cte.dml {
                 Some(statement) => {
                     let new = self.statement(statement)?;
@@ -696,6 +735,7 @@ impl<'a: 's, 's> Check<'a, 's> {
                 copy[index] = new;
             }
         }
+        self.detached.set(outer);
         Ok(match rebuilt {
             Some(copy) => {
                 *changed = true;
@@ -745,7 +785,15 @@ impl<'a: 's, 's> Check<'a, 's> {
     ) -> Bound<TableRef<'a>> {
         let mut rebuilt = table;
         if let Some(subquery) = table.subquery {
-            let new = self.select(subquery, parent)?;
+            // A LATERAL subquery may name the FROM items beside it, which
+            // this pass does not resolve; it keeps reading the row.
+            let outer = self.detached.get();
+            if !table.lateral {
+                self.detached.set(Some(outer.unwrap_or(&[])));
+            }
+            let new = self.select(subquery, parent);
+            self.detached.set(outer);
+            let new = new?;
             *changed |= !core::ptr::eq(new, subquery);
             rebuilt.subquery = Some(new);
         }
@@ -816,6 +864,24 @@ impl<'a: 's, 's> Check<'a, 's> {
             Some(from) => {
                 rebuilt.from = Some(self.join_sources(*from, parent, &mut changed)?);
                 let expanded = self.quietly(|| {
+                    let select = match self.detached.get() {
+                        Some(earlier) if !earlier.is_empty() => {
+                            // The earlier queries of the enclosing clause
+                            // resolve this level's FROM items.
+                            let mut with = crate::mem::arena::ArenaList::new(self.arena);
+                            for cte in earlier.iter().chain(select.with) {
+                                with.push(*cte).map_err(|_| super::arena_full())?;
+                            }
+                            &*self
+                                .arena
+                                .alloc(Select {
+                                    with: with.as_slice(),
+                                    ..*select
+                                })
+                                .map_err(|_| super::arena_full())?
+                        }
+                        _ => select,
+                    };
                     let select = super::expand_ctes(select, self.storage, self.txid, self.arena)?;
                     let from = select.from.as_ref().expect("expansion keeps FROM");
                     let from =

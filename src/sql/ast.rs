@@ -1390,6 +1390,8 @@ impl Stmt<'_> {
         matches!(
             self,
             Stmt::Select(_)
+                | Stmt::SetQuery(_)
+                | Stmt::With { .. }
                 | Stmt::Insert(_)
                 | Stmt::Update(_)
                 | Stmt::Delete(_)

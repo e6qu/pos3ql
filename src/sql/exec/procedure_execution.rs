@@ -259,7 +259,7 @@ impl SuspendedProcedure {
                     Ok(environment) => environment,
                     Err(error) => return Err((frame, error)),
                 };
-                let (parsed, code) = match frame.source().parse(arena) {
+                let (parsed, code) = match frame.source().parse(arena, None) {
                     Ok(parsed) => parsed,
                     Err(error) => return Err((frame, error)),
                 };

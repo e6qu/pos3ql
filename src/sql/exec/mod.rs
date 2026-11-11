@@ -18968,6 +18968,71 @@ enum TriggerDml<'a> {
     Update(Update<'a>),
     Delete(Delete<'a>),
     Merge(&'a crate::sql::ast::Merge<'a>),
+    With(TriggerDmlWith<'a>),
+}
+
+impl<'a> TriggerDml<'a> {
+    /// The statement a PL/pgSQL body writes, as parsed.
+    fn from_statement(statement: &'a Stmt<'a>) -> Option<Self> {
+        Some(match statement {
+            Stmt::Insert(statement) => Self::Insert(*statement),
+            Stmt::Update(statement) => Self::Update(*statement),
+            Stmt::Delete(statement) => Self::Delete(*statement),
+            Stmt::Merge(statement) => Self::Merge(statement),
+            Stmt::With { ctes, statement } => Self::With(TriggerDmlWith::new(ctes, statement)?),
+            _ => return None,
+        })
+    }
+
+    fn statement(self) -> Stmt<'a> {
+        match self {
+            Self::Insert(statement) => Stmt::Insert(statement),
+            Self::Update(statement) => Stmt::Update(statement),
+            Self::Delete(statement) => Stmt::Delete(statement),
+            Self::Merge(statement) => Stmt::Merge(*statement),
+            Self::With(with) => Stmt::With {
+                ctes: with.ctes,
+                statement: with.statement,
+            },
+        }
+    }
+
+    fn returns(self) -> bool {
+        match self {
+            Self::Insert(statement) => !statement.returning.is_empty(),
+            Self::Update(statement) => !statement.returning.is_empty(),
+            Self::Delete(statement) => !statement.returning.is_empty(),
+            Self::Merge(statement) => !statement.returning.is_empty(),
+            Self::With(with) => match with.statement {
+                Stmt::Insert(statement) => !statement.returning.is_empty(),
+                Stmt::Update(statement) => !statement.returning.is_empty(),
+                Stmt::Delete(statement) => !statement.returning.is_empty(),
+                _ => unreachable!("checked when the WITH statement was built"),
+            },
+        }
+    }
+}
+
+/// `WITH ... INSERT/UPDATE/DELETE` in a PL/pgSQL body. The statement after
+/// the `WITH` queries is one of the three writes, never another `WITH`.
+#[derive(Clone, Copy)]
+struct TriggerDmlWith<'a> {
+    ctes: &'a [crate::sql::ast::Cte<'a>],
+    statement: &'a Stmt<'a>,
+}
+
+impl<'a> TriggerDmlWith<'a> {
+    fn new(ctes: &'a [crate::sql::ast::Cte<'a>], statement: &'a Stmt<'a>) -> Option<Self> {
+        matches!(
+            statement,
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
+        )
+        .then_some(Self { ctes, statement })
+    }
+
+    fn writes(self) -> bool {
+        self.ctes.iter().any(|cte| cte.dml.is_some())
+    }
 }
 
 static NO_TRIGGER_DML_COLUMNS: NoColumns = NoColumns;
@@ -21540,23 +21605,23 @@ fn bind_plpgsql_dml_ctes<'a>(
     if !query.with.iter().any(|cte| cte.dml.is_some()) {
         return Ok((expand_plpgsql_with(context, query, scope)?, &[]));
     }
-    let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "data-modifying WITH queries are not supported in trigger functions"
-        ));
+    let main = super::query::CteReader::Select(query);
+    let materialized = match &mut context.host {
+        PlpgsqlExecHost::Routine { engine, guc, .. } => engine
+            .bind_dml_ctes(
+                query.with,
+                main,
+                context.txn,
+                context.arena,
+                context.params,
+                guc,
+                context.responder,
+            )?
+            .unwrap_or(&[]),
+        PlpgsqlExecHost::Atomic { .. } => {
+            run_nested_dml_ctes(context, query.with, main, &[], false)?
+        }
     };
-    let materialized = engine
-        .bind_dml_ctes(
-            query.with,
-            super::query::CteReader::Select(query),
-            context.txn,
-            context.arena,
-            context.params,
-            guc,
-            context.responder,
-        )?
-        .unwrap_or(&[]);
     let arena = context.arena;
     let mut kept = ArenaList::new(arena);
     for cte in query.with.iter().filter(|cte| cte.dml.is_none()) {
@@ -21612,16 +21677,231 @@ fn finish_plpgsql_dml_ctes<'a>(
     query: &'a Select<'a>,
     materialized: MaterializedWithQueries<'a>,
 ) -> Result<(), SqlError> {
-    if !query.with.iter().any(|cte| cte.dml.is_some()) {
+    finish_plpgsql_dml_ctes_of(
+        context,
+        query.with,
+        super::query::CteReader::Select(query),
+        materialized,
+    )
+}
+
+/// A cursor reruns its query from saved text at each FETCH, so it cannot
+/// keep the rows of `WITH` queries that write when it opens.
+fn reject_writing_cursor_query(statement: &Stmt<'_>) -> Result<(), SqlError> {
+    let with = match statement {
+        Stmt::Select(select) => select.with,
+        Stmt::SetQuery(query) => query.with,
+        _ => &[],
+    };
+    if with.iter().any(|cte| cte.dml.is_some()) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "OPEN of a query with data-modifying WITH queries is not supported"
+        ));
+    }
+    Ok(())
+}
+
+/// The first identifier in `source` naming `target` (its label when
+/// qualified), after the top-level `keyword` when one is given.
+fn plpgsql_target_text<'s>(
+    source: &'s str,
+    keyword: Option<&str>,
+    target: PlpgsqlVariableName,
+    arena: &Arena,
+) -> Option<&'s str> {
+    use crate::sql::lexer::{Lexer, Tok};
+    let from = match keyword {
+        Some(keyword) => trigger_top_level_keyword(source, keyword, arena).ok()?? + keyword.len(),
+        None => 0,
+    };
+    let tail = source.get(from..)?;
+    let first = target.label.unwrap_or(target.name);
+    arena
+        .with_remaining_region(|scratch| {
+            let mut lexer = Lexer::new(tail, scratch);
+            loop {
+                match lexer.next_token().ok()? {
+                    Tok::Ident(word) | Tok::QuotedIdent(word) if word == first.as_str() => {
+                        return tail.get(lexer.token_start()..lexer.token_end());
+                    }
+                    Tok::Eof => return None,
+                    _ => {}
+                }
+            }
+        })
+        .ok()?
+}
+
+/// Runs `run` in a new nested command, as PostgreSQL runs a statement with
+/// data-modifying `WITH` queries: its queries read the rows earlier
+/// statements wrote and share one snapshot.
+fn in_new_plpgsql_command<'a, T>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    run: impl FnOnce(&mut TriggerExecContext<'_, 'a, '_>) -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    let mut command = context.txn.enter_trigger_sql(context.host.storage())?;
+    run(&mut TriggerExecContext {
+        host: context.host.reborrow(),
+        txn: &mut command,
+        arena: context.arena,
+        params: context.params,
+        responder: context.responder,
+    })
+}
+
+/// Runs the `WITH` queries of a PL/pgSQL `WITH ... INSERT/UPDATE/DELETE`
+/// that its write reads, and returns the write with every `WITH` query
+/// bound in place, with the rows for [`finish_plpgsql_dml_ctes_of`].
+fn bind_plpgsql_write_ctes<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    with: TriggerDmlWith<'a>,
+) -> Result<(TriggerDml<'a>, MaterializedWithQueries<'a>), SqlError> {
+    let main = super::query::CteReader::Statement(with.statement);
+    let materialized = if !with.writes() {
+        &[]
+    } else if let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host {
+        engine
+            .bind_dml_ctes(
+                with.ctes,
+                main,
+                context.txn,
+                context.arena,
+                context.params,
+                guc,
+                context.responder,
+            )?
+            .unwrap_or(&[])
+    } else {
+        run_nested_dml_ctes(context, with.ctes, main, &[], false)?
+    };
+    let sequences = crate::sql::sequence::SeqEval::new(
+        context.storage(),
+        context.seq_session(),
+        context.txn.txid,
+    );
+    let expanded = super::query::expand_dml_ctes(
+        with.statement,
+        with.ctes,
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+        context.params,
+        materialized,
+        Some(&sequences),
+    )?;
+    let statement = match TriggerDml::from_statement(expanded) {
+        Some(
+            statement @ (TriggerDml::Insert(_) | TriggerDml::Update(_) | TriggerDml::Delete(_)),
+        ) => statement,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "WITH expansion changed the PL/pgSQL write"
+            ));
+        }
+    };
+    Ok((statement, materialized))
+}
+
+/// Runs, outside a routine (in a trigger an ordinary statement fires), the
+/// data-modifying `WITH` queries `main` reads, in order, or with `after`
+/// those it does not, last written first, as nested writes that share the
+/// running command. Returns `earlier` with the rows each one returned.
+fn run_nested_dml_ctes<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    with: &'a [crate::sql::ast::Cte<'a>],
+    main: super::query::CteReader<'_>,
+    earlier: MaterializedWithQueries<'a>,
+    after: bool,
+) -> Result<MaterializedWithQueries<'a>, SqlError> {
+    let arena = context.arena;
+    let mut materialized = ArenaList::new(arena);
+    for written in earlier {
+        materialized
+            .push(*written)
+            .map_err(|_| super::query::arena_full_pub())?;
+    }
+    let order: &mut dyn Iterator<Item = usize> = if after {
+        &mut (0..with.len()).rev()
+    } else {
+        &mut (0..with.len())
+    };
+    for index in order {
+        if with[index].dml.is_none() || super::query::dml_cte_runs_after(with, index, main) != after
+        {
+            continue;
+        }
+        let sequences = crate::sql::sequence::SeqEval::new(
+            context.storage(),
+            context.seq_session(),
+            context.txn.txid,
+        );
+        let (statement, mut relation) = super::analyze_dml_cte(
+            context.storage(),
+            with,
+            index,
+            materialized.as_slice(),
+            context.txn.txid,
+            arena,
+            context.params,
+            &sequences,
+        )?;
+        let mut rows = ArenaList::new(arena);
+        let mut capture = |_: &Storage,
+                           _: u32,
+                           _: &dyn crate::sql::eval::SequenceAccess,
+                           values: &[Datum<'_>]| {
+            rows.push(encode_projected_pub(values, arena)?)
+                .map_err(|_| super::query::arena_full_pub())
+        };
+        let mut pending = None;
+        let written = execute_nested_write(
+            context,
+            statement,
+            context.params,
+            None,
+            Some(&mut capture),
+            &mut pending,
+            None,
+            true,
+        );
+        if pending.take().is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a PL/pgSQL write with WITH queries cannot wait without retained write progress"
+            ));
+        }
+        written?;
+        relation.source = crate::sql::ast::MaterializedCteSource::Inline(rows.as_slice());
+        let relation = arena
+            .alloc(relation)
+            .map_err(|_| super::query::arena_full_pub())?;
+        materialized
+            .push((with[index].name, &*relation))
+            .map_err(|_| super::query::arena_full_pub())?;
+    }
+    Ok(materialized.as_slice())
+}
+
+/// Runs the data-modifying `WITH` queries that `main` did not read.
+fn finish_plpgsql_dml_ctes_of<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    with: &'a [crate::sql::ast::Cte<'a>],
+    main: super::query::CteReader<'_>,
+    materialized: MaterializedWithQueries<'a>,
+) -> Result<(), SqlError> {
+    if !with.iter().any(|cte| cte.dml.is_some()) {
         return Ok(());
     }
     let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
+        run_nested_dml_ctes(context, with, main, materialized, true)?;
         return Ok(());
     };
     let output_mark = context.responder.mark();
     engine.finish_dml_ctes(
-        query.with,
-        super::query::CteReader::Select(query),
+        with,
+        main,
         materialized,
         output_mark,
         context.txn,
@@ -22308,17 +22588,11 @@ fn parse_trigger_dml<'a>(source: &'a str, arena: &'a Arena) -> Result<TriggerDml
     {
         return Err(unsupported_trigger_body());
     }
-    match statement {
-        Some(Stmt::Insert(statement)) => Ok(TriggerDml::Insert(statement)),
-        Some(Stmt::Update(statement)) => Ok(TriggerDml::Update(statement)),
-        Some(Stmt::Delete(statement)) => Ok(TriggerDml::Delete(statement)),
-        Some(Stmt::Merge(statement)) => Ok(TriggerDml::Merge(
-            arena
-                .alloc(statement)
-                .map_err(|_| super::query::arena_full_pub())?,
-        )),
-        _ => Err(unsupported_trigger_body()),
-    }
+    let statement = statement.ok_or_else(unsupported_trigger_body)?;
+    let statement = arena
+        .alloc(statement)
+        .map_err(|_| super::query::arena_full_pub())?;
+    TriggerDml::from_statement(statement).ok_or_else(unsupported_trigger_body)
 }
 
 fn parse_trigger_return<'a>(
@@ -23233,16 +23507,18 @@ fn parse_trigger_statement<'a>(
     if let Some(control) = parse_trigger_loop_control(segment, arena, targets)? {
         return Ok(TriggerStatement::LoopControl(control));
     }
-    if strip_trigger_keyword(segment, "insert").is_some()
-        || strip_trigger_keyword(segment, "update").is_some()
-        || strip_trigger_keyword(segment, "delete").is_some()
-        || strip_trigger_keyword(segment, "merge").is_some()
-    {
+    let main = if strip_trigger_keyword(segment, "with").is_some() {
+        plpgsql_with_main_keyword(segment, arena)?
+    } else {
+        ["insert", "update", "delete", "merge"]
+            .into_iter()
+            .find(|keyword| strip_trigger_keyword(segment, keyword).is_some())
+    };
+    if let Some(main @ ("insert" | "update" | "delete" | "merge")) = main {
         // `INSERT INTO` and `MERGE INTO` name the target; a later top-level
-        // INTO receives the RETURNING row.
-        let skipped = if strip_trigger_keyword(segment, "insert").is_some()
-            || strip_trigger_keyword(segment, "merge").is_some()
-        {
+        // INTO receives the RETURNING row. `WITH` queries are parenthesized,
+        // so the first top-level INTO is still the target's.
+        let skipped = if matches!(main, "insert" | "merge") {
             trigger_top_level_keyword(segment, "into", arena)?.map_or(0, |at| at + 4)
         } else {
             0
@@ -24033,7 +24309,7 @@ fn resolve_plpgsql_program_locals<'a>(
         variable_conflict: program.variable_conflict,
         print_strict_params: program.print_strict_params,
     };
-    validate_plpgsql_constant_assignments(&program, has_parameter)?;
+    validate_plpgsql_constant_assignments(&program, has_parameter, arena)?;
     Ok(program)
 }
 
@@ -24125,15 +24401,19 @@ fn compile_plpgsql_execution<'a>(
     arena: &'a Arena,
     has_parameter: &dyn Fn(SqlName) -> bool,
 ) -> Result<(TriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
+    let written = source;
     let source = ProgramSource::capture(source, kind, &storage.execution_control)?;
-    let (parsed, code) = source.parse(arena)?;
-    let program = resolve_plpgsql_program_locals(parsed, storage, txid, arena, has_parameter)?;
+    let (parsed, code) = source.parse(arena, Some(written))?;
+    let program = crate::sql::error_position::with_copied_source(written, code.text(), || {
+        resolve_plpgsql_program_locals(parsed, storage, txid, arena, has_parameter)
+    })?;
     Ok((program, code))
 }
 
 fn validate_plpgsql_constant_assignments(
     program: &TriggerProgram<'_>,
     has_parameter: &dyn Fn(SqlName) -> bool,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     struct ScopedLocal<'a> {
         label: Option<SqlName>,
@@ -24203,35 +24483,43 @@ fn validate_plpgsql_constant_assignments(
         locals: &[TriggerLocalDecl],
         shadowed: Option<&ScopedLocal<'_>>,
         has_parameter: &dyn Fn(SqlName) -> bool,
+        arena: &Arena,
     ) -> Result<(), SqlError> {
-        for statement in current.statements {
+        for (statement, source) in current.statements.iter().zip(current.sources) {
+            // PostgreSQL positions the error at the target as written.
+            let reject = |target: PlpgsqlVariableName, keyword: Option<&str>| {
+                reject(target, locals, shadowed, has_parameter).map_err(|error| {
+                    match plpgsql_target_text(source, keyword, target, arena) {
+                        Some(text) => crate::sql::error_position::at_subject(error, text),
+                        None => error,
+                    }
+                })
+            };
             match *statement {
-                TriggerStatement::LocalAssign(assignment) => {
-                    reject(assignment.name, locals, shadowed, has_parameter)?
-                }
+                TriggerStatement::LocalAssign(assignment) => reject(assignment.name, None)?,
                 TriggerStatement::SelectInto(statement) => {
                     for target in statement.targets {
-                        reject(*target, locals, shadowed, has_parameter)?;
+                        reject(*target, Some("into"))?;
                     }
                 }
                 TriggerStatement::DynamicSelectInto(statement) => {
                     for target in statement.targets {
-                        reject(*target, locals, shadowed, has_parameter)?;
+                        reject(*target, Some("into"))?;
                     }
                 }
                 TriggerStatement::CursorMotion(statement) => {
                     for target in statement.targets {
-                        reject(*target, locals, shadowed, has_parameter)?;
+                        reject(*target, Some("into"))?;
                     }
                 }
                 TriggerStatement::GetDiagnostics(statement) => {
                     for assignment in statement.assignments {
-                        reject(assignment.target, locals, shadowed, has_parameter)?;
+                        reject(assignment.target, Some("diagnostics"))?;
                     }
                 }
                 TriggerStatement::GetStackedDiagnostics(statement) => {
                     for assignment in statement.assignments {
-                        reject(assignment.target, locals, shadowed, has_parameter)?;
+                        reject(assignment.target, Some("diagnostics"))?;
                     }
                 }
                 TriggerStatement::For(statement) => {
@@ -24255,7 +24543,13 @@ fn validate_plpgsql_constant_assignments(
                             constant: false,
                             parent: shadowed,
                         };
-                        validate_block(statement.block, locals, Some(&local), has_parameter)?;
+                        validate_block(
+                            statement.block,
+                            locals,
+                            Some(&local),
+                            has_parameter,
+                            arena,
+                        )?;
                     } else if let TriggerForSource::Cursor { .. } = statement.source {
                         // The loop declares its own record; a qualified name
                         // must still name a known variable.
@@ -24263,7 +24557,7 @@ fn validate_plpgsql_constant_assignments(
                             && binding_constant(statement.target, locals, shadowed, has_parameter)
                                 .is_none()
                         {
-                            reject(statement.target, locals, shadowed, has_parameter)?;
+                            reject(statement.target, Some("for"))?;
                         }
                         let local = ScopedLocal {
                             label: statement.label,
@@ -24271,17 +24565,23 @@ fn validate_plpgsql_constant_assignments(
                             constant: false,
                             parent: shadowed,
                         };
-                        validate_block(statement.block, locals, Some(&local), has_parameter)?;
+                        validate_block(
+                            statement.block,
+                            locals,
+                            Some(&local),
+                            has_parameter,
+                            arena,
+                        )?;
                     } else {
-                        reject(statement.target, locals, shadowed, has_parameter)?;
-                        validate_block(statement.block, locals, shadowed, has_parameter)?;
+                        reject(statement.target, Some("for"))?;
+                        validate_block(statement.block, locals, shadowed, has_parameter, arena)?;
                     }
                 }
                 TriggerStatement::While(statement) => {
-                    validate_block(statement.block, locals, shadowed, has_parameter)?
+                    validate_block(statement.block, locals, shadowed, has_parameter, arena)?
                 }
                 TriggerStatement::Loop(block_value) => {
-                    validate_block(block_value, locals, shadowed, has_parameter)?
+                    validate_block(block_value, locals, shadowed, has_parameter, arena)?
                 }
                 TriggerStatement::Block(statement) => validate_scope(
                     statement.declarations,
@@ -24290,22 +24590,23 @@ fn validate_plpgsql_constant_assignments(
                     locals,
                     shadowed,
                     has_parameter,
+                    arena,
                 )?,
                 TriggerStatement::If(statement) => {
                     for branch in statement.branches {
-                        validate_block(branch.block, locals, shadowed, has_parameter)?;
+                        validate_block(branch.block, locals, shadowed, has_parameter, arena)?;
                     }
                 }
                 TriggerStatement::Case(statement) => {
                     for branch in statement.branches {
-                        validate_block(branch.block, locals, shadowed, has_parameter)?;
+                        validate_block(branch.block, locals, shadowed, has_parameter, arena)?;
                     }
                     if let TriggerCaseElse::Block(otherwise) = statement.otherwise {
-                        validate_block(otherwise, locals, shadowed, has_parameter)?;
+                        validate_block(otherwise, locals, shadowed, has_parameter, arena)?;
                     }
                 }
                 TriggerStatement::Exception(statement) => {
-                    validate_block(statement.protected, locals, shadowed, has_parameter)?;
+                    validate_block(statement.protected, locals, shadowed, has_parameter, arena)?;
                     let state = ScopedLocal {
                         label: None,
                         name: SqlName::parse("sqlstate").expect("static diagnostic name"),
@@ -24319,7 +24620,13 @@ fn validate_plpgsql_constant_assignments(
                         parent: Some(&state),
                     };
                     for handler in statement.handlers {
-                        validate_block(handler.block, locals, Some(&message), has_parameter)?;
+                        validate_block(
+                            handler.block,
+                            locals,
+                            Some(&message),
+                            has_parameter,
+                            arena,
+                        )?;
                     }
                 }
                 TriggerStatement::Null
@@ -24351,9 +24658,10 @@ fn validate_plpgsql_constant_assignments(
         locals: &[TriggerLocalDecl],
         shadowed: Option<&ScopedLocal<'_>>,
         has_parameter: &dyn Fn(SqlName) -> bool,
+        arena: &Arena,
     ) -> Result<(), SqlError> {
         match declarations.split_first() {
-            None => validate_block(block, locals, shadowed, has_parameter),
+            None => validate_block(block, locals, shadowed, has_parameter, arena),
             Some((first, rest)) => {
                 let local = ScopedLocal {
                     label,
@@ -24361,11 +24669,19 @@ fn validate_plpgsql_constant_assignments(
                     constant: first.constant,
                     parent: shadowed,
                 };
-                validate_scope(rest, label, block, locals, Some(&local), has_parameter)
+                validate_scope(
+                    rest,
+                    label,
+                    block,
+                    locals,
+                    Some(&local),
+                    has_parameter,
+                    arena,
+                )
             }
         }
     }
-    validate_block(program.body, program.locals, None, has_parameter)
+    validate_block(program.body, program.locals, None, has_parameter, arena)
 }
 
 fn resolve_plpgsql_column_type(
@@ -27637,42 +27953,74 @@ fn execute_bound_plpgsql_dynamic_query<'a>(
     let arena = context.arena;
     let txid = context.txn.txid;
     let input_source = plpgsql_command_source(query.source, arena)?;
+    let run = |context: &mut TriggerExecContext<'_, 'a, '_>,
+               statement: &'a Stmt<'a>,
+               fresh_snapshot: bool| {
+        execute_procedural_query(context, fresh_snapshot, None, |storage, sequence| {
+            let mut rows = ArenaList::new(arena);
+            let mut capture = |values: &[Datum]| {
+                rows.push(encode_projected_pub(values, arena)?)
+                    .map_err(|_| super::query::arena_full_pub())
+            };
+            let result = match statement {
+                Stmt::Select(select) => super::query::select_into_rows(
+                    storage,
+                    txid,
+                    select,
+                    arena,
+                    query.arguments,
+                    None,
+                    Some(sequence),
+                    &mut capture,
+                ),
+                Stmt::SetQuery(set_query) => super::query::set_query_into_rows(
+                    storage,
+                    txid,
+                    set_query,
+                    arena,
+                    query.arguments,
+                    Some(sequence),
+                    &mut capture,
+                ),
+                _ => Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "PL/pgSQL dynamic query must be SELECT, VALUES, or a set operation"
+                )),
+            };
+            ProceduralQueryRows::complete(rows.as_slice(), result)
+        })
+    };
     let rows = super::type_input_plans::with_owner(query.owner, || {
         super::type_inputs::with_source(input_source, query.source, query.inputs, || {
             with_bound_parameter_types(query.parameter_types, || {
-                execute_procedural_query(context, false, None, |storage, sequence| {
-                    let mut rows = ArenaList::new(arena);
-                    let mut capture = |values: &[Datum]| {
-                        rows.push(encode_projected_pub(values, arena)?)
-                            .map_err(|_| super::query::arena_full_pub())
+                let Stmt::Select(select) = query.statement else {
+                    return run(context, query.statement, false);
+                };
+                if select.with.is_empty() {
+                    return run(context, query.statement, false);
+                }
+                // `WITH` queries see the `USING` values as parameters.
+                let bind = |context: &mut TriggerExecContext<'_, 'a, '_>| {
+                    let mut context = TriggerExecContext {
+                        host: context.host.reborrow(),
+                        txn: context.txn,
+                        arena,
+                        params: query.arguments,
+                        responder: context.responder,
                     };
-                    let result = match query.statement {
-                        Stmt::Select(select) => super::query::select_into_rows(
-                            storage,
-                            txid,
-                            select,
-                            arena,
-                            query.arguments,
-                            None,
-                            Some(sequence),
-                            &mut capture,
-                        ),
-                        Stmt::SetQuery(set_query) => super::query::set_query_into_rows(
-                            storage,
-                            txid,
-                            set_query,
-                            arena,
-                            query.arguments,
-                            Some(sequence),
-                            &mut capture,
-                        ),
-                        _ => Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "PL/pgSQL dynamic query must be SELECT, VALUES, or a set operation"
-                        )),
-                    };
-                    ProceduralQueryRows::complete(rows.as_slice(), result)
-                })
+                    let (bound, written) = bind_plpgsql_dml_ctes(&mut context, select, &NoColumns)?;
+                    let bound = arena
+                        .alloc(Stmt::Select(*bound))
+                        .map_err(|_| super::query::arena_full_pub())?;
+                    let rows = run(&mut context, bound, false)?;
+                    finish_plpgsql_dml_ctes(&mut context, select, written)?;
+                    Ok(rows)
+                };
+                if select.with.iter().any(|cte| cte.dml.is_some()) {
+                    in_new_plpgsql_command(context, bind)
+                } else {
+                    bind(context)
+                }
             })
         })
     })?;
@@ -27720,7 +28068,83 @@ fn execute_nested_data_modification<'a>(
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     capture: Option<&mut super::ReturningCapture<'_>>,
     pending: &mut Option<write_completion::PendingNestedWrite>,
+    progress: Option<&mut RowProgress>,
+) -> Result<u64, SqlError> {
+    let Stmt::With { ctes, statement } = statement else {
+        return execute_nested_write(
+            context,
+            statement,
+            arguments,
+            transition_relations,
+            capture,
+            pending,
+            progress,
+            false,
+        );
+    };
+    let with = TriggerDmlWith::new(ctes, statement).ok_or_else(|| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "a dynamic PL/pgSQL write after WITH must be INSERT, UPDATE or DELETE"
+        )
+    })?;
+    // `WITH` queries see the `USING` values as parameters, and they share a
+    // new command with the write.
+    in_new_plpgsql_command(context, |context| {
+        let mut context = TriggerExecContext {
+            host: context.host.reborrow(),
+            txn: context.txn,
+            arena: context.arena,
+            params: arguments,
+            responder: context.responder,
+        };
+        let (expanded, materialized) = bind_plpgsql_write_ctes(&mut context, with)?;
+        let expanded = context
+            .arena
+            .alloc(expanded.statement())
+            .map_err(|_| super::query::arena_full_pub())?;
+        let rows = execute_nested_write(
+            &mut context,
+            expanded,
+            arguments,
+            transition_relations,
+            capture,
+            pending,
+            None,
+            true,
+        );
+        if pending.take().is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a PL/pgSQL write with WITH queries cannot wait without retained write progress"
+            ));
+        }
+        let rows = rows?;
+        finish_plpgsql_dml_ctes_of(
+            &mut context,
+            with.ctes,
+            super::query::CteReader::Statement(with.statement),
+            materialized,
+        )?;
+        Ok(rows)
+    })
+}
+
+/// [`execute_nested_data_modification`] for one INSERT, UPDATE or DELETE;
+/// `shared_command` joins the nested command already running.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a nested write carries its capture, completion, progress and command"
+)]
+fn execute_nested_write<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    statement: &'a Stmt<'a>,
+    arguments: &'a [Datum<'a>],
+    transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
+    capture: Option<&mut super::ReturningCapture<'_>>,
+    pending: &mut Option<write_completion::PendingNestedWrite>,
     mut progress: Option<&mut RowProgress>,
+    shared_command: bool,
 ) -> Result<u64, SqlError> {
     let statement = match transition_relations {
         Some(relations) => super::query::bind_dml_materialized_relations(
@@ -27798,7 +28222,8 @@ fn execute_nested_data_modification<'a>(
             let boundary = context.nested_write_boundary();
             let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
 
-            let mut command = enter_write_command(txn, storage, progress.as_deref_mut())?;
+            let mut command =
+                enter_write_command(txn, storage, progress.as_deref_mut(), shared_command)?;
             let txn = &mut *command;
             let parent_boundary = txn.write_completion_boundary;
             txn.write_completion_boundary =
@@ -27859,7 +28284,8 @@ fn execute_nested_data_modification<'a>(
             let params = arguments;
             let boundary = context.nested_write_boundary();
             let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-            let mut command = enter_write_command(txn, storage, progress.as_deref_mut())?;
+            let mut command =
+                enter_write_command(txn, storage, progress.as_deref_mut(), shared_command)?;
             let txn = &mut *command;
             let parent_boundary = txn.write_completion_boundary;
             txn.write_completion_boundary =
@@ -27919,7 +28345,8 @@ fn execute_nested_data_modification<'a>(
             let params = arguments;
             let boundary = context.nested_write_boundary();
             let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-            let mut command = enter_write_command(txn, storage, progress.as_deref_mut())?;
+            let mut command =
+                enter_write_command(txn, storage, progress.as_deref_mut(), shared_command)?;
             let txn = &mut *command;
             let parent_boundary = txn.write_completion_boundary;
             txn.write_completion_boundary =
@@ -27996,7 +28423,8 @@ fn execute_nested_data_modification<'a>(
             };
             let boundary = context.nested_write_boundary();
             let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-            let mut command = enter_write_command(txn, storage, progress.as_deref_mut())?;
+            let mut command =
+                enter_write_command(txn, storage, progress.as_deref_mut(), shared_command)?;
             let txn = &mut *command;
             let parent_boundary = txn.write_completion_boundary;
             txn.write_completion_boundary =
@@ -30188,7 +30616,8 @@ fn execute_rewritten_nested_write<'a>(
         )));
     };
     let engine = &mut **engine;
-    let mut command = enter_write_command(context.txn, &engine.storage, progress.as_deref_mut())?;
+    let mut command =
+        enter_write_command(context.txn, &engine.storage, progress.as_deref_mut(), false)?;
     let txn = &mut *command;
     let parent_boundary = txn.write_completion_boundary;
     txn.write_completion_boundary =
@@ -31782,18 +32211,12 @@ fn prepare_static_plpgsql_statement<'a>(
                 context.txn.txid,
                 context.arena,
             )?;
-            let statement = match restored {
-                Stmt::Insert(statement) => TriggerDml::Insert(*statement),
-                Stmt::Update(statement) => TriggerDml::Update(*statement),
-                Stmt::Delete(statement) => TriggerDml::Delete(*statement),
-                Stmt::Merge(statement) => TriggerDml::Merge(statement),
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "PL/pgSQL data change statement changed kind"
-                    ));
-                }
-            };
+            let statement = TriggerDml::from_statement(restored).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "PL/pgSQL data change statement changed kind"
+                )
+            })?;
             TriggerStatement::Dml {
                 source: site.text,
                 statement,
@@ -31808,7 +32231,8 @@ fn prepare_static_plpgsql_statement<'a>(
 /// Applies the `plpgsql.variable_conflict` rule of `row` to the names in
 /// `statement` before it reads a row, as PostgreSQL's parse analysis does:
 /// a name that is both a column and a variable is an error under `error` and
-/// the variable's value under `use_variable`.
+/// the variable's value under `use_variable`. A `WITH` query sees every
+/// variable it names as its value.
 fn bind_procedural_names<'a>(
     statement: TriggerStatement<'a>,
     row: &TriggerLocalScope<'_, 'a>,
@@ -31816,9 +32240,6 @@ fn bind_procedural_names<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<TriggerStatement<'a>, SqlError> {
-    if row.invocation.variable_conflict == super::guc::VariableConflict::UseColumn {
-        return Ok(statement);
-    }
     let query = |query: &'a Select<'a>| -> Result<&'a Select<'a>, SqlError> {
         let statement = arena
             .alloc(Stmt::Select(*query))
@@ -31855,22 +32276,12 @@ fn bind_procedural_names<'a>(
             into,
         } => {
             let written = arena
-                .alloc(match dml {
-                    TriggerDml::Insert(statement) => Stmt::Insert(statement),
-                    TriggerDml::Update(statement) => Stmt::Update(statement),
-                    TriggerDml::Delete(statement) => Stmt::Delete(statement),
-                    TriggerDml::Merge(statement) => Stmt::Merge(*statement),
-                })
+                .alloc(dml.statement())
                 .map_err(|_| super::query::arena_full_pub())?;
-            let statement = match super::query::bind_procedural_statement(
+            let statement = TriggerDml::from_statement(super::query::bind_procedural_statement(
                 written, storage, txid, arena, row,
-            )? {
-                Stmt::Insert(statement) => TriggerDml::Insert(*statement),
-                Stmt::Update(statement) => TriggerDml::Update(*statement),
-                Stmt::Delete(statement) => TriggerDml::Delete(*statement),
-                Stmt::Merge(statement) => TriggerDml::Merge(statement),
-                _ => unreachable!("binding keeps the statement kind"),
-            };
+            )?)
+            .expect("binding keeps the statement kind");
             TriggerStatement::Dml {
                 source,
                 statement,
@@ -32026,17 +32437,25 @@ fn execute_trigger_step_in<'a>(
                 "unfinished nested write belongs to a different instruction"
             ));
         }
+        if let TriggerStatement::Dml {
+            statement: TriggerDml::With(_),
+            ..
+        } = statement
+        {
+            // The command the `WITH` queries and the write share ended with
+            // the wait; continuing would run the write under another one.
+            status.pending_write = None;
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a PL/pgSQL write with WITH queries cannot wait without retained write progress"
+            ));
+        }
         let (rows, output) = resume_nested_write(context, status)?;
         match statement {
             TriggerStatement::Dml {
                 statement, into, ..
             } => {
-                let returns = match statement {
-                    TriggerDml::Insert(statement) => !statement.returning.is_empty(),
-                    TriggerDml::Update(statement) => !statement.returning.is_empty(),
-                    TriggerDml::Delete(statement) => !statement.returning.is_empty(),
-                    TriggerDml::Merge(statement) => !statement.returning.is_empty(),
-                };
+                let returns = statement.returns();
                 finish_resumed_static_write(
                     context,
                     locals,
@@ -32180,7 +32599,9 @@ fn execute_trigger_step_in<'a>(
     let write_effects = super::query::enter_statement_read_effect_scope(write_reads.as_ref());
     let mut execute = |context: &mut TriggerExecContext<'_, 'a, '_>,
                        status: &mut TriggerExecutionStatus<'a>,
-                       mut progress: Option<&mut RowProgress>| {
+                       mut progress: Option<&mut RowProgress>,
+                       statement: TriggerStatement<'a>,
+                       shared_command: bool| {
         match statement {
             TriggerStatement::Null => execute_trigger_statement(|| Ok(None)),
             TriggerStatement::TransactionControl(command) => execute_trigger_statement(|| {
@@ -32694,6 +33115,7 @@ fn execute_trigger_step_in<'a>(
                                         },
                                     )?;
                                 }
+                                reject_writing_cursor_query(parsed)?;
                                 match parsed {
                                     Stmt::Select(_) | Stmt::SetQuery(_) => (
                                         source,
@@ -32729,6 +33151,7 @@ fn execute_trigger_step_in<'a>(
                                     ),
                                 )?;
                                 let bound = resolve_plpgsql_dynamic_prepared(context, bound)?;
+                                reject_writing_cursor_query(bound.statement)?;
                                 if !matches!(bound.statement, Stmt::Select(_) | Stmt::SetQuery(_)) {
                                     return Err(sql_err!(
                                         sqlstate::SYNTAX_ERROR,
@@ -33611,7 +34034,11 @@ fn execute_trigger_step_in<'a>(
                         Stmt::Select(_) | Stmt::SetQuery(_) => {
                             execute_bound_plpgsql_dynamic_query(context, query, &mut capture)?;
                         }
-                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
+                        Stmt::Insert(_)
+                        | Stmt::Update(_)
+                        | Stmt::Delete(_)
+                        | Stmt::Merge(_)
+                        | Stmt::With { .. } => {
                             let mut returning =
                                 |_: &Storage,
                                  _: u32,
@@ -33749,7 +34176,11 @@ fn execute_trigger_step_in<'a>(
                             })?;
                             rows
                         }
-                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
+                        Stmt::Insert(_)
+                        | Stmt::Update(_)
+                        | Stmt::Delete(_)
+                        | Stmt::Merge(_)
+                        | Stmt::With { .. } => {
                             let result = execute_procedural_write(
                                 context,
                                 status,
@@ -34193,6 +34624,13 @@ fn execute_trigger_step_in<'a>(
                 Ok(control_flow::Step::protected(exception_block, boundary))
             }
             TriggerStatement::Dml {
+                statement: TriggerDml::With(_),
+                ..
+            } => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "PL/pgSQL write ran before its WITH queries were bound"
+            )),
+            TriggerStatement::Dml {
                 source,
                 statement: TriggerDml::Insert(statement),
                 into,
@@ -34323,7 +34761,8 @@ fn execute_trigger_step_in<'a>(
                 let boundary = context.nested_write_boundary();
                 let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
 
-                let mut command = enter_write_command(txn, storage, progress.as_deref_mut())?;
+                let mut command =
+                    enter_write_command(txn, storage, progress.as_deref_mut(), shared_command)?;
                 let txn = &mut *command;
                 let parent_boundary = txn.write_completion_boundary;
                 txn.write_completion_boundary =
@@ -34513,7 +34952,8 @@ fn execute_trigger_step_in<'a>(
                 let params = context.params;
                 let boundary = context.nested_write_boundary();
                 let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-                let mut command = enter_write_command(txn, storage, progress.as_deref_mut())?;
+                let mut command =
+                    enter_write_command(txn, storage, progress.as_deref_mut(), shared_command)?;
                 let txn = &mut *command;
                 let parent_boundary = txn.write_completion_boundary;
                 txn.write_completion_boundary =
@@ -34702,7 +35142,8 @@ fn execute_trigger_step_in<'a>(
                 let params = context.params;
                 let boundary = context.nested_write_boundary();
                 let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-                let mut command = enter_write_command(txn, storage, progress.as_deref_mut())?;
+                let mut command =
+                    enter_write_command(txn, storage, progress.as_deref_mut(), shared_command)?;
                 let txn = &mut *command;
                 let parent_boundary = txn.write_completion_boundary;
                 txn.write_completion_boundary =
@@ -34867,7 +35308,8 @@ fn execute_trigger_step_in<'a>(
                 let params = context.params;
                 let boundary = context.nested_write_boundary();
                 let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-                let mut command = enter_write_command(txn, storage, progress.as_deref_mut())?;
+                let mut command =
+                    enter_write_command(txn, storage, progress.as_deref_mut(), shared_command)?;
                 let txn = &mut *command;
                 let parent_boundary = txn.write_completion_boundary;
                 txn.write_completion_boundary =
@@ -35482,23 +35924,73 @@ fn execute_trigger_step_in<'a>(
     };
     let mut attempt = |context: &mut TriggerExecContext<'_, 'a, '_>,
                        status: &mut TriggerExecutionStatus<'a>,
-                       progress: Option<&mut RowProgress>| {
+                       progress: Option<&mut RowProgress>,
+                       statement: TriggerStatement<'a>,
+                       shared_command: bool| {
         match &input_plan {
             Some((site, prepared)) => super::type_input_plans::with_owner(prepared.owner, || {
                 super::type_inputs::with_source(
                     prepared.source,
                     site.text,
                     prepared.bindings,
-                    || execute(context, status, progress),
+                    || execute(context, status, progress, statement, shared_command),
                 )
             }),
-            None => execute(context, status, progress),
+            None => execute(context, status, progress, statement, shared_command),
         }
     };
-    let result = if matches!(statement, TriggerStatement::Dml { .. }) {
-        execute_procedural_write(context, status, retained_parent, &mut attempt)
-    } else {
-        attempt(context, status, None)
+    // Data-modifying `WITH` queries run in a new command that their
+    // statement's own query or write shares: each reads the rows earlier
+    // statements wrote, and none sees another's changes. A write with `WITH`
+    // queries runs those its write reads, the write with their rows bound
+    // through the write's attempts, then the queries nothing read.
+    let query_writes = |query: &Select<'_>| query.with.iter().any(|cte| cte.dml.is_some());
+    let writing_with = match statement {
+        TriggerStatement::Dml {
+            statement: TriggerDml::With(with),
+            ..
+        } => Some(Some(with)),
+        TriggerStatement::Perform(query)
+        | TriggerStatement::ReturnQuery(query)
+        | TriggerStatement::SelectInto(TriggerSelectInto { query, .. })
+        | TriggerStatement::For(TriggerFor {
+            source: TriggerForSource::Query(query),
+            ..
+        }) if query_writes(query) => Some(None),
+        _ => None,
+    };
+    let result = match writing_with {
+        None if matches!(statement, TriggerStatement::Dml { .. }) => execute_procedural_write(
+            context,
+            status,
+            retained_parent,
+            &mut |context, status, progress| attempt(context, status, progress, statement, false),
+        ),
+        None => attempt(context, status, None, statement, false),
+        Some(with) => in_new_plpgsql_command(context, |context| {
+            let (Some(with), TriggerStatement::Dml { source, into, .. }) = (with, statement) else {
+                return attempt(context, status, None, statement, false);
+            };
+            let (expanded, materialized) = bind_plpgsql_write_ctes(context, with)?;
+            let expanded = TriggerStatement::Dml {
+                source,
+                statement: expanded,
+                into,
+            };
+            let step = execute_procedural_write(
+                context,
+                status,
+                retained_parent,
+                &mut |context, status, progress| attempt(context, status, progress, expanded, true),
+            )?;
+            finish_plpgsql_dml_ctes_of(
+                context,
+                with.ctes,
+                super::query::CteReader::Statement(with.statement),
+                materialized,
+            )?;
+            Ok(step)
+        }),
     };
     drop(write_effects);
     drop(write_reads);
@@ -36317,9 +36809,12 @@ fn enter_write_command<'t>(
     txn: &'t mut TxnState,
     storage: &Storage,
     progress: Option<&mut RowProgress>,
+    shared: bool,
 ) -> Result<super::txn::TriggerSqlScope<'t>, SqlError> {
     match progress.and_then(RowProgress::take_command) {
         Some(command) => command.resume(txn).map_err(|(_, error)| error),
+        // A `WITH` query's write joins the command its statement runs in.
+        None if shared => Ok(txn.share_trigger_sql(storage)),
         None => txn.enter_trigger_sql(storage),
     }
 }

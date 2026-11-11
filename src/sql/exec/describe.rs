@@ -4465,6 +4465,40 @@ fn comparable(a: ColType, b: ColType) -> bool {
         || (stringy(a) && stringy(b))
 }
 
+/// [`builtin_binary_type`], naming the operand types in a missing-operator
+/// error as the catalog does: a named composite array is `t[]`, not
+/// `record[]`.
+fn builtin_binary_type_named(
+    operator: &crate::sql::ast::BinaryOp,
+    lo: i32,
+    ro: i32,
+    columns: &dyn ColTypeResolver,
+) -> Result<(i32, i16), SqlError> {
+    builtin_binary_type(operator, lo, ro).map_err(|error| {
+        let user = |oid: i32| builtin_type_name_fixed(oid).is_none();
+        if error.sqlstate != sqlstate::UNDEFINED_FUNCTION
+            || !error
+                .message
+                .as_str()
+                .starts_with("operator does not exist: ")
+            || !(user(lo) || user(ro))
+        {
+            return error;
+        }
+        let name = |oid: i32| columns.type_name_fixed(oid).ok().flatten();
+        match (name(lo), name(ro), operator.operator_name()) {
+            (Some(left), Some(right), Some(symbol)) => sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator does not exist: {} {} {}",
+                left.as_str(),
+                symbol,
+                right.as_str()
+            ),
+            _ => error,
+        }
+    })
+}
+
 fn operator_undefined(l: ColType, operator: &str, r: ColType) -> SqlError {
     use core::fmt::Write;
     let mut left = crate::util::StackStr::<64>::new();
@@ -5113,10 +5147,11 @@ fn infer_type_unpositioned(
         && let [left, right] = *args
         && let Some(operator) = crate::sql::ast::BinaryOp::from_operator_name(symbol)
     {
-        return builtin_binary_type(
+        return builtin_binary_type_named(
             &operator,
             infer_type_res(left, columns)?.0,
             infer_type_res(right, columns)?.0,
+            columns,
         );
     }
     if let Some(result) = routine_result_metadata(expression, columns) {
@@ -5391,7 +5426,7 @@ fn infer_type_unpositioned(
             {
                 return Ok((result.type_oid, result.ctype.typlen()));
             }
-            builtin_binary_type(operator, lo, ro)?
+            builtin_binary_type_named(operator, lo, ro, columns)?
         }
         Expr::Collate { operand, .. } => infer_type_res(operand, columns)?,
         Expr::Cast {

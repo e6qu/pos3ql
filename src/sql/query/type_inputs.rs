@@ -170,14 +170,7 @@ pub(crate) fn capture_procedural_statement_type_inputs<'a>(
             visit,
             planner: PlannerPass::TypeInputs,
         };
-        match statement {
-            Stmt::Select(select) => walker.select(select, Some(&outer), None),
-            Stmt::SetQuery(query) => walker.set_query(query, Some(&outer)),
-            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
-                walker.dml(statement, Some(&outer))
-            }
-            _ => walker.statement(statement),
-        }
+        walker.statement(statement, Some(&outer))
     })
 }
 
@@ -483,7 +476,7 @@ fn discover(
         visit,
         planner: PlannerPass::TypeInputs,
     };
-    walker.statement(statement)
+    walker.statement(statement, None)
 }
 
 /// Planning visits selected expression calls with schema metadata only. The
@@ -619,23 +612,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
     where
         'storage: 'a,
     {
-        match statement {
-            Stmt::Select(select) => self.select(select, Some(outer), None),
-            Stmt::SetQuery(query) => self.set_query(query, Some(outer)),
-            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
-                self.dml(statement, Some(outer))
-            }
-            // A procedural CALL's arguments read the block's variables.
-            Stmt::Call { .. } => {
-                let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
-                let columns = RuntimeColumnTypes {
-                    row: outer,
-                    catalog: Some(&catalog),
-                };
-                self.call_statement(statement, &columns, outer)
-            }
-            _ => self.statement(statement),
-        }
+        self.statement(statement, Some(outer))
     }
 
     /// A `CALL`'s arguments, typed by `columns` and read from `row`.
@@ -1411,7 +1388,9 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                         self.select(select, outer, None)
                     }
                     super::cte::ScopedCte::Select(_) => Ok(()),
-                    super::cte::ScopedCte::DataModification(statement) => self.statement(statement),
+                    super::cte::ScopedCte::DataModification(statement) => {
+                        self.statement(statement, outer)
+                    }
                 },
             )?;
             let tree = super::cte::expand_set_tree(
@@ -1441,13 +1420,19 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         }
     }
 
-    fn statement<'a>(&mut self, statement: &'a Stmt<'a>) -> Result<(), SqlError>
+    /// Visits `statement`, whose queries see `outer` (a PL/pgSQL routine's
+    /// variables) beyond their own FROM items.
+    fn statement<'a>(
+        &mut self,
+        statement: &'a Stmt<'a>,
+        outer: Option<&dyn ColumnLookup<'a>>,
+    ) -> Result<(), SqlError>
     where
         'storage: 'a,
     {
         match statement {
-            Stmt::Select(select) => self.select(select, None, None),
-            Stmt::SetQuery(query) => self.set_query(query, None),
+            Stmt::Select(select) => self.select(select, outer, None),
+            Stmt::SetQuery(query) => self.set_query(query, outer),
             Stmt::With { ctes, statement } => {
                 let storage = self.storage;
                 let txid = self.txid;
@@ -1462,11 +1447,11 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     arena,
                     &mut |source| match source {
                         super::cte::ScopedCte::Select(select) if !planner => {
-                            self.select(select, None, None)
+                            self.select(select, outer, None)
                         }
                         super::cte::ScopedCte::Select(_) => Ok(()),
                         super::cte::ScopedCte::DataModification(statement) => {
-                            self.statement(statement)
+                            self.statement(statement, outer)
                         }
                     },
                 )?;
@@ -1479,10 +1464,19 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     None,
                     self.arena,
                 )?;
-                self.statement(statement)
+                self.statement(statement, outer)
             }
-            Stmt::Explain { statement, .. } => self.statement(statement),
+            Stmt::Explain { statement, .. } => self.statement(statement, outer),
             Stmt::Call { .. } => {
+                // A procedural CALL's arguments read the block's variables.
+                if let Some(outer) = outer {
+                    let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
+                    let columns = RuntimeColumnTypes {
+                        row: outer,
+                        catalog: Some(&catalog),
+                    };
+                    return self.call_statement(statement, &columns, outer);
+                }
                 let catalog = crate::sql::exec::CatalogCols {
                     definition: None,
                     alias: None,
@@ -1494,7 +1488,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 self.call_statement(statement, &catalog, &crate::sql::eval::NoColumns)
             }
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
-                self.dml(statement, None)
+                self.dml(statement, outer)
             }
             _ => Ok(()),
         }

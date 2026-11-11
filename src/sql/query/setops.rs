@@ -1687,7 +1687,9 @@ pub(crate) fn describe_set_body<'a>(
             .filter(|oid| *oid != crate::sql::types::oid::UNKNOWN)
             .unwrap_or_else(|| target[c].oid());
         col.typlen = target[c].typlen();
-        if identical_types[c].is_none() || !identical_mods[c] {
+        // An anonymous record keeps the leftmost input's shape, which
+        // PostgreSQL's field selection reads through a set operation.
+        if (identical_types[c].is_none() || !identical_mods[c]) && target[c] != ColType::Record {
             col.type_mod = -1;
         }
     }

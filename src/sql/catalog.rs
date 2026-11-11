@@ -23173,7 +23173,7 @@ fn access_object_catalog_identity(
         AccessClass::Extension => (3079, storage.extension(slot).oid()),
         AccessClass::Trigger => (2620, crate::storage::trigger_oid(&storage.trigger(slot))),
         AccessClass::EventTrigger => (3466, storage.event_trigger(slot).oid()),
-        AccessClass::Database => (1262, 5),
+        AccessClass::Database => (1262, storage.database(slot).oid.get()),
         AccessClass::LargeObject => (
             PG_LARGEOBJECT_OID,
             storage
@@ -30956,9 +30956,10 @@ pub(crate) struct SharedDependency {
 }
 
 /// Object classes whose owner `pg_shdepend` records.
-const OWNED_ACCESS_CLASSES: [crate::storage::AccessClass; 16] = {
+const OWNED_ACCESS_CLASSES: [crate::storage::AccessClass; 17] = {
     use crate::storage::AccessClass;
     [
+        AccessClass::Database,
         AccessClass::Schema,
         AccessClass::Table,
         AccessClass::View,
@@ -30977,6 +30978,64 @@ const OWNED_ACCESS_CLASSES: [crate::storage::AccessClass; 16] = {
         AccessClass::LargeObject,
     ]
 };
+
+/// How many shared dependencies on `role` each other database holds, as
+/// PostgreSQL's DROP ROLE `DETAIL` summarizes them (`2 objects in database
+/// d`): owned objects, then ACL grantees and grantors other than the owner.
+/// `counts` receives `(database, count)` pairs in database OID order.
+pub(crate) fn other_database_role_dependencies<'a>(
+    storage: &Storage,
+    txid: u32,
+    role: usize,
+    arena: &'a Arena,
+) -> Result<&'a [(crate::storage::DatabaseOid, usize)], SqlError> {
+    use crate::storage::AccessObject;
+    let counts = arena
+        .alloc_slice_with(storage.database_count(), |_| {
+            (crate::storage::DatabaseOid::POSTGRES, 0usize)
+        })
+        .map_err(|_| arena_full())?;
+    let mut used = 0usize;
+    let mut record = |database: crate::storage::DatabaseOid| {
+        if let Some(entry) = counts[..used].iter_mut().find(|(oid, _)| *oid == database) {
+            entry.1 += 1;
+        } else if used < counts.len() {
+            counts[used] = (database, 1);
+            used += 1;
+        }
+    };
+    for class in OWNED_ACCESS_CLASSES {
+        for slot in 0..storage.access_class_slots(class) {
+            let object = AccessObject {
+                class,
+                slot: slot as u16,
+            };
+            if let Some(database) = storage.access_object_in_other_database(object, txid)
+                && matches!(catalog_owner(storage, object, txid), CatalogOwner::Role(owner) if owner == role)
+            {
+                record(database);
+            }
+        }
+    }
+    // `acl_entries` lists only the current database's grants.
+    for slot in 0..storage.acl_entry_count() {
+        let entry = storage.acl_entry(slot);
+        if entry.object.slot == u16::MAX || !storage.acl_entry_visible(slot, txid) {
+            continue;
+        }
+        let Some(database) = storage.access_object_in_other_database(entry.object, txid) else {
+            continue;
+        };
+        let owner = storage.object_owner(entry.object, txid);
+        let (grantee, grantor) = storage.acl_identity(slot, txid);
+        if owner != role && (usize::from(grantee) == role || usize::from(grantor) == role) {
+            record(database);
+        }
+    }
+    let counts = &mut counts[..used];
+    counts.sort_unstable_by_key(|(database, _)| database.get());
+    Ok(counts)
+}
 
 /// The current database's `pg_shdepend` rows. As in PostgreSQL, the
 /// bootstrap superuser and `PUBLIC` are never recorded, and an ACL records
@@ -31025,7 +31084,11 @@ pub(crate) fn shared_dependencies<'a>(
             if !storage.access_object_visible_to(object, txid) {
                 continue;
             }
-            let owner = storage.object_owner(object, txid) as u16;
+            let CatalogOwner::Role(owner) = catalog_owner(storage, object, txid) else {
+                // pg_database_owner is pinned.
+                continue;
+            };
+            let owner = owner as u16;
             if role_is_pinned(owner) {
                 continue;
             }
@@ -31238,7 +31301,12 @@ fn pg_shdepend<'a>(
     for (output, dependency) in rows.iter_mut().zip(dependencies) {
         *output = row(
             &[
-                database,
+                // Shared objects (databases) record database 0.
+                if dependency.class == 1262 {
+                    Datum::Oid(0)
+                } else {
+                    database
+                },
                 Datum::Oid(dependency.class as u32),
                 Datum::Oid(dependency.object as u32),
                 Datum::Int4(dependency.sub),

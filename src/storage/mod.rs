@@ -26825,6 +26825,18 @@ impl Storage {
         }
     }
 
+    /// The database of an object visible to `txid` outside the current
+    /// database, if it is one.
+    pub(crate) fn access_object_in_other_database(
+        &self,
+        object: AccessObject,
+        txid: u32,
+    ) -> Option<DatabaseOid> {
+        let database = self.access_object_database(object)?;
+        (database != current_database() && self.access_object_visible_in_any_database(object, txid))
+            .then_some(database)
+    }
+
     fn access_object_in_current_database(&self, object: AccessObject) -> bool {
         self.access_object_database(object)
             .is_none_or(|database| database == current_database())

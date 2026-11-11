@@ -273,9 +273,9 @@ entry (every built-in name lookup must consult a renamed or moved row); a routin
 pseudo-types are not pos3ql column types, and `pg_type` lists 182 of
 PostgreSQL's 621 built-in types; a
 listed built-in that is neither implemented nor an operator, cast or input
-function fails with `0A000` when called; `DROP ROLE`'s `DETAIL` and
-`pg_shdepend` omit objects in other databases (PostgreSQL adds `2 objects in
-database other`) and order owners by OID rather than catalog insertion;
+function fails with `0A000` when called; `pg_shdepend` omits other
+databases' rows, and `DROP ROLE`'s `DETAIL` orders owners by OID rather than
+catalog insertion;
 `pg_describe_object` of a built-in operator class or family is empty, and
 `pg_cast` lacks PostgreSQL's built-in casts; `pg_attrdef` OIDs derive from
 table slots rather than creation identities; built-in operators, types and other

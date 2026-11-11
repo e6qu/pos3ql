@@ -9515,6 +9515,29 @@ fn role_dependency_detail(
                 if unreported == 1 { "" } else { "s" }
             );
         }
+        for &(database, count) in
+            super::catalog::other_database_role_dependencies(storage, txid, role, arena)?
+        {
+            let Some(name) = storage
+                .database_slot_by_oid(database, txid)
+                .map(|slot| storage.database_definition(slot, txid).name)
+            else {
+                continue;
+            };
+            let _ = write!(
+                detail,
+                "{}{} object{} in database {}",
+                if reported == 0 && unreported == 0 {
+                    ""
+                } else {
+                    "\n"
+                },
+                count,
+                if count == 1 { "" } else { "s" },
+                name.as_str()
+            );
+            reported += 1;
+        }
         Ok((reported != 0).then_some(detail))
     })();
     // The detail was copied out of the workspace.

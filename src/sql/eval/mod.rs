@@ -680,14 +680,20 @@ pub(crate) fn expression_type_identity<'a>(
         if let Some(ctype) = super::types::ColType::from_sql_name(type_name) {
             return Ok(ExpressionTypeIdentity::Known(ctype.oid()));
         }
-        return hooks
-            .catalog
-            .and_then(|catalog| catalog.user_type_oid(type_name))
+        let Some(catalog) = hooks.catalog else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "evaluated user-type cast has no catalog identity"
+            ));
+        };
+        return catalog
+            .user_type_oid(type_name)
             .map(ExpressionTypeIdentity::Known)
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "evaluated user-type cast has no catalog identity"
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}\" does not exist",
+                    type_name
                 )
             });
     }
@@ -2016,6 +2022,10 @@ pub trait CatalogAccess {
         _arena: &'a crate::mem::arena::Arena,
     ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
+    }
+    /// The name of a visible database.
+    fn database_name_by_oid(&self, _oid: i32) -> Option<crate::storage::SqlName> {
+        None
     }
     /// The relation and column a visible `pg_attrdef` OID belongs to.
     fn attribute_default_column(&self, _oid: i32) -> Option<(i32, i32)> {

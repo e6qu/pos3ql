@@ -645,6 +645,15 @@ pub(crate) fn describe_object_text<'a>(
         }
         return catalog.default_acl_description(object_id, arena);
     }
+    if class_id == 1262 {
+        let Some(name) = catalog
+            .database_name_by_oid(object_id)
+            .filter(|_| sub_id == 0)
+        else {
+            return Ok(None);
+        };
+        return described(stack_format!(1024, "database {}", name.as_str()), arena).map(Some);
+    }
     if class_id == 2604 {
         let Some((relation, column)) = catalog.attribute_default_column(object_id) else {
             return Ok(None);

@@ -2592,6 +2592,50 @@ fn builtin_routine_object(object_id: i32) -> Result<Option<EventObject>, SqlErro
 /// Resolve a PostgreSQL catalog address through the same typed object graph
 /// used by event triggers. DDL callbacks and SQL introspection therefore
 /// cannot disagree after a rename or while observing transaction-local DDL.
+/// PostgreSQL's `default acl` object: identity `for role r in schema s on
+/// sequences`, address names `{r,s}` and the object-type letter as argument.
+fn default_acl_object(storage: &Storage, txid: u32, object_id: i32) -> Option<EventObject> {
+    use crate::storage::DefaultPrivilegeClass;
+    let identity = storage.default_acl_identity_by_oid(object_id, txid)?;
+    let owner = storage.role_name_by_oid(identity.owner, txid)?;
+    let schema = match identity.schema {
+        Some(schema) => Some(catalog::schema_name_by_oid(storage, txid, schema.oid())?),
+        None => None,
+    };
+    let (objects, letter) = match identity.class {
+        DefaultPrivilegeClass::Table => ("relations", "r"),
+        DefaultPrivilegeClass::Sequence => ("sequences", "S"),
+        DefaultPrivilegeClass::Function => ("functions", "f"),
+        DefaultPrivilegeClass::Type => ("types", "T"),
+        DefaultPrivilegeClass::Schema => ("schemas", "n"),
+    };
+    let mut text = EventIdentity::new();
+    write!(text, "for role {}", identifier(owner.as_str()).as_str()).ok()?;
+    if let Some(schema) = schema {
+        write!(text, " in schema {}", identifier(schema.as_str()).as_str()).ok()?;
+    }
+    write!(text, " on {objects}").ok()?;
+    if text.is_truncated() {
+        return None;
+    }
+    let mut object = EventObject {
+        class_id: 826,
+        object_id,
+        object_type: StackStr::from_str("default acl"),
+        identity: text,
+        ..EventObject::EMPTY
+    };
+    object.address_names[0] = StackStr::from_str(owner.as_str());
+    object.address_name_count = 1;
+    if let Some(schema) = schema {
+        object.address_names[1] = StackStr::from_str(schema.as_str());
+        object.address_name_count = 2;
+    }
+    object.address_args[0] = StackStr::from_str(letter);
+    object.address_arg_count = 1;
+    Some(object)
+}
+
 fn existing_catalog_object(
     storage: &Storage,
     txid: u32,
@@ -2599,6 +2643,11 @@ fn existing_catalog_object(
     object_id: i32,
     sub_id: i32,
 ) -> Result<EventObject, SqlError> {
+    if class_id == 826 {
+        return default_acl_object(storage, txid, object_id)
+            .filter(|_| sub_id == 0)
+            .ok_or_else(|| catalog_lookup_failed(class_id, object_id));
+    }
     let reference = match class_id {
         catalog::PG_CLASS_OID => {
             let relation = relation_object_ref(storage, txid, object_id)

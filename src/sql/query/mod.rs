@@ -5489,6 +5489,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::sequence_state_by_oid(self.storage, oid, self.txid)
     }
 
+    fn database_name_by_oid(&self, oid: i32) -> Option<crate::storage::SqlName> {
+        let database = crate::storage::DatabaseOid::parse(oid)?;
+        self.storage
+            .database_slot_by_oid(database, self.txid)
+            .map(|slot| self.storage.database_definition(slot, self.txid).name)
+    }
+
     fn attribute_default_column(&self, oid: i32) -> Option<(i32, i32)> {
         super::catalog::attribute_default_column(self.storage, self.txid, oid)
     }

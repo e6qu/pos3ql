@@ -454,6 +454,23 @@ impl Storage {
         Ok(())
     }
 
+    /// The visible default-privileges row of the current database whose
+    /// `pg_default_acl` OID is `oid`.
+    pub(crate) fn default_acl_identity_by_oid(
+        &self,
+        oid: i32,
+        txid: u32,
+    ) -> Option<DefaultAclIdentity> {
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        catalog
+            .defaults
+            .iter()
+            .filter(|entry| entry.database == current_database())
+            .filter_map(|entry| entry.image_to(txid))
+            .map(|image| image.identity)
+            .find(|identity| identity.oid() == oid)
+    }
+
     pub(crate) fn default_acl_entry(&self, slot: usize) -> DefaultAclEntry {
         self.acl_catalog
             .lock()

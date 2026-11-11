@@ -301,12 +301,12 @@ pub mod oid {
     /// stamp; the bands are independent of configured catalog positions. A
     /// relation's row type is a composite identified by the relation's stamp,
     /// which shares the same creation sequence.
-    pub const FIRST_DOMAIN: i32 = 180_000_000;
-    pub const FIRST_ENUM: i32 = 200_000_000;
-    pub const FIRST_COMPOSITE: i32 = 220_000_000;
-    pub const FIRST_DOMAIN_ARRAY: i32 = 240_000_000;
-    pub const FIRST_ENUM_ARRAY: i32 = 260_000_000;
-    pub const FIRST_COMPOSITE_ARRAY: i32 = 280_000_000;
+    pub const FIRST_DOMAIN: i32 = crate::storage::OidBand::Domain.base();
+    pub const FIRST_ENUM: i32 = crate::storage::OidBand::Enum.base();
+    pub const FIRST_COMPOSITE: i32 = crate::storage::OidBand::Composite.base();
+    pub const FIRST_DOMAIN_ARRAY: i32 = crate::storage::OidBand::DomainArray.base();
+    pub const FIRST_ENUM_ARRAY: i32 = crate::storage::OidBand::EnumArray.base();
+    pub const FIRST_COMPOSITE_ARRAY: i32 = crate::storage::OidBand::CompositeArray.base();
     pub fn domain_oid(creation: crate::storage::TypeCreation) -> i32 {
         FIRST_DOMAIN + creation.created_at() as i32
     }

@@ -92,7 +92,7 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 141 | Trigger create | Current; requires the ten-byte position prefix. Kind 55 remains readable. |
 | 142 | Routine create | Current; 16-bit result counts. Kind 45 remains readable. |
 | 143 | Composite create | Current. Kind 58 remains readable. |
-| 144/145 | View create / view columns | Current; wide column sets. Kinds 5/126 remain readable. |
+| 144/145 | View create / view columns | Current; wide column sets; each column default is followed by its four-byte `pg_attrdef` stamp. Kinds 5/126 remain readable. |
 | 148 | Composite rename or schema move | Prior name, prior schema, new schema, new name. Preserves current fields. |
 | 149 | Enum create | Current. Kinds 23 and 147 are rejected. |
 | 150 | Extended statistics ANALYZE | Current. Kind 77 enum-dependent hash summaries are retired; counts stay valid. |
@@ -149,7 +149,7 @@ inserts a missing writer.
 | `table2` | Slot, creation stamp, hexadecimal checked-input image, name. Internal large-object page table keeps its reserved slot and stamp zero. |
 | `sq7`, `rtn2` | Sequence / routine slot and creation stamp. |
 | `mv6` | Materialized-view catalog position and backing-table position. |
-| `vw14` | View position and stamp, return-rule position and stamp, encoded query, checked column defaults by ordinal. |
+| `vw14` | View position and stamp, return-rule position and stamp, encoded query, checked column defaults by ordinal, each with its `pg_attrdef` stamp (zero without a default). |
 | `hidx <table-slot> <0-or-1>` | Required once per table, including tables without indexes. The large-object page table requires `0`. |
 | `col4` | Hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
 | `attributes2` | Entry count and each attribute entry as sixteen hex digits. |
@@ -236,7 +236,10 @@ therefore preserved, and an exhausted sequence cannot prevent loading existing
 objects. Reservations are not reused while the server runs.
 
 Public SQL identifiers (OIDs) are a fixed base plus the creation stamp, so names
-and slots never determine them. Every stamp is in 1–9,999,999; fresh creation
+and slots never determine them. Every family owns one band in a single registry
+(`src/storage/oid_bands.rs`); a compile-time check rejects a band that overlaps
+another, starts below PostgreSQL's first user OID (16,384) or passes the
+largest signed 32-bit OID, so an OID alone identifies its family. Every stamp is in 1–9,999,999; fresh creation
 past that returns `54000` and installs nothing. Recovery rejects zero,
 out-of-range, duplicate or unreserved stamps (`22000` where a SQLSTATE applies)
 before writer promotion, using fixed 8 KiB bitmaps scanned over bounded windows
@@ -247,13 +250,19 @@ rather than collections that grow with catalog churn.
 | Bootstrap administrator role | 10 |
 | Predefined roles (catalog slots 1–16) | PostgreSQL 18.6's OIDs (`pg_database_owner` 6171, `pg_monitor` 3373, …) |
 | Initdb role memberships of `pg_monitor` | 10,308–10,310; journal and manifest stamps 10,000,000–10,000,002 at positions 0–2 |
-| User roles | 16,385–2,147,483,647 (`54000` on exhaustion) |
+| User roles | 16,385–9,999,999 (`54000` on exhaustion) |
+| Databases | `CREATE DATABASE ... OID n` accepts any n from 16,384, as PostgreSQL does; automatic OIDs are 10,000,001–19,999,999 |
+| Parameter permissions (`pg_parameter_acl`) | 20,000,001–29,999,999 |
+| Temporary namespaces (`pg_temp_N`) | 30,000,000 + the smallest number no other live temporary namespace holds |
 | Built-in tablespaces | 1663, 1664 |
 | Initial `public` schema | 2200 |
-| Schemas | 80,000 + stamp; creation fails `54000` when `catalog_sequence` reaches 1,920,000 (temporary namespaces start at 2,000,000) |
-| Routines | 100,000 + stamp |
-| Row-security policies | 180,000 + stamp |
-| Custom tablespaces | 210,000 + stamp (bounded by the largest signed 32-bit OID) |
+| Schemas | 40,000,000 + stamp |
+| Routines | 50,000,000 + stamp |
+| Triggers / their constraint rows (`CREATE CONSTRAINT TRIGGER`) | 60,000,000 / 70,000,000 + trigger stamp |
+| Row-security policies | 80,000,000 + stamp |
+| Custom tablespaces | 90,000,000 + stamp |
+| Column defaults (`pg_attrdef`) | 100,000,000 + stamp; setting a default or generation expression, or changing its column's type, reserves a new stamp |
+| Inherited row triggers / their constraint rows | 110,000,000 / 120,000,000 + clone stamp |
 | Domains / enums / composites | 180,000,000 / 200,000,000 / 220,000,000 + stamp |
 | Their arrays | 240,000,000 / 260,000,000 / 280,000,000 + stamp |
 | Table, materialized-view and view row types (and arrays) | The composite bands above + the relation's stamp |
@@ -277,7 +286,7 @@ rather than collections that grow with catalog churn.
 | Access methods / event triggers | 800,000,000 / 820,000,000 + stamp |
 | Default privileges / role memberships | 840,000,000 / 860,000,000 + stamp |
 | Rewrite rules | 880,000,000 + stamp |
-| Inherited row triggers | 1,000,000,000 + stamp |
+| Large objects | Any OID; `lo_create(oid)` accepts the client's choice, as PostgreSQL does |
 
 **User example:** an application saves the OID of `orders`, drops the table and
 creates another `orders`. The saved OID cannot identify the replacement, even if
@@ -331,9 +340,11 @@ creation identity. Renames preserve it; replacing a backing index changes
 `conindid` but not the constraint identifier, comments or dependencies.
 
 Table payload v17 and domain marker 251 append one four-byte little-endian
-identity per constraint. Table order: CHECKs, foreign keys, live NOT NULL
-attributes by stable attribute number, detached partition CHECK, named primary
-and unique keys, exclusions, inline keys by attribute number. Domain order:
+identity per constraint and column default. Table order: CHECKs, foreign keys,
+live attributes by stable attribute number (NOT NULL, then the default or
+generation expression, each when present), detached partition CHECK, named
+primary and unique keys, exclusions, inline keys by attribute number. A column
+default's identity selects its `pg_attrdef` OID. Domain order:
 CHECKs, then NOT NULL. `dom7` appends domain identities. Positions describe the
 layout only. Recovery also rejects identities created before their owner, above
 the saved counter, or shared by distinct tables or domains in one database.

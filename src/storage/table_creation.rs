@@ -187,7 +187,8 @@ pub(super) fn allocate(
         };
         match allocation {
             super::CatalogAllocation::New => {
-                def.not_null_identities.fill(None);
+                def.attribute_identities
+                    .fill(super::AttributeIdentities::NONE);
                 for identity in def.constraint_identities_mut() {
                     *identity = None;
                 }

@@ -41562,7 +41562,7 @@ pub fn create_view(
                         schema: schema.as_str(),
                         name: name.name,
                         columns: crate::wal::WalViewColumns::Captured {
-                            columns: &columns,
+                            columns: storage.view(new_slot).columns_for(txn.txid),
                             default_inputs: &default_inputs,
                         },
                         sql: durable_sql.as_str(),
@@ -41945,7 +41945,7 @@ pub fn alter_view(
                         schema: schema.as_str(),
                         name: view_name.as_str(),
                         columns: crate::wal::WalViewColumns::Captured {
-                            columns: &columns,
+                            columns: storage.view(slot).columns_for(txn.txid),
                             default_inputs: &default_inputs,
                         },
                     },
@@ -42018,7 +42018,7 @@ pub fn alter_view(
                         schema: schema.as_str(),
                         name: view_name.as_str(),
                         columns: crate::wal::WalViewColumns::Captured {
-                            columns: &columns,
+                            columns: storage.view(slot).columns_for(txn.txid),
                             default_inputs: &default_inputs,
                         },
                     },
@@ -42085,7 +42085,7 @@ pub fn alter_view(
                         schema: schema.as_str(),
                         name: view_name.as_str(),
                         columns: crate::wal::WalViewColumns::Captured {
-                            columns: &columns,
+                            columns: storage.view(slot).columns_for(txn.txid),
                             default_inputs: &default_inputs,
                         },
                     },
@@ -42413,7 +42413,7 @@ fn publish_rewritten_view(
                 schema: view.schema_for(txn.txid).as_str(),
                 name: view.name_for(txn.txid).as_str(),
                 columns: crate::wal::WalViewColumns::Captured {
-                    columns: &dependent_columns,
+                    columns: storage.view(new_slot).columns_for(txn.txid),
                     default_inputs: view.default_inputs_for(txn.txid),
                 },
                 sql: rewritten.as_str(),
@@ -71573,6 +71573,19 @@ fn rewritten_exclusion_name<Definition0: crate::storage::DefinitionBacking>(
     Ok(None)
 }
 
+/// Forgets the stamp of a column default that this ALTER replaces, so table
+/// admission gives the new `pg_attrdef` row a new OID, as PostgreSQL does.
+fn renew_default_identity<B: crate::storage::DefinitionBacking>(
+    new_def: &mut TableDefBuilder,
+    def: &crate::storage::TableDefinition<B>,
+    source: ColSource<'_>,
+) {
+    if let ColSource::Keep(original) | ColSource::Cast { orig: original, .. } = source {
+        let attribute = usize::from(def.attribute_number(original) - 1);
+        new_def.attribute_identities[attribute].default = None;
+    }
+}
+
 /// How each column of a rewritten row is produced from the old row, composed
 /// across every subcommand of one ALTER TABLE so a single rewrite pass applies
 /// all of them.
@@ -74921,6 +74934,7 @@ fn alter_table_relation(
                     Err(e) => return sql_fail(e),
                 };
                 new_def.columns[i].default = default;
+                renew_default_identity(&mut new_def, &def, source[i]);
                 if let Err(error) =
                     record_table_input_override(&mut input_overrides, i, value_text, arena)
                 {
@@ -75151,6 +75165,7 @@ fn alter_table_relation(
                         Err(error) => return sql_fail(error),
                     };
                 new_def.columns[i].default = crate::storage::ColumnDefault::Generated(expression);
+                renew_default_identity(&mut new_def, &def, source[i]);
                 if let Err(error) =
                     record_table_input_override(&mut input_overrides, i, expression_text, arena)
                 {
@@ -75236,7 +75251,7 @@ fn alter_table_relation(
                         source[i]
                     {
                         let attribute = usize::from(def.attribute_number(original) - 1);
-                        new_def.not_null_identities[attribute] = None;
+                        new_def.attribute_identities[attribute].not_null = None;
                     }
                     new_def.not_null_names[i] = None;
                     new_def.not_null_name_edits.insert(i);
@@ -75337,6 +75352,9 @@ fn alter_table_relation(
                 // Compose with whatever already produces this column: a kept or
                 // cast original column becomes a (re)cast of its original index;
                 // a column added in this same statement re-casts its default.
+                if new_def.columns[i].default.expression().is_some() {
+                    renew_default_identity(&mut new_def, &def, source[i]);
+                }
                 match source[i] {
                     ColSource::Keep(orig) | ColSource::Cast { orig, .. } => {
                         source[i] = ColSource::Cast {

@@ -139,6 +139,7 @@ fn pending_routine_contract_reports_fixed_capacity_exhaustion() {
     let mut budget = Budget::new(1);
     let arena = Arena::new(&mut budget, "routine contract", 1).unwrap();
     let mut routine = Box::new(RoutineDef::EMPTY);
+    routine.created_at = 1;
     routine.argument_count = 1;
     crate::mem::guard::forbid_alloc(|| {
         let error = match OwnedRoutineCallContract::capture(&routine, &arena) {

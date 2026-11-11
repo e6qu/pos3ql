@@ -40,21 +40,21 @@ impl ExtendedStatisticsDef {
     }
 
     pub(crate) fn oid(&self) -> i32 {
-        440_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::ExtendedStatistics.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted Statistics has a checked creation identity")
-                .0
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 
 impl ExtensionDef {
     pub(crate) fn oid(&self) -> i32 {
-        460_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::Extension.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted Extension has a checked creation identity")
-                .0
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 
@@ -67,31 +67,31 @@ impl<D: Copy> foreign::ForeignCatalogEntry<D> {
 
 impl foreign::ForeignCatalogEntry<foreign::ForeignDataWrapperDefinition> {
     pub(crate) fn oid(&self) -> i32 {
-        480_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::ForeignDataWrapper.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted ForeignDataWrapper has a checked creation identity")
-                .0
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 
 impl foreign::ForeignCatalogEntry<foreign::ForeignServerDefinition> {
     pub(crate) fn oid(&self) -> i32 {
-        500_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::ForeignServer.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted ForeignServer has a checked creation identity")
-                .0
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 
 impl foreign::ForeignCatalogEntry<foreign::UserMappingDefinition> {
     pub(crate) fn oid(&self) -> i32 {
-        520_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::UserMapping.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted UserMapping has a checked creation identity")
-                .0
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 
@@ -102,21 +102,21 @@ impl PublicationDef {
     }
 
     pub(crate) fn oid(&self) -> i32 {
-        540_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::Publication.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted Publication has a checked creation identity")
-                .0
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 
 impl SubscriptionDef {
     pub(crate) fn oid(&self) -> i32 {
-        560_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::Subscription.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted Subscription has a checked creation identity")
-                .0
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 

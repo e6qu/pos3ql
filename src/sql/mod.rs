@@ -10290,7 +10290,9 @@ impl Engine {
             if let Err(error) = reject_unknown_parameter_fields(parser.parameter_fields(), types) {
                 return Ok(Err(error));
             }
-            resolve_unknown_parameters(types);
+            if let Err(error) = resolve_unknown_parameters(types) {
+                return Ok(Err(error));
+            }
         }
         let types = &*types;
         let mut result_columns = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -13860,7 +13862,7 @@ impl Engine {
             .map_err(|_| eval::arena_full())?;
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
-            Err(_) => return Ok(resolve_unknown_parameters(oids)),
+            Err(_) => return resolve_unknown_parameters(oids),
         };
         parser.set_type_inputs(type_inputs::decode(bound_inputs, arena)?);
         if let Ok(Some(statement)) = parser.next_stmt() {
@@ -13875,7 +13877,7 @@ impl Engine {
             }
         }
         reject_unknown_parameter_fields(parser.parameter_fields(), oids)?;
-        Ok(resolve_unknown_parameters(oids))
+        resolve_unknown_parameters(oids)
     }
 
     fn describe_data_modification_columns<'a>(
@@ -28954,14 +28956,23 @@ fn reject_unknown_parameter_fields(fields: &[(u32, &str)], oids: &[i32]) -> Resu
 }
 
 /// A parameter whose use determines no type is `text`, as PostgreSQL
-/// resolves an unknown parameter at the end of analysis.
-fn resolve_unknown_parameters(oids: &mut [i32]) -> &mut [i32] {
-    for oid in oids.iter_mut() {
+/// resolves an unknown parameter at the end of analysis. One that reaches only
+/// an argument of pseudo-type `"any"` or an `IS NULL` test stays undetermined
+/// (`param_types` leaves `"any"`), and PostgreSQL rejects the statement.
+fn resolve_unknown_parameters(oids: &mut [i32]) -> Result<&mut [i32], SqlError> {
+    for (index, oid) in oids.iter_mut().enumerate() {
+        if *oid == types::oid::ANY {
+            return Err(sql_err!(
+                sqlstate::INDETERMINATE_DATATYPE,
+                "could not determine data type of parameter ${}",
+                index + 1
+            ));
+        }
         if *oid == types::oid::UNKNOWN {
             *oid = types::oid::TEXT;
         }
     }
-    oids
+    Ok(oids)
 }
 
 /// Types an `EXPLAIN EXECUTE` statement by its prepared parameter types; any

@@ -1517,6 +1517,121 @@ fn constraint_public_identifiers_survive_journal_and_checkpoint_recovery() {
 }
 
 #[test]
+fn undetermined_prepare_parameters_fail_like_postgresql() {
+    let config = test_config("undetermined-prepare-parameters");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // A parameter that first reaches an argument of pseudo-type "any" or an
+    // IS NULL test while untyped stays undetermined (PostgreSQL 18.6).
+    for (sql, parameter) in [
+        ("PREPARE a1 AS SELECT pg_typeof($1)", 1),
+        ("PREPARE a4 AS SELECT count($1)", 1),
+        ("PREPARE a7 AS SELECT format('%s', $1)", 1),
+        ("PREPARE a8 AS SELECT num_nulls($1)", 1),
+        ("PREPARE a9 AS SELECT $1 IS NULL", 1),
+        ("PREPARE a10 AS SELECT pg_typeof($1), $1 + 1", 1),
+        ("PREPARE a11 AS SELECT $2 IS NULL, $1::int", 2),
+    ] {
+        let output = session.execute(&mut engine, sql, false);
+        assert_eq!(error_sqlstates(&output), ["42P18"], "{sql}");
+        assert!(
+            String::from_utf8_lossy(&output).contains(&format!(
+                "could not determine data type of parameter ${parameter}"
+            )),
+            "{sql}"
+        );
+    }
+    session.success(
+        &mut engine,
+        "PREPARE a2 AS SELECT $1; PREPARE a3 AS SELECT $1 || 'x'; \
+         PREPARE a5 AS SELECT coalesce($1, $2); PREPARE a12 AS SELECT pg_typeof($1::int)",
+        false,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT name, parameter_types::text FROM pg_prepared_statements ORDER BY name",
+            false,
+        )),
+        ["a12|{integer}", "a2|{text}", "a3|{text}", "a5|{text,text}"]
+    );
+}
+
+#[test]
+fn attribute_default_oids_follow_default_lifetimes_through_journal_and_checkpoint_recovery() {
+    // PostgreSQL stores a new pg_attrdef row (and OID) whenever a default or
+    // generation expression is set; renames and unrelated changes keep it.
+    const SETUP: &str = "CREATE TABLE ad_t(a int DEFAULT 1, b int GENERATED ALWAYS AS (a * 2) STORED, c text DEFAULT 'x');
+         CREATE VIEW ad_v AS SELECT a FROM ad_t;
+         ALTER VIEW ad_v ALTER a SET DEFAULT 5;
+         CREATE TABLE ad_saved(identity oid, relid oid, num int2);
+         INSERT INTO ad_saved SELECT oid, adrelid, adnum FROM pg_attrdef;
+         SELECT count(DISTINCT identity) = 4 FROM ad_saved;
+         SELECT count(*) = 0 FROM ad_saved s WHERE s.identity IN (SELECT oid FROM pg_constraint UNION ALL SELECT oid FROM pg_trigger UNION ALL SELECT oid FROM pg_class);
+         SELECT pg_describe_object(2604, identity, 0) = 'default value for column a of view ad_v' FROM ad_saved WHERE relid = 'ad_v'::regclass;
+         SELECT pg_describe_object(2604, identity, 0) = 'default value for column b of table ad_t' FROM ad_saved WHERE relid = 'ad_t'::regclass AND num = 2;
+         ALTER TABLE ad_t RENAME COLUMN c TO cc;
+         ALTER TABLE ad_t ALTER cc SET DEFAULT 'y';
+         ALTER TABLE ad_t ALTER b SET EXPRESSION AS (a * 3);
+         SELECT count(*) = 2 FROM ad_saved s JOIN pg_attrdef d ON d.oid = s.identity AND d.adrelid = s.relid AND d.adnum = s.num;
+         SELECT count(*) = 2 FROM pg_attrdef d WHERE d.adrelid = 'ad_t'::regclass AND d.oid NOT IN (SELECT identity FROM ad_saved)";
+    const QUERIES: &str = "SELECT count(*) = 2 FROM ad_saved s JOIN pg_attrdef d ON d.oid = s.identity AND d.adrelid = s.relid AND d.adnum = s.num;
+         SELECT count(DISTINCT oid) = 4 FROM pg_attrdef";
+    const AFTER: &str = "ALTER VIEW ad_v ALTER a SET DEFAULT 6;
+         ALTER TABLE ad_t ALTER a TYPE bigint;
+         SELECT count(*) = 0 FROM ad_saved s JOIN pg_attrdef d ON d.oid = s.identity;
+         SELECT count(DISTINCT oid) = 4 FROM pg_attrdef";
+    for checkpoint in [false, true] {
+        let name = format!("attribute-default-oids-{checkpoint}");
+        let mut config = test_config(&name);
+        config.max_ddl_per_transaction = 32;
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!("{name}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let run = |engine: &mut Engine,
+                   session: &mut ConfiguredTransactionSession,
+                   statements: &str,
+                   expected: usize| {
+            let mut observations = 0;
+            for statement in statements
+                .split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
+            {
+                let rows = data_rows(&session.success(engine, statement, false));
+                assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+                observations += rows.len();
+            }
+            assert_eq!(observations, expected);
+        };
+        {
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            run(&mut engine, &mut session, SETUP, 6);
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            engine.commit_wal().unwrap();
+        }
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        {
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            run(&mut engine, &mut session, QUERIES, 2);
+            run(&mut engine, &mut session, AFTER, 2);
+        }
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
 fn constraint_declaration_names_and_rejections_match_postgresql() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -7319,23 +7434,18 @@ fn catalog_constraint_identity_ranges_reject_overflow_and_keep_triggers_disjoint
                 < first.oid() as u64
         );
         for trigger in ForeignKeyTrigger::ALL {
-            assert!(last.oid() < first.foreign_key_trigger_oid(trigger));
+            for identity in [first, last] {
+                assert_eq!(
+                    crate::storage::OidBand::of(identity.foreign_key_trigger_oid(trigger)),
+                    Some(crate::storage::OidBand::ForeignKeyTrigger)
+                );
+                assert_eq!(
+                    crate::storage::OidBand::of(identity.attribute_default_oid()),
+                    Some(crate::storage::OidBand::AttributeDefault)
+                );
+            }
             assert!(first.foreign_key_trigger_oid(trigger) < last.foreign_key_trigger_oid(trigger));
-            assert!(
-                last.foreign_key_trigger_oid(trigger) < crate::storage::FIRST_PARTITION_TRIGGER_OID
-            );
-            assert!(
-                crate::storage::TRIGGER_OID_BASE as u64
-                    + crate::storage::MAX_TRIGGER_OID_GENERATION
-                    < first.foreign_key_trigger_oid(trigger) as u64
-            );
         }
-        assert!(
-            crate::storage::FIRST_PARTITION_TRIGGER_OID as u64
-                + crate::storage::MAX_CATALOG_CREATION
-                + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET as u64
-                <= i32::MAX as u64
-        );
     });
 }
 

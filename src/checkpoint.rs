@@ -311,7 +311,9 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
                     .next()
                     .and_then(|word| word.parse().ok())
                     .ok_or("invalid role identity allocator")?;
-                if !(crate::storage::RoleOid::USER_FLOOR..=i32::MAX as u64).contains(&sequence) {
+                if !(crate::storage::RoleOid::USER_FLOOR..=crate::storage::RoleOid::LAST_USER)
+                    .contains(&sequence)
+                {
                     return Err("invalid role identity allocator");
                 }
                 role_sequence = Some(sequence);
@@ -19068,6 +19070,7 @@ fn load_view(
     }
     let mut names = [crate::storage::SqlName::EMPTY; crate::storage::MAX_COLUMNS];
     let mut defaults = [ColumnDefault::NONE; crate::storage::MAX_COLUMNS];
+    let mut identities = [None; crate::storage::MAX_COLUMNS];
     if count == 0 {
         if !encoded_entries.is_empty() {
             return Err(CheckpointSetupError::Corrupt("invalid empty view columns"));
@@ -19078,7 +19081,7 @@ fn load_view(
             let entry = entries
                 .next()
                 .ok_or(CheckpointSetupError::Corrupt("view column missing"))?;
-            let mut fields = entry.splitn(4, '/');
+            let mut fields = entry.splitn(5, '/');
             names[index] =
                 sql_name(&decode_hex_name(fields.next().ok_or(
                     CheckpointSetupError::Corrupt("view column name missing"),
@@ -19090,6 +19093,13 @@ fn load_view(
             let expression = fields.next().ok_or(CheckpointSetupError::Corrupt(
                 "view column default expression missing",
             ))?;
+            let stamp = parse_field::<u64>(fields.next(), "view column default identity")?;
+            identities[index] = match stamp {
+                0 => None,
+                stamp => Some(crate::storage::ConstraintIdentity::parse(stamp).ok_or(
+                    CheckpointSetupError::Corrupt("invalid view column default identity"),
+                )?),
+            };
             let expression = if expression == "0" {
                 None
             } else {
@@ -19132,7 +19142,19 @@ fn load_view(
                 error.message.as_str()
             ))
         })?;
+        if matches!(default, ColumnDefault::None) != identities[index].is_none() {
+            return Err(CheckpointSetupError::Corrupt(
+                "view column default identity does not match its default",
+            ));
+        }
+        if let Some(identity) = identities[index] {
+            columns = columns.with_default_identity(index, identity).ok_or(
+                CheckpointSetupError::Corrupt("view column default identity has no default"),
+            )?;
+        }
     }
+    crate::storage::validate_constraint_identities(columns.default_identities())
+        .map_err(|_| CheckpointSetupError::Corrupt("duplicate view column default identity"))?;
     let bytes = decode_manifest_hex_bytes(words.next().ok_or(CheckpointSetupError::Corrupt(
         "view default type inputs missing",
     ))?)?;
@@ -19485,6 +19507,16 @@ impl core::fmt::Display for ManifestViewColumns {
                     return Err(core::fmt::Error);
                 }
             }
+            // The `pg_attrdef` stamp; zero for a column without a default.
+            let identity = match default {
+                ColumnDefault::None => 0,
+                _ => self
+                    .0
+                    .default_identity(index)
+                    .ok_or(core::fmt::Error)?
+                    .created_at(),
+            };
+            write!(output, "/{identity}")?;
         }
         Ok(())
     }
@@ -22544,7 +22576,7 @@ mod stored_dependency_tests {
                     (10, "nsp 7 0 6669727374\nnsp 7 0 7365636f6e64\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 0 6669727374\n"),
                     (10, "nsp 7 0 6669727374\nnsp 11 0 7365636f6e64\n"),
-                    (1_920_000, "nsp 7 0 6669727374\nnsp 1920000 0 7365636f6e64\n"),
+                    (10_000_000, "nsp 7 0 6669727374\nnsp 10000000 0 7365636f6e64\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 2 7365636f6e64\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 0 7365636f6e64 trailing\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 0 \n"),

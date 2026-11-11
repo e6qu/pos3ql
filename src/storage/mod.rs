@@ -59,7 +59,7 @@ mod routine_lifecycles;
 mod schema_names;
 pub(crate) use matview_lifecycles::MatviewDdlUndo;
 pub(crate) use matview_lifecycles::MatviewQueryUndo;
-pub(crate) use schema_names::{FIRST_TEMP_NAMESPACE_OID, SchemaIdentity, SchemaNameUndo};
+pub(crate) use schema_names::{SchemaIdentity, SchemaNameUndo};
 mod routine_resolution;
 pub(crate) use crate::sql::eval::RoutineCallSelection;
 pub(crate) use routine_resolution::builtin_compatible_element_oid;
@@ -83,7 +83,7 @@ mod restored_key_names;
 #[cfg(test)]
 pub(crate) use constraint_identities::MAX_CONSTRAINT_CREATION;
 pub(crate) use constraint_identities::{
-    ConstraintIdentity, ForeignKeyTrigger, validate_constraint_identities,
+    AttributeIdentities, ConstraintIdentity, ForeignKeyTrigger, validate_constraint_identities,
     validate_constraint_lifetimes,
 };
 pub(crate) use key_name_admission::{GeneratedNameClass, RelationNameSources};
@@ -115,6 +115,8 @@ pub(crate) use type_edits::{
     TypeDdlDecision, TypeDdlUndo, TypeEditTarget,
 };
 mod domain_validation;
+mod oid_bands;
+pub(crate) use oid_bands::OidBand;
 mod relation_identities;
 pub(crate) use relation_identities::{MAX_RELATION_GENERATION, RelationIdentity};
 mod relation_row_types;
@@ -2058,7 +2060,7 @@ pub struct TableDefinition<B: DefinitionBacking> {
     pub n_columns: usize,
     pub(crate) not_null_names: B::Slice<Option<SqlName>, MAX_COLUMNS>,
     pub(crate) not_null_name_edits: ColumnSet,
-    pub(crate) not_null_identities: B::Slice<Option<ConstraintIdentity>, MAX_RELATION_COLUMNS>,
+    pub(crate) attribute_identities: B::Slice<AttributeIdentities, MAX_RELATION_COLUMNS>,
     pub(crate) attributes: column_attributes::ColumnAttributes<B>,
     pub(crate) inline_index_identities: B::Slice<Option<RelationIdentity>, MAX_RELATION_COLUMNS>,
     pub(crate) inline_constraint_identities:
@@ -2490,7 +2492,7 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             partition: self.partition,
             columns: &self.columns.as_ref()[..self.n_columns],
             not_null_names: &self.not_null_names.as_ref()[..self.n_columns],
-            not_null_identities: &self.not_null_identities.as_ref()
+            attribute_identities: &self.attribute_identities.as_ref()
                 [..usize::from(self.attributes.count)],
             inline_index_identities: &self.inline_index_identities.as_ref()
                 [..usize::from(self.attributes.count)],
@@ -2690,8 +2692,8 @@ impl TableDefBuilder {
             .copy_from_slice(&source.columns.as_ref()[..source.n_columns]);
         result.not_null_names[..source.n_columns]
             .copy_from_slice(&source.not_null_names.as_ref()[..source.n_columns]);
-        result.not_null_identities[..attribute_count]
-            .copy_from_slice(&source.not_null_identities.as_ref()[..attribute_count]);
+        result.attribute_identities[..attribute_count]
+            .copy_from_slice(&source.attribute_identities.as_ref()[..attribute_count]);
         result.inline_index_identities[..attribute_count]
             .copy_from_slice(&source.inline_index_identities.as_ref()[..attribute_count]);
         result.inline_constraint_identities[..attribute_count]
@@ -2763,8 +2765,8 @@ impl TableDefBuilder {
             not_null_names: pool
                 .copy_slice(&self.not_null_names[..self.n_columns])
                 .map_err(exhausted)?,
-            not_null_identities: pool
-                .copy_slice(&self.not_null_identities[..attribute_count])
+            attribute_identities: pool
+                .copy_slice(&self.attribute_identities[..attribute_count])
                 .map_err(exhausted)?,
             inline_index_identities: pool
                 .copy_slice(&self.inline_index_identities[..attribute_count])
@@ -2813,7 +2815,7 @@ impl TableDefBuilder {
             n_columns: 0,
             not_null_names: [None; MAX_COLUMNS],
             not_null_name_edits: ColumnSet::EMPTY,
-            not_null_identities: [None; MAX_RELATION_COLUMNS],
+            attribute_identities: [AttributeIdentities::NONE; MAX_RELATION_COLUMNS],
             attributes: column_attributes::ColumnAttributes::<InlineDefinition>::EMPTY,
             inline_index_identities: [None; MAX_RELATION_COLUMNS],
             inline_constraint_identities: [None; MAX_RELATION_COLUMNS],
@@ -2856,7 +2858,7 @@ impl TableDef {
             n_columns: 0,
             not_null_names: crate::mem::lease_pool::SharedSlice::EMPTY,
             not_null_name_edits: ColumnSet::EMPTY,
-            not_null_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
+            attribute_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
             attributes: column_attributes::ColumnAttributes::<StoredDefinition>::EMPTY,
             inline_index_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
             inline_constraint_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
@@ -2898,7 +2900,7 @@ impl TableDefView<'_> {
             n_columns: 0,
             not_null_names: &[],
             not_null_name_edits: ColumnSet::EMPTY,
-            not_null_identities: &[],
+            attribute_identities: &[],
             attributes: column_attributes::ColumnAttributes::<BorrowedDefinition<'_>>::EMPTY,
             inline_index_identities: &[],
             inline_constraint_identities: &[],
@@ -3741,12 +3743,12 @@ fn text_search_lifetime_oid(
     created_at: u64,
 ) -> Result<i32, SqlError> {
     let base = match kind {
-        crate::sql::ast::TextSearchObjectKind::Parser => 640_000_000,
-        crate::sql::ast::TextSearchObjectKind::Template => 660_000_000,
-        crate::sql::ast::TextSearchObjectKind::Dictionary => 680_000_000,
-        crate::sql::ast::TextSearchObjectKind::Configuration => 700_000_000,
+        crate::sql::ast::TextSearchObjectKind::Parser => OidBand::TextSearchParser,
+        crate::sql::ast::TextSearchObjectKind::Template => OidBand::TextSearchTemplate,
+        crate::sql::ast::TextSearchObjectKind::Dictionary => OidBand::TextSearchDictionary,
+        crate::sql::ast::TextSearchObjectKind::Configuration => OidBand::TextSearchConfiguration,
     };
-    Ok(base + CatalogIdentity::require(created_at)?.get() as i32)
+    Ok(base.oid(CatalogIdentity::require(created_at)?.created_at()))
 }
 
 pub(crate) const TEXT_SEARCH_TOKEN_TYPES: usize = 23;
@@ -4041,10 +4043,11 @@ impl ConversionDef {
     }
 
     pub(crate) fn oid(self) -> i32 {
-        620_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::Conversion.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted conversion has a checked lifetime")
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 
@@ -4164,10 +4167,11 @@ impl EventTriggerDef {
     }
 
     pub(crate) fn oid(self) -> i32 {
-        820_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::EventTrigger.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted event trigger has a checked lifetime")
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 pub(crate) const EXTENDED_STATISTICS_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
@@ -5889,10 +5893,11 @@ impl RuleDef {
     }
 
     pub(crate) fn oid(self) -> i32 {
-        880_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::RewriteRule.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted rewrite rule has a checked identity")
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 
@@ -6121,7 +6126,9 @@ impl ViewColumns {
             if matches!(default, ColumnDefault::None) {
                 *entry = ViewColumnDefault::EMPTY;
             } else {
+                // A replacement is a new `pg_attrdef` row with its own OID.
                 entry.default = default;
+                entry.identity = None;
             }
             return Ok(self);
         }
@@ -6142,8 +6149,49 @@ impl ViewColumns {
         *entry = ViewColumnDefault {
             column: index as u16,
             default,
+            identity: None,
         };
         Ok(self)
+    }
+
+    /// The stamp of the column's default, once admission reserved it.
+    pub(crate) fn default_identity(&self, index: usize) -> Option<ConstraintIdentity> {
+        self.defaults
+            .iter()
+            .find(|entry| entry.column == index as u16 && entry.column != u16::MAX)
+            .and_then(|entry| entry.identity)
+    }
+
+    /// Restores the durable stamp of an existing default.
+    pub(crate) fn with_default_identity(
+        mut self,
+        index: usize,
+        identity: ConstraintIdentity,
+    ) -> Option<Self> {
+        let entry = self
+            .defaults
+            .iter_mut()
+            .find(|entry| entry.column == index as u16 && entry.column != u16::MAX)?;
+        entry.identity = Some(identity);
+        Some(self)
+    }
+
+    pub(crate) fn default_identities(
+        &self,
+    ) -> impl Iterator<Item = Option<ConstraintIdentity>> + Clone + '_ {
+        self.defaults
+            .iter()
+            .filter(|entry| entry.column != u16::MAX)
+            .map(|entry| entry.identity)
+    }
+
+    pub(crate) fn default_identities_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut Option<ConstraintIdentity>> {
+        self.defaults
+            .iter_mut()
+            .filter(|entry| entry.column != u16::MAX)
+            .map(|entry| &mut entry.identity)
     }
 
     pub fn with_name(mut self, index: usize, name: SqlName) -> Result<Self, SqlError> {
@@ -6179,12 +6227,14 @@ impl ViewColumns {
 struct ViewColumnDefault {
     column: u16,
     default: ColumnDefault,
+    identity: Option<ConstraintIdentity>,
 }
 
 impl ViewColumnDefault {
     const EMPTY: Self = Self {
         column: u16::MAX,
         default: ColumnDefault::NONE,
+        identity: None,
     };
 }
 
@@ -7339,10 +7389,8 @@ pub(crate) const MAX_TABLE_CATALOG_SLOTS: usize = 10_000;
 pub(crate) const MAX_VIEW_CATALOG_SLOTS: usize = 10_000;
 
 pub(crate) const FIRST_IMPLICIT_INDEX_OID: i32 = relation_identities::FIRST_RELATION_OID;
-pub(crate) const FIRST_EXPLICIT_INDEX_OID: i32 = 300_000_000;
-pub(crate) const FIRST_TOAST_INDEX_OID: i32 = 340_000_000;
-pub(crate) const FIRST_PARTITION_TRIGGER_OID: i32 = 1_000_000_000;
-pub(crate) const TRIGGER_CONSTRAINT_OID_OFFSET: i32 = 500_000;
+pub(crate) const FIRST_EXPLICIT_INDEX_OID: i32 = OidBand::Relation.base();
+pub(crate) const FIRST_TOAST_INDEX_OID: i32 = OidBand::ToastIndex.base();
 pub(crate) const MAX_INDEX_OID_GENERATION: u64 = relation_identities::MAX_RELATION_GENERATION;
 pub(crate) const MAX_TRIGGER_OID_GENERATION: u64 = MAX_CATALOG_CREATION;
 
@@ -7368,30 +7416,38 @@ pub(crate) const ROUTINE_SQL_MAX: usize = VIEW_SQL_MAX;
 pub(crate) const ROUTINE_DEFAULT_MAX: usize = DEFAULT_EXPR_MAX;
 pub(crate) const AGGREGATE_INIT_MAX: usize = 256;
 /// User-defined routine OIDs occupy a stable, disjoint catalog range.
-pub(crate) const ROUTINE_OID_BASE: i32 = 100_000;
+pub(crate) const ROUTINE_OID_BASE: i32 = OidBand::Routine.base();
 
 /// Declarations and inherited images use startup pools. Public identifiers
 /// belong to checked creation stamps, independently of reusable storage slots.
-pub(crate) const TRIGGER_OID_BASE: i32 = 140_000;
-pub(crate) const POLICY_OID_BASE: i32 = 180_000;
 pub(crate) const POLICY_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
 
 pub(crate) fn trigger_oid(trigger: &TriggerDef) -> i32 {
-    TRIGGER_OID_BASE
-        .checked_add(i32::try_from(trigger.created_at).expect("trigger OID range exhausted"))
-        .expect("trigger OID range exhausted")
+    OidBand::Trigger.oid(trigger.created_at)
+}
+
+/// The `pg_constraint` OID of a constraint trigger, in the band paired with
+/// its trigger's band.
+pub(crate) fn trigger_constraint_oid(trigger_oid: i32) -> i32 {
+    let (band, ordinal) = [
+        (OidBand::Trigger, OidBand::TriggerConstraint),
+        (
+            OidBand::PartitionTrigger,
+            OidBand::PartitionTriggerConstraint,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(trigger, constraint)| Some((constraint, trigger.ordinal(trigger_oid)?)))
+    .expect("constraint trigger OID is in a trigger band");
+    band.oid(ordinal)
 }
 
 pub(crate) fn policy_oid(policy: &PolicyDef) -> i32 {
-    POLICY_OID_BASE
-        .checked_add(i32::try_from(policy.created_at).expect("policy OID range exhausted"))
-        .expect("policy OID range exhausted")
+    OidBand::Policy.oid(policy.created_at)
 }
 
 pub(crate) fn routine_oid(routine: &RoutineDef) -> i32 {
-    ROUTINE_OID_BASE
-        .checked_add(i32::try_from(routine.created_at).expect("routine OID range exhausted"))
-        .expect("routine OID range exhausted")
+    OidBand::Routine.oid(routine.created_at)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7873,11 +7929,11 @@ impl RoutineResult {
     }
 }
 
-pub(crate) const CAST_OID_BASE: i32 = 720_000_000;
-pub(crate) const OPERATOR_OID_BASE: i32 = 740_000_000;
-pub(crate) const OPERATOR_FAMILY_OID_BASE: i32 = 760_000_000;
-pub(crate) const OPERATOR_CLASS_OID_BASE: i32 = 780_000_000;
-pub(crate) const ACCESS_METHOD_OID_BASE: i32 = 800_000_000;
+pub(crate) const CAST_OID_BASE: i32 = OidBand::Cast.base();
+pub(crate) const OPERATOR_OID_BASE: i32 = OidBand::Operator.base();
+pub(crate) const OPERATOR_FAMILY_OID_BASE: i32 = OidBand::OperatorFamily.base();
+pub(crate) const OPERATOR_CLASS_OID_BASE: i32 = OidBand::OperatorClass.base();
+pub(crate) const ACCESS_METHOD_OID_BASE: i32 = OidBand::AccessMethod.base();
 /// Operators and support functions each follow the parser's bounded DDL list.
 pub(crate) const MAX_OPERATOR_FAMILY_MEMBERS: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const MAX_ACCESS_METHODS: usize = 32;
@@ -11712,7 +11768,7 @@ pub(crate) fn index_expression_stackstr(
     Ok(value)
 }
 
-pub(crate) const USER_DATABASE_OID_BASE: i32 = 16_383;
+pub(crate) const USER_DATABASE_OID_BASE: i32 = OidBand::UserDatabase.base();
 pub(crate) const TABLESPACE_LOCATION_MAX: usize = 256;
 
 /// Stable database identity. Catalog slots are reusable, so session, ACL,
@@ -11729,7 +11785,7 @@ impl DatabaseOid {
         if oid == Self::TEMPLATE1.0
             || oid == Self::TEMPLATE0.0
             || oid == Self::POSTGRES.0
-            || oid > USER_DATABASE_OID_BASE
+            || oid >= oid_bands::FIRST_NORMAL_OBJECT_ID
         {
             Some(Self(oid))
         } else {
@@ -11741,8 +11797,25 @@ impl DatabaseOid {
         self.0
     }
 
+    /// The automatic allocator after `oid` is assigned; a client-chosen OID
+    /// outside the band leaves it unchanged.
+    fn after_assigning(self, oid: Self) -> Self {
+        if OidBand::UserDatabase.contains(oid.0) {
+            self.max(oid)
+        } else {
+            self
+        }
+    }
+
+    /// The next automatically assigned OID. `CREATE DATABASE ... OID` may
+    /// name any OID from 16,384, as in PostgreSQL; automatic ones stay in
+    /// their band.
     fn next_after(self) -> Option<Self> {
-        self.0.checked_add(1).and_then(Self::parse)
+        self.0
+            .max(OidBand::UserDatabase.base())
+            .checked_add(1)
+            .filter(|oid| OidBand::UserDatabase.contains(*oid))
+            .and_then(Self::parse)
     }
 }
 
@@ -13586,7 +13659,7 @@ pub(crate) struct DefaultAclIdentity {
 
 impl DefaultAclIdentity {
     pub(crate) fn oid(self) -> i32 {
-        840_000_000 + self.creation.get() as i32
+        OidBand::DefaultAcl.oid(self.creation.created_at())
     }
 }
 
@@ -13992,7 +14065,7 @@ impl RoleMembership {
         let created_at = self.creation_to(txid);
         match initdb_membership(created_at) {
             Some((_, initdb)) => initdb.oid,
-            None => 860_000_000 + created_at as i32,
+            None => OidBand::RoleMembership.oid(created_at),
         }
     }
 
@@ -15305,6 +15378,9 @@ struct SnapshotState {
 pub(crate) struct TemporaryNamespaceIdentity {
     database: DatabaseOid,
     connection: i32,
+    /// The smallest number no other live namespace holds, like PostgreSQL's
+    /// backend number; it selects the OID.
+    number: u32,
 }
 
 impl TemporaryNamespaceIdentity {
@@ -15313,9 +15389,7 @@ impl TemporaryNamespaceIdentity {
     }
 
     pub(crate) fn oid(self) -> i32 {
-        self.connection
-            .checked_add(FIRST_TEMP_NAMESPACE_OID)
-            .expect("temporary namespace identity was checked at creation")
+        OidBand::TemporaryNamespace.oid(u64::from(self.number))
     }
 
     pub(crate) fn name(self) -> SqlName {
@@ -19210,20 +19284,8 @@ impl Storage {
         &self,
         transaction: u32,
     ) -> Result<Option<TemporaryNamespaceIdentity>, SqlError> {
-        let identity = TemporaryNamespaceIdentity {
-            database: current_database(),
-            connection: self.current_connection_id(),
-        };
-        if identity
-            .connection
-            .checked_add(FIRST_TEMP_NAMESPACE_OID)
-            .is_none_or(|oid| oid <= 0)
-        {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "temporary namespace identity exhausted"
-            ));
-        }
+        let database = current_database();
+        let connection = self.current_connection_id();
         let creation = core::num::NonZeroU32::new(transaction).ok_or_else(|| {
             sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -19234,11 +19296,9 @@ impl Storage {
             .temporary_transactions
             .lock()
             .expect("temporary transaction lock poisoned");
-        if let Some(namespace) = state
-            .namespaces
-            .iter()
-            .find(|namespace| namespace.identity == identity)
-        {
+        if let Some(namespace) = state.namespaces.iter().find(|namespace| {
+            namespace.identity.database == database && namespace.identity.connection == connection
+        }) {
             if !namespace.visible_to(transaction) {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -19247,6 +19307,26 @@ impl Storage {
             }
             return Ok(None);
         }
+        // The registry is bounded, so a free number exists at or below its length.
+        let number = (1..=state.namespaces.len() as u32 + 1)
+            .find(|number| {
+                state
+                    .namespaces
+                    .iter()
+                    .all(|namespace| namespace.identity.number != *number)
+            })
+            .filter(|number| *number <= OidBand::TemporaryNamespace.capacity())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "temporary namespace identity exhausted"
+                )
+            })?;
+        let identity = TemporaryNamespaceIdentity {
+            database,
+            connection,
+            number,
+        };
         state
             .namespaces
             .push(TemporaryNamespace {
@@ -23551,7 +23631,7 @@ impl Storage {
                     catalog.definitions.len()
                 )
             })?;
-        catalog.allocated_oid = catalog.allocated_oid.max(oid);
+        catalog.allocated_oid = catalog.allocated_oid.after_assigning(oid);
         statistics.databases[slot] = DatabaseCumulativeStatistics::empty(oid);
         catalog.definitions[slot] = DatabaseDef {
             oid,
@@ -23598,7 +23678,7 @@ impl Storage {
                     catalog.definitions.len()
                 )
             })?;
-        catalog.allocated_oid = catalog.allocated_oid.max(oid);
+        catalog.allocated_oid = catalog.allocated_oid.after_assigning(oid);
         statistics.databases[slot] = DatabaseCumulativeStatistics::empty(oid);
         catalog.definitions[slot] = DatabaseDef {
             oid,
@@ -31873,16 +31953,9 @@ impl Storage {
             ));
         };
         let version = match allocation {
-            schema_names::SchemaAllocation::New => {
-                let version = self.catalog_sequence.next()?;
-                SchemaIdentity::parse(version).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "schema object identifier range is exhausted"
-                    )
-                })?;
-                version
-            }
+            schema_names::SchemaAllocation::New => self
+                .catalog_sequence
+                .next_bounded(MAX_CATALOG_CREATION, "schema")?,
             schema_names::SchemaAllocation::Restore { identity, .. } => {
                 if schemas.iter().any(|schema| {
                     schema.database == current_database() && schema.identity() == Some(identity)
@@ -45918,7 +45991,7 @@ impl Storage {
         &self,
         schema: SqlName,
         name: SqlName,
-        definition: ViewDefinition,
+        mut definition: ViewDefinition,
         or_replace: bool,
         txid: u32,
     ) -> Result<ViewPublication, SqlError> {
@@ -46001,6 +46074,7 @@ impl Storage {
         let created_at = self
             .catalog_sequence
             .next_bounded(MAX_RELATION_GENERATION, "relation")?;
+        self.reserve_view_default_identities(&mut definition.columns, None)?;
         // Reserve and populate the return rule before changing either view.
         // Capacity and identity errors preserve an existing replacement target.
         let rule = self.create_new_rule_in(
@@ -46603,7 +46677,7 @@ impl Storage {
             txid,
             RoutineCallKind::Function,
         ) {
-            RoutineCallSelection::Builtin { oid, .. } => self.builtin_call_input_oids(
+            RoutineCallSelection::Builtin { oid, .. } => self.builtin_call_parameter_oids(
                 oid,
                 argument_names,
                 actual_oids,

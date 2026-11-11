@@ -35,6 +35,7 @@ mod partition_ancestry;
 mod polymorphic_resolution;
 mod predefined_roles;
 mod prepared_object_capacity;
+mod prepared_parameter_types;
 mod procedural_expression_calls;
 mod procedural_progress;
 mod procedural_subtransactions;
@@ -88867,14 +88868,14 @@ fn prepare_coerces_args_to_declared_types() {
         "{:?}",
         String::from_utf8_lossy(&bad)
     );
-    // Wrong argument count is rejected.
+    // Wrong argument count is rejected as PostgreSQL's EvaluateParams does.
     let count = run_with(
         &mut e,
         &mut b,
         "PREPARE p3 (int) AS SELECT $1; EXECUTE p3(1, 2)",
     );
     assert!(
-        String::from_utf8_lossy(&count).contains("08P01"),
+        String::from_utf8_lossy(&count).contains("42601"),
         "{:?}",
         String::from_utf8_lossy(&count)
     );

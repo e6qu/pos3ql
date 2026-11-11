@@ -323,6 +323,9 @@ pub struct Parser<'a> {
     routine_name: Option<&'a str>,
     /// Local variables and record fields captured by a procedural OPEN.
     named_parameters: &'a [NamedParameter<'a>],
+    /// `$n.field` selections, kept so a parameter whose type stays undetermined
+    /// reports PostgreSQL's `unknown` composite error.
+    parameter_fields: core::cell::RefCell<ArenaList<'a, (u32, &'a str)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -875,7 +878,13 @@ impl<'a> Parser<'a> {
             routine_parameters: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
             routine_name: None,
             named_parameters: &[],
+            parameter_fields: core::cell::RefCell::new(ArenaList::new(arena)),
         })
+    }
+
+    /// The `$n.field` selections parsed so far.
+    pub(crate) fn parameter_fields(&self) -> &'a [(u32, &'a str)] {
+        self.parameter_fields.borrow().as_slice()
     }
 
     pub(crate) fn capture_type_inputs(&mut self) {
@@ -9248,6 +9257,15 @@ impl<'a> Parser<'a> {
                     },
                 })
                 .map_err(|_| self.arena_full("column source map exceeds SQL arena"))?;
+        }
+        if let Expr::Field { base, field } = e
+            && let Expr::Param(index) = base
+            && field != "*"
+        {
+            self.parameter_fields
+                .borrow_mut()
+                .push((*index, field))
+                .map_err(|_| self.arena_full("parameter field list exceeds SQL arena"))?;
         }
         let expression = self
             .arena

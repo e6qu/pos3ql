@@ -276,15 +276,14 @@ listed built-in that is neither implemented nor an operator, cast or input
 function fails with `0A000` when called; `pg_shdepend` omits other
 databases' rows, and `DROP ROLE`'s `DETAIL` orders owners by OID rather than
 catalog insertion;
-`pg_describe_object` of a built-in operator class or family is empty, and
-`pg_cast` lacks PostgreSQL's built-in casts; `pg_attrdef` OIDs derive from
+`pg_describe_object` of a built-in operator class or family is empty;
+`pg_attrdef` OIDs derive from
 table slots rather than creation identities; built-in operators, types and other
 catalog objects have no shipped `pg_description` text (built-in routines
-do). A parameter typed from a called
-built-in (`PREPARE q AS SELECT round($1)`) is not recorded as that type:
-`pg_prepared_statements.parameter_types` is empty, `pg_typeof($1)` is
-`unknown`, and `round($1)` with `2.5` rounds as `numeric` (3) where
-PostgreSQL's `double precision` gives 2. A SQL function whose earlier
+do). An undeclared `PREPARE` parameter that PostgreSQL leaves undetermined
+(`PREPARE x AS SELECT pg_typeof($1)`, `42P18`) is `text`, and protocol Parse
+analyzes nothing, so a Parse that PostgreSQL rejects (`SELECT ($1).a` with an
+unspecified type) fails at Describe or Bind instead. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final
@@ -332,11 +331,7 @@ reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
 PL/pgSQL `CALL` in a trigger function fails with `0A000`, and a procedure
 called from PL/pgSQL that waits for storage or a lock runs again from its
 start when its statement resumes (finished effects replay from the statement
-journal) instead of resuming at a saved position inside the procedure. Relation row types: a `PREPARE` parameter
-of a table's row type (`PREPARE q(t) AS SELECT $1.a`) fails with `42704`
-(`type "t" does not exist`); a field of a parameter whose type a client
-leaves unspecified (`SELECT ($1).a` through the extended protocol) reports
-`42809` with type `text` where PostgreSQL names type `unknown`; values and columns of a
+journal) instead of resuming at a saved position inside the procedure. Relation row types: values and columns of a
 view's row type, and dropping a relation through `DROP SCHEMA`, `DROP
 MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
 column uses its row type, fail with `0A000`; a `DROP TABLE ... CASCADE` that

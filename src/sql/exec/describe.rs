@@ -2361,6 +2361,22 @@ fn routine_parameter_type(index: u32) -> Option<(i32, i16)> {
     routine_parameter_metadata(index).map(|metadata| (metadata.type_oid, metadata.ctype.typlen()))
 }
 
+/// A statement parameter bound to a named composite or relation row type
+/// (`PREPARE q(t)`, or a Parse type OID), typed through its catalog identity.
+fn bound_composite_parameter(index: u32) -> Option<StaticTypeMeta> {
+    if !bound_parameter_context_active() {
+        return None;
+    }
+    let type_oid = bound_parameter_type_oid(index)?;
+    match crate::storage::NamedTypeKind::from_oid(type_oid)? {
+        (crate::storage::NamedTypeKind::Composite, creation, false) => Some(StaticTypeMeta {
+            type_oid,
+            ..StaticTypeMeta::of(ColType::Composite(Some(creation)))
+        }),
+        _ => None,
+    }
+}
+
 fn routine_parameter_metadata(index: u32) -> Option<StaticTypeMeta> {
     index.checked_sub(1).and_then(|index| {
         ROUTINE_PARAMETER_TYPES
@@ -3529,6 +3545,7 @@ fn record_shape_metadata_dyn(
         {
             routine_parameter_metadata(*index)
         }
+        Expr::Param(index) => bound_composite_parameter(*index),
         Expr::RoutineParam {
             qualifier,
             name,
@@ -3823,6 +3840,23 @@ pub fn record_field_metadata(
             "there is no parameter ${}",
             index
         ));
+    }
+    if let Expr::Param(index) = base
+        && let Some(parameter) = bound_composite_parameter(*index)
+        && let ColType::Composite(slot) = parameter.ctype
+    {
+        return columns.composite_field(slot, field).ok_or_else(|| {
+            match columns.type_name_fixed(parameter.type_oid) {
+                Ok(Some(name)) => sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" not found in data type {}",
+                    field,
+                    name.as_str()
+                ),
+                Ok(None) => could_not_identify(field),
+                Err(error) => error,
+            }
+        });
     }
     // A bare unknown literal cannot be coerced out of a ROW(...) — but only
     // selecting *that* field (star expansion checks every field elsewhere)

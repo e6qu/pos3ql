@@ -11,40 +11,11 @@ use crate::sql_err;
 use crate::storage::SqlName;
 
 use super::eval::SqlError;
-use super::types::ColType;
 use core::cell::Cell;
 
 /// PostgreSQL's unsigned 16-bit prepared-parameter boundary.
 pub const MAX_PREP_PARAMS: usize = u16::MAX as usize;
 const MAX_PREP_RESULTS: usize = super::exec::MAX_PROJ;
-
-fn type_from_code(code: u8) -> Option<ColType> {
-    if code == ColType::Record.code() {
-        Some(ColType::Record)
-    } else {
-        ColType::from_code(code)
-    }
-}
-
-pub(crate) fn decode_types<'a>(codes: &[u8], arena: &'a Arena) -> Result<&'a [ColType], SqlError> {
-    let types = arena
-        .alloc_slice_with(codes.len(), |_| ColType::Bool)
-        .map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "prepared parameter types exceed the statement arena"
-            )
-        })?;
-    for (target, code) in types.iter_mut().zip(codes.iter().copied()) {
-        *target = type_from_code(code).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "prepared statement contains an invalid parameter type"
-            )
-        })?;
-    }
-    Ok(types)
-}
 
 pub struct SqlPreparedPool {
     slots: Vec<Slot>,
@@ -83,7 +54,7 @@ pub(crate) struct PendingTypeInput {
 struct Slot {
     active: bool,
     name: SqlName,
-    /// Query text, parameter codes, result OIDs, then bound type inputs.
+    /// Query text, parameter type OIDs, result OIDs, then bound type inputs.
     /// All metadata shares the slot's configured `prepared_bytes` reservation.
     data: FixedBuf,
     text_len: usize,
@@ -124,20 +95,31 @@ pub(crate) fn with_active<R>(f: impl FnOnce(Option<&SqlPreparedPool>) -> R) -> R
 pub(crate) struct PreparedInfo<'a> {
     pub(crate) name: &'a str,
     pub(crate) statement: &'a str,
-    pub(crate) parameter_type_codes: &'a [u8],
+    pub(crate) parameter_types: PreparedTypes<'a>,
     pub(crate) prepared_at: i64,
     pub(crate) custom_plans: i64,
-    pub(crate) result_types: PreparedResultTypes<'a>,
+    pub(crate) result_types: PreparedTypes<'a>,
 }
 
+/// Big-endian type OIDs retained in a prepared statement's slot. An OID keeps
+/// the full catalog identity of a named type, its array and a pseudo-type.
 #[derive(Clone, Copy)]
-pub(crate) struct PreparedResultTypes<'a> {
+pub(crate) struct PreparedTypes<'a> {
     bytes: &'a [u8],
 }
 
-impl PreparedResultTypes<'_> {
+impl PreparedTypes<'_> {
     pub(crate) fn len(self) -> usize {
         self.bytes.len() / 4
+    }
+
+    /// Copies the OIDs into `arena` so the pool borrow can end.
+    pub(crate) fn copy_into(self, arena: &Arena) -> Result<&[i32], SqlError> {
+        let mut oids = self.iter();
+        arena
+            .alloc_slice_with(self.len(), |_| oids.next().unwrap_or(0))
+            .map(|oids| &*oids)
+            .map_err(|_| super::eval::arena_full())
     }
 
     pub(crate) fn iter(self) -> impl Iterator<Item = i32> {
@@ -201,7 +183,7 @@ impl SqlPreparedPool {
         &mut self,
         name: &str,
         sql: &str,
-        param_types: &[ColType],
+        param_types: &[i32],
         result_types: &[i32],
         type_inputs: &[u8],
     ) -> Result<(), SqlError> {
@@ -233,11 +215,10 @@ impl SqlPreparedPool {
             ));
         };
         slot.data.clear();
-        let result_bytes = result_types.len().saturating_mul(4);
         if sql
             .len()
-            .saturating_add(param_types.len())
-            .saturating_add(result_bytes)
+            .saturating_add(param_types.len().saturating_mul(4))
+            .saturating_add(result_types.len().saturating_mul(4))
             .saturating_add(type_inputs.len())
             > slot.data.capacity()
         {
@@ -247,10 +228,7 @@ impl SqlPreparedPool {
             ));
         }
         assert!(slot.data.append(sql.as_bytes()), "capacity checked above");
-        for ctype in param_types {
-            assert!(slot.data.append(&[ctype.code()]), "capacity checked above");
-        }
-        for type_oid in result_types {
+        for type_oid in param_types.iter().chain(result_types) {
             assert!(
                 slot.data.append(&type_oid.to_be_bytes()),
                 "capacity checked above"
@@ -279,13 +257,15 @@ impl SqlPreparedPool {
             })
     }
 
-    /// The declared `$n` parameter types for a prepared statement (empty slice
+    /// The declared `$n` parameter types for a prepared statement (empty
     /// when none were declared), or None if the statement does not exist.
-    pub fn get_type_codes(&self, name: &str) -> Option<&[u8]> {
+    pub(crate) fn parameter_types(&self, name: &str) -> Option<PreparedTypes<'_>> {
         self.slots
             .iter()
             .find(|s| s.active && s.name.as_str() == name)
-            .map(|s| &s.data.readable()[s.text_len..s.text_len + s.n_params])
+            .map(|s| PreparedTypes {
+                bytes: &s.data.readable()[s.text_len..s.text_len + s.n_params * 4],
+            })
     }
 
     pub(crate) fn type_inputs(&self, name: &str) -> Option<&[u8]> {
@@ -293,7 +273,7 @@ impl SqlPreparedPool {
             .iter()
             .find(|slot| slot.active && slot.name.as_str() == name)
             .map(|slot| {
-                let start = slot.text_len + slot.n_params + slot.n_results * 4;
+                let start = slot.text_len + (slot.n_params + slot.n_results) * 4;
                 &slot.data.readable()[start..start + slot.input_bytes]
             })
     }
@@ -527,17 +507,18 @@ impl SqlPreparedPool {
 
     pub(crate) fn visit(&self, mut visitor: impl FnMut(PreparedInfo<'_>)) {
         for slot in self.slots.iter().filter(|slot| slot.active) {
-            let result_start = slot.text_len + slot.n_params;
+            let result_start = slot.text_len + slot.n_params * 4;
             let result_end = result_start + slot.n_results * 4;
             visitor(PreparedInfo {
                 name: slot.name.as_str(),
                 statement: core::str::from_utf8(&slot.data.readable()[..slot.text_len])
                     .expect("prepared SQL was validated as UTF-8"),
-                parameter_type_codes: &slot.data.readable()
-                    [slot.text_len..slot.text_len + slot.n_params],
+                parameter_types: PreparedTypes {
+                    bytes: &slot.data.readable()[slot.text_len..result_start],
+                },
                 prepared_at: slot.prepared_at,
                 custom_plans: slot.custom_plans,
-                result_types: PreparedResultTypes {
+                result_types: PreparedTypes {
                     bytes: &slot.data.readable()[result_start..result_end],
                 },
             });

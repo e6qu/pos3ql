@@ -10065,6 +10065,42 @@ impl Engine {
         Ok(Ok(()))
     }
 
+    /// Resolves `PREPARE name(types)` through the catalog, as PostgreSQL's
+    /// `typenameTypeId`; a type modifier is not part of a parameter's type.
+    /// The remaining `count` positions start as text for inference.
+    fn prepared_parameter_types<'a>(
+        &self,
+        names: &[&str],
+        count: usize,
+        arena: &'a Arena,
+        txid: u32,
+    ) -> Result<&'a mut [i32], SqlError> {
+        let types = arena
+            .alloc_slice_with(count, |_| types::oid::TEXT)
+            .map_err(|_| eval::arena_full())?;
+        for (target, name) in types.iter_mut().zip(names) {
+            let resolved = exec::resolve_routine_type(&self.storage, txid, name)?;
+            if resolved.polymorphic_type().is_some() {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "prepared statement parameters of polymorphic type {} are not supported",
+                    name
+                ));
+            }
+            *target = self
+                .storage
+                .routine_type_oid(resolved.ctype, resolved.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "type \"{}\" does not exist",
+                        name
+                    )
+                })?;
+        }
+        Ok(types)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_prepare_statement(
         &mut self,
@@ -10087,19 +10123,6 @@ impl Engine {
                     prep::MAX_PREP_PARAMS
                 ),
             }));
-        }
-        let types = match arena.alloc_slice_with(param_types.len(), |_| ColType::Bool) {
-            Ok(types) => types,
-            Err(_) => return Ok(Err(eval::arena_full())),
-        };
-        for (index, type_name) in param_types.iter().enumerate() {
-            let Some(ctype) = ColType::from_sql_name(type_name) else {
-                return Ok(Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::UNDEFINED_OBJECT),
-                    message: stack_format!(192, "type \"{}\" does not exist", type_name),
-                }));
-            };
-            types[index] = ctype;
         }
         let inherited = match type_inputs::bindings_for_active_source(sql, arena) {
             Ok(bindings) => bindings.unwrap_or(&[]),
@@ -10133,6 +10156,12 @@ impl Engine {
         if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
             return Ok(Err(error));
         }
+        let parameter_count = param_types.len().max(parser.max_param() as usize);
+        let types =
+            match self.prepared_parameter_types(param_types, parameter_count, arena, txn.txid) {
+                Ok(types) => types,
+                Err(error) => return Ok(Err(error)),
+            };
         if let Err(error) = query::capture_contextual_type_inputs(
             &parser,
             &statement,
@@ -10246,51 +10275,74 @@ impl Engine {
                 )));
             }
         };
+        // Parameters the declaration omits take their types from their use, as
+        // PostgreSQL's variable-parameter analysis does; undetermined ones are
+        // text.
+        if parameter_count > param_types.len() {
+            let declared = &types[..param_types.len()];
+            let declared = match arena.alloc_slice_copy(declared) {
+                Ok(declared) => declared,
+                Err(_) => return Ok(Err(eval::arena_full())),
+            };
+            types.fill(types::oid::UNKNOWN);
+            param_types::infer(&self.storage, statement, txn.txid, arena, types);
+            types[..declared.len()].copy_from_slice(declared);
+            if let Err(error) = reject_unknown_parameter_fields(parser.parameter_fields(), types) {
+                return Ok(Err(error));
+            }
+            resolve_unknown_parameters(types);
+        }
+        let types = &*types;
         let mut result_columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         let described = type_inputs::with_source(
             type_inputs::Source::RootCommand { statement: 0 },
             sql,
             bindings,
-            || match statement {
-                Stmt::Select(select) => query::expand_ctes(select, &self.storage, txn.txid, arena)
-                    .and_then(|select| {
-                        query::describe_select(
-                            select,
-                            &self.storage,
-                            txn.txid,
-                            arena,
-                            &mut result_columns,
-                            crate::sql::exec::DescriptionTarget::Wire,
-                            None,
+            || {
+                exec::with_bound_parameter_types(types, || match statement {
+                    Stmt::Select(select) => {
+                        query::expand_ctes(select, &self.storage, txn.txid, arena).and_then(
+                            |select| {
+                                query::describe_select(
+                                    select,
+                                    &self.storage,
+                                    txn.txid,
+                                    arena,
+                                    &mut result_columns,
+                                    crate::sql::exec::DescriptionTarget::Wire,
+                                    None,
+                                )
+                            },
                         )
-                    }),
-                Stmt::SetQuery(query) => query::describe_set_query(
-                    &self.storage,
-                    txn.txid,
-                    query,
-                    &mut result_columns,
-                    arena,
-                    crate::sql::exec::DescriptionTarget::Wire,
-                ),
-                Stmt::With { statement, .. } => self.describe_data_modification_columns(
-                    statement,
-                    arena,
-                    txn,
-                    &mut result_columns,
-                    crate::sql::exec::DescriptionTarget::Wire,
-                ),
-                Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => self
-                    .describe_data_modification_columns(
+                    }
+                    Stmt::SetQuery(query) => query::describe_set_query(
+                        &self.storage,
+                        txn.txid,
+                        query,
+                        &mut result_columns,
+                        arena,
+                        crate::sql::exec::DescriptionTarget::Wire,
+                    ),
+                    Stmt::With { statement, .. } => self.describe_data_modification_columns(
                         statement,
                         arena,
                         txn,
                         &mut result_columns,
                         crate::sql::exec::DescriptionTarget::Wire,
                     ),
-                _ => Err(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "utility statements cannot be prepared"
-                )),
+                    Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => self
+                        .describe_data_modification_columns(
+                            statement,
+                            arena,
+                            txn,
+                            &mut result_columns,
+                            crate::sql::exec::DescriptionTarget::Wire,
+                        ),
+                    _ => Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "utility statements cannot be prepared"
+                    )),
+                })
             },
         );
         let result_count = match described {
@@ -13804,11 +13856,11 @@ impl Engine {
         bound_inputs: &[u8],
     ) -> Result<&'a mut [i32], SqlError> {
         let oids = arena
-            .alloc_slice_with(parameter_count, |_| types::oid::TEXT)
+            .alloc_slice_with(parameter_count, |_| types::oid::UNKNOWN)
             .map_err(|_| eval::arena_full())?;
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
-            Err(_) => return Ok(oids),
+            Err(_) => return Ok(resolve_unknown_parameters(oids)),
         };
         parser.set_type_inputs(type_inputs::decode(bound_inputs, arena)?);
         if let Ok(Some(statement)) = parser.next_stmt() {
@@ -13822,7 +13874,8 @@ impl Engine {
                 oids[i] = c;
             }
         }
-        Ok(oids)
+        reject_unknown_parameter_fields(parser.parameter_fields(), oids)?;
+        Ok(resolve_unknown_parameters(oids))
     }
 
     fn describe_data_modification_columns<'a>(
@@ -18537,19 +18590,10 @@ impl Engine {
             sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
             message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
         })?;
-        let declared = sqlprep.get_type_codes(name).map_or(0, <[u8]>::len);
-        if declared != 0 && argument_count != declared {
-            return Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::PROTOCOL_VIOLATION),
-                message: stack_format!(
-                    192,
-                    "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
-                    name,
-                    declared,
-                    argument_count
-                ),
-            });
-        }
+        let declared = sqlprep
+            .parameter_types(name)
+            .map_or(0, prep::PreparedTypes::len);
+        check_prepared_argument_count(name, declared, argument_count)?;
         let text = arena.alloc_str(text).map_err(|_| SqlError {
             sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
             message: stack_format!(192, "statement too large for SQL arena"),
@@ -18590,46 +18634,52 @@ impl Engine {
             })
     }
 
-    /// Evaluates SQL-level EXECUTE arguments once for an analyzed prepared
-    /// statement.  Planning and execution therefore use the same declared
-    /// parameter contract instead of treating EXPLAIN as a second protocol.
-    fn prepared_explain_arguments<'a>(
+    /// Evaluates SQL-level EXECUTE arguments once, coerced to the declared
+    /// parameter types, and returns them with those types. Planning, EXPLAIN
+    /// ANALYZE and execution share this one parameter contract.
+    #[allow(clippy::too_many_arguments)]
+    fn prepared_execute_arguments<'a>(
         &self,
         name: &str,
         arguments: &[&'a Expr<'a>],
         outer_params: &[Datum<'a>],
         sqlprep: &SqlPreparedPool,
         arena: &'a Arena,
-    ) -> Result<&'a [Datum<'a>], SqlError> {
-        let declared_codes = sqlprep.get_type_codes(name).ok_or_else(|| SqlError {
+        txid: u32,
+        guc: &GucState,
+    ) -> Result<(&'a [Datum<'a>], &'a [i32]), SqlError> {
+        let declared = sqlprep.parameter_types(name).ok_or_else(|| SqlError {
             sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
             message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
         })?;
-        let declared = prep::decode_types(declared_codes, arena)?;
-        if !declared.is_empty() && arguments.len() != declared.len() {
-            return Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::PROTOCOL_VIOLATION),
-                message: stack_format!(
-                    192,
-                    "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
-                    name,
-                    declared.len(),
-                    arguments.len()
-                ),
-            });
-        }
+        check_prepared_argument_count(name, declared.len(), arguments.len())?;
+        let types = declared.copy_into(arena)?;
+        let catalog = query::storage_catalog(&self.storage, &self.work, txid);
+        let sequences = sequence::SeqEval::new(&self.storage, guc.seq_session(), txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequences),
+            ..NO_HOOKS
+        };
         let values = arena
             .alloc_slice_with(arguments.len(), |_| Datum::Null)
             .map_err(|_| eval::arena_full())?;
         for (index, argument) in arguments.iter().enumerate() {
-            let value = eval(argument, arena, outer_params, &NoColumns)?;
-            values[index] = if index < declared.len() {
-                eval::cast(value, declared[index].internal_name(), arena)?
-            } else {
-                value
+            values[index] = match types.get(index) {
+                Some(&oid) => exec::eval_prepared_argument(
+                    argument,
+                    index + 1,
+                    oid,
+                    &self.storage,
+                    txid,
+                    arena,
+                    outer_params,
+                    &hooks,
+                )?,
+                None => eval::eval_full(argument, arena, outer_params, &NoColumns, &hooks)?,
             };
         }
-        Ok(values)
+        Ok((values, types))
     }
 
     /// Outer Result: wire-level trouble. Inner Result: SQL-level error.
@@ -19318,30 +19368,42 @@ impl Engine {
                 } else {
                     guc::PlannerSettings::EMPTY
                 };
-                let planned_statement = match statement {
+                let (planned_statement, parameter_types) = match statement {
                     Stmt::ExecutePrepared { name, args } => {
-                        match self.prepared_statement(name, args.len(), sqlprep, arena, txn.txid) {
-                            Ok(statement) => statement,
+                        let declared = self
+                            .prepared_statement(name, args.len(), sqlprep, arena, txn.txid)
+                            .and_then(|statement| {
+                                let types = sqlprep
+                                    .parameter_types(name)
+                                    .expect("a parsed prepared statement exists")
+                                    .copy_into(arena)?;
+                                Ok((statement, Some(types)))
+                            });
+                        match declared {
+                            Ok(declared) => declared,
                             Err(error) => return Ok(Err(error)),
                         }
                     }
-                    _ => statement,
+                    _ => (&**statement, None),
                 };
-                let planned = self.prepare_planner_inputs(
-                    planned_statement,
-                    None,
-                    arena,
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                )?;
+                let planned = with_prepared_parameter_types(parameter_types, || {
+                    self.prepare_planner_inputs(
+                        planned_statement,
+                        None,
+                        arena,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                    )
+                })?;
                 if planned.is_err() {
                     return Ok(planned);
                 }
-                let plan =
-                    explain::plan_statement(&self.storage, txn.txid, planned_statement, arena);
+                let plan = with_prepared_parameter_types(parameter_types, || {
+                    explain::plan_statement(&self.storage, txn.txid, planned_statement, arena)
+                });
                 let plan = match plan {
                     Ok(plan) => plan,
                     Err(error) => return Ok(Err(error)),
@@ -19353,11 +19415,12 @@ impl Engine {
                 if options.analyze
                     && let Stmt::ExecutePrepared { name, args } = statement
                 {
-                    prepared_params =
-                        match self.prepared_explain_arguments(name, args, params, sqlprep, arena) {
-                            Ok(values) => values,
-                            Err(error) => return Ok(Err(error)),
-                        };
+                    prepared_params = match self.prepared_execute_arguments(
+                        name, args, params, sqlprep, arena, txn.txid, guc,
+                    ) {
+                        Ok((values, _)) => values,
+                        Err(error) => return Ok(Err(error)),
+                    };
                 }
                 let actual = if options.analyze {
                     let before = self.storage.block_io_stats();
@@ -19370,14 +19433,16 @@ impl Engine {
                     } else {
                         params
                     };
-                    let execution = self.execute_explained_statement(
-                        planned_statement,
-                        arena,
-                        execution_params,
-                        txn,
-                        guc,
-                        responder,
-                    );
+                    let execution = with_prepared_parameter_types(parameter_types, || {
+                        self.execute_explained_statement(
+                            planned_statement,
+                            arena,
+                            execution_params,
+                            txn,
+                            guc,
+                            responder,
+                        )
+                    });
                     let output = responder.finish_discard_query_output();
                     match execution {
                         Err(wire) => return Err(wire),
@@ -21555,16 +21620,6 @@ impl Engine {
                         ),
                     }));
                 };
-                // Snapshot the declared parameter types into the arena before
-                // releasing the pool borrow.
-                let decl: &[ColType] = match sqlprep.get_type_codes(name) {
-                    Some(codes) => match prep::decode_types(codes, arena) {
-                        Ok(types) => types,
-                        Err(error) => return Ok(Err(error)),
-                    },
-                    None => &[],
-                };
-                let n_decl = decl.len();
                 let bound_inputs = match sqlprep
                     .type_inputs(name)
                     .ok_or_else(|| {
@@ -21592,45 +21647,12 @@ impl Engine {
                         }));
                     }
                 };
-                // If the statement declared parameter types, the argument count
-                // must match and each argument is coerced to its declared type.
-                if n_decl > 0 && args.len() != n_decl {
-                    return Ok(Err(SqlError {
-                        sqlstate: SqlState::known(sqlstate::PROTOCOL_VIOLATION),
-                        message: stack_format!(
-                            192,
-                            "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
-                            name,
-                            n_decl,
-                            args.len()
-                        ),
-                    }));
-                }
-                // Argument expressions become the inner statement's $n
-                // parameters, coerced to the declared types when present.
-                let inner_params = match arena.alloc_slice_with(args.len(), |_| Datum::Null) {
-                    Ok(values) => values,
-                    Err(_) => return Ok(Err(eval::arena_full())),
+                let (inner_params, parameter_oids) = match self
+                    .prepared_execute_arguments(name, args, params, sqlprep, arena, txn.txid, guc)
+                {
+                    Ok(arguments) => arguments,
+                    Err(error) => return Ok(Err(error)),
                 };
-                for (i, a) in args.iter().enumerate() {
-                    let v = match eval(a, arena, params, &NoColumns) {
-                        Ok(v) => v,
-                        Err(e) => return Ok(Err(e)),
-                    };
-                    inner_params[i] = if i < n_decl {
-                        match eval::cast(v, decl[i].internal_name(), arena) {
-                            Ok(v) => v,
-                            Err(e) => return Ok(Err(e)),
-                        }
-                    } else {
-                        v
-                    };
-                }
-                let parameter_oids =
-                    match arena.alloc_slice_with(decl.len(), |index| decl[index].oid()) {
-                        Ok(oids) => oids,
-                        Err(_) => return Ok(Err(eval::arena_full())),
-                    };
                 let mut inner = match Parser::new(text, arena) {
                     Ok(p) => p,
                     Err(e) => {
@@ -21665,7 +21687,7 @@ impl Engine {
                                     self.execute_stmt(
                                         &statement,
                                         arena,
-                                        &inner_params[..args.len()],
+                                        inner_params,
                                         txn,
                                         sqlprep,
                                         cursors,
@@ -28910,6 +28932,65 @@ impl Engine {
     pub(crate) fn publication_storage_for_tests(&self) -> &Storage {
         &self.storage
     }
+}
+
+/// PostgreSQL rejects a field of a parameter whose type its use leaves
+/// undetermined (`SELECT ($1).a`) while that type is still `unknown`.
+fn reject_unknown_parameter_fields(fields: &[(u32, &str)], oids: &[i32]) -> Result<(), SqlError> {
+    for &(index, field) in fields {
+        if (index as usize)
+            .checked_sub(1)
+            .and_then(|index| oids.get(index))
+            .is_some_and(|oid| *oid == types::oid::UNKNOWN)
+        {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "column notation .{} applied to type unknown, which is not a composite type",
+                field
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A parameter whose use determines no type is `text`, as PostgreSQL
+/// resolves an unknown parameter at the end of analysis.
+fn resolve_unknown_parameters(oids: &mut [i32]) -> &mut [i32] {
+    for oid in oids.iter_mut() {
+        if *oid == types::oid::UNKNOWN {
+            *oid = types::oid::TEXT;
+        }
+    }
+    oids
+}
+
+/// Types an `EXPLAIN EXECUTE` statement by its prepared parameter types; any
+/// other explained statement keeps the enclosing parameter context.
+fn with_prepared_parameter_types<R>(types: Option<&[i32]>, run: impl FnOnce() -> R) -> R {
+    match types {
+        Some(types) => exec::with_bound_parameter_types(types, run),
+        None => run(),
+    }
+}
+
+/// PostgreSQL's `EvaluateParams` count check: a statement with declared or
+/// inferred parameters takes exactly that many arguments.
+fn check_prepared_argument_count(
+    name: &str,
+    declared: usize,
+    supplied: usize,
+) -> Result<(), SqlError> {
+    if declared == 0 || declared == supplied {
+        return Ok(());
+    }
+    Err(eval::with_detail(
+        sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "wrong number of parameters for prepared statement \"{}\"",
+            name
+        ),
+        format_args!("Expected {} parameters but got {}.", declared, supplied),
+    ))
 }
 
 // Native SQL fixtures are separate from the ownership tests beside runtime modules.

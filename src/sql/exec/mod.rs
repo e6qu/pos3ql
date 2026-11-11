@@ -24368,38 +24368,6 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
     for argument in *args {
         reject_parameters(argument)?;
     }
-    let values = context
-        .arena
-        .alloc_slice_with(args.len(), |_| Datum::Null)
-        .map_err(|_| super::query::arena_full_pub())?;
-    let parameter_types = context
-        .arena
-        .alloc_slice_with(args.len(), |_| 0)
-        .map_err(|_| super::query::arena_full_pub())?;
-    with_bound_parameter_types(&[], || -> Result<(), SqlError> {
-        let catalog =
-            super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
-        let sequence = crate::sql::sequence::SeqEval::new(
-            context.storage(),
-            context.seq_session(),
-            context.txn.txid,
-        );
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            sequences: Some(&sequence),
-            ..NO_HOOKS
-        };
-        for (index, argument) in args.iter().copied().enumerate() {
-            parameter_types[index] =
-                super::eval::expression_type_identity(argument, &NoColumns, &hooks)?
-                    .record_field_oid();
-            values[index] = detached_trigger_datum(
-                eval_full(argument, context.arena, &[], &NoColumns, &hooks)?,
-                context.arena,
-            )?;
-        }
-        Ok(())
-    })?;
     let PlpgsqlExecHost::Routine {
         engine, sqlprep, ..
     } = &context.host
@@ -24419,27 +24387,68 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
     let owner = sqlprep
         .plan_owner(name)
         .expect("a live SQL prepared statement owns its routine input plans");
-    let declared =
-        crate::sql::prep::decode_types(sqlprep.get_type_codes(name).unwrap_or(&[]), context.arena)?;
-    let declared_count = declared.len();
-    if declared_count != 0 && values.len() != declared_count {
-        return Err(sql_err!(
-            sqlstate::PROTOCOL_VIOLATION,
-            "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
-            name,
-            declared_count,
-            values.len()
+    let declared = sqlprep
+        .parameter_types(name)
+        .expect("a resolved SQL prepared statement retains its parameter types");
+    if declared.len() != 0 && declared.len() != args.len() {
+        return Err(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "wrong number of parameters for prepared statement \"{}\"",
+                name
+            ),
+            format_args!(
+                "Expected {} parameters but got {}.",
+                declared.len(),
+                args.len()
+            ),
         ));
     }
-    for (index, value) in values.iter_mut().enumerate() {
-        if index < declared_count {
-            parameter_types[index] = declared[index].oid();
-            *value = detached_trigger_datum(
-                crate::sql::eval::cast(*value, declared[index].internal_name(), context.arena)?,
-                context.arena,
-            )?;
+    let mut declared = declared.iter();
+    let parameter_types = context
+        .arena
+        .alloc_slice_with(args.len(), |_| declared.next().unwrap_or(0))
+        .map_err(|_| super::query::arena_full_pub())?;
+    let declared_count = parameter_types.iter().take_while(|oid| **oid != 0).count();
+    let values = context
+        .arena
+        .alloc_slice_with(args.len(), |_| Datum::Null)
+        .map_err(|_| super::query::arena_full_pub())?;
+    with_bound_parameter_types(&[], || -> Result<(), SqlError> {
+        let catalog =
+            super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
+        let sequence = crate::sql::sequence::SeqEval::new(
+            context.storage(),
+            context.seq_session(),
+            context.txn.txid,
+        );
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequence),
+            ..NO_HOOKS
+        };
+        for (index, argument) in args.iter().copied().enumerate() {
+            let value = if index < declared_count {
+                eval_prepared_argument(
+                    argument,
+                    index + 1,
+                    parameter_types[index],
+                    context.storage(),
+                    context.txn.txid,
+                    context.arena,
+                    &[],
+                    &hooks,
+                )?
+            } else {
+                parameter_types[index] =
+                    super::eval::expression_type_identity(argument, &NoColumns, &hooks)?
+                        .record_field_oid();
+                eval_full(argument, context.arena, &[], &NoColumns, &hooks)?
+            };
+            values[index] = detached_trigger_datum(value, context.arena)?;
         }
-    }
+        Ok(())
+    })?;
     let text = context
         .arena
         .alloc_str(text)
@@ -78250,6 +78259,85 @@ fn coerce_assignment<'a>(
         return apply_typmod(value, column.ctype, column.type_mod, arena);
     }
     coerce_column_value(value, column, storage, txid, arena, sequences)
+}
+
+/// Evaluates one SQL `EXECUTE` argument into its declared parameter type
+/// with PostgreSQL's assignment coercion (`EvaluateParams`). The declared OID
+/// is the parameter's whole identity, so domains, enums, composites, relation
+/// row types and their arrays coerce through the catalog.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "prepared argument execution context"
+)]
+pub(crate) fn eval_prepared_argument<'a>(
+    expression: &Expr<'a>,
+    position: usize,
+    target_oid: i32,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    if expression.contains_subquery() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot use subquery in EXECUTE parameter"
+        ));
+    }
+    let target = storage
+        .routine_result_for_oid(target_oid, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type with OID {} does not exist",
+                target_oid
+            )
+        })?;
+    let source = super::eval::expression_type_identity(expression, &NoColumns, hooks)?
+        .routine_argument_oid();
+    let record_to_composite =
+        source == crate::sql::types::oid::RECORD && matches!(target.ctype, ColType::Composite(_));
+    if !record_to_composite
+        && !super::catalog::assignment_coercible(storage, txid, source, target_oid)
+    {
+        let name = |oid: i32| {
+            super::eval::regtype_of_oid_with_catalog(i64::from(oid), hooks.catalog, arena).map(
+                |name| match name {
+                    Datum::Regtype { name, .. } => name,
+                    _ => "",
+                },
+            )
+        };
+        let error = sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "parameter ${} of type {} cannot be coerced to the expected type {}",
+            position,
+            name(source)?,
+            name(target_oid)?
+        );
+        super::eval::stash_diagnostic(
+            None,
+            Some(StackStr::from_str(
+                "You will need to rewrite or cast the expression.",
+            )),
+        );
+        return Err(error);
+    }
+    let column = ColumnMeta {
+        ctype: target.ctype,
+        user_type: target.user_type,
+        ..ColumnMeta::EMPTY
+    };
+    let value = eval_assignment(
+        expression, &column, storage, txid, arena, params, &NoColumns, hooks,
+    )?;
+    match constraints::column_domain_target(storage, &column, txid)? {
+        Some(domain) => {
+            coerce_domain_value(storage, domain, value, txid, arena, &[], hooks.sequences)
+        }
+        None => Ok(value),
+    }
 }
 
 #[expect(

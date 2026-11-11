@@ -25361,404 +25361,15 @@ fn catalog_regproc<'a>(
 
 fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_cast", false);
-    let builtin = [
-        (
-            10_001,
-            super::types::oid::MONEY,
-            super::types::oid::NUMERIC,
-            3823,
-            "a",
-            "f",
-        ),
-        (
-            10_002,
-            super::types::oid::NUMERIC,
-            super::types::oid::MONEY,
-            3824,
-            "a",
-            "f",
-        ),
-        (
-            10_003,
-            super::types::oid::INT4,
-            super::types::oid::MONEY,
-            3811,
-            "a",
-            "f",
-        ),
-        (
-            10_004,
-            super::types::oid::INT8,
-            super::types::oid::MONEY,
-            3812,
-            "a",
-            "f",
-        ),
-        (
-            10143,
-            super::types::oid::INT2,
-            super::types::oid::BYTEA,
-            6367,
-            "e",
-            "f",
-        ),
-        (
-            10144,
-            super::types::oid::INT4,
-            super::types::oid::BYTEA,
-            6368,
-            "e",
-            "f",
-        ),
-        (
-            10145,
-            super::types::oid::INT8,
-            super::types::oid::BYTEA,
-            6369,
-            "e",
-            "f",
-        ),
-        (
-            10146,
-            super::types::oid::BYTEA,
-            super::types::oid::INT2,
-            6370,
-            "e",
-            "f",
-        ),
-        (
-            10147,
-            super::types::oid::BYTEA,
-            super::types::oid::INT4,
-            6371,
-            "e",
-            "f",
-        ),
-        (
-            10148,
-            super::types::oid::BYTEA,
-            super::types::oid::INT8,
-            6372,
-            "e",
-            "f",
-        ),
-        (
-            10158,
-            super::types::oid::DATE,
-            super::types::oid::TIMESTAMP,
-            2024,
-            "i",
-            "f",
-        ),
-        (
-            10159,
-            super::types::oid::DATE,
-            super::types::oid::TIMESTAMPTZ,
-            1174,
-            "i",
-            "f",
-        ),
-        (
-            10160,
-            super::types::oid::TIME,
-            super::types::oid::INTERVAL,
-            1370,
-            "i",
-            "f",
-        ),
-        (
-            10161,
-            super::types::oid::TIME,
-            super::types::oid::TIMETZ,
-            2047,
-            "i",
-            "f",
-        ),
-        (
-            10162,
-            super::types::oid::TIMESTAMP,
-            super::types::oid::DATE,
-            2029,
-            "a",
-            "f",
-        ),
-        (
-            10163,
-            super::types::oid::TIMESTAMP,
-            super::types::oid::TIME,
-            1316,
-            "a",
-            "f",
-        ),
-        (
-            10164,
-            super::types::oid::TIMESTAMP,
-            super::types::oid::TIMESTAMPTZ,
-            2028,
-            "i",
-            "f",
-        ),
-        (
-            10165,
-            super::types::oid::TIMESTAMPTZ,
-            super::types::oid::DATE,
-            1178,
-            "a",
-            "f",
-        ),
-        (
-            10166,
-            super::types::oid::TIMESTAMPTZ,
-            super::types::oid::TIME,
-            2019,
-            "a",
-            "f",
-        ),
-        (
-            10167,
-            super::types::oid::TIMESTAMPTZ,
-            super::types::oid::TIMESTAMP,
-            2027,
-            "a",
-            "f",
-        ),
-        (
-            10168,
-            super::types::oid::TIMESTAMPTZ,
-            super::types::oid::TIMETZ,
-            1388,
-            "a",
-            "f",
-        ),
-        (
-            10169,
-            super::types::oid::INTERVAL,
-            super::types::oid::TIME,
-            1419,
-            "a",
-            "f",
-        ),
-        (
-            10170,
-            super::types::oid::TIMETZ,
-            super::types::oid::TIME,
-            2046,
-            "a",
-            "f",
-        ),
-        (
-            10212,
-            super::types::oid::TIME,
-            super::types::oid::TIME,
-            1968,
-            "i",
-            "f",
-        ),
-        (
-            10213,
-            super::types::oid::TIMESTAMP,
-            super::types::oid::TIMESTAMP,
-            1961,
-            "i",
-            "f",
-        ),
-        (
-            10214,
-            super::types::oid::TIMESTAMPTZ,
-            super::types::oid::TIMESTAMPTZ,
-            1967,
-            "i",
-            "f",
-        ),
-        (
-            10215,
-            super::types::oid::INTERVAL,
-            super::types::oid::INTERVAL,
-            1200,
-            "i",
-            "f",
-        ),
-        (
-            10216,
-            super::types::oid::TIMETZ,
-            super::types::oid::TIMETZ,
-            1969,
-            "i",
-            "f",
-        ),
-        (
-            10185,
-            super::types::oid::MACADDR,
-            super::types::oid::MACADDR8,
-            4123,
-            "i",
-            "f",
-        ),
-        (
-            10186,
-            super::types::oid::MACADDR8,
-            super::types::oid::MACADDR,
-            4124,
-            "i",
-            "f",
-        ),
-        (
-            10187,
-            super::types::oid::CIDR,
-            super::types::oid::INET,
-            0,
-            "i",
-            "b",
-        ),
-        (
-            10188,
-            super::types::oid::INET,
-            super::types::oid::CIDR,
-            1715,
-            "a",
-            "f",
-        ),
-        (
-            10195,
-            super::types::oid::CIDR,
-            super::types::oid::TEXT,
-            730,
-            "a",
-            "f",
-        ),
-        (
-            10196,
-            super::types::oid::INET,
-            super::types::oid::TEXT,
-            730,
-            "a",
-            "f",
-        ),
-        (
-            10200,
-            super::types::oid::CIDR,
-            super::types::oid::VARCHAR,
-            730,
-            "a",
-            "f",
-        ),
-        (
-            10201,
-            super::types::oid::INET,
-            super::types::oid::VARCHAR,
-            730,
-            "a",
-            "f",
-        ),
-        (
-            10205,
-            super::types::oid::CIDR,
-            super::types::oid::BPCHAR,
-            730,
-            "a",
-            "f",
-        ),
-        (
-            10206,
-            super::types::oid::INET,
-            super::types::oid::BPCHAR,
-            730,
-            "a",
-            "f",
-        ),
-        (
-            10081,
-            super::types::oid::OID,
-            super::types::oid::REGCOLLATION,
-            0,
-            "i",
-            "b",
-        ),
-        (
-            10082,
-            super::types::oid::REGCOLLATION,
-            super::types::oid::OID,
-            0,
-            "i",
-            "b",
-        ),
-        (
-            10083,
-            super::types::oid::INT8,
-            super::types::oid::REGCOLLATION,
-            1287,
-            "i",
-            "f",
-        ),
-        (
-            10084,
-            super::types::oid::INT2,
-            super::types::oid::REGCOLLATION,
-            313,
-            "i",
-            "f",
-        ),
-        (
-            10085,
-            super::types::oid::INT4,
-            super::types::oid::REGCOLLATION,
-            0,
-            "i",
-            "b",
-        ),
-        (
-            10086,
-            super::types::oid::REGCOLLATION,
-            super::types::oid::INT8,
-            1288,
-            "a",
-            "f",
-        ),
-        (
-            10087,
-            super::types::oid::REGCOLLATION,
-            super::types::oid::INT4,
-            0,
-            "a",
-            "b",
-        ),
-    ];
     let rows = catalog_rows(
         arena,
-        builtin.len()
-            + crate::sql::geometry::CAST_IDENTITIES.len()
-            + storage.casts_visible_to(txid).count(),
+        builtin_properties::CASTS.len() + storage.casts_visible_to(txid).count(),
     )?;
-    for (index, (oid, source, target, function, context, method)) in builtin.into_iter().enumerate()
-    {
-        rows[index] = row(
+    for (target, cast) in rows.iter_mut().zip(builtin_properties::CASTS) {
+        *target = row(
             &[
                 Datum::Int4(2605),
-                Datum::Int4(oid),
-                Datum::Int4(source),
-                Datum::Int4(target),
-                Datum::Int4(function),
-                Datum::Bpchar(context),
-                Datum::Bpchar(method),
-            ],
-            arena,
-        )?;
-    }
-    let mut count = builtin.len();
-    for &(oid, source, target) in crate::sql::geometry::CAST_IDENTITIES {
-        let cast = builtin_properties::CASTS
-            .iter()
-            .find(|cast| cast.source == source.oid() && cast.target == target.oid())
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "geometric catalog cast has no shared declaration"
-                )
-            })?;
-        rows[count] = row(
-            &[
-                Datum::Int4(2605),
-                Datum::Int4(oid),
+                Datum::Int4(cast.oid),
                 Datum::Int4(cast.source),
                 Datum::Int4(cast.target),
                 Datum::Int4(cast.procedure),
@@ -25777,8 +25388,8 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ],
             arena,
         )?;
-        count += 1;
     }
+    let mut count = builtin_properties::CASTS.len();
     for (_, cast) in storage.casts_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_cast"));
@@ -30773,7 +30384,7 @@ fn pg_prepared_statements<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_prepared_statements", false);
-    let catalog_types = pg_type(storage, txid, Materialization::Query, arena)?;
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     crate::sql::prep::with_active(|pool| {
         let rows = arena
             .alloc_slice_with(
@@ -30788,84 +30399,36 @@ fn pg_prepared_statements<'a>(
                 if found_error.is_some() {
                     return;
                 }
-                let parameters = match arena
-                    .alloc_slice_with(prepared.parameter_type_codes.len(), |_| Datum::Null)
-                {
-                    Ok(parameters) => parameters,
-                    Err(_) => {
-                        found_error = Some(arena_full());
-                        return;
+                let type_array = |types: crate::sql::prep::PreparedTypes<'_>| {
+                    let mut names = [Datum::Null; super::exec::MAX_PROJ];
+                    let values = if types.len() <= names.len() {
+                        &mut names[..types.len()]
+                    } else {
+                        arena
+                            .alloc_slice_with(types.len(), |_| Datum::Null)
+                            .map_err(|_| arena_full())?
+                    };
+                    for (target, oid) in values.iter_mut().zip(types.iter()) {
+                        *target = super::eval::regtype_of_oid_with_catalog(
+                            i64::from(oid),
+                            Some(&catalog),
+                            arena,
+                        )?;
                     }
-                };
-                let parameter_types =
-                    match crate::sql::prep::decode_types(prepared.parameter_type_codes, arena) {
-                        Ok(types) => types,
-                        Err(error) => {
-                            found_error = Some(error);
-                            return;
-                        }
-                    };
-                for (target, ctype) in parameters.iter_mut().zip(parameter_types) {
-                    let oid = ctype.oid();
-                    let Some(name) = intrinsic_type_name(oid) else {
-                        found_error = Some(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "prepared parameter type {} has no catalog name",
-                            oid
-                        ));
-                        return;
-                    };
-                    *target = Datum::Regtype {
-                        referenced_oid: oid,
-                        name,
-                    };
-                }
-                let parameter_types = match super::array::build(parameters, arena) {
-                    Ok(raw) => Datum::Array {
+                    super::array::build(values, arena).map(|raw| Datum::Array {
                         element: super::types::ArrElem::Regtype,
                         raw,
-                    },
+                    })
+                };
+                let (parameter_types, result_types) = match type_array(prepared.parameter_types)
+                    .and_then(|parameters| Ok((parameters, type_array(prepared.result_types)?)))
+                {
+                    Ok(types) => types,
                     Err(error) => {
                         found_error = Some(error);
                         return;
                     }
                 };
-                let mut results = [Datum::Null; super::exec::MAX_PROJ];
-                for (target, oid) in results.iter_mut().zip(prepared.result_types.iter()) {
-                    let name = intrinsic_type_name(oid).or_else(|| {
-                        catalog_types.rows.iter().find_map(|row| {
-                            let matches = matches!(row[0], Datum::Int4(value) if value == oid)
-                                || matches!(row[0], Datum::Oid(value) if value == oid as u32);
-                            matches.then(|| match row[1] {
-                                Datum::Text(name) => Some(name),
-                                _ => None,
-                            })?
-                        })
-                    });
-                    let Some(name) = name else {
-                        found_error = Some(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "prepared result type {} has no catalog name",
-                            oid
-                        ));
-                        return;
-                    };
-                    *target = Datum::Regtype {
-                        referenced_oid: oid,
-                        name,
-                    };
-                }
-                let result_types =
-                    match super::array::build(&results[..prepared.result_types.len()], arena) {
-                        Ok(raw) => Datum::Array {
-                            element: super::types::ArrElem::Regtype,
-                            raw,
-                        },
-                        Err(error) => {
-                            found_error = Some(error);
-                            return;
-                        }
-                    };
                 match row(
                     &[
                         match text(prepared.name, arena) {

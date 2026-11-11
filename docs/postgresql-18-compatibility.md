@@ -87,7 +87,8 @@ Row types:
   a row type named like the relation. `ROW(1, 'a')::orders`, `'(1,a)'::orders`,
   `orders[]`, whole-row references (`SELECT o FROM orders o` has type
   `orders`), routine parameters and results (`RETURNS SETOF orders`) and table
-  columns (`CREATE TABLE archive(o orders)`) behave as in PostgreSQL. A routine
+  columns (`CREATE TABLE archive(o orders)`) and prepared statement
+  parameters (`PREPARE q(orders) AS SELECT $1.note`) behave as in PostgreSQL. A routine
   or column using the row type blocks `DROP TABLE orders`; `CASCADE` drops the
   routine or column. Comparing two composite values uses PostgreSQL's record
   ordering, so `ROW(1, NULL)::orders = ROW(1, NULL)::orders` is true.
@@ -293,6 +294,15 @@ Domains and checked inputs:
   over `integer[]`). Arrays of domains whose base is an array of user-defined
   values are rejected. A domain over an array of scalar domains
   (`CREATE DOMAIN positive_ids AS positive_integer[]`) works.
+- `PREPARE q(type, ...)` keeps each parameter's full catalog type, so a
+  domain, enum, composite, relation row type or array parameter is coerced by
+  `EXECUTE` with PostgreSQL's assignment rules: `EXECUTE q(5)` for an `orders`
+  parameter fails with `42804`, and `EXECUTE q(1.5)` for an `integer` one
+  passes 2. A parameter the declaration omits takes its type from its use
+  (`PREPARE r AS SELECT round($1)` has a `double precision` parameter), and
+  one whose use determines nothing is `text`. PostgreSQL instead rejects a
+  parameter that stays undetermined inside a call taking `"any"`
+  (`PREPARE x AS SELECT pg_typeof($1)` fails with `42P18`).
 - Bind validates parameters before function inputs are prepared, so an invalid
   integer parameter fails at Bind. `PREPARE saved AS SELECT
   '{paid}'::checked_status[]` checks the literal once at `PREPARE`;

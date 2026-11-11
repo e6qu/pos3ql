@@ -78,7 +78,7 @@ impl HttpObjectServer {
                 let Some((received, header_end)) =
                     crate::test_wait::read_request_head(&mut stream, &mut request, &server_stop)
                 else {
-                    break;
+                    continue;
                 };
                 let headers = std::str::from_utf8(&request[..header_end]).unwrap();
                 let mut words = headers.lines().next().unwrap().split_whitespace();

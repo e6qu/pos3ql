@@ -133,7 +133,8 @@ pub(super) fn at_routine_exit<T>(
     run().map_err(|error| routine_exit_error(context, invocation, error))
 }
 
-/// Adds the function-exit context line of [`at_routine_exit`] to `error`.
+/// Adds the routine-exit context line to `error`; waits and other internal
+/// control pass through unchanged so a resumed call reports them later.
 pub(super) fn routine_exit_error(
     context: &TriggerExecContext<'_, '_, '_>,
     invocation: TriggerInvocation<'_>,
@@ -185,7 +186,7 @@ pub(super) fn statement_name(statement: TriggerStatement<'_>) -> &'static str {
         TriggerStatement::Case(_) => "CASE",
         TriggerStatement::For(program) => match program.source {
             TriggerForSource::Numeric { .. } => "FOR with integer loop variable",
-            TriggerForSource::Query(_) => "FOR over SELECT rows",
+            TriggerForSource::Query(_) | TriggerForSource::Dml(_) => "FOR over SELECT rows",
             TriggerForSource::DynamicQuery(_) => "FOR over EXECUTE statement",
             TriggerForSource::Array { .. } => "FOREACH over array",
         },
@@ -1732,6 +1733,7 @@ fn bind_exception_variables<'a>(
             TriggerForSource::Query(query) => {
                 site(Kind::Query, core::ptr::from_ref(query) as usize)
             }
+            TriggerForSource::Dml(source) => site(Kind::Statement, source.as_ptr() as usize),
             TriggerForSource::DynamicQuery(query) => dynamic(query),
             TriggerForSource::Array {
                 expression: value, ..

@@ -20359,7 +20359,7 @@ mod stored_dependency_tests {
                     let Some((_, head)) =
                         crate::test_wait::read_request_head(&mut socket, &mut bytes, &server_stop)
                     else {
-                        break;
+                        continue;
                     };
                     let headers = core::str::from_utf8(&bytes[..head]).unwrap();
                     assert!(headers.starts_with("GET "));

@@ -217,7 +217,7 @@ fn sql_table_return_checks_keep_each_completed_row_and_domain_call() {
 }
 
 #[test]
-fn sql_row_callbacks_reject_restarts_that_would_hide_their_parent_write() {
+fn sql_row_callbacks_see_their_parent_write() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -233,25 +233,19 @@ fn sql_row_callbacks_reject_restarts_that_would_hide_their_parent_write() {
                 BEGIN INSERT INTO guarded_audit SELECT count(*) FROM guarded_target; RETURN 1; END$$; \
             CREATE FUNCTION guarded_parent() RETURNS bigint LANGUAGE SQL AS $$ \
                 INSERT INTO guarded_audit VALUES(-1); INSERT INTO guarded_target VALUES(nextval('guarded_numbers')) RETURNING guarded_child() $$",true);
-        let error = writer.execute(&mut engine, "SELECT guarded_parent()", true);
+        // PostgreSQL 18.6: the RETURNING call sees the row its write inserted.
         assert_eq!(
-            error_sqlstates(&error),
-            ["0A000"],
-            "{}",
-            String::from_utf8_lossy(&error)
-        );
-        assert!(
-            String::from_utf8_lossy(&error)
-                .contains("SQL row expression requires retained write progress")
+            data_rows(&writer.success(&mut engine, "SELECT guarded_parent()", true)),
+            ["1"]
         );
         assert_eq!(
             data_rows(&writer.success(
                 &mut engine,
-                "SELECT count(*) FROM guarded_target; SELECT count(*) FROM guarded_audit; \
+                "SELECT n FROM guarded_target; SELECT n FROM guarded_audit ORDER BY n; \
             SELECT last_value FROM guarded_numbers",
                 true
             )),
-            ["0", "0", "1"]
+            ["1", "-1", "1", "1"]
         );
         writer.success(
             &mut engine,
@@ -259,8 +253,12 @@ fn sql_row_callbacks_reject_restarts_that_would_hide_their_parent_write() {
             true,
         );
         assert_eq!(
-            data_rows(&writer.success(&mut engine, "SELECT n FROM guarded_target", true)),
-            ["2"]
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT n FROM guarded_target ORDER BY n",
+                true
+            )),
+            ["1", "2"]
         );
         drop((writer, engine));
         std::fs::remove_dir_all(config.data_dir).unwrap();

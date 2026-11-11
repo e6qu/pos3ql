@@ -103,6 +103,47 @@ impl<'a> TransitionCapture<'a> {
         Ok(())
     }
 
+    pub(super) fn lengths(&self) -> (usize, usize) {
+        (self.old_len, self.new_len)
+    }
+
+    /// The rows captured before `lengths`, for a write that keeps them.
+    pub(super) fn prefix(&self, lengths: (usize, usize)) -> TransitionRows<'_> {
+        TransitionRows {
+            old: &self.old[..lengths.0],
+            new: &self.new[..lengths.1],
+        }
+    }
+
+    /// Restores rows an earlier attempt of the same write captured.
+    pub(super) fn extend_saved(
+        &mut self,
+        rows: TransitionRows<'_>,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        if self.old.len() - self.old_len < rows.old.len()
+            || self.new.len() - self.new_len < rows.new.len()
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "saved transition rows exceed the resumed capture"
+            ));
+        }
+        for row in rows.old {
+            self.old[self.old_len] = arena
+                .alloc_slice_copy(row)
+                .map_err(|_| super::super::query::arena_full_pub())?;
+            self.old_len += 1;
+        }
+        for row in rows.new {
+            self.new[self.new_len] = arena
+                .alloc_slice_copy(row)
+                .map_err(|_| super::super::query::arena_full_pub())?;
+            self.new_len += 1;
+        }
+        Ok(())
+    }
+
     pub(super) fn into_rows(self) -> TransitionRows<'a> {
         // Consuming the writer prevents later mutation of a published row set.
         TransitionRows {

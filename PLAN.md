@@ -34,8 +34,10 @@ logical replication, backup and recovery from object storage work today and are
 compared with PostgreSQL 18 in CI. Object-store requests overlap and commits
 share uploads. SQL runs on one CPU worker. Many paths already pause during a
 storage wait and resume later: reads, cleanup, merges, checkpoints, cursors,
-PL/pgSQL and SQL-language functions, and triggers. Writing statements, and any
-statement after its first effect, still block that worker on a storage read. No measurement on separate machines has been published.
+PL/pgSQL and SQL-language functions, triggers, and the row selection of
+`INSERT ... SELECT`, `UPDATE`, `DELETE` and `MERGE`. A write's row changes,
+DDL, and any statement after its first effect still block that worker on a
+storage read. No measurement on separate machines has been published.
 
 ## Milestones
 
@@ -76,7 +78,15 @@ including nested `CALL`, resuming at the waiting statement after their own
 taken per `FETCH` and scrollable cursors that evaluate revisited rows again;
 client output that never blocks the worker on a slow reader; large
 single-table and generated-series results, and paged portals over them,
-resuming row by row across client, storage and lock waits. The
+resuming row by row across client, storage and lock waits; `INSERT ... SELECT`,
+`UPDATE`, `DELETE` and `MERGE`, at top level and in `CALL` and `DO` bodies,
+yielding on storage reads while they select and lock rows and restarting from
+their start; routine calls inside the rows of an `INSERT`, `UPDATE`, `DELETE`
+or `MERGE` (expressions, join conditions, row triggers, `RETURNING`) at top
+level, in PL/pgSQL statements (including static `RETURNING ... INTO`) and
+`EXECUTE`, and in SQL-language bodies, which keep the rows already changed so
+the call sees them, as in PostgreSQL; `MERGE` as a static PL/pgSQL statement
+and through `EXECUTE`. The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
 
@@ -92,13 +102,48 @@ is owned.
   after the sort), and cursors ordered by source columns, hand each call off
   on its row. Removing the restart needs those shapes retained (above): the
   general executor cannot run a routine body inside expression evaluation.
-- **Write phases:** BEFORE/INSTEAD triggers, source scans, row locks, partitions,
-  constraints, transition tables, rules, data-modifying common table
-  expressions (CTEs), COPY, replication apply and deferred triggers. Keep the
-  original command and rollback boundary. Replace the current explicit rejection
-  of row progress in multirow updates with saved progress: a child statement must
-  see earlier changed rows before the next row is written, and each operation
-  keeps its own transition table and firing order.
+- **Write phases:** a write yields only before its first row change, `VALUES`
+  row or trigger body; after that, row changes, index maintenance, constraint
+  checks, BEFORE/INSTEAD and statement triggers, partition routing, transition
+  tables, rules and `RETURNING` read synchronously, and so do DDL, COPY,
+  replication apply and deferred triggers. A routine call inside the rows
+  already keeps the changed rows within the running statement (row progress:
+  the next attempt selects the rows again under the original command and
+  continues at the unfinished row), also for views and rules written from
+  PL/pgSQL and SQL-language bodies. Move that progress into a
+  startup-reserved owner so a storage or lock wait in the row phase also
+  resumes at its row instead of restarting the statement. Extend row
+  progress to foreign tables, to data-modifying `WITH` inside routine
+  bodies, and to a multi-step statement inside another's step: a routine
+  call after their first row change fails with `0A000` (`SQL row expression
+  requires retained write progress`), because restarting would hide the
+  earlier rows from the call. `INSERT ... SELECT` evaluates its whole source
+  before writing, so a volatile call in the source does not see rows
+  inserted earlier by the same statement (this includes a rule action's
+  `VALUES` over several rows); fixing it needs the source and the row phase
+  to keep separate invocation logs, since the source then runs ahead of the
+  rows by a different amount in each attempt, and a selection that grows
+  between attempts. A data-modifying `WITH` sub-statement runs to completion
+  before the main statement reads it, where PostgreSQL interleaves them row
+  by row, so a call in the main statement sees all of its rows. PL/pgSQL
+  rejects statements that start with `WITH` (`0A000`). A `FOR` loop over a
+  data change fails with `0A000` when an `AFTER` trigger of that change
+  waits, since the loop has no owner for its returned rows.
+- **Routine variables in static statements:** a derived table in a static
+  PL/pgSQL statement (a `FROM` subquery, `UPDATE ... FROM`, or a `MERGE`
+  source) cannot read routine variables (`42703`): input preparation
+  describes it without the routine's scope. Binding variables as parameters
+  when the statement is parsed, as PostgreSQL's parser hook does and as
+  static writes to views and `FOR` loops over data changes already do,
+  fixes the class. In a trigger, `(new).f` fails in an `UPDATE` (`42703`),
+  and `(r).f` fails after `r := new` because the record loses its row type.
+- **Triggers fired inside a write** run without the engine's utility
+  executor, so DDL there (PL/pgSQL `CREATE TABLE`, `EXECUTE 'CREATE ...'`,
+  or a SQL procedure that a BEFORE trigger calls) and writes to views or
+  tables with rules from a `BEFORE` row trigger, or from a trigger of a write
+  another trigger made, fail with `0A000`. Running the trigger body on the
+  engine between write attempts, as routine calls in the rows already run,
+  removes the limit.
 - **Results and cursors:** large results resume row by row for `SELECT`
   from one table or builtin set-returning functions with constant arguments,
   or a nested-loop or hash join of up to eight such items and `VALUES` lists,

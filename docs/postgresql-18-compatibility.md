@@ -159,14 +159,40 @@ Syntax and errors:
   scalar result (`return type mismatch in function declared to return
   integer`, detail `Actual return type is text.`), with context `SQL function
   "f"`; an untyped literal there is text.
-- `INSERT`, `UPDATE` and `DELETE ... RETURNING ... INTO [STRICT] targets` in
-  PL/pgSQL store the returned row and set `FOUND` and `ROW_COUNT`. More than
+- A routine's `INSERT`, `UPDATE` or `DELETE` on a view or on a table with
+  rules goes through the view's triggers and the rules, as at top level:
+  static PL/pgSQL, `EXECUTE` and SQL-language functions alike. A static
+  statement reads the routine's variables and a trigger's `NEW` and `OLD`
+  rows, so `INSERT INTO active_orders VALUES (id)` works in a body. In a
+  `BEFORE` row trigger, or a trigger of a write that another trigger made,
+  it fails with `0A000`.
+- A subquery in `FROM`, an `UPDATE ... FROM` item or a `MERGE` source in a
+  static PL/pgSQL statement cannot read the routine's variables: `MERGE INTO
+  t USING (SELECT id_var AS id) s ...` fails with `42703` (`column "id_var"
+  does not exist`), where PostgreSQL reads the variable. Pass the value with
+  `EXECUTE ... USING` instead.
+- A rule on a data-modifying `WITH` sub-statement's target must leave one
+  statement, as in PostgreSQL: `DO ALSO`, conditional, multi-statement,
+  `NOTHING` and `NOTIFY` `INSTEAD` rules fail with `0A000` before anything
+  runs. The command tag of a statement an unconditional `INSTEAD` rule
+  replaces counts the last `INSTEAD` action of the same command.
+- `INSERT`, `UPDATE`, `DELETE` and `MERGE ... RETURNING ... INTO [STRICT]
+  targets` in PL/pgSQL store the returned row and set `FOUND` and
+  `ROW_COUNT`. A routine called in the statement's rows or `RETURNING` list
+  sees the rows the statement changed before it, as at top level. More than
   one row fails with `P0003` (`query returned more than one row`) even without
   `STRICT`; no row fails with `P0002` only under `STRICT` and otherwise stores
   NULLs. `RETURNING` without `INTO` fails with `query has no destination for
   result data`, and `INTO` without `RETURNING` with `INTO used with a command
   that cannot return data`. As in PostgreSQL, extra result columns are
   ignored and targets without a column become NULL.
+- `FOR target IN INSERT | UPDATE | DELETE | MERGE ... RETURNING ... LOOP`
+  and the same through `FOR ... IN EXECUTE` run the statement to completion
+  before the first iteration, as PostgreSQL does, so the loop body sees
+  every changed row. Without `RETURNING` the loop fails with `42P11`
+  (`cannot open INSERT query as cursor`). A scalar target takes the first
+  returned column. For example, `FOR r IN DELETE FROM jobs WHERE done
+  RETURNING id LOOP ... END LOOP` visits each deleted job once.
 - A function's name qualifies its parameters, as in PostgreSQL: in
   `CREATE FUNCTION f(a int)`, `f.a` is the parameter `a` in SQL and
   PL/pgSQL bodies, even when a table in the query has a column `a`.

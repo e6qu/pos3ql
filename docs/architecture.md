@@ -70,6 +70,50 @@ a volatile function or a user routine body, issuing `nextval`/`setval`, and
 output actually reaching the client. After the first effect, the remaining
 reads of that statement block until the statement ends.
 
+**Writes restart before their row changes.** `INSERT ... SELECT`, `UPDATE`,
+`DELETE` and `MERGE`, at top level or as a statement of a `CALL` or `DO` body,
+first select their rows: `INSERT ... SELECT` materializes its source rows,
+`UPDATE` and `DELETE` collect the target rows and lock each one, and `MERGE`
+joins its source and target. Nothing has changed yet, so a cold read or a row
+lock wait in this phase rolls the statement back to its start (row images,
+locks, journal records and statistics) and yields; on resume it runs again and
+sees the rows as of its new start, as PostgreSQL would had it started then.
+A sequence or routine call in the scan is an effect as usual: later reads
+block, and a later row-lock wait replays its results. The first row change, `VALUES` row or trigger body is the write's
+first effect: index maintenance, constraint checks, triggers and `RETURNING`
+then read synchronously until the statement ends. A `BEFORE STATEMENT` trigger
+therefore makes the whole scan synchronous.
+
+**Routine calls keep a write's changed rows.** A row expression, row trigger
+or `RETURNING` item of `INSERT`, `UPDATE`, `DELETE` or `MERGE` (including
+its join condition) that calls a PL/pgSQL or
+data-modifying function ends the write attempt, because the call runs on the
+engine. Before the first row change the attempt rolls back and runs again,
+replaying the call's saved result. After it, the write keeps its changed rows:
+only the unfinished row rolls back, the call runs and sees the earlier rows'
+changes, and the next attempt selects its rows again under the same command,
+skips the changed ones and continues at that row, or at its `RETURNING`
+values when the call was there. Statement triggers, transition rows,
+sequence values and returned rows each happen once. A wait or error inside
+such a call still rolls the whole statement back. `INSTEAD OF` view triggers
+keep their rows the same way. A statement made of several steps (the
+sub-statements of a data-modifying `WITH` and its main statement; a rule's
+original statement and actions) also keeps the steps it finished: their
+output rows and row counts are saved, the next attempt skips them, and the
+unfinished step continues at its row, or runs again from its own start.
+Where a write cannot keep its rows (a foreign table, a multi-step statement
+inside another's step, or a step that changed rows without row progress), a
+call after its first change fails with `0A000` instead of running after a
+rollback that would hide those changes.
+
+**Example:** `UPDATE items SET total = running_total()`, where
+`running_total()` sums `items`, gives each row the sum including the rows
+updated before it, as in PostgreSQL.
+
+**Example:** `UPDATE orders SET status = 'late' WHERE due < now()` over cold
+`orders` yields while it downloads the blocks it scans; other clients run
+meanwhile. Each wait discards only the scan, and the rows change once.
+
 **The worker never waits for a client.** A result larger than the
 connection's send buffer (`conn_send_buffer_bytes`) queues in the
 connection's **overflow area**: rows lease space from the shared result spool
@@ -180,9 +224,12 @@ BY id` sorts first, so its output queues in the spool instead.
 | A statement after its first effect (volatile function, routine body, sequence change, first output byte reaching the client) | Blocks until the statement ends |
 | Output queued for a slow client | Never blocks; the connection waits for the client between messages |
 | Result streams (see above), including `COPY ... TO STDOUT` and a streamed `FETCH`: each row before its first effect | Yields; delivered rows are kept |
-| Writing statements: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, DDL, `COPY FROM` | Blocks for the whole statement |
-| Top-level `CALL` and `DO` bodies: queries before the statement's first effect | Yields; the body resumes at its waiting statement |
-| Writes and statements after the first effect inside a `CALL` or `DO` body | Blocks |
+| Writes (`INSERT ... SELECT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`), also in a `CALL` or `DO` body: selecting and locking rows before the first row change, `VALUES` row or trigger body | Yields; the statement restarts from its start (see above) |
+| Writes after their first row change, `VALUES` row or trigger body: index maintenance, constraint checks, triggers, `RETURNING` | Blocks until the statement ends |
+| Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, rule actions, `INSTEAD OF` view triggers): row expressions, row triggers, `RETURNING` | Run on the engine between attempts; the write keeps its changed rows and finished steps and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
+| DDL and `COPY FROM` | Blocks for the whole statement |
+| Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |
+| Statements after the first effect inside a `CALL` or `DO` body | Blocks |
 | Commit processing, deferred constraint triggers, `SET CONSTRAINTS`, `PREPARE TRANSACTION`, `COMMIT PREPARED`/`ROLLBACK PREPARED` | Blocks |
 | `COPY FROM` rows and completion; a `COPY TO` that cannot stream once its first byte reaches the client; logical-replication apply and initial copy | Blocks |
 | Large-object fast-path calls, login event triggers, manual `CHECKPOINT` | Blocks |
@@ -337,7 +384,9 @@ Further rules that apply to every saved owner:
   call's receipt instead of taking another hold.
 - **Unsupported restarts fail loudly.** A path that cannot save its progress
   returns `0A000` and rolls back rather than repeat a write — for example
-  `SQL row expression requires retained write progress`, or an unsaved volatile
+  `SQL row expression requires retained write progress` for a routine call
+  after a SQL-language function's `MERGE` or data-modifying `WITH`, or a
+  foreign table's write, changed rows; or an unsaved volatile
   value such as `random()`. Contexts with no resumable executor reject advisory
   unlocks with `0A000`.
 - **Typed wait markers.** Internal waits use a typed marker, not a SQLSTATE.

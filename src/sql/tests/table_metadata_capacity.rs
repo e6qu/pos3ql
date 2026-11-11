@@ -749,12 +749,13 @@ fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
     .unwrap();
     engine.storage.attach_spill(reader);
     engine.ckpt = Some(checkpoint);
-    engine.enable_async_block_reads();
+    // The setup write reads synchronously; only commit admission is cold.
     session.success(
         &mut engine,
         "BEGIN; TRUNCATE cold_commit_empty; UPDATE cold_commit_rows SET id=2",
         true,
     );
+    engine.enable_async_block_reads();
     // UPDATE may retain its source block in the spill reader's decode scratch.
     // A fresh fixture reader gives the WAL builder a genuinely cold old image.
     let mut commit_read_budget = Budget::new(crate::storage::SpillReader::budget_bytes(

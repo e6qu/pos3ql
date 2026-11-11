@@ -376,12 +376,13 @@ fn sequence_advances_from_another_transaction_survive_cold_commit_retries() {
     // Keep the writer authority acquired by Engine::new for both checkpoints.
     // Only the row decoder is replaced below to make commit admission cold.
     let blocks = engine.ckpt.as_ref().unwrap().block_stack();
-    engine.enable_async_block_reads();
+    // The setup write reads synchronously; only commit admission is cold.
     session.success(
         &mut engine,
         "BEGIN; TRUNCATE cold_commit_empty; UPDATE cold_commit_rows SET id=2; SELECT nextval('publication_counter')",
         true,
     );
+    engine.enable_async_block_reads();
     // UPDATE may retain its source block in the spill reader's decode scratch.
     // A fresh fixture reader gives the WAL builder a genuinely cold old image.
     let mut commit_read_budget = Budget::new(crate::storage::SpillReader::budget_bytes(

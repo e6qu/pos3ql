@@ -59,6 +59,8 @@ struct SuspendedProcedureState {
     inputs: local_values::SavedValues,
     environment: SavedCallEnvironment,
     timing: super::super::statistics::PausedFunctionTiming,
+    /// The PL/pgSQL settings the body started with; a resumed body keeps them.
+    settings: super::super::guc::PlpgsqlSettings,
     execution: Option<execution_frame::SuspendedExecutionFrame>,
     progress: super::super::sequence::SavedStatementPosition,
 }
@@ -119,6 +121,10 @@ pub(super) fn execute<'a>(
                     inputs: saved_inputs,
                     environment: saved_environment,
                     timing: timing.pause(),
+                    settings: super::super::guc::PlpgsqlSettings {
+                        variable_conflict: body.invocation.variable_conflict,
+                        print_strict_params: body.invocation.print_strict_params,
+                    },
                     execution: Some(execution),
                     progress,
                 })
@@ -209,8 +215,8 @@ fn run<'a>(
 
 impl SuspendedProcedure {
     /// Continues the saved body at its waiting statement. `invocation` builds
-    /// the call's invocation from the restored program's input sites and
-    /// compile options, and
+    /// the call's invocation from the restored program's input sites and its
+    /// saved PL/pgSQL settings, and
     /// `seeded` maps the saved inputs to named locals. A failed attachment
     /// leaves the saved body in `retention` unchanged.
     pub(super) fn resume<'a>(
@@ -218,7 +224,8 @@ impl SuspendedProcedure {
         context: &mut TriggerExecContext<'_, 'a, '_>,
         identity: ProcedureIdentity,
         invocation: &dyn Fn(
-            super::ParsedTriggerProgram<'a>,
+            &'a [super::super::plpgsql_inputs::Site<'a>],
+            super::super::guc::PlpgsqlSettings,
         ) -> Result<TriggerInvocation<'a>, SqlError>,
         seeded: &dyn Fn(&'a [Datum<'a>]) -> Result<&'a [Datum<'a>], SqlError>,
         retention: &mut Option<SuspendedProcedure>,
@@ -259,7 +266,7 @@ impl SuspendedProcedure {
                     Ok(inputs) => inputs,
                     Err(error) => return Err((frame, error)),
                 };
-                let invocation = match invocation(parsed) {
+                let invocation = match invocation(parsed.input_sites, state.settings) {
                     Ok(invocation) => invocation,
                     Err(error) => return Err((frame, error)),
                 };

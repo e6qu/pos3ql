@@ -146,6 +146,7 @@ pub(crate) fn check_statement<'a, 'v>(
             }
             check.items(delete.returning.items, &target)
         }
+        Stmt::Merge(merge) => check.merge(merge, &root),
         _ => Ok(()),
     }
 }
@@ -197,6 +198,67 @@ impl<'a> Check<'a, '_> {
                 self.arena,
             )
         })
+    }
+
+    /// A `MERGE` as PostgreSQL's `transformMergeStmt` analyses it: the
+    /// source, the join condition over target and source, each `WHEN`
+    /// clause with the relations its kind can see (`NOT MATCHED [BY TARGET]`
+    /// sees only the source, `NOT MATCHED BY SOURCE` only the target), and
+    /// `RETURNING`.
+    fn merge(
+        &self,
+        merge: &'a crate::sql::ast::Merge<'a>,
+        root: &Level<'_, 'a>,
+    ) -> Result<(), SqlError> {
+        let Ok(source) = self.arena.alloc(FromClause {
+            base: merge.source,
+            joins: &[],
+        }) else {
+            return Err(super::arena_full_pub());
+        };
+        let source: &'a FromClause<'a> = source;
+        self.relation_sources(source, root)?;
+        let (Some(both), Some(target_only), Some(source_only)) = (
+            self.dml_scope(merge.target, merge.target_alias, Some(source)),
+            self.dml_scope(merge.target, merge.target_alias, None),
+            self.quietly(|| {
+                QueryScope::resolve_schema(self.storage, source, self.txid, self.arena, None)
+            }),
+        ) else {
+            return Ok(());
+        };
+        let level = |scope| Level {
+            scope: Some(scope),
+            parent: None,
+        };
+        let (both, target_only, source_only) =
+            (level(&both), level(&target_only), level(&source_only));
+        self.expression(merge.on, &both)?;
+        for when in merge.whens {
+            let visible = match when.kind() {
+                crate::sql::ast::MergeMatchKind::Matched => &both,
+                crate::sql::ast::MergeMatchKind::NotMatchedBySource => &target_only,
+                crate::sql::ast::MergeMatchKind::NotMatchedByTarget => &source_only,
+            };
+            if let Some(condition) = when.condition() {
+                self.expression(condition, visible)?;
+            }
+            match when.action() {
+                crate::sql::ast::MergeActionRef::Update(assignments) => {
+                    for (_, value) in assignments {
+                        self.expression(value, visible)?;
+                    }
+                }
+                crate::sql::ast::MergeActionRef::Insert { values, .. } => {
+                    for value in values {
+                        self.expression(value, visible)?;
+                    }
+                }
+                crate::sql::ast::MergeActionRef::Delete
+                | crate::sql::ast::MergeActionRef::DoNothing => {}
+            }
+        }
+        self.items(merge.returning.items, &both)
     }
 
     fn reference(

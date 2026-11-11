@@ -831,6 +831,7 @@ impl SqlExecution {
             .unwrap_or_else(|| query::RoutineInvocationState::new(owner, self.policy));
         calls.require_arena(owner)?;
         let replay = sequence::begin_replay_cursor()?;
+        let mut progress = super::RowProgress::new();
         let result = loop {
             sequence::rewind_replay_cursor(replay)?;
             calls.begin_attempt();
@@ -862,7 +863,8 @@ impl SqlExecution {
                     break Err(error);
                 }
             }
-            if capture {
+            // Rows a resumed write keeps also keep their returned values.
+            if capture && !progress.resuming() {
                 self.result.clear();
             }
             let shape = query::RoutineResultShape::from_contract(
@@ -876,18 +878,15 @@ impl SqlExecution {
                 let PlpgsqlExecHost::Routine { engine, .. } = &context.host else {
                     return Err(changed());
                 };
-                context.txn.statement_mark(
+                let (wal, lock) = (
                     engine.wal.stage_mark(context.txn.txid),
                     engine.storage.lock_mark(),
-                )
+                );
+                progress.begin_attempt(wal, lock);
+                context.txn.statement_mark(wal, lock)
             };
-            let before = context.txn.transaction_effect_mark();
-            let descriptors = context.txn.statement_large_object_descriptors(arena)?;
-            let advisory = context.storage().advisory_statement_mark();
-            let settings = match &context.host {
-                PlpgsqlExecHost::Routine { guc, .. } => guc.statement_settings(),
-                _ => return Err(changed()),
-            };
+            let effects = super::write_attempts::WriteAttemptEffects::capture(context)?
+                .ok_or_else(changed)?;
             let outcome = query::with_routine_invocation_scope(
                 Some(query::RoutineInvocationContext::new(&calls, owner)),
                 || {
@@ -922,6 +921,7 @@ impl SqlExecution {
                             None,
                             Some(&mut capture_rows),
                             &mut self.pending_write,
+                            Some(&mut progress),
                         )
                     } else {
                         let output_mark = context.responder.mark();
@@ -960,17 +960,7 @@ impl SqlExecution {
                     }
                 },
             );
-            let changed_effects = context.txn.transaction_effect_mark() != before
-                || !context
-                    .txn
-                    .matches_statement_large_object_descriptors(descriptors)
-                || context.storage().advisory_statement_mark() != advisory
-                || match &context.host {
-                    PlpgsqlExecHost::Routine { guc, .. } => {
-                        !guc.matches_statement_settings(&settings)
-                    }
-                    _ => true,
-                };
+            let changed_effects = effects.changed(context);
             match outcome {
                 Ok(_) => break Ok(()),
                 Err(error) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION => {
@@ -982,11 +972,12 @@ impl SqlExecution {
                         }
                         break result;
                     }
-                    if changed_effects {
-                        break Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "SQL row expression requires retained write progress"
-                        ));
+                    let unfinished = match progress.unfinished_row(context.txn) {
+                        Ok(unfinished) => unfinished,
+                        Err(error) => break Err(error),
+                    };
+                    if unfinished.is_none() && changed_effects {
+                        break Err(super::write_attempts::retained_progress_required());
                     }
                     let PlpgsqlExecHost::Routine {
                         engine,
@@ -998,7 +989,11 @@ impl SqlExecution {
                     else {
                         return Err(changed());
                     };
-                    engine.rollback_waiting_statement(context.txn, mark);
+                    // Kept rows stay changed; only the unfinished row is undone.
+                    engine.rollback_waiting_statement(
+                        context.txn,
+                        unfinished.map_or(mark, |row| row.mark),
+                    );
                     let pending = calls.take_pending().ok_or_else(|| {
                         sql_err!(
                             sqlstate::INTERNAL_ERROR,
@@ -1022,11 +1017,11 @@ impl SqlExecution {
                         break Err(error);
                     }
                 }
-                Err(error) if changed_effects && control_flow::is_execution_wait(&error) => {
-                    break Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "SQL row expression requires retained write progress"
-                    ));
+                Err(error)
+                    if (changed_effects || progress.changed_rows())
+                        && control_flow::is_execution_wait(&error) =>
+                {
+                    break Err(super::write_attempts::retained_progress_required());
                 }
                 Err(error) => break Err(error),
             }

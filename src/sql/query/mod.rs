@@ -1510,6 +1510,35 @@ pub(crate) fn with_routine_invocation_scope<R>(
     execute()
 }
 
+/// A position in a statement attempt's invocation log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InvocationPosition {
+    calls: usize,
+    inputs: usize,
+}
+
+/// The active invocation log's position; `None` without a log.
+pub(crate) fn active_invocation_position() -> Option<InvocationPosition> {
+    with_active_routine_invocations(|context| {
+        context.map(|(invocations, _)| invocations.position())
+    })
+}
+
+/// Moves the active invocation log to `position`, recorded by
+/// [`active_invocation_position`] in an earlier attempt of the same statement.
+pub(crate) fn seek_active_invocations(
+    position: Option<InvocationPosition>,
+) -> Result<(), SqlError> {
+    with_active_routine_invocations(|context| match (context, position) {
+        (Some((invocations, _)), Some(position)) => invocations.seek(position),
+        (None, None) => Ok(()),
+        _ => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "routine invocation log changed between write attempts"
+        )),
+    })
+}
+
 pub(crate) fn with_active_routine_invocations<R>(
     read: impl for<'scope> FnOnce(Option<(&'scope RoutineInvocationState, &'scope Arena)>) -> R,
 ) -> R {
@@ -1902,6 +1931,27 @@ impl RoutineInvocationState {
             sqlstate::INTERNAL_ROUTINE_INVOCATION,
             "mutable intrinsic invocation is pending"
         ))
+    }
+
+    pub(crate) fn position(&self) -> InvocationPosition {
+        InvocationPosition {
+            calls: self.next.get(),
+            inputs: self.inputs.position(),
+        }
+    }
+
+    /// Continues this attempt's replay at a position an earlier attempt
+    /// recorded, skipping the calls of work it does not repeat.
+    pub(crate) fn seek(&self, position: InvocationPosition) -> Result<(), SqlError> {
+        if position.calls > self.results.borrow().len() || self.pending.get().is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "routine invocation replay position is outside its log"
+            ));
+        }
+        self.next.set(position.calls);
+        self.inputs.seek(position.inputs);
+        Ok(())
     }
 
     pub(crate) fn take_pending(&self) -> Option<PendingRoutineInvocation> {

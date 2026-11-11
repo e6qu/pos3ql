@@ -9122,6 +9122,14 @@ impl Engine {
             .map(Checkpointer::atomic_block_read_scope)
     }
 
+    /// Reads that yield until `query::protect_statement_effects` activates
+    /// the scope.
+    fn deferred_block_read_scope(&self) -> Option<crate::checkpoint::AtomicBlockReadScope> {
+        self.ckpt
+            .as_ref()
+            .map(Checkpointer::deferred_atomic_block_read_scope)
+    }
+
     /// Enables reactor-driven reads for durable blocks. Root and journal
     /// uploads use their separately reserved clients and completion state.
     pub(crate) fn enable_async_block_reads(&mut self) {
@@ -14216,6 +14224,11 @@ impl Engine {
                 ));
             }
         }
+        for cte in with {
+            if let Some(dml) = cte.dml {
+                check_cte_rules(&self.storage, dml, txn)?;
+            }
+        }
         let deferred = query::with_active_routine_invocations(|context| {
             context.map(|(invocations, _)| invocations.hold_output_for_write_queries())
         })
@@ -14245,6 +14258,7 @@ impl Engine {
                     params,
                     guc,
                     responder,
+                    None,
                 )?)
             };
             let materialized = arena
@@ -14367,7 +14381,10 @@ impl Engine {
     }
 
     /// Runs one analysed data-modifying `WITH` query once and returns its
-    /// `RETURNING` rows, projected-encoded in `arena`.
+    /// `RETURNING` rows, projected-encoded in `arena`. With `progress`, the
+    /// query is the one step of a pending write's attempts: rows an earlier
+    /// attempt changed stay changed, and their returned rows are kept for
+    /// this attempt instead of being returned again.
     #[allow(clippy::too_many_arguments)]
     fn execute_dml_cte<'a, 'e>(
         storage: &mut Storage,
@@ -14380,12 +14397,42 @@ impl Engine {
         params: &[Datum<'e>],
         guc: &GucState,
         responder: &mut Responder,
+        mut progress: Option<&mut exec::RowProgress>,
     ) -> Result<&'a [&'a [u8]], SqlError> {
         use crate::sql::exec::encode_projected_pub;
+        if progress
+            .as_deref_mut()
+            .is_some_and(|progress| !progress.claim_steps())
+        {
+            progress = None;
+        }
+        let resumed = match progress.as_deref() {
+            Some(progress) => progress.resumed_steps(arena)?,
+            None => None,
+        };
+        if let Some(progress) = progress.as_deref_mut()
+            && !progress.begin_step(0, false, txn, responder)?
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a resumed data-modifying WITH query was already finished"
+            ));
+        }
         const EMPTY: &[u8] = &[];
         let mut store: *mut &[u8] = core::ptr::null_mut();
         let mut len = 0usize;
         let mut cap = 0usize;
+        // A resumed query starts with the rows it already returned.
+        if let Some(resumed) = &resumed
+            && !resumed.captured.is_empty()
+        {
+            let fresh = arena
+                .alloc_slice_copy(resumed.captured)
+                .map_err(|_| query::arena_full_pub())?;
+            store = fresh.as_mut_ptr();
+            len = fresh.len();
+            cap = fresh.len();
+        }
         let mut sink =
             |_: &Storage, _: u32, _: &dyn SequenceAccess, vals: &[Datum]| -> Result<(), SqlError> {
                 let enc = encode_projected_pub(vals, arena)?;
@@ -14416,6 +14463,7 @@ impl Engine {
                 guc,
                 responder,
                 Some(&mut sink),
+                progress.as_deref_mut(),
             ),
             _ => Self::execute_data_modification(
                 storage,
@@ -14428,19 +14476,31 @@ impl Engine {
                 guc,
                 responder,
                 Some(&mut sink),
+                progress.as_deref_mut(),
                 connection_id,
             ),
         };
-        match outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(query::arena_full_pub()),
-        }
-        Ok(if len == 0 {
+        let rows: &'a [&'a [u8]] = if len == 0 {
             &[]
         } else {
             unsafe { core::slice::from_raw_parts(store, len) }
-        })
+        };
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if e.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
+                    && let Some(progress) = progress
+                {
+                    progress.keep_steps(&[], rows, arena, &storage.row_work)?;
+                }
+                return Err(e);
+            }
+            Err(_) => return Err(query::arena_full_pub()),
+        }
+        if let Some(progress) = progress {
+            progress.finish_step();
+        }
+        Ok(rows)
     }
 
     /// Runs a pending data-modifying `WITH` query at the invocation ordinal of
@@ -14465,12 +14525,18 @@ impl Engine {
         let (with, params) = unsafe { write.statement() };
         let snapshot = self.storage.read_snapshot();
         let calls = invocations.write_query_child(arena);
+        // Rows an attempt changed before a call stay changed, so the call sees
+        // them; the next attempt continues at the unfinished row.
+        let mut progress = exec::RowProgress::new();
         loop {
             if let Err(error) = sequence::rewind_replay_cursor(replay) {
                 return Ok(Err(error));
             }
             calls.begin_attempt();
-            let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let (wal, lock) = (self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let mark = txn.statement_mark(wal, lock);
+            let effects = txn.transaction_effect_mark();
+            progress.begin_attempt(wal, lock);
             // The run's syntax and rows use the statement arena, whose tail
             // also takes the child log's retained calls; its executor uses
             // the query workspace, which the next attempt resets.
@@ -14485,6 +14551,7 @@ impl Engine {
                         params,
                         guc,
                         responder,
+                        &mut progress,
                     )?;
                     let length = exec::projected_rows_len(rows)?;
                     let image = arena
@@ -14510,7 +14577,17 @@ impl Engine {
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                 return Ok(Err(error));
             }
-            self.rollback_waiting_statement(txn, mark);
+            let unfinished = match progress.unfinished_row(txn) {
+                Ok(unfinished) => unfinished,
+                Err(error) => return Ok(Err(error)),
+            };
+            if unfinished.is_none() && txn.transaction_effect_mark() != effects {
+                // Running the call after a rollback would hide the attempt's
+                // changes from it, unlike PostgreSQL.
+                return Ok(Err(exec::retained_progress_required()));
+            }
+            // A query that kept rows undoes only its unfinished row.
+            self.rollback_waiting_statement(txn, unfinished.map_or(mark, |row| row.mark));
             self.dml_scratch.clear();
             let Some(pending) = calls.take_pending() else {
                 return Ok(Err(sql_err!(
@@ -14538,6 +14615,7 @@ impl Engine {
         params: &[Datum<'a>],
         guc: &GucState,
         responder: &mut Responder,
+        progress: &mut exec::RowProgress,
     ) -> Result<&'a [&'a [u8]], SqlError> {
         self.storage.set_read_snapshot(txn.command_id());
         let mut earlier = ArenaList::new(arena);
@@ -14568,6 +14646,7 @@ impl Engine {
             params,
             guc,
             responder,
+            Some(progress),
         )
     }
 
@@ -14616,6 +14695,7 @@ impl Engine {
                 params,
                 guc,
                 responder,
+                None,
             )?);
             let materialized = arena
                 .alloc(materialized)
@@ -14638,6 +14718,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
+        progress: Option<&mut exec::RowProgress>,
         connection_id: i32,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) =
@@ -14685,6 +14766,7 @@ impl Engine {
                     guc,
                     responder,
                     capture,
+                    progress,
                 );
             }
         };
@@ -14707,6 +14789,7 @@ impl Engine {
                     guc,
                     responder,
                     capture,
+                    progress,
                 );
             }
         };
@@ -14766,6 +14849,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                progress,
             );
         }
         let rule_owner = match u16::try_from(storage.object_owner(target.access_object(), txn.txid))
@@ -15096,31 +15180,65 @@ impl Engine {
         } else {
             statement
         };
+        let capturing = capture.is_some();
         let mut capture = capture;
+        // The original statement and each rule action are steps: one an
+        // earlier attempt finished keeps its row count instead of running again.
+        let mut progress = progress.and_then(|progress| progress.claim_steps().then_some(progress));
+        let resumed = match progress
+            .as_deref()
+            .map(|progress| progress.resumed_steps(arena))
+        {
+            Some(Ok(resumed)) => resumed.map(|resumed| resumed.finished),
+            Some(Err(error)) => return Ok(Err(error)),
+            None => None,
+        };
+        let mut steps = RuleSteps {
+            finished: crate::mem::arena::ArenaList::new(arena),
+            resumed: resumed.unwrap_or(&[]),
+            started: false,
+        };
         let mut original_rows = 0u64;
         if insert_event && !suppress_original {
-            let outcome = responder.without_command_complete(|responder| {
-                Self::execute_data_modification_unrewritten(
-                    storage,
-                    scratch,
-                    arena,
-                    original_statement,
-                    authorization,
-                    txn,
-                    params,
-                    guc,
-                    responder,
-                    capture.take(),
-                )
-            })?;
-            if outcome.is_err() {
-                return Ok(outcome);
+            match steps.begin(progress.as_deref_mut(), txn, responder) {
+                Ok(Some(affected)) => original_rows = affected,
+                Ok(None) => {
+                    let outcome = responder.without_command_complete(|responder| {
+                        Self::execute_data_modification_unrewritten(
+                            storage,
+                            scratch,
+                            arena,
+                            original_statement,
+                            authorization,
+                            txn,
+                            params,
+                            guc,
+                            responder,
+                            capture.take(),
+                            progress.as_deref_mut(),
+                        )
+                    })?;
+                    if let Err(error) = outcome {
+                        return Ok(Err(steps.stop(
+                            progress.as_deref_mut(),
+                            error,
+                            arena,
+                            &storage.row_work,
+                        )));
+                    }
+                    original_rows = responder.take_affected_rows().unwrap_or(0);
+                    if let Err(error) = steps.finish(progress.as_deref_mut(), original_rows) {
+                        return Ok(Err(error));
+                    }
+                }
+                Err(error) => return Ok(Err(error)),
             }
-            original_rows = responder.take_affected_rows().unwrap_or(0);
         }
 
         let mut last_name: Option<SqlName> = None;
-        let mut rewritten_rows = 0u64;
+        // PostgreSQL's tag counts the original statement's rows when it runs;
+        // otherwise those of the last INSTEAD action of the same command.
+        let mut instead_rows = None;
         loop {
             let selected = storage
                 .firing_rules_for(target, event, txn.replication_apply, txn.txid)
@@ -15143,7 +15261,7 @@ impl Engine {
             if let Err(error) = txn.enter_rule(rule.oid(), relation.name) {
                 return Ok(Err(error));
             }
-            let action_result = (|| -> Result<Result<u64, SqlError>, WireFull> {
+            let action_result = (|| -> Result<Result<(), SqlError>, WireFull> {
                 let user = eval::funcs::system::session_user_owned();
                 let path = storage.compute_path(
                     definition.creation_path.as_str(),
@@ -15194,7 +15312,6 @@ impl Engine {
                     }
                     None => None,
                 };
-                let mut affected = 0u64;
                 for (action_index, action_sql) in definition.action_sql().enumerate() {
                     let parsed = match query::parse_stored_rule_statement(
                         &definition,
@@ -15241,60 +15358,100 @@ impl Engine {
                     };
                     let use_returning = outer_returns_rows
                         && definition.returning_action == Some(action_index as u8);
-                    let outcome = Self::execute_rule_action(
-                        storage,
-                        scratch,
-                        arena,
-                        action,
-                        rule_authorization,
-                        txn,
-                        params,
-                        guc,
-                        responder,
-                        if use_returning { capture.take() } else { None },
-                        use_returning,
-                        connection_id,
-                    )?;
-                    if let Err(error) = outcome {
-                        return Ok(Err(error));
+                    let action_rows = match steps.begin(progress.as_deref_mut(), txn, responder) {
+                        Ok(Some(affected)) => affected,
+                        Ok(None) => {
+                            let outcome = Self::execute_rule_action(
+                                storage,
+                                scratch,
+                                arena,
+                                action,
+                                rule_authorization,
+                                txn,
+                                params,
+                                guc,
+                                responder,
+                                if use_returning { capture.take() } else { None },
+                                use_returning,
+                                connection_id,
+                                progress.as_deref_mut(),
+                            )?;
+                            if let Err(error) = outcome {
+                                return Ok(Err(steps.stop(
+                                    progress.as_deref_mut(),
+                                    error,
+                                    arena,
+                                    &storage.row_work,
+                                )));
+                            }
+                            let action_rows = responder.take_affected_rows().unwrap_or(0);
+                            if let Err(error) = steps.finish(progress.as_deref_mut(), action_rows) {
+                                return Ok(Err(error));
+                            }
+                            action_rows
+                        }
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    if definition.mode == crate::storage::RewriteMode::Instead
+                        && core::mem::discriminant(action) == core::mem::discriminant(statement)
+                    {
+                        instead_rows = Some(action_rows);
                     }
-                    affected = affected.saturating_add(responder.take_affected_rows().unwrap_or(0));
                 }
-                Ok(Ok(affected))
+                Ok(Ok(()))
             })();
             txn.leave_rule();
             match action_result? {
-                Ok(affected) => rewritten_rows = rewritten_rows.saturating_add(affected),
+                Ok(()) => {}
                 Err(error) => return Ok(Err(error)),
             }
         }
 
         if !insert_event && !suppress_original {
-            let outcome = responder.without_command_complete(|responder| {
-                Self::execute_data_modification_unrewritten(
-                    storage,
-                    scratch,
-                    arena,
-                    original_statement,
-                    authorization,
-                    txn,
-                    params,
-                    guc,
-                    responder,
-                    capture.take(),
-                )
-            })?;
-            if outcome.is_err() {
-                return Ok(outcome);
+            match steps.begin(progress.as_deref_mut(), txn, responder) {
+                Ok(Some(affected)) => original_rows = affected,
+                Ok(None) => {
+                    let outcome = responder.without_command_complete(|responder| {
+                        Self::execute_data_modification_unrewritten(
+                            storage,
+                            scratch,
+                            arena,
+                            original_statement,
+                            authorization,
+                            txn,
+                            params,
+                            guc,
+                            responder,
+                            capture.take(),
+                            progress.as_deref_mut(),
+                        )
+                    })?;
+                    if let Err(error) = outcome {
+                        return Ok(Err(steps.stop(
+                            progress.as_deref_mut(),
+                            error,
+                            arena,
+                            &storage.row_work,
+                        )));
+                    }
+                    original_rows = responder.take_affected_rows().unwrap_or(0);
+                    if let Err(error) = steps.finish(progress, original_rows) {
+                        return Ok(Err(error));
+                    }
+                }
+                Err(error) => return Ok(Err(error)),
             }
-            original_rows = responder.take_affected_rows().unwrap_or(0);
         }
         let affected = if suppress_original {
-            rewritten_rows
+            instead_rows.unwrap_or(0)
         } else {
             original_rows
         };
         responder.set_affected_rows(affected);
+        // Captured rows belong to an enclosing statement, which completes.
+        if capturing {
+            return Ok(Ok(()));
+        }
         let tag = match statement {
             Stmt::Insert(_) => stack_format!(48, "INSERT 0 {}", affected),
             Stmt::Update(_) => stack_format!(48, "UPDATE {}", affected),
@@ -15319,6 +15476,7 @@ impl Engine {
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         returning: bool,
         connection_id: i32,
+        progress: Option<&mut exec::RowProgress>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         match action {
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) if returning => responder
@@ -15334,6 +15492,7 @@ impl Engine {
                         guc,
                         responder,
                         capture,
+                        progress,
                         connection_id,
                     )
                 }),
@@ -15350,6 +15509,7 @@ impl Engine {
                         guc,
                         responder,
                         None,
+                        progress,
                         connection_id,
                     )
                 })
@@ -15422,6 +15582,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
+        progress: Option<&mut exec::RowProgress>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) =
             query::validate_dml_assignment_casts(statement, storage, txn.txid, arena, None)
@@ -15468,6 +15629,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                progress,
             );
         };
         let event = match statement {
@@ -15494,18 +15656,22 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                progress,
             );
         }
-        if let Err(error) = exec::fire_view_statement_triggers(
-            storage,
-            txn,
-            arena,
-            guc.seq_session(),
-            responder,
-            view,
-            statement,
-            true,
-        ) {
+        // A resumed attempt continues rows whose statement triggers ran.
+        if !progress.as_deref().is_some_and(exec::RowProgress::resuming)
+            && let Err(error) = exec::fire_view_statement_triggers(
+                storage,
+                txn,
+                arena,
+                guc.seq_session(),
+                responder,
+                view,
+                statement,
+                true,
+            )
+        {
             return Ok(Err(error));
         }
         let capturing = capture.is_some();
@@ -15521,6 +15687,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                progress,
             )
         })?;
         let affected = responder.take_affected_rows().unwrap_or(0);
@@ -15563,6 +15730,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
+        progress: Option<&mut exec::RowProgress>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) =
             query::validate_dml_assignment_casts(statement, storage, txn.txid, arena, None)
@@ -15593,6 +15761,8 @@ impl Engine {
             guc.seq_session(),
             responder,
             capture,
+            progress,
+            None,
         )
     }
 
@@ -15608,6 +15778,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
+        progress: Option<&mut exec::RowProgress>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let authorization = match match statement {
             Stmt::Insert(insert) => storage
@@ -15686,6 +15857,7 @@ impl Engine {
                         guc.seq_session(),
                         responder,
                         capture,
+                        progress,
                     );
                 }
                 let (insert, view_check) =
@@ -15753,6 +15925,7 @@ impl Engine {
                     None,
                     None,
                     exec::InsertSource::Statement,
+                    progress,
                 )
             }
             Stmt::Update(update) => {
@@ -15777,6 +15950,7 @@ impl Engine {
                         guc.seq_session(),
                         responder,
                         capture,
+                        progress,
                     );
                 }
                 let (update, view_check) =
@@ -15844,6 +16018,7 @@ impl Engine {
                     responder,
                     capture,
                     None,
+                    progress,
                 )
             }
             Stmt::Delete(delete) => {
@@ -15868,6 +16043,7 @@ impl Engine {
                         guc.seq_session(),
                         responder,
                         capture,
+                        progress,
                     );
                 }
                 let delete =
@@ -15922,6 +16098,7 @@ impl Engine {
                     responder,
                     capture,
                     None,
+                    progress,
                 )
             }
             _ => Ok(Err(sql_err!(
@@ -15943,6 +16120,20 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if statement.with.iter().any(|cte| cte.dml.is_some()) {
+            // Its data-modifying CTEs make it a write: an attempt that stops
+            // for a routine call rolls their row changes back.
+            return self.execute_modification_resumable(
+                &Stmt::Select(*statement),
+                arena,
+                params,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            );
+        }
         let source_snapshot = txn.command_id().saturating_add(1);
         self.storage.set_read_snapshot(source_snapshot);
         let catalog = query::storage_catalog(&self.storage, &self.work, txn.txid);
@@ -16000,7 +16191,6 @@ impl Engine {
             Ok(replay) => replay,
             Err(error) => return Ok(Err(error)),
         };
-        let modifies = statement.with.iter().any(|cte| cte.dml.is_some());
         loop {
             if let Err(error) = sequence::rewind_replay_cursor(replay) {
                 return Ok(Err(error));
@@ -16009,9 +16199,6 @@ impl Engine {
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
             let output_mark = responder.mark();
-            let attempt_arena_mark = arena.mark();
-            let statement_mark =
-                txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
             let outcome = self.execute_select_once(
                 statement,
                 arena,
@@ -16026,13 +16213,6 @@ impl Engine {
             };
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                 return Ok(Err(error));
-            }
-            if modifies {
-                // A data-modifying WITH query's changes are repeated by the
-                // next attempt, so this attempt's are undone first.
-                self.rollback_waiting_statement(txn, statement_mark);
-                self.dml_scratch.clear();
-                unsafe { arena.rewind_to(attempt_arena_mark) };
             }
             if let Err(error) = responder.truncate_to(output_mark) {
                 // Rows already sent cannot be withdrawn for another attempt.
@@ -16445,6 +16625,8 @@ impl Engine {
             .storage
             .read_snapshot()
             .min(txn.command_id().saturating_add(1));
+        let mut progress = exec::RowProgress::new();
+        let mut statement_start = None;
         loop {
             if let Err(error) = sequence::rewind_replay_cursor(replay) {
                 return Ok(Err(error));
@@ -16454,10 +16636,18 @@ impl Engine {
             invocations.begin_attempt();
             let attempt_arena_mark = arena.mark();
             let output_mark = responder.mark();
-            let statement_mark =
-                txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let (wal, lock) = (self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let statement_mark = txn.statement_mark(wal, lock);
+            let effects = txn.transaction_effect_mark();
+            progress.begin_attempt(wal, lock);
+            // AFTER triggers of a write that kept rows belong to its first attempt.
+            let start = *statement_start.get_or_insert(statement_mark);
             let boundary = completion_handoff.then_some(txn::WriteCompletionBoundary {
-                mark: statement_mark,
+                mark: if progress.changed_rows() {
+                    start
+                } else {
+                    statement_mark
+                },
                 command: txn.command_id(),
                 depth: txn.trigger_depth(),
             });
@@ -16479,6 +16669,7 @@ impl Engine {
                                     guc,
                                     responder,
                                     None,
+                                    Some(&mut progress),
                                     self.work.connection_id(),
                                 )?
                             }
@@ -16491,9 +16682,27 @@ impl Engine {
                                 guc,
                                 responder,
                                 None,
+                                Some(&mut progress),
                             )?,
                             Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                                ctes, statement, arena, params, txn, guc, responder, None,
+                                ctes,
+                                statement,
+                                arena,
+                                params,
+                                txn,
+                                guc,
+                                responder,
+                                None,
+                                Some(&mut progress),
+                            )?,
+                            Stmt::Select(select) => self.execute_select_once(
+                                select,
+                                arena,
+                                params,
+                                txn,
+                                guc,
+                                Some(&invocations),
+                                responder,
                             )?,
                             _ => unreachable!("resumable modification has a mutation statement"),
                         })
@@ -16514,7 +16723,19 @@ impl Engine {
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                 return Ok(Err(error));
             }
-            self.rollback_waiting_statement(txn, statement_mark);
+            let unfinished = match progress.unfinished_row(txn) {
+                Ok(unfinished) => unfinished,
+                Err(error) => return Ok(Err(error)),
+            };
+            if unfinished.is_none() && txn.transaction_effect_mark() != effects {
+                // Running the call after a rollback would hide the attempt's
+                // changes from it, unlike PostgreSQL.
+                return Ok(Err(exec::retained_progress_required()));
+            }
+            // A write that kept rows undoes only its unfinished row.
+            let (rollback, output_mark) =
+                unfinished.map_or((statement_mark, output_mark), |row| (row.mark, row.output));
+            self.rollback_waiting_statement(txn, rollback);
             self.dml_scratch.clear();
             if let Err(error) = responder.truncate_to(output_mark) {
                 // Rows already sent cannot be withdrawn for another attempt.
@@ -18121,6 +18342,7 @@ impl Engine {
                 guc,
                 responder,
                 None,
+                None,
                 self.work.connection_id(),
             ),
             Stmt::Merge(_) => Self::execute_merge(
@@ -18132,9 +18354,10 @@ impl Engine {
                 guc,
                 responder,
                 None,
+                None,
             ),
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                ctes, statement, arena, params, txn, guc, responder, None,
+                ctes, statement, arena, params, txn, guc, responder, None, None,
             ),
             _ => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -18157,6 +18380,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
+        progress: Option<&mut exec::RowProgress>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) = query::validate_dml_assignment_casts(
             &Stmt::With { ctes, statement },
@@ -18174,7 +18398,7 @@ impl Engine {
         };
         let output_mark = responder.mark();
         let outcome = self.execute_with_main_statement(
-            ctes, statement, dml_mats, params, txn, guc, responder, capture,
+            ctes, statement, dml_mats, params, txn, guc, responder, capture, progress,
         )?;
         if outcome.is_err() {
             return Ok(outcome);
@@ -18233,6 +18457,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
+        progress: Option<&mut exec::RowProgress>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
         let statement = match query::expand_dml_ctes(
@@ -18260,6 +18485,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                progress,
                 self.work.connection_id(),
             ),
             Stmt::Merge(_) => Self::execute_merge(
@@ -18271,6 +18497,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                progress,
             ),
             _ => Ok(Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -18466,6 +18693,7 @@ impl Engine {
         responder: &mut Responder,
         mut capture: Option<&mut exec::ProcedureOutputs<'a>>,
         mut retention: Option<&mut Option<exec::SuspendedProcedure>>,
+        caller_statement: Option<&str>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         // A saved body resumes in place of a new call: its settings, timer and
         // statistics entry already belong to the first attempt.
@@ -18595,7 +18823,7 @@ impl Engine {
             {
                 return Ok(Err(error));
             }
-            let executed = (|| {
+            let mut run = || {
                 if routine.language == crate::storage::RoutineLanguage::PlPgSql {
                     let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
                     let (instance, conflict) = match self.plpgsql_instance_owner(
@@ -18630,10 +18858,10 @@ impl Engine {
                             arena,
                             responder,
                             &mut output_values,
-                            conflict,
                             &environment,
                             timed.take(),
                             retention.as_deref_mut(),
+                            conflict,
                         )
                     });
                     let output_count = match executed {
@@ -18991,7 +19219,23 @@ impl Engine {
                         responder.command_complete("CALL").map(|_| Ok(()))
                     })
                 })
-            })();
+            };
+            // A static PL/pgSQL `CALL` runs its procedure as an SQL statement
+            // of the calling block, which names it in the body's error context.
+            let executed = match caller_statement {
+                Some(text) => {
+                    let frame = error_context::QueryFrame::new(
+                        text,
+                        error_context::QueryMode::Statement,
+                        false,
+                    );
+                    error_context::with_frame(&frame, || match run() {
+                        Ok(Err(error)) => Ok(Err(error_context::capture(error))),
+                        other => other,
+                    })
+                }
+                None => run(),
+            };
             if let Some((total, own)) = timed.and_then(statistics::FunctionTiming::finish)
                 && matches!(executed, Ok(Ok(())))
                 && let Err(error) = statistics::record_completed_call(
@@ -19671,10 +19915,22 @@ impl Engine {
             return Ok(Err(error));
         }
         // A top-level procedure body owns its waits: its queries may yield on
-        // storage reads before an effect, while its writes block.
-        let retained_body =
-            reset_workspace && matches!(statement, Stmt::Call { .. } | Stmt::Do { .. });
-        let _atomic_reads = if statement_writes(statement) && !retained_body {
+        // storage reads before an effect. A top-level data change yields
+        // while it selects and locks its rows, and restarts from its start
+        // after the wait; its row changes are an effect (see
+        // `protect_statement_effects`), after which reads block.
+        let yields_before_effects = reset_workspace
+            && matches!(
+                statement,
+                Stmt::Call { .. }
+                    | Stmt::Do { .. }
+                    | Stmt::Insert(_)
+                    | Stmt::Update(_)
+                    | Stmt::Delete(_)
+                    | Stmt::Merge(_)
+                    | Stmt::With { .. }
+            );
+        let _atomic_reads = if statement_writes(statement) && !yields_before_effects {
             self.ckpt
                 .as_ref()
                 .map(Checkpointer::atomic_block_read_scope)
@@ -20078,7 +20334,7 @@ impl Engine {
                 statement, arena, params, txn, sqlprep, cursors, guc, responder,
             ),
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                ctes, statement, arena, params, txn, guc, responder, capture,
+                ctes, statement, arena, params, txn, guc, responder, capture, None,
             ),
             Stmt::Select(select) => {
                 self.execute_select(select, arena, params, txn, sqlprep, cursors, guc, responder)
@@ -20430,6 +20686,7 @@ impl Engine {
                     responder,
                     None,
                     reset_workspace.then_some(&mut saved),
+                    None,
                 );
                 txn.pending_procedure = saved;
                 outcome
@@ -21424,6 +21681,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                None,
                 self.work.connection_id(),
             ),
             Stmt::Merge(_) => Self::execute_merge(
@@ -21435,6 +21693,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                None,
             ),
             Stmt::Comment { target, text } => exec::comment(
                 &mut self.storage,
@@ -29828,4 +30087,173 @@ fn check_prepared_argument_count(
         "wrong number of parameters for prepared statement \"{}\"",
         name
     ))
+}
+
+/// The steps of a statement rewritten by rules, for its row progress.
+struct RuleSteps<'a> {
+    finished: crate::mem::arena::ArenaList<'a, exec::StepRecord<'a>>,
+    resumed: &'a [exec::StepRecord<'a>],
+    /// Whether a step ran without progress, so the next is a new command.
+    started: bool,
+}
+
+impl<'a> RuleSteps<'a> {
+    /// Before the next step: `Some` with its row count when an earlier
+    /// attempt finished it.
+    fn begin(
+        &mut self,
+        progress: Option<&mut exec::RowProgress>,
+        txn: &mut TxnState,
+        responder: &Responder,
+    ) -> Result<Option<u64>, SqlError> {
+        let index = self.finished.len();
+        let Some(progress) = progress else {
+            // Each rewritten statement after the first sees the earlier
+            // ones' changes, as PostgreSQL runs them as separate commands.
+            if self.started {
+                txn.begin_command()?;
+            }
+            self.started = true;
+            return Ok(None);
+        };
+        if progress.begin_step(index, true, txn, responder)? {
+            return Ok(None);
+        }
+        let record = *self.resumed.get(index).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a resumed rule rewrite lost a finished step"
+            )
+        })?;
+        self.finished
+            .push(record)
+            .map_err(|_| query::arena_full_pub())?;
+        Ok(Some(record.affected))
+    }
+
+    fn finish(
+        &mut self,
+        progress: Option<&mut exec::RowProgress>,
+        affected: u64,
+    ) -> Result<(), SqlError> {
+        let Some(progress) = progress else {
+            return Ok(());
+        };
+        progress.finish_step();
+        self.finished
+            .push(exec::StepRecord {
+                rows: &[],
+                affected,
+            })
+            .map_err(|_| query::arena_full_pub())
+    }
+
+    /// The running step failed; a stop for a routine call keeps the
+    /// finished steps for the next attempt.
+    fn stop(
+        &self,
+        progress: Option<&mut exec::RowProgress>,
+        error: SqlError,
+        arena: &Arena,
+        pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    ) -> SqlError {
+        match progress {
+            Some(progress) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION => {
+                match progress.keep_steps(self.finished.as_slice(), &[], arena, pool) {
+                    Ok(()) => error,
+                    Err(kept) => kept,
+                }
+            }
+            _ => error,
+        }
+    }
+}
+
+/// PostgreSQL's rewriter accepts a data-modifying `WITH` sub-statement whose
+/// rules leave exactly one data-modifying statement; it rejects the others
+/// before anything runs.
+fn check_cte_rules(storage: &Storage, dml: &Stmt<'_>, txn: &TxnState) -> Result<(), SqlError> {
+    let (relation, event) = match dml {
+        Stmt::Insert(insert) => (insert.table, crate::storage::RewriteEvent::Insert),
+        Stmt::Update(update) => (update.table, crate::storage::RewriteEvent::Update),
+        Stmt::Delete(delete) => (delete.table, crate::storage::RewriteEvent::Delete),
+        _ => return Ok(()),
+    };
+    let target = match storage.resolve_relation(relation.schema, relation.name, txn.txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => {
+            crate::storage::RuleTarget::Table(slot as u16)
+        }
+        Some(crate::storage::ResolvedRelation::View(slot)) => {
+            crate::storage::RuleTarget::View(slot as u16)
+        }
+        _ => return Ok(()),
+    };
+    let rules = || storage.firing_rules_for(target, event, txn.replication_apply, txn.txid);
+    if rules().next().is_none() {
+        return Ok(());
+    }
+    let unconditional_instead = rules().any(|(_, rule)| {
+        let definition = rule.definition_for(txn.txid);
+        definition.mode == crate::storage::RewriteMode::Instead && definition.condition.is_none()
+    });
+    let actions: usize = rules()
+        .map(|(_, rule)| rule.definition_for(txn.txid).action_sql().count())
+        .sum();
+    let statements = actions + usize::from(!unconditional_instead);
+    let unsupported = |what: &str| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} rules are not supported for data-modifying statements in WITH",
+            what
+        )
+    };
+    if statements == 0 {
+        return Err(unsupported("DO INSTEAD NOTHING"));
+    }
+    if statements == 1 {
+        let notify = rules().any(|(_, rule)| {
+            rule.definition_for(txn.txid).action_sql().any(|action| {
+                action
+                    .trim_start()
+                    .get(..6)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("notify"))
+            })
+        });
+        return if notify {
+            Err(unsupported("DO INSTEAD NOTIFY"))
+        } else {
+            Ok(())
+        };
+    }
+    // The rewritten statements in rule-name order; the first that is not
+    // an unconditional INSTEAD action names the error.
+    let mut last: Option<crate::storage::SqlName> = None;
+    loop {
+        let next = rules()
+            .filter(|(_, rule)| {
+                last.is_none_or(|last| rule.definition_for(txn.txid).name.as_str() > last.as_str())
+            })
+            .min_by(|(_, left), (_, right)| {
+                left.definition_for(txn.txid)
+                    .name
+                    .as_str()
+                    .cmp(right.definition_for(txn.txid).name.as_str())
+            });
+        let Some((_, rule)) = next else {
+            break;
+        };
+        let definition = rule.definition_for(txn.txid);
+        last = Some(definition.name);
+        if definition.action_sql().next().is_none() {
+            continue;
+        }
+        match (definition.mode, definition.condition.is_some()) {
+            (crate::storage::RewriteMode::Instead, true) => {
+                return Err(unsupported("conditional DO INSTEAD"));
+            }
+            (crate::storage::RewriteMode::Instead, false) => {}
+            _ => return Err(unsupported("DO ALSO")),
+        }
+    }
+    Err(unsupported("multi-statement DO INSTEAD"))
 }

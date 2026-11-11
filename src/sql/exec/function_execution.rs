@@ -477,6 +477,7 @@ impl SuspendedFunctionState {
             .map(|sources| sources.enter())
             .transpose()?;
         let environment = self.binding.environment.enter(context.txn)?;
+        let invocation = self.binding.invocation(&[], arena)?;
         let pending = self.conversion.as_mut().ok_or_else(changed)?;
         let value = pending.value.read(0, arena)?;
         admission.commit();
@@ -485,16 +486,8 @@ impl SuspendedFunctionState {
             FunctionOutput::Scalar(value),
             self.binding.result_type,
             Some(&mut pending.check),
-        );
-        let result = match result {
-            Err(error) if !control_flow::is_execution_wait(&error) => {
-                Err(match self.binding.invocation(&[], arena) {
-                    Ok(invocation) => control_flow::routine_exit_error(context, invocation, error),
-                    Err(invocation_error) => invocation_error,
-                })
-            }
-            result => result,
-        };
+        )
+        .map_err(|error| control_flow::routine_exit_error(context, invocation, error));
         admission.preserve_caller_inputs()?;
         Ok(self.finish_conversion(result, &environment, context))
     }

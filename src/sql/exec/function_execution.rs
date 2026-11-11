@@ -4,6 +4,7 @@ use super::call_environment::{CallEnvironment, SavedCallEnvironment};
 use super::*;
 use crate::mem::lease_pool::SharedSlice;
 
+#[derive(Clone, Copy)]
 pub(crate) enum FunctionOutput<'a> {
     Scalar(Datum<'a>),
     Rows(&'a [&'a [u8]]),
@@ -167,12 +168,14 @@ fn declared_result(routine: &crate::storage::RoutineDef) -> Result<RoutineArgume
 
 /// Converts a scalar result to a declared user type as PostgreSQL's return
 /// cast does: a domain result enforces `NOT NULL` and its `CHECK`
-/// constraints, which may call routines. A routine called there that waits
-/// fails loudly, because the finished body has no statement to resume.
+/// constraints, which may call routines. With `check`, a routine called there
+/// that waits keeps its calls there, so the finished call can resume the
+/// conversion without running its body again.
 fn convert_result<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     output: FunctionOutput<'a>,
     result: RoutineArgumentDef,
+    check: Option<&mut Option<super::super::query::RoutineInvocationState>>,
 ) -> Result<FunctionOutput<'a>, SqlError> {
     let FunctionOutput::Scalar(value) = output else {
         return Ok(output);
@@ -182,7 +185,7 @@ fn convert_result<'a>(
     }
     let arena = context.arena;
     let txid = context.txn.txid;
-    execute_procedural_query(context, None, |storage, sequences| {
+    execute_procedural_query(context, check, |storage, sequences| {
         coerce_routine_argument(value, result, storage, txid, arena, Some(sequences))
     })
     .map(FunctionOutput::Scalar)
@@ -287,7 +290,38 @@ pub(crate) struct SuspendedPlpgsqlFunction {
 struct SuspendedFunctionState {
     binding: FunctionBinding,
     execution: Option<execution_frame::SuspendedExecutionFrame>,
+    /// Set instead of `execution` once the body has returned and only the
+    /// result's domain check is waiting.
+    conversion: Option<PendingConversion>,
     progress: super::super::sequence::SavedStatementPosition,
+}
+
+/// A finished result whose domain `CHECK` waits in a routine call: the value
+/// before conversion and the check's invocation log.
+struct PendingConversion {
+    value: local_values::SavedValues,
+    check: Option<super::super::query::RoutineInvocationState>,
+}
+
+impl PendingConversion {
+    fn new<'a>(
+        output: FunctionOutput<'a>,
+        check: Option<super::super::query::RoutineInvocationState>,
+        rows: &std::sync::Arc<LeasePool>,
+    ) -> Result<Self, SqlError> {
+        let FunctionOutput::Scalar(value) = output else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "set-returning function result waited in a domain check"
+            ));
+        };
+        let mut saved = local_values::SavedValues::new(rows)?;
+        saved.replace(&[value])?;
+        Ok(Self {
+            value: saved,
+            check,
+        })
+    }
 }
 
 impl FunctionBinding {
@@ -377,6 +411,23 @@ impl SuspendedPlpgsqlFunction {
             return Err(changed());
         }
         let prior = state.progress.take();
+        if state.conversion.is_some() {
+            let attached =
+                super::super::type_input_plans::with_owner(state.binding.input_owner, || {
+                    prior.with_resume(
+                        (),
+                        super::super::lock::AdvisoryPositionTail::Unchanged,
+                        |(), admission| state.resume_conversion(admission, &mut context),
+                    )
+                });
+            return match attached {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) | Err(((), error)) => {
+                    state.progress = prior;
+                    Err(error)
+                }
+            };
+        }
         let frame = state.execution.take().ok_or_else(changed)?;
         let attached =
             super::super::type_input_plans::with_owner(state.binding.input_owner, || {
@@ -398,6 +449,58 @@ impl SuspendedPlpgsqlFunction {
 }
 
 impl SuspendedFunctionState {
+    /// Runs a waiting domain check again with its saved calls. The outer error
+    /// means the saved conversion was not attached and is unchanged.
+    fn resume_conversion<'a>(
+        &mut self,
+        admission: &mut super::super::sequence::StatementPositionAdmission<'_>,
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+    ) -> Result<Result<FunctionOutput<'a>, SqlError>, SqlError> {
+        let arena = context.arena;
+        let _types = self
+            .binding
+            .type_sources
+            .as_ref()
+            .map(|sources| sources.enter())
+            .transpose()?;
+        let environment = self.binding.environment.enter(context.txn)?;
+        let pending = self.conversion.as_mut().ok_or_else(changed)?;
+        let value = pending.value.read(0, arena)?;
+        admission.commit();
+        let result = convert_result(
+            context,
+            FunctionOutput::Scalar(value),
+            self.binding.result_type,
+            Some(&mut pending.check),
+        );
+        admission.preserve_caller_inputs()?;
+        Ok(self.finish_conversion(result, &environment, context))
+    }
+
+    /// Keeps a waiting conversion's environment and journal position, or
+    /// completes the saved call.
+    fn finish_conversion<'a>(
+        &mut self,
+        result: Result<FunctionOutput<'a>, SqlError>,
+        environment: &CallEnvironment,
+        context: &TriggerExecContext<'_, 'a, '_>,
+    ) -> Result<FunctionOutput<'a>, SqlError> {
+        match result {
+            Err(error) if control_flow::is_execution_wait(&error) => {
+                self.binding.environment = SavedCallEnvironment::capture(
+                    environment,
+                    &context.storage().execution_control,
+                )?;
+                self.progress = super::super::sequence::SavedStatementPosition::capture()?;
+                Err(error)
+            }
+            result => {
+                self.binding.environment.complete();
+                result
+            }
+        }
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "failed attachment returns the original function execution without allocation"
@@ -468,13 +571,28 @@ impl SuspendedFunctionState {
         }
         match result {
             Ok(flow) => {
-                let output = self
-                    .binding
-                    .returns
-                    .finish(&execution, flow, self.binding.result_type.ctype, arena)
-                    .and_then(|output| convert_result(context, output, self.binding.result_type));
-                self.binding.environment.complete();
-                Ok(output)
+                let output = match self.binding.returns.finish(
+                    &execution,
+                    flow,
+                    self.binding.result_type.ctype,
+                    arena,
+                ) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        self.binding.environment.complete();
+                        return Ok(Err(error));
+                    }
+                };
+                let mut check = None;
+                let result =
+                    convert_result(context, output, self.binding.result_type, Some(&mut check));
+                if matches!(&result, Err(error) if control_flow::is_execution_wait(error)) {
+                    match PendingConversion::new(output, check, &context.storage().row_work) {
+                        Ok(pending) => self.conversion = Some(pending),
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+                Ok(self.finish_conversion(result, &environment, context))
             }
             Err(error) if control_flow::is_execution_wait(&error) => {
                 let captured = SavedCallEnvironment::capture(
@@ -795,56 +913,116 @@ pub(crate) fn execute<'a>(
         Ok(flow) => {
             let result = declared_result(routine)?;
             let output = returns.finish(&execution, flow, result.ctype, arena)?;
-            convert_result(&mut context, output, result)
+            if policy == super::super::query::RoutineExecution::StatementReplay {
+                return convert_result(&mut context, output, result, None);
+            }
+            let mut check = None;
+            let converted = convert_result(&mut context, output, result, Some(&mut check));
+            match converted {
+                Err(error) if control_flow::is_execution_wait(&error) => {
+                    let conversion =
+                        PendingConversion::new(output, check, &context.storage().row_work)?;
+                    *suspended = Some(suspend_call(
+                        &context,
+                        routine,
+                        kind,
+                        invocation.input_owner,
+                        collation,
+                        inputs,
+                        returns,
+                        environment,
+                        boundary,
+                        type_sources,
+                        None,
+                        Some(conversion),
+                    )?);
+                    Err(error)
+                }
+                converted => converted,
+            }
         }
         Err(error) if control_flow::is_execution_wait(&error) => {
             if policy == super::super::query::RoutineExecution::StatementReplay {
                 return Err(error);
             }
-            let storage = context.storage();
-            let mut state = storage
-                .execution_control
-                .lease(1)
-                .map_err(control_flow::execution_full)?;
-            let parameters = storage
-                .execution_control
-                .copy_slice(routine.arguments())
-                .map_err(control_flow::execution_full)?;
-            let mut saved_inputs = local_values::SavedValues::new(&storage.row_work)?;
-            saved_inputs.replace(inputs)?;
-            let environment =
-                SavedCallEnvironment::capture(environment, &storage.execution_control)?;
-            let owner = FunctionOwner::capture(&context);
-            let progress = super::super::sequence::SavedStatementPosition::capture()?;
             let execution = execution.suspend().map_err(|(_, error)| error)?;
-            state
-                .push_reserved(SuspendedFunctionState {
-                    binding: FunctionBinding {
-                        schema: routine.schema,
-                        name: routine.name,
-                        oid: crate::storage::routine_oid(routine),
-                        version: routine.version,
-                        kind,
-                        input_owner: invocation.input_owner,
-                        input_collation: collation,
-                        parameters,
-                        inputs: saved_inputs,
-                        returns,
-                        result_type: declared_result(routine)?,
-                        environment,
-                        owner,
-                        boundary,
-                        type_sources,
-                    },
-                    execution: Some(execution),
-                    progress,
-                })
-                .map_err(control_flow::execution_full)?;
-            *suspended = Some(SuspendedFunction::Plpgsql(SuspendedPlpgsqlFunction {
-                state,
-            }));
+            *suspended = Some(suspend_call(
+                &context,
+                routine,
+                kind,
+                invocation.input_owner,
+                collation,
+                inputs,
+                returns,
+                environment,
+                boundary,
+                type_sources,
+                Some(execution),
+                None,
+            )?);
             Err(error)
         }
         Err(error) => Err(error),
     }
+}
+
+/// Saves a call whose body or result conversion waits.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a saved call keeps its selected contract, inputs, environment and phase"
+)]
+fn suspend_call(
+    context: &TriggerExecContext<'_, '_, '_>,
+    routine: &crate::storage::RoutineDef,
+    kind: PlpgsqlProgramKind,
+    input_owner: super::super::type_input_plans::Owner,
+    collation: crate::sql::ast::Collation,
+    inputs: &[Datum<'_>],
+    returns: ReturnBinding,
+    environment: &CallEnvironment,
+    boundary: super::super::txn::StatementMark,
+    type_sources: Option<crate::storage::StatementFileLease>,
+    execution: Option<execution_frame::SuspendedExecutionFrame>,
+    conversion: Option<PendingConversion>,
+) -> Result<SuspendedFunction, SqlError> {
+    let storage = context.storage();
+    let mut state = storage
+        .execution_control
+        .lease(1)
+        .map_err(control_flow::execution_full)?;
+    let parameters = storage
+        .execution_control
+        .copy_slice(routine.arguments())
+        .map_err(control_flow::execution_full)?;
+    let mut saved_inputs = local_values::SavedValues::new(&storage.row_work)?;
+    saved_inputs.replace(inputs)?;
+    let environment = SavedCallEnvironment::capture(environment, &storage.execution_control)?;
+    let progress = super::super::sequence::SavedStatementPosition::capture()?;
+    state
+        .push_reserved(SuspendedFunctionState {
+            binding: FunctionBinding {
+                schema: routine.schema,
+                name: routine.name,
+                oid: crate::storage::routine_oid(routine),
+                version: routine.version,
+                kind,
+                input_owner,
+                input_collation: collation,
+                parameters,
+                inputs: saved_inputs,
+                returns,
+                result_type: declared_result(routine)?,
+                environment,
+                owner: FunctionOwner::capture(context),
+                boundary,
+                type_sources,
+            },
+            execution,
+            conversion,
+            progress,
+        })
+        .map_err(control_flow::execution_full)?;
+    Ok(SuspendedFunction::Plpgsql(SuspendedPlpgsqlFunction {
+        state,
+    }))
 }

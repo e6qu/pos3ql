@@ -681,3 +681,95 @@ fn both_protocols_resume_procedures_after_commit() {
         std::fs::remove_dir_all(config.data_dir).unwrap();
     }
 }
+
+/// A domain `CHECK` on a PL/pgSQL function's result calls a routine that
+/// waits for a lock. The finished result and the check's calls are kept, so
+/// the body's insert, the check's insert and each sequence value happen once:
+/// from a top-level `SELECT`, from `DO`, and from a procedure after its own
+/// `COMMIT`, in both transaction modes.
+#[test]
+fn domain_result_checks_resume_waiting_routines() {
+    for (label, sql, tag) in [
+        ("select", "SELECT checked_result(3)", "SELECT 1"),
+        (
+            "do",
+            "DO $$DECLARE v int; BEGIN v := checked_result(3); \
+             INSERT INTO check_log VALUES ('do-' || v, 0); END$$",
+            "DO",
+        ),
+        ("call", "CALL checked_proc()", "CALL"),
+    ] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = test_config(&format!("domain-check-wait-{label}-{mode:?}"));
+            config.transaction_mode = mode;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer =
+                ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            writer.success(
+                &mut engine,
+                "CREATE SEQUENCE check_numbers; CREATE TABLE check_log(stage text, n bigint); \
+                 CREATE FUNCTION check_small(v integer) RETURNS boolean LANGUAGE plpgsql AS $$ \
+                 BEGIN INSERT INTO check_log VALUES ('check-' || v, nextval('check_numbers')); \
+                 PERFORM pg_advisory_xact_lock(1011); RETURN v < 10; END$$; \
+                 CREATE DOMAIN checked_small AS integer CHECK (check_small(VALUE)); \
+                 CREATE FUNCTION checked_result(v integer) RETURNS checked_small \
+                 LANGUAGE plpgsql AS $$ BEGIN \
+                 INSERT INTO check_log VALUES ('body-' || v, nextval('check_numbers')); \
+                 RETURN v; END$$; \
+                 CREATE PROCEDURE checked_proc() LANGUAGE plpgsql AS $$ DECLARE v int; BEGIN \
+                 INSERT INTO check_log VALUES ('proc', nextval('check_numbers')); COMMIT; \
+                 v := checked_result(3); INSERT INTO check_log VALUES ('proc-' || v, 0); END$$",
+                true,
+            );
+            holder.success(
+                &mut engine,
+                "BEGIN; SELECT pg_advisory_xact_lock(1011)",
+                true,
+            );
+            let status = writer.execute_status(&mut engine, sql, true);
+            assert_eq!(
+                blocked_wait(&status, &writer),
+                StatementWait::Lock,
+                "{label}"
+            );
+            assert_eq!(
+                data_rows(&holder.success(&mut engine, "SELECT 40 + 2", true)),
+                ["42"]
+            );
+            holder.success(&mut engine, "COMMIT", true);
+            let status = resume_procedure_wait(&mut engine, &mut writer, sql, status);
+            assert_eq!(status, ExecutionStatus::Complete, "{label}");
+            assert!(
+                error_sqlstates(writer.send.readable()).is_empty(),
+                "{label}: {}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            assert_eq!(command_tags(writer.send.readable()), [tag], "{label}");
+            if label == "select" {
+                assert_eq!(data_rows(writer.send.readable()), ["3"]);
+            }
+            let expected: &[&str] = match label {
+                "select" => &["body-3:1", "check-3:2"],
+                "do" => &["do-3:0", "body-3:1", "check-3:2"],
+                _ => &["proc-3:0", "proc:1", "body-3:2", "check-3:3"],
+            };
+            assert_eq!(
+                data_rows(&writer.success(
+                    &mut engine,
+                    "SELECT stage || ':' || n FROM check_log ORDER BY n, stage",
+                    true
+                )),
+                expected,
+                "{label}"
+            );
+            drop((holder, writer, engine));
+            std::fs::remove_dir_all(config.data_dir).unwrap();
+        }
+    }
+}

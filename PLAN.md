@@ -69,7 +69,8 @@ declaration initializers and every PL/pgSQL statement's expressions,
 including statements with several (`FOR` bounds, `CASE`, `RAISE` arguments
 and options, `IF ... ELSIF`, `ASSERT`, `CALL` arguments, dynamic `EXECUTE`
 values), which keep finished values across a wait; SQL-language function
-bodies, child calls and return checks; PL/pgSQL procedures and `DO` blocks,
+bodies, child calls and return checks; domain `CHECK`s on a PL/pgSQL
+function's result, which keep the finished result and the check's calls; PL/pgSQL procedures and `DO` blocks,
 including nested `CALL`, resuming at the waiting statement after their own
 `COMMIT` or `ROLLBACK`, with queries yielding on storage reads; SQL cursors executing from retained query state, including row locks
 taken per `FETCH` and scrollable cursors that evaluate revisited rows again;
@@ -81,12 +82,7 @@ is owned.
 
 **Remaining:**
 
-- **Functions:** a PL/pgSQL function's domain result runs its `CHECK`
-  constraints after the body has finished, so a routine called by such a
-  check that waits cannot resume: it fails with `0A000` (`expression wait
-  requires an owned invocation log`), and inside a procedure the whole `CALL`
-  runs again, which after the procedure's first `COMMIT` fails with `0A000`.
-  Writes inside a procedure body still read storage synchronously. A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
+- **Functions:** writes inside a procedure body still read storage synchronously. A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
   grouping, subqueries) restarts once for each first call of a SQL-language
   routine, so its work grows with the square of those calls; single-table,
   `VALUES` and `generate_series` sources hand each call off on its row.

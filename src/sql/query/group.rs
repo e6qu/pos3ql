@@ -1277,7 +1277,7 @@ fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
         _ => (None, ""),
     };
     let table = match scope.find_column(qualifier, name) {
-        Ok(super::ResolvedColumn::Table(t, c)) => Some(scope.column_reference_name(t, c).0),
+        Ok(super::ResolvedColumn::Table(t, c)) => Some(scope.column_error_name(t, c).0),
         _ => qualifier,
     };
     let error = match table {

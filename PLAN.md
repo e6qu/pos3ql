@@ -295,23 +295,26 @@ AFTER trigger waits fails with `0A000` instead of resuming. A derived table
 in FROM, or a `WITH` query run as one, that names a routine variable or a
 trigger's `NEW`/`OLD` row fails as an unknown column in a function called
 from SQL or an AFTER trigger (`SELECT a INTO x FROM (SELECT n + 1 AS a) q`):
-describing it for planner inputs does not see the routine's variables. A `LATERAL` item inside a
-parenthesized join or a derived table can reference only the FROM items
-beside it, so `a JOIN (b JOIN LATERAL (SELECT a.x) s ON true) ON true`
-reports a missing FROM-clause entry for `a` where PostgreSQL accepts it. An
-ungrouped-column error inside an aliased parenthesized join names the alias
-(`j.x`) where PostgreSQL names the member table (`a.x`). A
+describing it for planner inputs does not see the routine's variables.
+Describing a derived table sees one level of FROM items at most, which
+needs a chain of enclosing scopes: a `LATERAL` item inside a parenthesized
+join or a derived table can reference only the FROM items beside it, so
+`a JOIN (b JOIN LATERAL (SELECT a.x) s ON true) ON true` reports a missing
+FROM-clause entry for `a` where PostgreSQL accepts it; a reference from a
+non-`LATERAL` derived table's projection to an earlier FROM item reports a
+missing FROM-clause entry without PostgreSQL's `invalid reference` detail
+and `LATERAL` hint; and one in its `WHERE` clause (`SELECT * FROM a,
+(SELECT * FROM b WHERE b.y = a.x) d`) runs as if the item were `LATERAL`
+where PostgreSQL rejects it. A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
-PostgreSQL types it as the table's row type `t`. An operator error names a
-named composite array's type `record[]` where PostgreSQL names it (`t[]`),
-and a column error in a FROM-less leaf of a set operation (`SELECT x UNION
-SELECT 1`) has no cursor position. A row constructor casts to a table's row type
+PostgreSQL types it as the table's row type `t`. A row constructor casts to a table's row type
 (`ROW(1, 'a')::t`) but not to a view's, and an array of a table's row type
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
-`r v%ROWTYPE`) fails with `0A000`; a table's works. A `CONSTANT`
-assignment error has no cursor position: PL/pgSQL assignment targets do not
-keep their place in the routine body. `pg_sleep` and its
+`r v%ROWTYPE`) fails with `0A000`; a table's works. In a trigger function,
+`SELECT ... INTO NEW.col` (and `EXECUTE ... INTO NEW.col`, `FETCH ... INTO
+NEW.col`) fails with `"new.col" is not a known variable`, where PostgreSQL
+assigns the field; `NEW.col := ...` works. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,

@@ -636,6 +636,30 @@ pub(crate) fn with_internal_source<R>(text: &str, run: impl FnOnce() -> R) -> R 
     run()
 }
 
+/// Runs `run` positioning subjects inside `copy`, a verbatim copy of
+/// `written`, where `written` appears in the installed statement text.
+pub(crate) fn with_copied_source<R>(written: &str, copy: &str, run: impl FnOnce() -> R) -> R {
+    let Some((at, current)) = locate(written) else {
+        return run();
+    };
+    let copies = [SourceCopy {
+        address: copy.as_ptr() as usize,
+        len: copy.len(),
+        at,
+    }];
+    let _scope = SourceScope(
+        SOURCE.with(|installed| {
+            installed.replace(Source {
+                copies: copies.as_ptr(),
+                copies_len: copies.len(),
+                ..current
+            })
+        }),
+        ANALYZED.with(Cell::get),
+    );
+    run()
+}
+
 /// Runs `run` positioning relation and column lookups in the installed
 /// statement text, for queries parsed from `text`, a slice of it written
 /// inside a utility statement (a `CREATE FUNCTION ... BEGIN ATOMIC` body):

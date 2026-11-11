@@ -1385,11 +1385,27 @@ fn plpgsql_labels_name_blocks_loops_and_their_variables() {
             ),
             (
                 "DO $$ BEGIN DECLARE a int; a int; BEGIN NULL; END; END $$",
-                "42601 duplicate declaration at or near \"a\"",
+                "42601 duplicate declaration at or near \"a\" @28",
             ),
             (
                 "DO $$ BEGIN DECLARE c CONSTANT int := 1; BEGIN c := 2; END; END $$",
-                "22005 variable \"c\" is declared CONSTANT",
+                "22005 variable \"c\" is declared CONSTANT @48",
+            ),
+            (
+                "DO $$ <<b>> DECLARE c CONSTANT int := 1; BEGIN b.c[1] := 2; END $$",
+                "22005 variable \"c\" is declared CONSTANT @48",
+            ),
+            (
+                "DO $$ DECLARE c CONSTANT int := 1; BEGIN SELECT c INTO c; END $$",
+                "22005 variable \"c\" is declared CONSTANT @56",
+            ),
+            (
+                "DO $$ DECLARE c CONSTANT int := 1; BEGIN GET DIAGNOSTICS c = ROW_COUNT; END $$",
+                "22005 variable \"c\" is declared CONSTANT @58",
+            ),
+            (
+                "DO $$ DECLARE c CONSTANT int := 1; BEGIN FOR c IN SELECT 1 LOOP END LOOP; END $$",
+                "22005 variable \"c\" is declared CONSTANT @46",
             ),
             (
                 "DO $$ <<b>> DECLARE x int := 1; BEGIN b.nope := 3; END $$",

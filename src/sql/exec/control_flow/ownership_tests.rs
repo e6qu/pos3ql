@@ -118,7 +118,7 @@ fn suspended_error_cleanup_keeps_its_original_diagnostic_after_worker_reuse() {
     drop((parsing, workspace));
     crate::mem::guard::forbid_alloc(|| {
         crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("another connection")), None);
-        let (_, code) = saved.source().parse(&restored_syntax).unwrap();
+        let (_, code) = saved.source().parse(&restored_syntax, None).unwrap();
         let mut execution = saved.restore(&output, &code).ok().unwrap();
         let frames = execution.status.control_frames.as_mut().unwrap();
         assert_eq!(frames.active, 1);
@@ -198,7 +198,7 @@ fn unfinished_returns_preserve_values_after_failed_capture_and_workspace_destruc
     });
     drop((parsing, workspace));
     crate::mem::guard::forbid_alloc(|| {
-        let (_, code) = saved.source().parse(&restored_syntax).unwrap();
+        let (_, code) = saved.source().parse(&restored_syntax, None).unwrap();
         let (saved, error) = saved.restore(&tiny, &code).err().unwrap();
         assert_eq!(error.sqlstate, "54000");
         assert_eq!(tiny.used(), 0);
@@ -276,7 +276,7 @@ fn suspended_query_attachment_keeps_receipts_after_rejecting_a_foreign_arena() {
     drop(parsing);
     crate::mem::guard::forbid_alloc(|| {
         owner.recycle_front();
-        let (_, code) = saved.source().parse(&reparsing).unwrap();
+        let (_, code) = saved.source().parse(&reparsing, None).unwrap();
         let (saved, error) = saved.restore(&foreign, &code).err().unwrap();
         assert_eq!(error.sqlstate, "XX000");
         assert_eq!(foreign.used(), 0);
@@ -299,7 +299,7 @@ fn parse_owned_program<'a>(
     pool: &std::sync::Arc<LeasePool>,
     kind: PlpgsqlProgramKind,
 ) -> Result<(ParsedTriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
-    ProgramSource::capture(text, kind, pool)?.parse(parsing)
+    ProgramSource::capture(text, kind, pool)?.parse(parsing, None)
 }
 
 #[test]
@@ -616,7 +616,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
     )
     .unwrap();
     let (mut status, retained, mut values) = crate::mem::guard::forbid_alloc(|| {
-        let (program, code) = source.parse(&parsing).unwrap();
+        let (program, code) = source.parse(&parsing, None).unwrap();
         let mut status =
             TriggerExecutionStatus::new(&workspace, &code, &locals, 0, &pool, &pool).unwrap();
         let mut retained = status.control_frames.take().unwrap();
@@ -664,7 +664,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
         moved_source.alloc_slice_with(1024, |_| 0xffu8).unwrap();
         drop(moved_source);
         parsing.alloc_slice_with(1024, |_| 0xffu8).unwrap();
-        let (_, code) = source.parse(&parsing).unwrap();
+        let (_, code) = source.parse(&parsing, None).unwrap();
         assert_eq!(
             moved.execution(&foreign, &code).err().unwrap().sqlstate,
             "40001"
@@ -720,7 +720,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
     // Resetting the workspace rejects later bindings while the source lives.
     let mut owner_budget = Budget::new(8192);
     let mut owner = Arena::new(&mut owner_budget, "reset procedural metadata", 8192).unwrap();
-    let (_, code) = source.parse(&parsing).unwrap();
+    let (_, code) = source.parse(&parsing, None).unwrap();
     let mut reset = ControlFrames::new(&owner, code.layout(), &pool).unwrap();
     reset.execution(&owner, &code).unwrap();
     owner.reset();
@@ -953,7 +953,7 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
     });
     parsing.reset();
     let saved = crate::mem::guard::forbid_alloc(|| {
-        let (program, code) = source.parse(&parsing).unwrap();
+        let (program, code) = source.parse(&parsing, None).unwrap();
         let mut retained = ControlFrames::new(&workspace, code.layout(), &pool).unwrap();
 
         let mut frames = retained.execution(&workspace, &code).unwrap();
@@ -971,14 +971,14 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
     parsing.reset();
     crate::mem::guard::forbid_alloc(|| {
         parsing.alloc_str("replacement parsing scratch").unwrap();
-        let (_, code) = source.parse(&parsing).unwrap();
+        let (_, code) = source.parse(&parsing, None).unwrap();
         let replaced = ProgramSource::capture(
             "BEGIN WHILE false LOOP NULL; END LOOP; END",
             PlpgsqlProgramKind::Anonymous,
             &pool,
         )
         .unwrap();
-        let (_, new_code) = replaced.parse(&replacement_parsing).unwrap();
+        let (_, new_code) = replaced.parse(&replacement_parsing, None).unwrap();
         let mut retained = ControlFrames::new(&workspace, saved.0, &pool).unwrap();
 
         assert_eq!(
@@ -1025,7 +1025,7 @@ fn source_owners_outlive_input_and_syntax_arenas_but_reject_replacement_images()
     )
     .unwrap();
     let mut retained = {
-        let (program, code) = source.parse(&parsing).unwrap();
+        let (program, code) = source.parse(&parsing, None).unwrap();
         let mut retained = ControlFrames::new(&workspace, code.layout(), &pool).unwrap();
         {
             let mut frames = retained.execution(&workspace, &code).unwrap();
@@ -1051,7 +1051,7 @@ fn source_owners_outlive_input_and_syntax_arenas_but_reject_replacement_images()
             assert_eq!(retained.slots[0].as_ref().unwrap().next, 1);
         }
         drop((other, other_kind));
-        let (_, code) = retained.source.parse(&parsing).unwrap();
+        let (_, code) = retained.source.parse(&parsing, None).unwrap();
         drop(source);
         drop(pool);
         let mut frames = retained.execution(&workspace, &code).unwrap();
@@ -1102,7 +1102,7 @@ fn source_capture_and_parse_failures_preserve_live_frames_and_return_capacity() 
             &pool,
         )
         .unwrap();
-        let (program, code) = source.parse(&parsing).unwrap();
+        let (program, code) = source.parse(&parsing, None).unwrap();
         let mut retained = ControlFrames::new(&workspace, code.layout(), &pool).unwrap();
         {
             let mut frames = retained.execution(&workspace, &code).unwrap();
@@ -1118,7 +1118,7 @@ fn source_capture_and_parse_failures_preserve_live_frames_and_return_capacity() 
         assert!(error.message.as_str().contains("0 available leases"));
         drop(held);
         assert_eq!(pool.lease::<u8>(4096).err().unwrap().free_bytes, free);
-        let error = source.parse(&tiny).err().unwrap();
+        let error = source.parse(&tiny, None).err().unwrap();
         assert_eq!(error.sqlstate, "54000");
         assert!(error.message.as_str().contains("statement memory"));
         assert_eq!(retained.active, 1);
@@ -1126,7 +1126,10 @@ fn source_capture_and_parse_failures_preserve_live_frames_and_return_capacity() 
         for text in ["BEGIN", "", "DECLARE", "DECLARE value integer"] {
             let invalid =
                 ProgramSource::capture(text, PlpgsqlProgramKind::Anonymous, &pool).unwrap();
-            assert_eq!(invalid.parse(&parsing).err().unwrap().sqlstate, "42601");
+            assert_eq!(
+                invalid.parse(&parsing, None).err().unwrap().sqlstate,
+                "42601"
+            );
             drop(invalid);
             assert_eq!(pool.lease::<u8>(4096).err().unwrap().free_bytes, free);
         }
@@ -1463,7 +1466,8 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                         variable_conflict: parsed.variable_conflict,
                         print_strict_params: parsed.print_strict_params,
                     };
-                    let result = validate_plpgsql_constant_assignments(&program, &|_| false);
+                    let result =
+                        validate_plpgsql_constant_assignments(&program, &|_| false, scratch);
                     match expected {
                         Some(state) => assert_eq!(result.unwrap_err().sqlstate, state, "{source}"),
                         None => result.unwrap(),
@@ -1650,7 +1654,7 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
     });
     parsing.reset();
     let (saved, source) = crate::mem::guard::forbid_alloc(|| {
-        let (_, code) = saved.source().parse(&parsing).unwrap();
+        let (_, code) = saved.source().parse(&parsing, None).unwrap();
         let saved = partial
             .with_remaining_region(|child| {
                 let held = child.alloc_slice_with(64, |_| 0xa5_u8).unwrap();
@@ -1675,7 +1679,7 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
     parsing.reset();
     crate::mem::guard::forbid_alloc(|| {
         parsing.alloc_slice_with(1024, |_| 0xaau8).unwrap();
-        let (_, code) = source.parse(&parsing).unwrap();
+        let (_, code) = source.parse(&parsing, None).unwrap();
         let mut execution = saved.restore(&output, &code).ok().unwrap();
         assert!(execution.locals[0].constant);
         assert!(execution.locals[1].not_null);

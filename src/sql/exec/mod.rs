@@ -19505,6 +19505,37 @@ fn reject_writing_cursor_query(statement: &Stmt<'_>) -> Result<(), SqlError> {
     Ok(())
 }
 
+/// The first identifier in `source` naming `target` (its label when
+/// qualified), after the top-level `keyword` when one is given.
+fn plpgsql_target_text<'s>(
+    source: &'s str,
+    keyword: Option<&str>,
+    target: PlpgsqlVariableName,
+    arena: &Arena,
+) -> Option<&'s str> {
+    use crate::sql::lexer::{Lexer, Tok};
+    let from = match keyword {
+        Some(keyword) => trigger_top_level_keyword(source, keyword, arena).ok()?? + keyword.len(),
+        None => 0,
+    };
+    let tail = source.get(from..)?;
+    let first = target.label.unwrap_or(target.name);
+    arena
+        .with_remaining_region(|scratch| {
+            let mut lexer = Lexer::new(tail, scratch);
+            loop {
+                match lexer.next_token().ok()? {
+                    Tok::Ident(word) | Tok::QuotedIdent(word) if word == first.as_str() => {
+                        return tail.get(lexer.token_start()..lexer.token_end());
+                    }
+                    Tok::Eof => return None,
+                    _ => {}
+                }
+            }
+        })
+        .ok()?
+}
+
 /// Runs `run` in a new nested command, as PostgreSQL runs a statement with
 /// data-modifying `WITH` queries: its queries read the rows earlier
 /// statements wrote and share one snapshot.
@@ -21801,7 +21832,7 @@ fn resolve_plpgsql_program_locals<'a>(
         variable_conflict: program.variable_conflict,
         print_strict_params: program.print_strict_params,
     };
-    validate_plpgsql_constant_assignments(&program, has_parameter)?;
+    validate_plpgsql_constant_assignments(&program, has_parameter, arena)?;
     Ok(program)
 }
 
@@ -21895,15 +21926,19 @@ fn compile_plpgsql_execution<'a>(
     arena: &'a Arena,
     has_parameter: &dyn Fn(SqlName) -> bool,
 ) -> Result<(TriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
+    let written = source;
     let source = ProgramSource::capture(source, kind, &storage.execution_control)?;
-    let (parsed, code) = source.parse(arena)?;
-    let program = resolve_plpgsql_program_locals(parsed, storage, txid, arena, has_parameter)?;
+    let (parsed, code) = source.parse(arena, Some(written))?;
+    let program = crate::sql::error_position::with_copied_source(written, code.text(), || {
+        resolve_plpgsql_program_locals(parsed, storage, txid, arena, has_parameter)
+    })?;
     Ok((program, code))
 }
 
 fn validate_plpgsql_constant_assignments(
     program: &TriggerProgram<'_>,
     has_parameter: &dyn Fn(SqlName) -> bool,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     struct ScopedLocal<'a> {
         label: Option<SqlName>,
@@ -21973,35 +22008,43 @@ fn validate_plpgsql_constant_assignments(
         locals: &[TriggerLocalDecl],
         shadowed: Option<&ScopedLocal<'_>>,
         has_parameter: &dyn Fn(SqlName) -> bool,
+        arena: &Arena,
     ) -> Result<(), SqlError> {
-        for statement in current.statements {
+        for (statement, source) in current.statements.iter().zip(current.sources) {
+            // PostgreSQL positions the error at the target as written.
+            let reject = |target: PlpgsqlVariableName, keyword: Option<&str>| {
+                reject(target, locals, shadowed, has_parameter).map_err(|error| {
+                    match plpgsql_target_text(source, keyword, target, arena) {
+                        Some(text) => crate::sql::error_position::at_subject(error, text),
+                        None => error,
+                    }
+                })
+            };
             match *statement {
-                TriggerStatement::LocalAssign(assignment) => {
-                    reject(assignment.name, locals, shadowed, has_parameter)?
-                }
+                TriggerStatement::LocalAssign(assignment) => reject(assignment.name, None)?,
                 TriggerStatement::SelectInto(statement) => {
                     for target in statement.targets {
-                        reject(*target, locals, shadowed, has_parameter)?;
+                        reject(*target, Some("into"))?;
                     }
                 }
                 TriggerStatement::DynamicSelectInto(statement) => {
                     for target in statement.targets {
-                        reject(*target, locals, shadowed, has_parameter)?;
+                        reject(*target, Some("into"))?;
                     }
                 }
                 TriggerStatement::CursorMotion(statement) => {
                     for target in statement.targets {
-                        reject(*target, locals, shadowed, has_parameter)?;
+                        reject(*target, Some("into"))?;
                     }
                 }
                 TriggerStatement::GetDiagnostics(statement) => {
                     for assignment in statement.assignments {
-                        reject(assignment.target, locals, shadowed, has_parameter)?;
+                        reject(assignment.target, Some("diagnostics"))?;
                     }
                 }
                 TriggerStatement::GetStackedDiagnostics(statement) => {
                     for assignment in statement.assignments {
-                        reject(assignment.target, locals, shadowed, has_parameter)?;
+                        reject(assignment.target, Some("diagnostics"))?;
                     }
                 }
                 TriggerStatement::For(statement) => {
@@ -22025,17 +22068,23 @@ fn validate_plpgsql_constant_assignments(
                             constant: false,
                             parent: shadowed,
                         };
-                        validate_block(statement.block, locals, Some(&local), has_parameter)?;
+                        validate_block(
+                            statement.block,
+                            locals,
+                            Some(&local),
+                            has_parameter,
+                            arena,
+                        )?;
                     } else {
-                        reject(statement.target, locals, shadowed, has_parameter)?;
-                        validate_block(statement.block, locals, shadowed, has_parameter)?;
+                        reject(statement.target, Some("for"))?;
+                        validate_block(statement.block, locals, shadowed, has_parameter, arena)?;
                     }
                 }
                 TriggerStatement::While(statement) => {
-                    validate_block(statement.block, locals, shadowed, has_parameter)?
+                    validate_block(statement.block, locals, shadowed, has_parameter, arena)?
                 }
                 TriggerStatement::Loop(block_value) => {
-                    validate_block(block_value, locals, shadowed, has_parameter)?
+                    validate_block(block_value, locals, shadowed, has_parameter, arena)?
                 }
                 TriggerStatement::Block(statement) => validate_scope(
                     statement.declarations,
@@ -22044,22 +22093,23 @@ fn validate_plpgsql_constant_assignments(
                     locals,
                     shadowed,
                     has_parameter,
+                    arena,
                 )?,
                 TriggerStatement::If(statement) => {
                     for branch in statement.branches {
-                        validate_block(branch.block, locals, shadowed, has_parameter)?;
+                        validate_block(branch.block, locals, shadowed, has_parameter, arena)?;
                     }
                 }
                 TriggerStatement::Case(statement) => {
                     for branch in statement.branches {
-                        validate_block(branch.block, locals, shadowed, has_parameter)?;
+                        validate_block(branch.block, locals, shadowed, has_parameter, arena)?;
                     }
                     if let TriggerCaseElse::Block(otherwise) = statement.otherwise {
-                        validate_block(otherwise, locals, shadowed, has_parameter)?;
+                        validate_block(otherwise, locals, shadowed, has_parameter, arena)?;
                     }
                 }
                 TriggerStatement::Exception(statement) => {
-                    validate_block(statement.protected, locals, shadowed, has_parameter)?;
+                    validate_block(statement.protected, locals, shadowed, has_parameter, arena)?;
                     let state = ScopedLocal {
                         label: None,
                         name: SqlName::parse("sqlstate").expect("static diagnostic name"),
@@ -22073,7 +22123,13 @@ fn validate_plpgsql_constant_assignments(
                         parent: Some(&state),
                     };
                     for handler in statement.handlers {
-                        validate_block(handler.block, locals, Some(&message), has_parameter)?;
+                        validate_block(
+                            handler.block,
+                            locals,
+                            Some(&message),
+                            has_parameter,
+                            arena,
+                        )?;
                     }
                 }
                 TriggerStatement::Null
@@ -22104,9 +22160,10 @@ fn validate_plpgsql_constant_assignments(
         locals: &[TriggerLocalDecl],
         shadowed: Option<&ScopedLocal<'_>>,
         has_parameter: &dyn Fn(SqlName) -> bool,
+        arena: &Arena,
     ) -> Result<(), SqlError> {
         match declarations.split_first() {
-            None => validate_block(block, locals, shadowed, has_parameter),
+            None => validate_block(block, locals, shadowed, has_parameter, arena),
             Some((first, rest)) => {
                 let local = ScopedLocal {
                     label,
@@ -22114,11 +22171,19 @@ fn validate_plpgsql_constant_assignments(
                     constant: first.constant,
                     parent: shadowed,
                 };
-                validate_scope(rest, label, block, locals, Some(&local), has_parameter)
+                validate_scope(
+                    rest,
+                    label,
+                    block,
+                    locals,
+                    Some(&local),
+                    has_parameter,
+                    arena,
+                )
             }
         }
     }
-    validate_block(program.body, program.locals, None, has_parameter)
+    validate_block(program.body, program.locals, None, has_parameter, arena)
 }
 
 fn resolve_plpgsql_column_type(

@@ -589,7 +589,7 @@ fn resume<'run>(
                 Ok(active) => active,
                 Err(error) => return Err(ResumeError::Unattached(frame, error)),
             };
-            let (parsed, code) = match frame.source().parse(context.arena) {
+            let (parsed, code) = match frame.source().parse(context.arena, None) {
                 Ok(parsed) => parsed,
                 Err(error) => return Err(ResumeError::Unattached(frame, error)),
             };

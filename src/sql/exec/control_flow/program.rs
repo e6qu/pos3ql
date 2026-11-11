@@ -34,9 +34,12 @@ impl ProgramSource {
         })
     }
 
+    /// Parses the saved text. `written` is the text as the statement wrote
+    /// it, when it is still installed: errors are positioned there.
     pub(in crate::sql::exec) fn parse<'a>(
         &self,
         parsing: &'a Arena,
+        written: Option<&str>,
     ) -> Result<(ParsedTriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
         let text = core::str::from_utf8(&self.bytes).expect("program sources copy UTF-8 text");
         let text = parsing.alloc_str(text).map_err(|_| {
@@ -45,7 +48,12 @@ impl ProgramSource {
                 "PL/pgSQL source parsing exceeds statement memory"
             )
         })?;
-        let program = parse_plpgsql_program(text, parsing, self.kind)?;
+        let program = match written {
+            Some(written) => crate::sql::error_position::with_copied_source(written, text, || {
+                parse_plpgsql_program(text, parsing, self.kind)
+            }),
+            None => parse_plpgsql_program(text, parsing, self.kind),
+        }?;
         let code = CompiledProgram::new(self.clone(), text, program.body, program.locals, parsing)?;
         Ok((program, code))
     }
@@ -75,6 +83,11 @@ pub(in crate::sql::exec) struct CompiledProgram<'a> {
 }
 
 impl<'a> CompiledProgram<'a> {
+    /// The program text every statement and declaration source slices.
+    pub(in crate::sql::exec) const fn text(&self) -> &'a str {
+        self.text
+    }
+
     fn new(
         source: ProgramSource,
         text: &'a str,

@@ -14,6 +14,8 @@ jobs:
         run: cargo test --lib --locked --no-run
       - name: Default buffers
         run: POS3QL_PROBE_TRACE=1 cargo test --lib --locked -- --test-threads=1 --nocapture long_streams_release_each_rows_effect_receipts pg::conn::sleep_tests result_streams_end_on_cancel || true
+      - name: Repeated sleep timeout
+        run: for i in 1 2 3 4 5 6 7 8 9 10; do cargo test --lib --locked -- --test-threads=2 pg::conn::sleep_tests || true; done
       - name: 64 KiB receive buffer
         run: POS3QL_PROBE_TRACE=1 POS3QL_PROBE_RCVBUF=65536 cargo test --lib --locked -- --test-threads=1 --nocapture long_streams_release_each_rows_effect_receipts || true
       - name: Socket settings

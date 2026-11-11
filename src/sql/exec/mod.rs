@@ -793,7 +793,7 @@ pub use describe::{
 pub(crate) use describe::{
     StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
     infer_type_catalog, intrinsic_record_field_meta, record_shape_metadata,
-    record_shape_pool_bytes, routine_result_metadata, unify_numeric_tower,
+    record_shape_pool_bytes, routine_result_metadata, row_expansion_error, unify_numeric_tower,
     visit_array_constructor_conversions, with_temporary_record_shapes,
 };
 pub(crate) use describe::{

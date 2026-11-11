@@ -131,6 +131,15 @@ fn rows(messages: &[(u8, Vec<u8>)]) -> Vec<String> {
         .collect()
 }
 
+/// Each message's kind and printable payload, for assertion failures.
+fn describe(messages: &[(u8, Vec<u8>)]) -> String {
+    messages
+        .iter()
+        .map(|(kind, payload)| format!("{}:{}", *kind as char, String::from_utf8_lossy(payload)))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 fn sqlstates(messages: &[(u8, Vec<u8>)]) -> Vec<String> {
     messages
         .iter()
@@ -227,10 +236,8 @@ fn statement_timeout_and_cancellation_end_a_sleep() {
         retry(&mut sleeper, &mut fixture.engine);
     }
     assert!(started.elapsed() < Duration::from_secs(10));
-    assert_eq!(
-        sqlstates(&received(&mut sleeper, &mut sleeper_client)),
-        ["57014"]
-    );
+    let response = received(&mut sleeper, &mut sleeper_client);
+    assert_eq!(sqlstates(&response), ["57014"], "{}", describe(&response));
     send(
         &mut sleeper,
         &mut fixture.engine,

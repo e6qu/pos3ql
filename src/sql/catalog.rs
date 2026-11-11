@@ -3997,10 +3997,72 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     intrinsic!(6274, "generate_series", 1184, "1184 1184 1186 25", 4, "i"),
 ];
 
+/// Whether `name`, as written, names an intrinsic routine. Expression
+/// evaluation asks this for every call it evaluates, so the spelling is
+/// parsed and folded once rather than once per intrinsic.
 pub(crate) fn intrinsic_routine_has_name(name: &str) -> bool {
-    INTRINSIC_ROUTINES
-        .iter()
-        .any(|routine| routine_name_matches(name, "pg_catalog", routine.name))
+    let Some((schema, written)) = split_qualified_name(name) else {
+        return false;
+    };
+    if schema.is_some_and(|schema| !identifier_spelling_matches(schema, "pg_catalog")) {
+        return false;
+    }
+    let mut folded = [0u8; MAX_INTRINSIC_NAME_BYTES];
+    // A spelling longer than every intrinsic's name names none of them.
+    folded_identifier(written, &mut folded).is_some_and(|folded| {
+        INTRINSIC_ROUTINES
+            .iter()
+            .any(|routine| routine.name.as_bytes() == folded)
+    })
+}
+
+/// Bytes in the longest intrinsic routine name.
+const MAX_INTRINSIC_NAME_BYTES: usize = {
+    let mut longest = 0;
+    let mut index = 0;
+    while index < INTRINSIC_ROUTINES.len() {
+        if INTRINSIC_ROUTINES[index].name.len() > longest {
+            longest = INTRINSIC_ROUTINES[index].name.len();
+        }
+        index += 1;
+    }
+    longest
+};
+
+/// The identifier `written` denotes, as [`identifier_spelling_matches`]
+/// compares it: a quoted spelling with doubled quotes undone, or an unquoted
+/// one folded to lower case. None if it is malformed or exceeds `into`.
+fn folded_identifier<'b>(written: &str, into: &'b mut [u8]) -> Option<&'b [u8]> {
+    let written = written.trim();
+    let mut length = 0;
+    let mut push = |byte: u8| -> Option<()> {
+        *into.get_mut(length)? = byte;
+        length += 1;
+        Some(())
+    };
+    if let Some(inner) = written
+        .strip_prefix('"')
+        .and_then(|written| written.strip_suffix('"'))
+    {
+        let mut input = inner.bytes();
+        while let Some(byte) = input.next() {
+            if byte == b'"' && input.next() != Some(b'"') {
+                return None;
+            }
+            push(byte)?;
+        }
+    } else {
+        if written.is_empty() {
+            return None;
+        }
+        for byte in written.bytes() {
+            if byte.is_ascii_whitespace() || matches!(byte, b'"' | b'.' | b'(' | b')' | b',') {
+                return None;
+            }
+            push(byte.to_ascii_lowercase())?;
+        }
+    }
+    Some(&into[..length])
 }
 
 /// Catalog properties describe execution order, not routine acceptance.
@@ -13795,9 +13857,61 @@ fn routine_name_matches(written: &str, schema: &str, name: &str) -> bool {
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod routine_name_tests {
     use super::{
-        ACCESS_METHODS, PROCEDURAL_LANGUAGES, access_method_name, access_method_oid,
-        procedural_language_name, procedural_language_oid, routine_name_matches,
+        ACCESS_METHODS, INTRINSIC_ROUTINES, PROCEDURAL_LANGUAGES, access_method_name,
+        access_method_oid, intrinsic_routine_has_name, procedural_language_name,
+        procedural_language_oid, routine_name_matches,
     };
+
+    /// The folded lookup agrees with matching each intrinsic's spelling.
+    #[test]
+    fn intrinsic_names_fold_like_routine_spellings() {
+        let per_routine = |written: &str| {
+            INTRINSIC_ROUTINES
+                .iter()
+                .any(|routine| routine_name_matches(written, "pg_catalog", routine.name))
+        };
+        let longest = INTRINSIC_ROUTINES
+            .iter()
+            .map(|routine| routine.name)
+            .max_by_key(|name| name.len())
+            .unwrap();
+        let too_long = format!("{longest}x");
+        for written in [
+            "nextval",
+            "NEXTVAL",
+            " nextval ",
+            "\"nextval\"",
+            "\"NEXTVAL\"",
+            "pg_catalog.nextval",
+            "PG_CATALOG.\"nextval\"",
+            "public.nextval",
+            "\"next\"\"val\"",
+            "next val",
+            "nextval(",
+            "",
+            "\"\"",
+            "a.b.c",
+            longest,
+            too_long.as_str(),
+            "no_such_intrinsic",
+        ] {
+            assert_eq!(
+                intrinsic_routine_has_name(written),
+                per_routine(written),
+                "{written:?}"
+            );
+        }
+        for routine in INTRINSIC_ROUTINES {
+            let quoted = format!("\"{}\"", routine.name.replace('"', "\"\""));
+            assert!(intrinsic_routine_has_name(&quoted), "{quoted}");
+            assert_eq!(
+                intrinsic_routine_has_name(routine.name),
+                per_routine(routine.name),
+                "{}",
+                routine.name
+            );
+        }
+    }
 
     #[test]
     fn static_comment_catalog_identities_round_trip() {

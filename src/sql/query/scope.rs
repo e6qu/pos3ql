@@ -2058,6 +2058,19 @@ impl<'d> QueryScope<'d> {
                 "missing FROM-clause entry for table \"{}\"",
                 table
             ),
+            // A bare name of a table the FROM clause gave an alias.
+            None if (0..self.n).any(|index| {
+                self.defs
+                    .get(index)
+                    .is_some_and(|definition| definition.name.as_str() == name)
+            }) =>
+            {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    name
+                )
+            }
             None => sql_err!(
                 sqlstate::UNDEFINED_TABLE,
                 "missing FROM-clause entry for table \"{}\"",

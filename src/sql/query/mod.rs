@@ -13351,10 +13351,7 @@ fn describe_scope_record_star<'q>(
                 index += 1;
             }
             if index == 0 {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
+                return Err(super::exec::row_expansion_error(base, &resolver));
             }
         }
         _ => {
@@ -13402,10 +13399,7 @@ fn describe_scope_record_star<'q>(
                 return Ok(n);
             }
             let Some(handle) = super::exec::expr_record_handle_pub(base, &resolver) else {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
+                return Err(super::exec::row_expansion_error(base, &resolver));
             };
             let mut push_err = None;
             super::exec::visit_record_shape_metadata_pub(handle, |field_name, meta| {
@@ -14160,12 +14154,8 @@ pub(super) fn record_star_width(
             &fromless
         }
     };
-    super::exec::record_shape_metadata(base, columns, |_, _| {})?.ok_or_else(|| {
-        sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "row expansion is not supported on this expression"
-        )
-    })
+    super::exec::record_shape_metadata(base, columns, |_, _| {})?
+        .ok_or_else(|| super::exec::row_expansion_error(base, columns))
 }
 
 fn infer_scope_type(expression: &Expr, scope: &QueryScope) -> Result<(i32, i16), SqlError> {

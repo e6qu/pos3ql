@@ -1155,19 +1155,26 @@ fn result_streams_end_on_cancel_timeout_and_disconnect() {
         assert_rows(&rows, rows.len());
 
         // statement_timeout expires while the stream waits for its client.
-        // The timeout leaves a loaded host time to open the stream first.
+        // The armed deadline is moved into the past rather than slept past,
+        // so a loaded host cannot expire it before the stream opens.
         run(
             &mut conn,
             &mut fixture.engine,
             &mut client,
-            "SET statement_timeout = '1s'",
+            "SET statement_timeout = '1h'",
         );
+        let submitted = crate::sql::datetime::now_micros();
         client
             .write_all(&query("SELECT id, payload FROM big"))
             .unwrap();
         assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
         assert!(conn.result_streams.is_active());
-        std::thread::sleep(Duration::from_millis(1100));
+        let armed = conn.expire_result_stream_deadline();
+        assert!(
+            (submitted + 3_600_000_000..=crate::sql::datetime::now_micros() + 3_600_000_000)
+                .contains(&armed),
+            "the stream keeps the statement's deadline"
+        );
         let generation = fixture.engine.lock_generation();
         let pending = crate::mem::guard::forbid_alloc(|| {
             conn.retry_parked(&mut fixture.engine, KEY, generation, false)

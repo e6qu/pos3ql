@@ -1272,10 +1272,7 @@ fn expand_grouped_stars<'a>(
                     return Err(error);
                 }
                 if expanded.is_none() {
-                    return Err(sql_err!(
-                        sqlstate::WRONG_OBJECT_TYPE,
-                        "row expansion is not supported on this expression"
-                    ));
+                    return Err(crate::sql::exec::row_expansion_error(base, &resolver));
                 }
             }
             other => push(*other, &mut n)?,

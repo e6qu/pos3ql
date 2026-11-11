@@ -804,6 +804,22 @@ impl Conn {
         self.parked.then_some(self.parked_wait)
     }
 
+    /// Moves the running result stream's statement_timeout deadline into the
+    /// past, both where its parked wait reads it and where the resumed stream
+    /// restores it, so tests expire it without racing the host clock.
+    /// Returns the deadline it replaced.
+    #[cfg(test)]
+    pub(crate) fn expire_result_stream_deadline(&mut self) -> i64 {
+        let state = self
+            .result_streams
+            .active_mut()
+            .and_then(|stream| stream.state.as_mut())
+            .expect("a running result stream");
+        let armed = core::mem::replace(&mut state.deadline, 1);
+        assert_eq!(self.txn.expire_suspended_statement_deadline(), armed);
+        armed
+    }
+
     /// Skips startup for engine tests that drive a connection directly.
     #[cfg(test)]
     pub(crate) fn enter_ready_for_tests(&mut self, engine: &Engine) {

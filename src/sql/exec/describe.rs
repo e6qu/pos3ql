@@ -1204,12 +1204,7 @@ fn describe_record_star<'q>(
             if let Some(error) = error {
                 return Err(error);
             }
-            width.ok_or_else(|| {
-                sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                )
-            })?;
+            width.ok_or_else(|| row_expansion_error(base, &resolver))?;
             Ok(())
         }
         Expr::WholeRow(table)
@@ -1327,10 +1322,16 @@ fn describe_record_star<'q>(
                 return Ok(());
             }
             let Some(handle) = expr_record_handle(base, resolver) else {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
+                // Name the value's type through the catalog, as PostgreSQL does.
+                let catalog = CatalogCols {
+                    definition: def,
+                    alias: table_alias,
+                    output_aliases,
+                    storage: storage.expect("checked"),
+                    txid,
+                    arena,
+                };
+                return Err(row_expansion_error(base, &catalog));
             };
             let mut push_err = None;
             visit_record_shape_metadata(handle, |field_name, meta| {
@@ -1375,10 +1376,7 @@ fn describe_record_star<'q>(
                 None => &NoCols,
             };
             let Some(handle) = expr_record_handle(base, resolver) else {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
+                return Err(row_expansion_error(base, resolver));
             };
             let mut push_err = None;
             visit_record_shape_metadata(handle, |field_name, meta| {
@@ -3492,10 +3490,7 @@ pub(crate) fn expand_record_call_items<'a>(
             return Err(error);
         }
         if width.is_none() {
-            return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "row expansion is not supported on this expression"
-            ));
+            return Err(row_expansion_error(base, columns));
         }
     }
     Ok(expanded.as_slice())
@@ -4008,6 +4003,39 @@ pub fn could_not_identify(field: &str) -> SqlError {
         "could not identify column \"{}\" in record data type",
         field
     )
+}
+
+/// PostgreSQL's 42809 for `(value).*`: a value of a known non-row type names
+/// that type; a row whose fields pos3ql cannot list says so instead.
+pub(crate) fn row_expansion_error(base: &Expr, columns: &dyn ColTypeResolver) -> SqlError {
+    let scalar = |ctype: ColType| !matches!(ctype, ColType::Record | ColType::Composite(_));
+    let type_oid = match base {
+        Expr::Null | Expr::Str(_) => Some(oid::UNKNOWN),
+        // A domain names itself; one over a row type expands elsewhere.
+        Expr::Cast { type_name, .. }
+            if let Some(named) = columns.named_type_oid(type_name)
+                && let Some(base_type) = columns.domain_base_type(named) =>
+        {
+            scalar(base_type).then_some(named)
+        }
+        _ => infer_type_res(base, columns)
+            .ok()
+            .map(|(type_oid, _)| type_oid)
+            .filter(|type_oid| ColType::from_oid(*type_oid).is_some_and(scalar)),
+    };
+    let scalar_name =
+        type_oid.and_then(|type_oid| columns.type_name_fixed(type_oid).ok().flatten());
+    match scalar_name {
+        Some(name) => sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "type {} is not composite",
+            name.as_str()
+        ),
+        None => sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "row expansion is not supported on this expression"
+        ),
+    }
 }
 
 /// PostgreSQL's 42809 for column notation on a non-composite value.

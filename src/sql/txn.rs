@@ -1611,6 +1611,19 @@ impl TxnState {
         }
     }
 
+    /// Moves a suspended statement's armed deadline into the past, so tests
+    /// expire statement_timeout without racing the host clock. Returns the
+    /// deadline it replaced.
+    #[cfg(test)]
+    pub(crate) fn expire_suspended_statement_deadline(&mut self) -> i64 {
+        let suspended = self
+            .suspended_statement
+            .as_mut()
+            .expect("a suspended statement");
+        assert_ne!(suspended.deadline, 0, "statement_timeout is armed");
+        core::mem::replace(&mut suspended.deadline, 1)
+    }
+
     pub(crate) fn enter_statement_timeout(&mut self, entry: super::StatementTimeoutEntry) {
         if self.staged_commit.is_some() {
             super::query::disarm_timeout();

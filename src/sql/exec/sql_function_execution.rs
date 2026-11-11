@@ -642,9 +642,12 @@ impl SqlExecution {
         capture: bool,
     ) -> Result<(), SqlError> {
         // Data-modifying WITH queries run before the query that reads them,
-        // under the statement's snapshot, as in a top-level query.
+        // under the statement's snapshot, as in a top-level query. A query
+        // resuming after a wait continues from its saved state; its WITH
+        // writes already ran and must not run again.
         if let query::RoutineQuery::Select(select) = query
             && select.with.iter().any(|cte| cte.dml.is_some())
+            && self.pending_query.is_none()
         {
             let params = core::mem::replace(&mut context.params, arguments);
             let bound = super::bind_plpgsql_dml_ctes(context, select);

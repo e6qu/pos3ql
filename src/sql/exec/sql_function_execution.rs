@@ -730,13 +730,8 @@ impl SqlExecution {
                     engine.storage.lock_mark(),
                 )
             };
-            let before = context.txn.transaction_effect_mark();
-            let descriptors = context.txn.statement_large_object_descriptors(arena)?;
-            let advisory = context.storage().advisory_statement_mark();
-            let settings = match &context.host {
-                PlpgsqlExecHost::Routine { guc, .. } => guc.statement_settings(),
-                _ => return Err(changed()),
-            };
+            let effects = super::write_attempts::WriteAttemptEffects::capture(context)?
+                .ok_or_else(changed)?;
             let outcome = query::with_routine_invocation_scope(
                 Some(query::RoutineInvocationContext::new(&calls, owner)),
                 || {
@@ -809,17 +804,7 @@ impl SqlExecution {
                     }
                 },
             );
-            let changed_effects = context.txn.transaction_effect_mark() != before
-                || !context
-                    .txn
-                    .matches_statement_large_object_descriptors(descriptors)
-                || context.storage().advisory_statement_mark() != advisory
-                || match &context.host {
-                    PlpgsqlExecHost::Routine { guc, .. } => {
-                        !guc.matches_statement_settings(&settings)
-                    }
-                    _ => true,
-                };
+            let changed_effects = effects.changed(context);
             match outcome {
                 Ok(_) => break Ok(()),
                 Err(error) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION => {
@@ -832,10 +817,7 @@ impl SqlExecution {
                         break result;
                     }
                     if changed_effects {
-                        break Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "SQL row expression requires retained write progress"
-                        ));
+                        break Err(super::write_attempts::retained_progress_required());
                     }
                     let PlpgsqlExecHost::Routine {
                         engine,
@@ -872,10 +854,7 @@ impl SqlExecution {
                     }
                 }
                 Err(error) if changed_effects && control_flow::is_execution_wait(&error) => {
-                    break Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "SQL row expression requires retained write progress"
-                    ));
+                    break Err(super::write_attempts::retained_progress_required());
                 }
                 Err(error) => break Err(error),
             }

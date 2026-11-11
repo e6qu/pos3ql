@@ -414,3 +414,49 @@ fn procedure_writes_yield_during_source_scans() {
         cold.finish();
     }
 }
+
+/// A `DO` body's `UPDATE` and dynamic `INSERT` call a PL/pgSQL function: the
+/// cold scan yields, each call runs once with the engine, and the write
+/// replays its result, as in PostgreSQL 18.6.
+#[test]
+fn procedural_writes_call_procedural_functions_after_waits() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for extended in [false, true] {
+            let mut cold = cold_table(
+                "procedural-calls",
+                mode,
+                "CREATE TABLE hot_log(stage text); \
+                 CREATE FUNCTION tag(value text) RETURNS text LANGUAGE plpgsql AS $$ BEGIN \
+                 INSERT INTO hot_log VALUES ('tag-' || value); RETURN value || '!'; END$$",
+            );
+            let waits = cold.run(
+                "DO $$ BEGIN UPDATE cold_items SET code = tag(code) WHERE id = 7; \
+                 EXECUTE 'INSERT INTO hot_log SELECT tag(code) FROM cold_items WHERE id = $1' \
+                 USING 7; END$$",
+                extended,
+                other_client_progresses,
+            );
+            let context = format!("{mode:?} extended={extended}");
+            assert!(waits > 0, "{context}: the scan must wait");
+            let output = cold.writer.send.readable().to_vec();
+            assert!(
+                error_sqlstates(&output).is_empty(),
+                "{context}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert_eq!(
+                cold.rows("SELECT code FROM cold_items WHERE id = 7"),
+                ["c7!"]
+            );
+            assert_eq!(
+                cold.rows("SELECT string_agg(stage, ',' ORDER BY stage) FROM hot_log"),
+                ["c7!!,other,tag-c7,tag-c7!"],
+                "{context}"
+            );
+            cold.finish();
+        }
+    }
+}

@@ -105,10 +105,7 @@ is owned.
   order. Triggers fired inside a write run without the engine's utility
   executor, so DDL there (PL/pgSQL `CREATE TABLE`, or a SQL procedure that a
   BEFORE trigger calls) fails with `0A000`; running the row phase from the
-  engine with saved progress gives them that executor. A PL/pgSQL `INSERT`,
-  `UPDATE` or `DELETE` whose expressions call a PL/pgSQL function fails with
-  `0A000` (`PL/pgSQL functions require a resumable query executor`); the
-  statement needs the invocation log that SQL-language function writes use.
+  engine with saved progress gives them that executor.
 - **Results and cursors:** resume more large results row by row; only
   single-table `SELECT` from a simple Query or an unpaged `Execute` does today.
   Remaining: paged and named portals (`Execute` with a row limit still buffers

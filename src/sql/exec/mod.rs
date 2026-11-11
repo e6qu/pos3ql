@@ -821,7 +821,9 @@ pub(super) use function_execution::{FunctionOutput, SuspendedFunction};
 pub(super) use procedure_execution::SuspendedProcedure;
 pub(super) use sql_function_execution::execute_sql_function;
 mod trigger_firing;
+mod write_attempts;
 mod write_completion;
+use write_attempts::execute_procedural_write;
 pub(super) use write_completion::SuspendedWriteCompletion;
 pub(super) use write_completion::resume as resume_write_completion;
 
@@ -17912,6 +17914,8 @@ struct TriggerExecutionStatus<'a> {
     pending_write: Option<write_completion::PendingNestedWrite>,
     pending_statement: Option<super::sequence::SavedStatementPosition>,
     pending_query: Option<super::query::RoutineInvocationState>,
+    /// Calls a waiting data change completed before its wait.
+    write_calls: Option<super::query::RoutineInvocationState>,
     /// Finished expressions of a waiting statement that evaluates several.
     expressions: local_values::ExpressionProgress,
     /// A procedure this frame's `CALL` started that is waiting.
@@ -17950,6 +17954,7 @@ impl<'a> TriggerExecutionStatus<'a> {
             pending_write: None,
             pending_statement: None,
             pending_query: None,
+            write_calls: None,
             expressions: local_values::ExpressionProgress::new(rows)?,
             pending_call: None,
         })
@@ -28090,396 +28095,411 @@ fn execute_trigger_step<'a>(
         _ => None,
     };
     let write_effects = super::query::enter_statement_read_effect_scope(write_reads.as_ref());
-    let mut execute = || match statement {
-        TriggerStatement::Null => execute_trigger_statement(|| Ok(None)),
-        TriggerStatement::TransactionControl(command) => execute_trigger_statement(|| {
-            context.host.transaction_control(
-                command,
-                context.txn,
-                context.arena,
-                context.responder,
-            )?;
-            Ok(None)
-        }),
-        TriggerStatement::ReturnNext(expression) => execute_trigger_statement(|| {
-            let output_source = context.arena;
-            output_source
-                .with_remaining_region(|arena| {
-                    let host = context.host.reborrow();
-                    let mut context = TriggerExecContext {
-                        host,
-                        txn: context.txn,
-                        arena,
-                        params: context.params,
-                        responder: context.responder,
-                    };
-                    let values = match expression {
-                        Some(expression) => {
-                            let transition = TriggerTransition {
-                                definition,
-                                old,
-                                new: new.as_deref(),
-                            };
-                            let scope = TriggerLocalScope {
-                                locals,
-                                values: &local_values[..locals.len()],
-                                found: status.found,
-                                invocation,
-                                transition: &transition,
-                            };
-                            match eval_procedural_expression(
-                                &mut context,
-                                expression,
-                                &scope,
-                                retained_parent.then_some(&mut status.pending_query),
-                            )? {
-                                Datum::Record(fields) => {
-                                    if fields.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
-                                        return Err(sql_err!(
-                                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                            "RETURN NEXT record has too many columns"
-                                        ));
-                                    }
-                                    arena
-                                        .alloc_slice_with(fields.len(), |index| fields[index].value)
-                                        .map_err(|_| super::query::arena_full_pub())?
-                                }
-                                value => arena
-                                    .alloc_slice_copy(&[value])
-                                    .map_err(|_| super::query::arena_full_pub())?,
-                            }
-                        }
-                        None => {
-                            let values = arena
-                                .alloc_slice_with(status.outputs.len(), |_| Datum::Null)
-                                .map_err(|_| super::query::arena_full_pub())?;
-                            for (value, output) in values.iter_mut().zip(status.outputs.iter()) {
-                                *value = if output.shadow_depth == 0 {
-                                    local_values[output.local]
-                                } else {
-                                    output.value.read(0, arena)?
+    let mut execute = |context: &mut TriggerExecContext<'_, 'a, '_>,
+                       status: &mut TriggerExecutionStatus<'a>| {
+        match statement {
+            TriggerStatement::Null => execute_trigger_statement(|| Ok(None)),
+            TriggerStatement::TransactionControl(command) => execute_trigger_statement(|| {
+                context.host.transaction_control(
+                    command,
+                    context.txn,
+                    context.arena,
+                    context.responder,
+                )?;
+                Ok(None)
+            }),
+            TriggerStatement::ReturnNext(expression) => execute_trigger_statement(|| {
+                let output_source = context.arena;
+                output_source
+                    .with_remaining_region(|arena| {
+                        let host = context.host.reborrow();
+                        let mut context = TriggerExecContext {
+                            host,
+                            txn: context.txn,
+                            arena,
+                            params: context.params,
+                            responder: context.responder,
+                        };
+                        let values = match expression {
+                            Some(expression) => {
+                                let transition = TriggerTransition {
+                                    definition,
+                                    old,
+                                    new: new.as_deref(),
                                 };
+                                let scope = TriggerLocalScope {
+                                    locals,
+                                    values: &local_values[..locals.len()],
+                                    found: status.found,
+                                    invocation,
+                                    transition: &transition,
+                                };
+                                match eval_procedural_expression(
+                                    &mut context,
+                                    expression,
+                                    &scope,
+                                    retained_parent.then_some(&mut status.pending_query),
+                                )? {
+                                    Datum::Record(fields) => {
+                                        if fields.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
+                                            return Err(sql_err!(
+                                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                                "RETURN NEXT record has too many columns"
+                                            ));
+                                        }
+                                        arena
+                                            .alloc_slice_with(fields.len(), |index| {
+                                                fields[index].value
+                                            })
+                                            .map_err(|_| super::query::arena_full_pub())?
+                                    }
+                                    value => arena
+                                        .alloc_slice_copy(&[value])
+                                        .map_err(|_| super::query::arena_full_pub())?,
+                                }
                             }
-                            values
-                        }
-                    };
-                    status.emit_set_row(values, arena)?;
-                    Ok(None)
-                })
-                .map_err(|_| super::query::arena_full_pub())?
-        }),
-        TriggerStatement::ReturnQuery(query) => execute_trigger_statement(|| {
-            let query = match transition_relations {
-                Some(relations) => super::query::bind_materialized_relations(
+                            None => {
+                                let values = arena
+                                    .alloc_slice_with(status.outputs.len(), |_| Datum::Null)
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                for (value, output) in values.iter_mut().zip(status.outputs.iter())
+                                {
+                                    *value = if output.shadow_depth == 0 {
+                                        local_values[output.local]
+                                    } else {
+                                        output.value.read(0, arena)?
+                                    };
+                                }
+                                values
+                            }
+                        };
+                        status.emit_set_row(values, arena)?;
+                        Ok(None)
+                    })
+                    .map_err(|_| super::query::arena_full_pub())?
+            }),
+            TriggerStatement::ReturnQuery(query) => execute_trigger_statement(|| {
+                let query = match transition_relations {
+                    Some(relations) => super::query::bind_materialized_relations(
+                        query,
+                        relations,
+                        context.storage(),
+                        context.txn.txid,
+                        context.arena,
+                    )?,
+                    None => query,
+                };
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let arena = context.arena;
+                let params = context.params;
+                let txid = context.txn.txid;
+                let rows = execute_procedural_query(context, None, |storage, sequence| {
+                    let mut rows = ArenaList::new(arena);
+                    let result = super::query::select_into_rows(
+                        storage,
+                        txid,
+                        query,
+                        arena,
+                        params,
+                        Some(&scope),
+                        Some(sequence),
+                        &mut |values| {
+                            if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
+                                return Err(sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "RETURN QUERY produced too many columns"
+                                ));
+                            }
+                            rows.push(encode_projected_pub(values, arena)?)
+                                .map_err(|_| super::query::arena_full_pub())
+                        },
+                    );
+                    ProceduralQueryRows::complete(rows.as_slice(), result)
+                })?;
+                for row in rows.rows {
+                    let mut values = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
+                    let width = decode_projected_row_into(row, arena, &mut values)?;
+                    status.emit_set_row(&values[..width], arena)?;
+                }
+
+                if let Some(error) = rows.terminal_error {
+                    return Err(error);
+                }
+                Ok(None)
+            }),
+            TriggerStatement::ReturnDynamicQuery(query) => execute_trigger_statement(|| {
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let query = bind_plpgsql_dynamic_query(
+                    context,
                     query,
-                    relations,
+                    &scope,
+                    DynamicCommandKind::Statement,
+                    &mut StatementExpressions::new(
+                        retained_parent,
+                        true,
+                        &mut status.expressions,
+                        &mut status.pending_query,
+                    ),
+                )?;
+                let arena = context.arena;
+                execute_bound_plpgsql_dynamic_query(context, query, &mut |values| {
+                    if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "RETURN QUERY EXECUTE produced too many columns"
+                        ));
+                    }
+                    let mut detached = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
+                    for (index, value) in values.iter().copied().enumerate() {
+                        detached[index] = detached_trigger_datum(value, arena)?;
+                    }
+                    status.emit_set_row(&detached[..values.len()], arena)
+                })?;
+
+                Ok(None)
+            }),
+            TriggerStatement::Return(result) => execute_trigger_statement(|| {
+                let result = match result {
+                    TriggerReturn::New => TriggerReturnValue::New,
+                    TriggerReturn::Old => TriggerReturnValue::Old,
+                    TriggerReturn::Null => TriggerReturnValue::Null,
+                    TriggerReturn::Void => TriggerReturnValue::Void,
+                    TriggerReturn::Value(expression) => {
+                        let transition = TriggerTransition {
+                            definition,
+                            old,
+                            new: new.as_deref(),
+                        };
+                        let scope = TriggerLocalScope {
+                            locals,
+                            values: &local_values[..locals.len()],
+                            found: status.found,
+                            invocation,
+                            transition: &transition,
+                        };
+                        TriggerReturnValue::Value(eval_procedural_expression(
+                            context,
+                            expression,
+                            &scope,
+                            retained_parent.then_some(&mut status.pending_query),
+                        )?)
+                    }
+                };
+                Ok(Some(TriggerFlow::Return(result)))
+            }),
+            TriggerStatement::Assign(assignment) => execute_trigger_statement(|| {
+                if !before || new.is_none() {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "NEW assignments require a BEFORE INSERT or UPDATE trigger"
+                    ));
+                }
+                let Some(column) = definition.column_index(assignment.column.as_str()) else {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        assignment.column.as_str()
+                    ));
+                };
+                if definition.columns()[column].default.is_generated() {
+                    return Err(sql_err!(
+                        sqlstate::GENERATED_ALWAYS,
+                        "cannot assign to generated column \"{}\"",
+                        assignment.column.as_str()
+                    ));
+                }
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let catalog = super::query::storage_catalog(
+                    context.storage(),
+                    context.arena,
+                    context.txn.txid,
+                );
+                let hooks = EvalHooks {
+                    catalog: Some(&catalog),
+                    ..NO_HOOKS
+                };
+                let source =
+                    super::eval::expression_type_identity(assignment.expression, &scope, &hooks)?
+                        .routine_argument_oid();
+                let cast = prepare_assignment_cast(
+                    source,
+                    &definition.columns()[column],
                     context.storage(),
                     context.txn.txid,
                     context.arena,
-                )?,
-                None => query,
-            };
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let arena = context.arena;
-            let params = context.params;
-            let txid = context.txn.txid;
-            let rows = execute_procedural_query(context, None, |storage, sequence| {
-                let mut rows = ArenaList::new(arena);
-                let result = super::query::select_into_rows(
-                    storage,
-                    txid,
-                    query,
-                    arena,
-                    params,
-                    Some(&scope),
-                    Some(sequence),
-                    &mut |values| {
-                        if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
-                            return Err(sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "RETURN QUERY produced too many columns"
-                            ));
-                        }
-                        rows.push(encode_projected_pub(values, arena)?)
-                            .map_err(|_| super::query::arena_full_pub())
+                )?;
+                let input_collation = super::eval::coercion_input_collation(
+                    assignment.expression,
+                    &scope,
+                    hooks.catalog,
+                )?;
+                let value = eval_procedural_expression(
+                    context,
+                    assignment.expression,
+                    &scope,
+                    retained_parent.then_some(&mut status.pending_query),
+                )?;
+                let value = coerce_assignment(
+                    value,
+                    &definition.columns()[column],
+                    PlannedAssignmentCast {
+                        input_collation,
+                        defined: cast.as_ref(),
+                        site: None,
                     },
-                );
-                ProceduralQueryRows::complete(rows.as_slice(), result)
-            })?;
-            for row in rows.rows {
-                let mut values = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
-                let width = decode_projected_row_into(row, arena, &mut values)?;
-                status.emit_set_row(&values[..width], arena)?;
-            }
-
-            if let Some(error) = rows.terminal_error {
-                return Err(error);
-            }
-            Ok(None)
-        }),
-        TriggerStatement::ReturnDynamicQuery(query) => execute_trigger_statement(|| {
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let query = bind_plpgsql_dynamic_query(
-                context,
-                query,
-                &scope,
-                DynamicCommandKind::Statement,
-                &mut StatementExpressions::new(
-                    retained_parent,
-                    true,
-                    &mut status.expressions,
-                    &mut status.pending_query,
-                ),
-            )?;
-            let arena = context.arena;
-            execute_bound_plpgsql_dynamic_query(context, query, &mut |values| {
-                if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "RETURN QUERY EXECUTE produced too many columns"
-                    ));
-                }
-                let mut detached = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
-                for (index, value) in values.iter().copied().enumerate() {
-                    detached[index] = detached_trigger_datum(value, arena)?;
-                }
-                status.emit_set_row(&detached[..values.len()], arena)
-            })?;
-
-            Ok(None)
-        }),
-        TriggerStatement::Return(result) => execute_trigger_statement(|| {
-            let result = match result {
-                TriggerReturn::New => TriggerReturnValue::New,
-                TriggerReturn::Old => TriggerReturnValue::Old,
-                TriggerReturn::Null => TriggerReturnValue::Null,
-                TriggerReturn::Void => TriggerReturnValue::Void,
-                TriggerReturn::Value(expression) => {
-                    let transition = TriggerTransition {
-                        definition,
-                        old,
-                        new: new.as_deref(),
-                    };
-                    let scope = TriggerLocalScope {
-                        locals,
-                        values: &local_values[..locals.len()],
-                        found: status.found,
-                        invocation,
-                        transition: &transition,
-                    };
-                    TriggerReturnValue::Value(eval_procedural_expression(
-                        context,
-                        expression,
-                        &scope,
-                        retained_parent.then_some(&mut status.pending_query),
-                    )?)
-                }
-            };
-            Ok(Some(TriggerFlow::Return(result)))
-        }),
-        TriggerStatement::Assign(assignment) => execute_trigger_statement(|| {
-            if !before || new.is_none() {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "NEW assignments require a BEFORE INSERT or UPDATE trigger"
-                ));
-            }
-            let Some(column) = definition.column_index(assignment.column.as_str()) else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    assignment.column.as_str()
-                ));
-            };
-            if definition.columns()[column].default.is_generated() {
-                return Err(sql_err!(
-                    sqlstate::GENERATED_ALWAYS,
-                    "cannot assign to generated column \"{}\"",
-                    assignment.column.as_str()
-                ));
-            }
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let catalog =
-                super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
-            let hooks = EvalHooks {
-                catalog: Some(&catalog),
-                ..NO_HOOKS
-            };
-            let source =
-                super::eval::expression_type_identity(assignment.expression, &scope, &hooks)?
-                    .routine_argument_oid();
-            let cast = prepare_assignment_cast(
-                source,
-                &definition.columns()[column],
-                context.storage(),
-                context.txn.txid,
-                context.arena,
-            )?;
-            let input_collation = super::eval::coercion_input_collation(
-                assignment.expression,
-                &scope,
-                hooks.catalog,
-            )?;
-            let value = eval_procedural_expression(
-                context,
-                assignment.expression,
-                &scope,
-                retained_parent.then_some(&mut status.pending_query),
-            )?;
-            let value = coerce_assignment(
-                value,
-                &definition.columns()[column],
-                PlannedAssignmentCast {
-                    input_collation,
-                    defined: cast.as_ref(),
-                    site: None,
-                },
-                context.storage(),
-                context.txn.txid,
-                context.arena,
-                Some(&crate::sql::sequence::SeqEval::new(
                     context.storage(),
-                    context.seq_session(),
                     context.txn.txid,
-                )),
-            )?;
-            new.as_deref_mut().expect("checked NEW image")[column] = value;
+                    context.arena,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        context.storage(),
+                        context.seq_session(),
+                        context.txn.txid,
+                    )),
+                )?;
+                new.as_deref_mut().expect("checked NEW image")[column] = value;
 
-            Ok(None)
-        }),
-        TriggerStatement::LocalAssign(assignment) => execute_trigger_statement(|| {
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let value = eval_procedural_expression(
-                context,
-                assignment.expression,
-                &scope,
-                retained_parent.then_some(&mut status.pending_query),
-            )?;
-            if locals.iter().any(|local| local.name == assignment.name) {
-                assign_trigger_local(context, locals, local_values, assignment.name, value)?;
-            } else if TriggerStatusVariable::parse(assignment.name.as_str()).is_some() {
-                status.found = match cast_to(value, ColType::Bool, context.arena)? {
-                    Datum::Bool(value) => Some(value),
-                    Datum::Null => None,
-                    _ => unreachable!("boolean cast preserves its datum kind"),
+                Ok(None)
+            }),
+            TriggerStatement::LocalAssign(assignment) => execute_trigger_statement(|| {
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
                 };
-            } else {
-                assign_trigger_local(context, locals, local_values, assignment.name, value)?;
-            }
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let value = eval_procedural_expression(
+                    context,
+                    assignment.expression,
+                    &scope,
+                    retained_parent.then_some(&mut status.pending_query),
+                )?;
+                if locals.iter().any(|local| local.name == assignment.name) {
+                    assign_trigger_local(context, locals, local_values, assignment.name, value)?;
+                } else if TriggerStatusVariable::parse(assignment.name.as_str()).is_some() {
+                    status.found = match cast_to(value, ColType::Bool, context.arena)? {
+                        Datum::Bool(value) => Some(value),
+                        Datum::Null => None,
+                        _ => unreachable!("boolean cast preserves its datum kind"),
+                    };
+                } else {
+                    assign_trigger_local(context, locals, local_values, assignment.name, value)?;
+                }
 
-            Ok(None)
-        }),
-        TriggerStatement::CursorOpen(statement) => execute_trigger_statement(|| {
-            let changed = [trigger_local_index(locals, statement.variable)?];
-            cursor_statement_effect(
-                context,
-                &invocation,
-                CursorReceiptOperation::Open {
-                    variable: statement.variable,
-                    scroll: statement.scroll,
-                },
-                &changed,
-                local_values,
-                status,
-                |context, local_values, status, completed| {
-                    let local = trigger_local_index(locals, statement.variable)?;
-                    if locals[local].ctype != ColType::Refcursor {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "variable \"{}\" must be of type cursor or refcursor",
-                            statement.variable.as_str()
-                        ));
-                    }
-                    let assign_name = local_values[local].is_null();
-                    if assign_name && locals[local].constant {
-                        return Err(sql_err!(
-                            sqlstate::ERROR_IN_ASSIGNMENT,
-                            "variable \"{}\" is declared CONSTANT",
-                            statement.variable.as_str()
-                        ));
-                    }
-                    let generated;
-                    let name = match local_values[local] {
-                        Datum::Text(name) => name,
-                        Datum::Null => {
-                            let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host else {
-                                return Err(sql_err!(
-                                    sqlstate::FEATURE_NOT_SUPPORTED,
-                                    "SQL cursors are not available in trigger execution"
-                                ));
-                            };
-                            generated = cursors.unnamed_name()?;
-                            context
-                                .arena
-                                .alloc_str(generated.as_str())
-                                .map_err(|_| super::query::arena_full_pub())?
-                        }
-                        _ => {
+                Ok(None)
+            }),
+            TriggerStatement::CursorOpen(statement) => execute_trigger_statement(|| {
+                let changed = [trigger_local_index(locals, statement.variable)?];
+                cursor_statement_effect(
+                    context,
+                    &invocation,
+                    CursorReceiptOperation::Open {
+                        variable: statement.variable,
+                        scroll: statement.scroll,
+                    },
+                    &changed,
+                    local_values,
+                    status,
+                    |context, local_values, status, completed| {
+                        let local = trigger_local_index(locals, statement.variable)?;
+                        if locals[local].ctype != ColType::Refcursor {
                             return Err(sql_err!(
                                 sqlstate::DATATYPE_MISMATCH,
                                 "variable \"{}\" must be of type cursor or refcursor",
                                 statement.variable.as_str()
                             ));
                         }
-                    };
-                    let transition = TriggerTransition {
-                        definition,
-                        old,
-                        new: new.as_deref(),
-                    };
-                    let scope = TriggerLocalScope {
-                        locals,
-                        values: &local_values[..locals.len()],
-                        found: status.found,
-                        invocation,
-                        transition: &transition,
-                    };
-                    let (source, arguments, capture_locals, parameter_types, plan_owner, inputs) =
-                        match statement.query {
+                        let assign_name = local_values[local].is_null();
+                        if assign_name && locals[local].constant {
+                            return Err(sql_err!(
+                                sqlstate::ERROR_IN_ASSIGNMENT,
+                                "variable \"{}\" is declared CONSTANT",
+                                statement.variable.as_str()
+                            ));
+                        }
+                        let generated;
+                        let name = match local_values[local] {
+                            Datum::Text(name) => name,
+                            Datum::Null => {
+                                let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host
+                                else {
+                                    return Err(sql_err!(
+                                        sqlstate::FEATURE_NOT_SUPPORTED,
+                                        "SQL cursors are not available in trigger execution"
+                                    ));
+                                };
+                                generated = cursors.unnamed_name()?;
+                                context
+                                    .arena
+                                    .alloc_str(generated.as_str())
+                                    .map_err(|_| super::query::arena_full_pub())?
+                            }
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::DATATYPE_MISMATCH,
+                                    "variable \"{}\" must be of type cursor or refcursor",
+                                    statement.variable.as_str()
+                                ));
+                            }
+                        };
+                        let transition = TriggerTransition {
+                            definition,
+                            old,
+                            new: new.as_deref(),
+                        };
+                        let scope = TriggerLocalScope {
+                            locals,
+                            values: &local_values[..locals.len()],
+                            found: status.found,
+                            invocation,
+                            transition: &transition,
+                        };
+                        let (
+                            source,
+                            arguments,
+                            capture_locals,
+                            parameter_types,
+                            plan_owner,
+                            inputs,
+                        ) = match statement.query {
                             PlpgsqlCursorQuery::Static(source) => {
                                 let parsed =
                                     super::parser::parse_stored_statement(source, context.arena)?;
@@ -28534,110 +28554,20 @@ fn execute_trigger_step<'a>(
                                 )
                             }
                         };
-                    let captured = if capture_locals {
-                        scope.cursor_locals(context.storage(), context.txn.txid, context.arena)?
-                    } else {
-                        &[]
-                    };
-                    let PlpgsqlExecHost::Routine {
-                        engine,
-                        guc,
-                        cursors,
-                        sqlprep,
-                        ..
-                    } = &mut context.host
-                    else {
-                        return Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "SQL cursors are not available in trigger execution"
-                        ));
-                    };
-                    let mut open = || {
-                        engine.materialize_cursor(
-                            name,
-                            source,
-                            source,
-                            statement.scroll,
-                            false,
-                            false,
-                            captured,
-                            &mut super::CursorStatementContext {
-                                arena: context.arena,
-                                params: arguments,
-                                txn: context.txn,
-                                sqlprep,
-                                cursors,
-                                guc,
-                                responder: context.responder,
-                            },
-                        )
-                    };
-                    let input_source = plpgsql_command_source(source, context.arena)?;
-                    super::type_input_plans::with_owner(plan_owner, || {
-                        super::type_inputs::with_source(input_source, source, inputs, || {
-                            match parameter_types {
-                                Some(types) => with_bound_parameter_types(types, open),
-                                None => open(),
-                            }
-                        })
-                    })?;
-                    *completed = true;
-                    if assign_name {
-                        assign_trigger_local(
-                            context,
-                            locals,
-                            local_values,
-                            statement.variable,
-                            Datum::Text(name),
-                        )?;
-                    }
-
-                    Ok(())
-                },
-            )
-        }),
-        TriggerStatement::CursorMotion(statement) => execute_trigger_statement(|| {
-            let changed = context
-                .arena
-                .alloc_slice_with(statement.targets.len(), |_| 0usize)
-                .map_err(|_| super::query::arena_full_pub())?;
-            for (local, target) in changed.iter_mut().zip(statement.targets) {
-                *local = trigger_local_index(locals, *target)?;
-            }
-            cursor_statement_effect(
-                context,
-                &invocation,
-                CursorReceiptOperation::Motion {
-                    variable: statement.variable,
-                    motion: statement.motion,
-                    move_only: statement.move_only,
-                },
-                changed,
-                local_values,
-                status,
-                |context, local_values, status, completed| {
-                    let local = trigger_local_index(locals, statement.variable)?;
-                    if locals[local].ctype != ColType::Refcursor {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "variable \"{}\" must be of type cursor or refcursor",
-                            statement.variable.as_str()
-                        ));
-                    }
-                    let Datum::Text(name) = local_values[local] else {
-                        return Err(sql_err!(
-                            sqlstate::NULL_VALUE_NOT_ALLOWED,
-                            "cursor variable \"{}\" is null",
-                            statement.variable.as_str()
-                        ));
-                    };
-                    let arena = context.arena;
-                    let (count, rows) = {
+                        let captured = if capture_locals {
+                            scope.cursor_locals(
+                                context.storage(),
+                                context.txn.txid,
+                                context.arena,
+                            )?
+                        } else {
+                            &[]
+                        };
                         let PlpgsqlExecHost::Routine {
                             engine,
+                            guc,
                             cursors,
                             sqlprep,
-                            guc,
                             ..
                         } = &mut context.host
                         else {
@@ -28646,644 +28576,87 @@ fn execute_trigger_step<'a>(
                                 "SQL cursors are not available in trigger execution"
                             ));
                         };
-                        let count = engine.fetch_cursor(
-                            name,
-                            statement.motion,
-                            statement.move_only,
-                            &mut super::CursorStatementContext {
-                                arena,
-                                params: &[],
-                                txn: context.txn,
-                                sqlprep,
-                                cursors,
-                                guc,
-                                responder: context.responder,
-                            },
-                        )?;
-                        *completed = true;
-                        let rows = arena
-                            .alloc_slice_copy(cursors.emitted())
-                            .map_err(|_| super::query::arena_full_pub())?;
-                        (count, rows)
-                    };
-                    if !statement.move_only {
-                        if count > 1 {
-                            return Err(sql_err!(
-                                sqlstate::CARDINALITY_VIOLATION,
-                                "FETCH statement returned more than one row"
-                            ));
-                        }
-                        let target_local = statement
-                            .targets
-                            .first()
-                            .copied()
-                            .map(|target| trigger_local_index(locals, target))
-                            .transpose()?;
-                        let record_target = statement.targets.len() == 1
-                            && target_local.is_some_and(|target| {
-                                matches!(
-                                    locals[target].ctype,
-                                    ColType::Record | ColType::Composite(_)
-                                )
-                            });
-                        let mut column_names = [None; MAX_COLUMNS];
-                        let mut column_type_oids = [0; MAX_COLUMNS];
-                        let column_count = {
-                            let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
-                                unreachable!("cursor host cannot change during execution")
-                            };
-                            let mut borrowed_names = [None; MAX_COLUMNS];
-                            let count = cursors.record_columns(
+                        let mut open = || {
+                            engine.materialize_cursor(
                                 name,
-                                &mut borrowed_names,
-                                &mut column_type_oids,
-                            )?;
-                            for (target, source) in column_names[..count]
-                                .iter_mut()
-                                .zip(&borrowed_names[..count])
-                            {
-                                *target = Some(
-                                    context
-                                        .arena
-                                        .alloc_str(source.expect("description name initialized"))
-                                        .map_err(|_| super::query::arena_full_pub())?,
-                                );
-                            }
-                            count
+                                source,
+                                source,
+                                statement.scroll,
+                                false,
+                                false,
+                                captured,
+                                &mut super::CursorStatementContext {
+                                    arena: context.arena,
+                                    params: arguments,
+                                    txn: context.txn,
+                                    sqlprep,
+                                    cursors,
+                                    guc,
+                                    responder: context.responder,
+                                },
+                            )
                         };
-                        if !record_target && column_count != statement.targets.len() {
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "cursor returned {} columns but FETCH INTO expects {}",
-                                column_count,
-                                statement.targets.len()
-                            ));
-                        }
-                        let mut values = [Datum::Null; MAX_COLUMNS];
-                        let mut decoded = [Datum::Null; MAX_COLUMNS];
-                        if let Some(row) = rows.first().copied() {
-                            let width = {
-                                let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
-                                    unreachable!("cursor host cannot change during execution")
-                                };
-                                cursors.copy_row(name, row, arena, &mut decoded)?
-                            };
-                            if width != column_count {
-                                return Err(sql_err!(
-                                    sqlstate::INTERNAL_ERROR,
-                                    "cursor row has {} columns but its description has {}",
-                                    width,
-                                    column_count
-                                ));
-                            }
-                            if !record_target {
-                                values[..width].copy_from_slice(&decoded[..width]);
-                            }
-                        }
-                        if record_target {
-                            let mut fields = [RecordField {
-                                name: "",
-                                type_oid: 0,
-                                value: Datum::Null,
-                            }; MAX_COLUMNS];
-                            for index in 0..column_count {
-                                let value = decoded[index];
-                                let value = match catalog_column_type(
-                                    context.storage(),
-                                    context.txn.txid,
-                                    column_type_oids[index],
-                                ) {
-                                    Some((ctype, _)) => cast_to(value, ctype, arena)?,
-                                    None => value,
-                                };
-                                fields[index] = RecordField {
-                                    name: column_names[index]
-                                        .expect("cursor description name initialized"),
-                                    type_oid: column_type_oids[index],
-                                    value,
-                                };
-                            }
-                            let fields = arena
-                                .alloc_slice_copy(&fields[..column_count])
-                                .map_err(|_| super::query::arena_full_pub())?;
-                            values[0] = Datum::Record(&*fields);
-                        }
-                        for (index, target) in statement.targets.iter().copied().enumerate() {
+                        let input_source = plpgsql_command_source(source, context.arena)?;
+                        super::type_input_plans::with_owner(plan_owner, || {
+                            super::type_inputs::with_source(input_source, source, inputs, || {
+                                match parameter_types {
+                                    Some(types) => with_bound_parameter_types(types, open),
+                                    None => open(),
+                                }
+                            })
+                        })?;
+                        *completed = true;
+                        if assign_name {
                             assign_trigger_local(
                                 context,
                                 locals,
                                 local_values,
-                                target,
-                                values[index],
+                                statement.variable,
+                                Datum::Text(name),
                             )?;
                         }
-                    }
-                    status.set_rows(count as u64)?;
 
-                    Ok(())
-                },
-            )
-        }),
-        TriggerStatement::CursorClose(variable) => execute_trigger_statement(|| {
-            let changed: &[usize] = &[];
-            cursor_statement_effect(
-                context,
-                &invocation,
-                CursorReceiptOperation::Close { variable },
-                changed,
-                local_values,
-                status,
-                |context, local_values, _status, _completed| {
-                    let local = trigger_local_index(locals, variable)?;
-                    if locals[local].ctype != ColType::Refcursor {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "variable \"{}\" must be of type cursor or refcursor",
-                            variable.as_str()
-                        ));
-                    }
-                    let Datum::Text(name) = local_values[local] else {
-                        return Err(sql_err!(
-                            sqlstate::NULL_VALUE_NOT_ALLOWED,
-                            "cursor variable \"{}\" is null",
-                            variable.as_str()
-                        ));
-                    };
-                    let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host else {
-                        return Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "SQL cursors are not available in trigger execution"
-                        ));
-                    };
-                    if !cursors.close(name) {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_CURSOR,
-                            "cursor \"{}\" does not exist",
-                            name
-                        ));
-                    }
-
-                    Ok(())
-                },
-            )
-        }),
-        TriggerStatement::LoopControl(control) => execute_trigger_statement(|| {
-            let (condition, unwind) = match control {
-                TriggerLoopControl::Exit { condition, unwind }
-                | TriggerLoopControl::Continue { condition, unwind } => (condition, unwind),
-            };
-            let selected = match condition {
-                Some(condition) => trigger_condition(
-                    context,
-                    condition,
-                    definition,
-                    invocation,
-                    old,
-                    new.as_deref(),
-                    locals,
-                    &local_values[..locals.len()],
-                    status.found,
-                    retained_parent.then_some(&mut status.pending_query),
-                )?,
-                None => true,
-            };
-            if selected {
-                return Ok(Some(match control {
-                    TriggerLoopControl::Exit { .. } => TriggerFlow::Exit(unwind),
-                    TriggerLoopControl::Continue { .. } => TriggerFlow::Continue(unwind),
-                }));
-            }
-
-            Ok(None)
-        }),
-        TriggerStatement::SelectInto(statement) => execute_trigger_statement(|| {
-            let mut targets = [0usize; MAX_COLUMNS];
-            for (index, target) in statement.targets.iter().enumerate() {
-                targets[index] = trigger_local_index(locals, *target)?;
-            }
-            let query = match transition_relations {
-                Some(relations) => super::query::bind_materialized_relations(
-                    statement.query,
-                    relations,
-                    context.storage(),
-                    context.txn.txid,
-                    context.arena,
-                )?,
-                None => statement.query,
-            };
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let record_target = statement.targets.len() == 1
-                && matches!(
-                    locals[targets[0]].ctype,
-                    ColType::Record | ColType::Composite(_)
-                );
-            let arena = context.arena;
-            let mut fields = [("", 0); MAX_PROJ];
-            let record_width = if record_target {
-                let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-                let width = super::query::describe_select(
-                    query,
-                    context.storage(),
-                    context.txn.txid,
-                    arena,
-                    &mut columns,
-                    crate::sql::exec::DescriptionTarget::Sql,
-                    Some(&scope),
-                )?;
-                for (field, column) in fields.iter_mut().zip(&columns[..width]) {
-                    *field = (
-                        arena
-                            .alloc_str(column.name)
-                            .map_err(|_| super::query::arena_full_pub())?,
-                        column.type_oid,
-                    );
+                        Ok(())
+                    },
+                )
+            }),
+            TriggerStatement::CursorMotion(statement) => execute_trigger_statement(|| {
+                let changed = context
+                    .arena
+                    .alloc_slice_with(statement.targets.len(), |_| 0usize)
+                    .map_err(|_| super::query::arena_full_pub())?;
+                for (local, target) in changed.iter_mut().zip(statement.targets) {
+                    *local = trigger_local_index(locals, *target)?;
                 }
-                width
-            } else {
-                0
-            };
-            let params = context.params;
-            let txid = context.txn.txid;
-            let continuation = if retained_parent {
-                Some(&mut status.pending_query)
-            } else {
-                None
-            };
-            let (selected, row_count) =
-                execute_procedural_query(context, continuation, |storage, sequence| {
-                    let mut selected = [Datum::Null; MAX_COLUMNS];
-                    let mut found = false;
-                    let mut row_count = 0usize;
-                    super::query::consume_query_rows(
-                        core::num::NonZeroU64::new(if statement.strict { 2 } else { 1 })
-                            .expect("SELECT INTO consumes one or two rows"),
-                        |emit| {
-                            super::query::select_into_rows(
-                                storage,
-                                txid,
-                                query,
-                                arena,
-                                params,
-                                Some(&scope),
-                                Some(sequence),
-                                emit,
-                            )
-                        },
-                        &mut |values| {
-                            if !record_target && values.len() != statement.targets.len() {
-                                return Err(sql_err!(
-                                    sqlstate::DATATYPE_MISMATCH,
-                                    "query returned {} columns but SELECT INTO expects {}",
-                                    values.len(),
-                                    statement.targets.len()
-                                ));
-                            }
-                            if record_target && values.len() != record_width {
-                                return Err(sql_err!(
-                                    sqlstate::INTERNAL_ERROR,
-                                    "SELECT INTO record shape changed during execution"
-                                ));
-                            }
-                            if !found {
-                                if record_target {
-                                    let mut row_fields = [RecordField {
-                                        name: "",
-                                        type_oid: 0,
-                                        value: Datum::Null,
-                                    };
-                                        MAX_PROJ];
-                                    for (index, value) in values.iter().copied().enumerate() {
-                                        row_fields[index] = RecordField {
-                                            name: fields[index].0,
-                                            type_oid: fields[index].1,
-                                            value: detached_trigger_datum(value, arena)?,
-                                        };
-                                    }
-                                    let fields = arena
-                                        .alloc_slice_copy(&row_fields[..values.len()])
-                                        .map_err(|_| super::query::arena_full_pub())?;
-                                    selected[0] = Datum::Record(&*fields);
-                                } else {
-                                    for (index, value) in values.iter().copied().enumerate() {
-                                        selected[index] = detached_trigger_datum(value, arena)?;
-                                    }
-                                }
-                                found = true;
-                            }
-                            row_count += 1;
-                            Ok(())
-                        },
-                    )?;
-                    if record_target && row_count == 0 && !statement.strict {
-                        let empty = arena
-                            .alloc_slice_with(record_width, |index| RecordField {
-                                name: fields[index].0,
-                                type_oid: fields[index].1,
-                                value: Datum::Null,
-                            })
-                            .map_err(|_| super::query::arena_full_pub())?;
-                        selected[0] = Datum::Record(empty);
-                    }
-                    Ok((selected, row_count))
-                })?;
-            status.set_rows(row_count as u64)?;
-            if statement.strict {
-                match row_count {
-                    0 => {
-                        return Err(sql_err!(sqlstate::NO_DATA_FOUND, "query returned no rows"));
-                    }
-                    1 => {}
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::TOO_MANY_ROWS,
-                            "query returned more than one row"
-                        ));
-                    }
-                }
-            }
-            for (index, _) in targets[..statement.targets.len()].iter().enumerate() {
-                assign_trigger_local(
+                cursor_statement_effect(
                     context,
-                    locals,
+                    &invocation,
+                    CursorReceiptOperation::Motion {
+                        variable: statement.variable,
+                        motion: statement.motion,
+                        move_only: statement.move_only,
+                    },
+                    changed,
                     local_values,
-                    statement.targets[index],
-                    selected[index],
-                )?;
-            }
-
-            Ok(None)
-        }),
-        TriggerStatement::DynamicSelectInto(statement) => execute_trigger_statement(|| {
-            let mut targets = [0usize; MAX_COLUMNS];
-            for (index, target) in statement.targets.iter().enumerate() {
-                targets[index] = trigger_local_index(locals, *target)?;
-            }
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let mut selected = [Datum::Null; MAX_COLUMNS];
-            let mut found = false;
-            let mut row_count = 0usize;
-            let query = bind_plpgsql_dynamic_query(
-                context,
-                statement.query,
-                &scope,
-                DynamicCommandKind::Statement,
-                &mut StatementExpressions::new(
-                    retained_parent,
-                    true,
-                    &mut status.expressions,
-                    &mut status.pending_query,
-                ),
-            )?;
-            let query = resolve_plpgsql_dynamic_prepared(context, query)?;
-            let has_result = match query.statement {
-                Stmt::Insert(statement) => !statement.returning.is_empty(),
-                Stmt::Update(statement) => !statement.returning.is_empty(),
-                Stmt::Delete(statement) => !statement.returning.is_empty(),
-                _ => true,
-            };
-            with_bound_parameter_types(query.parameter_types, || {
-                let record_target = statement.targets.len() == 1
-                    && matches!(
-                        locals[targets[0]].ctype,
-                        ColType::Record | ColType::Composite(_)
-                    );
-                let (record_width, record_names, record_type_oids) = {
-                    let mut names = [StackStr::<63>::new(); MAX_PROJ];
-                    let mut type_oids = [0i32; MAX_PROJ];
-                    let width = if record_target
-                        && let Stmt::FetchCursor {
-                            name,
-                            move_only: false,
-                            ..
-                        } = query.statement
-                    {
-                        let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
+                    status,
+                    |context, local_values, status, completed| {
+                        let local = trigger_local_index(locals, statement.variable)?;
+                        if locals[local].ctype != ColType::Refcursor {
                             return Err(sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "SQL cursors are not available in trigger execution"
+                                sqlstate::DATATYPE_MISMATCH,
+                                "variable \"{}\" must be of type cursor or refcursor",
+                                statement.variable.as_str()
+                            ));
+                        }
+                        let Datum::Text(name) = local_values[local] else {
+                            return Err(sql_err!(
+                                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                                "cursor variable \"{}\" is null",
+                                statement.variable.as_str()
                             ));
                         };
-                        let mut borrowed = [None; MAX_PROJ];
-                        let width = cursors.record_columns(name, &mut borrowed, &mut type_oids)?;
-                        for (name, source) in names[..width].iter_mut().zip(&borrowed[..width]) {
-                            *name = StackStr::from_str(
-                                source.expect("cursor description name initialized"),
-                            );
-                        }
-                        width
-                    } else {
-                        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-                        let width = match query.statement {
-                            Stmt::Select(select) if record_target => super::query::describe_select(
-                                select,
-                                context.storage(),
-                                context.txn.txid,
-                                context.arena,
-                                &mut columns,
-                                crate::sql::exec::DescriptionTarget::Sql,
-                                None,
-                            )?,
-                            Stmt::SetQuery(set_query) if record_target => {
-                                super::query::describe_set_query(
-                                    context.storage(),
-                                    context.txn.txid,
-                                    set_query,
-                                    &mut columns,
-                                    context.arena,
-                                    crate::sql::exec::DescriptionTarget::Sql,
-                                )?
-                            }
-                            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
-                                if record_target =>
-                            {
-                                describe_data_modification_columns(
-                                    context.storage(),
-                                    query.statement,
-                                    context.arena,
-                                    context.txn.txid,
-                                    &mut columns,
-                                    crate::sql::exec::DescriptionTarget::Sql,
-                                )?
-                            }
-                            Stmt::Show(name) if record_target => {
-                                let title = super::guc::canonical_setting_name(name)?;
-                                let title = context
-                                    .arena
-                                    .alloc_str(title.as_str())
-                                    .map_err(|_| super::query::arena_full_pub())?;
-                                columns[0] = ColDesc::new(title, super::types::oid::TEXT, -1);
-                                1
-                            }
-                            Stmt::ShowAll if record_target => {
-                                columns[..3].copy_from_slice(&super::guc::SHOW_ALL_COLUMNS);
-                                3
-                            }
-                            Stmt::Explain { .. } if record_target => {
-                                columns[0] =
-                                    ColDesc::new("QUERY PLAN", super::types::oid::TEXT, -1);
-                                1
-                            }
-                            _ => 0,
-                        };
-                        for (index, column) in columns[..width].iter().enumerate() {
-                            names[index] = StackStr::from_str(column.name);
-                            type_oids[index] = column.type_oid;
-                        }
-                        width
-                    };
-                    (width, names, type_oids)
-                };
-                let arena = context.arena;
-                let prepare_empty_record = |selected: &mut [Datum<'a>],
-                                            found: bool|
-                 -> Result<(), SqlError> {
-                    if record_target && !found && !statement.strict {
-                        let fields = arena
-                            .alloc_slice_with(record_width, |index| RecordField {
-                                name: "",
-                                type_oid: record_type_oids[index],
-                                value: Datum::Null,
-                            })
-                            .map_err(|_| super::query::arena_full_pub())?;
-                        for (field, name) in fields.iter_mut().zip(&record_names[..record_width]) {
-                            field.name = arena
-                                .alloc_str(name.as_str())
-                                .map_err(|_| super::query::arena_full_pub())?;
-                        }
-                        selected[0] = Datum::Record(fields);
-                    }
-                    Ok(())
-                };
-                let mut capture = |values: &[Datum]| {
-                    if !record_target && values.len() != statement.targets.len() {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "query returned {} columns but EXECUTE INTO expects {}",
-                            values.len(),
-                            statement.targets.len()
-                        ));
-                    }
-                    if record_target && record_width != 0 && values.len() != record_width {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "EXECUTE INTO record shape changed during execution"
-                        ));
-                    }
-                    if !found {
-                        if record_target {
-                            let mut fields = [RecordField {
-                                name: "",
-                                type_oid: 0,
-                                value: Datum::Null,
-                            }; MAX_PROJ];
-                            for (index, value) in values.iter().copied().enumerate() {
-                                fields[index] = RecordField {
-                                    name: arena
-                                        .alloc_str(record_names[index].as_str())
-                                        .map_err(|_| super::query::arena_full_pub())?,
-                                    type_oid: record_type_oids[index],
-                                    value: detached_trigger_datum(value, arena)?,
-                                };
-                            }
-                            let fields = arena
-                                .alloc_slice_copy(&fields[..values.len()])
-                                .map_err(|_| super::query::arena_full_pub())?;
-                            selected[0] = Datum::Record(&*fields);
-                        } else {
-                            for (index, value) in values.iter().copied().enumerate() {
-                                selected[index] = detached_trigger_datum(value, arena)?;
-                            }
-                        }
-                        found = true;
-                    }
-                    row_count = row_count.checked_add(1).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "dynamic query returned too many rows"
-                        )
-                    })?;
-                    Ok(())
-                };
-                match query.statement {
-                    Stmt::Explain { options, statement } => {
                         let arena = context.arena;
-                        execute_plpgsql_dynamic_explain(
-                            context,
-                            *options,
-                            statement,
-                            query.arguments,
-                            &mut |line| {
-                                let line = arena
-                                    .alloc_str(line)
-                                    .map_err(|_| super::query::arena_full_pub())?;
-                                capture(&[Datum::Text(line)])
-                            },
-                        )?;
-                    }
-                    Stmt::Show(name) => {
-                        let value = {
-                            let PlpgsqlExecHost::Routine { engine, guc, .. } = &context.host else {
-                                return Err(sql_err!(
-                                    sqlstate::FEATURE_NOT_SUPPORTED,
-                                    "SHOW is not available in trigger execution"
-                                ));
-                            };
-                            engine.show_setting_value(name, guc, context.txn)?
-                        };
-                        let value = context
-                            .arena
-                            .alloc_str(value.as_str())
-                            .map_err(|_| super::query::arena_full_pub())?;
-                        capture(&[Datum::Text(value)])?;
-                    }
-                    Stmt::ShowAll => {
-                        let PlpgsqlExecHost::Routine { engine, guc, .. } = &context.host else {
-                            return Err(sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "SHOW ALL is not available in trigger execution"
-                            ));
-                        };
-                        engine.visit_show_all_rows(guc, context.txn, |name, value| {
-                            let name = context
-                                .arena
-                                .alloc_str(name)
-                                .map_err(|_| super::query::arena_full_pub())?;
-                            let value = context
-                                .arena
-                                .alloc_str(value)
-                                .map_err(|_| super::query::arena_full_pub())?;
-                            capture(&[Datum::Text(name), Datum::Text(value), Datum::Text("")])
-                        })?;
-                    }
-                    Stmt::FetchCursor {
-                        name,
-                        motion,
-                        move_only: false,
-                    } => {
-                        let arena = context.arena;
-                        let rows = {
+                        let (count, rows) = {
                             let PlpgsqlExecHost::Routine {
                                 engine,
                                 cursors,
@@ -29297,10 +28670,10 @@ fn execute_trigger_step<'a>(
                                     "SQL cursors are not available in trigger execution"
                                 ));
                             };
-                            engine.fetch_cursor(
+                            let count = engine.fetch_cursor(
                                 name,
-                                *motion,
-                                false,
+                                statement.motion,
+                                statement.move_only,
                                 &mut super::CursorStatementContext {
                                     arena,
                                     params: &[],
@@ -29311,271 +28684,1399 @@ fn execute_trigger_step<'a>(
                                     responder: context.responder,
                                 },
                             )?;
-                            arena
+                            *completed = true;
+                            let rows = arena
                                 .alloc_slice_copy(cursors.emitted())
-                                .map_err(|_| super::query::arena_full_pub())?
+                                .map_err(|_| super::query::arena_full_pub())?;
+                            (count, rows)
                         };
-                        for row in rows.iter().copied() {
-                            let mut values = [Datum::Null; MAX_COLUMNS];
-                            let width = {
+                        if !statement.move_only {
+                            if count > 1 {
+                                return Err(sql_err!(
+                                    sqlstate::CARDINALITY_VIOLATION,
+                                    "FETCH statement returned more than one row"
+                                ));
+                            }
+                            let target_local = statement
+                                .targets
+                                .first()
+                                .copied()
+                                .map(|target| trigger_local_index(locals, target))
+                                .transpose()?;
+                            let record_target = statement.targets.len() == 1
+                                && target_local.is_some_and(|target| {
+                                    matches!(
+                                        locals[target].ctype,
+                                        ColType::Record | ColType::Composite(_)
+                                    )
+                                });
+                            let mut column_names = [None; MAX_COLUMNS];
+                            let mut column_type_oids = [0; MAX_COLUMNS];
+                            let column_count = {
                                 let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
                                     unreachable!("cursor host cannot change during execution")
                                 };
-                                cursors.copy_row(name, row, arena, &mut values)?
-                            };
-                            capture(&values[..width])?;
-                        }
-                    }
-                    Stmt::Select(_) | Stmt::SetQuery(_) => {
-                        execute_bound_plpgsql_dynamic_query(context, query, &mut capture)?;
-                    }
-                    Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-                        let mut returning =
-                            |_: &Storage,
-                             _: u32,
-                             _: &dyn crate::sql::eval::SequenceAccess,
-                             values: &[Datum]| capture(values);
-                        let result = execute_bound_plpgsql_dynamic_dml(
-                            context,
-                            query,
-                            transition_relations,
-                            Some(&mut returning),
-                            &mut status.pending_write,
-                        );
-                        let result = match result {
-                            Err(error)
-                                if control_flow::is_execution_wait(&error)
-                                    && status.pending_write.is_some() =>
-                            {
-                                resume_nested_write(context, status).map(|(rows, output)| {
-                                    debug_assert!(output.is_none());
-                                    rows
-                                })
-                            }
-                            result => result,
-                        };
-                        let affected = match result {
-                            Ok(rows) => rows,
-                            Err(error) => {
-                                if control_flow::is_execution_wait(&error)
-                                    && let Some(pending) = &mut status.pending_write
+                                let mut borrowed_names = [None; MAX_COLUMNS];
+                                let count = cursors.record_columns(
+                                    name,
+                                    &mut borrowed_names,
+                                    &mut column_type_oids,
+                                )?;
+                                for (target, source) in column_names[..count]
+                                    .iter_mut()
+                                    .zip(&borrowed_names[..count])
                                 {
-                                    let values = if has_result {
-                                        prepare_empty_record(&mut selected, found)?;
-                                        Some(&selected[..statement.targets.len()])
-                                    } else {
-                                        None
-                                    };
-                                    pending.save_output(
-                                        values,
-                                        row_count as u64,
-                                        &context.storage().row_work,
-                                    )?;
+                                    *target = Some(
+                                        context
+                                            .arena
+                                            .alloc_str(
+                                                source.expect("description name initialized"),
+                                            )
+                                            .map_err(|_| super::query::arena_full_pub())?,
+                                    );
                                 }
-                                return Err(error);
+                                count
+                            };
+                            if !record_target && column_count != statement.targets.len() {
+                                return Err(sql_err!(
+                                    sqlstate::DATATYPE_MISMATCH,
+                                    "cursor returned {} columns but FETCH INTO expects {}",
+                                    column_count,
+                                    statement.targets.len()
+                                ));
                             }
-                        };
-                        if !has_result {
-                            status.set_row_count(affected)?;
-                            return Err(sql_err!(
-                                sqlstate::SYNTAX_ERROR,
-                                "INTO used with a command that cannot return data"
-                            ));
+                            let mut values = [Datum::Null; MAX_COLUMNS];
+                            let mut decoded = [Datum::Null; MAX_COLUMNS];
+                            if let Some(row) = rows.first().copied() {
+                                let width = {
+                                    let PlpgsqlExecHost::Routine { cursors, .. } = &context.host
+                                    else {
+                                        unreachable!("cursor host cannot change during execution")
+                                    };
+                                    cursors.copy_row(name, row, arena, &mut decoded)?
+                                };
+                                if width != column_count {
+                                    return Err(sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "cursor row has {} columns but its description has {}",
+                                        width,
+                                        column_count
+                                    ));
+                                }
+                                if !record_target {
+                                    values[..width].copy_from_slice(&decoded[..width]);
+                                }
+                            }
+                            if record_target {
+                                let mut fields = [RecordField {
+                                    name: "",
+                                    type_oid: 0,
+                                    value: Datum::Null,
+                                }; MAX_COLUMNS];
+                                for index in 0..column_count {
+                                    let value = decoded[index];
+                                    let value = match catalog_column_type(
+                                        context.storage(),
+                                        context.txn.txid,
+                                        column_type_oids[index],
+                                    ) {
+                                        Some((ctype, _)) => cast_to(value, ctype, arena)?,
+                                        None => value,
+                                    };
+                                    fields[index] = RecordField {
+                                        name: column_names[index]
+                                            .expect("cursor description name initialized"),
+                                        type_oid: column_type_oids[index],
+                                        value,
+                                    };
+                                }
+                                let fields = arena
+                                    .alloc_slice_copy(&fields[..column_count])
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                values[0] = Datum::Record(&*fields);
+                            }
+                            for (index, target) in statement.targets.iter().copied().enumerate() {
+                                assign_trigger_local(
+                                    context,
+                                    locals,
+                                    local_values,
+                                    target,
+                                    values[index],
+                                )?;
+                            }
                         }
-                        debug_assert_eq!(affected, row_count as u64);
-                    }
-                    Stmt::Call { .. } => {
-                        // EXECUTE ... INTO takes the output parameters as one row.
-                        let outputs = execute_plpgsql_dynamic_call(context, query)?;
-                        if outputs.count == 0 {
-                            return Err(sql_err!(
-                                sqlstate::SYNTAX_ERROR,
-                                "INTO used with a command that cannot return data"
-                            ));
-                        }
-                        capture(&outputs.values[..outputs.count])?;
-                    }
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "INTO used with a command that cannot return data"
-                        ));
-                    }
-                }
-                prepare_empty_record(&mut selected, found)?;
-                finish_dynamic_into(
+                        status.set_rows(count as u64)?;
+
+                        Ok(())
+                    },
+                )
+            }),
+            TriggerStatement::CursorClose(variable) => execute_trigger_statement(|| {
+                let changed: &[usize] = &[];
+                cursor_statement_effect(
                     context,
-                    locals,
+                    &invocation,
+                    CursorReceiptOperation::Close { variable },
+                    changed,
                     local_values,
-                    statement,
-                    &selected[..statement.targets.len()],
-                    row_count as u64,
                     status,
-                )?;
-
-                Ok(None)
-            })
-        }),
-        TriggerStatement::DynamicQuery(query) => execute_trigger_statement(|| {
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let query = bind_plpgsql_dynamic_query(
-                context,
-                query,
-                &scope,
-                DynamicCommandKind::Statement,
-                &mut StatementExpressions::new(
-                    retained_parent,
-                    true,
-                    &mut status.expressions,
-                    &mut status.pending_query,
-                ),
-            )?;
-            let query = resolve_plpgsql_dynamic_prepared(context, query)?;
-            with_bound_parameter_types(query.parameter_types, || {
-                let row_count = match query.statement {
-                    Stmt::Select(_) | Stmt::SetQuery(_) => {
-                        let mut rows = 0u64;
-                        execute_bound_plpgsql_dynamic_query(context, query, &mut |_| {
-                            rows = rows.checked_add(1).ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "PL/pgSQL dynamic query returned too many rows"
-                                )
-                            })?;
-                            Ok(())
-                        })?;
-                        rows
-                    }
-                    Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-                        let result = execute_bound_plpgsql_dynamic_dml(
-                            context,
-                            query,
-                            transition_relations,
-                            None,
-                            &mut status.pending_write,
-                        );
-                        match result {
-                            Err(error)
-                                if control_flow::is_execution_wait(&error)
-                                    && status.pending_write.is_some() =>
-                            {
-                                let (rows, output) = resume_nested_write(context, status)?;
-                                debug_assert!(output.is_none());
-                                rows
-                            }
-                            result => result?,
+                    |context, local_values, _status, _completed| {
+                        let local = trigger_local_index(locals, variable)?;
+                        if locals[local].ctype != ColType::Refcursor {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "variable \"{}\" must be of type cursor or refcursor",
+                                variable.as_str()
+                            ));
                         }
-                    }
-                    Stmt::Explain { options, statement } => {
-                        execute_plpgsql_dynamic_explain(
-                            context,
-                            *options,
-                            statement,
-                            query.arguments,
-                            &mut |_| Ok(()),
-                        )?;
-                        0
-                    }
-                    _ => {
-                        execute_bound_plpgsql_utility(context, query)?;
-                        0
-                    }
+                        let Datum::Text(name) = local_values[local] else {
+                            return Err(sql_err!(
+                                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                                "cursor variable \"{}\" is null",
+                                variable.as_str()
+                            ));
+                        };
+                        let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host else {
+                            return Err(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "SQL cursors are not available in trigger execution"
+                            ));
+                        };
+                        if !cursors.close(name) {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_CURSOR,
+                                "cursor \"{}\" does not exist",
+                                name
+                            ));
+                        }
+
+                        Ok(())
+                    },
+                )
+            }),
+            TriggerStatement::LoopControl(control) => execute_trigger_statement(|| {
+                let (condition, unwind) = match control {
+                    TriggerLoopControl::Exit { condition, unwind }
+                    | TriggerLoopControl::Continue { condition, unwind } => (condition, unwind),
                 };
-                status.set_row_count(row_count)?;
+                let selected = match condition {
+                    Some(condition) => trigger_condition(
+                        context,
+                        condition,
+                        definition,
+                        invocation,
+                        old,
+                        new.as_deref(),
+                        locals,
+                        &local_values[..locals.len()],
+                        status.found,
+                        retained_parent.then_some(&mut status.pending_query),
+                    )?,
+                    None => true,
+                };
+                if selected {
+                    return Ok(Some(match control {
+                        TriggerLoopControl::Exit { .. } => TriggerFlow::Exit(unwind),
+                        TriggerLoopControl::Continue { .. } => TriggerFlow::Continue(unwind),
+                    }));
+                }
 
                 Ok(None)
-            })
-        }),
-        TriggerStatement::Call { statement, .. } => execute_trigger_statement(|| {
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            // Even one argument is saved: the called procedure can wait after it.
-            let mut expressions = StatementExpressions::new(
-                retained_parent,
-                true,
-                &mut status.expressions,
-                &mut status.pending_query,
-            );
-            let outputs = execute_plpgsql_call(
-                context,
-                statement,
-                locals,
-                &scope,
-                &mut expressions,
-                &mut status.pending_call,
-            )?;
-            for (argument, output) in outputs.arguments.iter().zip(outputs.assigned) {
-                if let (Some(name), Some(output)) = (argument, output) {
-                    assign_trigger_local(
-                        context,
-                        locals,
-                        local_values,
-                        *name,
-                        outputs.values[usize::from(output)],
-                    )?;
+            }),
+            TriggerStatement::SelectInto(statement) => execute_trigger_statement(|| {
+                let mut targets = [0usize; MAX_COLUMNS];
+                for (index, target) in statement.targets.iter().enumerate() {
+                    targets[index] = trigger_local_index(locals, *target)?;
                 }
-            }
-            status.set_row_count(0)?;
-            Ok(None)
-        }),
-        TriggerStatement::Utility { source, statement } => execute_trigger_statement(|| {
-            execute_bound_plpgsql_utility(
-                context,
-                BoundPlpgsqlCommand {
-                    owner: context.plan_owner()?,
-                    source,
-                    statement,
-                    inputs: super::type_inputs::bindings_for_active_source(source, context.arena)?
-                        .unwrap_or(&[]),
-                    arguments: &[],
-                    parameter_types: &[],
-                },
-            )?;
-            status.set_row_count(0)?;
-            Ok(None)
-        }),
-        TriggerStatement::Perform(query) => execute_trigger_statement(|| {
-            // Only the count escapes. The region reclaims query front
-            // storage and nested invocation receipts together.
-            let row_count = context.arena.with_remaining_region(|arena| {
-                let host = context.host.reborrow();
-                let mut context = TriggerExecContext {
-                    host,
-                    txn: context.txn,
-                    arena,
-                    params: context.params,
-                    responder: context.responder,
-                };
                 let query = match transition_relations {
                     Some(relations) => super::query::bind_materialized_relations(
-                        query,
+                        statement.query,
                         relations,
                         context.storage(),
                         context.txn.txid,
                         context.arena,
                     )?,
-                    None => query,
+                    None => statement.query,
+                };
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let record_target = statement.targets.len() == 1
+                    && matches!(
+                        locals[targets[0]].ctype,
+                        ColType::Record | ColType::Composite(_)
+                    );
+                let arena = context.arena;
+                let mut fields = [("", 0); MAX_PROJ];
+                let record_width = if record_target {
+                    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+                    let width = super::query::describe_select(
+                        query,
+                        context.storage(),
+                        context.txn.txid,
+                        arena,
+                        &mut columns,
+                        crate::sql::exec::DescriptionTarget::Sql,
+                        Some(&scope),
+                    )?;
+                    for (field, column) in fields.iter_mut().zip(&columns[..width]) {
+                        *field = (
+                            arena
+                                .alloc_str(column.name)
+                                .map_err(|_| super::query::arena_full_pub())?,
+                            column.type_oid,
+                        );
+                    }
+                    width
+                } else {
+                    0
+                };
+                let params = context.params;
+                let txid = context.txn.txid;
+                let continuation = if retained_parent {
+                    Some(&mut status.pending_query)
+                } else {
+                    None
+                };
+                let (selected, row_count) =
+                    execute_procedural_query(context, continuation, |storage, sequence| {
+                        let mut selected = [Datum::Null; MAX_COLUMNS];
+                        let mut found = false;
+                        let mut row_count = 0usize;
+                        super::query::consume_query_rows(
+                            core::num::NonZeroU64::new(if statement.strict { 2 } else { 1 })
+                                .expect("SELECT INTO consumes one or two rows"),
+                            |emit| {
+                                super::query::select_into_rows(
+                                    storage,
+                                    txid,
+                                    query,
+                                    arena,
+                                    params,
+                                    Some(&scope),
+                                    Some(sequence),
+                                    emit,
+                                )
+                            },
+                            &mut |values| {
+                                if !record_target && values.len() != statement.targets.len() {
+                                    return Err(sql_err!(
+                                        sqlstate::DATATYPE_MISMATCH,
+                                        "query returned {} columns but SELECT INTO expects {}",
+                                        values.len(),
+                                        statement.targets.len()
+                                    ));
+                                }
+                                if record_target && values.len() != record_width {
+                                    return Err(sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "SELECT INTO record shape changed during execution"
+                                    ));
+                                }
+                                if !found {
+                                    if record_target {
+                                        let mut row_fields = [RecordField {
+                                            name: "",
+                                            type_oid: 0,
+                                            value: Datum::Null,
+                                        };
+                                            MAX_PROJ];
+                                        for (index, value) in values.iter().copied().enumerate() {
+                                            row_fields[index] = RecordField {
+                                                name: fields[index].0,
+                                                type_oid: fields[index].1,
+                                                value: detached_trigger_datum(value, arena)?,
+                                            };
+                                        }
+                                        let fields = arena
+                                            .alloc_slice_copy(&row_fields[..values.len()])
+                                            .map_err(|_| super::query::arena_full_pub())?;
+                                        selected[0] = Datum::Record(&*fields);
+                                    } else {
+                                        for (index, value) in values.iter().copied().enumerate() {
+                                            selected[index] = detached_trigger_datum(value, arena)?;
+                                        }
+                                    }
+                                    found = true;
+                                }
+                                row_count += 1;
+                                Ok(())
+                            },
+                        )?;
+                        if record_target && row_count == 0 && !statement.strict {
+                            let empty = arena
+                                .alloc_slice_with(record_width, |index| RecordField {
+                                    name: fields[index].0,
+                                    type_oid: fields[index].1,
+                                    value: Datum::Null,
+                                })
+                                .map_err(|_| super::query::arena_full_pub())?;
+                            selected[0] = Datum::Record(empty);
+                        }
+                        Ok((selected, row_count))
+                    })?;
+                status.set_rows(row_count as u64)?;
+                if statement.strict {
+                    match row_count {
+                        0 => {
+                            return Err(sql_err!(
+                                sqlstate::NO_DATA_FOUND,
+                                "query returned no rows"
+                            ));
+                        }
+                        1 => {}
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::TOO_MANY_ROWS,
+                                "query returned more than one row"
+                            ));
+                        }
+                    }
+                }
+                for (index, _) in targets[..statement.targets.len()].iter().enumerate() {
+                    assign_trigger_local(
+                        context,
+                        locals,
+                        local_values,
+                        statement.targets[index],
+                        selected[index],
+                    )?;
+                }
+
+                Ok(None)
+            }),
+            TriggerStatement::DynamicSelectInto(statement) => execute_trigger_statement(|| {
+                let mut targets = [0usize; MAX_COLUMNS];
+                for (index, target) in statement.targets.iter().enumerate() {
+                    targets[index] = trigger_local_index(locals, *target)?;
+                }
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let mut selected = [Datum::Null; MAX_COLUMNS];
+                let mut found = false;
+                let mut row_count = 0usize;
+                let query = bind_plpgsql_dynamic_query(
+                    context,
+                    statement.query,
+                    &scope,
+                    DynamicCommandKind::Statement,
+                    &mut StatementExpressions::new(
+                        retained_parent,
+                        true,
+                        &mut status.expressions,
+                        &mut status.pending_query,
+                    ),
+                )?;
+                let query = resolve_plpgsql_dynamic_prepared(context, query)?;
+                let has_result = match query.statement {
+                    Stmt::Insert(statement) => !statement.returning.is_empty(),
+                    Stmt::Update(statement) => !statement.returning.is_empty(),
+                    Stmt::Delete(statement) => !statement.returning.is_empty(),
+                    _ => true,
+                };
+                with_bound_parameter_types(query.parameter_types, || {
+                    let record_target = statement.targets.len() == 1
+                        && matches!(
+                            locals[targets[0]].ctype,
+                            ColType::Record | ColType::Composite(_)
+                        );
+                    let (record_width, record_names, record_type_oids) = {
+                        let mut names = [StackStr::<63>::new(); MAX_PROJ];
+                        let mut type_oids = [0i32; MAX_PROJ];
+                        let width = if record_target
+                            && let Stmt::FetchCursor {
+                                name,
+                                move_only: false,
+                                ..
+                            } = query.statement
+                        {
+                            let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
+                                return Err(sql_err!(
+                                    sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "SQL cursors are not available in trigger execution"
+                                ));
+                            };
+                            let mut borrowed = [None; MAX_PROJ];
+                            let width =
+                                cursors.record_columns(name, &mut borrowed, &mut type_oids)?;
+                            for (name, source) in names[..width].iter_mut().zip(&borrowed[..width])
+                            {
+                                *name = StackStr::from_str(
+                                    source.expect("cursor description name initialized"),
+                                );
+                            }
+                            width
+                        } else {
+                            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+                            let width = match query.statement {
+                                Stmt::Select(select) if record_target => {
+                                    super::query::describe_select(
+                                        select,
+                                        context.storage(),
+                                        context.txn.txid,
+                                        context.arena,
+                                        &mut columns,
+                                        crate::sql::exec::DescriptionTarget::Sql,
+                                        None,
+                                    )?
+                                }
+                                Stmt::SetQuery(set_query) if record_target => {
+                                    super::query::describe_set_query(
+                                        context.storage(),
+                                        context.txn.txid,
+                                        set_query,
+                                        &mut columns,
+                                        context.arena,
+                                        crate::sql::exec::DescriptionTarget::Sql,
+                                    )?
+                                }
+                                Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
+                                    if record_target =>
+                                {
+                                    describe_data_modification_columns(
+                                        context.storage(),
+                                        query.statement,
+                                        context.arena,
+                                        context.txn.txid,
+                                        &mut columns,
+                                        crate::sql::exec::DescriptionTarget::Sql,
+                                    )?
+                                }
+                                Stmt::Show(name) if record_target => {
+                                    let title = super::guc::canonical_setting_name(name)?;
+                                    let title = context
+                                        .arena
+                                        .alloc_str(title.as_str())
+                                        .map_err(|_| super::query::arena_full_pub())?;
+                                    columns[0] = ColDesc::new(title, super::types::oid::TEXT, -1);
+                                    1
+                                }
+                                Stmt::ShowAll if record_target => {
+                                    columns[..3].copy_from_slice(&super::guc::SHOW_ALL_COLUMNS);
+                                    3
+                                }
+                                Stmt::Explain { .. } if record_target => {
+                                    columns[0] =
+                                        ColDesc::new("QUERY PLAN", super::types::oid::TEXT, -1);
+                                    1
+                                }
+                                _ => 0,
+                            };
+                            for (index, column) in columns[..width].iter().enumerate() {
+                                names[index] = StackStr::from_str(column.name);
+                                type_oids[index] = column.type_oid;
+                            }
+                            width
+                        };
+                        (width, names, type_oids)
+                    };
+                    let arena = context.arena;
+                    let prepare_empty_record =
+                        |selected: &mut [Datum<'a>], found: bool| -> Result<(), SqlError> {
+                            if record_target && !found && !statement.strict {
+                                let fields = arena
+                                    .alloc_slice_with(record_width, |index| RecordField {
+                                        name: "",
+                                        type_oid: record_type_oids[index],
+                                        value: Datum::Null,
+                                    })
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                for (field, name) in
+                                    fields.iter_mut().zip(&record_names[..record_width])
+                                {
+                                    field.name = arena
+                                        .alloc_str(name.as_str())
+                                        .map_err(|_| super::query::arena_full_pub())?;
+                                }
+                                selected[0] = Datum::Record(fields);
+                            }
+                            Ok(())
+                        };
+                    let mut capture = |values: &[Datum]| {
+                        if !record_target && values.len() != statement.targets.len() {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "query returned {} columns but EXECUTE INTO expects {}",
+                                values.len(),
+                                statement.targets.len()
+                            ));
+                        }
+                        if record_target && record_width != 0 && values.len() != record_width {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "EXECUTE INTO record shape changed during execution"
+                            ));
+                        }
+                        if !found {
+                            if record_target {
+                                let mut fields = [RecordField {
+                                    name: "",
+                                    type_oid: 0,
+                                    value: Datum::Null,
+                                }; MAX_PROJ];
+                                for (index, value) in values.iter().copied().enumerate() {
+                                    fields[index] = RecordField {
+                                        name: arena
+                                            .alloc_str(record_names[index].as_str())
+                                            .map_err(|_| super::query::arena_full_pub())?,
+                                        type_oid: record_type_oids[index],
+                                        value: detached_trigger_datum(value, arena)?,
+                                    };
+                                }
+                                let fields = arena
+                                    .alloc_slice_copy(&fields[..values.len()])
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                selected[0] = Datum::Record(&*fields);
+                            } else {
+                                for (index, value) in values.iter().copied().enumerate() {
+                                    selected[index] = detached_trigger_datum(value, arena)?;
+                                }
+                            }
+                            found = true;
+                        }
+                        row_count = row_count.checked_add(1).ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "dynamic query returned too many rows"
+                            )
+                        })?;
+                        Ok(())
+                    };
+                    match query.statement {
+                        Stmt::Explain { options, statement } => {
+                            let arena = context.arena;
+                            execute_plpgsql_dynamic_explain(
+                                context,
+                                *options,
+                                statement,
+                                query.arguments,
+                                &mut |line| {
+                                    let line = arena
+                                        .alloc_str(line)
+                                        .map_err(|_| super::query::arena_full_pub())?;
+                                    capture(&[Datum::Text(line)])
+                                },
+                            )?;
+                        }
+                        Stmt::Show(name) => {
+                            let value = {
+                                let PlpgsqlExecHost::Routine { engine, guc, .. } = &context.host
+                                else {
+                                    return Err(sql_err!(
+                                        sqlstate::FEATURE_NOT_SUPPORTED,
+                                        "SHOW is not available in trigger execution"
+                                    ));
+                                };
+                                engine.show_setting_value(name, guc, context.txn)?
+                            };
+                            let value = context
+                                .arena
+                                .alloc_str(value.as_str())
+                                .map_err(|_| super::query::arena_full_pub())?;
+                            capture(&[Datum::Text(value)])?;
+                        }
+                        Stmt::ShowAll => {
+                            let PlpgsqlExecHost::Routine { engine, guc, .. } = &context.host else {
+                                return Err(sql_err!(
+                                    sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "SHOW ALL is not available in trigger execution"
+                                ));
+                            };
+                            engine.visit_show_all_rows(guc, context.txn, |name, value| {
+                                let name = context
+                                    .arena
+                                    .alloc_str(name)
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                let value = context
+                                    .arena
+                                    .alloc_str(value)
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                capture(&[Datum::Text(name), Datum::Text(value), Datum::Text("")])
+                            })?;
+                        }
+                        Stmt::FetchCursor {
+                            name,
+                            motion,
+                            move_only: false,
+                        } => {
+                            let arena = context.arena;
+                            let rows = {
+                                let PlpgsqlExecHost::Routine {
+                                    engine,
+                                    cursors,
+                                    sqlprep,
+                                    guc,
+                                    ..
+                                } = &mut context.host
+                                else {
+                                    return Err(sql_err!(
+                                        sqlstate::FEATURE_NOT_SUPPORTED,
+                                        "SQL cursors are not available in trigger execution"
+                                    ));
+                                };
+                                engine.fetch_cursor(
+                                    name,
+                                    *motion,
+                                    false,
+                                    &mut super::CursorStatementContext {
+                                        arena,
+                                        params: &[],
+                                        txn: context.txn,
+                                        sqlprep,
+                                        cursors,
+                                        guc,
+                                        responder: context.responder,
+                                    },
+                                )?;
+                                arena
+                                    .alloc_slice_copy(cursors.emitted())
+                                    .map_err(|_| super::query::arena_full_pub())?
+                            };
+                            for row in rows.iter().copied() {
+                                let mut values = [Datum::Null; MAX_COLUMNS];
+                                let width = {
+                                    let PlpgsqlExecHost::Routine { cursors, .. } = &context.host
+                                    else {
+                                        unreachable!("cursor host cannot change during execution")
+                                    };
+                                    cursors.copy_row(name, row, arena, &mut values)?
+                                };
+                                capture(&values[..width])?;
+                            }
+                        }
+                        Stmt::Select(_) | Stmt::SetQuery(_) => {
+                            execute_bound_plpgsql_dynamic_query(context, query, &mut capture)?;
+                        }
+                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+                            let mut returning =
+                                |_: &Storage,
+                                 _: u32,
+                                 _: &dyn crate::sql::eval::SequenceAccess,
+                                 values: &[Datum]| capture(values);
+                            let result = execute_procedural_write(
+                                context,
+                                status,
+                                retained_parent,
+                                &mut |context, status| {
+                                    execute_bound_plpgsql_dynamic_dml(
+                                        context,
+                                        query,
+                                        transition_relations,
+                                        Some(&mut returning),
+                                        &mut status.pending_write,
+                                    )
+                                },
+                            );
+                            let result = match result {
+                                Err(error)
+                                    if control_flow::is_execution_wait(&error)
+                                        && status.pending_write.is_some() =>
+                                {
+                                    resume_nested_write(context, status).map(|(rows, output)| {
+                                        debug_assert!(output.is_none());
+                                        rows
+                                    })
+                                }
+                                result => result,
+                            };
+                            let affected = match result {
+                                Ok(rows) => rows,
+                                Err(error) => {
+                                    if control_flow::is_execution_wait(&error)
+                                        && let Some(pending) = &mut status.pending_write
+                                    {
+                                        let values = if has_result {
+                                            prepare_empty_record(&mut selected, found)?;
+                                            Some(&selected[..statement.targets.len()])
+                                        } else {
+                                            None
+                                        };
+                                        pending.save_output(
+                                            values,
+                                            row_count as u64,
+                                            &context.storage().row_work,
+                                        )?;
+                                    }
+                                    return Err(error);
+                                }
+                            };
+                            if !has_result {
+                                status.set_row_count(affected)?;
+                                return Err(sql_err!(
+                                    sqlstate::SYNTAX_ERROR,
+                                    "INTO used with a command that cannot return data"
+                                ));
+                            }
+                            debug_assert_eq!(affected, row_count as u64);
+                        }
+                        Stmt::Call { .. } => {
+                            // EXECUTE ... INTO takes the output parameters as one row.
+                            let outputs = execute_plpgsql_dynamic_call(context, query)?;
+                            if outputs.count == 0 {
+                                return Err(sql_err!(
+                                    sqlstate::SYNTAX_ERROR,
+                                    "INTO used with a command that cannot return data"
+                                ));
+                            }
+                            capture(&outputs.values[..outputs.count])?;
+                        }
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "INTO used with a command that cannot return data"
+                            ));
+                        }
+                    }
+                    prepare_empty_record(&mut selected, found)?;
+                    finish_dynamic_into(
+                        context,
+                        locals,
+                        local_values,
+                        statement,
+                        &selected[..statement.targets.len()],
+                        row_count as u64,
+                        status,
+                    )?;
+
+                    Ok(None)
+                })
+            }),
+            TriggerStatement::DynamicQuery(query) => execute_trigger_statement(|| {
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let query = bind_plpgsql_dynamic_query(
+                    context,
+                    query,
+                    &scope,
+                    DynamicCommandKind::Statement,
+                    &mut StatementExpressions::new(
+                        retained_parent,
+                        true,
+                        &mut status.expressions,
+                        &mut status.pending_query,
+                    ),
+                )?;
+                let query = resolve_plpgsql_dynamic_prepared(context, query)?;
+                with_bound_parameter_types(query.parameter_types, || {
+                    let row_count = match query.statement {
+                        Stmt::Select(_) | Stmt::SetQuery(_) => {
+                            let mut rows = 0u64;
+                            execute_bound_plpgsql_dynamic_query(context, query, &mut |_| {
+                                rows = rows.checked_add(1).ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "PL/pgSQL dynamic query returned too many rows"
+                                    )
+                                })?;
+                                Ok(())
+                            })?;
+                            rows
+                        }
+                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+                            let result = execute_procedural_write(
+                                context,
+                                status,
+                                retained_parent,
+                                &mut |context, status| {
+                                    execute_bound_plpgsql_dynamic_dml(
+                                        context,
+                                        query,
+                                        transition_relations,
+                                        None,
+                                        &mut status.pending_write,
+                                    )
+                                },
+                            );
+                            match result {
+                                Err(error)
+                                    if control_flow::is_execution_wait(&error)
+                                        && status.pending_write.is_some() =>
+                                {
+                                    let (rows, output) = resume_nested_write(context, status)?;
+                                    debug_assert!(output.is_none());
+                                    rows
+                                }
+                                result => result?,
+                            }
+                        }
+                        Stmt::Explain { options, statement } => {
+                            execute_plpgsql_dynamic_explain(
+                                context,
+                                *options,
+                                statement,
+                                query.arguments,
+                                &mut |_| Ok(()),
+                            )?;
+                            0
+                        }
+                        _ => {
+                            execute_bound_plpgsql_utility(context, query)?;
+                            0
+                        }
+                    };
+                    status.set_row_count(row_count)?;
+
+                    Ok(None)
+                })
+            }),
+            TriggerStatement::Call { statement, .. } => execute_trigger_statement(|| {
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                // Even one argument is saved: the called procedure can wait after it.
+                let mut expressions = StatementExpressions::new(
+                    retained_parent,
+                    true,
+                    &mut status.expressions,
+                    &mut status.pending_query,
+                );
+                let outputs = execute_plpgsql_call(
+                    context,
+                    statement,
+                    locals,
+                    &scope,
+                    &mut expressions,
+                    &mut status.pending_call,
+                )?;
+                for (argument, output) in outputs.arguments.iter().zip(outputs.assigned) {
+                    if let (Some(name), Some(output)) = (argument, output) {
+                        assign_trigger_local(
+                            context,
+                            locals,
+                            local_values,
+                            *name,
+                            outputs.values[usize::from(output)],
+                        )?;
+                    }
+                }
+                status.set_row_count(0)?;
+                Ok(None)
+            }),
+            TriggerStatement::Utility { source, statement } => execute_trigger_statement(|| {
+                execute_bound_plpgsql_utility(
+                    context,
+                    BoundPlpgsqlCommand {
+                        owner: context.plan_owner()?,
+                        source,
+                        statement,
+                        inputs: super::type_inputs::bindings_for_active_source(
+                            source,
+                            context.arena,
+                        )?
+                        .unwrap_or(&[]),
+                        arguments: &[],
+                        parameter_types: &[],
+                    },
+                )?;
+                status.set_row_count(0)?;
+                Ok(None)
+            }),
+            TriggerStatement::Perform(query) => execute_trigger_statement(|| {
+                // Only the count escapes. The region reclaims query front
+                // storage and nested invocation receipts together.
+                let row_count = context.arena.with_remaining_region(|arena| {
+                    let host = context.host.reborrow();
+                    let mut context = TriggerExecContext {
+                        host,
+                        txn: context.txn,
+                        arena,
+                        params: context.params,
+                        responder: context.responder,
+                    };
+                    let query = match transition_relations {
+                        Some(relations) => super::query::bind_materialized_relations(
+                            query,
+                            relations,
+                            context.storage(),
+                            context.txn.txid,
+                            context.arena,
+                        )?,
+                        None => query,
+                    };
+                    let transition = TriggerTransition {
+                        definition,
+                        old,
+                        new: new.as_deref(),
+                    };
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let arena = context.arena;
+                    let params = context.params;
+                    let txid = context.txn.txid;
+                    let continuation = if retained_parent {
+                        Some(&mut status.pending_query)
+                    } else {
+                        None
+                    };
+                    execute_procedural_query(&mut context, continuation, |storage, sequence| {
+                        let mut row_count = 0u64;
+                        super::query::select_into_rows(
+                            storage,
+                            txid,
+                            query,
+                            arena,
+                            params,
+                            Some(&scope),
+                            Some(sequence),
+                            &mut |_| {
+                                row_count = row_count.checked_add(1).ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "PL/pgSQL query returned too many rows"
+                                    )
+                                })?;
+                                Ok(())
+                            },
+                        )?;
+                        Ok(row_count)
+                    })
+                });
+                status.set_rows(row_count.map_err(|_| super::query::arena_full_pub())??)?;
+
+                Ok(None)
+            }),
+            TriggerStatement::Assert(assertion) => execute_trigger_statement(|| {
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let mut expressions = StatementExpressions::new(
+                    retained_parent,
+                    assertion.message.is_some(),
+                    &mut status.expressions,
+                    &mut status.pending_query,
+                );
+                if trigger_condition_value(expressions.eval(
+                    context,
+                    assertion.condition,
+                    &scope,
+                )?)? {
+                    return Ok(None);
+                }
+                let message = match assertion.message {
+                    Some(message) => {
+                        let value = expressions.eval(context, message, &scope)?;
+                        if value.is_null() {
+                            stack_format!(192, "assertion failed")
+                        } else {
+                            stack_format!(192, "{}", datum_to_text(value, context.arena)?)
+                        }
+                    }
+                    None => stack_format!(192, "assertion failed"),
+                };
+                Err(sql_err!(sqlstate::ASSERT_FAILURE, "{}", message.as_str()))
+            }),
+            TriggerStatement::Raise(TriggerRaise::Rethrow) => execute_trigger_statement(|| {
+                let exception =
+                    exception.expect("bare RAISE is parsed only in an exception handler");
+                crate::sql::eval::stash_diagnostic(
+                    exception.stack::<{ super::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>(
+                        diagnostics::Field::Detail,
+                    )?,
+                    exception.stack::<128>(diagnostics::Field::Hint)?,
+                );
+                Err(SqlError {
+                    sqlstate: exception.sqlstate,
+                    message: exception
+                        .stack::<192>(diagnostics::Field::Message)?
+                        .expect("caught error has a message"),
+                })
+            }),
+            TriggerStatement::Raise(TriggerRaise::Message(raise)) => {
+                execute_trigger_statement(|| {
+                    let transition = TriggerTransition {
+                        definition,
+                        old,
+                        new: new.as_deref(),
+                    };
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let count = usize::from(matches!(
+                        raise.sqlstate,
+                        TriggerRaiseSqlState::Expression(_)
+                    )) + match (raise.message, raise.default_message, raise.format) {
+                        (Some(_), _, _) => 1,
+                        (None, Some(_), _) | (None, None, None) => 0,
+                        (None, None, Some(_)) => raise.arguments.len(),
+                    } + usize::from(raise.detail.is_some())
+                        + usize::from(raise.hint.is_some());
+                    let mut expressions = StatementExpressions::new(
+                        retained_parent,
+                        count > 1,
+                        &mut status.expressions,
+                        &mut status.pending_query,
+                    );
+                    let sqlstate =
+                        trigger_raise_sqlstate(raise.sqlstate, context, &scope, &mut expressions)?;
+                    let message = match raise.message {
+                        Some(message) => trigger_diagnostic_text::<192>(
+                            message,
+                            context,
+                            &scope,
+                            &mut expressions,
+                        )?,
+                        None if raise.default_message.is_some() => {
+                            stack_format!(
+                                192,
+                                "{}",
+                                raise.default_message.expect("default message")
+                            )
+                        }
+                        None => match raise.format {
+                            Some(format) => trigger_format_message(
+                                format,
+                                raise.arguments,
+                                context,
+                                &scope,
+                                &mut expressions,
+                            )?,
+                            None => stack_format!(192, "{}", sqlstate.as_str()),
+                        },
+                    };
+                    let detail = raise
+                        .detail
+                        .map(|detail| {
+                            trigger_diagnostic_text::<
+                                { crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES },
+                            >(detail, context, &scope, &mut expressions)
+                        })
+                        .transpose()?;
+                    let hint = raise
+                        .hint
+                        .map(|hint| {
+                            trigger_diagnostic_text::<128>(hint, context, &scope, &mut expressions)
+                        })
+                        .transpose()?;
+                    if detail.is_some() || hint.is_some() {
+                        crate::sql::eval::stash_diagnostic(detail, hint);
+                    }
+                    match raise.level {
+                        TriggerRaiseLevel::Debug => context
+                            .responder
+                            .debug(sqlstate, message.as_str())
+                            .map_err(trigger_notice_to_sql)?,
+                        TriggerRaiseLevel::Log => context
+                            .responder
+                            .log(sqlstate, message.as_str())
+                            .map_err(trigger_notice_to_sql)?,
+                        TriggerRaiseLevel::Info => context
+                            .responder
+                            .info(sqlstate, message.as_str())
+                            .map_err(trigger_notice_to_sql)?,
+                        TriggerRaiseLevel::Exception => {
+                            return Err(SqlError { sqlstate, message });
+                        }
+                        TriggerRaiseLevel::Warning => context
+                            .responder
+                            .warning(sqlstate, message.as_str())
+                            .map_err(trigger_notice_to_sql)?,
+                        TriggerRaiseLevel::Notice => context
+                            .responder
+                            .notice(sqlstate, message.as_str())
+                            .map_err(trigger_notice_to_sql)?,
+                    }
+
+                    Ok(None)
+                })
+            }
+            TriggerStatement::GetDiagnostics(statement) => execute_trigger_statement(|| {
+                for assignment in statement.assignments {
+                    let value = match assignment.item {
+                        TriggerDiagnostic::RowCount => Datum::Int8(status.row_count),
+                        TriggerDiagnostic::PgRoutineOid => Datum::Int4(invocation.routine_oid),
+                        TriggerDiagnostic::PgContext => {
+                            let text = invocation.context();
+                            Datum::Text(
+                                context
+                                    .arena
+                                    .alloc_str(text.as_str())
+                                    .map_err(|_| super::query::arena_full_pub())?,
+                            )
+                        }
+                    };
+                    assign_trigger_local(context, locals, local_values, assignment.target, value)?;
+                }
+
+                Ok(None)
+            }),
+            TriggerStatement::GetStackedDiagnostics(statement) => execute_trigger_statement(|| {
+                let Some(exception) = exception else {
+                    return Err(sql_err!(
+                        sqlstate::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER,
+                        "GET STACKED DIAGNOSTICS cannot be used outside an exception handler"
+                    ));
+                };
+                for assignment in statement.assignments {
+                    let field = match assignment.item {
+                        TriggerStackedDiagnostic::ReturnedSqlstate => {
+                            Some(diagnostics::Field::Sqlstate)
+                        }
+                        TriggerStackedDiagnostic::MessageText => Some(diagnostics::Field::Message),
+                        TriggerStackedDiagnostic::ColumnName
+                        | TriggerStackedDiagnostic::ConstraintName
+                        | TriggerStackedDiagnostic::PgDatatypeName
+                        | TriggerStackedDiagnostic::TableName
+                        | TriggerStackedDiagnostic::SchemaName => None,
+                        TriggerStackedDiagnostic::PgExceptionDetail => {
+                            Some(diagnostics::Field::Detail)
+                        }
+                        TriggerStackedDiagnostic::PgExceptionHint => Some(diagnostics::Field::Hint),
+                        TriggerStackedDiagnostic::PgExceptionContext => {
+                            Some(diagnostics::Field::Context)
+                        }
+                    };
+                    let value = Datum::Text(match field {
+                        Some(field) => exception.text(field, context.arena)?.unwrap_or(""),
+                        None => "",
+                    });
+                    assign_trigger_local(context, locals, local_values, assignment.target, value)?;
+                }
+
+                Ok(None)
+            }),
+            TriggerStatement::Exception(exception_block) => {
+                let boundary = begin_trigger_subtransaction(context)?;
+                Ok(control_flow::Step::protected(exception_block, boundary))
+            }
+            TriggerStatement::Dml {
+                statement: TriggerDml::Insert(statement),
+                ..
+            } => execute_trigger_statement(|| {
+                let statement = match transition_relations {
+                    Some(relations) => Insert {
+                        select: statement
+                            .select
+                            .map(|select| {
+                                super::query::bind_materialized_relations(
+                                    select,
+                                    relations,
+                                    context.storage(),
+                                    context.txn.txid,
+                                    context.arena,
+                                )
+                            })
+                            .transpose()?,
+                        ..statement
+                    },
+                    None => statement,
+                };
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                super::query::validate_dml_assignment_casts(
+                    &Stmt::Insert(statement),
+                    context.storage(),
+                    context.txn.txid,
+                    context.arena,
+                    Some(&scope),
+                )?;
+                let assignment_casts = prepare_dml_assignment_casts(
+                    &Stmt::Insert(statement),
+                    context.storage(),
+                    context.txn.txid,
+                    context.arena,
+                    Some(&scope),
+                )?;
+                let prepared_select = match statement.select {
+                    Some(select) => {
+                        let casts = prepare_insert_select_casts(
+                            &statement,
+                            select,
+                            context.storage(),
+                            context.txn.txid,
+                            context.arena,
+                            Some(&scope),
+                        )?;
+                        Some(materialize_trigger_insert_source(
+                            context.storage(),
+                            &statement,
+                            select,
+                            casts,
+                            context.arena,
+                            context.arena,
+                            context.txn.txid,
+                            TriggerQueryExecution {
+                                params: context.params,
+                                seq_session: context.seq_session(),
+                            },
+                            Some(&scope),
+                        )?)
+                    }
+                    None => None,
+                };
+                let conflict_scope = match statement.on_conflict {
+                    Some(_) => Some(snapshot_trigger_dml_scope(&scope, context.arena)?),
+                    None => None,
+                };
+                let arena = context.arena;
+                let params = context.params;
+                let boundary = context.nested_write_boundary();
+                let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
+
+                let mut command = txn.enter_trigger_sql(storage)?;
+                let txn = &mut *command;
+                let parent_boundary = txn.write_completion_boundary;
+                txn.write_completion_boundary =
+                    boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                        mark,
+                        command: txn.command_id(),
+                        depth: txn.trigger_depth(),
+                    });
+                responder.clear_affected_rows();
+                let outcome = responder.without_command_complete(|responder| {
+                    insert(
+                        storage,
+                        txn,
+                        &statement,
+                        DmlAuthorization::Invoker,
+                        None,
+                        arena,
+                        params,
+                        seq_session,
+                        responder,
+                        None,
+                        Some(&scope),
+                        transition_relations,
+                        conflict_scope,
+                        prepared_select.map_or(InsertSource::Statement, |rows| {
+                            InsertSource::MaterializedSelect {
+                                rows,
+                                assignments: assignment_casts,
+                            }
+                        }),
+                    )
+                });
+                txn.write_completion_boundary = parent_boundary;
+                let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+                {
+                    txn.pending_write_completion.take()
+                } else {
+                    None
+                };
+                if let Some(completion) = completion {
+                    status.pending_write = Some(write_completion::PendingNestedWrite::new(
+                        command.suspend(),
+                        completion,
+                    ));
+                    let (rows, output) = resume_nested_write(context, status)?;
+                    debug_assert!(output.is_none());
+                    status.set_rows(rows)?;
+                    return Ok(None);
+                }
+                drop(command);
+                match outcome {
+                    Ok(Ok(())) => status.set_rows(
+                        context
+                            .responder
+                            .take_affected_rows()
+                            .expect("trigger INSERT publishes an affected-row count"),
+                    )?,
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "trigger-side INSERT response exceeded the output buffer"
+                        ));
+                    }
+                }
+
+                Ok(None)
+            }),
+            TriggerStatement::Dml {
+                statement: TriggerDml::Update(statement),
+                ..
+            } => execute_trigger_statement(|| {
+                let statement = match transition_relations {
+                    Some(relations) => {
+                        let dml = context
+                            .arena
+                            .alloc(super::ast::Stmt::Update(statement))
+                            .map_err(|_| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "trigger UPDATE expansion exceeds the statement arena"
+                                )
+                            })?;
+                        let super::ast::Stmt::Update(bound) =
+                            *super::query::bind_dml_materialized_relations(
+                                dml,
+                                context.storage(),
+                                context.txn.txid,
+                                context.arena,
+                                context.params,
+                                relations,
+                            )?
+                        else {
+                            unreachable!("UPDATE expansion returned a different statement kind");
+                        };
+                        bound
+                    }
+                    None => statement,
                 };
                 let transition = TriggerTransition {
                     definition,
@@ -29591,639 +30092,491 @@ fn execute_trigger_step<'a>(
                 };
                 let arena = context.arena;
                 let params = context.params;
-                let txid = context.txn.txid;
-                let continuation = if retained_parent {
-                    Some(&mut status.pending_query)
+                let boundary = context.nested_write_boundary();
+                let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
+                let mut command = txn.enter_trigger_sql(storage)?;
+                let txn = &mut *command;
+                let parent_boundary = txn.write_completion_boundary;
+                txn.write_completion_boundary =
+                    boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                        mark,
+                        command: txn.command_id(),
+                        depth: txn.trigger_depth(),
+                    });
+                let mut scratch = storage.row_work.lease(0).map_err(|error| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "nested DML selection: {}",
+                        error
+                    )
+                })?;
+                responder.clear_affected_rows();
+                let outcome = responder.without_command_complete(|responder| {
+                    update(
+                        storage,
+                        txn,
+                        &mut scratch,
+                        &statement,
+                        DmlAuthorization::Invoker,
+                        None,
+                        arena,
+                        params,
+                        seq_session,
+                        responder,
+                        None,
+                        Some(&scope),
+                    )
+                });
+                txn.write_completion_boundary = parent_boundary;
+                let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+                {
+                    txn.pending_write_completion.take()
                 } else {
                     None
                 };
-                execute_procedural_query(&mut context, continuation, |storage, sequence| {
-                    let mut row_count = 0u64;
-                    super::query::select_into_rows(
-                        storage,
-                        txid,
-                        query,
-                        arena,
-                        params,
-                        Some(&scope),
-                        Some(sequence),
-                        &mut |_| {
-                            row_count = row_count.checked_add(1).ok_or_else(|| {
+                if let Some(completion) = completion {
+                    status.pending_write = Some(write_completion::PendingNestedWrite::new(
+                        command.suspend(),
+                        completion,
+                    ));
+                    let (rows, output) = resume_nested_write(context, status)?;
+                    debug_assert!(output.is_none());
+                    status.set_rows(rows)?;
+                    return Ok(None);
+                }
+                drop(command);
+                match outcome {
+                    Ok(Ok(())) => status.set_rows(
+                        context
+                            .responder
+                            .take_affected_rows()
+                            .expect("trigger UPDATE publishes an affected-row count"),
+                    )?,
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "trigger-side UPDATE response exceeded the output buffer"
+                        ));
+                    }
+                }
+
+                Ok(None)
+            }),
+            TriggerStatement::Dml {
+                statement: TriggerDml::Delete(statement),
+                ..
+            } => execute_trigger_statement(|| {
+                let statement = match transition_relations {
+                    Some(relations) => {
+                        let dml = context
+                            .arena
+                            .alloc(super::ast::Stmt::Delete(statement))
+                            .map_err(|_| {
                                 sql_err!(
                                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "PL/pgSQL query returned too many rows"
+                                    "trigger DELETE expansion exceeds the statement arena"
                                 )
                             })?;
-                            Ok(())
-                        },
-                    )?;
-                    Ok(row_count)
-                })
-            });
-            status.set_rows(row_count.map_err(|_| super::query::arena_full_pub())??)?;
-
-            Ok(None)
-        }),
-        TriggerStatement::Assert(assertion) => execute_trigger_statement(|| {
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let mut expressions = StatementExpressions::new(
-                retained_parent,
-                assertion.message.is_some(),
-                &mut status.expressions,
-                &mut status.pending_query,
-            );
-            if trigger_condition_value(expressions.eval(context, assertion.condition, &scope)?)? {
-                return Ok(None);
-            }
-            let message = match assertion.message {
-                Some(message) => {
-                    let value = expressions.eval(context, message, &scope)?;
-                    if value.is_null() {
-                        stack_format!(192, "assertion failed")
-                    } else {
-                        stack_format!(192, "{}", datum_to_text(value, context.arena)?)
-                    }
-                }
-                None => stack_format!(192, "assertion failed"),
-            };
-            Err(sql_err!(sqlstate::ASSERT_FAILURE, "{}", message.as_str()))
-        }),
-        TriggerStatement::Raise(TriggerRaise::Rethrow) => execute_trigger_statement(|| {
-            let exception = exception.expect("bare RAISE is parsed only in an exception handler");
-            crate::sql::eval::stash_diagnostic(
-                exception.stack::<{ super::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>(
-                    diagnostics::Field::Detail,
-                )?,
-                exception.stack::<128>(diagnostics::Field::Hint)?,
-            );
-            Err(SqlError {
-                sqlstate: exception.sqlstate,
-                message: exception
-                    .stack::<192>(diagnostics::Field::Message)?
-                    .expect("caught error has a message"),
-            })
-        }),
-        TriggerStatement::Raise(TriggerRaise::Message(raise)) => execute_trigger_statement(|| {
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let count = usize::from(matches!(
-                raise.sqlstate,
-                TriggerRaiseSqlState::Expression(_)
-            )) + match (raise.message, raise.default_message, raise.format) {
-                (Some(_), _, _) => 1,
-                (None, Some(_), _) | (None, None, None) => 0,
-                (None, None, Some(_)) => raise.arguments.len(),
-            } + usize::from(raise.detail.is_some())
-                + usize::from(raise.hint.is_some());
-            let mut expressions = StatementExpressions::new(
-                retained_parent,
-                count > 1,
-                &mut status.expressions,
-                &mut status.pending_query,
-            );
-            let sqlstate =
-                trigger_raise_sqlstate(raise.sqlstate, context, &scope, &mut expressions)?;
-            let message = match raise.message {
-                Some(message) => {
-                    trigger_diagnostic_text::<192>(message, context, &scope, &mut expressions)?
-                }
-                None if raise.default_message.is_some() => {
-                    stack_format!(192, "{}", raise.default_message.expect("default message"))
-                }
-                None => match raise.format {
-                    Some(format) => trigger_format_message(
-                        format,
-                        raise.arguments,
-                        context,
-                        &scope,
-                        &mut expressions,
-                    )?,
-                    None => stack_format!(192, "{}", sqlstate.as_str()),
-                },
-            };
-            let detail = raise
-                .detail
-                .map(|detail| {
-                    trigger_diagnostic_text::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>(
-                        detail,
-                        context,
-                        &scope,
-                        &mut expressions,
-                    )
-                })
-                .transpose()?;
-            let hint = raise
-                .hint
-                .map(|hint| trigger_diagnostic_text::<128>(hint, context, &scope, &mut expressions))
-                .transpose()?;
-            if detail.is_some() || hint.is_some() {
-                crate::sql::eval::stash_diagnostic(detail, hint);
-            }
-            match raise.level {
-                TriggerRaiseLevel::Debug => context
-                    .responder
-                    .debug(sqlstate, message.as_str())
-                    .map_err(trigger_notice_to_sql)?,
-                TriggerRaiseLevel::Log => context
-                    .responder
-                    .log(sqlstate, message.as_str())
-                    .map_err(trigger_notice_to_sql)?,
-                TriggerRaiseLevel::Info => context
-                    .responder
-                    .info(sqlstate, message.as_str())
-                    .map_err(trigger_notice_to_sql)?,
-                TriggerRaiseLevel::Exception => {
-                    return Err(SqlError { sqlstate, message });
-                }
-                TriggerRaiseLevel::Warning => context
-                    .responder
-                    .warning(sqlstate, message.as_str())
-                    .map_err(trigger_notice_to_sql)?,
-                TriggerRaiseLevel::Notice => context
-                    .responder
-                    .notice(sqlstate, message.as_str())
-                    .map_err(trigger_notice_to_sql)?,
-            }
-
-            Ok(None)
-        }),
-        TriggerStatement::GetDiagnostics(statement) => execute_trigger_statement(|| {
-            for assignment in statement.assignments {
-                let value = match assignment.item {
-                    TriggerDiagnostic::RowCount => Datum::Int8(status.row_count),
-                    TriggerDiagnostic::PgRoutineOid => Datum::Int4(invocation.routine_oid),
-                    TriggerDiagnostic::PgContext => {
-                        let text = invocation.context();
-                        Datum::Text(
-                            context
-                                .arena
-                                .alloc_str(text.as_str())
-                                .map_err(|_| super::query::arena_full_pub())?,
-                        )
-                    }
-                };
-                assign_trigger_local(context, locals, local_values, assignment.target, value)?;
-            }
-
-            Ok(None)
-        }),
-        TriggerStatement::GetStackedDiagnostics(statement) => execute_trigger_statement(|| {
-            let Some(exception) = exception else {
-                return Err(sql_err!(
-                    sqlstate::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER,
-                    "GET STACKED DIAGNOSTICS cannot be used outside an exception handler"
-                ));
-            };
-            for assignment in statement.assignments {
-                let field = match assignment.item {
-                    TriggerStackedDiagnostic::ReturnedSqlstate => {
-                        Some(diagnostics::Field::Sqlstate)
-                    }
-                    TriggerStackedDiagnostic::MessageText => Some(diagnostics::Field::Message),
-                    TriggerStackedDiagnostic::ColumnName
-                    | TriggerStackedDiagnostic::ConstraintName
-                    | TriggerStackedDiagnostic::PgDatatypeName
-                    | TriggerStackedDiagnostic::TableName
-                    | TriggerStackedDiagnostic::SchemaName => None,
-                    TriggerStackedDiagnostic::PgExceptionDetail => Some(diagnostics::Field::Detail),
-                    TriggerStackedDiagnostic::PgExceptionHint => Some(diagnostics::Field::Hint),
-                    TriggerStackedDiagnostic::PgExceptionContext => {
-                        Some(diagnostics::Field::Context)
-                    }
-                };
-                let value = Datum::Text(match field {
-                    Some(field) => exception.text(field, context.arena)?.unwrap_or(""),
-                    None => "",
-                });
-                assign_trigger_local(context, locals, local_values, assignment.target, value)?;
-            }
-
-            Ok(None)
-        }),
-        TriggerStatement::Exception(exception_block) => {
-            let boundary = begin_trigger_subtransaction(context)?;
-            Ok(control_flow::Step::protected(exception_block, boundary))
-        }
-        TriggerStatement::Dml {
-            statement: TriggerDml::Insert(statement),
-            ..
-        } => execute_trigger_statement(|| {
-            let statement = match transition_relations {
-                Some(relations) => Insert {
-                    select: statement
-                        .select
-                        .map(|select| {
-                            super::query::bind_materialized_relations(
-                                select,
-                                relations,
+                        let super::ast::Stmt::Delete(bound) =
+                            *super::query::bind_dml_materialized_relations(
+                                dml,
                                 context.storage(),
                                 context.txn.txid,
                                 context.arena,
-                            )
-                        })
-                        .transpose()?,
-                    ..statement
-                },
-                None => statement,
-            };
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            super::query::validate_dml_assignment_casts(
-                &Stmt::Insert(statement),
-                context.storage(),
-                context.txn.txid,
-                context.arena,
-                Some(&scope),
-            )?;
-            let assignment_casts = prepare_dml_assignment_casts(
-                &Stmt::Insert(statement),
-                context.storage(),
-                context.txn.txid,
-                context.arena,
-                Some(&scope),
-            )?;
-            let prepared_select = match statement.select {
-                Some(select) => {
-                    let casts = prepare_insert_select_casts(
-                        &statement,
-                        select,
-                        context.storage(),
-                        context.txn.txid,
-                        context.arena,
-                        Some(&scope),
-                    )?;
-                    Some(materialize_trigger_insert_source(
-                        context.storage(),
-                        &statement,
-                        select,
-                        casts,
-                        context.arena,
-                        context.arena,
-                        context.txn.txid,
-                        TriggerQueryExecution {
-                            params: context.params,
-                            seq_session: context.seq_session(),
-                        },
-                        Some(&scope),
-                    )?)
-                }
-                None => None,
-            };
-            let conflict_scope = match statement.on_conflict {
-                Some(_) => Some(snapshot_trigger_dml_scope(&scope, context.arena)?),
-                None => None,
-            };
-            let arena = context.arena;
-            let params = context.params;
-            let boundary = context.nested_write_boundary();
-            let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-
-            let mut command = txn.enter_trigger_sql(storage)?;
-            let txn = &mut *command;
-            let parent_boundary = txn.write_completion_boundary;
-            txn.write_completion_boundary =
-                boundary.map(|mark| super::txn::WriteCompletionBoundary {
-                    mark,
-                    command: txn.command_id(),
-                    depth: txn.trigger_depth(),
-                });
-            responder.clear_affected_rows();
-            let outcome = responder.without_command_complete(|responder| {
-                insert(
-                    storage,
-                    txn,
-                    &statement,
-                    DmlAuthorization::Invoker,
-                    None,
-                    arena,
-                    params,
-                    seq_session,
-                    responder,
-                    None,
-                    Some(&scope),
-                    transition_relations,
-                    conflict_scope,
-                    prepared_select.map_or(InsertSource::Statement, |rows| {
-                        InsertSource::MaterializedSelect {
-                            rows,
-                            assignments: assignment_casts,
-                        }
-                    }),
-                )
-            });
-            txn.write_completion_boundary = parent_boundary;
-            let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
-            {
-                txn.pending_write_completion.take()
-            } else {
-                None
-            };
-            if let Some(completion) = completion {
-                status.pending_write = Some(write_completion::PendingNestedWrite::new(
-                    command.suspend(),
-                    completion,
-                ));
-                let (rows, output) = resume_nested_write(context, status)?;
-                debug_assert!(output.is_none());
-                status.set_rows(rows)?;
-                return Ok(None);
-            }
-            drop(command);
-            match outcome {
-                Ok(Ok(())) => status.set_rows(
-                    context
-                        .responder
-                        .take_affected_rows()
-                        .expect("trigger INSERT publishes an affected-row count"),
-                )?,
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger-side INSERT response exceeded the output buffer"
-                    ));
-                }
-            }
-
-            Ok(None)
-        }),
-        TriggerStatement::Dml {
-            statement: TriggerDml::Update(statement),
-            ..
-        } => execute_trigger_statement(|| {
-            let statement = match transition_relations {
-                Some(relations) => {
-                    let dml = context
-                        .arena
-                        .alloc(super::ast::Stmt::Update(statement))
-                        .map_err(|_| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "trigger UPDATE expansion exceeds the statement arena"
-                            )
-                        })?;
-                    let super::ast::Stmt::Update(bound) =
-                        *super::query::bind_dml_materialized_relations(
-                            dml,
-                            context.storage(),
-                            context.txn.txid,
-                            context.arena,
-                            context.params,
-                            relations,
-                        )?
-                    else {
-                        unreachable!("UPDATE expansion returned a different statement kind");
-                    };
-                    bound
-                }
-                None => statement,
-            };
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let arena = context.arena;
-            let params = context.params;
-            let boundary = context.nested_write_boundary();
-            let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-            let mut command = txn.enter_trigger_sql(storage)?;
-            let txn = &mut *command;
-            let parent_boundary = txn.write_completion_boundary;
-            txn.write_completion_boundary =
-                boundary.map(|mark| super::txn::WriteCompletionBoundary {
-                    mark,
-                    command: txn.command_id(),
-                    depth: txn.trigger_depth(),
-                });
-            let mut scratch = storage.row_work.lease(0).map_err(|error| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "nested DML selection: {}",
-                    error
-                )
-            })?;
-            responder.clear_affected_rows();
-            let outcome = responder.without_command_complete(|responder| {
-                update(
-                    storage,
-                    txn,
-                    &mut scratch,
-                    &statement,
-                    DmlAuthorization::Invoker,
-                    None,
-                    arena,
-                    params,
-                    seq_session,
-                    responder,
-                    None,
-                    Some(&scope),
-                )
-            });
-            txn.write_completion_boundary = parent_boundary;
-            let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
-            {
-                txn.pending_write_completion.take()
-            } else {
-                None
-            };
-            if let Some(completion) = completion {
-                status.pending_write = Some(write_completion::PendingNestedWrite::new(
-                    command.suspend(),
-                    completion,
-                ));
-                let (rows, output) = resume_nested_write(context, status)?;
-                debug_assert!(output.is_none());
-                status.set_rows(rows)?;
-                return Ok(None);
-            }
-            drop(command);
-            match outcome {
-                Ok(Ok(())) => status.set_rows(
-                    context
-                        .responder
-                        .take_affected_rows()
-                        .expect("trigger UPDATE publishes an affected-row count"),
-                )?,
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger-side UPDATE response exceeded the output buffer"
-                    ));
-                }
-            }
-
-            Ok(None)
-        }),
-        TriggerStatement::Dml {
-            statement: TriggerDml::Delete(statement),
-            ..
-        } => execute_trigger_statement(|| {
-            let statement = match transition_relations {
-                Some(relations) => {
-                    let dml = context
-                        .arena
-                        .alloc(super::ast::Stmt::Delete(statement))
-                        .map_err(|_| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "trigger DELETE expansion exceeds the statement arena"
-                            )
-                        })?;
-                    let super::ast::Stmt::Delete(bound) =
-                        *super::query::bind_dml_materialized_relations(
-                            dml,
-                            context.storage(),
-                            context.txn.txid,
-                            context.arena,
-                            context.params,
-                            relations,
-                        )?
-                    else {
-                        unreachable!("DELETE expansion returned a different statement kind");
-                    };
-                    bound
-                }
-                None => statement,
-            };
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let arena = context.arena;
-            let params = context.params;
-            let boundary = context.nested_write_boundary();
-            let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-            let mut command = txn.enter_trigger_sql(storage)?;
-            let txn = &mut *command;
-            let parent_boundary = txn.write_completion_boundary;
-            txn.write_completion_boundary =
-                boundary.map(|mark| super::txn::WriteCompletionBoundary {
-                    mark,
-                    command: txn.command_id(),
-                    depth: txn.trigger_depth(),
-                });
-            let mut scratch = storage.row_work.lease(0).map_err(|error| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "nested DML selection: {}",
-                    error
-                )
-            })?;
-            responder.clear_affected_rows();
-            let outcome = responder.without_command_complete(|responder| {
-                delete(
-                    storage,
-                    txn,
-                    &mut scratch,
-                    &statement,
-                    DmlAuthorization::Invoker,
-                    arena,
-                    params,
-                    seq_session,
-                    responder,
-                    None,
-                    Some(&scope),
-                )
-            });
-            txn.write_completion_boundary = parent_boundary;
-            let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
-            {
-                txn.pending_write_completion.take()
-            } else {
-                None
-            };
-            if let Some(completion) = completion {
-                status.pending_write = Some(write_completion::PendingNestedWrite::new(
-                    command.suspend(),
-                    completion,
-                ));
-                let (rows, output) = resume_nested_write(context, status)?;
-                debug_assert!(output.is_none());
-                status.set_rows(rows)?;
-                return Ok(None);
-            }
-            drop(command);
-            match outcome {
-                Ok(Ok(())) => status.set_rows(
-                    context
-                        .responder
-                        .take_affected_rows()
-                        .expect("trigger DELETE publishes an affected-row count"),
-                )?,
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger-side DELETE response exceeded the output buffer"
-                    ));
-                }
-            }
-
-            Ok(None)
-        }),
-        TriggerStatement::For(program) => {
-            if let TriggerForSource::Numeric {
-                counter_keyword: _,
-                lower,
-                upper,
-                step,
-                reverse,
-            } = program.source
-            {
+                                context.params,
+                                relations,
+                            )?
+                        else {
+                            unreachable!("DELETE expansion returned a different statement kind");
+                        };
+                        bound
+                    }
+                    None => statement,
+                };
                 let transition = TriggerTransition {
                     definition,
                     old,
                     new: new.as_deref(),
                 };
-                // Range expressions bind outside the loop's implicit integer declaration.
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let arena = context.arena;
+                let params = context.params;
+                let boundary = context.nested_write_boundary();
+                let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
+                let mut command = txn.enter_trigger_sql(storage)?;
+                let txn = &mut *command;
+                let parent_boundary = txn.write_completion_boundary;
+                txn.write_completion_boundary =
+                    boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                        mark,
+                        command: txn.command_id(),
+                        depth: txn.trigger_depth(),
+                    });
+                let mut scratch = storage.row_work.lease(0).map_err(|error| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "nested DML selection: {}",
+                        error
+                    )
+                })?;
+                responder.clear_affected_rows();
+                let outcome = responder.without_command_complete(|responder| {
+                    delete(
+                        storage,
+                        txn,
+                        &mut scratch,
+                        &statement,
+                        DmlAuthorization::Invoker,
+                        arena,
+                        params,
+                        seq_session,
+                        responder,
+                        None,
+                        Some(&scope),
+                    )
+                });
+                txn.write_completion_boundary = parent_boundary;
+                let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+                {
+                    txn.pending_write_completion.take()
+                } else {
+                    None
+                };
+                if let Some(completion) = completion {
+                    status.pending_write = Some(write_completion::PendingNestedWrite::new(
+                        command.suspend(),
+                        completion,
+                    ));
+                    let (rows, output) = resume_nested_write(context, status)?;
+                    debug_assert!(output.is_none());
+                    status.set_rows(rows)?;
+                    return Ok(None);
+                }
+                drop(command);
+                match outcome {
+                    Ok(Ok(())) => status.set_rows(
+                        context
+                            .responder
+                            .take_affected_rows()
+                            .expect("trigger DELETE publishes an affected-row count"),
+                    )?,
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "trigger-side DELETE response exceeded the output buffer"
+                        ));
+                    }
+                }
+
+                Ok(None)
+            }),
+            TriggerStatement::For(program) => {
+                if let TriggerForSource::Numeric {
+                    counter_keyword: _,
+                    lower,
+                    upper,
+                    step,
+                    reverse,
+                } = program.source
+                {
+                    let transition = TriggerTransition {
+                        definition,
+                        old,
+                        new: new.as_deref(),
+                    };
+                    // Range expressions bind outside the loop's implicit integer declaration.
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let mut expressions = StatementExpressions::new(
+                        retained_parent,
+                        true,
+                        &mut status.expressions,
+                        &mut status.pending_query,
+                    );
+                    let lower = trigger_loop_integer(
+                        expressions.eval(context, lower, &scope)?,
+                        context.arena,
+                        "lower bound",
+                    )?;
+                    let upper = trigger_loop_integer(
+                        expressions.eval(context, upper, &scope)?,
+                        context.arena,
+                        "upper bound",
+                    )?;
+                    let step = trigger_loop_integer(
+                        expressions.eval(context, step, &scope)?,
+                        context.arena,
+                        "BY value",
+                    )?;
+                    if step <= 0 {
+                        return Err(sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "BY value of FOR loop must be greater than zero"
+                        ));
+                    }
+                    control_flow::start_numeric_loop(
+                        program,
+                        lower,
+                        upper,
+                        step,
+                        reverse,
+                        child_scope,
+                        locals,
+                        local_values,
+                        status,
+                    )
+                } else {
+                    let target = trigger_local_index(locals, program.target)?;
+                    let query_source = matches!(
+                        program.source,
+                        TriggerForSource::Query(_) | TriggerForSource::DynamicQuery(_)
+                    );
+                    let pool = std::sync::Arc::clone(&context.storage().row_work);
+                    let values = context
+                        .arena
+                        .with_remaining_region(|arena| {
+                            let host = context.host.reborrow();
+                            let mut context = TriggerExecContext {
+                                host,
+                                txn: context.txn,
+                                arena,
+                                params: context.params,
+                                responder: context.responder,
+                            };
+                            let values = match program.source {
+                                TriggerForSource::Query(query) => {
+                                    let query = match transition_relations {
+                                        Some(relations) => {
+                                            super::query::bind_materialized_relations(
+                                                query,
+                                                relations,
+                                                context.storage(),
+                                                context.txn.txid,
+                                                context.arena,
+                                            )?
+                                        }
+                                        None => query,
+                                    };
+                                    let transition = TriggerTransition {
+                                        definition,
+                                        old,
+                                        new: new.as_deref(),
+                                    };
+                                    let scope = TriggerLocalScope {
+                                        locals,
+                                        values: &local_values[..locals.len()],
+                                        found: status.found,
+                                        invocation,
+                                        transition: &transition,
+                                    };
+                                    let arena = context.arena;
+                                    let params = context.params;
+                                    let txid = context.txn.txid;
+                                    execute_procedural_query(
+                                        &mut context,
+                                        None,
+                                        |storage, sequence| {
+                                            if locals[target].ctype == ColType::Record {
+                                                materialize_trigger_for_record_query(
+                                                    storage, query, arena, arena, txid, params,
+                                                    sequence, &scope,
+                                                )
+                                            } else {
+                                                materialize_trigger_for_query(
+                                                    storage, query, arena, arena, txid, params,
+                                                    sequence, &scope,
+                                                )
+                                            }
+                                        },
+                                    )?
+                                }
+                                TriggerForSource::DynamicQuery(query) => {
+                                    let transition = TriggerTransition {
+                                        definition,
+                                        old,
+                                        new: new.as_deref(),
+                                    };
+                                    let scope = TriggerLocalScope {
+                                        locals,
+                                        values: &local_values[..locals.len()],
+                                        found: status.found,
+                                        invocation,
+                                        transition: &transition,
+                                    };
+                                    materialize_plpgsql_dynamic_for_query(
+                                        &mut context,
+                                        query,
+                                        &scope,
+                                        locals[target].ctype == ColType::Record,
+                                        &mut StatementExpressions::new(
+                                            retained_parent,
+                                            true,
+                                            &mut status.expressions,
+                                            &mut status.pending_query,
+                                        ),
+                                    )?
+                                }
+                                TriggerForSource::Array { expression, slice } => {
+                                    let transition = TriggerTransition {
+                                        definition,
+                                        old,
+                                        new: new.as_deref(),
+                                    };
+                                    let scope = TriggerLocalScope {
+                                        locals,
+                                        values: &local_values[..locals.len()],
+                                        found: status.found,
+                                        invocation,
+                                        transition: &transition,
+                                    };
+                                    let array = eval_procedural_expression(
+                                        &mut context,
+                                        expression,
+                                        &scope,
+                                        retained_parent.then_some(&mut status.pending_query),
+                                    )?;
+                                    let Datum::Array { element, raw } = array else {
+                                        if array.is_null() {
+                                            return Err(sql_err!(
+                                                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                                                "FOREACH expression must not be null"
+                                            ));
+                                        }
+                                        return Err(sql_err!(
+                                            sqlstate::DATATYPE_MISMATCH,
+                                            "FOREACH expression must yield an array"
+                                        ));
+                                    };
+                                    let shape = crate::sql::array::shape(raw)
+                                        .expect("array datum invariant");
+                                    let slice_rank =
+                                        slice.map_or(0, |slice| usize::from(slice.get()));
+                                    if slice_rank > shape.dimension_count() {
+                                        return Err(sql_err!(
+                                            sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                                            "FOREACH SLICE {} exceeds array dimensions {}",
+                                            slice_rank,
+                                            shape.dimension_count()
+                                        ));
+                                    }
+                                    let mut dimensions =
+                                        [0usize; crate::sql::array::MAX_DIMENSIONS];
+                                    let mut lower_bounds =
+                                        [0i32; crate::sql::array::MAX_DIMENSIONS];
+                                    for index in 0..slice_rank {
+                                        let source = shape.dimension_count() - slice_rank + index;
+                                        dimensions[index] = shape.dimension(source).unwrap();
+                                        lower_bounds[index] = shape.lower_bound(source).unwrap();
+                                    }
+                                    let slice_shape = crate::sql::array::Shape::new(
+                                        &dimensions[..slice_rank],
+                                        &lower_bounds[..slice_rank],
+                                    )?;
+                                    let width = if slice_rank == 0 {
+                                        1
+                                    } else {
+                                        slice_shape.element_count()
+                                    };
+                                    let values = context
+                                        .arena
+                                        .alloc_slice_with(
+                                            crate::sql::array::len(raw) / width,
+                                            |_| Datum::Null,
+                                        )
+                                        .map_err(|_| super::query::arena_full_pub())?;
+                                    let mut elements = crate::sql::array::elements(raw, element);
+                                    for value in values.iter_mut() {
+                                        if slice_rank == 0 {
+                                            *value = detached_trigger_datum(
+                                                elements.next().expect("array datum invariant"),
+                                                context.arena,
+                                            )?;
+                                        } else {
+                                            let items = context
+                                                .arena
+                                                .alloc_slice_with(width, |_| Datum::Null)
+                                                .map_err(|_| super::query::arena_full_pub())?;
+                                            for (item, source) in
+                                                items.iter_mut().zip(elements.by_ref().take(width))
+                                            {
+                                                *item = source;
+                                            }
+                                            *value = Datum::Array {
+                                                element,
+                                                raw: crate::sql::array::build_shaped(
+                                                    items,
+                                                    slice_shape,
+                                                    context.arena,
+                                                )?,
+                                            };
+                                        }
+                                    }
+                                    TriggerForRows {
+                                        values: &*values,
+                                        empty: Datum::Null,
+                                    }
+                                }
+                                TriggerForSource::Numeric { .. } => {
+                                    unreachable!("numeric loop handled above")
+                                }
+                            };
+                            loop_rows::LoopRows::capture(&pool, values)
+                        })
+                        .map_err(|_| super::query::arena_full_pub())??;
+                    control_flow::start_row_loop(
+                        context,
+                        program,
+                        values,
+                        query_source,
+                        locals,
+                        local_values,
+                        status,
+                    )
+                }
+            }
+            TriggerStatement::While(program) => {
+                if trigger_condition(
+                    context,
+                    program.condition,
+                    definition,
+                    invocation,
+                    old,
+                    new.as_deref(),
+                    locals,
+                    &local_values[..locals.len()],
+                    status.found,
+                    retained_parent.then_some(&mut status.pending_query),
+                )? {
+                    Ok(control_flow::Step::while_loop(program))
+                } else {
+                    Ok(control_flow::Step::complete())
+                }
+            }
+            TriggerStatement::Loop(block) => Ok(control_flow::Step::plain_loop(block)),
+            TriggerStatement::If(program) => {
+                let conditions = program
+                    .branches
+                    .iter()
+                    .filter(|branch| branch.condition.is_some())
+                    .count();
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
@@ -30233,394 +30586,130 @@ fn execute_trigger_step<'a>(
                 };
                 let mut expressions = StatementExpressions::new(
                     retained_parent,
-                    true,
+                    conditions > 1,
                     &mut status.expressions,
                     &mut status.pending_query,
                 );
-                let lower = trigger_loop_integer(
-                    expressions.eval(context, lower, &scope)?,
-                    context.arena,
-                    "lower bound",
-                )?;
-                let upper = trigger_loop_integer(
-                    expressions.eval(context, upper, &scope)?,
-                    context.arena,
-                    "upper bound",
-                )?;
-                let step = trigger_loop_integer(
-                    expressions.eval(context, step, &scope)?,
-                    context.arena,
-                    "BY value",
-                )?;
-                if step <= 0 {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "BY value of FOR loop must be greater than zero"
-                    ));
+                for branch in program.branches {
+                    let selected = match branch.condition {
+                        None => true,
+                        Some(condition) => match expressions.eval(context, condition, &scope)? {
+                            Datum::Bool(value) => value,
+                            Datum::Null => false,
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::DATATYPE_MISMATCH,
+                                    "IF condition must be type boolean"
+                                ));
+                            }
+                        },
+                    };
+                    if selected {
+                        return Ok(control_flow::Step::branch(branch.block));
+                    }
                 }
-                control_flow::start_numeric_loop(
-                    program,
-                    lower,
-                    upper,
-                    step,
-                    reverse,
-                    child_scope,
-                    locals,
-                    local_values,
-                    status,
-                )
-            } else {
-                let target = trigger_local_index(locals, program.target)?;
-                let query_source = matches!(
-                    program.source,
-                    TriggerForSource::Query(_) | TriggerForSource::DynamicQuery(_)
-                );
-                let pool = std::sync::Arc::clone(&context.storage().row_work);
-                let values = context
-                    .arena
-                    .with_remaining_region(|arena| {
-                        let host = context.host.reborrow();
-                        let mut context = TriggerExecContext {
-                            host,
-                            txn: context.txn,
-                            arena,
-                            params: context.params,
-                            responder: context.responder,
-                        };
-                        let values = match program.source {
-                            TriggerForSource::Query(query) => {
-                                let query = match transition_relations {
-                                    Some(relations) => super::query::bind_materialized_relations(
-                                        query,
-                                        relations,
-                                        context.storage(),
-                                        context.txn.txid,
-                                        context.arena,
-                                    )?,
-                                    None => query,
-                                };
-                                let transition = TriggerTransition {
-                                    definition,
-                                    old,
-                                    new: new.as_deref(),
-                                };
-                                let scope = TriggerLocalScope {
-                                    locals,
-                                    values: &local_values[..locals.len()],
-                                    found: status.found,
-                                    invocation,
-                                    transition: &transition,
-                                };
-                                let arena = context.arena;
-                                let params = context.params;
-                                let txid = context.txn.txid;
-                                execute_procedural_query(
-                                    &mut context,
-                                    None,
-                                    |storage, sequence| {
-                                        if locals[target].ctype == ColType::Record {
-                                            materialize_trigger_for_record_query(
-                                                storage, query, arena, arena, txid, params,
-                                                sequence, &scope,
-                                            )
-                                        } else {
-                                            materialize_trigger_for_query(
-                                                storage, query, arena, arena, txid, params,
-                                                sequence, &scope,
-                                            )
-                                        }
-                                    },
-                                )?
-                            }
-                            TriggerForSource::DynamicQuery(query) => {
-                                let transition = TriggerTransition {
-                                    definition,
-                                    old,
-                                    new: new.as_deref(),
-                                };
-                                let scope = TriggerLocalScope {
-                                    locals,
-                                    values: &local_values[..locals.len()],
-                                    found: status.found,
-                                    invocation,
-                                    transition: &transition,
-                                };
-                                materialize_plpgsql_dynamic_for_query(
-                                    &mut context,
-                                    query,
-                                    &scope,
-                                    locals[target].ctype == ColType::Record,
-                                    &mut StatementExpressions::new(
-                                        retained_parent,
-                                        true,
-                                        &mut status.expressions,
-                                        &mut status.pending_query,
-                                    ),
-                                )?
-                            }
-                            TriggerForSource::Array { expression, slice } => {
-                                let transition = TriggerTransition {
-                                    definition,
-                                    old,
-                                    new: new.as_deref(),
-                                };
-                                let scope = TriggerLocalScope {
-                                    locals,
-                                    values: &local_values[..locals.len()],
-                                    found: status.found,
-                                    invocation,
-                                    transition: &transition,
-                                };
-                                let array = eval_procedural_expression(
-                                    &mut context,
-                                    expression,
-                                    &scope,
-                                    retained_parent.then_some(&mut status.pending_query),
-                                )?;
-                                let Datum::Array { element, raw } = array else {
-                                    if array.is_null() {
-                                        return Err(sql_err!(
-                                            sqlstate::NULL_VALUE_NOT_ALLOWED,
-                                            "FOREACH expression must not be null"
-                                        ));
-                                    }
-                                    return Err(sql_err!(
-                                        sqlstate::DATATYPE_MISMATCH,
-                                        "FOREACH expression must yield an array"
-                                    ));
-                                };
-                                let shape =
-                                    crate::sql::array::shape(raw).expect("array datum invariant");
-                                let slice_rank = slice.map_or(0, |slice| usize::from(slice.get()));
-                                if slice_rank > shape.dimension_count() {
-                                    return Err(sql_err!(
-                                        sqlstate::ARRAY_SUBSCRIPT_ERROR,
-                                        "FOREACH SLICE {} exceeds array dimensions {}",
-                                        slice_rank,
-                                        shape.dimension_count()
-                                    ));
-                                }
-                                let mut dimensions = [0usize; crate::sql::array::MAX_DIMENSIONS];
-                                let mut lower_bounds = [0i32; crate::sql::array::MAX_DIMENSIONS];
-                                for index in 0..slice_rank {
-                                    let source = shape.dimension_count() - slice_rank + index;
-                                    dimensions[index] = shape.dimension(source).unwrap();
-                                    lower_bounds[index] = shape.lower_bound(source).unwrap();
-                                }
-                                let slice_shape = crate::sql::array::Shape::new(
-                                    &dimensions[..slice_rank],
-                                    &lower_bounds[..slice_rank],
-                                )?;
-                                let width = if slice_rank == 0 {
-                                    1
-                                } else {
-                                    slice_shape.element_count()
-                                };
-                                let values = context
-                                    .arena
-                                    .alloc_slice_with(crate::sql::array::len(raw) / width, |_| {
-                                        Datum::Null
-                                    })
-                                    .map_err(|_| super::query::arena_full_pub())?;
-                                let mut elements = crate::sql::array::elements(raw, element);
-                                for value in values.iter_mut() {
-                                    if slice_rank == 0 {
-                                        *value = detached_trigger_datum(
-                                            elements.next().expect("array datum invariant"),
-                                            context.arena,
-                                        )?;
-                                    } else {
-                                        let items = context
-                                            .arena
-                                            .alloc_slice_with(width, |_| Datum::Null)
-                                            .map_err(|_| super::query::arena_full_pub())?;
-                                        for (item, source) in
-                                            items.iter_mut().zip(elements.by_ref().take(width))
-                                        {
-                                            *item = source;
-                                        }
-                                        *value = Datum::Array {
-                                            element,
-                                            raw: crate::sql::array::build_shaped(
-                                                items,
-                                                slice_shape,
-                                                context.arena,
-                                            )?,
-                                        };
-                                    }
-                                }
-                                TriggerForRows {
-                                    values: &*values,
-                                    empty: Datum::Null,
-                                }
-                            }
-                            TriggerForSource::Numeric { .. } => {
-                                unreachable!("numeric loop handled above")
-                            }
-                        };
-                        loop_rows::LoopRows::capture(&pool, values)
-                    })
-                    .map_err(|_| super::query::arena_full_pub())??;
-                control_flow::start_row_loop(
-                    context,
-                    program,
-                    values,
-                    query_source,
-                    locals,
-                    local_values,
-                    status,
-                )
-            }
-        }
-        TriggerStatement::While(program) => {
-            if trigger_condition(
-                context,
-                program.condition,
-                definition,
-                invocation,
-                old,
-                new.as_deref(),
-                locals,
-                &local_values[..locals.len()],
-                status.found,
-                retained_parent.then_some(&mut status.pending_query),
-            )? {
-                Ok(control_flow::Step::while_loop(program))
-            } else {
+
                 Ok(control_flow::Step::complete())
             }
-        }
-        TriggerStatement::Loop(block) => Ok(control_flow::Step::plain_loop(block)),
-        TriggerStatement::If(program) => {
-            let conditions = program
-                .branches
-                .iter()
-                .filter(|branch| branch.condition.is_some())
-                .count();
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let mut expressions = StatementExpressions::new(
-                retained_parent,
-                conditions > 1,
-                &mut status.expressions,
-                &mut status.pending_query,
-            );
-            for branch in program.branches {
-                let selected = match branch.condition {
-                    None => true,
-                    Some(condition) => match expressions.eval(context, condition, &scope)? {
-                        Datum::Bool(value) => value,
-                        Datum::Null => false,
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "IF condition must be type boolean"
-                            ));
-                        }
-                    },
+            TriggerStatement::Case(program) => {
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
                 };
-                if selected {
-                    return Ok(control_flow::Step::branch(branch.block));
-                }
-            }
-
-            Ok(control_flow::Step::complete())
-        }
-        TriggerStatement::Case(program) => {
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let mut expressions = StatementExpressions::new(
-                retained_parent,
-                program.branches.len() + usize::from(program.operand.is_some()) > 1,
-                &mut status.expressions,
-                &mut status.pending_query,
-            );
-            let operand = program
-                .operand
-                .map(|expression| expressions.eval(context, expression, &scope))
-                .transpose()?;
-            let mut selected = None;
-            for branch in program.branches {
-                let value = expressions.eval(context, branch.when, &scope)?;
-                let matches = match operand {
-                    Some(operand) => {
-                        let catalog = crate::sql::query::storage_catalog(
-                            context.storage(),
-                            context.arena,
-                            context.txn.txid,
-                        );
-                        let collation = crate::sql::eval::resolve_comparison_collation(
-                            program.operand.expect("simple CASE operand"),
-                            branch.when,
-                            &scope,
-                            Some(&catalog),
-                        )?;
-                        !operand.is_null()
-                            && !value.is_null()
-                            && compare_datums_collated(
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let mut expressions = StatementExpressions::new(
+                    retained_parent,
+                    program.branches.len() + usize::from(program.operand.is_some()) > 1,
+                    &mut status.expressions,
+                    &mut status.pending_query,
+                );
+                let operand = program
+                    .operand
+                    .map(|expression| expressions.eval(context, expression, &scope))
+                    .transpose()?;
+                let mut selected = None;
+                for branch in program.branches {
+                    let value = expressions.eval(context, branch.when, &scope)?;
+                    let matches = match operand {
+                        Some(operand) => {
+                            let catalog = crate::sql::query::storage_catalog(
                                 context.storage(),
+                                context.arena,
                                 context.txn.txid,
-                                collation,
-                                &operand,
-                                &value,
-                            )? == core::cmp::Ordering::Equal
-                    }
-                    None => match value {
-                        Datum::Bool(value) => value,
-                        Datum::Null => false,
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "CASE condition must be type boolean"
-                            ));
+                            );
+                            let collation = crate::sql::eval::resolve_comparison_collation(
+                                program.operand.expect("simple CASE operand"),
+                                branch.when,
+                                &scope,
+                                Some(&catalog),
+                            )?;
+                            !operand.is_null()
+                                && !value.is_null()
+                                && compare_datums_collated(
+                                    context.storage(),
+                                    context.txn.txid,
+                                    collation,
+                                    &operand,
+                                    &value,
+                                )? == core::cmp::Ordering::Equal
                         }
-                    },
-                };
-                if matches {
-                    selected = Some(branch.block);
-                    break;
+                        None => match value {
+                            Datum::Bool(value) => value,
+                            Datum::Null => false,
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::DATATYPE_MISMATCH,
+                                    "CASE condition must be type boolean"
+                                ));
+                            }
+                        },
+                    };
+                    if matches {
+                        selected = Some(branch.block);
+                        break;
+                    }
                 }
-            }
-            if let Some(block) = selected {
-                return Ok(control_flow::Step::branch(block));
-            }
-            match program.otherwise {
-                TriggerCaseElse::Block(block) => Ok(control_flow::Step::branch(block)),
-                TriggerCaseElse::RaiseNotFound => {
-                    super::eval::stash_diagnostic(
-                        None,
-                        Some(StackStr::from_str("CASE statement is missing ELSE part.")),
-                    );
-                    Err(sql_err!(sqlstate::CASE_NOT_FOUND, "case not found"))
+                if let Some(block) = selected {
+                    return Ok(control_flow::Step::branch(block));
+                }
+                match program.otherwise {
+                    TriggerCaseElse::Block(block) => Ok(control_flow::Step::branch(block)),
+                    TriggerCaseElse::RaiseNotFound => {
+                        super::eval::stash_diagnostic(
+                            None,
+                            Some(StackStr::from_str("CASE statement is missing ELSE part.")),
+                        );
+                        Err(sql_err!(sqlstate::CASE_NOT_FOUND, "case not found"))
+                    }
                 }
             }
         }
     };
-    let result = match input_plan {
-        Some((site, prepared)) => super::type_input_plans::with_owner(prepared.owner, || {
-            super::type_inputs::with_source(prepared.source, site.text, prepared.bindings, execute)
-        }),
-        None => execute(),
+    let mut attempt = |context: &mut TriggerExecContext<'_, 'a, '_>,
+                       status: &mut TriggerExecutionStatus<'a>| {
+        match &input_plan {
+            Some((site, prepared)) => super::type_input_plans::with_owner(prepared.owner, || {
+                super::type_inputs::with_source(
+                    prepared.source,
+                    site.text,
+                    prepared.bindings,
+                    || execute(context, status),
+                )
+            }),
+            None => execute(context, status),
+        }
+    };
+    let result = if matches!(statement, TriggerStatement::Dml { .. }) {
+        execute_procedural_write(context, status, retained_parent, &mut attempt)
+    } else {
+        attempt(context, status)
     };
     drop(write_effects);
     drop(write_reads);
@@ -30651,6 +30740,7 @@ fn execute_trigger_step<'a>(
         // so its expressions run again instead of reading saved results.
         status.expressions.clear();
         status.pending_query = None;
+        status.write_calls = None;
     } else if write_start.is_some()
         && status.pending_write.is_none()
         && result.as_ref().is_err_and(control_flow::is_execution_wait)

@@ -3448,8 +3448,21 @@ pub(crate) fn require_node_builtin_execute<'a>(
 
 /// Checks [`require_node_builtin_execute`] for `expression` and, before it
 /// runs, for its children and built-in routine calls. Subquery bodies are
-/// checked when they run.
+/// checked when they run. Only a privilege failure is reported here: an
+/// expression whose types or routine cannot be resolved before execution
+/// reports that error when it is evaluated, in PostgreSQL's order.
 pub(crate) fn require_expression_builtin_execute<'a>(
+    expression: &Expr<'a>,
+    row: &dyn ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(), SqlError> {
+    match require_expression_builtin_execute_tree(expression, row, hooks) {
+        Err(error) if error.sqlstate == sqlstate::INSUFFICIENT_PRIVILEGE => Err(error),
+        _ => Ok(()),
+    }
+}
+
+fn require_expression_builtin_execute_tree<'a>(
     expression: &Expr<'a>,
     row: &dyn ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
@@ -3461,7 +3474,7 @@ pub(crate) fn require_expression_builtin_execute<'a>(
         return Ok(());
     }
     super::query::walk_children(expression, &mut |child| {
-        require_expression_builtin_execute(child, row, hooks)
+        require_expression_builtin_execute_tree(child, row, hooks)
     })?;
     require_node_builtin_execute(expression, row, hooks)?;
     if let Expr::Call {
@@ -4287,13 +4300,25 @@ fn eval_full_inner<'a>(
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                     || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
             {
-                params.get(index as usize - 1).copied().ok_or_else(|| {
+                let value = params.get(index as usize - 1).copied().ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_PARAMETER,
                         "there is no parameter ${}",
                         index
                     )
-                })
+                })?;
+                if source != crate::sql::ast::ParameterSource::SqlRoutineField {
+                    return Ok(value);
+                }
+                match materialize_named_composite(value, hooks, arena)? {
+                    Datum::Null => Ok(Datum::Null),
+                    Datum::Record(fields) | Datum::Composite { fields, .. } => fields
+                        .iter()
+                        .find(|field| field.name.eq_ignore_ascii_case(name))
+                        .map(|field| field.value)
+                        .ok_or(error),
+                    _ => Err(error),
+                }
             }
             Err(error) => Err(error),
         },
@@ -6070,6 +6095,19 @@ fn expression_collation<'a>(
                             )
                         })
                     }
+                    // A composite field keeps its type's default collation.
+                    super::ast::ParameterSource::SqlRoutineField => {
+                        let collatable =
+                            static_type(expression, row).is_some_and(ColType::is_collatable);
+                        DerivedCollation::implicit(
+                            if collatable {
+                                Collation::Default
+                            } else {
+                                Collation::None
+                            },
+                            collatable,
+                        )
+                    }
                     super::ast::ParameterSource::PlpgsqlCursor => None,
                 })
             }
@@ -7342,11 +7380,14 @@ fn call<'a>(
     if let Some((oid, _)) = builtin
         && let Some(catalog) = hooks.catalog
         && catalog.builtin_routine_strict(oid) == Some(true)
+        && super::catalog::builtin_callable_by_oid(oid)
+            .is_some_and(|routine| !routine.catalog.strict)
         && args.iter().any(|argument| is_null_constant(argument))
     {
-        // PostgreSQL's planner folds a call with a constant NULL input to
-        // NULL when `pg_proc` marks the function strict; execution uses the
-        // built-in's own null handling, so a later NULL still reaches it.
+        // `ALTER FUNCTION ... STRICT` made `pg_proc` mark this built-in
+        // strict: PostgreSQL's planner folds a call with a constant NULL
+        // input to NULL, while execution keeps the built-in's own null
+        // handling, so a later NULL still reaches it.
         return Ok(Datum::Null);
     }
     // Only a declared variadic handler unpacks the selected final input.

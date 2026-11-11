@@ -1169,6 +1169,19 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         let third = self.any_ident("column name")?;
+                        // `routine.parameter.field` names a field of a
+                        // composite parameter unless a relation answers.
+                        if self.routine_name == Some(name)
+                            && let Some((index, source)) = self.routine_parameter_field(column)
+                        {
+                            self.max_param = self.max_param.max(index);
+                            return self.arena_expr(Expr::RoutineParam {
+                                qualifier: Some(self.composed_qualifier(name, column)?),
+                                name: third,
+                                index,
+                                source,
+                            });
+                        }
                         return self.arena_expr(Expr::SchemaColumn {
                             schema: name,
                             table: column,
@@ -1276,6 +1289,19 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         let third = self.any_ident("column name")?;
+                        // `routine.parameter.field` names a field of a
+                        // composite parameter unless a relation answers.
+                        if self.routine_name == Some(name)
+                            && let Some((index, source)) = self.routine_parameter_field(column)
+                        {
+                            self.max_param = self.max_param.max(index);
+                            return self.arena_expr(Expr::RoutineParam {
+                                qualifier: Some(self.composed_qualifier(name, column)?),
+                                name: third,
+                                index,
+                                source,
+                            });
+                        }
                         return self.arena_expr(Expr::SchemaColumn {
                             schema: name,
                             table: column,

@@ -334,10 +334,7 @@ reaches both columns and routines, or names several tables, reports one notice
 per table or dependency kind where PostgreSQL reports one for the statement, and a routine's dependency on a row type is described as depending on the
 table. Values and columns of a view's row type need the view's column types,
 which pos3ql derives from the view's query on each use instead of storing them
-as PostgreSQL's `pg_attribute` rows do. In a SQL-language function, `o.note`
-for a composite parameter `o` fails with `42P01` (`(o).note` works): the
-reference must fall back from a column to the parameter's field in every typing
-pass, as PostgreSQL's `sql_fn_post_column_ref` does. The
+as PostgreSQL's `pg_attribute` rows do. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

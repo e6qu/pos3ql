@@ -1140,6 +1140,24 @@ impl<'a> Parser<'a> {
             .is_some_and(|routine| routine == qualifier)
             .then(|| self.routine_parameter(name))
             .flatten()
+            .or_else(|| self.routine_parameter_field(qualifier))
+    }
+
+    /// `parameter.field` in a SQL-language routine body; the qualifier names
+    /// the parameter and the reference's column name is the field.
+    pub(super) fn routine_parameter_field(
+        &self,
+        parameter: &str,
+    ) -> Option<(u32, crate::sql::ast::ParameterSource)> {
+        self.routine_parameters
+            .iter()
+            .position(|candidate| candidate.is_some_and(|candidate| candidate == parameter))
+            .map(|index| {
+                (
+                    index as u32 + 1,
+                    crate::sql::ast::ParameterSource::SqlRoutineField,
+                )
+            })
     }
 
     fn column_default_expression(&mut self) -> Result<&'a Expr<'a>, ParseError> {

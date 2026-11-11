@@ -235,6 +235,11 @@ Domains and checked inputs:
   one instance per resolved argument types and collation. Views, rules,
   `BEGIN ATOMIC` bodies, and stored defaults keep their checked inputs with the
   definition. See [plan lifetimes](architecture.md#the-request-path).
+- In a SQL function body, `o.note` reads field `note` of a composite
+  parameter `o` (also written `f.o.note` with the function's name `f`), unless
+  a table or alias `o` in the query has a column `note`, which wins as in
+  PostgreSQL. A field the parameter's type lacks fails with `42P01` (`missing
+  FROM-clause entry for table "o"`).
 - `DISCARD PLANS` drops cached routine plans for future calls; `DISCARD ALL`
   also drops prepared statements. Either returns `0A000` while such a plan is
   executing.

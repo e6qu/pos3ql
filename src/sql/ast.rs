@@ -5622,6 +5622,11 @@ pub enum AlterStatisticsAction<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParameterSource {
     SqlRoutine,
+    /// `p.f` in a SQL-language routine, where `p` names a composite
+    /// parameter: a column `f` of a FROM item `p` wins, and otherwise the
+    /// reference is field `f` (the node's `name`) of parameter `index`, as
+    /// PostgreSQL's `sql_fn_post_column_ref` resolves it.
+    SqlRoutineField,
     PlpgsqlCursor,
 }
 

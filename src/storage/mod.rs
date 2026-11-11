@@ -46938,6 +46938,20 @@ impl Storage {
             Some(actual) => actual,
             None => return false,
         };
+        // Every composite type, including a relation's row type, coerces to
+        // `record` (and its arrays to `record[]`) without a pg_cast row.
+        match (actual.ctype, expected_oid) {
+            (ColType::Composite(_) | ColType::Record, oid::RECORD) => return true,
+            (ColType::Array(element), oid::RECORD_ARRAY)
+                if matches!(
+                    element.to_coltype(),
+                    ColType::Composite(_) | ColType::Record
+                ) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
         let expected = match self.routine_result_for_oid(expected_oid, txid) {
             Some(expected) => expected,
             None => return false,

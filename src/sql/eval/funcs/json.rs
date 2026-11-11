@@ -1702,9 +1702,63 @@ pub(crate) fn dispatch<'a>(
                     ));
                 }
                 let v = eval_full(args[0], arena, params, row, hooks)?;
+                let pretty = if name == "row_to_json" && args.len() == 2 {
+                    match eval_full(args[1], arena, params, row, hooks)? {
+                        Datum::Bool(pretty) => pretty,
+                        Datum::Null => return Ok(Datum::Null),
+                        other => return Err(type_mismatch("pretty_bool must be boolean", &other)),
+                    }
+                } else if args.len() == 2 {
+                    return Err(arity_err(name, args.len()));
+                } else {
+                    false
+                };
                 let jsonb = name == "to_jsonb";
                 let mut buf = ArenaString::new(arena);
-                json::write_datum_json(&v, jsonb, &mut buf).map_err(|_| arena_full())?;
+                if v.is_null() {
+                    // `row_to_json(NULL)` and `to_json(NULL)` are SQL NULL.
+                    return Ok(Datum::Null);
+                }
+                // Named composites (including relation rows) are read through
+                // the catalog, so their fields keep their names and types.
+                write_sql_json_argument(args[0], v, arena, row, hooks, &mut buf)?;
+                if pretty {
+                    // PostgreSQL puts each top-level field on its own line.
+                    let compact = buf.as_str();
+                    let mut spread = ArenaString::new(arena);
+                    let mut depth = 0usize;
+                    let mut quoted = false;
+                    let mut escaped = false;
+                    for character in compact.chars() {
+                        spread.write_char(character).map_err(|_| arena_full())?;
+                        if quoted {
+                            match (escaped, character) {
+                                (true, _) => escaped = false,
+                                (false, '\\') => escaped = true,
+                                (false, '"') => quoted = false,
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        match character {
+                            '"' => quoted = true,
+                            '{' | '[' => depth += 1,
+                            '}' | ']' => depth -= 1,
+                            ',' if depth == 1 => {
+                                spread.write_str("\n ").map_err(|_| arena_full())?
+                            }
+                            _ => {}
+                        }
+                    }
+                    buf = spread;
+                }
+                if jsonb {
+                    let value = json::parse(buf.as_str(), arena)?;
+                    return Ok(Datum::Json {
+                        text: json_to_text(&value, arena)?,
+                        jsonb: true,
+                    });
+                }
                 let text = buf.as_str();
                 Ok(Datum::Json { text, jsonb })
             }

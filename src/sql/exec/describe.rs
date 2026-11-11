@@ -5099,6 +5099,13 @@ pub fn infer_type_res(
             {
                 match source {
                     crate::sql::ast::ParameterSource::SqlRoutine => routine_parameter_type(*index),
+                    // A field the parameter's type lacks leaves the column
+                    // reference unresolved, as in PostgreSQL.
+                    crate::sql::ast::ParameterSource::SqlRoutineField => {
+                        let meta = record_field_metadata(&Expr::Param(*index), name, columns)
+                            .map_err(|_| error)?;
+                        Some((meta.type_oid, meta.ctype.typlen()))
+                    }
                     crate::sql::ast::ParameterSource::PlpgsqlCursor => {
                         bound_parameter_type_oid(*index)
                             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))

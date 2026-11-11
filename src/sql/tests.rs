@@ -15,6 +15,7 @@ mod builtin_routine_comments;
 mod canonical_sequences;
 mod catalog_identity_lookup;
 mod client_catalog;
+mod composite_parameter_fields;
 mod constraint_index_identity;
 mod cursor_execution;
 mod deparsed_expressions;

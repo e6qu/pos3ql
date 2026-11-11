@@ -14734,7 +14734,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_routine_codec_keeps_database_routine_and_fixed_attributes() {
+    fn builtin_routine_codec_keeps_database_routine_and_attributes() {
         use crate::storage::{BuiltinRoutineAttributes, BuiltinRoutineOid, RoutineVolatility};
         let lower = BuiltinRoutineOid::parse(870).unwrap();
         let mut attributes = BuiltinRoutineAttributes::catalog(lower).attributes;
@@ -14760,9 +14760,21 @@ mod tests {
         assert_eq!(decoded.materialize(lower), Some(image));
         let mut invalid = [0; 256];
         invalid[..payload.len()].copy_from_slice(payload);
-        // Strictness is fixed for built-ins; a flipped flag is corruption.
-        invalid[8] = 0;
+        // Flags are bytes 0 or 1; any other value is corruption.
+        invalid[8] = 2;
         assert!(decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len()]).is_none());
+        invalid[8] = 0;
+        let Some(WalOp::SetBuiltinRoutine { image: changed, .. }) =
+            decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len()])
+        else {
+            panic!("a changed strictness is a valid built-in routine row");
+        };
+        assert_eq!(
+            changed
+                .materialize(lower)
+                .map(|image| image.attributes.strict),
+            Some(false)
+        );
         invalid[..payload.len()].copy_from_slice(payload);
         invalid[4..8].copy_from_slice(&16_384i32.to_le_bytes());
         assert!(decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len()]).is_none());

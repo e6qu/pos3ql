@@ -7829,7 +7829,14 @@ impl<'a> Parser<'a> {
                             .1 = *value;
                         continue;
                     }
-                    return Err(self.err_here("multiple assignments to the same column"));
+                    return Err(ParseError {
+                        message: stack_format!(
+                            PARSE_MESSAGE_BYTES,
+                            "multiple assignments to same column \"{}\"",
+                            name
+                        ),
+                        ..self.err_here("")
+                    });
                 }
                 self.push(&mut assignments, (*name, *value))?;
             }

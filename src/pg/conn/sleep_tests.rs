@@ -258,10 +258,22 @@ fn statement_timeout_and_cancellation_end_a_sleep() {
         sleeper.parked_wait(),
         Some(crate::sql::StatementWait::Timer)
     );
+    let before_cancel = (sleeper.send.len(), sleeper.recv.len());
     assert!(sleeper.cancel_parked(&mut fixture.engine));
+    let after_cancel = (
+        sleeper.send.len(),
+        sleeper.recv.len(),
+        sleeper.parked_wait(),
+    );
+    let response = received(&mut sleeper, &mut sleeper_client);
     assert_eq!(
-        sqlstates(&received(&mut sleeper, &mut sleeper_client)),
-        ["57014"]
+        sqlstates(&response),
+        ["57014"],
+        "response [{}]; send/recv before cancel {before_cancel:?}; after {after_cancel:?}; \
+         queued after read {:?}; later [{}]",
+        describe(&response),
+        (sleeper.send.len(), sleeper.overflow_bytes()),
+        describe(&received(&mut sleeper, &mut sleeper_client))
     );
     send(
         &mut sleeper,

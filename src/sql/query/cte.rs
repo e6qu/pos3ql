@@ -5306,7 +5306,7 @@ fn subst_select_items<'a>(
             if (old && !transition.old_available) || (!old && !transition.new_available) {
                 return Err(sql_err!(
                     sqlstate::INVALID_OBJECT_DEFINITION,
-                    "ON {} rule cannot reference {}",
+                    "ON {} rule cannot use {}",
                     if old { "INSERT" } else { "DELETE" },
                     if old { "OLD" } else { "NEW" }
                 ));
@@ -6823,7 +6823,7 @@ fn subst_expr<'a>(
                 if (old && !transition.old_available) || (!old && !transition.new_available) {
                     return Err(sql_err!(
                         sqlstate::INVALID_OBJECT_DEFINITION,
-                        "ON {} rule cannot reference {}",
+                        "ON {} rule cannot use {}",
                         if old { "INSERT" } else { "DELETE" },
                         if old { "OLD" } else { "NEW" }
                     ));

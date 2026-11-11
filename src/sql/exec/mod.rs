@@ -1191,7 +1191,7 @@ fn create_table_kind(
     {
         return sql_fail(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "unlogged partitioned tables are not supported"
+            "partitioned tables cannot be unlogged"
         ));
     }
     if statement.persistence != crate::sql::ast::RelationPersistence::Temporary
@@ -34539,7 +34539,7 @@ pub fn drop_trigger(
         }
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
-            "trigger \"{}\" for relation \"{}\" does not exist",
+            "trigger \"{}\" for table \"{}\" does not exist",
             trigger.name,
             trigger.table.name
         ));
@@ -34656,7 +34656,7 @@ pub fn alter_trigger(
         }
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
-            "trigger \"{}\" for relation \"{}\" does not exist",
+            "trigger \"{}\" for table \"{}\" does not exist",
             identity.name,
             identity.table.name
         ));
@@ -44484,7 +44484,7 @@ impl ColTypeResolver for RuleConditionColumns<'_> {
             if old && !self.old || new && !self.new {
                 return Err(sql_err!(
                     sqlstate::INVALID_OBJECT_DEFINITION,
-                    "ON {} rule cannot reference {}",
+                    "ON {} rule cannot use {}",
                     if old { "INSERT" } else { "DELETE" },
                     if old { "OLD" } else { "NEW" }
                 ));
@@ -44762,15 +44762,15 @@ fn stored_rule_definition(
                     sqlstate::INVALID_OBJECT_DEFINITION,
                     "rule condition may only reference OLD or NEW"
                 ));
-            } else if old && matches!(event, crate::storage::RewriteEvent::Insert) {
+            } else if old && matches!(event, crate::storage::RewriteEvent::Insert)
+                || new && matches!(event, crate::storage::RewriteEvent::Delete)
+            {
+                // A condition sees OLD and NEW as range-table entries, so
+                // PostgreSQL reports the missing one as an invalid reference.
                 invalid = Some(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "ON INSERT rule cannot reference OLD"
-                ));
-            } else if new && matches!(event, crate::storage::RewriteEvent::Delete) {
-                invalid = Some(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "ON DELETE rule cannot reference NEW"
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    if old { "old" } else { "new" }
                 ));
             } else if condition_columns.names[..condition_columns.count]
                 .iter()
@@ -45636,7 +45636,7 @@ pub fn comment(
             {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
-                    "trigger \"{}\" for relation \"{}\" does not exist",
+                    "trigger \"{}\" for table \"{}\" does not exist",
                     identity.name,
                     identity.table.name
                 ));
@@ -60462,7 +60462,7 @@ fn set_clustered_index(
             let definition = storage.table_def(table, txn.txid);
             return Err(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,
-                "index \"{}\" is not an index for table \"{}\"",
+                "\"{}\" is not an index for table \"{}\"",
                 index.name_for(txn.txid).as_str(),
                 definition.name.as_str()
             ));
@@ -70079,7 +70079,7 @@ pub(crate) fn update<'a>(
         if targets[..i].contains(&column) {
             return sql_fail(sql_err!(
                 sqlstate::SYNTAX_ERROR,
-                "multiple assignments to the same column \"{}\"",
+                "multiple assignments to same column \"{}\"",
                 name
             ));
         }
@@ -72473,7 +72473,7 @@ fn attach_constraint_using_index<Definition0: crate::storage::DefinitionBacking>
     if storage.index_table_slot_to(slot, txn.txid) != Some(table_index) {
         return Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
-            "index \"{}\" is not an index for table \"{}\"",
+            "\"{}\" is not an index for table \"{}\"",
             index.name_for(txn.txid).as_str(),
             definition.name.as_str()
         ));
@@ -73451,7 +73451,7 @@ fn alter_table_trigger_enabled(
     if !matched && let crate::sql::ast::TriggerEnableTarget::Name(name) = trigger_target {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
-            "trigger \"{}\" for relation \"{}\" does not exist",
+            "trigger \"{}\" for table \"{}\" does not exist",
             name,
             relation
         ));
@@ -76441,11 +76441,14 @@ fn alter_table_relation(
                     ));
                 }
                 if new_def.columns[i].default.is_generated() {
-                    return sql_fail(sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "column \"{}\" of relation \"{}\" is a generated column; use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead",
-                        column,
-                        statement.table.name
+                    return sql_fail(crate::sql::error_position::with_hint(
+                        sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "column \"{}\" of relation \"{}\" is a generated column",
+                            column,
+                            statement.table.name
+                        ),
+                        "Use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead.",
                     ));
                 }
                 new_def.columns[i].default = crate::storage::ColumnDefault::NONE;
@@ -78462,7 +78465,7 @@ fn validate_replica_identity_index<Definition0: crate::storage::DefinitionBackin
     if storage.index_table_slot_to(slot, txid) != Some(table_index) {
         return Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
-            "index \"{}\" is not an index for table \"{}\"",
+            "\"{}\" is not an index for table \"{}\"",
             index.name_for(txid).as_str(),
             definition.name.as_str()
         ));

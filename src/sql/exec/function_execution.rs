@@ -87,6 +87,7 @@ impl ReturnBinding {
         execution: &execution_frame::ExecutionFrame<'_, 'a>,
         flow: Option<TriggerFlow<'a>>,
         result_type: ColType,
+        (storage, txid): (&crate::storage::Storage, u32),
         arena: &'a Arena,
     ) -> Result<FunctionOutput<'a>, SqlError> {
         let output = match (self, flow) {
@@ -145,7 +146,13 @@ impl ReturnBinding {
         }?;
         match output {
             FunctionOutput::Scalar(value) => Ok(FunctionOutput::Scalar(cast_to(
-                detach_routine_datum(value, arena)?,
+                super::plpgsql_conversion_input(
+                    detach_routine_datum(value, arena)?,
+                    storage.routine_type_oid(result_type, None, txid),
+                    storage,
+                    txid,
+                    arena,
+                )?,
                 result_type,
                 arena,
             )?)),
@@ -439,9 +446,13 @@ impl SuspendedFunctionState {
         match result {
             Ok(flow) => {
                 let output = control_flow::at_routine_exit(context, invocation, || {
-                    self.binding
-                        .returns
-                        .finish(&execution, flow, self.binding.result_type, arena)
+                    self.binding.returns.finish(
+                        &execution,
+                        flow,
+                        self.binding.result_type,
+                        (context.storage(), context.txn.txid),
+                        arena,
+                    )
                 });
                 self.binding.environment.complete();
                 Ok(output)
@@ -774,6 +785,7 @@ pub(crate) fn execute<'a>(
                 &execution,
                 flow,
                 routine.kind.function_result().ok_or_else(changed)?,
+                (context.storage(), context.txn.txid),
                 arena,
             )
         }),

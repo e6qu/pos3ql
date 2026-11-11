@@ -17705,6 +17705,7 @@ enum TriggerStatement<'a> {
     Dml {
         source: &'a str,
         statement: TriggerDml<'a>,
+        into: Option<PlpgsqlInto<'a>>,
     },
     If(TriggerIf<'a>),
     Case(TriggerCase<'a>),
@@ -18340,6 +18341,12 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
             self.outer.lookup(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.lookup(None, name)
+        } else if qualifier.is_some()
+            && self.row.col_type(qualifier, name).is_none()
+            && self.outer.procedural_variable(qualifier, name).is_some()
+        {
+            // A parameter qualified by its function's name (`f.a`).
+            self.outer.lookup(qualifier, name)
         } else if self.row.col_type(qualifier, name).is_none()
             || super::eval::column_precedes_variable(Some(self.outer), qualifier, name)?
         {
@@ -18430,6 +18437,12 @@ where
             self.outer.lookup(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.lookup(None, name)
+        } else if qualifier.is_some()
+            && self.row.col_type(qualifier, name).is_none()
+            && self.outer.procedural_variable(qualifier, name).is_some()
+        {
+            // A parameter qualified by its function's name (`f.a`).
+            self.outer.lookup(qualifier, name)
         } else if self.row.col_type(qualifier, name).is_none()
             || super::eval::column_precedes_variable(Some(self.outer), qualifier, name)?
         {
@@ -19119,22 +19132,45 @@ fn parse_trigger_select_into<'a>(
     let Some(into_at) = trigger_top_level_keyword(statement, "into", arena)? else {
         return Ok(None);
     };
+    let (source, into) = take_plpgsql_into(statement, into_at, arena)?;
+    let query = parse_plpgsql_query(source, statement, arena)?;
+    Ok(Some(TriggerSelectInto {
+        query,
+        targets: into.targets,
+        strict: into.strict,
+    }))
+}
+
+/// The `INTO [STRICT] target, ...` clause of a static PL/pgSQL statement.
+#[derive(Clone, Copy)]
+struct PlpgsqlInto<'a> {
+    targets: &'a [SqlName],
+    strict: bool,
+}
+
+/// Splits the INTO clause starting at `into_at` out of `statement`. PostgreSQL
+/// blanks the clause, so positions in the query it runs and reports match
+/// the statement as written.
+fn take_plpgsql_into<'a>(
+    statement: &'a str,
+    into_at: usize,
+    arena: &'a Arena,
+) -> Result<(&'a str, PlpgsqlInto<'a>), SqlError> {
     let after_into = &statement[into_at + 4..];
     let mut targets = [SqlName::EMPTY; MAX_COLUMNS];
     let (count, strict, end) = arena
         .with_remaining_region(|scratch| {
             use crate::sql::lexer::{Lexer, Tok};
             let mut lexer = Lexer::new(after_into, scratch);
-            let mut token = lexer.next_token().map_err(|error| {
-                super::parse_error_to_sql(&super::parser::ParseError::lexical(error, after_into))
-            })?;
+            fn next<'l>(lexer: &mut Lexer<'l>, source: &str) -> Result<Tok<'l>, SqlError> {
+                lexer.next_token().map_err(|error| {
+                    super::parse_error_to_sql(&super::parser::ParseError::lexical(error, source))
+                })
+            }
+            let mut token = next(&mut lexer, after_into)?;
             let strict = matches!(token, Tok::Ident(word) if word.eq_ignore_ascii_case("strict"));
             if strict {
-                token = lexer.next_token().map_err(|error| {
-                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
-                        error, after_into,
-                    ))
-                })?;
+                token = next(&mut lexer, after_into)?;
             }
             let mut count = 0usize;
             loop {
@@ -19152,25 +19188,15 @@ fn parse_trigger_select_into<'a>(
                 };
                 count += 1;
                 let end = lexer.token_end();
-                token = lexer.next_token().map_err(|error| {
-                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
-                        error, after_into,
-                    ))
-                })?;
+                token = next(&mut lexer, after_into)?;
                 if !matches!(token, Tok::Op(",")) {
                     return Ok((count, strict, end));
                 }
-                token = lexer.next_token().map_err(|error| {
-                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
-                        error, after_into,
-                    ))
-                })?;
+                token = next(&mut lexer, after_into)?;
             }
         })
         .map_err(|_| super::query::arena_full_pub())??;
     let tail = &after_into[end..];
-    // PostgreSQL blanks the INTO clause, so positions in the query it runs
-    // and reports match the statement as written.
     let mut source = StackStr::<ROUTINE_SQL_MAX>::new();
     use core::fmt::Write as _;
     let _ = source.write_str(&statement[..into_at]);
@@ -19183,27 +19209,28 @@ fn parse_trigger_select_into<'a>(
     if source.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "trigger SELECT INTO exceeds the routine SQL limit"
+            "PL/pgSQL INTO statement exceeds the routine SQL limit"
         ));
     }
     let source = arena.alloc_str(source.as_str()).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "trigger SELECT INTO exceeds the statement arena"
+            "PL/pgSQL INTO statement exceeds the statement arena"
         )
     })?;
-    let query = parse_plpgsql_query(source, statement, arena)?;
     let targets = arena.alloc_slice_copy(&targets[..count]).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "trigger SELECT INTO targets exceed the statement arena"
+            "PL/pgSQL INTO targets exceed the statement arena"
         )
     })?;
-    Ok(Some(TriggerSelectInto {
-        query,
-        targets: &*targets,
-        strict,
-    }))
+    Ok((
+        source,
+        PlpgsqlInto {
+            targets: &*targets,
+            strict,
+        },
+    ))
 }
 
 fn split_trigger_arguments<'a>(
@@ -19776,15 +19803,9 @@ fn parse_trigger_dml<'a>(source: &'a str, arena: &'a Arena) -> Result<TriggerDml
         return Err(unsupported_trigger_body());
     }
     match statement {
-        Some(Stmt::Insert(statement)) if statement.returning.is_empty() => {
-            Ok(TriggerDml::Insert(statement))
-        }
-        Some(Stmt::Update(statement)) if statement.returning.is_empty() => {
-            Ok(TriggerDml::Update(statement))
-        }
-        Some(Stmt::Delete(statement)) if statement.returning.is_empty() => {
-            Ok(TriggerDml::Delete(statement))
-        }
+        Some(Stmt::Insert(statement)) => Ok(TriggerDml::Insert(statement)),
+        Some(Stmt::Update(statement)) => Ok(TriggerDml::Update(statement)),
+        Some(Stmt::Delete(statement)) => Ok(TriggerDml::Delete(statement)),
         _ => Err(unsupported_trigger_body()),
     }
 }
@@ -20508,15 +20529,31 @@ fn parse_trigger_statement<'a>(
         || strip_trigger_keyword(segment, "update").is_some()
         || strip_trigger_keyword(segment, "delete").is_some()
     {
-        super::plpgsql_inputs::record(
+        // `INSERT INTO` names the target; a later top-level INTO receives
+        // the RETURNING row.
+        let skipped = if strip_trigger_keyword(segment, "insert").is_some() {
+            trigger_top_level_keyword(segment, "into", arena)?.map_or(0, |at| at + 4)
+        } else {
+            0
+        };
+        let (source, into) = match trigger_top_level_keyword(&segment[skipped..], "into", arena)? {
+            Some(at) => {
+                let (source, into) = take_plpgsql_into(segment, skipped + at, arena)?;
+                (source, Some(into))
+            }
+            None => (segment, None),
+        };
+        super::plpgsql_inputs::record_rewritten(
             super::plpgsql_inputs::Kind::Statement,
-            segment.as_ptr() as usize,
+            source.as_ptr() as usize,
+            source,
             segment,
-            segment,
+            arena,
         )?;
         return Ok(TriggerStatement::Dml {
-            source: segment,
-            statement: parse_trigger_dml(segment, arena)?,
+            source,
+            statement: parse_trigger_dml(source, arena)?,
+            into,
         });
     }
     if [
@@ -22407,6 +22444,22 @@ impl<'a> TriggerLocalScope<'_, 'a> {
             .rposition(|local| local.name.as_str() == name)
     }
 
+    /// PostgreSQL labels a function's parameters with its name, so `f.a` in
+    /// function `f` is its parameter `a`: such a qualifier is dropped.
+    fn parameter_qualifier<'q>(&self, qualifier: Option<&'q str>, name: &str) -> Option<&'q str> {
+        match qualifier {
+            Some(qualifier)
+                if qualifier == self.invocation.routine_name
+                    && self.locals.iter().any(|local| {
+                        local.scope == PlpgsqlScope::Invocation && local.name.as_str() == name
+                    }) =>
+            {
+                None
+            }
+            qualifier => qualifier,
+        }
+    }
+
     fn cursor_locals(
         &self,
         storage: &Storage,
@@ -22485,6 +22538,7 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<super::guc::VariableConflict> {
+        let qualifier = self.parameter_qualifier(qualifier, name);
         let answers = match qualifier {
             None => self.variable(name).is_some(),
             Some("old" | "new") => false,
@@ -22500,6 +22554,7 @@ where
     }
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        let qualifier = self.parameter_qualifier(qualifier, name);
         if matches!(qualifier, Some("old" | "new")) {
             return None;
         }
@@ -22509,6 +22564,7 @@ where
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
+        let qualifier = self.parameter_qualifier(qualifier, name);
         if matches!(qualifier, Some("old" | "new")) {
             return self.transition.lookup(qualifier, name);
         }
@@ -22547,6 +22603,7 @@ where
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        let qualifier = self.parameter_qualifier(qualifier, name);
         if matches!(qualifier, Some("old" | "new")) {
             return self.transition.col_type(qualifier, name);
         }
@@ -22569,6 +22626,7 @@ where
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        let qualifier = self.parameter_qualifier(qualifier, name);
         if matches!(qualifier, Some("old" | "new")) {
             return self.transition.collation(qualifier, name);
         }
@@ -23311,21 +23369,37 @@ fn in_simple_expression<T>(
 /// The error PostgreSQL's planner raises folding `expression`'s constant
 /// subexpressions (literals combined by operators and casts), in the order
 /// it folds them, if any.
-fn constant_fold_error(expression: &Expr<'_>, arena: &Arena) -> Option<SqlError> {
-    fn constant(expression: &Expr<'_>) -> bool {
-        match expression {
-            Expr::Null
-            | Expr::Bool(_)
-            | Expr::Int(_)
-            | Expr::Float(_)
-            | Expr::NumericLit(_)
-            | Expr::Str(_) => true,
-            Expr::Unary { operand, .. } | Expr::Cast { operand, .. } => constant(operand),
-            Expr::Binary { left, right, .. } => constant(left) && constant(right),
-            _ => false,
-        }
+/// Whether PostgreSQL's planner folds `expression` to a constant: literals
+/// combined by operators and casts.
+fn folds_to_constant(expression: &Expr<'_>) -> bool {
+    match expression {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_) => true,
+        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } => folds_to_constant(operand),
+        Expr::Binary { left, right, .. } => folds_to_constant(left) && folds_to_constant(right),
+        _ => false,
     }
-    if constant(expression) {
+}
+
+/// The value a PL/pgSQL assignment stores: a subscripted target's
+/// assigned element, otherwise the whole expression.
+fn assigned_value<'e, 'a>(expression: &'e Expr<'a>) -> &'e Expr<'a> {
+    match expression {
+        Expr::Call {
+            name: "__jsonb_subscript_set" | "__array_subscript_set",
+            args: [_, value, ..],
+            ..
+        } => value,
+        _ => expression,
+    }
+}
+
+fn constant_fold_error(expression: &Expr<'_>, arena: &Arena) -> Option<SqlError> {
+    if folds_to_constant(expression) {
         if matches!(
             expression,
             Expr::Unary { .. } | Expr::Binary { .. } | Expr::Cast { .. }
@@ -26355,7 +26429,13 @@ fn coerce_plpgsql_local<'a>(
             coerce_plpgsql_table_rowtype(slot, value, storage, txid, arena, sequences)?
         }
         Some(PlpgsqlRecordShape::Dynamic) | None => coerce_routine_argument(
-            value,
+            plpgsql_conversion_input(
+                value,
+                storage.routine_type_oid(local.ctype, local.user_type, txid),
+                storage,
+                txid,
+                arena,
+            )?,
             crate::storage::RoutineArgumentDef {
                 name: local.name,
                 ctype: local.ctype,
@@ -26376,6 +26456,39 @@ fn coerce_plpgsql_local<'a>(
         ));
     }
     Ok(value)
+}
+
+/// PL/pgSQL converts a value to a declared type (`exec_cast_value`) with an
+/// assignment cast when one exists and otherwise through text: the value's
+/// output is read by the target type's input routine, so `true` assigned to
+/// an integer fails as `invalid input syntax for type integer: "t"`.
+pub(crate) fn plpgsql_conversion_input<'a>(
+    value: Datum<'a>,
+    target_oid: Option<i32>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let Some(target_oid) = target_oid else {
+        return Ok(value);
+    };
+    if value.is_null()
+        || crate::sql::catalog::can_coerce_assignment(storage, txid, value.type_oid(), target_oid)
+    {
+        return Ok(value);
+    }
+    let text = match value {
+        Datum::Bool(value) => {
+            if value {
+                "t"
+            } else {
+                "f"
+            }
+        }
+        Datum::Bpchar(text) => text,
+        value => crate::sql::eval::cast_to_text(value, arena)?,
+    };
+    Ok(Datum::Text(text))
 }
 
 fn coerce_plpgsql_table_rowtype<'a>(
@@ -27030,7 +27143,7 @@ fn prepare_static_plpgsql_statement<'a>(
                 context.arena,
             )?,
         },
-        TriggerStatement::Dml { .. } => {
+        TriggerStatement::Dml { into, .. } => {
             let restored = restore_plpgsql_statement(
                 site.text,
                 prepared.bindings,
@@ -27052,6 +27165,7 @@ fn prepare_static_plpgsql_statement<'a>(
             TriggerStatement::Dml {
                 source: site.text,
                 statement,
+                into,
             }
         }
         statement => statement,
@@ -27217,14 +27331,24 @@ fn execute_trigger_step_in<'a>(
         }
         let (rows, output) = resume_nested_write(context, status)?;
         match statement {
-            TriggerStatement::Dml { .. } => {
-                if output.is_some() {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "static write has unexpected returned values"
-                    ));
-                }
-                status.set_rows(rows)?;
+            TriggerStatement::Dml {
+                statement, into, ..
+            } => {
+                let returns = match statement {
+                    TriggerDml::Insert(statement) => !statement.returning.is_empty(),
+                    TriggerDml::Update(statement) => !statement.returning.is_empty(),
+                    TriggerDml::Delete(statement) => !statement.returning.is_empty(),
+                };
+                finish_resumed_static_write(
+                    context,
+                    locals,
+                    local_values,
+                    into,
+                    returns,
+                    rows,
+                    output,
+                    status,
+                )?;
             }
             TriggerStatement::DynamicQuery(_) => {
                 if output.is_some() {
@@ -27610,23 +27734,47 @@ fn execute_trigger_step_in<'a>(
                 invocation,
                 transition: &transition,
             };
-            let value = eval_procedural_expression(context, assignment.expression, &scope, None)?;
-            if let Expr::Str(literal) = assignment.expression
+            if folds_to_constant(assigned_value(assignment.expression))
                 && let Some(statement) = crate::sql::error_context::innermost_assignment()
                 && locals.iter().any(|local| local.name == assignment.name)
             {
-                // PostgreSQL converts a literal to the target's type while
-                // analysing the assignment, so the failure points at it.
+                // PostgreSQL folds a constant's conversion to the target's
+                // (or a subscripted target's element) type while planning
+                // the assignment, so the failure has the assignment's
+                // context and points at a literal.
+                // A subscripted target converts its element while the
+                // expression runs; a plain one when the value is stored.
+                let value = if core::ptr::eq(
+                    assigned_value(assignment.expression),
+                    assignment.expression,
+                ) {
+                    eval_procedural_expression(context, assignment.expression, &scope, None)?
+                } else {
+                    in_procedural_query(
+                        statement,
+                        crate::sql::error_context::QueryMode::Assignment,
+                        false,
+                        || eval_procedural_expression(context, assignment.expression, &scope, None),
+                    )?
+                };
                 in_procedural_query(
                     statement,
                     crate::sql::error_context::QueryMode::Assignment,
-                    true,
+                    false,
                     || {
                         assign_trigger_local(context, locals, local_values, assignment.name, value)
-                            .map_err(|error| crate::sql::error_position::at_subject(error, literal))
+                            .map_err(|error| match assignment.expression {
+                                Expr::Str(literal) => {
+                                    crate::sql::error_position::at_subject(error, literal)
+                                }
+                                _ => error,
+                            })
                     },
                 )?;
-            } else if locals.iter().any(|local| local.name == assignment.name) {
+                return Ok(None);
+            }
+            let value = eval_procedural_expression(context, assignment.expression, &scope, None)?;
+            if locals.iter().any(|local| local.name == assignment.name) {
                 assign_trigger_local(context, locals, local_values, assignment.name, value)?;
             } else if TriggerStatusVariable::parse(assignment.name.as_str()).is_some() {
                 status.found = match cast_to(value, ColType::Bool, context.arena)? {
@@ -28164,14 +28312,6 @@ fn execute_trigger_step_in<'a>(
                             )
                         },
                         &mut |values| {
-                            if !record_target && values.len() != statement.targets.len() {
-                                return Err(sql_err!(
-                                    sqlstate::DATATYPE_MISMATCH,
-                                    "query returned {} columns but SELECT INTO expects {}",
-                                    values.len(),
-                                    statement.targets.len()
-                                ));
-                            }
                             if record_target && values.len() != record_width {
                                 return Err(sql_err!(
                                     sqlstate::INTERNAL_ERROR,
@@ -28198,8 +28338,13 @@ fn execute_trigger_step_in<'a>(
                                         .map_err(|_| super::query::arena_full_pub())?;
                                     selected[0] = Datum::Record(&*fields);
                                 } else {
-                                    for (index, value) in values.iter().copied().enumerate() {
-                                        selected[index] = detached_trigger_datum(value, arena)?;
+                                    // Extra columns are ignored and missing
+                                    // ones leave their targets NULL.
+                                    for (slot, value) in selected[..statement.targets.len()]
+                                        .iter_mut()
+                                        .zip(values.iter().copied())
+                                    {
+                                        *slot = detached_trigger_datum(value, arena)?;
                                     }
                                 }
                                 found = true;
@@ -28227,19 +28372,9 @@ fn execute_trigger_step_in<'a>(
             crate::sql::error_context::outside_query(|| {
                 if statement.strict {
                     match row_count {
-                        0 => {
-                            return Err(sql_err!(
-                                sqlstate::NO_DATA_FOUND,
-                                "query returned no rows"
-                            ));
-                        }
+                        0 => return Err(no_rows_returned()),
                         1 => {}
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::TOO_MANY_ROWS,
-                                "query returned more than one row"
-                            ));
-                        }
+                        _ => return Err(too_many_rows_returned()),
                     }
                 }
                 for (index, _) in targets[..statement.targets.len()].iter().enumerate() {
@@ -28403,14 +28538,6 @@ fn execute_trigger_step_in<'a>(
                     Ok(())
                 };
                 let mut capture = |values: &[Datum]| {
-                    if !record_target && values.len() != statement.targets.len() {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "query returned {} columns but EXECUTE INTO expects {}",
-                            values.len(),
-                            statement.targets.len()
-                        ));
-                    }
                     if record_target && record_width != 0 && values.len() != record_width {
                         return Err(sql_err!(
                             sqlstate::INTERNAL_ERROR,
@@ -28438,8 +28565,13 @@ fn execute_trigger_step_in<'a>(
                                 .map_err(|_| super::query::arena_full_pub())?;
                             selected[0] = Datum::Record(&*fields);
                         } else {
-                            for (index, value) in values.iter().copied().enumerate() {
-                                selected[index] = detached_trigger_datum(value, arena)?;
+                            // Extra columns are ignored and missing ones
+                            // leave their targets NULL.
+                            for (slot, value) in selected[..statement.targets.len()]
+                                .iter_mut()
+                                .zip(values.iter().copied())
+                            {
+                                *slot = detached_trigger_datum(value, arena)?;
                             }
                         }
                         found = true;
@@ -29010,6 +29142,7 @@ fn execute_trigger_step_in<'a>(
         }
         TriggerStatement::Dml {
             statement: TriggerDml::Insert(statement),
+            into,
             ..
         } => execute_trigger_statement(|| {
             let statement = match transition_relations {
@@ -29087,6 +29220,9 @@ fn execute_trigger_step_in<'a>(
                 Some(_) => Some(snapshot_trigger_dml_scope(&scope, context.arena)?),
                 None => None,
             };
+            let returns = !statement.returning.is_empty();
+            let mut returning =
+                StaticReturning::new(context, locals, into, Stmt::Insert(statement))?;
             let arena = context.arena;
             let params = context.params;
             let boundary = context.nested_write_boundary();
@@ -29103,6 +29239,11 @@ fn execute_trigger_step_in<'a>(
                 });
             responder.clear_affected_rows();
             let outcome = responder.without_command_complete(|responder| {
+                let mut capture =
+                    |_: &Storage,
+                     _: u32,
+                     _: &dyn crate::sql::eval::SequenceAccess,
+                     values: &[Datum<'_>]| { returning.capture(values, arena) };
                 insert(
                     storage,
                     txn,
@@ -29113,7 +29254,7 @@ fn execute_trigger_step_in<'a>(
                     params,
                     seq_session,
                     responder,
-                    None,
+                    returns.then_some(&mut capture as &mut super::ReturningCapture<'_>),
                     Some(&scope),
                     transition_relations,
                     conflict_scope,
@@ -29133,23 +29274,49 @@ fn execute_trigger_step_in<'a>(
                 None
             };
             if let Some(completion) = completion {
-                status.pending_write = Some(write_completion::PendingNestedWrite::new(
-                    command.suspend(),
-                    completion,
-                ));
+                let mut pending =
+                    write_completion::PendingNestedWrite::new(command.suspend(), completion);
+                if into.is_some() && returns {
+                    let returned = returning.rows;
+                    pending.save_output(
+                        Some(returning.values(context.arena)?),
+                        returned,
+                        &context.storage().row_work,
+                    )?;
+                }
+                status.pending_write = Some(pending);
                 let (rows, output) = resume_nested_write(context, status)?;
-                debug_assert!(output.is_none());
-                status.set_rows(rows)?;
+                finish_resumed_static_write(
+                    context,
+                    locals,
+                    local_values,
+                    into,
+                    returns,
+                    rows,
+                    output,
+                    status,
+                )?;
                 return Ok(None);
             }
             drop(command);
             match outcome {
-                Ok(Ok(())) => status.set_rows(
-                    context
+                Ok(Ok(())) => {
+                    let rows = context
                         .responder
                         .take_affected_rows()
-                        .expect("trigger INSERT publishes an affected-row count"),
-                )?,
+                        .expect("trigger INSERT publishes an affected-row count");
+                    let selected = returning.values(context.arena)?;
+                    finish_static_returning(
+                        context,
+                        locals,
+                        local_values,
+                        into,
+                        returns,
+                        selected,
+                        rows,
+                        status,
+                    )?;
+                }
                 Ok(Err(error)) => return Err(error),
                 Err(_) => {
                     return Err(sql_err!(
@@ -29163,6 +29330,7 @@ fn execute_trigger_step_in<'a>(
         }),
         TriggerStatement::Dml {
             statement: TriggerDml::Update(statement),
+            into,
             ..
         } => execute_trigger_statement(|| {
             let statement = match transition_relations {
@@ -29204,6 +29372,9 @@ fn execute_trigger_step_in<'a>(
                 invocation,
                 transition: &transition,
             };
+            let returns = !statement.returning.is_empty();
+            let mut returning =
+                StaticReturning::new(context, locals, into, Stmt::Update(statement))?;
             let arena = context.arena;
             let params = context.params;
             let boundary = context.nested_write_boundary();
@@ -29226,6 +29397,11 @@ fn execute_trigger_step_in<'a>(
             })?;
             responder.clear_affected_rows();
             let outcome = responder.without_command_complete(|responder| {
+                let mut capture =
+                    |_: &Storage,
+                     _: u32,
+                     _: &dyn crate::sql::eval::SequenceAccess,
+                     values: &[Datum<'_>]| { returning.capture(values, arena) };
                 update(
                     storage,
                     txn,
@@ -29237,7 +29413,7 @@ fn execute_trigger_step_in<'a>(
                     params,
                     seq_session,
                     responder,
-                    None,
+                    returns.then_some(&mut capture as &mut super::ReturningCapture<'_>),
                     Some(&scope),
                 )
             });
@@ -29249,23 +29425,49 @@ fn execute_trigger_step_in<'a>(
                 None
             };
             if let Some(completion) = completion {
-                status.pending_write = Some(write_completion::PendingNestedWrite::new(
-                    command.suspend(),
-                    completion,
-                ));
+                let mut pending =
+                    write_completion::PendingNestedWrite::new(command.suspend(), completion);
+                if into.is_some() && returns {
+                    let returned = returning.rows;
+                    pending.save_output(
+                        Some(returning.values(context.arena)?),
+                        returned,
+                        &context.storage().row_work,
+                    )?;
+                }
+                status.pending_write = Some(pending);
                 let (rows, output) = resume_nested_write(context, status)?;
-                debug_assert!(output.is_none());
-                status.set_rows(rows)?;
+                finish_resumed_static_write(
+                    context,
+                    locals,
+                    local_values,
+                    into,
+                    returns,
+                    rows,
+                    output,
+                    status,
+                )?;
                 return Ok(None);
             }
             drop(command);
             match outcome {
-                Ok(Ok(())) => status.set_rows(
-                    context
+                Ok(Ok(())) => {
+                    let rows = context
                         .responder
                         .take_affected_rows()
-                        .expect("trigger UPDATE publishes an affected-row count"),
-                )?,
+                        .expect("trigger UPDATE publishes an affected-row count");
+                    let selected = returning.values(context.arena)?;
+                    finish_static_returning(
+                        context,
+                        locals,
+                        local_values,
+                        into,
+                        returns,
+                        selected,
+                        rows,
+                        status,
+                    )?;
+                }
                 Ok(Err(error)) => return Err(error),
                 Err(_) => {
                     return Err(sql_err!(
@@ -29279,6 +29481,7 @@ fn execute_trigger_step_in<'a>(
         }),
         TriggerStatement::Dml {
             statement: TriggerDml::Delete(statement),
+            into,
             ..
         } => execute_trigger_statement(|| {
             let statement = match transition_relations {
@@ -29320,6 +29523,9 @@ fn execute_trigger_step_in<'a>(
                 invocation,
                 transition: &transition,
             };
+            let returns = !statement.returning.is_empty();
+            let mut returning =
+                StaticReturning::new(context, locals, into, Stmt::Delete(statement))?;
             let arena = context.arena;
             let params = context.params;
             let boundary = context.nested_write_boundary();
@@ -29342,6 +29548,11 @@ fn execute_trigger_step_in<'a>(
             })?;
             responder.clear_affected_rows();
             let outcome = responder.without_command_complete(|responder| {
+                let mut capture =
+                    |_: &Storage,
+                     _: u32,
+                     _: &dyn crate::sql::eval::SequenceAccess,
+                     values: &[Datum<'_>]| { returning.capture(values, arena) };
                 delete(
                     storage,
                     txn,
@@ -29352,7 +29563,7 @@ fn execute_trigger_step_in<'a>(
                     params,
                     seq_session,
                     responder,
-                    None,
+                    returns.then_some(&mut capture as &mut super::ReturningCapture<'_>),
                     Some(&scope),
                 )
             });
@@ -29364,23 +29575,49 @@ fn execute_trigger_step_in<'a>(
                 None
             };
             if let Some(completion) = completion {
-                status.pending_write = Some(write_completion::PendingNestedWrite::new(
-                    command.suspend(),
-                    completion,
-                ));
+                let mut pending =
+                    write_completion::PendingNestedWrite::new(command.suspend(), completion);
+                if into.is_some() && returns {
+                    let returned = returning.rows;
+                    pending.save_output(
+                        Some(returning.values(context.arena)?),
+                        returned,
+                        &context.storage().row_work,
+                    )?;
+                }
+                status.pending_write = Some(pending);
                 let (rows, output) = resume_nested_write(context, status)?;
-                debug_assert!(output.is_none());
-                status.set_rows(rows)?;
+                finish_resumed_static_write(
+                    context,
+                    locals,
+                    local_values,
+                    into,
+                    returns,
+                    rows,
+                    output,
+                    status,
+                )?;
                 return Ok(None);
             }
             drop(command);
             match outcome {
-                Ok(Ok(())) => status.set_rows(
-                    context
+                Ok(Ok(())) => {
+                    let rows = context
                         .responder
                         .take_affected_rows()
-                        .expect("trigger DELETE publishes an affected-row count"),
-                )?,
+                        .expect("trigger DELETE publishes an affected-row count");
+                    let selected = returning.values(context.arena)?;
+                    finish_static_returning(
+                        context,
+                        locals,
+                        local_values,
+                        into,
+                        returns,
+                        selected,
+                        rows,
+                        status,
+                    )?;
+                }
                 Ok(Err(error)) => return Err(error),
                 Err(_) => {
                     return Err(sql_err!(
@@ -30099,27 +30336,250 @@ fn finish_dynamic_into<'a>(
         ));
     }
     status.set_row_count(rows)?;
-    if statement.strict {
-        match rows {
-            0 => return Err(sql_err!(sqlstate::NO_DATA_FOUND, "query returned no rows")),
-            1 => {}
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::TOO_MANY_ROWS,
-                    "query returned more than one row"
-                ));
+    crate::sql::error_context::outside_query(|| {
+        if statement.strict {
+            match rows {
+                0 => return Err(no_rows_returned()),
+                1 => {}
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::TOO_MANY_ROWS,
+                        "query returned more than one row"
+                    ));
+                }
             }
         }
+        for (target, value) in statement
+            .targets
+            .iter()
+            .copied()
+            .zip(selected.iter().copied())
+        {
+            assign_trigger_local(context, locals, local_values, target, value)?;
+        }
+        Ok(())
+    })
+}
+
+/// The RETURNING rows of a static PL/pgSQL data change: the first row,
+/// kept for its INTO targets, and how many rows there were.
+struct StaticReturning<'a> {
+    into: Option<PlpgsqlInto<'a>>,
+    /// Field names and types when a single record variable receives the row.
+    record: Option<&'a [(&'a str, i32)]>,
+    selected: [Datum<'a>; MAX_COLUMNS],
+    rows: u64,
+}
+
+impl<'a> StaticReturning<'a> {
+    fn new(
+        context: &TriggerExecContext<'_, 'a, '_>,
+        locals: &[TriggerLocalDecl],
+        into: Option<PlpgsqlInto<'a>>,
+        statement: Stmt<'a>,
+    ) -> Result<Self, SqlError> {
+        let mut record = None;
+        if let Some(PlpgsqlInto {
+            targets: [target], ..
+        }) = into
+            && matches!(
+                locals[trigger_local_index(locals, *target)?].ctype,
+                ColType::Record | ColType::Composite(_)
+            )
+        {
+            let arena = context.arena;
+            let statement = arena
+                .alloc(statement)
+                .map_err(|_| super::query::arena_full_pub())?;
+            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let width = describe_data_modification_columns(
+                context.storage(),
+                statement,
+                arena,
+                context.txn.txid,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Sql,
+            )?;
+            let fields = arena
+                .alloc_slice_with(width, |index| ("", columns[index].type_oid))
+                .map_err(|_| super::query::arena_full_pub())?;
+            for (field, column) in fields.iter_mut().zip(&columns[..width]) {
+                field.0 = arena
+                    .alloc_str(column.name)
+                    .map_err(|_| super::query::arena_full_pub())?;
+            }
+            record = Some(&*fields);
+        }
+        Ok(Self {
+            into,
+            record,
+            selected: [Datum::Null; MAX_COLUMNS],
+            rows: 0,
+        })
     }
-    for (target, value) in statement
-        .targets
-        .iter()
-        .copied()
-        .zip(selected.iter().copied())
-    {
+
+    fn capture(&mut self, values: &[Datum<'_>], arena: &'a Arena) -> Result<(), SqlError> {
+        if self.rows == 0 && self.into.is_some() {
+            match self.record {
+                Some(fields) => {
+                    let row = arena
+                        .alloc_slice_with(fields.len(), |index| RecordField {
+                            name: fields[index].0,
+                            type_oid: fields[index].1,
+                            value: Datum::Null,
+                        })
+                        .map_err(|_| super::query::arena_full_pub())?;
+                    for (field, value) in row.iter_mut().zip(values) {
+                        field.value = detached_trigger_datum(*value, arena)?;
+                    }
+                    self.selected[0] = Datum::Record(row);
+                }
+                None => {
+                    for (slot, value) in self.selected.iter_mut().zip(values) {
+                        *slot = detached_trigger_datum(*value, arena)?;
+                    }
+                }
+            }
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// The values to assign: the first row, or NULLs (a record of NULL
+    /// fields) when there was none.
+    fn values(&mut self, arena: &'a Arena) -> Result<&[Datum<'a>], SqlError> {
+        let Some(into) = self.into else {
+            return Ok(&[]);
+        };
+        if self.rows == 0
+            && let Some(fields) = self.record
+        {
+            let row = arena
+                .alloc_slice_with(fields.len(), |index| RecordField {
+                    name: fields[index].0,
+                    type_oid: fields[index].1,
+                    value: Datum::Null,
+                })
+                .map_err(|_| super::query::arena_full_pub())?;
+            self.selected[0] = Datum::Record(row);
+        }
+        Ok(&self.selected[..into.targets.len()])
+    }
+}
+
+/// PostgreSQL's handling of a static data change's result
+/// (`exec_stmt_execsql`): RETURNING rows need INTO, INTO needs RETURNING,
+/// and INTO takes exactly one row (none is allowed without STRICT).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "INTO assignment needs the statement's variables and diagnostics"
+)]
+fn finish_static_returning<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    locals: &[TriggerLocalDecl],
+    local_values: &mut [Datum<'a>],
+    into: Option<PlpgsqlInto<'a>>,
+    returns: bool,
+    selected: &[Datum<'a>],
+    rows: u64,
+    status: &mut TriggerExecutionStatus<'a>,
+) -> Result<(), SqlError> {
+    status.set_rows(rows)?;
+    // Checking the result and storing it happen after the query, outside
+    // its context.
+    crate::sql::error_context::outside_query(|| {
+        store_static_returning(context, locals, local_values, into, returns, selected, rows)
+    })
+}
+
+fn store_static_returning<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    locals: &[TriggerLocalDecl],
+    local_values: &mut [Datum<'a>],
+    into: Option<PlpgsqlInto<'a>>,
+    returns: bool,
+    selected: &[Datum<'a>],
+    rows: u64,
+) -> Result<(), SqlError> {
+    let into = match (into, returns) {
+        (None, false) => return Ok(()),
+        (None, true) => {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "query has no destination for result data"
+            ));
+        }
+        (Some(_), false) => {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "INTO used with a command that cannot return data"
+            ));
+        }
+        (Some(into), true) => into,
+    };
+    match rows {
+        0 if into.strict => return Err(no_rows_returned()),
+        0 | 1 => {}
+        _ => return Err(too_many_rows_returned()),
+    }
+    for (target, value) in into.targets.iter().copied().zip(selected.iter().copied()) {
         assign_trigger_local(context, locals, local_values, target, value)?;
     }
     Ok(())
+}
+
+/// [`finish_static_returning`] once a waiting data change has completed,
+/// from the RETURNING values saved before it waited.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "INTO assignment needs the statement's variables and diagnostics"
+)]
+fn finish_resumed_static_write<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    locals: &[TriggerLocalDecl],
+    local_values: &mut [Datum<'a>],
+    into: Option<PlpgsqlInto<'a>>,
+    returns: bool,
+    rows: u64,
+    output: Option<write_completion::NestedWriteOutput>,
+    status: &mut TriggerExecutionStatus<'a>,
+) -> Result<(), SqlError> {
+    let selected = match output {
+        None if into.is_none() || !returns => &[][..],
+        Some(write_completion::NestedWriteOutput::Rows {
+            values,
+            rows: returned,
+        }) if returned == rows => values.decode(context.arena)?,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "nested write lost its returned values"
+            ));
+        }
+    };
+    finish_static_returning(
+        context,
+        locals,
+        local_values,
+        into,
+        returns,
+        selected,
+        rows,
+        status,
+    )
+}
+
+/// PL/pgSQL's `STRICT` error for an empty result.
+fn no_rows_returned() -> SqlError {
+    sql_err!(sqlstate::NO_DATA_FOUND, "query returned no rows")
+}
+
+/// PL/pgSQL's error for a second row where INTO takes one.
+fn too_many_rows_returned() -> SqlError {
+    crate::sql::error_position::with_hint(
+        sql_err!(sqlstate::TOO_MANY_ROWS, "query returned more than one row"),
+        "Make sure the query returns a single row, or use LIMIT 1.",
+    )
 }
 
 fn resume_nested_write(
@@ -37147,6 +37607,42 @@ pub(crate) fn resolve_routine_declaration(
     })
 }
 
+/// [`super::query::check_routine_scalar_result`] for a SQL function whose
+/// declared scalar result `CREATE FUNCTION` checks.
+fn check_sql_scalar_result<'a>(
+    program: &super::query::RoutineFunctionProgram<'a>,
+    result: crate::storage::RoutineResult,
+    contract: super::query::RoutineResultContract<'_>,
+    name: &str,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let super::query::RoutineResultContract::Returns(declared) = contract else {
+        return Ok(());
+    };
+    if matches!(
+        result.ctype,
+        ColType::Void | ColType::Record | ColType::Composite(_)
+    ) {
+        return Ok(());
+    }
+    let Some(declared_oid) = storage.routine_type_oid(result.ctype, result.user_type, txid) else {
+        return Ok(());
+    };
+    let frame = crate::sql::error_context::SqlFunctionValidationFrame { name };
+    crate::sql::error_context::within(&frame, || {
+        super::query::check_routine_scalar_result(
+            program,
+            declared_oid,
+            declared,
+            storage,
+            txid,
+            arena,
+        )
+    })
+}
+
 pub(crate) struct ValidatedRoutineBody {
     dependencies: crate::storage::StoredQueryDependencies,
     creation_path: StackStr<128>,
@@ -37270,7 +37766,7 @@ pub(crate) fn validate_routine_body(
                         .iter()
                         .any(|argument| argument.polymorphic_type().is_some())
                     {
-                        crate::sql::error_position::with_analysis(|| {
+                        crate::sql::error_position::with_analysis_in(body_text, || {
                             super::query::analyse_routine_program(
                                 &program, storage, txn.txid, arena,
                             )
@@ -37284,6 +37780,15 @@ pub(crate) fn validate_routine_body(
                     )?;
                     creation_path = StackStr::from_str(raw_path.as_str());
                 }
+                check_sql_scalar_result(
+                    &program,
+                    result,
+                    sql_result,
+                    routine.name.name,
+                    storage,
+                    txn.txid,
+                    arena,
+                )?;
             }
         }
         crate::storage::RoutineKind::SetFunction { .. }
@@ -37349,6 +37854,17 @@ pub(crate) fn validate_routine_body(
                         &program, storage, txn.txid, path, arena,
                     )?;
                     creation_path = StackStr::from_str(raw_path.as_str());
+                }
+                if let crate::storage::RoutineKind::SetFunction { result } = kind {
+                    check_sql_scalar_result(
+                        &program,
+                        result,
+                        sql_result,
+                        routine.name.name,
+                        storage,
+                        txn.txid,
+                        arena,
+                    )?;
                 }
             }
         }
@@ -77295,7 +77811,9 @@ fn prepare_insert_select_casts<'a>(
 /// PostgreSQL's analysis of `INSERT ... VALUES` lists against the target
 /// columns, positioned at the list, expression or target column at fault.
 fn check_insert_values_shape(statement: &Insert<'_>, n_targets: usize) -> Result<(), SqlError> {
-    let Some(first) = statement.rows.first() else {
+    // `DEFAULT VALUES` is the one empty row; a view's rewrite can name its
+    // target columns.
+    let Some(first) = statement.rows.first().filter(|row| !row.is_empty()) else {
         return Ok(());
     };
     // PostgreSQL checks each list against the targets after comparing its
@@ -77321,7 +77839,10 @@ fn check_insert_values_shape(statement: &Insert<'_>, n_targets: usize) -> Result
 
 /// The written expression of output column `index` of `select`, through a
 /// set operation's first branch; None for an expanded `*`.
-fn select_output_expression<'a>(select: &'a Select<'a>, index: usize) -> Option<&'a Expr<'a>> {
+pub(crate) fn select_output_expression<'a>(
+    select: &'a Select<'a>,
+    index: usize,
+) -> Option<&'a Expr<'a>> {
     let mut select = select;
     while let Some(body) = select.set_body {
         let mut tree = body;

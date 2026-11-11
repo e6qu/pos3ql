@@ -46137,16 +46137,21 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
         ["0"]
     );
 
+    // As in PostgreSQL, RETURNING without INTO is accepted when the function
+    // is created and fails when the statement has run.
     let rejected = run_with(
         &mut engine,
         &mut budget,
         "CREATE FUNCTION reject_trigger_returning() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN INSERT INTO trigger_body_audit VALUES (1, 1) RETURNING id; RETURN NEW; END'",
+           'BEGIN INSERT INTO trigger_body_audit VALUES (1, 1) RETURNING id; RETURN NEW; END';
+         CREATE TRIGGER reject_trigger_returning BEFORE INSERT ON trigger_body_target
+           FOR EACH ROW EXECUTE FUNCTION reject_trigger_returning();
+         INSERT INTO trigger_body_target (id, value) VALUES (3, 1);",
     );
+    let text = String::from_utf8_lossy(&rejected);
     assert!(
-        String::from_utf8_lossy(&rejected).contains("0A000"),
-        "{}",
-        String::from_utf8_lossy(&rejected)
+        text.contains("C42601") && text.contains("query has no destination for result data"),
+        "{text}"
     );
 }
 

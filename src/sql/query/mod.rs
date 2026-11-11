@@ -7283,7 +7283,9 @@ pub(crate) fn analyse_routine_statement<'a>(
         .resolve_relation(target.schema, target.name, txid)
         .is_some()
     {
-        return Ok(());
+        // Target columns and the values assigned to them are analysed with
+        // the statement.
+        return validate_dml_assignment_casts(statement, storage, txid, arena, None);
     }
     let error = match target.schema {
         Some(schema) => sql_err!(
@@ -7329,6 +7331,62 @@ pub(crate) fn analyse_routine_program<'a>(
         }
         _ => Ok(()),
     }
+}
+
+/// PostgreSQL's `check_sql_fn_retval` at `CREATE FUNCTION` for a scalar
+/// result: the final query returns exactly one column, of a type with an
+/// assignment cast to the declared one (an untyped literal resolves to text).
+pub(crate) fn check_routine_scalar_result<'a>(
+    program: &RoutineFunctionProgram<'a>,
+    declared_oid: i32,
+    declared: &str,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let mut types = [0; crate::sql::exec::MAX_PROJ];
+    let count = match program.result {
+        RoutineFunctionResult::Query(RoutineQuery::Select(select)) => {
+            let mut count = 0;
+            visit_projection_types(select, storage, txid, arena, None, &mut |source, _| {
+                if let Some(slot) = types.get_mut(count) {
+                    *slot = source;
+                }
+                count += 1;
+                Ok(())
+            })?;
+            count
+        }
+        RoutineFunctionResult::Query(RoutineQuery::Set(query)) => {
+            let mut columns =
+                [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
+            setops::describe_set_body(
+                storage,
+                query.body,
+                txid,
+                &mut columns,
+                arena,
+                Some(&mut types),
+                crate::sql::exec::DescriptionTarget::Sql,
+                None,
+            )?
+        }
+        _ => return Ok(()),
+    };
+    if count != 1 {
+        return Err(routine_result_width_mismatch(declared, true, count, 1));
+    }
+    let source = if types[0] == super::types::oid::UNKNOWN {
+        ColType::Text.oid()
+    } else {
+        types[0]
+    };
+    if super::catalog::can_coerce_assignment(storage, txid, source, declared_oid) {
+        return Ok(());
+    }
+    let actual = super::catalog::format_type_name(storage, txid, source)?;
+    let detail = crate::stack_format!(300, "Actual return type is {}.", actual.as_str());
+    Err(routine_result_mismatch(declared, detail.as_str()))
 }
 
 /// PostgreSQL resolves an operator between a typed value and an
@@ -7446,6 +7504,18 @@ fn check_key_types<'a>(
         if let SelectItem::Expr { expression, .. } = item {
             check_literal_operands(expression, scope, arena)?;
         }
+    }
+    for expression in statement
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .chain(statement.where_clause)
+        .chain(statement.having)
+    {
+        subquery::check_subquery_literals(expression, Some(scope), storage, txid, arena)?;
     }
     for expression in statement
         .where_clause
@@ -10236,6 +10306,21 @@ pub(crate) fn constant_select_resumable<'a>(
     }
     if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
+    }
+    for expression in statement
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .chain(statement.where_clause)
+    {
+        if let Err(error) =
+            subquery::check_subquery_literals(expression, None, storage, txid, arena)
+        {
+            return sql_fail(error);
+        }
     }
     // A window function needs rows to compute over, and this path has no scan
     // to give it. A FROM-less SELECT is exactly one row, though, so it can be

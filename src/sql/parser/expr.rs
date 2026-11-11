@@ -715,7 +715,7 @@ impl<'a> Parser<'a> {
                         .alloc(select)
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                     self.parenthesized_primary = Some(source_position_at);
-                    return self.arena_expr(Expr::Subquery(boxed));
+                    return self.arena_expr_at(Expr::Subquery(boxed), source_position_at);
                 }
                 let inner = self.expression(0)?;
                 // A parenthesized comma list is either an OVERLAPS period pair

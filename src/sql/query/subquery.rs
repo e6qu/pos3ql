@@ -711,6 +711,103 @@ fn collect_subqueries<'a>(
     walk_children(expression, &mut |child| collect_subqueries(child, out))
 }
 
+/// PostgreSQL analyses each subquery level against its own FROM schema, so a
+/// constant compared with a subquery's column converts to the column's type
+/// before any row is read (`SELECT (SELECT a FROM t WHERE a = 'q')` fails on
+/// an empty `t`).
+pub(super) fn check_subquery_literals<'a>(
+    expression: &'a Expr<'a>,
+    outer: Option<&QueryScope<'a>>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let mut nodes = ArenaList::new(arena);
+    collect_subqueries(expression, &mut nodes)?;
+    for node in nodes.as_slice() {
+        let select = match node {
+            Expr::Subquery(select) | Expr::ArraySubquery(select) | Expr::Exists(select) => select,
+            Expr::RowSubquery { select, .. }
+            | Expr::InSubquery { select, .. }
+            | Expr::QuantifiedSubquery { select, .. } => select,
+            _ => continue,
+        };
+        check_select_literals(select, outer, storage, txid, arena)?;
+    }
+    Ok(())
+}
+
+fn check_select_literals<'a>(
+    select: &'a Select<'a>,
+    outer: Option<&QueryScope<'a>>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    if let Some(tree) = select.set_body {
+        fn leaves<'t>(
+            tree: &'t SetTree<'t>,
+            visit: &mut dyn FnMut(&'t Select<'t>) -> Result<(), SqlError>,
+        ) -> Result<(), SqlError> {
+            match tree {
+                SetTree::Select(select) => visit(select),
+                SetTree::Op { left, right, .. } => {
+                    leaves(left, visit)?;
+                    leaves(right, visit)
+                }
+            }
+        }
+        return leaves(tree, &mut |leaf| {
+            check_select_literals(leaf, outer, storage, txid, arena)
+        });
+    }
+    let Some(from) = select.from.as_ref() else {
+        for expression in select
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::Expr { expression, .. } => Some(*expression),
+                _ => None,
+            })
+            .chain(select.where_clause)
+        {
+            check_subquery_literals(expression, outer, storage, txid, arena)?;
+        }
+        return Ok(());
+    };
+    // A FROM clause that does not resolve is reported by the query's own
+    // analysis when it runs, in PostgreSQL's order.
+    let outer_columns = outer.map(super::ScopeSchema);
+    let Ok(scope) = crate::sql::error_position::preserving_pending(|| {
+        QueryScope::resolve_schema(
+            storage,
+            from,
+            txid,
+            arena,
+            outer_columns
+                .as_ref()
+                .map(|columns| columns as &dyn ColumnLookup<'_>),
+        )
+    }) else {
+        return Ok(());
+    };
+    let expressions = select
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .chain(select.where_clause)
+        .chain(select.having)
+        .chain(from.joins.iter().filter_map(|join| join.on));
+    for expression in expressions {
+        super::check_literal_operands(expression, &scope, arena)?;
+        check_subquery_literals(expression, Some(&scope), storage, txid, arena)?;
+    }
+    Ok(())
+}
+
 /// Selects the already-classified correlated nodes that occur inside one
 /// expression. Executors use this to evaluate WHERE's correlated subqueries
 /// before the select-list ones, so rows rejected by ordinary join predicates
@@ -2734,6 +2831,58 @@ pub(crate) fn subquery_expression_type(
     let (select, array) = match expression {
         Expr::Subquery(select) => (select, false),
         Expr::ArraySubquery(select) => (select, true),
+        // One column of a multiple-column assignment's sub-SELECT.
+        Expr::RecordFieldIndex {
+            base: Expr::RowSubquery { select, .. },
+            index,
+        } => {
+            if select.set_body.is_some() {
+                let mut type_oid = None;
+                let mut column = 0;
+                super::visit_projection_types(
+                    select,
+                    storage,
+                    txid,
+                    arena,
+                    Some(outer),
+                    &mut |source, _| {
+                        if column == usize::from(*index) {
+                            type_oid = Some(source);
+                        }
+                        column += 1;
+                        Ok(())
+                    },
+                )?;
+                return Ok(type_oid);
+            }
+            let Some(SelectItem::Expr { expression, .. }) = select.items.get(usize::from(*index))
+            else {
+                return Ok(None);
+            };
+            let scope = select
+                .from
+                .as_ref()
+                .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, Some(outer)))
+                .transpose()?;
+            let columns = SubqueryColumns {
+                scope: scope.as_ref(),
+                outer: Some(outer),
+                catalog: crate::sql::exec::CatalogCols {
+                    definition: None,
+                    alias: None,
+                    output_aliases: &[],
+                    storage,
+                    txid,
+                    arena,
+                },
+            };
+            let type_oid = crate::sql::exec::infer_routine_argument_oid(expression, &columns)?;
+            return Ok(Some(if type_oid == crate::sql::types::oid::UNKNOWN {
+                ColType::Text.oid()
+            } else {
+                type_oid
+            }));
+        }
         _ => return Ok(None),
     };
     if select.set_body.is_some() {

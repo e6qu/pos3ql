@@ -1066,7 +1066,12 @@ pub(crate) fn dispatch<'a>(
                         "jsonb subscript does not support slices"
                     ));
                 }
-                let value = eval_full(args[1], arena, params, row, hooks)?;
+                let value = enum_element_input(
+                    base,
+                    eval_full(args[1], arena, params, row, hooks)?,
+                    hooks,
+                    arena,
+                )?;
                 crate::sql::array_assignment::assign(base, &subscripts[..kinds.len()], value, arena)
             }
             "__jsonb_subscript_set" => {
@@ -1102,7 +1107,12 @@ pub(crate) fn dispatch<'a>(
                             )?)?,
                         );
                     }
-                    let value = eval_full(args[1], arena, params, row, hooks)?;
+                    let value = enum_element_input(
+                        base,
+                        eval_full(args[1], arena, params, row, hooks)?,
+                        hooks,
+                        arena,
+                    )?;
                     return crate::sql::array_assignment::assign(
                         base,
                         &subscripts[..args.len() - 2],
@@ -2144,4 +2154,24 @@ fn assignment_subscript(value: Datum<'_>) -> Result<i32, SqlError> {
     };
     i32::try_from(value)
         .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range"))
+}
+
+/// An untyped literal assigned into an enum array's element reads as a label
+/// of that enum; analysis has rejected every typed non-enum value.
+fn enum_element_input<'a>(
+    base: Datum<'a>,
+    value: Datum<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match (base, value) {
+        (
+            Datum::Array {
+                element: crate::sql::types::ArrElem::Enum(Some(slot)),
+                ..
+            },
+            Datum::Text(_),
+        ) => super::super::coerce_enum_value(slot, value, hooks, arena),
+        _ => Ok(value),
+    }
 }

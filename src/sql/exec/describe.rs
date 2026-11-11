@@ -5377,6 +5377,12 @@ fn infer_type_unpositioned(
             .subquery_type(expression)?
             .unwrap_or((oid::UNKNOWN, -2)),
         Expr::RowSubquery { .. } => (oid::UNKNOWN, -2),
+        Expr::RecordFieldIndex {
+            base: Expr::RowSubquery { .. },
+            ..
+        } => columns
+            .subquery_type(expression)?
+            .unwrap_or((oid::UNKNOWN, -2)),
         Expr::RecordFieldIndex { base, index } => {
             record_field_index_metadata(base, usize::from(*index), columns)?
                 .map_or((oid::UNKNOWN, -2), |metadata| {
@@ -6297,6 +6303,22 @@ fn infer_type_unpositioned(
                 }
             }
             "xmlagg" => of(ColType::Xml),
+            "json_agg"
+            | "json_agg_strict"
+            | "json_object_agg"
+            | "json_object_agg_strict"
+            | "json_object_agg_unique"
+            | "json_object_agg_unique_strict"
+            | "__json_arrayagg_absent_json"
+            | "__json_arrayagg_null_json" => of(ColType::Json),
+            "jsonb_agg"
+            | "jsonb_agg_strict"
+            | "jsonb_object_agg"
+            | "jsonb_object_agg_strict"
+            | "jsonb_object_agg_unique"
+            | "jsonb_object_agg_unique_strict"
+            | "__json_arrayagg_absent_jsonb"
+            | "__json_arrayagg_null_jsonb" => of(ColType::Jsonb),
             "array_agg" => {
                 // Element type from the argument; the result is elem[].
                 let elem = args

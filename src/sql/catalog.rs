@@ -4300,6 +4300,99 @@ pub(crate) fn builtin_nullif_input_oids(left: i32, right: i32) -> Result<(i32, i
     }
 }
 
+/// PostgreSQL's `can_coerce_type` in assignment context for one concrete
+/// (non-polymorphic) target: whether a value of `source` can be stored in
+/// `target`. An UNKNOWN source is a literal that the target's input reads.
+pub(crate) fn can_coerce_assignment(
+    storage: &Storage,
+    txid: u32,
+    source: i32,
+    target: i32,
+) -> bool {
+    use super::types::oid;
+    if source == target || source == oid::UNKNOWN {
+        return true;
+    }
+    let composite = |type_oid: i32| {
+        storage
+            .routine_result_for_oid(type_oid, txid)
+            .is_some_and(|result| matches!(result.ctype, ColType::Composite(_)))
+    };
+    let composite_array = |type_oid: i32| {
+        storage
+            .routine_result_for_oid(type_oid, txid)
+            .is_some_and(|result| {
+                matches!(result.ctype, ColType::Array(element)
+                    if matches!(element.to_coltype(), ColType::Composite(_)))
+            })
+    };
+    if (source == oid::RECORD && composite(target))
+        || (target == oid::RECORD && composite(source))
+        || (source == oid::RECORD_ARRAY && composite_array(target))
+        || (target == oid::RECORD_ARRAY && composite_array(source))
+    {
+        return true;
+    }
+    coercion_pathway_exists(storage, txid, source, target)
+}
+
+/// PostgreSQL's `find_coercion_pathway` in assignment context, reduced to
+/// whether a path exists. Domains coerce through their base types; a declared
+/// cast decides alone; otherwise arrays coerce element-wise, and any value's
+/// text output feeds a string target.
+fn coercion_pathway_exists(storage: &Storage, txid: u32, source: i32, target: i32) -> bool {
+    use super::types::oid;
+    let base = |type_oid: i32| {
+        storage
+            .domain_base_type_for_oid(type_oid, txid)
+            .map_or(type_oid, |base| {
+                storage
+                    .routine_type_oid(base, None, txid)
+                    .unwrap_or_else(|| base.oid())
+            })
+    };
+    let source = base(source);
+    let target = base(target);
+    if source == target {
+        return true;
+    }
+    let declared = storage
+        .cast_for_oids(source, target, txid)
+        .map(|(_, cast)| cast.context)
+        .or_else(|| builtin_cast_context(source, target));
+    if let Some(declared) = declared {
+        return declared.permits_assignment();
+    }
+    let result = |type_oid: i32| storage.routine_result_for_oid(type_oid, txid);
+    let source_type = result(source).map(|result| result.ctype);
+    let target_type = result(target).map(|result| result.ctype);
+    if target != oid::OIDVECTOR
+        && target != oid::INT2VECTOR
+        && let (Some(ColType::Array(source_element)), Some(ColType::Array(target_element))) =
+            (source_type, target_type)
+        && coercion_pathway_exists(
+            storage,
+            txid,
+            source_element.element_oid(),
+            target_element.element_oid(),
+        )
+    {
+        return true;
+    }
+    target_type.map(super::types::type_category) == Some("S")
+}
+
+/// The name PostgreSQL's `format_type_be` prints for a type OID.
+pub(crate) fn format_type_name(
+    storage: &Storage,
+    txid: u32,
+    type_oid: i32,
+) -> Result<StackStr<260>, SqlError> {
+    user_type_name_fixed(storage, txid, type_oid)?
+        .or_else(|| super::exec::builtin_type_name_fixed(type_oid))
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type identity is unavailable"))
+}
+
 /// Resolve a user-defined conversion, including PostgreSQL's element-wise
 /// array coercion. Domains use their base conversion and retain their checks
 /// at the destination boundary; casts declared on a domain are ignored.

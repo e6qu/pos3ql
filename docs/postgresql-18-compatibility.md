@@ -122,9 +122,42 @@ Syntax and errors:
 - Statements are analysed before they read a row, as in PostgreSQL: a `WITH`
   query nothing reads must still be valid (`WITH x AS (SELECT * FROM missing)
   SELECT 1` fails), a constant compared with or added to a column must convert
-  to its type (`WHERE id = 'abc'` fails even on an empty table), and
-  `CREATE FUNCTION` checks a SQL body's queries and target relations unless
-  `check_function_bodies` is off (always for a `BEGIN ATOMIC` body).
+  to its type (`WHERE id = 'abc'` fails even on an empty table, and so does a
+  `SELECT`'s subquery `(SELECT id FROM t WHERE id = 'abc')`), and
+  `CREATE FUNCTION` checks a SQL body's queries, target relations, target
+  columns and assigned value types unless `check_function_bodies` is off
+  (always for a `BEGIN ATOMIC` body).
+- A value written to a column must convert to the column's type with an
+  implicit or assignment cast, as PostgreSQL checks before any row is read.
+  An untyped literal (`'5'`) is read by the column type's input, and any
+  value converts to a text column, but `INSERT INTO t (id) VALUES
+  ('5'::text)` fails with `42804` (`column "id" is of type integer but
+  expression is of type text`, hint `You will need to rewrite or cast the
+  expression.`) pointing at the value. A subscripted target checks the
+  element, or the whole array for a slice: `UPDATE t SET m[1] = 'x'::text`
+  reports `subscripted assignment to "m" requires type integer but expression
+  is of type text` at `m`. `INSERT ... SELECT` checks the query's output
+  types, so a `UNION` of untyped literals is text. A `SELECT *` mismatch has
+  no cursor position.
+- PL/pgSQL converts a value to a variable's, `OUT` parameter's or result's
+  type with an assignment cast when one exists, and otherwise through text, as
+  PostgreSQL does: `x := true` for an integer `x` fails with `invalid input
+  syntax for type integer: "t"`. `CREATE FUNCTION` checks that a SQL
+  function's final query returns one column of a type that converts to a
+  scalar result (`return type mismatch in function declared to return
+  integer`, detail `Actual return type is text.`), with context `SQL function
+  "f"`; an untyped literal there is text.
+- `INSERT`, `UPDATE` and `DELETE ... RETURNING ... INTO [STRICT] targets` in
+  PL/pgSQL store the returned row and set `FOUND` and `ROW_COUNT`. More than
+  one row fails with `P0003` (`query returned more than one row`) even without
+  `STRICT`; no row fails with `P0002` only under `STRICT` and otherwise stores
+  NULLs. `RETURNING` without `INTO` fails with `query has no destination for
+  result data`, and `INTO` without `RETURNING` with `INTO used with a command
+  that cannot return data`. As in PostgreSQL, extra result columns are
+  ignored and targets without a column become NULL.
+- A function's name qualifies its parameters, as in PostgreSQL: in
+  `CREATE FUNCTION f(a int)`, `f.a` is the parameter `a` in SQL and
+  PL/pgSQL bodies, even when a table in the query has a column `a`.
 - A name in a PL/pgSQL statement that is both a variable and a column is
   ambiguous, as in PostgreSQL: with parameter `a`, `UPDATE t SET b = 1/(a-15)`
   fails with `42702` (`column reference "a" is ambiguous`, detail `It could

@@ -3785,6 +3785,7 @@ impl<'a> Parser<'a> {
                 self.expect_op(",")?;
             }
         }
+        let mut missing_result = false;
         let kind = if function {
             let has_returns = self.eat_ident("returns")?;
             if has_returns && self.eat_ident("trigger")? {
@@ -3858,12 +3859,12 @@ impl<'a> Parser<'a> {
                     declared_result_type,
                     set_returning,
                 }
+            } else if !has_returns {
+                // PostgreSQL reports this after the options parse, so a
+                // syntax error there wins.
+                missing_result = true;
+                RoutineCreateKind::Procedure
             } else {
-                if !has_returns {
-                    return Err(
-                        self.invalid_function_definition("function result type must be specified")
-                    );
-                }
                 RoutineCreateKind::Function {
                     set_returning: self.eat_ident("setof")?,
                     result_type: self.type_name()?,
@@ -3956,6 +3957,10 @@ impl<'a> Parser<'a> {
                     }
                     if self.peeked == Tok::Eof {
                         return Err(self.syntax_error_here());
+                    }
+                    // PostgreSQL's statement list allows empty statements.
+                    if self.eat_op(";")? {
+                        continue;
                     }
                     let _ = self.statement()?;
                     self.expect_op(";")?;
@@ -4183,6 +4188,9 @@ impl<'a> Parser<'a> {
                 || rows_seen)
         {
             return Err(self.syntax_error_here());
+        }
+        if missing_result {
+            return Err(self.invalid_function_definition("function result type must be specified"));
         }
         if attributes.rows.is_some()
             && !matches!(

@@ -1510,7 +1510,7 @@ pub(crate) fn attach_rule_source<'a>(
                     tree = arena
                         .alloc(SetTree::Op {
                             operator: SetOp::Union,
-                            syntax: crate::sql::ast::SetOperationSyntax::Explicit,
+                            syntax: crate::sql::ast::SetOperationSyntax::Values,
                             all: true,
                             left: tree,
                             right: leaf,
@@ -6561,7 +6561,14 @@ fn subst_expr<'a>(
         return Ok(e);
     }
     let rebuilt = match e {
-        Expr::Subquery(s) => Expr::Subquery(subst_select(s, context, arena)?),
+        Expr::Subquery(s) => {
+            let rebuilt = subst_select(s, context, arena)?;
+            // An unchanged subquery keeps its node, which locates its position.
+            if core::ptr::eq(rebuilt, *s) || rebuilt == *s {
+                return Ok(e);
+            }
+            Expr::Subquery(rebuilt)
+        }
         Expr::RowSubquery { select, arity } => Expr::RowSubquery {
             select: subst_select(select, context, arena)?,
             arity: *arity,

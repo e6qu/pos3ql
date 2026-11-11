@@ -9404,6 +9404,24 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// An expression node whose error position is `at`, the start of its
+    /// written text (a scalar subquery's opening parenthesis).
+    pub(super) fn arena_expr_at(&self, e: Expr<'a>, at: usize) -> Result<&'a Expr<'a>, ParseError> {
+        let expression = self
+            .arena
+            .alloc(e)
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        if let Some(copies) = &self.source_copies
+            && copies
+                .borrow_mut()
+                .push(crate::sql::error_position::SourceCopy::node(expression, at))
+                .is_err()
+        {
+            return Err(self.arena_full("statement too large for SQL arena"));
+        }
+        Ok(expression)
+    }
+
     fn arena_expr(&self, e: Expr<'a>) -> Result<&'a Expr<'a>, ParseError> {
         // A constant keeps no source text; its node records where its token
         // was written, so an error about it can point there.

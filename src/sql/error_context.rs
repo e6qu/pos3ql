@@ -188,6 +188,21 @@ impl Frame for SqlFunctionFrame<'_> {
     }
 }
 
+/// A SQL-language function body validated at `CREATE FUNCTION`: an error
+/// that cannot point into the statement names the function.
+pub(crate) struct SqlFunctionValidationFrame<'a> {
+    pub(crate) name: &'a str,
+}
+
+impl Frame for SqlFunctionValidationFrame<'_> {
+    fn write_line(&self, out: &mut dyn Write, positioned: bool) -> fmt::Result {
+        if positioned {
+            return Ok(());
+        }
+        write!(out, "SQL function \"{}\"", self.name)
+    }
+}
+
 struct Node {
     frame: *const (dyn Frame + 'static),
     previous: *const Node,

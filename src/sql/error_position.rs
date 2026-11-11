@@ -187,7 +187,12 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
             .map(|at| (at, source))
     };
     match expression {
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null | Expr::Param(_) => {
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Param(_)
+        | Expr::Subquery(_) => {
             let address = core::ptr::from_ref(expression) as usize;
             // with_statement_source keeps the copy map alive with its text.
             let copies = unsafe { core::slice::from_raw_parts(source.copies, source.copies_len) };
@@ -197,7 +202,10 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
                 .map(|copy| (copy.at, source))
         }
         Expr::Str(text) | Expr::NumericLit(text) | Expr::BitLit(text) => locate(text),
-        Expr::Column { qualifier, name } => locate(qualifier.unwrap_or(name)),
+        Expr::Column { qualifier, name }
+        | Expr::RoutineParam {
+            qualifier, name, ..
+        } => locate(qualifier.unwrap_or(name)),
         Expr::Binary { left, .. } => expression_start(left),
         Expr::Cast {
             operand,
@@ -217,6 +225,15 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
         | Expr::Call {
             source_position, ..
         } => parsed(*source_position),
+        Expr::RecordFieldIndex {
+            base: Expr::RowSubquery { select, .. },
+            index,
+        } => match select.items.get(usize::from(*index)) {
+            Some(crate::sql::ast::SelectItem::Expr { expression, .. }) => {
+                expression_start(expression)
+            }
+            _ => None,
+        },
         Expr::IsNull { operand, .. }
         | Expr::Collate { operand, .. }
         | Expr::InList { operand, .. }
@@ -450,11 +467,19 @@ pub(crate) fn with_internal_source<R>(text: &str, run: impl FnOnce() -> R) -> R 
 }
 
 /// Runs `run` positioning relation and column lookups in the installed
-/// statement text, for a query written inside a utility statement such as
-/// the body of `CREATE FUNCTION ... BEGIN ATOMIC`.
-pub(crate) fn with_analysis<R>(run: impl FnOnce() -> R) -> R {
+/// statement text, for queries parsed from `text`, a slice of it written
+/// inside a utility statement (a `CREATE FUNCTION ... BEGIN ATOMIC` body):
+/// their parsed offsets count from the slice's start.
+pub(crate) fn with_analysis_in<R>(text: &str, run: impl FnOnce() -> R) -> R {
+    let current = SOURCE.with(Cell::get);
+    let start = current.text as usize;
+    let address = text.as_ptr() as usize;
+    let mut source = current;
+    if !current.text.is_null() && address >= start && address + text.len() <= start + current.len {
+        source.offset_base = address - start;
+    }
     let _scope = SourceScope(
-        SOURCE.with(Cell::get),
+        SOURCE.with(|installed| installed.replace(source)),
         ANALYZED.with(|flag| flag.replace(true)),
     );
     run()

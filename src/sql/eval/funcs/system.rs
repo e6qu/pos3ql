@@ -828,6 +828,13 @@ fn schema_object_description<'a>(
     let (Some(visible), 2) = (visible, object.address_name_count) else {
         return Ok(None);
     };
+    // getObjectDescription names an operator as regoperator output does
+    // (format_operator), its operand types unqualified when visible.
+    if class_id == 2617
+        && let Some(signature) = catalog.operator_name(object_id, true, arena)?
+    {
+        return described(stack_format!(1024, "operator {}", signature), arena).map(Some);
+    }
     let schema = object.address_names[0].as_str();
     let name = object.address_names[1].as_str();
     let mut text = crate::util::StackStr::<1024>::new();

@@ -336,12 +336,17 @@ start when its statement resumes (finished effects replay from the statement
 journal) instead of resuming at a saved position inside the procedure. Relation row types: values and columns of a
 view's row type, and dropping a relation through `DROP SCHEMA`, `DROP
 MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
-column uses its row type, fail with `0A000`; a `DROP TABLE ... CASCADE` that
-reaches both columns and routines, or names several tables, reports one notice
-per table or dependency kind where PostgreSQL reports one for the statement, and a routine's dependency on a row type is described as depending on the
-table; a `DROP TYPE` or `DROP DOMAIN` whose type both routines and other
-objects (columns, views, casts) use reports the routines separately from
-those objects where PostgreSQL reports them together. Values and columns of a view's row type need the view's column types,
+column uses its row type, fail with `0A000`. `DROP` of casts, operators,
+operator classes and families, collations, text search objects, extensions,
+servers, policies, triggers, rules, indexes and `DROP OWNED` still describe
+their dependents with their own code instead of the `pg_depend` walk that
+`DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`, `SEQUENCE`, `FUNCTION`, `TYPE`,
+`DOMAIN` and `SCHEMA` share, and `pg_depend` still lacks PostgreSQL's rows for
+languages, column collations, index columns, TOAST tables, partition keys,
+`NOT NULL` constraints, extended statistics, types named only inside
+expressions (a cast in a default or routine body), and the column-level rows
+of rules and of views that read a sequence.
+Values and columns of a view's row type need the view's column types,
 which pos3ql derives from the view's query on each use instead of storing them
 as PostgreSQL's `pg_attribute` rows do. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current

@@ -116,7 +116,7 @@ pub(crate) use type_edits::{
 };
 mod domain_validation;
 mod oid_bands;
-pub(crate) use oid_bands::OidBand;
+pub(crate) use oid_bands::{FIRST_NORMAL_OBJECT_ID, OidBand};
 mod relation_identities;
 pub(crate) use relation_identities::{MAX_RELATION_GENERATION, RelationIdentity};
 mod relation_row_types;
@@ -9262,24 +9262,29 @@ pub(crate) struct AggregateRoutine {
 }
 
 impl AggregateRoutine {
+    /// Every support function the aggregate calls: transition, final,
+    /// combine, serialization and moving-aggregate functions.
+    pub(crate) fn support_function_oids(self) -> [Option<i32>; 8] {
+        [
+            Some(self.transition_oid),
+            self.final_function.map(|function| function.function_oid),
+            self.partial.map(|partial| partial.combine_oid),
+            self.partial
+                .and_then(|partial| partial.serde)
+                .map(|serde| serde.serialize_oid),
+            self.partial
+                .and_then(|partial| partial.serde)
+                .map(|serde| serde.deserialize_oid),
+            self.moving.map(|moving| moving.transition_oid),
+            self.moving.map(|moving| moving.inverse_oid),
+            self.moving
+                .and_then(|moving| moving.final_function)
+                .map(|function| function.function_oid),
+        ]
+    }
+
     pub(crate) fn uses_function_oid(self, oid: i32) -> bool {
-        self.transition_oid == oid
-            || self
-                .final_function
-                .is_some_and(|function| function.function_oid == oid)
-            || self.partial.is_some_and(|partial| {
-                partial.combine_oid == oid
-                    || partial.serde.is_some_and(|serde| {
-                        serde.serialize_oid == oid || serde.deserialize_oid == oid
-                    })
-            })
-            || self.moving.is_some_and(|moving| {
-                moving.transition_oid == oid
-                    || moving.inverse_oid == oid
-                    || moving
-                        .final_function
-                        .is_some_and(|function| function.function_oid == oid)
-            })
+        self.support_function_oids().contains(&Some(oid))
     }
 
     pub(crate) fn encode_wire(self) -> StackStr<ROUTINE_SQL_MAX> {

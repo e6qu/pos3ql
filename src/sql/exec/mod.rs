@@ -766,6 +766,146 @@ fn sql_fail(e: SqlError) -> Outcome {
     Ok(Err(e))
 }
 
+use crate::sql::catalog::dependencies::ObjectAddress;
+
+const DROPPED_NOTHING: ObjectAddress = ObjectAddress::new(0, 0, 0);
+
+/// Whether a `DROP` may proceed to its dependency report: the object is no
+/// extension member and the current role owns it. Otherwise the executor
+/// reports PostgreSQL's error first.
+fn may_drop(
+    storage: &Storage,
+    class: crate::storage::AccessClass,
+    slot: usize,
+    txid: u32,
+    kind: &str,
+) -> bool {
+    let object = crate::storage::AccessObject {
+        class,
+        slot: slot as u16,
+    };
+    storage
+        .require_not_extension_member(object, txid, kind)
+        .is_ok()
+        && storage.require_owner(object, txid, kind).is_ok()
+}
+
+/// What a relation name denotes, for PostgreSQL's wrong-kind `DROP` error.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelationKindName {
+    Table,
+    Sequence,
+    View,
+    MaterializedView,
+    Index,
+    Type,
+    ForeignTable,
+}
+
+impl RelationKindName {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Sequence => "sequence",
+            Self::View => "view",
+            Self::MaterializedView => "materialized view",
+            Self::Index => "index",
+            Self::Type => "type",
+            Self::ForeignTable => "foreign table",
+        }
+    }
+
+    fn drop_hint(self) -> &'static str {
+        match self {
+            Self::Table => "Use DROP TABLE to remove a table.",
+            Self::Sequence => "Use DROP SEQUENCE to remove a sequence.",
+            Self::View => "Use DROP VIEW to remove a view.",
+            Self::MaterializedView => "Use DROP MATERIALIZED VIEW to remove a materialized view.",
+            Self::Index => "Use DROP INDEX to remove an index.",
+            Self::Type => "Use DROP TYPE to remove a type.",
+            Self::ForeignTable => "Use DROP FOREIGN TABLE to remove a foreign table.",
+        }
+    }
+
+    /// The kind of relation `name` denotes, if any.
+    fn of(storage: &Storage, name: &QualName, txid: u32) -> Option<Self> {
+        match storage.resolve_relation(name.schema, name.name, txid) {
+            Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                let definition = storage.table_def(slot, txid);
+                return Some(
+                    if storage
+                        .matview_slot(definition.schema.as_str(), definition.name.as_str(), txid)
+                        .is_some()
+                    {
+                        Self::MaterializedView
+                    } else if definition.kind == crate::storage::TableKind::Foreign {
+                        Self::ForeignTable
+                    } else {
+                        Self::Table
+                    },
+                );
+            }
+            Some(crate::storage::ResolvedRelation::View(_)) => return Some(Self::View),
+            Some(crate::storage::ResolvedRelation::Catalog) | None => {}
+        }
+        if storage
+            .sequence_on_path(name.schema, name.name, txid)
+            .is_some()
+        {
+            Some(Self::Sequence)
+        } else if storage
+            .resolve_index_slot(name.schema, name.name, txid)
+            .is_some()
+        {
+            Some(Self::Index)
+        } else if match name.schema {
+            Some(schema) => storage.composite_slot(schema, name.name, txid),
+            None => storage.resolve_composite_slot(name.name, txid),
+        }
+        .is_some()
+        {
+            Some(Self::Type)
+        } else {
+            None
+        }
+    }
+
+    /// PostgreSQL's `DropErrorMsgWrongType` when `name` is a relation of
+    /// another kind than the `DROP` names; `IF EXISTS` does not suppress it.
+    fn wrong_kind(
+        storage: &Storage,
+        name: &QualName,
+        txid: u32,
+        expected: Self,
+    ) -> Option<SqlError> {
+        let actual = Self::of(storage, name, txid).filter(|actual| *actual != expected)?;
+        crate::sql::eval::stash_diagnostic(
+            None,
+            Some(crate::util::StackStr::from_str(actual.drop_hint())),
+        );
+        Some(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "\"{}\" is not a {}",
+            name.name,
+            expected.noun()
+        ))
+    }
+}
+
+/// Runs a `DROP`'s executors after its dependency report: a failed report
+/// fails the statement, and a sent one covers the executors' own notices.
+fn run_reported_drop<'b>(
+    report: Result<Option<crate::pg::respond::DependencyReport>, SqlError>,
+    responder: &mut Responder<'b>,
+    drop: impl FnOnce(&mut Responder<'b>) -> Outcome,
+) -> Outcome {
+    match report {
+        Err(error) => sql_fail(error),
+        Ok(Some(filter)) => responder.with_dependency_report(filter, drop),
+        Ok(None) => drop(responder),
+    }
+}
+
 mod copy_transition;
 mod partition_insert;
 mod partition_update;
@@ -842,6 +982,7 @@ pub use projected::{
 pub(crate) use projected::{pack_projected_rows_into, projected_rows_len};
 
 mod ddl;
+mod dependency_report;
 pub(crate) use ddl::check_referenced_columns;
 use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build_def};
 
@@ -6707,7 +6848,6 @@ fn drop_row_type_columns(
     use core::fmt::Write as _;
     let mut detail =
         crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
-    let mut first = crate::util::StackStr::<192>::new();
     let mut count = 0usize;
     row_type_column_users(
         storage,
@@ -6734,8 +6874,6 @@ fn drop_row_type_columns(
             };
             if count != 0 {
                 let _ = detail.write_char('\n');
-            } else {
-                first = line;
             }
             let _ = detail.write_str(line.as_str());
             count += 1;
@@ -6775,20 +6913,7 @@ fn drop_row_type_columns(
             relation.name.as_str()
         ));
     };
-    let notice_failed = |_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "response buffer full");
-    if count == 1 {
-        responder
-            .notice(sqlstate::SUCCESSFUL_COMPLETION, first.as_str())
-            .map_err(notice_failed)?;
-    } else {
-        crate::sql::eval::stash_diagnostic(Some(detail), None);
-        responder
-            .notice(
-                sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(128, "drop cascades to {} other objects", count).as_str(),
-            )
-            .map_err(notice_failed)?;
-    }
+    dependency_report::send_cascade_lines(responder, detail.as_str(), count)?;
     loop {
         let mut target = None;
         row_type_column_users(storage, txn.txid, creation, excluded, |slot, _, _, _| {
@@ -6865,407 +6990,439 @@ fn drop_table_kind_with_columns(
     mut row_type_columns: Option<RowTypeColumnCascade<'_>>,
     responder: &mut Responder,
 ) -> Outcome {
-    let mut selected_tables = [usize::MAX; 16];
-    let mut selected_table_count = 0usize;
-    for name in statement.names {
-        if let Some(crate::storage::ResolvedRelation::Table(slot)) =
-            storage.resolve_relation(name.schema, name.name, txn.txid)
-            && storage
+    let report = (|| {
+        let originals = arena
+            .alloc_slice_with(statement.names.len(), |_| DROPPED_NOTHING)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for name in statement.names {
+            let Some(crate::storage::ResolvedRelation::Table(slot)) =
+                storage.resolve_relation(name.schema, name.name, txn.txid)
+            else {
+                if statement.if_exists
+                    && storage
+                        .sequence_on_path(name.schema, name.name, txn.txid)
+                        .is_none()
+                    && storage
+                        .resolve_relation(name.schema, name.name, txn.txid)
+                        .is_none()
+                {
+                    continue;
+                }
+                return Ok(None);
+            };
+            let definition = storage.table_def(slot, txn.txid);
+            if storage
                 .matview_slot(
-                    storage.table_def(slot, txn.txid).schema.as_str(),
-                    storage.table_def(slot, txn.txid).name.as_str(),
+                    definition.schema.as_str(),
+                    definition.name.as_str(),
                     txn.txid,
                 )
-                .is_none()
-            && !selected_tables[..selected_table_count].contains(&slot)
-        {
-            if selected_table_count == selected_tables.len() {
-                return sql_fail(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many tables in one DROP statement"
-                ));
+                .is_some()
+                || expected_kind.is_some_and(|kind| definition.kind != kind)
+                || !may_drop(
+                    storage,
+                    crate::storage::AccessClass::Table,
+                    slot,
+                    txn.txid,
+                    "table",
+                )
+            {
+                return Ok(None);
             }
-            selected_tables[selected_table_count] = slot;
-            selected_table_count += 1;
+            originals[count] = ObjectAddress::new(
+                super::catalog::PG_CLASS_OID,
+                super::catalog::user_table_oid(storage, slot),
+                0,
+            );
+            count += 1;
         }
-    }
-    for name in statement.names {
-        // A DROP whose qualifier names no schema is PostgreSQL's 3F000 (a
-        // SELECT of the same spelling is 42P01 — the codes really differ).
-        if let Some(schema) = name.schema
-            && schema != "pg_temp"
-            && storage.find_schema_visible(schema, txn.txid).is_none()
-            && !statement.if_exists
-        {
-            return sql_fail(sql_err!(
-                sqlstate::INVALID_SCHEMA_NAME,
-                "schema \"{}\" does not exist",
-                schema
-            ));
-        }
-        // A sequence is a relation, but not a table: DROP TABLE on it is a type
-        // error (42809), which IF EXISTS does not suppress.
-        if storage
-            .sequence_on_path(name.schema, name.name, txn.txid)
-            .is_some()
-        {
-            return sql_fail(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "\"{}\" is not a table",
-                name.name
-            ));
-        }
-        match storage.resolve_relation(name.schema, name.name, txn.txid) {
-            Some(crate::storage::ResolvedRelation::Table(index))
-                if storage
+        dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &originals[..count],
+            statement.cascade,
+            arena,
+            responder,
+        )
+    })();
+    run_reported_drop(report, responder, |responder| {
+        let mut selected_tables = [usize::MAX; 16];
+        let mut selected_table_count = 0usize;
+        for name in statement.names {
+            if let Some(crate::storage::ResolvedRelation::Table(slot)) =
+                storage.resolve_relation(name.schema, name.name, txn.txid)
+                && storage
                     .matview_slot(
-                        storage.table_def(index, txn.txid).schema.as_str(),
-                        storage.table_def(index, txn.txid).name.as_str(),
+                        storage.table_def(slot, txn.txid).schema.as_str(),
+                        storage.table_def(slot, txn.txid).name.as_str(),
                         txn.txid,
                     )
-                    .is_some() =>
+                    .is_none()
+                && !selected_tables[..selected_table_count].contains(&slot)
             {
-                // The backing table of a materialized view is not an ordinary
-                // table; PostgreSQL refuses DROP TABLE on it (42809), directing
-                // the user to DROP MATERIALIZED VIEW.
+                if selected_table_count == selected_tables.len() {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many tables in one DROP statement"
+                    ));
+                }
+                selected_tables[selected_table_count] = slot;
+                selected_table_count += 1;
+            }
+        }
+        for name in statement.names {
+            // A DROP whose qualifier names no schema is PostgreSQL's 3F000 (a
+            // SELECT of the same spelling is 42P01 — the codes really differ).
+            if let Some(schema) = name.schema
+                && schema != "pg_temp"
+                && storage.find_schema_visible(schema, txn.txid).is_none()
+                && !statement.if_exists
+            {
                 return sql_fail(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "\"{}\" is not a table",
-                    name.name
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema
                 ));
             }
-            Some(crate::storage::ResolvedRelation::Table(index)) => {
-                if expected_kind.is_some_and(|kind| storage.table_def(index, txn.txid).kind != kind)
-                {
-                    return sql_fail(sql_err!(
-                        sqlstate::WRONG_OBJECT_TYPE,
-                        "\"{}\" is not a {}",
-                        name.name,
-                        if expected_kind == Some(crate::storage::TableKind::Foreign) {
-                            "foreign table"
-                        } else {
-                            "table"
-                        }
-                    ));
-                }
-                if let Err(error) = storage.require_not_extension_member(
-                    crate::storage::AccessObject {
-                        class: crate::storage::AccessClass::Table,
-                        slot: index as u16,
-                    },
-                    txn.txid,
-                    "table",
-                ) {
-                    return sql_fail(error);
-                }
-                if let Err(error) = storage.require_owner(
-                    crate::storage::AccessObject {
-                        class: crate::storage::AccessClass::Table,
-                        slot: index as u16,
-                    },
-                    txn.txid,
-                    "table",
-                ) {
-                    return sql_fail(error);
-                }
-                if let Err(error) = storage.lock_table(
-                    txn.txid,
-                    index,
-                    crate::sql::ast::TableLockMode::AccessExclusive,
-                    false,
-                ) {
-                    return sql_fail(error);
-                }
-                if let Err(error) = super::cursor::require_table_idle(index, name.name, tag) {
-                    return sql_fail(error);
-                }
-                if let Some(other) = storage.table(index).ddl_locked_by_other(txn.txid) {
-                    if let Err(error) = storage.wait_for_transaction(txn.txid, other) {
+            // A relation of another kind is a type error (42809) with a hint
+            // naming its own DROP, which IF EXISTS does not suppress.
+            let expected = if expected_kind == Some(crate::storage::TableKind::Foreign) {
+                RelationKindName::ForeignTable
+            } else {
+                RelationKindName::Table
+            };
+            // Internal callers (no expected kind) drop foreign and local tables
+            // alike, but never a materialized view's backing table.
+            if (expected_kind.is_some()
+                || RelationKindName::of(storage, name, txn.txid)
+                    == Some(RelationKindName::MaterializedView))
+                && let Some(error) = RelationKindName::wrong_kind(storage, name, txn.txid, expected)
+            {
+                return sql_fail(error);
+            }
+            match storage.resolve_relation(name.schema, name.name, txn.txid) {
+                Some(crate::storage::ResolvedRelation::Table(index)) => {
+                    if let Err(error) = storage.require_not_extension_member(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Table,
+                            slot: index as u16,
+                        },
+                        txn.txid,
+                        "table",
+                    ) {
                         return sql_fail(error);
                     }
-                    return sql_fail(sql_err!(
-                        crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
-                        "statement is waiting for concurrent DDL on \"{}\"",
-                        name.name
-                    ));
-                }
-                let def = (*storage.table_def(index, txn.txid)).clone();
-                // Partitions are internal dependencies of their parent. Drop
-                // the deepest visible child first through the ordinary DROP
-                // path so its indexes, triggers, sequences, WAL, and undo state
-                // receive exactly the same treatment as an explicit DROP.
-                loop {
-                    let child = (0..storage.table_count()).find_map(|candidate| {
-                        if !storage.table(candidate).visible_to(txn.txid) {
-                            return None;
+                    if let Err(error) = storage.require_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Table,
+                            slot: index as u16,
+                        },
+                        txn.txid,
+                        "table",
+                    ) {
+                        return sql_fail(error);
+                    }
+                    if let Err(error) = storage.lock_table(
+                        txn.txid,
+                        index,
+                        crate::sql::ast::TableLockMode::AccessExclusive,
+                        false,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    if let Err(error) = super::cursor::require_table_idle(index, name.name, tag) {
+                        return sql_fail(error);
+                    }
+                    if let Some(other) = storage.table(index).ddl_locked_by_other(txn.txid) {
+                        if let Err(error) = storage.wait_for_transaction(txn.txid, other) {
+                            return sql_fail(error);
                         }
-                        let definition = storage.table_def(candidate, txn.txid);
-                        let partition = definition
-                            .partition
-                            .attachment
-                            .is_some_and(|attachment| usize::from(attachment.parent) == index);
-                        let inheritance = definition.inheritance.contains(index);
-                        (partition || inheritance).then_some((candidate, inheritance))
-                    });
-                    let Some((child, ordinary_inheritance)) = child else {
-                        break;
+                        return sql_fail(sql_err!(
+                            crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
+                            "statement is waiting for concurrent DDL on \"{}\"",
+                            name.name
+                        ));
+                    }
+                    let def = (*storage.table_def(index, txn.txid)).clone();
+                    // Partitions are internal dependencies of their parent. Drop
+                    // the deepest visible child first through the ordinary DROP
+                    // path so its indexes, triggers, sequences, WAL, and undo state
+                    // receive exactly the same treatment as an explicit DROP.
+                    loop {
+                        let child = (0..storage.table_count()).find_map(|candidate| {
+                            if !storage.table(candidate).visible_to(txn.txid) {
+                                return None;
+                            }
+                            let definition = storage.table_def(candidate, txn.txid);
+                            let partition = definition
+                                .partition
+                                .attachment
+                                .is_some_and(|attachment| usize::from(attachment.parent) == index);
+                            let inheritance = definition.inheritance.contains(index);
+                            (partition || inheritance).then_some((candidate, inheritance))
+                        });
+                        let Some((child, ordinary_inheritance)) = child else {
+                            break;
+                        };
+                        if ordinary_inheritance && !statement.cascade {
+                            return sql_fail(sql_err!(
+                                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                                "cannot drop table {} because other objects depend on it",
+                                def.name.as_str()
+                            ));
+                        }
+                        let child_def = (*storage.table_def(child, txn.txid)).clone();
+                        let child_name = QualName {
+                            schema: Some(
+                                if child_def.persistence
+                                    == crate::storage::RelationPersistence::Temporary
+                                {
+                                    "pg_temp"
+                                } else {
+                                    child_def.schema.as_str()
+                                },
+                            ),
+                            name: child_def.name.as_str(),
+                        };
+                        let child_drop = DropTable {
+                            names: core::slice::from_ref(&child_name),
+                            if_exists: false,
+                            cascade: statement.cascade,
+                        };
+                        let outcome = responder.without_command_complete(|responder| {
+                            drop_table_kind_with_columns(
+                                storage,
+                                wal,
+                                txn,
+                                &child_drop,
+                                None,
+                                tag,
+                                arena,
+                                row_type_columns
+                                    .as_mut()
+                                    .map(RowTypeColumnCascade::reborrow),
+                                responder,
+                            )
+                        });
+                        match outcome {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => return sql_fail(error),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    if let Err(error) = drop_row_type_columns(
+                        storage,
+                        wal,
+                        txn,
+                        &def,
+                        storage.relation_row_type_creation(crate::storage::RowTypeRelation::Table(
+                            index,
+                        )),
+                        &selected_tables[..selected_table_count],
+                        statement.cascade,
+                        row_type_columns
+                            .as_mut()
+                            .map(RowTypeColumnCascade::reborrow),
+                        arena,
+                        responder,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    let root = |dependency: &crate::storage::StoredQueryDependency| {
+                        dependency.class == crate::storage::DependencyClass::Table
+                            && dependency.slot as usize == index
                     };
-                    if ordinary_inheritance && !statement.cascade {
+                    let closure = stored_query_dependent_closure(storage, txn.txid, arena, root);
+                    let StoredDependencyClosure {
+                        views: dependent_views,
+                        matviews: dependent_matviews,
+                        routines: dependent_routines,
+                        rules: dependent_rules,
+                    } = match closure {
+                        Ok(closure) => closure,
+                        Err(error) => return sql_fail(error),
+                    };
+                    let policy_root = PolicyDependencySelection::Catalog {
+                        class: crate::storage::DependencyClass::Table,
+                        slot: index,
+                    };
+                    let has_dependents = dependent_views.iter().any(|selected| *selected)
+                        || dependent_matviews.iter().any(|selected| *selected)
+                        || dependent_routines.iter().any(|selected| *selected)
+                        || dependent_rules.iter().any(|selected| *selected)
+                        || policy_dependents_exist(
+                            storage,
+                            txn.txid,
+                            policy_root,
+                            dependent_views,
+                            dependent_matviews,
+                            dependent_routines,
+                        );
+                    if has_dependents && !statement.cascade {
+                        if let Err(error) = report_stored_query_dependents(
+                            storage,
+                            txn.txid,
+                            StoredQueryRoot {
+                                class: crate::storage::DependencyClass::Table,
+                                slot: index,
+                                kind: "table",
+                                schema: def.schema,
+                                name: def.name,
+                                suffix: crate::util::StackStr::new(),
+                            },
+                            StoredQuerySelection {
+                                views: dependent_views,
+                                matviews: dependent_matviews,
+                                routines: dependent_routines,
+                                rules: dependent_rules,
+                                policy_root: Some(policy_root),
+                            },
+                            false,
+                            arena,
+                            responder,
+                        ) {
+                            return sql_fail(error);
+                        }
                         return sql_fail(sql_err!(
                             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                             "cannot drop table {} because other objects depend on it",
                             def.name.as_str()
                         ));
                     }
-                    let child_def = (*storage.table_def(child, txn.txid)).clone();
-                    let child_name = QualName {
-                        schema: Some(
-                            if child_def.persistence
-                                == crate::storage::RelationPersistence::Temporary
-                            {
-                                "pg_temp"
-                            } else {
-                                child_def.schema.as_str()
+                    if statement.cascade {
+                        if let Err(error) = report_stored_query_dependents(
+                            storage,
+                            txn.txid,
+                            StoredQueryRoot {
+                                class: crate::storage::DependencyClass::Table,
+                                slot: index,
+                                kind: "table",
+                                schema: def.schema,
+                                name: def.name,
+                                suffix: crate::util::StackStr::new(),
                             },
-                        ),
-                        name: child_def.name.as_str(),
-                    };
-                    let child_drop = DropTable {
-                        names: core::slice::from_ref(&child_name),
-                        if_exists: false,
-                        cascade: statement.cascade,
-                    };
-                    let outcome = responder.without_command_complete(|responder| {
-                        drop_table_kind_with_columns(
+                            StoredQuerySelection {
+                                views: dependent_views,
+                                matviews: dependent_matviews,
+                                routines: dependent_routines,
+                                rules: dependent_rules,
+                                policy_root: Some(policy_root),
+                            },
+                            true,
+                            arena,
+                            responder,
+                        ) {
+                            return sql_fail(error);
+                        }
+                        if let Err(error) = drop_policy_dependents(
                             storage,
                             wal,
                             txn,
-                            &child_drop,
-                            None,
-                            tag,
-                            arena,
-                            row_type_columns
-                                .as_mut()
-                                .map(RowTypeColumnCascade::reborrow),
-                            responder,
-                        )
-                    });
-                    match outcome {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => return sql_fail(error),
-                        Err(error) => return Err(error),
-                    }
-                }
-                if let Err(error) = drop_row_type_columns(
-                    storage,
-                    wal,
-                    txn,
-                    &def,
-                    storage
-                        .relation_row_type_creation(crate::storage::RowTypeRelation::Table(index)),
-                    &selected_tables[..selected_table_count],
-                    statement.cascade,
-                    row_type_columns
-                        .as_mut()
-                        .map(RowTypeColumnCascade::reborrow),
-                    arena,
-                    responder,
-                ) {
-                    return sql_fail(error);
-                }
-                let root = |dependency: &crate::storage::StoredQueryDependency| {
-                    dependency.class == crate::storage::DependencyClass::Table
-                        && dependency.slot as usize == index
-                };
-                let closure = stored_query_dependent_closure(storage, txn.txid, arena, root);
-                let StoredDependencyClosure {
-                    views: dependent_views,
-                    matviews: dependent_matviews,
-                    routines: dependent_routines,
-                    rules: dependent_rules,
-                } = match closure {
-                    Ok(closure) => closure,
-                    Err(error) => return sql_fail(error),
-                };
-                let policy_root = PolicyDependencySelection::Catalog {
-                    class: crate::storage::DependencyClass::Table,
-                    slot: index,
-                };
-                let has_dependents = dependent_views.iter().any(|selected| *selected)
-                    || dependent_matviews.iter().any(|selected| *selected)
-                    || dependent_routines.iter().any(|selected| *selected)
-                    || dependent_rules.iter().any(|selected| *selected)
-                    || policy_dependents_exist(
-                        storage,
-                        txn.txid,
-                        policy_root,
-                        dependent_views,
-                        dependent_matviews,
-                        dependent_routines,
-                    );
-                if has_dependents && !statement.cascade {
-                    if let Err(error) = report_stored_query_dependents(
-                        storage,
-                        txn.txid,
-                        StoredQueryRoot {
-                            class: crate::storage::DependencyClass::Table,
-                            slot: index,
-                            kind: "table",
-                            schema: def.schema,
-                            name: def.name,
-                            suffix: crate::util::StackStr::new(),
-                        },
-                        StoredQuerySelection {
-                            views: dependent_views,
-                            matviews: dependent_matviews,
-                            routines: dependent_routines,
-                            rules: dependent_rules,
-                            policy_root: Some(policy_root),
-                        },
-                        false,
-                        arena,
-                        responder,
-                    ) {
-                        return sql_fail(error);
-                    }
-                    return sql_fail(sql_err!(
-                        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                        "cannot drop table {} because other objects depend on it",
-                        def.name.as_str()
-                    ));
-                }
-                if statement.cascade {
-                    if let Err(error) = report_stored_query_dependents(
-                        storage,
-                        txn.txid,
-                        StoredQueryRoot {
-                            class: crate::storage::DependencyClass::Table,
-                            slot: index,
-                            kind: "table",
-                            schema: def.schema,
-                            name: def.name,
-                            suffix: crate::util::StackStr::new(),
-                        },
-                        StoredQuerySelection {
-                            views: dependent_views,
-                            matviews: dependent_matviews,
-                            routines: dependent_routines,
-                            rules: dependent_rules,
-                            policy_root: Some(policy_root),
-                        },
-                        true,
-                        arena,
-                        responder,
-                    ) {
-                        return sql_fail(error);
-                    }
-                    if let Err(error) = drop_policy_dependents(
-                        storage,
-                        wal,
-                        txn,
-                        policy_root,
-                        dependent_views,
-                        dependent_matviews,
-                        dependent_routines,
-                    ) {
-                        return sql_fail(error);
-                    }
-                    if let Err(error) = drop_selected_stored_queries(
-                        storage,
-                        wal,
-                        txn,
-                        dependent_views,
-                        dependent_matviews,
-                        dependent_routines,
-                        dependent_rules,
-                    ) {
-                        return sql_fail(error);
-                    }
-                }
-                loop {
-                    let inbound = (0..storage.table_count()).find_map(|child| {
-                        if !storage.table(child).visible_to(txn.txid)
-                            || selected_tables[..selected_table_count].contains(&child)
-                        {
-                            return None;
+                            policy_root,
+                            dependent_views,
+                            dependent_matviews,
+                            dependent_routines,
+                        ) {
+                            return sql_fail(error);
                         }
-                        storage
-                            .table_def(child, txn.txid)
-                            .fkeys()
-                            .iter()
-                            .position(|foreign_key| {
-                                foreign_key.parent_schema == def.schema
-                                    && foreign_key.parent == def.name
-                            })
-                            .map(|foreign_key| (child, foreign_key))
-                    });
-                    let Some((child, foreign_key)) = inbound else {
-                        break;
-                    };
-                    let (child_target, child_definition) =
-                        storage.select_table_definition(child, txn.txid);
-                    let constraint = child_definition.fkeys()[foreign_key].name;
-                    if !statement.cascade {
-                        return sql_fail(sql_err!(
-                            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                            "cannot drop table {} because other objects depend on it",
-                            def.name.as_str()
-                        ));
+                        if let Err(error) = drop_selected_stored_queries(
+                            storage,
+                            wal,
+                            txn,
+                            dependent_views,
+                            dependent_matviews,
+                            dependent_routines,
+                            dependent_rules,
+                        ) {
+                            return sql_fail(error);
+                        }
                     }
-                    let lsn = storage.bump_lsn();
-                    if let Err(error) = wal.stage_reserved(
-                        txn.txid,
-                        lsn,
-                        &WalOp::DropTableFk {
-                            schema: child_definition.schema.as_str(),
-                            table: child_definition.name.as_str(),
-                            fk_name: constraint.as_str(),
-                        },
-                    ) {
-                        return sql_fail(error);
+                    loop {
+                        let inbound = (0..storage.table_count()).find_map(|child| {
+                            if !storage.table(child).visible_to(txn.txid)
+                                || selected_tables[..selected_table_count].contains(&child)
+                            {
+                                return None;
+                            }
+                            storage
+                                .table_def(child, txn.txid)
+                                .fkeys()
+                                .iter()
+                                .position(|foreign_key| {
+                                    foreign_key.parent_schema == def.schema
+                                        && foreign_key.parent == def.name
+                                })
+                                .map(|foreign_key| (child, foreign_key))
+                        });
+                        let Some((child, foreign_key)) = inbound else {
+                            break;
+                        };
+                        let (child_target, child_definition) =
+                            storage.select_table_definition(child, txn.txid);
+                        let constraint = child_definition.fkeys()[foreign_key].name;
+                        if !statement.cascade {
+                            return sql_fail(sql_err!(
+                                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                                "cannot drop table {} because other objects depend on it",
+                                def.name.as_str()
+                            ));
+                        }
+                        let lsn = storage.bump_lsn();
+                        if let Err(error) = wal.stage_reserved(
+                            txn.txid,
+                            lsn,
+                            &WalOp::DropTableFk {
+                                schema: child_definition.schema.as_str(),
+                                table: child_definition.name.as_str(),
+                                fk_name: constraint.as_str(),
+                            },
+                        ) {
+                            return sql_fail(error);
+                        }
+                        let mut updated = TableDefBuilder::from_definition(&child_definition);
+                        if !drop_named_constraint(&mut updated, constraint.as_str()) {
+                            return sql_fail(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "inbound foreign key vanished during DROP TABLE"
+                            ));
+                        }
+                        let mut identity_mapping = [None; MAX_COLUMNS];
+                        for (column, target) in identity_mapping
+                            .iter_mut()
+                            .enumerate()
+                            .take(child_definition.n_columns)
+                        {
+                            *target = Some(child_definition.columns()[column].name);
+                        }
+                        if let Err(error) = txn.write_table_definition(
+                            storage,
+                            child_target,
+                            updated,
+                            &identity_mapping,
+                            false,
+                            crate::storage::ColumnSet::EMPTY,
+                        ) {
+                            return sql_fail(error);
+                        }
                     }
-                    let mut updated = TableDefBuilder::from_definition(&child_definition);
-                    if !drop_named_constraint(&mut updated, constraint.as_str()) {
-                        return sql_fail(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "inbound foreign key vanished during DROP TABLE"
-                        ));
-                    }
-                    let mut identity_mapping = [None; MAX_COLUMNS];
-                    for (column, target) in identity_mapping
-                        .iter_mut()
-                        .enumerate()
-                        .take(child_definition.n_columns)
-                    {
-                        *target = Some(child_definition.columns()[column].name);
-                    }
-                    if let Err(error) = txn.write_table_definition(
-                        storage,
-                        child_target,
-                        updated,
-                        &identity_mapping,
-                        false,
-                        crate::storage::ColumnSet::EMPTY,
-                    ) {
-                        return sql_fail(error);
-                    }
-                }
-                // Owned serial/identity sequences are internal dependencies:
-                // dropping their table drops them in the same transaction.
-                for sequence_index in 0..storage.sequence_count() {
-                    let sequence = storage.sequence_for(sequence_index, txn.txid);
-                    if !sequence.visible_to(txn.txid)
-                        || !matches!(
-                            sequence.owner,
-                            Some(owner)
-                                if owner.table_schema == def.schema && owner.table == def.name
-                        )
-                    {
-                        continue;
-                    }
-                    let (sequence_schema, sequence_name) = (sequence.schema, sequence.name);
-                    let wal_result =
-                        if sequence.persistence == crate::storage::RelationPersistence::Temporary {
+                    // Owned serial/identity sequences are internal dependencies:
+                    // dropping their table drops them in the same transaction.
+                    for sequence_index in 0..storage.sequence_count() {
+                        let sequence = storage.sequence_for(sequence_index, txn.txid);
+                        if !sequence.visible_to(txn.txid)
+                            || !matches!(
+                                sequence.owner,
+                                Some(owner)
+                                    if owner.table_schema == def.schema && owner.table == def.name
+                            )
+                        {
+                            continue;
+                        }
+                        let (sequence_schema, sequence_name) = (sequence.schema, sequence.name);
+                        let wal_result = if sequence.persistence
+                            == crate::storage::RelationPersistence::Temporary
+                        {
                             Ok(())
                         } else {
                             let lsn = storage.bump_lsn();
@@ -7279,119 +7436,123 @@ fn drop_table_kind_with_columns(
                                 },
                             )
                         };
-                    if let Err(error) = wal_result {
-                        return sql_fail(error);
+                        if let Err(error) = wal_result {
+                            return sql_fail(error);
+                        }
+                        match storage.drop_sequence(
+                            sequence_schema.as_str(),
+                            sequence_name.as_str(),
+                            txn.txid,
+                        ) {
+                            Ok(Some(slot)) => {
+                                if let Err(error) = txn.record_sequence_change(storage, slot) {
+                                    return sql_fail(error);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => return sql_fail(error),
+                        }
                     }
-                    match storage.drop_sequence(
-                        sequence_schema.as_str(),
-                        sequence_name.as_str(),
-                        txn.txid,
-                    ) {
-                        Ok(Some(slot)) => {
-                            if let Err(error) = txn.record_sequence_change(storage, slot) {
+                    loop {
+                        let statistics_slot = {
+                            storage
+                                .extended_statistics_for_table(index, txn.txid)
+                                .map(|(slot, _)| slot)
+                                .next()
+                        };
+                        let Some(statistics_slot) = statistics_slot else {
+                            break;
+                        };
+                        let definition = storage
+                            .extended_statistics(statistics_slot)
+                            .definition_for(txn.txid);
+                        if let Err(error) =
+                            storage.drop_extended_statistics(statistics_slot, txn.txid)
+                        {
+                            return sql_fail(error);
+                        }
+                        if def.persistence != crate::storage::RelationPersistence::Temporary {
+                            let lsn = storage.bump_lsn();
+                            if let Err(error) = wal.stage_reserved(
+                                txn.txid,
+                                lsn,
+                                &WalOp::DropExtendedStatistics {
+                                    schema: definition.schema.as_str(),
+                                    name: definition.name.as_str(),
+                                },
+                            ) {
+                                storage
+                                    .rollback_extended_statistics_drop(statistics_slot, txn.txid);
                                 return sql_fail(error);
                             }
                         }
-                        Ok(None) => {}
-                        Err(error) => return sql_fail(error),
-                    }
-                }
-                loop {
-                    let statistics_slot = {
-                        storage
-                            .extended_statistics_for_table(index, txn.txid)
-                            .map(|(slot, _)| slot)
-                            .next()
-                    };
-                    let Some(statistics_slot) = statistics_slot else {
-                        break;
-                    };
-                    let definition = storage
-                        .extended_statistics(statistics_slot)
-                        .definition_for(txn.txid);
-                    if let Err(error) = storage.drop_extended_statistics(statistics_slot, txn.txid)
-                    {
-                        return sql_fail(error);
-                    }
-                    if def.persistence != crate::storage::RelationPersistence::Temporary {
-                        let lsn = storage.bump_lsn();
-                        if let Err(error) = wal.stage_reserved(
-                            txn.txid,
-                            lsn,
-                            &WalOp::DropExtendedStatistics {
-                                schema: definition.schema.as_str(),
-                                name: definition.name.as_str(),
-                            },
+                        if let Err(error) = txn.record_ddl(
+                            storage,
+                            super::txn::DdlUndo::StatisticsDropped(statistics_slot as u32),
                         ) {
                             storage.rollback_extended_statistics_drop(statistics_slot, txn.txid);
                             return sql_fail(error);
                         }
                     }
-                    if let Err(error) = txn.record_ddl(
-                        storage,
-                        super::txn::DdlUndo::StatisticsDropped(statistics_slot as u32),
-                    ) {
-                        storage.rollback_extended_statistics_drop(statistics_slot, txn.txid);
-                        return sql_fail(error);
+                    let trigger_target = crate::storage::TriggerTarget::Table(index as u16);
+                    loop {
+                        let trigger = storage.triggers_with_slots_visible_to(txn.txid).find_map(
+                            |(slot, trigger)| (trigger.target == trigger_target).then_some(slot),
+                        );
+                        let Some(slot) = trigger else { break };
+                        if let Err(error) = storage.drop_trigger(slot, txn.txid) {
+                            return sql_fail(error);
+                        }
+                        if let Err(error) = txn
+                            .record_ddl(storage, super::txn::DdlUndo::TriggerDropped(slot as u32))
+                        {
+                            storage.rollback_trigger_drop(slot, txn.txid);
+                            return sql_fail(error);
+                        }
                     }
-                }
-                let trigger_target = crate::storage::TriggerTarget::Table(index as u16);
-                loop {
-                    let trigger = storage.triggers_with_slots_visible_to(txn.txid).find_map(
-                        |(slot, trigger)| (trigger.target == trigger_target).then_some(slot),
-                    );
-                    let Some(slot) = trigger else { break };
-                    if let Err(error) = storage.drop_trigger(slot, txn.txid) {
-                        return sql_fail(error);
+                    let wal_result =
+                        if def.persistence == crate::storage::RelationPersistence::Temporary {
+                            Ok(())
+                        } else {
+                            let lsn = storage.bump_lsn();
+                            wal.stage_reserved(
+                                txn.txid,
+                                lsn,
+                                &WalOp::DropTable {
+                                    identity: storage.table_position(index),
+                                    schema: def.schema.as_str(),
+                                    name: def.name.as_str(),
+                                },
+                            )
+                        };
+                    if let Err(e) = wal_result {
+                        return sql_fail(e);
                     }
-                    if let Err(error) =
-                        txn.record_ddl(storage, super::txn::DdlUndo::TriggerDropped(slot as u32))
-                    {
-                        storage.rollback_trigger_drop(slot, txn.txid);
-                        return sql_fail(error);
-                    }
-                }
-                let wal_result =
-                    if def.persistence == crate::storage::RelationPersistence::Temporary {
-                        Ok(())
-                    } else {
-                        let lsn = storage.bump_lsn();
-                        wal.stage_reserved(
-                            txn.txid,
-                            lsn,
-                            &WalOp::DropTable {
-                                identity: storage.table_position(index),
-                                schema: def.schema.as_str(),
-                                name: def.name.as_str(),
-                            },
-                        )
+                    let dropped = match storage.drop_table_in(index, txn.txid) {
+                        Ok(undo) => undo,
+                        Err(error) => return sql_fail(error),
                     };
-                if let Err(e) = wal_result {
-                    return sql_fail(e);
+                    if let Err(e) = txn.record_table_drop(storage, dropped) {
+                        return sql_fail(e);
+                    }
+                    // A table's indexes are dropped with it (no separate journal
+                    // record; DropTable replay re-applies this).
+                    storage.drop_indexes_for(index, txn.txid);
                 }
-                let dropped = match storage.drop_table_in(index, txn.txid) {
-                    Ok(undo) => undo,
-                    Err(error) => return sql_fail(error),
-                };
-                if let Err(e) = txn.record_table_drop(storage, dropped) {
-                    return sql_fail(e);
+                _ if statement.if_exists => {
+                    // PostgreSQL's skip notice carries SQLSTATE 00000.
+                    responder.notice(
+                        crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                        stack_format!(128, "table \"{}\" does not exist, skipping", name.name)
+                            .as_str(),
+                    )?;
                 }
-                // A table's indexes are dropped with it (no separate journal
-                // record; DropTable replay re-applies this).
-                storage.drop_indexes_for(index, txn.txid);
+                _ => return sql_fail(undefined_kind("table", name.name)),
             }
-            _ if statement.if_exists => {
-                // PostgreSQL's skip notice carries SQLSTATE 00000.
-                responder.notice(
-                    crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(128, "table \"{}\" does not exist, skipping", name.name).as_str(),
-                )?;
-            }
-            _ => return sql_fail(undefined_kind("table", name.name)),
         }
-    }
-    responder.command_complete(tag)?;
-    sql_ok()
+        responder.command_complete(tag)?;
+        sql_ok()
+    })
 }
 
 /// CREATE SCHEMA [IF NOT EXISTS]: registers a schema in the catalog,
@@ -14000,293 +14161,373 @@ pub(crate) fn drop_schema(
             }
         }
     }
-    let selected_schema = temporary.or_else(|| {
-        slots[..n_slots]
-            .first()
-            .map(|&slot| storage.schema_def_for(slot, txn.txid).name)
-    });
-    // Everything the drop sweeps up, across all listed schemas.
-    let schema_transaction = txn.txid;
-    let in_listed = |storage: &Storage, schema: &str| {
-        temporary.is_some_and(|selected| selected.as_str() == schema)
-            || slots[..n_slots].iter().any(|&slot| {
-                storage
-                    .schema_def_for(slot, schema_transaction)
-                    .name
-                    .as_str()
-                    == schema
-            })
-    };
-    let type_uses_listed_schema = |storage: &Storage,
-                                   base: ColType,
-                                   txid: u32|
-     -> Result<bool, SqlError> {
-        use crate::storage::NamedTypeKind;
-        let (kind, creation) = match base {
-            ColType::Enum(creation) | ColType::Array(super::types::ArrElem::Enum(creation)) => (
-                NamedTypeKind::Enum,
-                crate::storage::TypeCreation::require(creation)?,
-            ),
-            ColType::Composite(creation)
-            | ColType::Array(super::types::ArrElem::Composite(creation)) => (
-                NamedTypeKind::Composite,
-                crate::storage::TypeCreation::require(creation)?,
-            ),
-            _ => return Ok(false),
-        };
-        let target = crate::storage::TypeDefinitionTarget::by_creation(storage, kind, creation)?;
-        let schema = match kind {
-            NamedTypeKind::Enum => {
-                storage
-                    .read_enum_definition(target, txid)?
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type no longer exists")
-                    })?
-                    .schema
+    let report = if temporary.is_some() {
+        Ok(None)
+    } else {
+        (|| {
+            let originals = arena
+                .alloc_slice_with(n_slots, |_| DROPPED_NOTHING)
+                .map_err(|_| arena_full())?;
+            for (original, slot) in originals.iter_mut().zip(&slots[..n_slots]) {
+                *original = ObjectAddress::new(
+                    super::catalog::PG_NAMESPACE_OID,
+                    super::catalog::namespace_oid_for_slot(storage, *slot),
+                    0,
+                );
             }
-            NamedTypeKind::Composite => {
-                storage
-                    .read_composite_definition(target, txid)?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "composite type no longer exists"
-                        )
-                    })?
-                    .schema
-            }
-            NamedTypeKind::Domain => unreachable!("selected enum or composite representation"),
+            dependency_report::report_drop(storage, txn.txid, originals, cascade, arena, responder)
+        })()
+    };
+    run_reported_drop(report, responder, |responder| {
+        let selected_schema = temporary.or_else(|| {
+            slots[..n_slots]
+                .first()
+                .map(|&slot| storage.schema_def_for(slot, txn.txid).name)
+        });
+        // Everything the drop sweeps up, across all listed schemas.
+        let schema_transaction = txn.txid;
+        let in_listed = |storage: &Storage, schema: &str| {
+            temporary.is_some_and(|selected| selected.as_str() == schema)
+                || slots[..n_slots].iter().any(|&slot| {
+                    storage
+                        .schema_def_for(slot, schema_transaction)
+                        .name
+                        .as_str()
+                        == schema
+                })
         };
-        Ok(in_listed(storage, schema.as_str()))
-    };
-
-    let objects = match arena.alloc_slice_with(storage.schema_drop_object_count(txn.txid), |_| None)
-    {
-        Ok(objects) => objects,
-        Err(_) => return sql_fail(arena_full()),
-    };
-    let mut n_objects = 0usize;
-    let mut push = |o: SchemaObject, n_objects: &mut usize| -> Result<(), SqlError> {
-        if *n_objects == objects.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "DROP SCHEMA sweeps up more than {} objects",
-                objects.len()
-            ));
-        }
-        objects[*n_objects] = Some(o);
-        *n_objects += 1;
-        Ok(())
-    };
-    #[derive(Clone, Copy)]
-    struct TableDropSelection {
-        source: crate::storage::TableDefinitionTarget,
-        mode: Option<crate::sql::ast::TableLockMode>,
-    }
-    let table_locks =
-        match arena.alloc_slice_with(storage.table_count(), |_| None::<TableDropSelection>) {
-            Ok(locks) => locks,
-            Err(_) => return sql_fail(arena_full()),
-        };
-    for (t, selected) in table_locks.iter_mut().enumerate() {
-        if !storage.table_slot_visible_to(t, txn.txid) {
-            continue;
-        }
-        let (source, schema, name) = {
-            let definitions = storage.table_definition_images();
-            let (source, definition) = match definitions.selection(storage, t, txn.txid) {
-                Ok(selection) => selection,
-                Err(error) => return sql_fail(error),
+        let type_uses_listed_schema =
+            |storage: &Storage, base: ColType, txid: u32| -> Result<bool, SqlError> {
+                use crate::storage::NamedTypeKind;
+                let (kind, creation) = match base {
+                    ColType::Enum(creation)
+                    | ColType::Array(super::types::ArrElem::Enum(creation)) => (
+                        NamedTypeKind::Enum,
+                        crate::storage::TypeCreation::require(creation)?,
+                    ),
+                    ColType::Composite(creation)
+                    | ColType::Array(super::types::ArrElem::Composite(creation)) => (
+                        NamedTypeKind::Composite,
+                        crate::storage::TypeCreation::require(creation)?,
+                    ),
+                    _ => return Ok(false),
+                };
+                let target =
+                    crate::storage::TypeDefinitionTarget::by_creation(storage, kind, creation)?;
+                let schema = match kind {
+                    NamedTypeKind::Enum => {
+                        storage
+                            .read_enum_definition(target, txid)?
+                            .ok_or_else(|| {
+                                sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type no longer exists")
+                            })?
+                            .schema
+                    }
+                    NamedTypeKind::Composite => {
+                        storage
+                            .read_composite_definition(target, txid)?
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "composite type no longer exists"
+                                )
+                            })?
+                            .schema
+                    }
+                    NamedTypeKind::Domain => {
+                        unreachable!("selected enum or composite representation")
+                    }
+                };
+                Ok(in_listed(storage, schema.as_str()))
             };
-            (source, definition.schema, definition.name)
+
+        let objects =
+            match arena.alloc_slice_with(storage.schema_drop_object_count(txn.txid), |_| None) {
+                Ok(objects) => objects,
+                Err(_) => return sql_fail(arena_full()),
+            };
+        let mut n_objects = 0usize;
+        let mut push = |o: SchemaObject, n_objects: &mut usize| -> Result<(), SqlError> {
+            if *n_objects == objects.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "DROP SCHEMA sweeps up more than {} objects",
+                    objects.len()
+                ));
+            }
+            objects[*n_objects] = Some(o);
+            *n_objects += 1;
+            Ok(())
         };
-        // Keep the original identity/revision for lock validation, releasing
-        // the wide image before the next table or any catalog callback.
-        *selected = Some(TableDropSelection { source, mode: None });
-        if !in_listed(storage, schema.as_str()) {
-            continue;
+        #[derive(Clone, Copy)]
+        struct TableDropSelection {
+            source: crate::storage::TableDefinitionTarget,
+            mode: Option<crate::sql::ast::TableLockMode>,
         }
-        let object = match storage.matview_slot(schema.as_str(), name.as_str(), txn.txid) {
-            Some(catalog) => SchemaObject::Matview { table: t, catalog },
-            None => SchemaObject::Table(t),
-        };
-        if let Err(e) = push(object, &mut n_objects) {
-            return sql_fail(e);
-        }
-    }
-    for v in 0..storage.view_count() {
-        if storage.view(v).visible_to(txn.txid)
-            && in_listed(storage, storage.view(v).schema.as_str())
-            && let Err(e) = push(SchemaObject::View(v), &mut n_objects)
-        {
-            return sql_fail(e);
-        }
-    }
-    for routine in 0..storage.routine_count() {
-        let definition = storage.routine_for(routine, txn.txid);
-        if definition.visible_to(txn.txid)
-            && in_listed(storage, definition.schema_for(txn.txid).as_str())
-            && let Err(error) = push(SchemaObject::Routine(routine), &mut n_objects)
-        {
-            return sql_fail(error);
-        }
-    }
-    for (slot, definition) in storage.collations_visible_to(txn.txid) {
-        if in_listed(storage, definition.schema.as_str())
-            && let Err(error) = push(SchemaObject::Collation(slot), &mut n_objects)
-        {
-            return sql_fail(error);
-        }
-    }
-    for (slot, definition) in storage.conversions_visible_to(txn.txid) {
-        if in_listed(storage, definition.schema.as_str())
-            && let Err(error) = push(SchemaObject::Conversion(slot), &mut n_objects)
-        {
-            return sql_fail(error);
-        }
-    }
-    for (slot, definition) in storage.text_search_objects_visible_to(txn.txid) {
-        if in_listed(storage, definition.schema().as_str())
-            && let Err(error) = push(SchemaObject::TextSearch(slot), &mut n_objects)
-        {
-            return sql_fail(error);
-        }
-    }
-    for sequence in 0..storage.sequence_count() {
-        let sequence_definition = storage.sequence_for(sequence, txn.txid);
-        if sequence_definition.visible_to(txn.txid)
-            && in_listed(storage, sequence_definition.schema.as_str())
-            && sequence_definition.owner.is_none()
-            && let Err(e) = push(SchemaObject::Sequence(sequence), &mut n_objects)
-        {
-            return sql_fail(e);
-        }
-    }
-    let schema_domains = match arena.alloc_slice_with(storage.domain_count(), |_| false) {
-        Ok(values) => values,
-        Err(_) => return sql_fail(arena_full()),
-    };
-    for (domain, selected) in schema_domains
-        .iter_mut()
-        .enumerate()
-        .take(storage.domain_count())
-    {
-        if storage.domain_slot_visible_to(domain, txn.txid)
-            && in_listed(
-                storage,
-                storage.domain_for(domain, txn.txid).schema.as_str(),
-            )
-        {
-            *selected = true;
-            if let Err(e) = push(SchemaObject::Domain(domain), &mut n_objects) {
+        let table_locks =
+            match arena.alloc_slice_with(storage.table_count(), |_| None::<TableDropSelection>) {
+                Ok(locks) => locks,
+                Err(_) => return sql_fail(arena_full()),
+            };
+        for (t, selected) in table_locks.iter_mut().enumerate() {
+            if !storage.table_slot_visible_to(t, txn.txid) {
+                continue;
+            }
+            let (source, schema, name) = {
+                let definitions = storage.table_definition_images();
+                let (source, definition) = match definitions.selection(storage, t, txn.txid) {
+                    Ok(selection) => selection,
+                    Err(error) => return sql_fail(error),
+                };
+                (source, definition.schema, definition.name)
+            };
+            // Keep the original identity/revision for lock validation, releasing
+            // the wide image before the next table or any catalog callback.
+            *selected = Some(TableDropSelection { source, mode: None });
+            if !in_listed(storage, schema.as_str()) {
+                continue;
+            }
+            let object = match storage.matview_slot(schema.as_str(), name.as_str(), txn.txid) {
+                Some(catalog) => SchemaObject::Matview { table: t, catalog },
+                None => SchemaObject::Table(t),
+            };
+            if let Err(e) = push(object, &mut n_objects) {
                 return sql_fail(e);
             }
         }
-    }
-    for enumeration in 0..storage.enum_count() {
-        if storage.enum_slot_visible_to(enumeration, txn.txid)
-            && in_listed(
-                storage,
-                storage.enum_for(enumeration, txn.txid).schema.as_str(),
-            )
-            && let Err(e) = push(SchemaObject::Enum(enumeration), &mut n_objects)
-        {
-            return sql_fail(e);
+        for v in 0..storage.view_count() {
+            if storage.view(v).visible_to(txn.txid)
+                && in_listed(storage, storage.view(v).schema.as_str())
+                && let Err(e) = push(SchemaObject::View(v), &mut n_objects)
+            {
+                return sql_fail(e);
+            }
         }
-    }
-    for composite in 0..storage.composite_count() {
-        let definition = storage.composite_for(composite, txn.txid);
-        if storage.composite_slot_visible_to(composite, txn.txid)
-            && in_listed(storage, definition.schema.as_str())
-            && let Err(error) = push(SchemaObject::Composite(composite), &mut n_objects)
-        {
-            return sql_fail(error);
+        for routine in 0..storage.routine_count() {
+            let definition = storage.routine_for(routine, txn.txid);
+            if definition.visible_to(txn.txid)
+                && in_listed(storage, definition.schema_for(txn.txid).as_str())
+                && let Err(error) = push(SchemaObject::Routine(routine), &mut n_objects)
+            {
+                return sql_fail(error);
+            }
         }
-    }
-    for (operator, definition) in storage.operators_visible_to(txn.txid) {
-        if in_listed(storage, definition.schema.as_str())
-            && let Err(error) = push(SchemaObject::Operator(operator), &mut n_objects)
-        {
-            return sql_fail(error);
+        for (slot, definition) in storage.collations_visible_to(txn.txid) {
+            if in_listed(storage, definition.schema.as_str())
+                && let Err(error) = push(SchemaObject::Collation(slot), &mut n_objects)
+            {
+                return sql_fail(error);
+            }
         }
-    }
-    for (family, definition) in storage.operator_families_visible_to(txn.txid) {
-        if in_listed(storage, definition.schema.as_str())
-            && let Err(error) = push(SchemaObject::OperatorFamily(family), &mut n_objects)
-        {
-            return sql_fail(error);
+        for (slot, definition) in storage.conversions_visible_to(txn.txid) {
+            if in_listed(storage, definition.schema.as_str())
+                && let Err(error) = push(SchemaObject::Conversion(slot), &mut n_objects)
+            {
+                return sql_fail(error);
+            }
         }
-    }
-    for (class, definition) in storage.operator_classes_visible_to(txn.txid) {
-        if in_listed(storage, definition.schema.as_str())
-            && let Err(error) = push(SchemaObject::OperatorClass(class), &mut n_objects)
-        {
-            return sql_fail(error);
+        for (slot, definition) in storage.text_search_objects_visible_to(txn.txid) {
+            if in_listed(storage, definition.schema().as_str())
+                && let Err(error) = push(SchemaObject::TextSearch(slot), &mut n_objects)
+            {
+                return sql_fail(error);
+            }
         }
-    }
-    for (statistics, definition) in storage.extended_statistics_visible(txn.txid) {
-        let mutable = definition.definition_for(txn.txid);
-        if (in_listed(storage, mutable.schema.as_str())
-            || (cascade
+        for sequence in 0..storage.sequence_count() {
+            let sequence_definition = storage.sequence_for(sequence, txn.txid);
+            if sequence_definition.visible_to(txn.txid)
+                && in_listed(storage, sequence_definition.schema.as_str())
+                && sequence_definition.owner.is_none()
+                && let Err(e) = push(SchemaObject::Sequence(sequence), &mut n_objects)
+            {
+                return sql_fail(e);
+            }
+        }
+        let schema_domains = match arena.alloc_slice_with(storage.domain_count(), |_| false) {
+            Ok(values) => values,
+            Err(_) => return sql_fail(arena_full()),
+        };
+        for (domain, selected) in schema_domains
+            .iter_mut()
+            .enumerate()
+            .take(storage.domain_count())
+        {
+            if storage.domain_slot_visible_to(domain, txn.txid)
                 && in_listed(
                     storage,
-                    storage
-                        .table_def(usize::from(definition.table), txn.txid)
-                        .schema
-                        .as_str(),
-                )))
-            && let Err(error) = push(SchemaObject::Statistics(statistics), &mut n_objects)
-        {
-            return sql_fail(error);
-        }
-    }
-    if cascade {
-        // Include contained domain arrays before dependent columns and queries.
-        loop {
-            let mut changed = false;
-            for domain_slot in 0..storage.domain_count() {
-                if !storage.domain_slot_visible_to(domain_slot, txn.txid)
-                    || schema_domains[domain_slot]
-                {
-                    continue;
+                    storage.domain_for(domain, txn.txid).schema.as_str(),
+                )
+            {
+                *selected = true;
+                if let Err(e) = push(SchemaObject::Domain(domain), &mut n_objects) {
+                    return sql_fail(e);
                 }
-                let domain = storage.domain_for(domain_slot, txn.txid);
-                let parent_in_schema = match selected_domain_dependency(
+            }
+        }
+        for enumeration in 0..storage.enum_count() {
+            if storage.enum_slot_visible_to(enumeration, txn.txid)
+                && in_listed(
                     storage,
-                    domain_slot,
-                    schema_domains,
-                    txn.txid,
-                ) {
-                    Ok(parent) => parent.is_some(),
-                    Err(error) => return sql_fail(error),
-                };
-                let type_in_schema = match type_uses_listed_schema(storage, domain.base, txn.txid) {
-                    Ok(selected) => selected,
-                    Err(error) => return sql_fail(error),
-                };
-                if parent_in_schema || type_in_schema {
-                    if let Err(error) = push(SchemaObject::Domain(domain_slot), &mut n_objects) {
-                        return sql_fail(error);
-                    }
-                    schema_domains[domain_slot] = true;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
+                    storage.enum_for(enumeration, txn.txid).schema.as_str(),
+                )
+                && let Err(e) = push(SchemaObject::Enum(enumeration), &mut n_objects)
+            {
+                return sql_fail(e);
             }
         }
-        loop {
-            let mut dependent = None;
-            for table in 0..storage.table_count() {
-                if !storage.table_slot_visible_to(table, txn.txid) {
-                    continue;
+        for composite in 0..storage.composite_count() {
+            let definition = storage.composite_for(composite, txn.txid);
+            if storage.composite_slot_visible_to(composite, txn.txid)
+                && in_listed(storage, definition.schema.as_str())
+                && let Err(error) = push(SchemaObject::Composite(composite), &mut n_objects)
+            {
+                return sql_fail(error);
+            }
+        }
+        for (operator, definition) in storage.operators_visible_to(txn.txid) {
+            if in_listed(storage, definition.schema.as_str())
+                && let Err(error) = push(SchemaObject::Operator(operator), &mut n_objects)
+            {
+                return sql_fail(error);
+            }
+        }
+        for (family, definition) in storage.operator_families_visible_to(txn.txid) {
+            if in_listed(storage, definition.schema.as_str())
+                && let Err(error) = push(SchemaObject::OperatorFamily(family), &mut n_objects)
+            {
+                return sql_fail(error);
+            }
+        }
+        for (class, definition) in storage.operator_classes_visible_to(txn.txid) {
+            if in_listed(storage, definition.schema.as_str())
+                && let Err(error) = push(SchemaObject::OperatorClass(class), &mut n_objects)
+            {
+                return sql_fail(error);
+            }
+        }
+        for (statistics, definition) in storage.extended_statistics_visible(txn.txid) {
+            let mutable = definition.definition_for(txn.txid);
+            if (in_listed(storage, mutable.schema.as_str())
+                || (cascade
+                    && in_listed(
+                        storage,
+                        storage
+                            .table_def(usize::from(definition.table), txn.txid)
+                            .schema
+                            .as_str(),
+                    )))
+                && let Err(error) = push(SchemaObject::Statistics(statistics), &mut n_objects)
+            {
+                return sql_fail(error);
+            }
+        }
+        if cascade {
+            // Include contained domain arrays before dependent columns and queries.
+            loop {
+                let mut changed = false;
+                for domain_slot in 0..storage.domain_count() {
+                    if !storage.domain_slot_visible_to(domain_slot, txn.txid)
+                        || schema_domains[domain_slot]
+                    {
+                        continue;
+                    }
+                    let domain = storage.domain_for(domain_slot, txn.txid);
+                    let parent_in_schema = match selected_domain_dependency(
+                        storage,
+                        domain_slot,
+                        schema_domains,
+                        txn.txid,
+                    ) {
+                        Ok(parent) => parent.is_some(),
+                        Err(error) => return sql_fail(error),
+                    };
+                    let type_in_schema =
+                        match type_uses_listed_schema(storage, domain.base, txn.txid) {
+                            Ok(selected) => selected,
+                            Err(error) => return sql_fail(error),
+                        };
+                    if parent_in_schema || type_in_schema {
+                        if let Err(error) = push(SchemaObject::Domain(domain_slot), &mut n_objects)
+                        {
+                            return sql_fail(error);
+                        }
+                        schema_domains[domain_slot] = true;
+                        changed = true;
+                    }
                 }
-                let def = storage.table_def(table, txn.txid);
-                if in_listed(storage, def.schema.as_str()) {
-                    continue;
+                if !changed {
+                    break;
                 }
-                let mut uses_schema_type = false;
+            }
+            loop {
+                let mut dependent = None;
+                for table in 0..storage.table_count() {
+                    if !storage.table_slot_visible_to(table, txn.txid) {
+                        continue;
+                    }
+                    let def = storage.table_def(table, txn.txid);
+                    if in_listed(storage, def.schema.as_str()) {
+                        continue;
+                    }
+                    let mut uses_schema_type = false;
+                    for column in def.columns() {
+                        let result = match storage.bind_routine_result(
+                            crate::storage::RoutineResult {
+                                ctype: column.ctype,
+                                user_type: column.user_type,
+                            },
+                            txn.txid,
+                        ) {
+                            Ok(result) => result,
+                            Err(error) => return sql_fail(error),
+                        };
+                        let Some(identity) = result.user_type else {
+                            continue;
+                        };
+                        if in_listed(storage, identity.schema.as_str()) {
+                            uses_schema_type = true;
+                            break;
+                        }
+                        let domain_slot = match storage.domain_reference_slot(identity, txn.txid) {
+                            Ok(Some(slot)) => slot,
+                            Ok(None) => continue,
+                            Err(error) => return sql_fail(error),
+                        };
+                        let parent_in_schema = match selected_domain_dependency(
+                            storage,
+                            domain_slot,
+                            schema_domains,
+                            txn.txid,
+                        ) {
+                            Ok(parent) => parent.is_some(),
+                            Err(error) => return sql_fail(error),
+                        };
+                        let type_in_schema = match type_uses_listed_schema(
+                            storage,
+                            storage.domain_for(domain_slot, txn.txid).base,
+                            txn.txid,
+                        ) {
+                            Ok(selected) => selected,
+                            Err(error) => return sql_fail(error),
+                        };
+                        if parent_in_schema || type_in_schema {
+                            uses_schema_type = true;
+                            break;
+                        }
+                    }
+                    if !uses_schema_type {
+                        continue;
+                    }
+                    dependent = Some(table);
+                    break;
+                }
+                let Some(table_slot) = dependent else {
+                    break;
+                };
+                let def = storage.table_def(table_slot, txn.txid);
+                let (table_schema, table) = (def.schema, def.name);
+                let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
+                let mut column_count = 0;
                 for column in def.columns() {
                     let result = match storage.bind_routine_result(
                         crate::storage::RoutineResult {
@@ -14298,188 +14539,199 @@ pub(crate) fn drop_schema(
                         Ok(result) => result,
                         Err(error) => return sql_fail(error),
                     };
-                    let Some(identity) = result.user_type else {
-                        continue;
-                    };
-                    if in_listed(storage, identity.schema.as_str()) {
-                        uses_schema_type = true;
-                        break;
-                    }
-                    let domain_slot = match storage.domain_reference_slot(identity, txn.txid) {
-                        Ok(Some(slot)) => slot,
-                        Ok(None) => continue,
+                    let directly_in_schema = result
+                        .user_type
+                        .is_some_and(|identity| in_listed(storage, identity.schema.as_str()));
+                    let domain_slot = match result
+                        .user_type
+                        .map(|identity| storage.domain_reference_slot(identity, txn.txid))
+                        .transpose()
+                    {
+                        Ok(slot) => slot.flatten(),
                         Err(error) => return sql_fail(error),
                     };
-                    let parent_in_schema = match selected_domain_dependency(
-                        storage,
-                        domain_slot,
-                        schema_domains,
-                        txn.txid,
-                    ) {
-                        Ok(parent) => parent.is_some(),
-                        Err(error) => return sql_fail(error),
+                    let through_domain = if let Some(domain_slot) = domain_slot {
+                        let parent_in_schema = match selected_domain_dependency(
+                            storage,
+                            domain_slot,
+                            schema_domains,
+                            txn.txid,
+                        ) {
+                            Ok(parent) => parent.is_some(),
+                            Err(error) => return sql_fail(error),
+                        };
+                        let type_in_schema = match type_uses_listed_schema(
+                            storage,
+                            storage.domain_for(domain_slot, txn.txid).base,
+                            txn.txid,
+                        ) {
+                            Ok(selected) => selected,
+                            Err(error) => return sql_fail(error),
+                        };
+                        parent_in_schema || type_in_schema
+                    } else {
+                        false
                     };
-                    let type_in_schema = match type_uses_listed_schema(
-                        storage,
-                        storage.domain_for(domain_slot, txn.txid).base,
-                        txn.txid,
-                    ) {
-                        Ok(selected) => selected,
-                        Err(error) => return sql_fail(error),
-                    };
-                    if parent_in_schema || type_in_schema {
-                        uses_schema_type = true;
-                        break;
+                    if directly_in_schema || through_domain {
+                        columns[column_count] = column.name;
+                        column_count += 1;
                     }
                 }
-                if !uses_schema_type {
-                    continue;
-                }
-                dependent = Some(table);
-                break;
-            }
-            let Some(table_slot) = dependent else {
-                break;
-            };
-            let def = storage.table_def(table_slot, txn.txid);
-            let (table_schema, table) = (def.schema, def.name);
-            let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
-            let mut column_count = 0;
-            for column in def.columns() {
-                let result = match storage.bind_routine_result(
-                    crate::storage::RoutineResult {
-                        ctype: column.ctype,
-                        user_type: column.user_type,
-                    },
-                    txn.txid,
+                drop(def);
+                if let Err(error) = cascade_drop_type_column(
+                    storage,
+                    wal,
+                    txn,
+                    scratch,
+                    table_schema,
+                    table,
+                    &columns[..column_count],
+                    arena,
+                    seq_session,
+                    responder,
                 ) {
-                    Ok(result) => result,
-                    Err(error) => return sql_fail(error),
-                };
-                let directly_in_schema = result
-                    .user_type
-                    .is_some_and(|identity| in_listed(storage, identity.schema.as_str()));
-                let domain_slot = match result
-                    .user_type
-                    .map(|identity| storage.domain_reference_slot(identity, txn.txid))
-                    .transpose()
-                {
-                    Ok(slot) => slot.flatten(),
-                    Err(error) => return sql_fail(error),
-                };
-                let through_domain = if let Some(domain_slot) = domain_slot {
-                    let parent_in_schema = match selected_domain_dependency(
-                        storage,
-                        domain_slot,
-                        schema_domains,
-                        txn.txid,
-                    ) {
-                        Ok(parent) => parent.is_some(),
-                        Err(error) => return sql_fail(error),
-                    };
-                    let type_in_schema = match type_uses_listed_schema(
-                        storage,
-                        storage.domain_for(domain_slot, txn.txid).base,
-                        txn.txid,
-                    ) {
-                        Ok(selected) => selected,
-                        Err(error) => return sql_fail(error),
-                    };
-                    parent_in_schema || type_in_schema
-                } else {
-                    false
-                };
-                if directly_in_schema || through_domain {
-                    columns[column_count] = column.name;
-                    column_count += 1;
+                    return sql_fail(error);
                 }
             }
-            drop(def);
-            if let Err(error) = cascade_drop_type_column(
-                storage,
-                wal,
-                txn,
-                scratch,
-                table_schema,
-                table,
-                &columns[..column_count],
-                arena,
-                seq_session,
-                responder,
-            ) {
-                return sql_fail(error);
+            // Stored queries outside the dropped schemas follow their resolved
+            // dependencies transitively, exactly as pg_depend drives CASCADE.
+            if n_objects > 0 {
+                let closure =
+                    stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
+                        in_listed(storage, dependency.schema.as_str())
+                            || (dependency.class == crate::storage::DependencyClass::Domain
+                                && schema_domains[usize::from(dependency.slot)])
+                    });
+                let StoredDependencyClosure {
+                    views: dependent_views,
+                    matviews: dependent_matviews,
+                    routines: dependent_routines,
+                    rules: _dependent_rules,
+                } = match closure {
+                    Ok(closure) => closure,
+                    Err(error) => return sql_fail(error),
+                };
+                for (view_slot, &is_dependent) in dependent_views
+                    .iter()
+                    .enumerate()
+                    .take(storage.view_count())
+                {
+                    let view = storage.view(view_slot);
+                    if is_dependent
+                        && view.visible_to(txn.txid)
+                        && !in_listed(storage, view.schema.as_str())
+                        && let Err(error) = push(SchemaObject::View(view_slot), &mut n_objects)
+                    {
+                        return sql_fail(error);
+                    }
+                }
+                for (matview_slot, &is_dependent) in dependent_matviews
+                    .iter()
+                    .enumerate()
+                    .take(storage.matview_count())
+                {
+                    if !is_dependent || !storage.matview(matview_slot).visible_to(txn.txid) {
+                        continue;
+                    }
+                    let table = storage.matview_table(matview_slot);
+                    let definition = storage.table_def(table, txn.txid);
+                    if in_listed(storage, definition.schema.as_str()) {
+                        continue;
+                    }
+                    if let Err(error) = push(
+                        SchemaObject::Matview {
+                            table,
+                            catalog: matview_slot,
+                        },
+                        &mut n_objects,
+                    ) {
+                        return sql_fail(error);
+                    }
+                }
+                for (routine_slot, &is_dependent) in dependent_routines
+                    .iter()
+                    .enumerate()
+                    .take(storage.routine_count())
+                {
+                    let routine = storage.routine_for(routine_slot, txn.txid);
+                    if is_dependent
+                        && storage
+                            .routine_identity_for(routine_slot, txn.txid)
+                            .is_some()
+                        && !in_listed(storage, routine.schema_for(txn.txid).as_str())
+                        && let Err(error) =
+                            push(SchemaObject::Routine(routine_slot), &mut n_objects)
+                    {
+                        return sql_fail(error);
+                    }
+                }
+                for policy_slot in 0..storage.policy_count() {
+                    let policy = storage.policy(policy_slot);
+                    if !policy.visible_to(txn.txid)
+                        || in_listed(
+                            storage,
+                            storage
+                                .table_def(usize::from(policy.table), txn.txid)
+                                .schema
+                                .as_str(),
+                        )
+                    {
+                        continue;
+                    }
+                    let dependencies = storage.policy_dependencies(policy_slot, txn.txid);
+                    let direct_dependency = dependencies
+                        .entries()
+                        .iter()
+                        .find(|dependency| {
+                            in_listed(storage, dependency.schema.as_str())
+                                || (dependency.class == crate::storage::DependencyClass::Domain
+                                    && schema_domains[usize::from(dependency.slot)])
+                        })
+                        .copied();
+                    if (direct_dependency.is_some()
+                        || policy_depends_on_selected_stored_query(
+                            storage,
+                            txn.txid,
+                            dependencies.view(),
+                            dependent_views,
+                            dependent_matviews,
+                            dependent_routines,
+                        ))
+                        && let Err(error) = push(
+                            SchemaObject::Policy {
+                                slot: policy_slot,
+                                root_schema: direct_dependency
+                                    .map(|dependency| dependency.schema)
+                                    .unwrap_or_else(|| {
+                                        selected_schema
+                                            .expect("dependent object has a selected schema")
+                                    }),
+                                root_class: direct_dependency.map(|dependency| dependency.class),
+                                root_slot: direct_dependency
+                                    .map_or(usize::MAX, |dependency| usize::from(dependency.slot)),
+                            },
+                            &mut n_objects,
+                        )
+                    {
+                        return sql_fail(error);
+                    }
+                }
             }
         }
-        // Stored queries outside the dropped schemas follow their resolved
-        // dependencies transitively, exactly as pg_depend drives CASCADE.
-        if n_objects > 0 {
-            let closure = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
-                in_listed(storage, dependency.schema.as_str())
-                    || (dependency.class == crate::storage::DependencyClass::Domain
-                        && schema_domains[usize::from(dependency.slot)])
-            });
+        if !cascade && n_objects > 0 {
             let StoredDependencyClosure {
                 views: dependent_views,
                 matviews: dependent_matviews,
                 routines: dependent_routines,
                 rules: _dependent_rules,
-            } = match closure {
+            } = match stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
+                in_listed(storage, dependency.schema.as_str())
+                    || (dependency.class == crate::storage::DependencyClass::Domain
+                        && schema_domains[usize::from(dependency.slot)])
+            }) {
                 Ok(closure) => closure,
                 Err(error) => return sql_fail(error),
             };
-            for (view_slot, &is_dependent) in dependent_views
-                .iter()
-                .enumerate()
-                .take(storage.view_count())
-            {
-                let view = storage.view(view_slot);
-                if is_dependent
-                    && view.visible_to(txn.txid)
-                    && !in_listed(storage, view.schema.as_str())
-                    && let Err(error) = push(SchemaObject::View(view_slot), &mut n_objects)
-                {
-                    return sql_fail(error);
-                }
-            }
-            for (matview_slot, &is_dependent) in dependent_matviews
-                .iter()
-                .enumerate()
-                .take(storage.matview_count())
-            {
-                if !is_dependent || !storage.matview(matview_slot).visible_to(txn.txid) {
-                    continue;
-                }
-                let table = storage.matview_table(matview_slot);
-                let definition = storage.table_def(table, txn.txid);
-                if in_listed(storage, definition.schema.as_str()) {
-                    continue;
-                }
-                if let Err(error) = push(
-                    SchemaObject::Matview {
-                        table,
-                        catalog: matview_slot,
-                    },
-                    &mut n_objects,
-                ) {
-                    return sql_fail(error);
-                }
-            }
-            for (routine_slot, &is_dependent) in dependent_routines
-                .iter()
-                .enumerate()
-                .take(storage.routine_count())
-            {
-                let routine = storage.routine_for(routine_slot, txn.txid);
-                if is_dependent
-                    && storage
-                        .routine_identity_for(routine_slot, txn.txid)
-                        .is_some()
-                    && !in_listed(storage, routine.schema_for(txn.txid).as_str())
-                    && let Err(error) = push(SchemaObject::Routine(routine_slot), &mut n_objects)
-                {
-                    return sql_fail(error);
-                }
-            }
             for policy_slot in 0..storage.policy_count() {
                 let policy = storage.policy(policy_slot);
                 if !policy.visible_to(txn.txid)
@@ -14531,1244 +14783,957 @@ pub(crate) fn drop_schema(
                 }
             }
         }
-    }
-    if !cascade && n_objects > 0 {
-        let StoredDependencyClosure {
-            views: dependent_views,
-            matviews: dependent_matviews,
-            routines: dependent_routines,
-            rules: _dependent_rules,
-        } = match stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
-            in_listed(storage, dependency.schema.as_str())
-                || (dependency.class == crate::storage::DependencyClass::Domain
-                    && schema_domains[usize::from(dependency.slot)])
-        }) {
-            Ok(closure) => closure,
-            Err(error) => return sql_fail(error),
-        };
-        for policy_slot in 0..storage.policy_count() {
-            let policy = storage.policy(policy_slot);
-            if !policy.visible_to(txn.txid)
-                || in_listed(
-                    storage,
-                    storage
-                        .table_def(usize::from(policy.table), txn.txid)
-                        .schema
-                        .as_str(),
-                )
+        // Inbound foreign keys: a surviving table referencing a dropped one loses
+        // the constraint (PostgreSQL drops the constraint, not the table).
+        for t in 0..storage.table_count() {
+            let def = storage.table_def(t, txn.txid);
+            if !storage.table_slot_visible_to(t, txn.txid)
+                || in_listed(storage, def.schema.as_str())
             {
                 continue;
             }
-            let dependencies = storage.policy_dependencies(policy_slot, txn.txid);
-            let direct_dependency = dependencies
-                .entries()
-                .iter()
-                .find(|dependency| {
-                    in_listed(storage, dependency.schema.as_str())
-                        || (dependency.class == crate::storage::DependencyClass::Domain
-                            && schema_domains[usize::from(dependency.slot)])
-                })
-                .copied();
-            if (direct_dependency.is_some()
-                || policy_depends_on_selected_stored_query(
-                    storage,
-                    txn.txid,
-                    dependencies.view(),
-                    dependent_views,
-                    dependent_matviews,
-                    dependent_routines,
-                ))
-                && let Err(error) = push(
-                    SchemaObject::Policy {
-                        slot: policy_slot,
-                        root_schema: direct_dependency
-                            .map(|dependency| dependency.schema)
-                            .unwrap_or_else(|| {
-                                selected_schema.expect("dependent object has a selected schema")
-                            }),
-                        root_class: direct_dependency.map(|dependency| dependency.class),
-                        root_slot: direct_dependency
-                            .map_or(usize::MAX, |dependency| usize::from(dependency.slot)),
-                    },
-                    &mut n_objects,
-                )
-            {
-                return sql_fail(error);
-            }
-        }
-    }
-    // Inbound foreign keys: a surviving table referencing a dropped one loses
-    // the constraint (PostgreSQL drops the constraint, not the table).
-    for t in 0..storage.table_count() {
-        let def = storage.table_def(t, txn.txid);
-        if !storage.table_slot_visible_to(t, txn.txid) || in_listed(storage, def.schema.as_str()) {
-            continue;
-        }
-        for f in 0..def.n_fkeys {
-            if in_listed(storage, def.fkeys[f].parent_schema.as_str())
-                && let Err(e) = push(
-                    SchemaObject::InboundFk {
-                        table: t,
-                        fk_index: f,
-                    },
-                    &mut n_objects,
-                )
-            {
-                return sql_fail(e);
-            }
-        }
-    }
-    // PostgreSQL walks the listed schemas in reverse, and reports each
-    // schema's dependents in OID (creation) order; a severed constraint
-    // sorts with its child table, after it.
-    let schema_rank = |storage: &Storage, schema: &str| -> usize {
-        if temporary.is_some_and(|selected| selected.as_str() == schema) {
-            return 1;
-        }
-        slots[..n_slots]
-            .iter()
-            .position(|&slot| storage.schema_def_for(slot, txn.txid).name.as_str() == schema)
-            .map(|p| n_slots - p)
-            .unwrap_or(0)
-    };
-    let sort_key = |storage: &Storage, o: &SchemaObject| -> (usize, u64, u8) {
-        match o {
-            SchemaObject::Table(t) => {
-                let (schema, created_at) = {
-                    let def = storage.table_def(*t, txn.txid);
-                    (def.schema, def.identity().created_at)
-                };
-                (schema_rank(storage, schema.as_str()), created_at, 0)
-            }
-            SchemaObject::View(v) => {
-                let view = storage.view(*v);
-                (
-                    schema_rank(storage, view.schema.as_str()),
-                    view.created_at,
-                    0,
-                )
-            }
-            SchemaObject::Routine(routine) => {
-                let routine = storage.routine_for(*routine, txn.txid);
-                (
-                    schema_rank(storage, routine.schema_for(txn.txid).as_str()),
-                    routine.created_at,
-                    0,
-                )
-            }
-            SchemaObject::Collation(slot) => {
-                let state = storage.collation(*slot);
-                let definition = state.definition_for(txn.txid);
-                (
-                    schema_rank(storage, definition.schema.as_str()),
-                    state.created_at,
-                    0,
-                )
-            }
-            SchemaObject::Conversion(slot) => {
-                let state = storage.conversion(*slot);
-                let definition = state.definition_for(txn.txid);
-                (
-                    schema_rank(storage, definition.schema.as_str()),
-                    state.created_at,
-                    0,
-                )
-            }
-            SchemaObject::TextSearch(slot) => {
-                let state = storage.text_search_object(*slot);
-                let definition = state.definition_for(txn.txid);
-                (
-                    schema_rank(storage, definition.schema().as_str()),
-                    state.created_at,
-                    0,
-                )
-            }
-            SchemaObject::Matview { table, .. } => {
-                let (schema, created_at) = {
-                    let def = storage.table_def(*table, txn.txid);
-                    (def.schema, def.identity().created_at)
-                };
-                (schema_rank(storage, schema.as_str()), created_at, 0)
-            }
-            SchemaObject::Sequence(sequence) => {
-                let sequence = storage.sequence_for(*sequence, txn.txid);
-                (
-                    schema_rank(storage, sequence.schema.as_str()),
-                    sequence.created_at,
-                    0,
-                )
-            }
-            SchemaObject::Domain(domain) => {
-                let domain = storage.domain_for(*domain, txn.txid);
-                (
-                    schema_rank(storage, domain.schema.as_str()),
-                    domain.created_at,
-                    0,
-                )
-            }
-            SchemaObject::Enum(enumeration) => {
-                let enumeration = storage.enum_for(*enumeration, txn.txid);
-                (
-                    schema_rank(storage, enumeration.schema.as_str()),
-                    enumeration.created_at,
-                    0,
-                )
-            }
-            SchemaObject::Composite(composite) => {
-                let definition = storage.composite_for(*composite, txn.txid);
-                (
-                    schema_rank(storage, definition.schema.as_str()),
-                    definition.created_at,
-                    0,
-                )
-            }
-            SchemaObject::Operator(operator) => {
-                let definition = storage.operator_for(*operator, txn.txid);
-                (
-                    schema_rank(storage, definition.schema.as_str()),
-                    storage.operator(*operator).created_at,
-                    0,
-                )
-            }
-            SchemaObject::OperatorFamily(family) => {
-                let definition = storage.operator_family_for(*family, txn.txid);
-                (
-                    schema_rank(storage, definition.schema.as_str()),
-                    storage.operator_family(*family).created_at,
-                    0,
-                )
-            }
-            SchemaObject::OperatorClass(class) => {
-                let definition = storage.operator_class_for(*class, txn.txid);
-                (
-                    schema_rank(storage, definition.schema.as_str()),
-                    storage.operator_class(*class).created_at,
-                    0,
-                )
-            }
-            SchemaObject::Statistics(statistics) => {
-                let definition = storage.extended_statistics(*statistics);
-                let mutable = definition.definition_for(txn.txid);
-                (
-                    schema_rank(storage, mutable.schema.as_str()),
-                    definition.created_at,
-                    0,
-                )
-            }
-            SchemaObject::Policy {
-                slot, root_schema, ..
-            } => {
-                let policy = storage.policy(*slot);
-                (
-                    schema_rank(storage, root_schema.as_str()),
-                    policy.created_at,
-                    0,
-                )
-            }
-            SchemaObject::InboundFk { table, fk_index } => {
-                let (schema, created_at) = {
-                    let def = storage.table_def(*table, txn.txid);
-                    (
-                        def.fkeys[*fk_index].parent_schema,
-                        def.identity().created_at,
+            for f in 0..def.n_fkeys {
+                if in_listed(storage, def.fkeys[f].parent_schema.as_str())
+                    && let Err(e) = push(
+                        SchemaObject::InboundFk {
+                            table: t,
+                            fk_index: f,
+                        },
+                        &mut n_objects,
                     )
-                };
-                (schema_rank(storage, schema.as_str()), created_at, 1)
-            }
-        }
-    };
-    {
-        let slice = &mut objects[..n_objects];
-        slice.sort_unstable_by_key(|o| sort_key(storage, o.as_ref().expect("filled")));
-    }
-    // Renders one swept object the way PostgreSQL's dependency report does:
-    // qualified only when its schema is not on the current search path.
-    let in_path = |storage: &Storage, schema: &str| {
-        storage.path().entries().iter().any(|e| match e {
-            crate::storage::PathEntry::Schema(slot) => {
-                storage
-                    .schema_def_for(*slot as usize, txn.txid)
-                    .name
-                    .as_str()
-                    == schema
-            }
-            crate::storage::PathEntry::Catalog => schema == "pg_catalog",
-            crate::storage::PathEntry::InformationSchema => schema == "information_schema",
-            crate::storage::PathEntry::Toast => schema == "pg_toast",
-        })
-    };
-    let write_rel = |out: &mut crate::util::StackStr<192>, schema: &SqlName, name: &SqlName| {
-        if in_path(storage, schema.as_str()) {
-            write_identifier(out, name.as_str());
-        } else {
-            write_identifier(out, schema.as_str());
-            let _ = out.write_char('.');
-            write_identifier(out, name.as_str());
-        }
-    };
-    let describe = |storage: &Storage,
-                    o: &SchemaObject,
-                    out: &mut crate::util::StackStr<192>|
-     -> Result<(), SqlError> {
-        match o {
-            SchemaObject::Table(t) => {
-                let def = storage.table_def(*t, txn.txid);
-                let _ = write!(out, "table ");
-                write_rel(out, &def.schema, &def.name);
-            }
-            SchemaObject::View(v) => {
-                let view = storage.view(*v);
-                let _ = write!(out, "view ");
-                write_rel(out, &view.schema, &view.name);
-            }
-            SchemaObject::Routine(slot) => {
-                let routine = storage.routine_for(*slot, txn.txid);
-                // PostgreSQL's getObjectDescription names every routine a function.
-                let _ = write!(out, "function ");
-                write_rel(
-                    out,
-                    &routine.schema_for(txn.txid),
-                    &routine.name_for(txn.txid),
-                );
-                let signature = routine_dependency_suffix(storage, txn.txid, &routine)?;
-                let _ = write!(out, "{}", signature.as_str());
-            }
-            SchemaObject::Collation(slot) => {
-                let definition = storage.collation(*slot).definition_for(txn.txid);
-                let _ = write!(out, "collation ");
-                write_rel(out, &definition.schema, &definition.name);
-            }
-            SchemaObject::Conversion(slot) => {
-                let definition = storage.conversion(*slot).definition_for(txn.txid);
-                let _ = write!(out, "conversion ");
-                write_rel(out, &definition.schema, &definition.name);
-            }
-            SchemaObject::TextSearch(slot) => {
-                let definition = storage.text_search_object(*slot).definition_for(txn.txid);
-                let _ = write!(out, "{} ", definition.kind().noun());
-                write_rel(out, &definition.schema(), &definition.name());
-            }
-            SchemaObject::Matview { table, .. } => {
-                let def = storage.table_def(*table, txn.txid);
-                let _ = write!(out, "materialized view ");
-                write_rel(out, &def.schema, &def.name);
-            }
-            SchemaObject::Sequence(sequence) => {
-                let sequence = storage.sequence_for(*sequence, txn.txid);
-                let _ = write!(out, "sequence ");
-                write_rel(out, &sequence.schema, &sequence.name);
-            }
-            SchemaObject::Domain(domain) => {
-                let domain = storage.domain_for(*domain, txn.txid);
-                let _ = write!(out, "type ");
-                write_rel(out, &domain.schema, &domain.name);
-            }
-            SchemaObject::Enum(enumeration) => {
-                let enumeration = storage.enum_for(*enumeration, txn.txid);
-                let _ = write!(out, "type ");
-                write_rel(out, &enumeration.schema, &enumeration.name);
-            }
-            SchemaObject::Composite(composite) => {
-                let definition = storage.composite_for(*composite, txn.txid);
-                let _ = write!(out, "type ");
-                write_rel(out, &definition.schema, &definition.name);
-            }
-            SchemaObject::Operator(operator) => {
-                let definition = storage.operator_for(*operator, txn.txid);
-                let _ = write!(out, "operator ");
-                if !in_path(storage, definition.schema.as_str()) {
-                    write_identifier(out, definition.schema.as_str());
-                    let _ = out.write_char('.');
-                }
-                let _ = out.write_str(definition.name.as_str());
-                let signature = dependency_signature_suffix(
-                    storage,
-                    txn.txid,
-                    "operator",
-                    [definition.signature.left, definition.signature.right],
-                )?;
-                let _ = out.write_str(signature.as_str());
-            }
-            SchemaObject::OperatorFamily(family) => {
-                let definition = storage.operator_family_for(*family, txn.txid);
-                let _ = write!(out, "operator family ");
-                write_rel(out, &definition.schema, &definition.name);
-                // User-defined operator classes and families are btree only.
-                let _ = write!(out, " for access method btree");
-            }
-            SchemaObject::OperatorClass(class) => {
-                let definition = storage.operator_class_for(*class, txn.txid);
-                let _ = write!(out, "operator class ");
-                write_rel(out, &definition.schema, &definition.name);
-                // User-defined operator classes and families are btree only.
-                let _ = write!(out, " for access method btree");
-            }
-            SchemaObject::Statistics(statistics) => {
-                let definition = storage
-                    .extended_statistics(*statistics)
-                    .definition_for(txn.txid);
-                let _ = write!(out, "statistics object ");
-                write_rel(out, &definition.schema, &definition.name);
-            }
-            SchemaObject::Policy { slot, .. } => {
-                let policy = storage.policy(*slot);
-                let table = storage.table_def(usize::from(policy.table), txn.txid);
-                let _ = write!(out, "policy {} on table ", policy.name.as_str());
-                write_rel(out, &table.schema, &table.name);
-            }
-            SchemaObject::InboundFk { table, fk_index } => {
-                let def = storage.table_def(*table, txn.txid);
-                let _ = write!(
-                    out,
-                    "constraint {} on table ",
-                    def.fkeys[*fk_index].name.as_str()
-                );
-                write_rel(out, &def.schema, &def.name);
-            }
-        }
-        Ok(())
-    };
-    let independently_reported = |object: &SchemaObject| match object {
-        // PostgreSQL reports the owning table and suppresses its internal
-        // statistics dependents. A statistics object on a surviving table is
-        // still reported independently.
-        SchemaObject::Statistics(statistics) => {
-            let table = usize::from(storage.extended_statistics(*statistics).table);
-            !objects[..n_objects].iter().flatten().any(|candidate| {
-                matches!(
-                    candidate,
-                    SchemaObject::Table(selected) if *selected == table
-                ) || matches!(
-                    candidate,
-                    SchemaObject::Matview { table: selected, .. } if *selected == table
-                )
-            })
-        }
-        _ => true,
-    };
-    let reported_object_count = objects[..n_objects]
-        .iter()
-        .flatten()
-        .filter(|object| independently_reported(object))
-        .count();
-    if reported_object_count > 0 && !cascade {
-        let first = slots[0];
-        let mut detail =
-            crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
-        for (i, o) in objects[..n_objects]
-            .iter()
-            .flatten()
-            .filter(|object| independently_reported(object))
-            .enumerate()
-        {
-            let mut line = crate::util::StackStr::<192>::new();
-            if let Err(error) = describe(storage, o, &mut line) {
-                return sql_fail(error);
-            }
-            let schema = match o {
-                SchemaObject::Table(t) => storage.table_def(*t, txn.txid).schema,
-                SchemaObject::View(v) => storage.view(*v).schema,
-                SchemaObject::Routine(routine) => {
-                    storage.routine_for(*routine, txn.txid).schema_for(txn.txid)
-                }
-                SchemaObject::Collation(slot) => {
-                    storage.collation(*slot).definition_for(txn.txid).schema
-                }
-                SchemaObject::Conversion(slot) => {
-                    storage.conversion(*slot).definition_for(txn.txid).schema
-                }
-                SchemaObject::TextSearch(slot) => storage
-                    .text_search_object(*slot)
-                    .definition_for(txn.txid)
-                    .schema(),
-                SchemaObject::Matview { table, .. } => storage.table_def(*table, txn.txid).schema,
-                SchemaObject::Sequence(sequence) => {
-                    storage.sequence_for(*sequence, txn.txid).schema
-                }
-                SchemaObject::Domain(domain) => storage.domain_for(*domain, txn.txid).schema,
-                SchemaObject::Enum(enumeration) => storage.enum_for(*enumeration, txn.txid).schema,
-                SchemaObject::Composite(composite) => {
-                    storage.composite_for(*composite, txn.txid).schema
-                }
-                SchemaObject::Operator(operator) => {
-                    storage.operator_for(*operator, txn.txid).schema
-                }
-                SchemaObject::OperatorFamily(family) => {
-                    storage.operator_family_for(*family, txn.txid).schema
-                }
-                SchemaObject::OperatorClass(class) => {
-                    storage.operator_class_for(*class, txn.txid).schema
-                }
-                SchemaObject::Statistics(statistics) => {
-                    storage
-                        .extended_statistics(*statistics)
-                        .definition_for(txn.txid)
-                        .schema
-                }
-                SchemaObject::Policy { root_schema, .. } => *root_schema,
-                SchemaObject::InboundFk { table, fk_index } => {
-                    storage.table_def(*table, txn.txid).fkeys[*fk_index].parent_schema
-                }
-            };
-            if let SchemaObject::Policy {
-                root_class: Some(root_class),
-                root_slot,
-                ..
-            } = o
-            {
-                let mut dependency = crate::util::StackStr::<192>::new();
-                match root_class {
-                    crate::storage::DependencyClass::Table => {
-                        let definition = storage.table_def(*root_slot, txn.txid);
-                        let kind = if storage
-                            .matview_slot(
-                                definition.schema.as_str(),
-                                definition.name.as_str(),
-                                txn.txid,
-                            )
-                            .is_some()
-                        {
-                            "materialized view"
-                        } else {
-                            "table"
-                        };
-                        let _ = write!(dependency, "{kind} ");
-                        write_rel(&mut dependency, &definition.schema, &definition.name);
-                    }
-                    crate::storage::DependencyClass::View => {
-                        let view = storage.view(*root_slot);
-                        let _ = write!(dependency, "view ");
-                        write_rel(&mut dependency, &view.schema, &view.name);
-                    }
-                    crate::storage::DependencyClass::Sequence => {
-                        let sequence = storage.sequence_for(*root_slot, txn.txid);
-                        let _ = write!(dependency, "sequence ");
-                        write_rel(&mut dependency, &sequence.schema, &sequence.name);
-                    }
-                    crate::storage::DependencyClass::Domain => {
-                        let domain = storage.domain_for(*root_slot, txn.txid);
-                        let _ = write!(dependency, "type ");
-                        write_rel(&mut dependency, &domain.schema, &domain.name);
-                    }
-                    crate::storage::DependencyClass::Enum => {
-                        let enumeration = storage.enum_for(*root_slot, txn.txid);
-                        let _ = write!(dependency, "type ");
-                        write_rel(&mut dependency, &enumeration.schema, &enumeration.name);
-                    }
-                    crate::storage::DependencyClass::Composite => {
-                        let composite = storage.composite(*root_slot);
-                        let _ = write!(dependency, "type ");
-                        write_rel(&mut dependency, &composite.schema, &composite.name);
-                    }
-                    crate::storage::DependencyClass::Routine => {
-                        let routine = storage.routine(*root_slot);
-                        let _ = write!(dependency, "function ");
-                        write_rel(
-                            &mut dependency,
-                            &routine.schema_for(txn.txid),
-                            &routine.name_for(txn.txid),
-                        );
-                    }
-                    crate::storage::DependencyClass::Operator => {
-                        let operator = storage.operator_for(*root_slot, txn.txid);
-                        let _ = write!(dependency, "operator ");
-                        write_rel(&mut dependency, &operator.schema, &operator.name);
-                    }
-                    crate::storage::DependencyClass::Collation => {
-                        let collation = storage.collation(*root_slot).definition_for(txn.txid);
-                        let _ = write!(dependency, "collation ");
-                        write_rel(&mut dependency, &collation.schema, &collation.name);
-                    }
-                    crate::storage::DependencyClass::TextSearchConfiguration => {
-                        let configuration = storage
-                            .text_search_object(*root_slot)
-                            .definition_for(txn.txid);
-                        let _ = write!(dependency, "text search configuration ");
-                        write_rel(
-                            &mut dependency,
-                            &configuration.schema(),
-                            &configuration.name(),
-                        );
-                    }
-                }
-                let _ = write!(
-                    detail,
-                    "{}{} depends on {}",
-                    if i > 0 { "\n" } else { "" },
-                    line.as_str(),
-                    dependency.as_str(),
-                );
-            } else {
-                let _ = write!(
-                    detail,
-                    "{}{} depends on schema {}",
-                    if i > 0 { "\n" } else { "" },
-                    line.as_str(),
-                    schema.as_str(),
-                );
-            }
-        }
-        let mut hint = crate::util::StackStr::<128>::new();
-        let _ = write!(
-            hint,
-            "Use DROP ... CASCADE to drop the dependent objects too."
-        );
-        crate::sql::eval::stash_diagnostic(Some(detail), Some(hint));
-        return sql_fail(sql_err!(
-            crate::sql::eval::sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-            "cannot drop schema {} because other objects depend on it",
-            storage.schema_def_for(first, txn.txid).name.as_str()
-        ));
-    }
-    let view_locks = match arena.alloc_slice_with(storage.view_count(), |_| false) {
-        Ok(locks) => locks,
-        Err(_) => return sql_fail(arena_full()),
-    };
-    for object in objects[..n_objects].iter().flatten() {
-        let requested = match object {
-            SchemaObject::Table(table)
-            | SchemaObject::Matview { table, .. }
-            | SchemaObject::InboundFk { table, .. } => {
-                Some((*table, crate::sql::ast::TableLockMode::AccessExclusive))
-            }
-            SchemaObject::View(view) => {
-                view_locks[*view] = true;
-                None
-            }
-            SchemaObject::Policy { slot, .. } => {
-                let table = usize::from(storage.policy(*slot).table);
-                Some((table, crate::sql::ast::TableLockMode::ShareRowExclusive))
-            }
-            _ => None,
-        };
-        if let Some((table, mode)) = requested {
-            let Some(selection) = table_locks[table].as_mut() else {
-                return sql_fail(sql_err!(
-                    sqlstate::SERIALIZATION_FAILURE,
-                    "schema drop selected a table without its original definition source"
-                ));
-            };
-            if selection.mode.is_none() || mode == crate::sql::ast::TableLockMode::AccessExclusive {
-                selection.mode = Some(mode);
-            }
-        }
-    }
-    // Resolve all waits before cascade notices, journal writes or catalog edits.
-    for (table, selection) in table_locks.iter().copied().enumerate() {
-        let Some(TableDropSelection {
-            source,
-            mode: Some(mode),
-        }) = selection
-        else {
-            continue;
-        };
-        if let Err(error) = storage
-            .lock_table(txn.txid, table, mode, false)
-            .and_then(|()| source.validate(storage))
-        {
-            return sql_fail(error);
-        }
-    }
-    for (view, selected) in view_locks.iter().copied().enumerate() {
-        if selected
-            && let Err(error) = storage.lock_object(
-                txn.txid,
-                crate::storage::ObjectLockTarget::View(view),
-                crate::sql::ast::TableLockMode::AccessExclusive,
-                false,
-            )
-        {
-            return sql_fail(error);
-        }
-    }
-    if temporary.is_none() && reported_object_count == 1 {
-        let mut line = crate::util::StackStr::<192>::new();
-        let object = objects[..n_objects]
-            .iter()
-            .flatten()
-            .find(|object| independently_reported(object))
-            .expect("one independently reported object");
-        if let Err(error) = describe(storage, object, &mut line) {
-            return sql_fail(error);
-        }
-        responder.notice(
-            crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-            stack_format!(224, "drop cascades to {}", line.as_str()).as_str(),
-        )?;
-    } else if temporary.is_none() && reported_object_count > 1 {
-        let mut detail =
-            crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
-        for (i, o) in objects[..n_objects]
-            .iter()
-            .flatten()
-            .filter(|object| independently_reported(object))
-            .enumerate()
-        {
-            let mut line = crate::util::StackStr::<192>::new();
-            if let Err(error) = describe(storage, o, &mut line) {
-                return sql_fail(error);
-            }
-            let _ = write!(
-                detail,
-                "{}drop cascades to {}",
-                if i > 0 { "\n" } else { "" },
-                line.as_str()
-            );
-        }
-        crate::sql::eval::stash_diagnostic(Some(detail), None);
-        responder.notice(
-            crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-            stack_format!(
-                128,
-                "drop cascades to {} other objects",
-                reported_object_count
-            )
-            .as_str(),
-        )?;
-    }
-    let owned_sequence_undo = objects[..n_objects]
-        .iter()
-        .flatten()
-        .filter_map(|object| match object {
-            SchemaObject::Table(table) => Some((*storage.table_def(*table, txn.txid)).clone()),
-            _ => None,
-        })
-        .map(|table| {
-            (0..storage.sequence_count())
-                .filter(|sequence_slot| {
-                    let sequence = storage.sequence_for(*sequence_slot, txn.txid);
-                    sequence.visible_to(txn.txid)
-                        && matches!(
-                            sequence.owner,
-                            Some(owner)
-                                if owner.table_schema == table.schema
-                                    && owner.table == table.name
-                        )
-                })
-                .count()
-        })
-        .sum::<usize>();
-    let table_trigger_undo = storage
-        .triggers_with_slots_visible_to(txn.txid)
-        .filter(|(_, trigger)| {
-            matches!(
-                trigger.target,
-                crate::storage::TriggerTarget::Table(table)
-                    if objects[..n_objects].iter().flatten().any(|object| {
-                        matches!(object, SchemaObject::Table(selected) if *selected == usize::from(table))
-                    })
-            )
-        })
-        .count();
-    let routine_trigger_undo = storage
-        .triggers_with_slots_visible_to(txn.txid)
-        .filter(|(_, trigger)| {
-            objects[..n_objects].iter().flatten().any(|object| {
-                matches!(
-                    object,
-                    SchemaObject::Routine(routine)
-                        if *routine == usize::from(trigger.function)
-                )
-            })
-        })
-        .count();
-    let undo_needed = n_objects
-        + objects[..n_objects]
-            .iter()
-            .flatten()
-            .filter(|object| matches!(object, SchemaObject::Matview { .. }))
-            .count()
-        + owned_sequence_undo
-        + table_trigger_undo
-        + routine_trigger_undo
-        + n_slots;
-    if txn.ddl().len() + undo_needed > txn.ddl_capacity() {
-        return sql_fail(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "DROP SCHEMA needs {} DDL undo entries but only {} remain",
-            undo_needed,
-            txn.ddl_capacity() - txn.ddl().len()
-        ));
-    }
-    // Persist drops while every referenced type and routine can still be
-    // resolved. The notice above retains PostgreSQL's creation order.
-    let drop_rank = |object: &SchemaObject| match object {
-        SchemaObject::OperatorClass(_) => 0,
-        SchemaObject::OperatorFamily(_) => 1,
-        SchemaObject::Operator(_) => 2,
-        SchemaObject::Domain(_) | SchemaObject::Composite(_) => 4,
-        SchemaObject::Enum(_) => 5,
-        _ => 3,
-    };
-    objects[..n_objects].sort_unstable_by_key(|object| drop_rank(object.as_ref().expect("filled")));
-    let no_views = match dependency_flags(arena, storage.view_count()) {
-        Ok(values) => values,
-        Err(error) => return sql_fail(error),
-    };
-    let no_matviews = match dependency_flags(arena, storage.matview_count()) {
-        Ok(values) => values,
-        Err(error) => return sql_fail(error),
-    };
-    let selected_routines = match dependency_flags(arena, storage.routine_count()) {
-        Ok(values) => values,
-        Err(error) => return sql_fail(error),
-    };
-    let no_rules = match dependency_flags(arena, storage.rule_count()) {
-        Ok(values) => values,
-        Err(error) => return sql_fail(error),
-    };
-    for o in objects[..n_objects].iter().flatten() {
-        match o {
-            SchemaObject::InboundFk { table, fk_index } => {
-                let (edit_target, def) = storage.select_table_definition(*table, txn.txid);
-                let fk_name = def.fkeys[*fk_index].name;
-                let (schema, tname) = (def.schema, def.name);
-                let lsn = storage.bump_lsn();
-                if let Err(e) = wal.stage_reserved(
-                    txn.txid,
-                    lsn,
-                    &WalOp::DropTableFk {
-                        schema: schema.as_str(),
-                        table: tname.as_str(),
-                        fk_name: fk_name.as_str(),
-                    },
-                ) {
+                {
                     return sql_fail(e);
                 }
-                let mut updated = TableDefBuilder::from_definition(&def);
-                if !drop_named_constraint(&mut updated, fk_name.as_str()) {
-                    continue;
-                }
-                let mut identity_mapping = [None; MAX_COLUMNS];
-                for (column, target) in identity_mapping.iter_mut().enumerate().take(def.n_columns)
-                {
-                    *target = Some(def.columns()[column].name);
-                }
-                if let Err(error) = txn.write_table_definition(
-                    storage,
-                    edit_target,
-                    updated,
-                    &identity_mapping,
-                    false,
-                    crate::storage::ColumnSet::EMPTY,
-                ) {
-                    return sql_fail(error);
-                }
             }
-            SchemaObject::View(v) => {
-                let (schema, vname, temporary) = {
+        }
+        // PostgreSQL walks the listed schemas in reverse, and reports each
+        // schema's dependents in OID (creation) order; a severed constraint
+        // sorts with its child table, after it.
+        let schema_rank = |storage: &Storage, schema: &str| -> usize {
+            if temporary.is_some_and(|selected| selected.as_str() == schema) {
+                return 1;
+            }
+            slots[..n_slots]
+                .iter()
+                .position(|&slot| storage.schema_def_for(slot, txn.txid).name.as_str() == schema)
+                .map(|p| n_slots - p)
+                .unwrap_or(0)
+        };
+        let sort_key = |storage: &Storage, o: &SchemaObject| -> (usize, u64, u8) {
+            match o {
+                SchemaObject::Table(t) => {
+                    let (schema, created_at) = {
+                        let def = storage.table_def(*t, txn.txid);
+                        (def.schema, def.identity().created_at)
+                    };
+                    (schema_rank(storage, schema.as_str()), created_at, 0)
+                }
+                SchemaObject::View(v) => {
                     let view = storage.view(*v);
                     (
-                        view.schema_for(txn.txid),
-                        view.name_for(txn.txid),
-                        view.persistence == crate::storage::RelationPersistence::Temporary,
+                        schema_rank(storage, view.schema.as_str()),
+                        view.created_at,
+                        0,
                     )
+                }
+                SchemaObject::Routine(routine) => {
+                    let routine = storage.routine_for(*routine, txn.txid);
+                    (
+                        schema_rank(storage, routine.schema_for(txn.txid).as_str()),
+                        routine.created_at,
+                        0,
+                    )
+                }
+                SchemaObject::Collation(slot) => {
+                    let state = storage.collation(*slot);
+                    let definition = state.definition_for(txn.txid);
+                    (
+                        schema_rank(storage, definition.schema.as_str()),
+                        state.created_at,
+                        0,
+                    )
+                }
+                SchemaObject::Conversion(slot) => {
+                    let state = storage.conversion(*slot);
+                    let definition = state.definition_for(txn.txid);
+                    (
+                        schema_rank(storage, definition.schema.as_str()),
+                        state.created_at,
+                        0,
+                    )
+                }
+                SchemaObject::TextSearch(slot) => {
+                    let state = storage.text_search_object(*slot);
+                    let definition = state.definition_for(txn.txid);
+                    (
+                        schema_rank(storage, definition.schema().as_str()),
+                        state.created_at,
+                        0,
+                    )
+                }
+                SchemaObject::Matview { table, .. } => {
+                    let (schema, created_at) = {
+                        let def = storage.table_def(*table, txn.txid);
+                        (def.schema, def.identity().created_at)
+                    };
+                    (schema_rank(storage, schema.as_str()), created_at, 0)
+                }
+                SchemaObject::Sequence(sequence) => {
+                    let sequence = storage.sequence_for(*sequence, txn.txid);
+                    (
+                        schema_rank(storage, sequence.schema.as_str()),
+                        sequence.created_at,
+                        0,
+                    )
+                }
+                SchemaObject::Domain(domain) => {
+                    let domain = storage.domain_for(*domain, txn.txid);
+                    (
+                        schema_rank(storage, domain.schema.as_str()),
+                        domain.created_at,
+                        0,
+                    )
+                }
+                SchemaObject::Enum(enumeration) => {
+                    let enumeration = storage.enum_for(*enumeration, txn.txid);
+                    (
+                        schema_rank(storage, enumeration.schema.as_str()),
+                        enumeration.created_at,
+                        0,
+                    )
+                }
+                SchemaObject::Composite(composite) => {
+                    let definition = storage.composite_for(*composite, txn.txid);
+                    (
+                        schema_rank(storage, definition.schema.as_str()),
+                        definition.created_at,
+                        0,
+                    )
+                }
+                SchemaObject::Operator(operator) => {
+                    let definition = storage.operator_for(*operator, txn.txid);
+                    (
+                        schema_rank(storage, definition.schema.as_str()),
+                        storage.operator(*operator).created_at,
+                        0,
+                    )
+                }
+                SchemaObject::OperatorFamily(family) => {
+                    let definition = storage.operator_family_for(*family, txn.txid);
+                    (
+                        schema_rank(storage, definition.schema.as_str()),
+                        storage.operator_family(*family).created_at,
+                        0,
+                    )
+                }
+                SchemaObject::OperatorClass(class) => {
+                    let definition = storage.operator_class_for(*class, txn.txid);
+                    (
+                        schema_rank(storage, definition.schema.as_str()),
+                        storage.operator_class(*class).created_at,
+                        0,
+                    )
+                }
+                SchemaObject::Statistics(statistics) => {
+                    let definition = storage.extended_statistics(*statistics);
+                    let mutable = definition.definition_for(txn.txid);
+                    (
+                        schema_rank(storage, mutable.schema.as_str()),
+                        definition.created_at,
+                        0,
+                    )
+                }
+                SchemaObject::Policy {
+                    slot, root_schema, ..
+                } => {
+                    let policy = storage.policy(*slot);
+                    (
+                        schema_rank(storage, root_schema.as_str()),
+                        policy.created_at,
+                        0,
+                    )
+                }
+                SchemaObject::InboundFk { table, fk_index } => {
+                    let (schema, created_at) = {
+                        let def = storage.table_def(*table, txn.txid);
+                        (
+                            def.fkeys[*fk_index].parent_schema,
+                            def.identity().created_at,
+                        )
+                    };
+                    (schema_rank(storage, schema.as_str()), created_at, 1)
+                }
+            }
+        };
+        {
+            let slice = &mut objects[..n_objects];
+            slice.sort_unstable_by_key(|o| sort_key(storage, o.as_ref().expect("filled")));
+        }
+        // Renders one swept object the way PostgreSQL's dependency report does:
+        // qualified only when its schema is not on the current search path.
+        let in_path = |storage: &Storage, schema: &str| {
+            storage.path().entries().iter().any(|e| match e {
+                crate::storage::PathEntry::Schema(slot) => {
+                    storage
+                        .schema_def_for(*slot as usize, txn.txid)
+                        .name
+                        .as_str()
+                        == schema
+                }
+                crate::storage::PathEntry::Catalog => schema == "pg_catalog",
+                crate::storage::PathEntry::InformationSchema => schema == "information_schema",
+                crate::storage::PathEntry::Toast => schema == "pg_toast",
+            })
+        };
+        let write_rel = |out: &mut crate::util::StackStr<192>, schema: &SqlName, name: &SqlName| {
+            if in_path(storage, schema.as_str()) {
+                write_identifier(out, name.as_str());
+            } else {
+                write_identifier(out, schema.as_str());
+                let _ = out.write_char('.');
+                write_identifier(out, name.as_str());
+            }
+        };
+        let describe = |storage: &Storage,
+                        o: &SchemaObject,
+                        out: &mut crate::util::StackStr<192>|
+         -> Result<(), SqlError> {
+            match o {
+                SchemaObject::Table(t) => {
+                    let def = storage.table_def(*t, txn.txid);
+                    let _ = write!(out, "table ");
+                    write_rel(out, &def.schema, &def.name);
+                }
+                SchemaObject::View(v) => {
+                    let view = storage.view(*v);
+                    let _ = write!(out, "view ");
+                    write_rel(out, &view.schema, &view.name);
+                }
+                SchemaObject::Routine(slot) => {
+                    let routine = storage.routine_for(*slot, txn.txid);
+                    // PostgreSQL's getObjectDescription names every routine a function.
+                    let _ = write!(out, "function ");
+                    write_rel(
+                        out,
+                        &routine.schema_for(txn.txid),
+                        &routine.name_for(txn.txid),
+                    );
+                    let signature = routine_dependency_suffix(storage, txn.txid, &routine)?;
+                    let _ = write!(out, "{}", signature.as_str());
+                }
+                SchemaObject::Collation(slot) => {
+                    let definition = storage.collation(*slot).definition_for(txn.txid);
+                    let _ = write!(out, "collation ");
+                    write_rel(out, &definition.schema, &definition.name);
+                }
+                SchemaObject::Conversion(slot) => {
+                    let definition = storage.conversion(*slot).definition_for(txn.txid);
+                    let _ = write!(out, "conversion ");
+                    write_rel(out, &definition.schema, &definition.name);
+                }
+                SchemaObject::TextSearch(slot) => {
+                    let definition = storage.text_search_object(*slot).definition_for(txn.txid);
+                    let _ = write!(out, "{} ", definition.kind().noun());
+                    write_rel(out, &definition.schema(), &definition.name());
+                }
+                SchemaObject::Matview { table, .. } => {
+                    let def = storage.table_def(*table, txn.txid);
+                    let _ = write!(out, "materialized view ");
+                    write_rel(out, &def.schema, &def.name);
+                }
+                SchemaObject::Sequence(sequence) => {
+                    let sequence = storage.sequence_for(*sequence, txn.txid);
+                    let _ = write!(out, "sequence ");
+                    write_rel(out, &sequence.schema, &sequence.name);
+                }
+                SchemaObject::Domain(domain) => {
+                    let domain = storage.domain_for(*domain, txn.txid);
+                    let _ = write!(out, "type ");
+                    write_rel(out, &domain.schema, &domain.name);
+                }
+                SchemaObject::Enum(enumeration) => {
+                    let enumeration = storage.enum_for(*enumeration, txn.txid);
+                    let _ = write!(out, "type ");
+                    write_rel(out, &enumeration.schema, &enumeration.name);
+                }
+                SchemaObject::Composite(composite) => {
+                    let definition = storage.composite_for(*composite, txn.txid);
+                    let _ = write!(out, "type ");
+                    write_rel(out, &definition.schema, &definition.name);
+                }
+                SchemaObject::Operator(operator) => {
+                    let definition = storage.operator_for(*operator, txn.txid);
+                    let _ = write!(out, "operator ");
+                    if !in_path(storage, definition.schema.as_str()) {
+                        write_identifier(out, definition.schema.as_str());
+                        let _ = out.write_char('.');
+                    }
+                    let _ = out.write_str(definition.name.as_str());
+                    let signature = dependency_signature_suffix(
+                        storage,
+                        txn.txid,
+                        "operator",
+                        [definition.signature.left, definition.signature.right],
+                    )?;
+                    let _ = out.write_str(signature.as_str());
+                }
+                SchemaObject::OperatorFamily(family) => {
+                    let definition = storage.operator_family_for(*family, txn.txid);
+                    let _ = write!(out, "operator family ");
+                    write_rel(out, &definition.schema, &definition.name);
+                    // User-defined operator classes and families are btree only.
+                    let _ = write!(out, " for access method btree");
+                }
+                SchemaObject::OperatorClass(class) => {
+                    let definition = storage.operator_class_for(*class, txn.txid);
+                    let _ = write!(out, "operator class ");
+                    write_rel(out, &definition.schema, &definition.name);
+                    // User-defined operator classes and families are btree only.
+                    let _ = write!(out, " for access method btree");
+                }
+                SchemaObject::Statistics(statistics) => {
+                    let definition = storage
+                        .extended_statistics(*statistics)
+                        .definition_for(txn.txid);
+                    let _ = write!(out, "statistics object ");
+                    write_rel(out, &definition.schema, &definition.name);
+                }
+                SchemaObject::Policy { slot, .. } => {
+                    let policy = storage.policy(*slot);
+                    let table = storage.table_def(usize::from(policy.table), txn.txid);
+                    let _ = write!(out, "policy {} on table ", policy.name.as_str());
+                    write_rel(out, &table.schema, &table.name);
+                }
+                SchemaObject::InboundFk { table, fk_index } => {
+                    let def = storage.table_def(*table, txn.txid);
+                    let _ = write!(
+                        out,
+                        "constraint {} on table ",
+                        def.fkeys[*fk_index].name.as_str()
+                    );
+                    write_rel(out, &def.schema, &def.name);
+                }
+            }
+            Ok(())
+        };
+        let independently_reported = |object: &SchemaObject| match object {
+            // PostgreSQL reports the owning table and suppresses its internal
+            // statistics dependents. A statistics object on a surviving table is
+            // still reported independently.
+            SchemaObject::Statistics(statistics) => {
+                let table = usize::from(storage.extended_statistics(*statistics).table);
+                !objects[..n_objects].iter().flatten().any(|candidate| {
+                    matches!(
+                        candidate,
+                        SchemaObject::Table(selected) if *selected == table
+                    ) || matches!(
+                        candidate,
+                        SchemaObject::Matview { table: selected, .. } if *selected == table
+                    )
+                })
+            }
+            _ => true,
+        };
+        let reported_object_count = objects[..n_objects]
+            .iter()
+            .flatten()
+            .filter(|object| independently_reported(object))
+            .count();
+        if reported_object_count > 0 && !cascade {
+            let first = slots[0];
+            let mut detail =
+                crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+            for (i, o) in objects[..n_objects]
+                .iter()
+                .flatten()
+                .filter(|object| independently_reported(object))
+                .enumerate()
+            {
+                let mut line = crate::util::StackStr::<192>::new();
+                if let Err(error) = describe(storage, o, &mut line) {
+                    return sql_fail(error);
+                }
+                let schema = match o {
+                    SchemaObject::Table(t) => storage.table_def(*t, txn.txid).schema,
+                    SchemaObject::View(v) => storage.view(*v).schema,
+                    SchemaObject::Routine(routine) => {
+                        storage.routine_for(*routine, txn.txid).schema_for(txn.txid)
+                    }
+                    SchemaObject::Collation(slot) => {
+                        storage.collation(*slot).definition_for(txn.txid).schema
+                    }
+                    SchemaObject::Conversion(slot) => {
+                        storage.conversion(*slot).definition_for(txn.txid).schema
+                    }
+                    SchemaObject::TextSearch(slot) => storage
+                        .text_search_object(*slot)
+                        .definition_for(txn.txid)
+                        .schema(),
+                    SchemaObject::Matview { table, .. } => {
+                        storage.table_def(*table, txn.txid).schema
+                    }
+                    SchemaObject::Sequence(sequence) => {
+                        storage.sequence_for(*sequence, txn.txid).schema
+                    }
+                    SchemaObject::Domain(domain) => storage.domain_for(*domain, txn.txid).schema,
+                    SchemaObject::Enum(enumeration) => {
+                        storage.enum_for(*enumeration, txn.txid).schema
+                    }
+                    SchemaObject::Composite(composite) => {
+                        storage.composite_for(*composite, txn.txid).schema
+                    }
+                    SchemaObject::Operator(operator) => {
+                        storage.operator_for(*operator, txn.txid).schema
+                    }
+                    SchemaObject::OperatorFamily(family) => {
+                        storage.operator_family_for(*family, txn.txid).schema
+                    }
+                    SchemaObject::OperatorClass(class) => {
+                        storage.operator_class_for(*class, txn.txid).schema
+                    }
+                    SchemaObject::Statistics(statistics) => {
+                        storage
+                            .extended_statistics(*statistics)
+                            .definition_for(txn.txid)
+                            .schema
+                    }
+                    SchemaObject::Policy { root_schema, .. } => *root_schema,
+                    SchemaObject::InboundFk { table, fk_index } => {
+                        storage.table_def(*table, txn.txid).fkeys[*fk_index].parent_schema
+                    }
                 };
-                if !temporary {
+                if let SchemaObject::Policy {
+                    root_class: Some(root_class),
+                    root_slot,
+                    ..
+                } = o
+                {
+                    let mut dependency = crate::util::StackStr::<192>::new();
+                    match root_class {
+                        crate::storage::DependencyClass::Table => {
+                            let definition = storage.table_def(*root_slot, txn.txid);
+                            let kind = if storage
+                                .matview_slot(
+                                    definition.schema.as_str(),
+                                    definition.name.as_str(),
+                                    txn.txid,
+                                )
+                                .is_some()
+                            {
+                                "materialized view"
+                            } else {
+                                "table"
+                            };
+                            let _ = write!(dependency, "{kind} ");
+                            write_rel(&mut dependency, &definition.schema, &definition.name);
+                        }
+                        crate::storage::DependencyClass::View => {
+                            let view = storage.view(*root_slot);
+                            let _ = write!(dependency, "view ");
+                            write_rel(&mut dependency, &view.schema, &view.name);
+                        }
+                        crate::storage::DependencyClass::Sequence => {
+                            let sequence = storage.sequence_for(*root_slot, txn.txid);
+                            let _ = write!(dependency, "sequence ");
+                            write_rel(&mut dependency, &sequence.schema, &sequence.name);
+                        }
+                        crate::storage::DependencyClass::Domain => {
+                            let domain = storage.domain_for(*root_slot, txn.txid);
+                            let _ = write!(dependency, "type ");
+                            write_rel(&mut dependency, &domain.schema, &domain.name);
+                        }
+                        crate::storage::DependencyClass::Enum => {
+                            let enumeration = storage.enum_for(*root_slot, txn.txid);
+                            let _ = write!(dependency, "type ");
+                            write_rel(&mut dependency, &enumeration.schema, &enumeration.name);
+                        }
+                        crate::storage::DependencyClass::Composite => {
+                            let composite = storage.composite(*root_slot);
+                            let _ = write!(dependency, "type ");
+                            write_rel(&mut dependency, &composite.schema, &composite.name);
+                        }
+                        crate::storage::DependencyClass::Routine => {
+                            let routine = storage.routine(*root_slot);
+                            let _ = write!(dependency, "function ");
+                            write_rel(
+                                &mut dependency,
+                                &routine.schema_for(txn.txid),
+                                &routine.name_for(txn.txid),
+                            );
+                        }
+                        crate::storage::DependencyClass::Operator => {
+                            let operator = storage.operator_for(*root_slot, txn.txid);
+                            let _ = write!(dependency, "operator ");
+                            write_rel(&mut dependency, &operator.schema, &operator.name);
+                        }
+                        crate::storage::DependencyClass::Collation => {
+                            let collation = storage.collation(*root_slot).definition_for(txn.txid);
+                            let _ = write!(dependency, "collation ");
+                            write_rel(&mut dependency, &collation.schema, &collation.name);
+                        }
+                        crate::storage::DependencyClass::TextSearchConfiguration => {
+                            let configuration = storage
+                                .text_search_object(*root_slot)
+                                .definition_for(txn.txid);
+                            let _ = write!(dependency, "text search configuration ");
+                            write_rel(
+                                &mut dependency,
+                                &configuration.schema(),
+                                &configuration.name(),
+                            );
+                        }
+                    }
+                    let _ = write!(
+                        detail,
+                        "{}{} depends on {}",
+                        if i > 0 { "\n" } else { "" },
+                        line.as_str(),
+                        dependency.as_str(),
+                    );
+                } else {
+                    let _ = write!(
+                        detail,
+                        "{}{} depends on schema {}",
+                        if i > 0 { "\n" } else { "" },
+                        line.as_str(),
+                        schema.as_str(),
+                    );
+                }
+            }
+            let mut hint = crate::util::StackStr::<128>::new();
+            let _ = write!(
+                hint,
+                "Use DROP ... CASCADE to drop the dependent objects too."
+            );
+            crate::sql::eval::stash_diagnostic(Some(detail), Some(hint));
+            return sql_fail(sql_err!(
+                crate::sql::eval::sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop schema {} because other objects depend on it",
+                storage.schema_def_for(first, txn.txid).name.as_str()
+            ));
+        }
+        let view_locks = match arena.alloc_slice_with(storage.view_count(), |_| false) {
+            Ok(locks) => locks,
+            Err(_) => return sql_fail(arena_full()),
+        };
+        for object in objects[..n_objects].iter().flatten() {
+            let requested = match object {
+                SchemaObject::Table(table)
+                | SchemaObject::Matview { table, .. }
+                | SchemaObject::InboundFk { table, .. } => {
+                    Some((*table, crate::sql::ast::TableLockMode::AccessExclusive))
+                }
+                SchemaObject::View(view) => {
+                    view_locks[*view] = true;
+                    None
+                }
+                SchemaObject::Policy { slot, .. } => {
+                    let table = usize::from(storage.policy(*slot).table);
+                    Some((table, crate::sql::ast::TableLockMode::ShareRowExclusive))
+                }
+                _ => None,
+            };
+            if let Some((table, mode)) = requested {
+                let Some(selection) = table_locks[table].as_mut() else {
+                    return sql_fail(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "schema drop selected a table without its original definition source"
+                    ));
+                };
+                if selection.mode.is_none()
+                    || mode == crate::sql::ast::TableLockMode::AccessExclusive
+                {
+                    selection.mode = Some(mode);
+                }
+            }
+        }
+        // Resolve all waits before cascade notices, journal writes or catalog edits.
+        for (table, selection) in table_locks.iter().copied().enumerate() {
+            let Some(TableDropSelection {
+                source,
+                mode: Some(mode),
+            }) = selection
+            else {
+                continue;
+            };
+            if let Err(error) = storage
+                .lock_table(txn.txid, table, mode, false)
+                .and_then(|()| source.validate(storage))
+            {
+                return sql_fail(error);
+            }
+        }
+        for (view, selected) in view_locks.iter().copied().enumerate() {
+            if selected
+                && let Err(error) = storage.lock_object(
+                    txn.txid,
+                    crate::storage::ObjectLockTarget::View(view),
+                    crate::sql::ast::TableLockMode::AccessExclusive,
+                    false,
+                )
+            {
+                return sql_fail(error);
+            }
+        }
+        if temporary.is_none() && reported_object_count > 0 {
+            let mut detail =
+                crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+            for (i, o) in objects[..n_objects]
+                .iter()
+                .flatten()
+                .filter(|object| independently_reported(object))
+                .enumerate()
+            {
+                let mut line = crate::util::StackStr::<192>::new();
+                if let Err(error) = describe(storage, o, &mut line) {
+                    return sql_fail(error);
+                }
+                let _ = write!(
+                    detail,
+                    "{}drop cascades to {}",
+                    if i > 0 { "\n" } else { "" },
+                    line.as_str()
+                );
+            }
+            if let Err(error) = dependency_report::send_cascade_lines(
+                responder,
+                detail.as_str(),
+                reported_object_count,
+            ) {
+                return sql_fail(error);
+            }
+        }
+        let owned_sequence_undo = objects[..n_objects]
+            .iter()
+            .flatten()
+            .filter_map(|object| match object {
+                SchemaObject::Table(table) => Some((*storage.table_def(*table, txn.txid)).clone()),
+                _ => None,
+            })
+            .map(|table| {
+                (0..storage.sequence_count())
+                    .filter(|sequence_slot| {
+                        let sequence = storage.sequence_for(*sequence_slot, txn.txid);
+                        sequence.visible_to(txn.txid)
+                            && matches!(
+                                sequence.owner,
+                                Some(owner)
+                                    if owner.table_schema == table.schema
+                                        && owner.table == table.name
+                            )
+                    })
+                    .count()
+            })
+            .sum::<usize>();
+        let table_trigger_undo = storage
+            .triggers_with_slots_visible_to(txn.txid)
+            .filter(|(_, trigger)| {
+                matches!(
+                    trigger.target,
+                    crate::storage::TriggerTarget::Table(table)
+                        if objects[..n_objects].iter().flatten().any(|object| {
+                            matches!(object, SchemaObject::Table(selected) if *selected == usize::from(table))
+                        })
+                )
+            })
+            .count();
+        let routine_trigger_undo = storage
+            .triggers_with_slots_visible_to(txn.txid)
+            .filter(|(_, trigger)| {
+                objects[..n_objects].iter().flatten().any(|object| {
+                    matches!(
+                        object,
+                        SchemaObject::Routine(routine)
+                            if *routine == usize::from(trigger.function)
+                    )
+                })
+            })
+            .count();
+        let undo_needed = n_objects
+            + objects[..n_objects]
+                .iter()
+                .flatten()
+                .filter(|object| matches!(object, SchemaObject::Matview { .. }))
+                .count()
+            + owned_sequence_undo
+            + table_trigger_undo
+            + routine_trigger_undo
+            + n_slots;
+        if txn.ddl().len() + undo_needed > txn.ddl_capacity() {
+            return sql_fail(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "DROP SCHEMA needs {} DDL undo entries but only {} remain",
+                undo_needed,
+                txn.ddl_capacity() - txn.ddl().len()
+            ));
+        }
+        // Persist drops while every referenced type and routine can still be
+        // resolved. The notice above retains PostgreSQL's creation order.
+        let drop_rank = |object: &SchemaObject| match object {
+            SchemaObject::OperatorClass(_) => 0,
+            SchemaObject::OperatorFamily(_) => 1,
+            SchemaObject::Operator(_) => 2,
+            SchemaObject::Domain(_) | SchemaObject::Composite(_) => 4,
+            SchemaObject::Enum(_) => 5,
+            _ => 3,
+        };
+        objects[..n_objects]
+            .sort_unstable_by_key(|object| drop_rank(object.as_ref().expect("filled")));
+        let no_views = match dependency_flags(arena, storage.view_count()) {
+            Ok(values) => values,
+            Err(error) => return sql_fail(error),
+        };
+        let no_matviews = match dependency_flags(arena, storage.matview_count()) {
+            Ok(values) => values,
+            Err(error) => return sql_fail(error),
+        };
+        let selected_routines = match dependency_flags(arena, storage.routine_count()) {
+            Ok(values) => values,
+            Err(error) => return sql_fail(error),
+        };
+        let no_rules = match dependency_flags(arena, storage.rule_count()) {
+            Ok(values) => values,
+            Err(error) => return sql_fail(error),
+        };
+        for o in objects[..n_objects].iter().flatten() {
+            match o {
+                SchemaObject::InboundFk { table, fk_index } => {
+                    let (edit_target, def) = storage.select_table_definition(*table, txn.txid);
+                    let fk_name = def.fkeys[*fk_index].name;
+                    let (schema, tname) = (def.schema, def.name);
                     let lsn = storage.bump_lsn();
                     if let Err(e) = wal.stage_reserved(
                         txn.txid,
                         lsn,
-                        &WalOp::DropView {
+                        &WalOp::DropTableFk {
                             schema: schema.as_str(),
-                            name: vname.as_str(),
+                            table: tname.as_str(),
+                            fk_name: fk_name.as_str(),
                         },
                     ) {
                         return sql_fail(e);
                     }
-                }
-                let dropped = match storage.drop_view(schema.as_str(), vname.as_str(), txn.txid) {
-                    Ok(d) => d,
-                    Err(e) => return sql_fail(e),
-                };
-                if let Some(undo) = dropped
-                    && let Err(error) =
-                        txn.record_ddl(storage, super::txn::DdlUndo::ViewDropped(undo))
-                {
-                    storage.rollback_view_drop(undo);
-                    return sql_fail(error);
-                }
-            }
-            SchemaObject::Routine(routine) => {
-                if storage.routine_identity_for(*routine, txn.txid).is_some() {
-                    let routine_oid =
-                        crate::storage::routine_oid(&storage.routine_for(*routine, txn.txid));
-                    if let Err(error) = cascade_routine_cast_operator_dependents(
-                        storage,
-                        wal,
-                        txn,
-                        routine_oid,
-                        arena,
-                    ) {
-                        return sql_fail(error);
-                    }
-                }
-                selected_routines.fill(false);
-                selected_routines[*routine] = true;
-                if let Err(error) = drop_selected_stored_queries(
-                    storage,
-                    wal,
-                    txn,
-                    no_views,
-                    no_matviews,
-                    selected_routines,
-                    no_rules,
-                ) {
-                    return sql_fail(error);
-                }
-            }
-            SchemaObject::Collation(slot) => {
-                if !storage.collation(*slot).visible_to(txn.txid) {
-                    continue;
-                }
-                let definition = storage.collation(*slot).definition_for(txn.txid);
-                let Some(owner) = storage.role_slot_by_oid(definition.owner, txn.txid) else {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "collation owner does not exist"
-                    ));
-                };
-                let owner = storage.role_name(owner, txn.txid);
-                let qualified = QualName {
-                    schema: Some(definition.schema.as_str()),
-                    name: definition.name.as_str(),
-                };
-                let owner = match storage.capture_role(owner.as_str(), txn.txid) {
-                    Ok(role) => crate::storage::SessionIdentity::bound(role),
-                    Err(error) => return sql_fail(error),
-                };
-                let outcome = run_as_role(owner, || {
-                    responder.without_command_complete(|responder| {
-                        drop_collation(
-                            storage,
-                            &mut *wal,
-                            txn,
-                            scratch,
-                            &qualified,
-                            false,
-                            true,
-                            arena,
-                            seq_session,
-                            responder,
-                        )
-                    })
-                });
-                match outcome {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => return sql_fail(error),
-                    Err(error) => return Err(error),
-                }
-            }
-            SchemaObject::Conversion(slot) => {
-                if !storage.conversion(*slot).visible_to(txn.txid) {
-                    continue;
-                }
-                let definition = storage.conversion(*slot).definition_for(txn.txid);
-                let Some(owner) = storage.role_slot_by_oid(definition.owner, txn.txid) else {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "conversion owner does not exist"
-                    ));
-                };
-                let owner = storage.role_name(owner, txn.txid);
-                let qualified = QualName {
-                    schema: Some(definition.schema.as_str()),
-                    name: definition.name.as_str(),
-                };
-                let owner = match storage.capture_role(owner.as_str(), txn.txid) {
-                    Ok(role) => crate::storage::SessionIdentity::bound(role),
-                    Err(error) => return sql_fail(error),
-                };
-                let outcome = run_as_role(owner, || {
-                    responder.without_command_complete(|responder| {
-                        drop_conversion(storage, &mut *wal, txn, &qualified, false, true, responder)
-                    })
-                });
-                match outcome {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => return sql_fail(error),
-                    Err(error) => return Err(error),
-                }
-            }
-            SchemaObject::TextSearch(slot) => {
-                if storage.text_search_object(*slot).visible_to(txn.txid)
-                    && let Err(error) = drop_text_search_slot(storage, wal, txn, *slot, true, arena)
-                {
-                    return sql_fail(error);
-                }
-            }
-            SchemaObject::Matview { table, catalog } => {
-                let def = (*storage.table_def(*table, txn.txid)).clone();
-                let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage_reserved(
-                    txn.txid,
-                    lsn,
-                    &WalOp::DropTable {
-                        identity: storage.table_position(*table),
-                        schema: def.schema.as_str(),
-                        name: def.name.as_str(),
-                    },
-                ) {
-                    return sql_fail(error);
-                }
-                if let Err(error) = require_row_type_unused(storage, txn.txid, *table, |user| {
-                    user.schema == def.schema
-                }) {
-                    return sql_fail(error);
-                }
-                let dropped = match storage.drop_table_in(*table, txn.txid) {
-                    Ok(undo) => undo,
-                    Err(error) => return sql_fail(error),
-                };
-                if let Err(error) = txn.record_table_drop(storage, dropped) {
-                    return sql_fail(error);
-                }
-                storage.drop_indexes_for(*table, txn.txid);
-                let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage_reserved(
-                    txn.txid,
-                    lsn,
-                    &WalOp::DropMatview {
-                        identity: storage.matview_position(*catalog),
-                        schema: def.schema.as_str(),
-                        name: def.name.as_str(),
-                    },
-                ) {
-                    return sql_fail(error);
-                }
-                let target = match storage.prepare_matview_edit(*catalog, txn.txid) {
-                    Ok(target) => target,
-                    Err(error) => return sql_fail(error),
-                };
-                let change = match storage.drop_matview(target, txn.txid) {
-                    Ok(change) => change,
-                    Err(error) => return sql_fail(error),
-                };
-                if let Err(error) = txn.record_matview_change(storage, change) {
-                    return sql_fail(error);
-                }
-            }
-            SchemaObject::Sequence(sequence) => {
-                let identity = storage.sequence_position(*sequence);
-                let sequence = storage.sequence_for(*sequence, txn.txid);
-                let (schema, name) = (sequence.schema, sequence.name);
-                if sequence.persistence != crate::storage::RelationPersistence::Temporary {
-                    let lsn = storage.bump_lsn();
-                    if let Err(error) = wal.stage_reserved(
-                        txn.txid,
-                        lsn,
-                        &WalOp::DropSequence {
-                            identity,
-                            schema: schema.as_str(),
-                            name: name.as_str(),
-                        },
-                    ) {
-                        return sql_fail(error);
-                    }
-                }
-                match storage.drop_sequence(schema.as_str(), name.as_str(), txn.txid) {
-                    Ok(Some(slot)) => {
-                        if let Err(error) = txn.record_sequence_change(storage, slot) {
-                            return sql_fail(error);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => return sql_fail(error),
-                }
-            }
-            SchemaObject::Domain(domain) => {
-                let domain = storage.domain_for(*domain, txn.txid);
-                let (schema, name) = (domain.schema, domain.name);
-                let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage_reserved(
-                    txn.txid,
-                    lsn,
-                    &WalOp::DropDomain {
-                        schema: schema.as_str(),
-                        name: name.as_str(),
-                    },
-                ) {
-                    return sql_fail(error);
-                }
-                match storage.stage_type_drop(
-                    crate::storage::NamedTypeKind::Domain,
-                    schema.as_str(),
-                    name.as_str(),
-                    txn.txid,
-                ) {
-                    Ok(Some(slot)) => {
-                        if let Err(error) =
-                            txn.record_ddl(storage, super::txn::DdlUndo::DomainDropped(slot))
-                        {
-                            storage
-                                .finish_type_ddl(slot, crate::storage::TypeDdlDecision::Rollback);
-                            return sql_fail(error);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => return sql_fail(error),
-                }
-            }
-            SchemaObject::Enum(enumeration) => {
-                let enumeration = storage.enum_for(*enumeration, txn.txid);
-                let (schema, name) = (enumeration.schema, enumeration.name);
-                let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage_reserved(
-                    txn.txid,
-                    lsn,
-                    &WalOp::DropEnum {
-                        schema: schema.as_str(),
-                        name: name.as_str(),
-                    },
-                ) {
-                    return sql_fail(error);
-                }
-                match storage.stage_type_drop(
-                    crate::storage::NamedTypeKind::Enum,
-                    schema.as_str(),
-                    name.as_str(),
-                    txn.txid,
-                ) {
-                    Ok(Some(slot)) => {
-                        if let Err(error) =
-                            txn.record_ddl(storage, super::txn::DdlUndo::EnumDropped(slot))
-                        {
-                            storage
-                                .finish_type_ddl(slot, crate::storage::TypeDdlDecision::Rollback);
-                            return sql_fail(error);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => return sql_fail(error),
-                }
-            }
-            SchemaObject::Composite(composite) => {
-                if storage.composite(*composite).visible_to(txn.txid)
-                    && let Err(error) = drop_composite_type(
-                        storage,
-                        wal,
-                        txn,
-                        scratch,
-                        *composite,
-                        true,
-                        arena,
-                        seq_session,
-                        responder,
-                    )
-                {
-                    return sql_fail(error);
-                }
-            }
-            SchemaObject::Operator(operator) => {
-                if storage.operator(*operator).visible_to(txn.txid) {
-                    let operator_oid = storage.operator(*operator).oid();
-                    if let Err(error) =
-                        cascade_operator_dependencies(storage, wal, txn, operator_oid, arena)
-                    {
-                        return sql_fail(error);
-                    }
-                    if let Err(error) = stage_operator_drop(storage, wal, txn, *operator) {
-                        return sql_fail(error);
-                    }
-                }
-            }
-            SchemaObject::OperatorFamily(family) => {
-                if storage.operator_family(*family).visible_to(txn.txid) {
-                    let family_oid = storage.operator_family(*family).oid();
-                    loop {
-                        let dependent = storage
-                            .operator_classes_visible_to(txn.txid)
-                            .find_map(|(slot, class)| (class.family == family_oid).then_some(slot));
-                        let Some(class) = dependent else { break };
-                        if let Err(error) =
-                            stage_operator_class_drop(storage, wal, txn, class, true)
-                        {
-                            return sql_fail(error);
-                        }
-                    }
-                    if let Err(error) = stage_operator_family_drop(storage, wal, txn, *family) {
-                        return sql_fail(error);
-                    }
-                }
-            }
-            SchemaObject::OperatorClass(class) => {
-                if storage.operator_class(*class).visible_to(txn.txid)
-                    && let Err(error) = stage_operator_class_drop(storage, wal, txn, *class, true)
-                {
-                    return sql_fail(error);
-                }
-            }
-            SchemaObject::Statistics(statistics) => {
-                if !storage
-                    .extended_statistics(*statistics)
-                    .visible_to(txn.txid)
-                {
-                    continue;
-                }
-                let definition = storage
-                    .extended_statistics(*statistics)
-                    .definition_for(txn.txid);
-                if let Err(error) = storage.drop_extended_statistics(*statistics, txn.txid) {
-                    return sql_fail(error);
-                }
-                if storage
-                    .table_def(
-                        usize::from(storage.extended_statistics(*statistics).table),
-                        txn.txid,
-                    )
-                    .persistence
-                    != crate::storage::RelationPersistence::Temporary
-                {
-                    let lsn = storage.bump_lsn();
-                    if let Err(error) = wal.stage_reserved(
-                        txn.txid,
-                        lsn,
-                        &WalOp::DropExtendedStatistics {
-                            schema: definition.schema.as_str(),
-                            name: definition.name.as_str(),
-                        },
-                    ) {
-                        storage.rollback_extended_statistics_drop(*statistics, txn.txid);
-                        return sql_fail(error);
-                    }
-                }
-                if let Err(error) = txn.record_ddl(
-                    storage,
-                    super::txn::DdlUndo::StatisticsDropped(*statistics as u32),
-                ) {
-                    storage.rollback_extended_statistics_drop(*statistics, txn.txid);
-                    return sql_fail(error);
-                }
-            }
-            SchemaObject::Policy { slot, .. } => {
-                if let Err(error) = drop_policy_slot(storage, wal, txn, *slot) {
-                    return sql_fail(error);
-                }
-            }
-            SchemaObject::Table(t) => {
-                if let Some(other) = storage.table(*t).ddl_locked_by_other(txn.txid) {
-                    if let Err(error) = storage.wait_for_transaction(txn.txid, other) {
-                        return sql_fail(error);
-                    }
-                    return sql_fail(sql_err!(
-                        crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
-                        "statement is waiting for concurrent DDL on \"{}\"",
-                        storage.table_def(*t, txn.txid).name.as_str()
-                    ));
-                }
-                let def = (*storage.table_def(*t, txn.txid)).clone();
-                for sequence_slot in 0..storage.sequence_count() {
-                    let sequence = storage.sequence_for(sequence_slot, txn.txid);
-                    if !sequence.visible_to(txn.txid)
-                        || !matches!(
-                            sequence.owner,
-                            Some(owner)
-                                if owner.table_schema == def.schema
-                                    && owner.table == def.name
-                        )
-                    {
+                    let mut updated = TableDefBuilder::from_definition(&def);
+                    if !drop_named_constraint(&mut updated, fk_name.as_str()) {
                         continue;
                     }
+                    let mut identity_mapping = [None; MAX_COLUMNS];
+                    for (column, target) in
+                        identity_mapping.iter_mut().enumerate().take(def.n_columns)
+                    {
+                        *target = Some(def.columns()[column].name);
+                    }
+                    if let Err(error) = txn.write_table_definition(
+                        storage,
+                        edit_target,
+                        updated,
+                        &identity_mapping,
+                        false,
+                        crate::storage::ColumnSet::EMPTY,
+                    ) {
+                        return sql_fail(error);
+                    }
+                }
+                SchemaObject::View(v) => {
+                    let (schema, vname, temporary) = {
+                        let view = storage.view(*v);
+                        (
+                            view.schema_for(txn.txid),
+                            view.name_for(txn.txid),
+                            view.persistence == crate::storage::RelationPersistence::Temporary,
+                        )
+                    };
+                    if !temporary {
+                        let lsn = storage.bump_lsn();
+                        if let Err(e) = wal.stage_reserved(
+                            txn.txid,
+                            lsn,
+                            &WalOp::DropView {
+                                schema: schema.as_str(),
+                                name: vname.as_str(),
+                            },
+                        ) {
+                            return sql_fail(e);
+                        }
+                    }
+                    let dropped = match storage.drop_view(schema.as_str(), vname.as_str(), txn.txid)
+                    {
+                        Ok(d) => d,
+                        Err(e) => return sql_fail(e),
+                    };
+                    if let Some(undo) = dropped
+                        && let Err(error) =
+                            txn.record_ddl(storage, super::txn::DdlUndo::ViewDropped(undo))
+                    {
+                        storage.rollback_view_drop(undo);
+                        return sql_fail(error);
+                    }
+                }
+                SchemaObject::Routine(routine) => {
+                    if storage.routine_identity_for(*routine, txn.txid).is_some() {
+                        let routine_oid =
+                            crate::storage::routine_oid(&storage.routine_for(*routine, txn.txid));
+                        if let Err(error) = cascade_routine_cast_operator_dependents(
+                            storage,
+                            wal,
+                            txn,
+                            routine_oid,
+                            arena,
+                        ) {
+                            return sql_fail(error);
+                        }
+                    }
+                    selected_routines.fill(false);
+                    selected_routines[*routine] = true;
+                    if let Err(error) = drop_selected_stored_queries(
+                        storage,
+                        wal,
+                        txn,
+                        no_views,
+                        no_matviews,
+                        selected_routines,
+                        no_rules,
+                    ) {
+                        return sql_fail(error);
+                    }
+                }
+                SchemaObject::Collation(slot) => {
+                    if !storage.collation(*slot).visible_to(txn.txid) {
+                        continue;
+                    }
+                    let definition = storage.collation(*slot).definition_for(txn.txid);
+                    let Some(owner) = storage.role_slot_by_oid(definition.owner, txn.txid) else {
+                        return sql_fail(sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "collation owner does not exist"
+                        ));
+                    };
+                    let owner = storage.role_name(owner, txn.txid);
+                    let qualified = QualName {
+                        schema: Some(definition.schema.as_str()),
+                        name: definition.name.as_str(),
+                    };
+                    let owner = match storage.capture_role(owner.as_str(), txn.txid) {
+                        Ok(role) => crate::storage::SessionIdentity::bound(role),
+                        Err(error) => return sql_fail(error),
+                    };
+                    let outcome = run_as_role(owner, || {
+                        responder.without_command_complete(|responder| {
+                            drop_collation(
+                                storage,
+                                &mut *wal,
+                                txn,
+                                scratch,
+                                &qualified,
+                                false,
+                                true,
+                                arena,
+                                seq_session,
+                                responder,
+                            )
+                        })
+                    });
+                    match outcome {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return sql_fail(error),
+                        Err(error) => return Err(error),
+                    }
+                }
+                SchemaObject::Conversion(slot) => {
+                    if !storage.conversion(*slot).visible_to(txn.txid) {
+                        continue;
+                    }
+                    let definition = storage.conversion(*slot).definition_for(txn.txid);
+                    let Some(owner) = storage.role_slot_by_oid(definition.owner, txn.txid) else {
+                        return sql_fail(sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "conversion owner does not exist"
+                        ));
+                    };
+                    let owner = storage.role_name(owner, txn.txid);
+                    let qualified = QualName {
+                        schema: Some(definition.schema.as_str()),
+                        name: definition.name.as_str(),
+                    };
+                    let owner = match storage.capture_role(owner.as_str(), txn.txid) {
+                        Ok(role) => crate::storage::SessionIdentity::bound(role),
+                        Err(error) => return sql_fail(error),
+                    };
+                    let outcome = run_as_role(owner, || {
+                        responder.without_command_complete(|responder| {
+                            drop_conversion(
+                                storage, &mut *wal, txn, &qualified, false, true, responder,
+                            )
+                        })
+                    });
+                    match outcome {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return sql_fail(error),
+                        Err(error) => return Err(error),
+                    }
+                }
+                SchemaObject::TextSearch(slot) => {
+                    if storage.text_search_object(*slot).visible_to(txn.txid)
+                        && let Err(error) =
+                            drop_text_search_slot(storage, wal, txn, *slot, true, arena)
+                    {
+                        return sql_fail(error);
+                    }
+                }
+                SchemaObject::Matview { table, catalog } => {
+                    let def = (*storage.table_def(*table, txn.txid)).clone();
+                    let lsn = storage.bump_lsn();
+                    if let Err(error) = wal.stage_reserved(
+                        txn.txid,
+                        lsn,
+                        &WalOp::DropTable {
+                            identity: storage.table_position(*table),
+                            schema: def.schema.as_str(),
+                            name: def.name.as_str(),
+                        },
+                    ) {
+                        return sql_fail(error);
+                    }
+                    if let Err(error) = require_row_type_unused(storage, txn.txid, *table, |user| {
+                        user.schema == def.schema
+                    }) {
+                        return sql_fail(error);
+                    }
+                    let dropped = match storage.drop_table_in(*table, txn.txid) {
+                        Ok(undo) => undo,
+                        Err(error) => return sql_fail(error),
+                    };
+                    if let Err(error) = txn.record_table_drop(storage, dropped) {
+                        return sql_fail(error);
+                    }
+                    storage.drop_indexes_for(*table, txn.txid);
+                    let lsn = storage.bump_lsn();
+                    if let Err(error) = wal.stage_reserved(
+                        txn.txid,
+                        lsn,
+                        &WalOp::DropMatview {
+                            identity: storage.matview_position(*catalog),
+                            schema: def.schema.as_str(),
+                            name: def.name.as_str(),
+                        },
+                    ) {
+                        return sql_fail(error);
+                    }
+                    let target = match storage.prepare_matview_edit(*catalog, txn.txid) {
+                        Ok(target) => target,
+                        Err(error) => return sql_fail(error),
+                    };
+                    let change = match storage.drop_matview(target, txn.txid) {
+                        Ok(change) => change,
+                        Err(error) => return sql_fail(error),
+                    };
+                    if let Err(error) = txn.record_matview_change(storage, change) {
+                        return sql_fail(error);
+                    }
+                }
+                SchemaObject::Sequence(sequence) => {
+                    let identity = storage.sequence_position(*sequence);
+                    let sequence = storage.sequence_for(*sequence, txn.txid);
                     let (schema, name) = (sequence.schema, sequence.name);
                     if sequence.persistence != crate::storage::RelationPersistence::Temporary {
                         let lsn = storage.bump_lsn();
@@ -15776,7 +15741,7 @@ pub(crate) fn drop_schema(
                             txn.txid,
                             lsn,
                             &WalOp::DropSequence {
-                                identity: storage.sequence_position(sequence_slot),
+                                identity,
                                 schema: schema.as_str(),
                                 name: name.as_str(),
                             },
@@ -15794,119 +15759,344 @@ pub(crate) fn drop_schema(
                         Err(error) => return sql_fail(error),
                     }
                 }
-                let trigger_target = crate::storage::TriggerTarget::Table(*t as u16);
-                loop {
-                    let trigger = storage.triggers_with_slots_visible_to(txn.txid).find_map(
-                        |(slot, trigger)| (trigger.target == trigger_target).then_some(slot),
-                    );
-                    let Some(slot) = trigger else { break };
-                    if let Err(error) = storage.drop_trigger(slot, txn.txid) {
-                        return sql_fail(error);
-                    }
-                    if let Err(error) =
-                        txn.record_ddl(storage, super::txn::DdlUndo::TriggerDropped(slot as u32))
-                    {
-                        storage.rollback_trigger_drop(slot, txn.txid);
-                        return sql_fail(error);
-                    }
-                }
-                if def.persistence != crate::storage::RelationPersistence::Temporary {
+                SchemaObject::Domain(domain) => {
+                    let domain = storage.domain_for(*domain, txn.txid);
+                    let (schema, name) = (domain.schema, domain.name);
                     let lsn = storage.bump_lsn();
-                    if let Err(e) = wal.stage_reserved(
+                    if let Err(error) = wal.stage_reserved(
                         txn.txid,
                         lsn,
-                        &WalOp::DropTable {
-                            identity: storage.table_position(*t),
-                            schema: def.schema.as_str(),
-                            name: def.name.as_str(),
+                        &WalOp::DropDomain {
+                            schema: schema.as_str(),
+                            name: name.as_str(),
                         },
                     ) {
-                        return sql_fail(e);
+                        return sql_fail(error);
+                    }
+                    match storage.stage_type_drop(
+                        crate::storage::NamedTypeKind::Domain,
+                        schema.as_str(),
+                        name.as_str(),
+                        txn.txid,
+                    ) {
+                        Ok(Some(slot)) => {
+                            if let Err(error) =
+                                txn.record_ddl(storage, super::txn::DdlUndo::DomainDropped(slot))
+                            {
+                                storage.finish_type_ddl(
+                                    slot,
+                                    crate::storage::TypeDdlDecision::Rollback,
+                                );
+                                return sql_fail(error);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => return sql_fail(error),
                     }
                 }
-                if let Err(error) =
-                    require_row_type_unused(storage, txn.txid, *t, |user| user.schema == def.schema)
-                {
-                    return sql_fail(error);
+                SchemaObject::Enum(enumeration) => {
+                    let enumeration = storage.enum_for(*enumeration, txn.txid);
+                    let (schema, name) = (enumeration.schema, enumeration.name);
+                    let lsn = storage.bump_lsn();
+                    if let Err(error) = wal.stage_reserved(
+                        txn.txid,
+                        lsn,
+                        &WalOp::DropEnum {
+                            schema: schema.as_str(),
+                            name: name.as_str(),
+                        },
+                    ) {
+                        return sql_fail(error);
+                    }
+                    match storage.stage_type_drop(
+                        crate::storage::NamedTypeKind::Enum,
+                        schema.as_str(),
+                        name.as_str(),
+                        txn.txid,
+                    ) {
+                        Ok(Some(slot)) => {
+                            if let Err(error) =
+                                txn.record_ddl(storage, super::txn::DdlUndo::EnumDropped(slot))
+                            {
+                                storage.finish_type_ddl(
+                                    slot,
+                                    crate::storage::TypeDdlDecision::Rollback,
+                                );
+                                return sql_fail(error);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => return sql_fail(error),
+                    }
                 }
-                let dropped = match storage.drop_table_in(*t, txn.txid) {
-                    Ok(undo) => undo,
+                SchemaObject::Composite(composite) => {
+                    if storage.composite(*composite).visible_to(txn.txid)
+                        && let Err(error) = drop_composite_type(
+                            storage,
+                            wal,
+                            txn,
+                            scratch,
+                            *composite,
+                            true,
+                            arena,
+                            seq_session,
+                            responder,
+                        )
+                    {
+                        return sql_fail(error);
+                    }
+                }
+                SchemaObject::Operator(operator) => {
+                    if storage.operator(*operator).visible_to(txn.txid) {
+                        let operator_oid = storage.operator(*operator).oid();
+                        if let Err(error) =
+                            cascade_operator_dependencies(storage, wal, txn, operator_oid, arena)
+                        {
+                            return sql_fail(error);
+                        }
+                        if let Err(error) = stage_operator_drop(storage, wal, txn, *operator) {
+                            return sql_fail(error);
+                        }
+                    }
+                }
+                SchemaObject::OperatorFamily(family) => {
+                    if storage.operator_family(*family).visible_to(txn.txid) {
+                        let family_oid = storage.operator_family(*family).oid();
+                        loop {
+                            let dependent = storage.operator_classes_visible_to(txn.txid).find_map(
+                                |(slot, class)| (class.family == family_oid).then_some(slot),
+                            );
+                            let Some(class) = dependent else { break };
+                            if let Err(error) =
+                                stage_operator_class_drop(storage, wal, txn, class, true)
+                            {
+                                return sql_fail(error);
+                            }
+                        }
+                        if let Err(error) = stage_operator_family_drop(storage, wal, txn, *family) {
+                            return sql_fail(error);
+                        }
+                    }
+                }
+                SchemaObject::OperatorClass(class) => {
+                    if storage.operator_class(*class).visible_to(txn.txid)
+                        && let Err(error) =
+                            stage_operator_class_drop(storage, wal, txn, *class, true)
+                    {
+                        return sql_fail(error);
+                    }
+                }
+                SchemaObject::Statistics(statistics) => {
+                    if !storage
+                        .extended_statistics(*statistics)
+                        .visible_to(txn.txid)
+                    {
+                        continue;
+                    }
+                    let definition = storage
+                        .extended_statistics(*statistics)
+                        .definition_for(txn.txid);
+                    if let Err(error) = storage.drop_extended_statistics(*statistics, txn.txid) {
+                        return sql_fail(error);
+                    }
+                    if storage
+                        .table_def(
+                            usize::from(storage.extended_statistics(*statistics).table),
+                            txn.txid,
+                        )
+                        .persistence
+                        != crate::storage::RelationPersistence::Temporary
+                    {
+                        let lsn = storage.bump_lsn();
+                        if let Err(error) = wal.stage_reserved(
+                            txn.txid,
+                            lsn,
+                            &WalOp::DropExtendedStatistics {
+                                schema: definition.schema.as_str(),
+                                name: definition.name.as_str(),
+                            },
+                        ) {
+                            storage.rollback_extended_statistics_drop(*statistics, txn.txid);
+                            return sql_fail(error);
+                        }
+                    }
+                    if let Err(error) = txn.record_ddl(
+                        storage,
+                        super::txn::DdlUndo::StatisticsDropped(*statistics as u32),
+                    ) {
+                        storage.rollback_extended_statistics_drop(*statistics, txn.txid);
+                        return sql_fail(error);
+                    }
+                }
+                SchemaObject::Policy { slot, .. } => {
+                    if let Err(error) = drop_policy_slot(storage, wal, txn, *slot) {
+                        return sql_fail(error);
+                    }
+                }
+                SchemaObject::Table(t) => {
+                    if let Some(other) = storage.table(*t).ddl_locked_by_other(txn.txid) {
+                        if let Err(error) = storage.wait_for_transaction(txn.txid, other) {
+                            return sql_fail(error);
+                        }
+                        return sql_fail(sql_err!(
+                            crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
+                            "statement is waiting for concurrent DDL on \"{}\"",
+                            storage.table_def(*t, txn.txid).name.as_str()
+                        ));
+                    }
+                    let def = (*storage.table_def(*t, txn.txid)).clone();
+                    for sequence_slot in 0..storage.sequence_count() {
+                        let sequence = storage.sequence_for(sequence_slot, txn.txid);
+                        if !sequence.visible_to(txn.txid)
+                            || !matches!(
+                                sequence.owner,
+                                Some(owner)
+                                    if owner.table_schema == def.schema
+                                        && owner.table == def.name
+                            )
+                        {
+                            continue;
+                        }
+                        let (schema, name) = (sequence.schema, sequence.name);
+                        if sequence.persistence != crate::storage::RelationPersistence::Temporary {
+                            let lsn = storage.bump_lsn();
+                            if let Err(error) = wal.stage_reserved(
+                                txn.txid,
+                                lsn,
+                                &WalOp::DropSequence {
+                                    identity: storage.sequence_position(sequence_slot),
+                                    schema: schema.as_str(),
+                                    name: name.as_str(),
+                                },
+                            ) {
+                                return sql_fail(error);
+                            }
+                        }
+                        match storage.drop_sequence(schema.as_str(), name.as_str(), txn.txid) {
+                            Ok(Some(slot)) => {
+                                if let Err(error) = txn.record_sequence_change(storage, slot) {
+                                    return sql_fail(error);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => return sql_fail(error),
+                        }
+                    }
+                    let trigger_target = crate::storage::TriggerTarget::Table(*t as u16);
+                    loop {
+                        let trigger = storage.triggers_with_slots_visible_to(txn.txid).find_map(
+                            |(slot, trigger)| (trigger.target == trigger_target).then_some(slot),
+                        );
+                        let Some(slot) = trigger else { break };
+                        if let Err(error) = storage.drop_trigger(slot, txn.txid) {
+                            return sql_fail(error);
+                        }
+                        if let Err(error) = txn
+                            .record_ddl(storage, super::txn::DdlUndo::TriggerDropped(slot as u32))
+                        {
+                            storage.rollback_trigger_drop(slot, txn.txid);
+                            return sql_fail(error);
+                        }
+                    }
+                    if def.persistence != crate::storage::RelationPersistence::Temporary {
+                        let lsn = storage.bump_lsn();
+                        if let Err(e) = wal.stage_reserved(
+                            txn.txid,
+                            lsn,
+                            &WalOp::DropTable {
+                                identity: storage.table_position(*t),
+                                schema: def.schema.as_str(),
+                                name: def.name.as_str(),
+                            },
+                        ) {
+                            return sql_fail(e);
+                        }
+                    }
+                    if let Err(error) = require_row_type_unused(storage, txn.txid, *t, |user| {
+                        user.schema == def.schema
+                    }) {
+                        return sql_fail(error);
+                    }
+                    let dropped = match storage.drop_table_in(*t, txn.txid) {
+                        Ok(undo) => undo,
+                        Err(error) => return sql_fail(error),
+                    };
+                    if let Err(e) = txn.record_table_drop(storage, dropped) {
+                        return sql_fail(e);
+                    }
+                    storage.drop_indexes_for(*t, txn.txid);
+                }
+            }
+        }
+        for &slot in &slots[..n_slots] {
+            let name = storage.schema_def_for(slot, txn.txid).name;
+            for default_slot in 0..storage.default_acl_entry_count() {
+                let entry = storage.default_acl_entry(default_slot);
+                if entry.database != storage.current_database_oid()
+                    || usize::from(entry.schema) != slot
+                    || entry.image_to(txn.txid).is_none()
+                {
+                    continue;
+                }
+                let change = match storage.change_default_acl(
+                    crate::storage::DefaultAclKey {
+                        owner: entry.owner,
+                        schema: entry.schema,
+                        class: entry.class,
+                        grantee: entry.grantee,
+                    },
+                    false,
+                    crate::storage::PrivilegeSet::NONE,
+                    crate::storage::PrivilegeSet::NONE,
+                    txn.txid,
+                ) {
+                    Ok(change) => change,
                     Err(error) => return sql_fail(error),
                 };
-                if let Err(e) = txn.record_table_drop(storage, dropped) {
-                    return sql_fail(e);
+                if let Some((changed, prior)) = change
+                    && let Err(error) = txn.record_ddl(
+                        storage,
+                        super::txn::DdlUndo::DefaultAclChanged {
+                            slot: changed as u32,
+                            prior,
+                        },
+                    )
+                {
+                    storage.restore_default_acl_pending(changed, prior);
+                    return sql_fail(error);
                 }
-                storage.drop_indexes_for(*t, txn.txid);
             }
-        }
-    }
-    for &slot in &slots[..n_slots] {
-        let name = storage.schema_def_for(slot, txn.txid).name;
-        for default_slot in 0..storage.default_acl_entry_count() {
-            let entry = storage.default_acl_entry(default_slot);
-            if entry.database != storage.current_database_oid()
-                || usize::from(entry.schema) != slot
-                || entry.image_to(txn.txid).is_none()
-            {
-                continue;
-            }
-            let change = match storage.change_default_acl(
-                crate::storage::DefaultAclKey {
-                    owner: entry.owner,
-                    schema: entry.schema,
-                    class: entry.class,
-                    grantee: entry.grantee,
-                },
-                false,
-                crate::storage::PrivilegeSet::NONE,
-                crate::storage::PrivilegeSet::NONE,
-                txn.txid,
-            ) {
-                Ok(change) => change,
-                Err(error) => return sql_fail(error),
-            };
-            if let Some((changed, prior)) = change
-                && let Err(error) = txn.record_ddl(
-                    storage,
-                    super::txn::DdlUndo::DefaultAclChanged {
-                        slot: changed as u32,
-                        prior,
-                    },
-                )
-            {
-                storage.restore_default_acl_pending(changed, prior);
+            if let Err(error) = storage.drop_schema_in(slot, txn.txid) {
                 return sql_fail(error);
             }
+            if let Err(error) = remove_schema_from_publications(storage, wal, txn, slot as u8) {
+                storage.rollback_schema_drop(slot, txn.txid);
+                return sql_fail(error);
+            }
+            let lsn = storage.bump_lsn();
+            if let Err(e) = wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::DropSchema {
+                    identity: storage
+                        .schema_def(slot)
+                        .identity()
+                        .expect("dropped schema retains its identity"),
+                    name: name.as_str(),
+                },
+            ) {
+                storage.rollback_schema_drop(slot, txn.txid);
+                return sql_fail(e);
+            }
+            if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::SchemaDropped(slot as u32))
+            {
+                storage.rollback_schema_drop(slot, txn.txid);
+                return sql_fail(e);
+            }
         }
-        if let Err(error) = storage.drop_schema_in(slot, txn.txid) {
-            return sql_fail(error);
-        }
-        if let Err(error) = remove_schema_from_publications(storage, wal, txn, slot as u8) {
-            storage.rollback_schema_drop(slot, txn.txid);
-            return sql_fail(error);
-        }
-        let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage_reserved(
-            txn.txid,
-            lsn,
-            &WalOp::DropSchema {
-                identity: storage
-                    .schema_def(slot)
-                    .identity()
-                    .expect("dropped schema retains its identity"),
-                name: name.as_str(),
-            },
-        ) {
-            storage.rollback_schema_drop(slot, txn.txid);
-            return sql_fail(e);
-        }
-        if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::SchemaDropped(slot as u32)) {
-            storage.rollback_schema_drop(slot, txn.txid);
-            return sql_fail(e);
-        }
-    }
-    responder.command_complete("DROP SCHEMA")?;
-    sql_ok()
+        responder.command_complete("DROP SCHEMA")?;
+        sql_ok()
+    })
 }
 
 fn remove_schema_from_publications(
@@ -40907,192 +41097,208 @@ pub fn drop_routine(
     if let Some(signature) = builtin {
         return sql_fail(routine_lookup::builtin_drop_error(signature));
     }
-    for target_index in 0..target_count {
-        let identity = identity_at(target_index);
-        // A target found above and missing now was already dropped by this
-        // statement, as a repeated target or a cascaded dependent.
-        let slot = match resolve_drop_routine_target(storage, txn.txid, kind, &identity) {
-            Ok(Ok(RoutineTarget::Stored(slot))) => slot,
-            Ok(Ok(RoutineTarget::Builtin(_)) | Err(_)) => continue,
-            Err(error) => return sql_fail(error),
-        };
-        let actual_kind = match storage.routine(slot).kind {
-            crate::storage::RoutineKind::Procedure => crate::sql::ast::RoutineTargetKind::Procedure,
-            crate::storage::RoutineKind::Aggregate(_) => {
-                crate::sql::ast::RoutineTargetKind::Aggregate
+    let report = (|| {
+        let originals = arena
+            .alloc_slice_with(target_count, |_| DROPPED_NOTHING)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for target_index in 0..target_count {
+            if let Ok(Ok(RoutineTarget::Stored(slot))) =
+                resolve_drop_routine_target(storage, txn.txid, kind, &identity_at(target_index))
+            {
+                if storage
+                    .require_not_extension_member(
+                        Storage::routine_access_object(slot),
+                        txn.txid,
+                        "function",
+                    )
+                    .is_err()
+                {
+                    return Ok(None);
+                }
+                originals[count] = ObjectAddress::new(
+                    super::catalog::PG_PROC_OID,
+                    crate::storage::routine_oid(&storage.routine_for(slot, txn.txid)),
+                    0,
+                );
+                count += 1;
             }
-            _ => crate::sql::ast::RoutineTargetKind::Function,
-        };
-        if let Err(error) = storage.require_not_extension_member(
-            Storage::routine_access_object(slot),
-            txn.txid,
-            actual_kind.noun(),
-        ) {
-            return sql_fail(error);
         }
-        let routine = storage.routine(slot);
-        let StoredDependencyClosure {
-            views: dependent_views,
-            matviews: dependent_matviews,
-            routines: dependent_routines,
-            rules: dependent_rules,
-        } = match stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
-            dependency.class == crate::storage::DependencyClass::Routine
-                && dependency.slot as usize == slot
-        }) {
-            Ok(dependents) => dependents,
-            Err(error) => return sql_fail(error),
-        };
-        // CREATE OR REPLACE can bind recursion to the routine's stable slot.
-        dependent_routines[slot] = false;
-        let policy_root = PolicyDependencySelection::Catalog {
-            class: crate::storage::DependencyClass::Routine,
-            slot,
-        };
-        let has_stored_dependents = dependent_views.iter().any(|selected| *selected)
-            || dependent_matviews.iter().any(|selected| *selected)
-            || dependent_routines.iter().any(|selected| *selected)
-            || dependent_rules.iter().any(|selected| *selected)
-            || policy_dependents_exist(
-                storage,
+        dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &originals[..count],
+            cascade,
+            arena,
+            responder,
+        )
+    })();
+    run_reported_drop(report, responder, |responder| {
+        for target_index in 0..target_count {
+            let identity = identity_at(target_index);
+            // A target found above and missing now was already dropped by this
+            // statement, as a repeated target or a cascaded dependent.
+            let slot = match resolve_drop_routine_target(storage, txn.txid, kind, &identity) {
+                Ok(Ok(RoutineTarget::Stored(slot))) => slot,
+                Ok(Ok(RoutineTarget::Builtin(_)) | Err(_)) => continue,
+                Err(error) => return sql_fail(error),
+            };
+            let actual_kind = match storage.routine(slot).kind {
+                crate::storage::RoutineKind::Procedure => {
+                    crate::sql::ast::RoutineTargetKind::Procedure
+                }
+                crate::storage::RoutineKind::Aggregate(_) => {
+                    crate::sql::ast::RoutineTargetKind::Aggregate
+                }
+                _ => crate::sql::ast::RoutineTargetKind::Function,
+            };
+            if let Err(error) = storage.require_not_extension_member(
+                Storage::routine_access_object(slot),
                 txn.txid,
-                policy_root,
-                dependent_views,
-                dependent_matviews,
-                dependent_routines,
-            );
-        let dependency_suffix = match routine_dependency_suffix(storage, txn.txid, &routine) {
-            Ok(suffix) => suffix,
-            Err(error) => return sql_fail(error),
-        };
-        if has_stored_dependents && !cascade {
-            if let Err(error) = report_stored_query_dependents(
-                storage,
-                txn.txid,
-                StoredQueryRoot {
-                    class: crate::storage::DependencyClass::Routine,
-                    slot,
-                    kind: "function",
-                    schema: routine.schema_for(txn.txid),
-                    name: routine.name_for(txn.txid),
-                    suffix: dependency_suffix,
-                },
-                StoredQuerySelection {
-                    views: dependent_views,
-                    matviews: dependent_matviews,
-                    routines: dependent_routines,
-                    rules: dependent_rules,
-                    policy_root: Some(policy_root),
-                },
-                false,
-                arena,
-                responder,
+                actual_kind.noun(),
             ) {
                 return sql_fail(error);
             }
-            return sql_fail(stored_dependency_drop_error(
-                storage,
-                txn.txid,
-                StoredQueryRoot {
-                    class: crate::storage::DependencyClass::Routine,
-                    slot,
-                    kind: "function",
-                    schema: routine.schema_for(txn.txid),
-                    name: routine.name_for(txn.txid),
-                    suffix: dependency_suffix,
-                },
-            ));
-        }
-        if has_stored_dependents
-            && let Err(error) = report_stored_query_dependents(
-                storage,
-                txn.txid,
-                StoredQueryRoot {
-                    class: crate::storage::DependencyClass::Routine,
-                    slot,
-                    kind: "function",
-                    schema: routine.schema_for(txn.txid),
-                    name: routine.name_for(txn.txid),
-                    suffix: dependency_suffix,
-                },
-                StoredQuerySelection {
-                    views: dependent_views,
-                    matviews: dependent_matviews,
-                    routines: dependent_routines,
-                    rules: dependent_rules,
-                    policy_root: Some(policy_root),
-                },
-                true,
-                arena,
-                responder,
-            )
-        {
-            return sql_fail(error);
-        }
-        if has_stored_dependents
-            && let Err(error) = drop_policy_dependents(
-                storage,
-                wal,
-                txn,
-                policy_root,
-                dependent_views,
-                dependent_matviews,
-                dependent_routines,
-            )
-        {
-            return sql_fail(error);
-        }
-        if has_stored_dependents
-            && let Err(error) = drop_selected_stored_queries(
-                storage,
-                wal,
-                txn,
-                dependent_views,
-                dependent_matviews,
-                dependent_routines,
-                dependent_rules,
-            )
-        {
-            return sql_fail(error);
-        }
-        let support_oid = crate::storage::routine_oid(&routine);
-        if routine_has_cast_operator_dependents(storage, txn.txid, support_oid) && !cascade {
-            return sql_fail(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop function {} because cast or operator objects depend on it",
-                routine.name_for(txn.txid).as_str()
-            ));
-        }
-        if cascade
-            && let Err(error) =
-                cascade_routine_cast_operator_dependents(storage, wal, txn, support_oid, arena)
-        {
-            return sql_fail(error);
-        }
-        let dependent_aggregate = (0..storage.routine_count()).find(|candidate| {
-            *candidate != slot
-                && storage.routine_identity_for(*candidate, txn.txid).is_some()
-                && matches!(
-                    storage.routine_for(*candidate, txn.txid).kind,
-                    crate::storage::RoutineKind::Aggregate(aggregate)
-                        if aggregate.uses_function_oid(support_oid)
+            let routine = storage.routine(slot);
+            let StoredDependencyClosure {
+                views: dependent_views,
+                matviews: dependent_matviews,
+                routines: dependent_routines,
+                rules: dependent_rules,
+            } = match stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
+                dependency.class == crate::storage::DependencyClass::Routine
+                    && dependency.slot as usize == slot
+            }) {
+                Ok(dependents) => dependents,
+                Err(error) => return sql_fail(error),
+            };
+            // CREATE OR REPLACE can bind recursion to the routine's stable slot.
+            dependent_routines[slot] = false;
+            let policy_root = PolicyDependencySelection::Catalog {
+                class: crate::storage::DependencyClass::Routine,
+                slot,
+            };
+            let has_stored_dependents = dependent_views.iter().any(|selected| *selected)
+                || dependent_matviews.iter().any(|selected| *selected)
+                || dependent_routines.iter().any(|selected| *selected)
+                || dependent_rules.iter().any(|selected| *selected)
+                || policy_dependents_exist(
+                    storage,
+                    txn.txid,
+                    policy_root,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
+                );
+            let dependency_suffix = match routine_dependency_suffix(storage, txn.txid, &routine) {
+                Ok(suffix) => suffix,
+                Err(error) => return sql_fail(error),
+            };
+            if has_stored_dependents && !cascade {
+                if let Err(error) = report_stored_query_dependents(
+                    storage,
+                    txn.txid,
+                    StoredQueryRoot {
+                        class: crate::storage::DependencyClass::Routine,
+                        slot,
+                        kind: "function",
+                        schema: routine.schema_for(txn.txid),
+                        name: routine.name_for(txn.txid),
+                        suffix: dependency_suffix,
+                    },
+                    StoredQuerySelection {
+                        views: dependent_views,
+                        matviews: dependent_matviews,
+                        routines: dependent_routines,
+                        rules: dependent_rules,
+                        policy_root: Some(policy_root),
+                    },
+                    false,
+                    arena,
+                    responder,
+                ) {
+                    return sql_fail(error);
+                }
+                return sql_fail(stored_dependency_drop_error(
+                    storage,
+                    txn.txid,
+                    StoredQueryRoot {
+                        class: crate::storage::DependencyClass::Routine,
+                        slot,
+                        kind: "function",
+                        schema: routine.schema_for(txn.txid),
+                        name: routine.name_for(txn.txid),
+                        suffix: dependency_suffix,
+                    },
+                ));
+            }
+            if has_stored_dependents
+                && let Err(error) = report_stored_query_dependents(
+                    storage,
+                    txn.txid,
+                    StoredQueryRoot {
+                        class: crate::storage::DependencyClass::Routine,
+                        slot,
+                        kind: "function",
+                        schema: routine.schema_for(txn.txid),
+                        name: routine.name_for(txn.txid),
+                        suffix: dependency_suffix,
+                    },
+                    StoredQuerySelection {
+                        views: dependent_views,
+                        matviews: dependent_matviews,
+                        routines: dependent_routines,
+                        rules: dependent_rules,
+                        policy_root: Some(policy_root),
+                    },
+                    true,
+                    arena,
+                    responder,
                 )
-        });
-        if let Some(dependent) = dependent_aggregate
-            && !cascade
-        {
-            return sql_fail(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop function {} because aggregate {} depends on it",
-                routine.name_for(txn.txid).as_str(),
-                storage
-                    .routine_for(dependent, txn.txid)
-                    .name_for(txn.txid)
-                    .as_str()
-            ));
-        }
-        loop {
-            let dependent = (0..storage.routine_count()).find(|candidate| {
+            {
+                return sql_fail(error);
+            }
+            if has_stored_dependents
+                && let Err(error) = drop_policy_dependents(
+                    storage,
+                    wal,
+                    txn,
+                    policy_root,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
+                )
+            {
+                return sql_fail(error);
+            }
+            if has_stored_dependents
+                && let Err(error) = drop_selected_stored_queries(
+                    storage,
+                    wal,
+                    txn,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
+                    dependent_rules,
+                )
+            {
+                return sql_fail(error);
+            }
+            let support_oid = crate::storage::routine_oid(&routine);
+            if routine_has_cast_operator_dependents(storage, txn.txid, support_oid) && !cascade {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop function {} because cast or operator objects depend on it",
+                    routine.name_for(txn.txid).as_str()
+                ));
+            }
+            if cascade
+                && let Err(error) =
+                    cascade_routine_cast_operator_dependents(storage, wal, txn, support_oid, arena)
+            {
+                return sql_fail(error);
+            }
+            let dependent_aggregate = (0..storage.routine_count()).find(|candidate| {
                 *candidate != slot
                     && storage.routine_identity_for(*candidate, txn.txid).is_some()
                     && matches!(
@@ -41101,29 +41307,150 @@ pub fn drop_routine(
                             if aggregate.uses_function_oid(support_oid)
                     )
             });
-            let Some(dependent) = dependent else {
-                break;
-            };
-            let definition = storage.routine_for(dependent, txn.txid);
+            if let Some(dependent) = dependent_aggregate
+                && !cascade
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop function {} because aggregate {} depends on it",
+                    routine.name_for(txn.txid).as_str(),
+                    storage
+                        .routine_for(dependent, txn.txid)
+                        .name_for(txn.txid)
+                        .as_str()
+                ));
+            }
+            loop {
+                let dependent = (0..storage.routine_count()).find(|candidate| {
+                    *candidate != slot
+                        && storage.routine_identity_for(*candidate, txn.txid).is_some()
+                        && matches!(
+                            storage.routine_for(*candidate, txn.txid).kind,
+                            crate::storage::RoutineKind::Aggregate(aggregate)
+                                if aggregate.uses_function_oid(support_oid)
+                        )
+                });
+                let Some(dependent) = dependent else {
+                    break;
+                };
+                let definition = storage.routine_for(dependent, txn.txid);
+                let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
+                let signature =
+                    match encode_routine_signature(definition.arguments(), &mut signature) {
+                        Ok(signature) => signature,
+                        Err(error) => return sql_fail(error),
+                    };
+                let lsn = storage.bump_lsn();
+                if let Err(error) = wal.stage_reserved(
+                    txn.txid,
+                    lsn,
+                    &WalOp::DropRoutine {
+                        identity: storage.routine_position(dependent),
+                        schema: definition.schema_for(txn.txid).as_str(),
+                        name: definition.name_for(txn.txid).as_str(),
+                        argument_signature: signature,
+                    },
+                ) {
+                    return sql_fail(error);
+                }
+                let target = match storage.prepare_routine_edit(dependent, txn.txid) {
+                    Ok(target) => target,
+                    Err(error) => return sql_fail(error),
+                };
+                let change = match storage.drop_routine(target, txn.txid) {
+                    Ok(change) => change,
+                    Err(error) => return sql_fail(error),
+                };
+                if let Err(error) = txn.record_routine_change(storage, change) {
+                    return sql_fail(error);
+                }
+            }
+            if storage
+                .event_triggers_visible_to(txn.txid)
+                .any(|(_, trigger)| usize::from(trigger.function) == slot)
+                && !cascade
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop function {} because event trigger objects depend on it",
+                    routine.name_for(txn.txid).as_str()
+                ));
+            }
+            loop {
+                let dependency = storage.event_triggers_visible_to(txn.txid).find_map(
+                    |(trigger_slot, trigger)| {
+                        (usize::from(trigger.function) == slot).then_some((trigger_slot, trigger))
+                    },
+                );
+                let Some((trigger_slot, trigger)) = dependency else {
+                    break;
+                };
+                if let Err(error) = storage.drop_event_trigger(trigger_slot, txn.txid) {
+                    return sql_fail(error);
+                }
+                let lsn = storage.bump_lsn();
+                if let Err(error) = wal.stage_reserved(
+                    txn.txid,
+                    lsn,
+                    &WalOp::DropEventTrigger {
+                        name: trigger.name.as_str(),
+                    },
+                ) {
+                    storage.rollback_event_trigger_drop(trigger_slot, txn.txid);
+                    return sql_fail(error);
+                }
+                if let Err(error) = txn.record_ddl(
+                    storage,
+                    super::txn::DdlUndo::EventTriggerDropped(trigger_slot as u32),
+                ) {
+                    storage.rollback_event_trigger_drop(trigger_slot, txn.txid);
+                    return sql_fail(error);
+                }
+            }
+            if storage
+                .triggers_with_slots_visible_to(txn.txid)
+                .any(|(_, trigger)| usize::from(trigger.function) == slot)
+                && !cascade
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop function {} because trigger objects depend on it",
+                    routine.name_for(txn.txid).as_str()
+                ));
+            }
+            loop {
+                let dependency = storage.triggers_with_slots_visible_to(txn.txid).find_map(
+                    |(trigger_slot, trigger)| {
+                        (usize::from(trigger.function) == slot).then_some((trigger_slot, trigger))
+                    },
+                );
+                let Some((trigger_slot, trigger)) = dependency else {
+                    break;
+                };
+                if let Err(error) = drop_trigger_with_undo(storage, wal, txn, trigger_slot, trigger)
+                {
+                    return sql_fail(error);
+                }
+            }
+            let lsn = storage.bump_lsn();
             let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
-            let signature = match encode_routine_signature(definition.arguments(), &mut signature) {
+            let signature = match encode_routine_signature(routine.arguments(), &mut signature) {
                 Ok(signature) => signature,
                 Err(error) => return sql_fail(error),
             };
-            let lsn = storage.bump_lsn();
             if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::DropRoutine {
-                    identity: storage.routine_position(dependent),
-                    schema: definition.schema_for(txn.txid).as_str(),
-                    name: definition.name_for(txn.txid).as_str(),
+                    identity: storage.routine_position(slot),
+                    schema: routine.schema_for(txn.txid).as_str(),
+                    name: routine.name_for(txn.txid).as_str(),
                     argument_signature: signature,
                 },
             ) {
                 return sql_fail(error);
             }
-            let target = match storage.prepare_routine_edit(dependent, txn.txid) {
+            let target = match storage.prepare_routine_edit(slot, txn.txid) {
                 Ok(target) => target,
                 Err(error) => return sql_fail(error),
             };
@@ -41135,110 +41462,14 @@ pub fn drop_routine(
                 return sql_fail(error);
             }
         }
-        if storage
-            .event_triggers_visible_to(txn.txid)
-            .any(|(_, trigger)| usize::from(trigger.function) == slot)
-            && !cascade
-        {
-            return sql_fail(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop function {} because event trigger objects depend on it",
-                routine.name_for(txn.txid).as_str()
-            ));
-        }
-        loop {
-            let dependency =
-                storage
-                    .event_triggers_visible_to(txn.txid)
-                    .find_map(|(trigger_slot, trigger)| {
-                        (usize::from(trigger.function) == slot).then_some((trigger_slot, trigger))
-                    });
-            let Some((trigger_slot, trigger)) = dependency else {
-                break;
-            };
-            if let Err(error) = storage.drop_event_trigger(trigger_slot, txn.txid) {
-                return sql_fail(error);
-            }
-            let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage_reserved(
-                txn.txid,
-                lsn,
-                &WalOp::DropEventTrigger {
-                    name: trigger.name.as_str(),
-                },
-            ) {
-                storage.rollback_event_trigger_drop(trigger_slot, txn.txid);
-                return sql_fail(error);
-            }
-            if let Err(error) = txn.record_ddl(
-                storage,
-                super::txn::DdlUndo::EventTriggerDropped(trigger_slot as u32),
-            ) {
-                storage.rollback_event_trigger_drop(trigger_slot, txn.txid);
-                return sql_fail(error);
-            }
-        }
-        if storage
-            .triggers_with_slots_visible_to(txn.txid)
-            .any(|(_, trigger)| usize::from(trigger.function) == slot)
-            && !cascade
-        {
-            return sql_fail(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop function {} because trigger objects depend on it",
-                routine.name_for(txn.txid).as_str()
-            ));
-        }
-        loop {
-            let dependency = storage.triggers_with_slots_visible_to(txn.txid).find_map(
-                |(trigger_slot, trigger)| {
-                    (usize::from(trigger.function) == slot).then_some((trigger_slot, trigger))
-                },
-            );
-            let Some((trigger_slot, trigger)) = dependency else {
-                break;
-            };
-            if let Err(error) = drop_trigger_with_undo(storage, wal, txn, trigger_slot, trigger) {
-                return sql_fail(error);
-            }
-        }
-        let lsn = storage.bump_lsn();
-        let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
-        let signature = match encode_routine_signature(routine.arguments(), &mut signature) {
-            Ok(signature) => signature,
-            Err(error) => return sql_fail(error),
-        };
-        if let Err(error) = wal.stage_reserved(
-            txn.txid,
-            lsn,
-            &WalOp::DropRoutine {
-                identity: storage.routine_position(slot),
-                schema: routine.schema_for(txn.txid).as_str(),
-                name: routine.name_for(txn.txid).as_str(),
-                argument_signature: signature,
-            },
-        ) {
-            return sql_fail(error);
-        }
-        let target = match storage.prepare_routine_edit(slot, txn.txid) {
-            Ok(target) => target,
-            Err(error) => return sql_fail(error),
-        };
-        let change = match storage.drop_routine(target, txn.txid) {
-            Ok(change) => change,
-            Err(error) => return sql_fail(error),
-        };
-        if let Err(error) = txn.record_routine_change(storage, change) {
-            return sql_fail(error);
-        }
-    }
-    responder.command_complete(match kind {
-        crate::sql::ast::RoutineTargetKind::Function => "DROP FUNCTION",
-        crate::sql::ast::RoutineTargetKind::Procedure => "DROP PROCEDURE",
-        crate::sql::ast::RoutineTargetKind::Aggregate => "DROP AGGREGATE",
-        crate::sql::ast::RoutineTargetKind::Either => "DROP ROUTINE",
-    })?;
-    sql_ok()
+        responder.command_complete(match kind {
+            crate::sql::ast::RoutineTargetKind::Function => "DROP FUNCTION",
+            crate::sql::ast::RoutineTargetKind::Procedure => "DROP PROCEDURE",
+            crate::sql::ast::RoutineTargetKind::Aggregate => "DROP AGGREGATE",
+            crate::sql::ast::RoutineTargetKind::Either => "DROP ROUTINE",
+        })?;
+        sql_ok()
+    })
 }
 
 pub fn create_view(
@@ -45219,187 +45450,243 @@ pub fn drop_materialized_view(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    for name in names {
-        let idx = match storage.resolve_relation(name.schema, name.name, txn.txid) {
-            Some(crate::storage::ResolvedRelation::Table(idx))
-                if storage
-                    .matview_slot(
-                        storage.table_def(idx, txn.txid).schema.as_str(),
-                        storage.table_def(idx, txn.txid).name.as_str(),
-                        txn.txid,
-                    )
-                    .is_some() =>
-            {
-                idx
+    let report = (|| {
+        let originals = arena
+            .alloc_slice_with(names.len(), |_| DROPPED_NOTHING)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for name in names {
+            let slot = match storage.resolve_relation(name.schema, name.name, txn.txid) {
+                Some(crate::storage::ResolvedRelation::Table(slot)) => slot,
+                None if if_exists => continue,
+                _ => return Ok(None),
+            };
+            let definition = storage.table_def(slot, txn.txid);
+            let Some(matview) = storage.matview_slot(
+                definition.schema.as_str(),
+                definition.name.as_str(),
+                txn.txid,
+            ) else {
+                return Ok(None);
+            };
+            if !may_drop(
+                storage,
+                crate::storage::AccessClass::MaterializedView,
+                matview,
+                txn.txid,
+                "materialized view",
+            ) {
+                return Ok(None);
             }
-            // A relation that exists but is not a materialized view is a type
-            // error (42809), which IF EXISTS does not suppress.
-            Some(_) => {
+            originals[count] = ObjectAddress::new(
+                super::catalog::PG_CLASS_OID,
+                super::catalog::user_table_oid(storage, slot),
+                0,
+            );
+            count += 1;
+        }
+        dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &originals[..count],
+            cascade,
+            arena,
+            responder,
+        )
+    })();
+    run_reported_drop(report, responder, |responder| {
+        for name in names {
+            let idx = match storage.resolve_relation(name.schema, name.name, txn.txid) {
+                Some(crate::storage::ResolvedRelation::Table(idx))
+                    if storage
+                        .matview_slot(
+                            storage.table_def(idx, txn.txid).schema.as_str(),
+                            storage.table_def(idx, txn.txid).name.as_str(),
+                            txn.txid,
+                        )
+                        .is_some() =>
+                {
+                    idx
+                }
+                // A relation that exists but is not a materialized view is a type
+                // error (42809), which IF EXISTS does not suppress.
+                Some(_) => {
+                    return sql_fail(
+                        RelationKindName::wrong_kind(
+                            storage,
+                            name,
+                            txn.txid,
+                            RelationKindName::MaterializedView,
+                        )
+                        .unwrap_or_else(|| {
+                            sql_err!(
+                                sqlstate::WRONG_OBJECT_TYPE,
+                                "\"{}\" is not a materialized view",
+                                name.name
+                            )
+                        }),
+                    );
+                }
+                None if if_exists => {
+                    responder.notice(
+                        crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                        stack_format!(
+                            128,
+                            "materialized view \"{}\" does not exist, skipping",
+                            name.name
+                        )
+                        .as_str(),
+                    )?;
+                    continue;
+                }
+                None => return sql_fail(undefined_kind("materialized view", name.name)),
+            };
+            let def = (*storage.table_def(idx, txn.txid)).clone();
+            let matview_slot = storage
+                .matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid)
+                .expect("resolved materialized view has a catalog entry");
+            if let Err(error) = storage.require_not_extension_member(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::MaterializedView,
+                    slot: matview_slot as u16,
+                },
+                txn.txid,
+                "materialized view",
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = storage.require_owner(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::MaterializedView,
+                    slot: matview_slot as u16,
+                },
+                txn.txid,
+                "materialized view",
+            ) {
+                return sql_fail(error);
+            }
+            let closure = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
+                dependency.class == crate::storage::DependencyClass::Table
+                    && dependency.slot as usize == idx
+            });
+            let StoredDependencyClosure {
+                views: dependent_views,
+                matviews: dependent_matviews,
+                routines: dependent_routines,
+                rules: dependent_rules,
+            } = match closure {
+                Ok(closure) => closure,
+                Err(error) => return sql_fail(error),
+            };
+            let policy_root = PolicyDependencySelection::Catalog {
+                class: crate::storage::DependencyClass::Table,
+                slot: idx,
+            };
+            let has_dependents = dependent_views.iter().any(|selected| *selected)
+                || dependent_matviews.iter().any(|selected| *selected)
+                || dependent_routines.iter().any(|selected| *selected)
+                || dependent_rules.iter().any(|selected| *selected)
+                || policy_dependents_exist(
+                    storage,
+                    txn.txid,
+                    policy_root,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
+                );
+            if has_dependents && !cascade {
                 return sql_fail(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "\"{}\" is not a materialized view",
-                    name.name
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop materialized view {} because other objects depend on it",
+                    def.name.as_str()
                 ));
             }
-            None if if_exists => {
-                responder.notice(
-                    crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(
-                        128,
-                        "materialized view \"{}\" does not exist, skipping",
-                        name.name
-                    )
-                    .as_str(),
-                )?;
-                continue;
+            if cascade {
+                if let Err(error) = drop_policy_dependents(
+                    storage,
+                    wal,
+                    txn,
+                    policy_root,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
+                ) {
+                    return sql_fail(error);
+                }
+                if let Err(error) = drop_selected_stored_queries(
+                    storage,
+                    wal,
+                    txn,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
+                    dependent_rules,
+                ) {
+                    return sql_fail(error);
+                }
             }
-            None => return sql_fail(undefined_kind("materialized view", name.name)),
-        };
-        let def = (*storage.table_def(idx, txn.txid)).clone();
-        let matview_slot = storage
-            .matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid)
-            .expect("resolved materialized view has a catalog entry");
-        if let Err(error) = storage.require_not_extension_member(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::MaterializedView,
-                slot: matview_slot as u16,
-            },
-            txn.txid,
-            "materialized view",
-        ) {
-            return sql_fail(error);
-        }
-        if let Err(error) = storage.require_owner(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::MaterializedView,
-                slot: matview_slot as u16,
-            },
-            txn.txid,
-            "materialized view",
-        ) {
-            return sql_fail(error);
-        }
-        let closure = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
-            dependency.class == crate::storage::DependencyClass::Table
-                && dependency.slot as usize == idx
-        });
-        let StoredDependencyClosure {
-            views: dependent_views,
-            matviews: dependent_matviews,
-            routines: dependent_routines,
-            rules: dependent_rules,
-        } = match closure {
-            Ok(closure) => closure,
-            Err(error) => return sql_fail(error),
-        };
-        let policy_root = PolicyDependencySelection::Catalog {
-            class: crate::storage::DependencyClass::Table,
-            slot: idx,
-        };
-        let has_dependents = dependent_views.iter().any(|selected| *selected)
-            || dependent_matviews.iter().any(|selected| *selected)
-            || dependent_routines.iter().any(|selected| *selected)
-            || dependent_rules.iter().any(|selected| *selected)
-            || policy_dependents_exist(
-                storage,
+            // Drop the backing table.
+            let lsn = storage.bump_lsn();
+            if let Err(e) = wal.stage_reserved(
                 txn.txid,
-                policy_root,
-                dependent_views,
-                dependent_matviews,
-                dependent_routines,
-            );
-        if has_dependents && !cascade {
-            return sql_fail(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop materialized view {} because other objects depend on it",
-                def.name.as_str()
-            ));
-        }
-        if cascade {
-            if let Err(error) = drop_policy_dependents(
-                storage,
-                wal,
-                txn,
-                policy_root,
-                dependent_views,
-                dependent_matviews,
-                dependent_routines,
+                lsn,
+                &WalOp::DropTable {
+                    identity: storage.table_position(idx),
+                    schema: def.schema.as_str(),
+                    name: def.name.as_str(),
+                },
             ) {
+                return sql_fail(e);
+            }
+            if let Err(error) = require_row_type_unused(storage, txn.txid, idx, |_| false) {
                 return sql_fail(error);
             }
-            if let Err(error) = drop_selected_stored_queries(
-                storage,
-                wal,
-                txn,
-                dependent_views,
-                dependent_matviews,
-                dependent_routines,
-                dependent_rules,
+            let dropped = match storage.drop_table_in(idx, txn.txid) {
+                Ok(undo) => undo,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(e) = txn.record_table_drop(storage, dropped) {
+                return sql_fail(e);
+            }
+            storage.drop_indexes_for(idx, txn.txid);
+            // Drop the matview catalog entry.
+            let lsn = storage.bump_lsn();
+            if let Err(e) = wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::DropMatview {
+                    identity: storage.matview_position(
+                        storage
+                            .matview_slot_for_table(idx, txn.txid)
+                            .expect("selected materialized view retains its catalog entry"),
+                    ),
+                    schema: def.schema.as_str(),
+                    name: def.name.as_str(),
+                },
             ) {
+                return sql_fail(e);
+            }
+            let Some(slot) = storage.matview_slot_for_table(idx, txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "materialized-view catalog entry no longer exists"
+                ));
+            };
+            let target = match storage.prepare_matview_edit(slot, txn.txid) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
+            };
+            let change = match storage.drop_matview(target, txn.txid) {
+                Ok(change) => change,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = txn.record_matview_change(storage, change) {
                 return sql_fail(error);
             }
         }
-        // Drop the backing table.
-        let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage_reserved(
-            txn.txid,
-            lsn,
-            &WalOp::DropTable {
-                identity: storage.table_position(idx),
-                schema: def.schema.as_str(),
-                name: def.name.as_str(),
-            },
-        ) {
-            return sql_fail(e);
-        }
-        if let Err(error) = require_row_type_unused(storage, txn.txid, idx, |_| false) {
-            return sql_fail(error);
-        }
-        let dropped = match storage.drop_table_in(idx, txn.txid) {
-            Ok(undo) => undo,
-            Err(error) => return sql_fail(error),
-        };
-        if let Err(e) = txn.record_table_drop(storage, dropped) {
-            return sql_fail(e);
-        }
-        storage.drop_indexes_for(idx, txn.txid);
-        // Drop the matview catalog entry.
-        let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage_reserved(
-            txn.txid,
-            lsn,
-            &WalOp::DropMatview {
-                identity: storage.matview_position(
-                    storage
-                        .matview_slot_for_table(idx, txn.txid)
-                        .expect("selected materialized view retains its catalog entry"),
-                ),
-                schema: def.schema.as_str(),
-                name: def.name.as_str(),
-            },
-        ) {
-            return sql_fail(e);
-        }
-        let Some(slot) = storage.matview_slot_for_table(idx, txn.txid) else {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "materialized-view catalog entry no longer exists"
-            ));
-        };
-        let target = match storage.prepare_matview_edit(slot, txn.txid) {
-            Ok(target) => target,
-            Err(error) => return sql_fail(error),
-        };
-        let change = match storage.drop_matview(target, txn.txid) {
-            Ok(change) => change,
-            Err(error) => return sql_fail(error),
-        };
-        if let Err(error) = txn.record_matview_change(storage, change) {
-            return sql_fail(error);
-        }
-    }
-    responder.command_complete("DROP MATERIALIZED VIEW")?;
-    sql_ok()
+        responder.command_complete("DROP MATERIALIZED VIEW")?;
+        sql_ok()
+    })
 }
 
 /// Maps an `AS <type>` name to a [`SeqType`]; unknown types are rejected exactly
@@ -46353,202 +46640,241 @@ pub fn drop_sequence(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    for name in names {
-        let slot = match resolve_sequence(storage, name, txn.txid) {
-            Ok(Some(slot)) => slot,
-            Ok(None) if if_exists => {
-                responder.notice(
-                    crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(128, "sequence \"{}\" does not exist, skipping", name.name)
-                        .as_str(),
-                )?;
-                continue;
+    let report = (|| {
+        let originals = arena
+            .alloc_slice_with(names.len(), |_| DROPPED_NOTHING)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for name in names {
+            let slot = match resolve_sequence(storage, name, txn.txid) {
+                Ok(Some(slot)) => slot,
+                Ok(None) if if_exists => continue,
+                _ => return Ok(None),
+            };
+            if !may_drop(
+                storage,
+                crate::storage::AccessClass::Sequence,
+                slot,
+                txn.txid,
+                "sequence",
+            ) {
+                return Ok(None);
             }
-            Ok(None) => return sql_fail(undefined_kind("sequence", name.name)),
-            Err(e) => return sql_fail(e),
-        };
-        if let Err(error) = storage.require_not_extension_member(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Sequence,
-                slot: slot as u16,
-            },
-            txn.txid,
-            "sequence",
-        ) {
-            return sql_fail(error);
+            originals[count] = ObjectAddress::new(
+                super::catalog::PG_CLASS_OID,
+                super::catalog::sequence_oid(storage, slot),
+                0,
+            );
+            count += 1;
         }
-        if let Err(error) = storage.require_owner(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Sequence,
-                slot: slot as u16,
-            },
+        dependency_report::report_drop(
+            storage,
             txn.txid,
-            "sequence",
-        ) {
-            return sql_fail(error);
-        }
-        let (schema, sname, persistence) = {
-            let s = storage.sequence_for(slot, txn.txid);
-            if let Some(owner) = s.generator_for {
-                return sql_fail(sql_err!(
-                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                    "cannot drop identity sequence \"{}\" because column {}.{}.{} requires it",
-                    s.name.as_str(),
-                    owner.table_schema.as_str(),
-                    owner.table.as_str(),
-                    owner.column.as_str()
+            &originals[..count],
+            cascade,
+            arena,
+            responder,
+        )
+    })();
+    run_reported_drop(report, responder, |responder| {
+        for name in names {
+            let slot = match resolve_sequence(storage, name, txn.txid) {
+                Ok(Some(slot)) => slot,
+                Ok(None) if if_exists => {
+                    responder.notice(
+                        crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                        stack_format!(128, "sequence \"{}\" does not exist, skipping", name.name)
+                            .as_str(),
+                    )?;
+                    continue;
+                }
+                Ok(None) => return sql_fail(undefined_kind("sequence", name.name)),
+                Err(e) => return sql_fail(e),
+            };
+            if let Err(error) = storage.require_not_extension_member(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Sequence,
+                    slot: slot as u16,
+                },
+                txn.txid,
+                "sequence",
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = storage.require_owner(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Sequence,
+                    slot: slot as u16,
+                },
+                txn.txid,
+                "sequence",
+            ) {
+                return sql_fail(error);
+            }
+            let (schema, sname, persistence) = {
+                let s = storage.sequence_for(slot, txn.txid);
+                if let Some(owner) = s.generator_for {
+                    return sql_fail(sql_err!(
+                        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                        "cannot drop identity sequence \"{}\" because column {}.{}.{} requires it",
+                        s.name.as_str(),
+                        owner.table_schema.as_str(),
+                        owner.table.as_str(),
+                        owner.column.as_str()
+                    ));
+                }
+                (s.schema, s.name, s.persistence)
+            };
+            if let Err(error) =
+                remove_sequence_column_defaults(storage, wal, txn, slot, cascade, arena)
+            {
+                return sql_fail(error);
+            }
+            let closure = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
+                dependency.class == crate::storage::DependencyClass::Sequence
+                    && dependency.slot as usize == slot
+            });
+            let StoredDependencyClosure {
+                views: dependent_views,
+                matviews: dependent_matviews,
+                routines: dependent_routines,
+                rules: dependent_rules,
+            } = match closure {
+                Ok(closure) => closure,
+                Err(error) => return sql_fail(error),
+            };
+            let policy_root = PolicyDependencySelection::Catalog {
+                class: crate::storage::DependencyClass::Sequence,
+                slot,
+            };
+            let has_dependents = dependent_views.iter().any(|selected| *selected)
+                || dependent_matviews.iter().any(|selected| *selected)
+                || dependent_routines.iter().any(|selected| *selected)
+                || dependent_rules.iter().any(|selected| *selected)
+                || policy_dependents_exist(
+                    storage,
+                    txn.txid,
+                    policy_root,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
+                );
+            if has_dependents && !cascade {
+                if let Err(error) = report_stored_query_dependents(
+                    storage,
+                    txn.txid,
+                    StoredQueryRoot {
+                        class: crate::storage::DependencyClass::Sequence,
+                        slot,
+                        kind: "sequence",
+                        schema,
+                        name: sname,
+                        suffix: crate::util::StackStr::new(),
+                    },
+                    StoredQuerySelection {
+                        views: dependent_views,
+                        matviews: dependent_matviews,
+                        routines: dependent_routines,
+                        rules: dependent_rules,
+                        policy_root: Some(policy_root),
+                    },
+                    false,
+                    arena,
+                    responder,
+                ) {
+                    return sql_fail(error);
+                }
+                return sql_fail(stored_dependency_drop_error(
+                    storage,
+                    txn.txid,
+                    StoredQueryRoot {
+                        class: crate::storage::DependencyClass::Sequence,
+                        slot,
+                        kind: "sequence",
+                        schema,
+                        name: sname,
+                        suffix: crate::util::StackStr::new(),
+                    },
                 ));
             }
-            (s.schema, s.name, s.persistence)
-        };
-        if let Err(error) = remove_sequence_column_defaults(storage, wal, txn, slot, cascade, arena)
-        {
-            return sql_fail(error);
-        }
-        let closure = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
-            dependency.class == crate::storage::DependencyClass::Sequence
-                && dependency.slot as usize == slot
-        });
-        let StoredDependencyClosure {
-            views: dependent_views,
-            matviews: dependent_matviews,
-            routines: dependent_routines,
-            rules: dependent_rules,
-        } = match closure {
-            Ok(closure) => closure,
-            Err(error) => return sql_fail(error),
-        };
-        let policy_root = PolicyDependencySelection::Catalog {
-            class: crate::storage::DependencyClass::Sequence,
-            slot,
-        };
-        let has_dependents = dependent_views.iter().any(|selected| *selected)
-            || dependent_matviews.iter().any(|selected| *selected)
-            || dependent_routines.iter().any(|selected| *selected)
-            || dependent_rules.iter().any(|selected| *selected)
-            || policy_dependents_exist(
-                storage,
-                txn.txid,
-                policy_root,
-                dependent_views,
-                dependent_matviews,
-                dependent_routines,
-            );
-        if has_dependents && !cascade {
-            if let Err(error) = report_stored_query_dependents(
-                storage,
-                txn.txid,
-                StoredQueryRoot {
-                    class: crate::storage::DependencyClass::Sequence,
-                    slot,
-                    kind: "sequence",
-                    schema,
-                    name: sname,
-                    suffix: crate::util::StackStr::new(),
-                },
-                StoredQuerySelection {
-                    views: dependent_views,
-                    matviews: dependent_matviews,
-                    routines: dependent_routines,
-                    rules: dependent_rules,
-                    policy_root: Some(policy_root),
-                },
-                false,
-                arena,
-                responder,
-            ) {
-                return sql_fail(error);
-            }
-            return sql_fail(stored_dependency_drop_error(
-                storage,
-                txn.txid,
-                StoredQueryRoot {
-                    class: crate::storage::DependencyClass::Sequence,
-                    slot,
-                    kind: "sequence",
-                    schema,
-                    name: sname,
-                    suffix: crate::util::StackStr::new(),
-                },
-            ));
-        }
-        if cascade {
-            if let Err(error) = report_stored_query_dependents(
-                storage,
-                txn.txid,
-                StoredQueryRoot {
-                    class: crate::storage::DependencyClass::Sequence,
-                    slot,
-                    kind: "sequence",
-                    schema,
-                    name: sname,
-                    suffix: crate::util::StackStr::new(),
-                },
-                StoredQuerySelection {
-                    views: dependent_views,
-                    matviews: dependent_matviews,
-                    routines: dependent_routines,
-                    rules: dependent_rules,
-                    policy_root: Some(policy_root),
-                },
-                true,
-                arena,
-                responder,
-            ) {
-                return sql_fail(error);
-            }
-            if let Err(error) = drop_policy_dependents(
-                storage,
-                wal,
-                txn,
-                policy_root,
-                dependent_views,
-                dependent_matviews,
-                dependent_routines,
-            ) {
-                return sql_fail(error);
-            }
-            if let Err(error) = drop_selected_stored_queries(
-                storage,
-                wal,
-                txn,
-                dependent_views,
-                dependent_matviews,
-                dependent_routines,
-                dependent_rules,
-            ) {
-                return sql_fail(error);
-            }
-        }
-        let wal_result = if persistence == crate::storage::RelationPersistence::Temporary {
-            Ok(())
-        } else {
-            let lsn = storage.bump_lsn();
-            wal.stage_reserved(
-                txn.txid,
-                lsn,
-                &WalOp::DropSequence {
-                    identity: storage.sequence_position(slot),
-                    schema: schema.as_str(),
-                    name: sname.as_str(),
-                },
-            )
-        };
-        if let Err(e) = wal_result {
-            return sql_fail(e);
-        }
-        match storage.drop_sequence(schema.as_str(), sname.as_str(), txn.txid) {
-            Ok(Some(slot)) => {
-                if let Err(e) = txn.record_sequence_change(storage, slot) {
-                    return sql_fail(e);
+            if cascade {
+                if let Err(error) = report_stored_query_dependents(
+                    storage,
+                    txn.txid,
+                    StoredQueryRoot {
+                        class: crate::storage::DependencyClass::Sequence,
+                        slot,
+                        kind: "sequence",
+                        schema,
+                        name: sname,
+                        suffix: crate::util::StackStr::new(),
+                    },
+                    StoredQuerySelection {
+                        views: dependent_views,
+                        matviews: dependent_matviews,
+                        routines: dependent_routines,
+                        rules: dependent_rules,
+                        policy_root: Some(policy_root),
+                    },
+                    true,
+                    arena,
+                    responder,
+                ) {
+                    return sql_fail(error);
+                }
+                if let Err(error) = drop_policy_dependents(
+                    storage,
+                    wal,
+                    txn,
+                    policy_root,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
+                ) {
+                    return sql_fail(error);
+                }
+                if let Err(error) = drop_selected_stored_queries(
+                    storage,
+                    wal,
+                    txn,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
+                    dependent_rules,
+                ) {
+                    return sql_fail(error);
                 }
             }
-            Ok(None) => {}
-            Err(e) => return sql_fail(e),
+            let wal_result = if persistence == crate::storage::RelationPersistence::Temporary {
+                Ok(())
+            } else {
+                let lsn = storage.bump_lsn();
+                wal.stage_reserved(
+                    txn.txid,
+                    lsn,
+                    &WalOp::DropSequence {
+                        identity: storage.sequence_position(slot),
+                        schema: schema.as_str(),
+                        name: sname.as_str(),
+                    },
+                )
+            };
+            if let Err(e) = wal_result {
+                return sql_fail(e);
+            }
+            match storage.drop_sequence(schema.as_str(), sname.as_str(), txn.txid) {
+                Ok(Some(slot)) => {
+                    if let Err(e) = txn.record_sequence_change(storage, slot) {
+                        return sql_fail(e);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => return sql_fail(e),
+            }
         }
-    }
-    responder.command_complete("DROP SEQUENCE")?;
-    sql_ok()
+        responder.command_complete("DROP SEQUENCE")?;
+        sql_ok()
+    })
 }
 
 // --- CREATE / ALTER / DROP DOMAIN --------------------------------------------
@@ -47007,20 +47333,7 @@ fn report_type_dependent_routines(
             type_text.as_str()
         ));
     }
-    let wire_full = |_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "response buffer full");
-    if count == 1 {
-        responder
-            .notice(sqlstate::SUCCESSFUL_COMPLETION, detail.as_str())
-            .map_err(wire_full)
-    } else {
-        crate::sql::eval::stash_diagnostic(Some(detail), None);
-        responder
-            .notice(
-                sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(128, "drop cascades to {} other objects", count).as_str(),
-            )
-            .map_err(wire_full)
-    }
+    dependency_report::send_cascade_lines(responder, detail.as_str(), count)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -47311,69 +47624,112 @@ pub(crate) fn drop_domain(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
-    let selected = match arena.alloc_slice_with(storage.domain_count(), |_| false) {
-        Ok(values) => values,
-        Err(_) => return sql_fail(arena_full()),
-    };
-    for name in names {
-        let slot = match name.schema {
-            Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
-            None => storage.resolve_domain_slot(name.name, txn.txid),
-        };
-        let Some(slot) = slot else {
-            if if_exists {
-                responder.notice(
-                    sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(128, "type \"{}\" does not exist, skipping", name.name).as_str(),
-                )?;
-                continue;
+    let report = (|| {
+        let originals = arena
+            .alloc_slice_with(names.len(), |_| DROPPED_NOTHING)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for name in names {
+            let Some(slot) = (match name.schema {
+                Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
+                None => storage.resolve_domain_slot(name.name, txn.txid),
+            }) else {
+                if if_exists {
+                    continue;
+                }
+                return Ok(None);
+            };
+            if !may_drop(
+                storage,
+                crate::storage::AccessClass::Domain,
+                slot,
+                txn.txid,
+                "type",
+            ) {
+                return Ok(None);
             }
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                name.name
-            ));
+            originals[count] = ObjectAddress::new(
+                super::catalog::PG_TYPE_OID,
+                super::catalog::domain_oid(storage, slot, txn.txid),
+                0,
+            );
+            count += 1;
+        }
+        dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &originals[..count],
+            cascade,
+            arena,
+            responder,
+        )
+    })();
+    run_reported_drop(report, responder, |responder| {
+        let selected = match arena.alloc_slice_with(storage.domain_count(), |_| false) {
+            Ok(values) => values,
+            Err(_) => return sql_fail(arena_full()),
         };
-        if let Err(error) = storage.require_not_extension_member(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Domain,
-                slot: slot as u16,
-            },
-            txn.txid,
-            "type",
-        ) {
-            return sql_fail(error);
+        for name in names {
+            let slot = match name.schema {
+                Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
+                None => storage.resolve_domain_slot(name.name, txn.txid),
+            };
+            let Some(slot) = slot else {
+                if if_exists {
+                    responder.notice(
+                        sqlstate::SUCCESSFUL_COMPLETION,
+                        stack_format!(128, "type \"{}\" does not exist, skipping", name.name)
+                            .as_str(),
+                    )?;
+                    continue;
+                }
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}\" does not exist",
+                    name.name
+                ));
+            };
+            if let Err(error) = storage.require_not_extension_member(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Domain,
+                    slot: slot as u16,
+                },
+                txn.txid,
+                "type",
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = storage.require_owner(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Domain,
+                    slot: slot as u16,
+                },
+                txn.txid,
+                "type",
+            ) {
+                return sql_fail(error);
+            }
+            selected[slot] = true;
         }
-        if let Err(error) = storage.require_owner(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Domain,
-                slot: slot as u16,
-            },
-            txn.txid,
-            "type",
-        ) {
-            return sql_fail(error);
-        }
-        selected[slot] = true;
-    }
 
-    if let Err(error) = drop_domain_selection(
-        storage,
-        wal,
-        txn,
-        scratch,
-        selected,
-        None,
-        cascade,
-        0,
-        arena,
-        seq_session,
-        responder,
-    ) {
-        return sql_fail(error);
-    }
-    responder.command_complete("DROP DOMAIN")?;
-    sql_ok()
+        if let Err(error) = drop_domain_selection(
+            storage,
+            wal,
+            txn,
+            scratch,
+            selected,
+            None,
+            cascade,
+            0,
+            arena,
+            seq_session,
+            responder,
+        ) {
+            return sql_fail(error);
+        }
+        responder.command_complete("DROP DOMAIN")?;
+        sql_ok()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -48633,217 +48989,284 @@ pub(crate) fn drop_type(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
-    for name in names {
-        let slot = match name.schema {
-            Some(schema) => storage.enum_slot(schema, name.name, txn.txid),
-            None => storage.resolve_enum_slot(name.name, txn.txid),
-        };
-        let Some(slot) = slot else {
-            let composite = match name.schema {
+    let report = (|| {
+        let originals = arena
+            .alloc_slice_with(names.len(), |_| DROPPED_NOTHING)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for name in names {
+            let (class, slot, oid) = if let Some(slot) = match name.schema {
+                Some(schema) => storage.enum_slot(schema, name.name, txn.txid),
+                None => storage.resolve_enum_slot(name.name, txn.txid),
+            } {
+                let creation = storage.enum_for(slot, txn.txid).creation();
+                (
+                    crate::storage::AccessClass::Enum,
+                    slot,
+                    crate::sql::types::oid::enum_oid(creation),
+                )
+            } else if let Some(slot) = match name.schema {
                 Some(schema) => storage.composite_slot(schema, name.name, txn.txid),
                 None => storage.resolve_composite_slot(name.name, txn.txid),
-            };
-            if let Some(slot) = composite {
-                if let Err(error) = storage.require_not_extension_member(
-                    crate::storage::AccessObject {
-                        class: crate::storage::AccessClass::Composite,
-                        slot: slot as u16,
-                    },
-                    txn.txid,
-                    "type",
-                ) {
-                    return sql_fail(error);
-                }
-                if let Err(error) = drop_composite_type(
-                    storage,
-                    wal,
-                    txn,
-                    scratch,
+            } {
+                let creation = storage.composite_for(slot, txn.txid).creation();
+                (
+                    crate::storage::AccessClass::Composite,
                     slot,
-                    cascade,
-                    arena,
-                    seq_session,
-                    responder,
-                ) {
-                    return sql_fail(error);
-                }
-                continue;
-            }
-            if if_exists {
-                responder.notice(
-                    sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(128, "type \"{}\" does not exist, skipping", name.name).as_str(),
-                )?;
-                continue;
-            }
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                name.name
-            ));
-        };
-        if let Err(error) = storage.require_not_extension_member(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Enum,
-                slot: slot as u16,
-            },
-            txn.txid,
-            "type",
-        ) {
-            return sql_fail(error);
-        }
-        if let Err(error) = storage.require_owner(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Enum,
-                slot: slot as u16,
-            },
-            txn.txid,
-            "type",
-        ) {
-            return sql_fail(error);
-        }
-        let (schema, ename) = {
-            let e = storage.enum_for(slot, txn.txid);
-            (e.schema, e.name)
-        };
-        let creation = storage.enum_for(slot, txn.txid).creation();
-        while let Some((table_schema, table, _)) = enum_column_in_use(storage, slot, txn.txid) {
-            if cascade {
-                let table_slot = storage
-                    .find_visible(table_schema.as_str(), table.as_str(), txn.txid)
-                    .expect("dependent table remains visible");
-                let def = storage.table_def(table_slot, txn.txid);
-                let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
-                let mut column_count = 0;
-                for column in def.columns() {
-                    if matches!(
-                        column.ctype,
-                        ColType::Enum(enum_slot)
-                            | ColType::Array(super::types::ArrElem::Enum(enum_slot))
-                            if enum_slot == Some(creation)
-                    ) {
-                        columns[column_count] = column.name;
-                        column_count += 1;
+                    crate::sql::types::oid::composite_oid(creation),
+                )
+            } else if let Some(row_type) =
+                match storage.resolve_relation(name.schema, name.name, txn.txid) {
+                    Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                        Some(super::catalog::table_row_type_oid(storage, slot, false))
                     }
+                    Some(crate::storage::ResolvedRelation::View(slot)) => {
+                        Some(super::catalog::view_row_type_oid(storage, slot, false))
+                    }
+                    _ => None,
                 }
-                drop(def);
-                if let Err(error) = cascade_drop_type_column(
-                    storage,
-                    wal,
-                    txn,
-                    scratch,
-                    table_schema,
-                    table,
-                    &columns[..column_count],
-                    arena,
-                    seq_session,
-                    responder,
-                ) {
-                    return sql_fail(error);
-                }
+            {
+                // A relation's row type belongs to the relation; the report
+                // names the relation to drop instead.
+                originals[count] = ObjectAddress::new(super::catalog::PG_TYPE_OID, row_type, 0);
+                count += 1;
                 continue;
+            } else if if_exists {
+                continue;
+            } else {
+                return Ok(None);
+            };
+            if !may_drop(storage, class, slot, txn.txid, "type") {
+                return Ok(None);
             }
-            return sql_fail(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop type {} because other objects depend on it",
-                ename.as_str()
-            ));
+            originals[count] = ObjectAddress::new(super::catalog::PG_TYPE_OID, oid, 0);
+            count += 1;
         }
-        while let Some(composite_slot) = composite_field_uses_enum(storage, slot, txn.txid) {
-            if !cascade {
+        dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &originals[..count],
+            cascade,
+            arena,
+            responder,
+        )
+    })();
+    run_reported_drop(report, responder, |responder| {
+        for name in names {
+            let slot = match name.schema {
+                Some(schema) => storage.enum_slot(schema, name.name, txn.txid),
+                None => storage.resolve_enum_slot(name.name, txn.txid),
+            };
+            let Some(slot) = slot else {
+                let composite = match name.schema {
+                    Some(schema) => storage.composite_slot(schema, name.name, txn.txid),
+                    None => storage.resolve_composite_slot(name.name, txn.txid),
+                };
+                if let Some(slot) = composite {
+                    if let Err(error) = storage.require_not_extension_member(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Composite,
+                            slot: slot as u16,
+                        },
+                        txn.txid,
+                        "type",
+                    ) {
+                        return sql_fail(error);
+                    }
+                    if let Err(error) = drop_composite_type(
+                        storage,
+                        wal,
+                        txn,
+                        scratch,
+                        slot,
+                        cascade,
+                        arena,
+                        seq_session,
+                        responder,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    continue;
+                }
+                if if_exists {
+                    responder.notice(
+                        sqlstate::SUCCESSFUL_COMPLETION,
+                        stack_format!(128, "type \"{}\" does not exist, skipping", name.name)
+                            .as_str(),
+                    )?;
+                    continue;
+                }
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}\" does not exist",
+                    name.name
+                ));
+            };
+            if let Err(error) = storage.require_not_extension_member(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Enum,
+                    slot: slot as u16,
+                },
+                txn.txid,
+                "type",
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = storage.require_owner(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Enum,
+                    slot: slot as u16,
+                },
+                txn.txid,
+                "type",
+            ) {
+                return sql_fail(error);
+            }
+            let (schema, ename) = {
+                let e = storage.enum_for(slot, txn.txid);
+                (e.schema, e.name)
+            };
+            let creation = storage.enum_for(slot, txn.txid).creation();
+            while let Some((table_schema, table, _)) = enum_column_in_use(storage, slot, txn.txid) {
+                if cascade {
+                    let table_slot = storage
+                        .find_visible(table_schema.as_str(), table.as_str(), txn.txid)
+                        .expect("dependent table remains visible");
+                    let def = storage.table_def(table_slot, txn.txid);
+                    let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
+                    let mut column_count = 0;
+                    for column in def.columns() {
+                        if matches!(
+                            column.ctype,
+                            ColType::Enum(enum_slot)
+                                | ColType::Array(super::types::ArrElem::Enum(enum_slot))
+                                if enum_slot == Some(creation)
+                        ) {
+                            columns[column_count] = column.name;
+                            column_count += 1;
+                        }
+                    }
+                    drop(def);
+                    if let Err(error) = cascade_drop_type_column(
+                        storage,
+                        wal,
+                        txn,
+                        scratch,
+                        table_schema,
+                        table,
+                        &columns[..column_count],
+                        arena,
+                        seq_session,
+                        responder,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    continue;
+                }
                 return sql_fail(sql_err!(
                     sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                     "cannot drop type {} because other objects depend on it",
                     ename.as_str()
                 ));
             }
-            if let Err(error) =
-                cascade_drop_composite_fields(storage, wal, txn, composite_slot, |field| {
-                    Ok(matches!(
-                        field.ctype,
-                        ColType::Enum(candidate)
-                            | ColType::Array(super::types::ArrElem::Enum(candidate))
-                            if candidate == Some(creation)
-                    ))
-                })
-            {
-                return sql_fail(error);
-            }
-        }
-        let dependent_domains = match arena.alloc_slice_with(storage.domain_count(), |_| false) {
-            Ok(values) => values,
-            Err(_) => return sql_fail(arena_full()),
-        };
-        for (domain_slot, is_dependent) in dependent_domains
-            .iter_mut()
-            .enumerate()
-            .take(storage.domain_count())
-        {
-            if !storage.domain_slot_visible_to(domain_slot, txn.txid) {
-                continue;
-            }
-            let domain = storage.domain_for(domain_slot, txn.txid);
-            if matches!(
-                domain.base,
-                ColType::Enum(enum_slot)
-                    | ColType::Array(super::types::ArrElem::Enum(enum_slot))
-                    if enum_slot == Some(creation)
-            ) {
-                *is_dependent = true;
-            }
-        }
-        let dependent_count = dependent_domains.iter().filter(|&&yes| yes).count();
-        if dependent_count > 0 && !cascade {
-            return sql_fail(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop type {} because other objects depend on it",
-                ename.as_str()
-            ));
-        }
-        if let Err(error) = drop_domain_selection(
-            storage,
-            wal,
-            txn,
-            scratch,
-            dependent_domains,
-            Some(slot),
-            cascade,
-            1,
-            arena,
-            seq_session,
-            responder,
-        ) {
-            return sql_fail(error);
-        }
-        let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage_reserved(
-            txn.txid,
-            lsn,
-            &WalOp::DropEnum {
-                schema: schema.as_str(),
-                name: ename.as_str(),
-            },
-        ) {
-            return sql_fail(e);
-        }
-        match storage.stage_type_drop(
-            crate::storage::NamedTypeKind::Enum,
-            schema.as_str(),
-            ename.as_str(),
-            txn.txid,
-        ) {
-            Ok(Some(slot)) => {
-                if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::EnumDropped(slot)) {
-                    storage.finish_type_ddl(slot, crate::storage::TypeDdlDecision::Rollback);
-                    return sql_fail(e);
+            while let Some(composite_slot) = composite_field_uses_enum(storage, slot, txn.txid) {
+                if !cascade {
+                    return sql_fail(sql_err!(
+                        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                        "cannot drop type {} because other objects depend on it",
+                        ename.as_str()
+                    ));
+                }
+                if let Err(error) =
+                    cascade_drop_composite_fields(storage, wal, txn, composite_slot, |field| {
+                        Ok(matches!(
+                            field.ctype,
+                            ColType::Enum(candidate)
+                                | ColType::Array(super::types::ArrElem::Enum(candidate))
+                                if candidate == Some(creation)
+                        ))
+                    })
+                {
+                    return sql_fail(error);
                 }
             }
-            Ok(None) => {}
-            Err(e) => return sql_fail(e),
+            let dependent_domains = match arena.alloc_slice_with(storage.domain_count(), |_| false)
+            {
+                Ok(values) => values,
+                Err(_) => return sql_fail(arena_full()),
+            };
+            for (domain_slot, is_dependent) in dependent_domains
+                .iter_mut()
+                .enumerate()
+                .take(storage.domain_count())
+            {
+                if !storage.domain_slot_visible_to(domain_slot, txn.txid) {
+                    continue;
+                }
+                let domain = storage.domain_for(domain_slot, txn.txid);
+                if matches!(
+                    domain.base,
+                    ColType::Enum(enum_slot)
+                        | ColType::Array(super::types::ArrElem::Enum(enum_slot))
+                        if enum_slot == Some(creation)
+                ) {
+                    *is_dependent = true;
+                }
+            }
+            let dependent_count = dependent_domains.iter().filter(|&&yes| yes).count();
+            if dependent_count > 0 && !cascade {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop type {} because other objects depend on it",
+                    ename.as_str()
+                ));
+            }
+            if let Err(error) = drop_domain_selection(
+                storage,
+                wal,
+                txn,
+                scratch,
+                dependent_domains,
+                Some(slot),
+                cascade,
+                1,
+                arena,
+                seq_session,
+                responder,
+            ) {
+                return sql_fail(error);
+            }
+            let lsn = storage.bump_lsn();
+            if let Err(e) = wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::DropEnum {
+                    schema: schema.as_str(),
+                    name: ename.as_str(),
+                },
+            ) {
+                return sql_fail(e);
+            }
+            match storage.stage_type_drop(
+                crate::storage::NamedTypeKind::Enum,
+                schema.as_str(),
+                ename.as_str(),
+                txn.txid,
+            ) {
+                Ok(Some(slot)) => {
+                    if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::EnumDropped(slot))
+                    {
+                        storage.finish_type_ddl(slot, crate::storage::TypeDdlDecision::Rollback);
+                        return sql_fail(e);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => return sql_fail(e),
+            }
         }
-    }
-    responder.command_complete("DROP TYPE")?;
-    sql_ok()
+        responder.command_complete("DROP TYPE")?;
+        sql_ok()
+    })
 }
 
 fn composite_field_uses_enum(storage: &Storage, enum_slot: usize, txid: u32) -> Option<usize> {
@@ -49203,7 +49626,9 @@ fn report_composite_type_dependents(
         crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
     let mut count = 0usize;
     let mut push = |line: &str| {
-        let _ = detail.write_char('\n');
+        if count != 0 {
+            let _ = detail.write_char('\n');
+        }
         let _ = detail.write_str(line);
         count += 1;
     };
@@ -49324,21 +49749,15 @@ fn report_composite_type_dependents(
             "composite type dependency report exceeds its fixed buffer"
         ));
     }
-    let mut hint = crate::util::StackStr::<128>::new();
-    if !cascade {
-        let _ = write!(
-            hint,
-            "Use DROP ... CASCADE to drop the dependent objects too."
-        );
-    }
-    crate::sql::eval::stash_diagnostic(Some(detail), (!cascade).then_some(hint));
     if cascade {
-        responder
-            .notice(
-                sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(128, "drop cascades to {} other objects", count).as_str(),
-            )
-            .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "response buffer full"))?;
+        dependency_report::send_cascade_lines(responder, detail.as_str(), count)?;
+    } else {
+        crate::sql::eval::stash_diagnostic(
+            Some(detail),
+            Some(crate::util::StackStr::from_str(
+                "Use DROP ... CASCADE to drop the dependent objects too.",
+            )),
+        );
     }
     Ok(true)
 }
@@ -50618,17 +51037,17 @@ fn report_stored_query_dependents(
         };
     let describe_rule = |slot: usize, out: &mut crate::util::StackStr<192>| {
         let definition = storage.rule(slot).definition_for(txid);
-        let (schema, relation) = match definition.target {
+        let (kind, schema, relation) = match definition.target {
             crate::storage::RuleTarget::Table(table) => {
                 let table = storage.table_def(usize::from(table), txid);
-                (table.schema, table.name)
+                ("table", table.schema, table.name)
             }
             crate::storage::RuleTarget::View(view) => {
                 let view = storage.view(usize::from(view));
-                (view.schema, view.name)
+                ("view", view.schema, view.name)
             }
         };
-        let _ = write!(out, "rule {} on ", definition.name.as_str());
+        let _ = write!(out, "rule {} on {} ", definition.name.as_str(), kind);
         write_name(out, &schema, &relation);
     };
     let mut detail =
@@ -50916,19 +51335,7 @@ fn report_stored_query_dependents(
     }
 
     if cascade {
-        if count == 1 {
-            responder
-                .notice(sqlstate::SUCCESSFUL_COMPLETION, detail.as_str())
-                .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "response buffer full"))?;
-        } else {
-            crate::sql::eval::stash_diagnostic(Some(detail), None);
-            responder
-                .notice(
-                    sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(128, "drop cascades to {} other objects", count).as_str(),
-                )
-                .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "response buffer full"))?;
-        }
+        dependency_report::send_cascade_lines(responder, detail.as_str(), count)?;
     } else {
         let mut hint = crate::util::StackStr::<128>::new();
         let _ = write!(
@@ -53296,160 +53703,206 @@ pub fn drop_view(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    for name in names {
-        if let Some(schema) = name.schema
-            && schema != "pg_temp"
-            && storage.find_schema_visible(schema, txn.txid).is_none()
-            && !if_exists
-        {
-            return sql_fail(sql_err!(
-                sqlstate::INVALID_SCHEMA_NAME,
-                "schema \"{}\" does not exist",
-                schema
-            ));
+    let report = (|| {
+        let originals = arena
+            .alloc_slice_with(names.len(), |_| DROPPED_NOTHING)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for name in names {
+            match storage.resolve_relation(name.schema, name.name, txn.txid) {
+                Some(crate::storage::ResolvedRelation::View(slot))
+                    if may_drop(
+                        storage,
+                        crate::storage::AccessClass::View,
+                        slot,
+                        txn.txid,
+                        "view",
+                    ) =>
+                {
+                    originals[count] = ObjectAddress::new(
+                        super::catalog::PG_CLASS_OID,
+                        super::catalog::view_oid(storage, slot),
+                        0,
+                    );
+                    count += 1;
+                }
+                None if if_exists => {}
+                _ => return Ok(None),
+            }
         }
-        let found = match storage.resolve_relation(name.schema, name.name, txn.txid) {
-            Some(crate::storage::ResolvedRelation::View(slot)) => Some(slot),
-            _ => None,
-        };
-        if let Some(slot) = found {
-            if let Err(error) = storage.lock_object(
-                txn.txid,
-                crate::storage::ObjectLockTarget::View(slot),
-                crate::sql::ast::TableLockMode::AccessExclusive,
-                false,
-            ) {
-                return sql_fail(error);
-            }
-            if let Err(error) = storage.require_not_extension_member(
-                crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::View,
-                    slot: slot as u16,
-                },
-                txn.txid,
-                "view",
-            ) {
-                return sql_fail(error);
-            }
-            if let Err(error) = storage.require_owner(
-                crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::View,
-                    slot: slot as u16,
-                },
-                txn.txid,
-                "view",
-            ) {
-                return sql_fail(error);
-            }
-            let (schema, view_name, temporary) = {
-                let v = storage.view(slot);
-                (
-                    v.schema_for(txn.txid),
-                    v.name_for(txn.txid),
-                    v.persistence == crate::storage::RelationPersistence::Temporary,
-                )
-            };
-            let closure = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
-                dependency.class == crate::storage::DependencyClass::View
-                    && dependency.slot as usize == slot
-            });
-            let StoredDependencyClosure {
-                views: dependent_views,
-                matviews: dependent_matviews,
-                routines: dependent_routines,
-                rules: dependent_rules,
-            } = match closure {
-                Ok(closure) => closure,
-                Err(error) => return sql_fail(error),
-            };
-            let policy_root = PolicyDependencySelection::Catalog {
-                class: crate::storage::DependencyClass::View,
-                slot,
-            };
-            let has_dependents = dependent_views.iter().any(|selected| *selected)
-                || dependent_matviews.iter().any(|selected| *selected)
-                || dependent_routines.iter().any(|selected| *selected)
-                || dependent_rules.iter().any(|selected| *selected)
-                || policy_dependents_exist(
-                    storage,
-                    txn.txid,
-                    policy_root,
-                    dependent_views,
-                    dependent_matviews,
-                    dependent_routines,
-                );
-            if has_dependents && !cascade {
+        dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &originals[..count],
+            cascade,
+            arena,
+            responder,
+        )
+    })();
+    run_reported_drop(report, responder, |responder| {
+        for name in names {
+            if let Some(schema) = name.schema
+                && schema != "pg_temp"
+                && storage.find_schema_visible(schema, txn.txid).is_none()
+                && !if_exists
+            {
                 return sql_fail(sql_err!(
-                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                    "cannot drop view {} because other objects depend on it",
-                    view_name.as_str()
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema
                 ));
             }
-            if cascade {
-                if let Err(error) = drop_policy_dependents(
-                    storage,
-                    wal,
-                    txn,
-                    policy_root,
-                    dependent_views,
-                    dependent_matviews,
-                    dependent_routines,
-                ) {
-                    return sql_fail(error);
-                }
-                if let Err(error) = drop_selected_stored_queries(
-                    storage,
-                    wal,
-                    txn,
-                    dependent_views,
-                    dependent_matviews,
-                    dependent_routines,
-                    dependent_rules,
-                ) {
-                    return sql_fail(error);
-                }
-            }
-            if let Err(error) = drop_view_trigger_dependencies(storage, wal, txn, slot) {
-                return sql_fail(error);
-            }
-            if !temporary {
-                let lsn = storage.bump_lsn();
-                if let Err(e) = wal.stage_reserved(
-                    txn.txid,
-                    lsn,
-                    &WalOp::DropView {
-                        schema: schema.as_str(),
-                        name: view_name.as_str(),
-                    },
-                ) {
-                    return sql_fail(e);
-                }
-            }
-            let dropped = match storage.drop_view(schema.as_str(), view_name.as_str(), txn.txid) {
-                Ok(d) => d,
-                Err(e) => return sql_fail(e),
-            };
-            if let Some(undo) = dropped
-                && let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::ViewDropped(undo))
+            if let Some(error) =
+                RelationKindName::wrong_kind(storage, name, txn.txid, RelationKindName::View)
             {
-                storage.rollback_view_drop(undo);
                 return sql_fail(error);
             }
-        } else if if_exists {
-            responder.notice(
-                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(128, "view \"{}\" does not exist, skipping", name.name).as_str(),
-            )?;
-        } else {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "view \"{}\" does not exist",
-                name.name
-            ));
+            let found = match storage.resolve_relation(name.schema, name.name, txn.txid) {
+                Some(crate::storage::ResolvedRelation::View(slot)) => Some(slot),
+                _ => None,
+            };
+            if let Some(slot) = found {
+                if let Err(error) = storage.lock_object(
+                    txn.txid,
+                    crate::storage::ObjectLockTarget::View(slot),
+                    crate::sql::ast::TableLockMode::AccessExclusive,
+                    false,
+                ) {
+                    return sql_fail(error);
+                }
+                if let Err(error) = storage.require_not_extension_member(
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::View,
+                        slot: slot as u16,
+                    },
+                    txn.txid,
+                    "view",
+                ) {
+                    return sql_fail(error);
+                }
+                if let Err(error) = storage.require_owner(
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::View,
+                        slot: slot as u16,
+                    },
+                    txn.txid,
+                    "view",
+                ) {
+                    return sql_fail(error);
+                }
+                let (schema, view_name, temporary) = {
+                    let v = storage.view(slot);
+                    (
+                        v.schema_for(txn.txid),
+                        v.name_for(txn.txid),
+                        v.persistence == crate::storage::RelationPersistence::Temporary,
+                    )
+                };
+                let closure =
+                    stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
+                        dependency.class == crate::storage::DependencyClass::View
+                            && dependency.slot as usize == slot
+                    });
+                let StoredDependencyClosure {
+                    views: dependent_views,
+                    matviews: dependent_matviews,
+                    routines: dependent_routines,
+                    rules: dependent_rules,
+                } = match closure {
+                    Ok(closure) => closure,
+                    Err(error) => return sql_fail(error),
+                };
+                let policy_root = PolicyDependencySelection::Catalog {
+                    class: crate::storage::DependencyClass::View,
+                    slot,
+                };
+                let has_dependents = dependent_views.iter().any(|selected| *selected)
+                    || dependent_matviews.iter().any(|selected| *selected)
+                    || dependent_routines.iter().any(|selected| *selected)
+                    || dependent_rules.iter().any(|selected| *selected)
+                    || policy_dependents_exist(
+                        storage,
+                        txn.txid,
+                        policy_root,
+                        dependent_views,
+                        dependent_matviews,
+                        dependent_routines,
+                    );
+                if has_dependents && !cascade {
+                    return sql_fail(sql_err!(
+                        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                        "cannot drop view {} because other objects depend on it",
+                        view_name.as_str()
+                    ));
+                }
+                if cascade {
+                    if let Err(error) = drop_policy_dependents(
+                        storage,
+                        wal,
+                        txn,
+                        policy_root,
+                        dependent_views,
+                        dependent_matviews,
+                        dependent_routines,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    if let Err(error) = drop_selected_stored_queries(
+                        storage,
+                        wal,
+                        txn,
+                        dependent_views,
+                        dependent_matviews,
+                        dependent_routines,
+                        dependent_rules,
+                    ) {
+                        return sql_fail(error);
+                    }
+                }
+                if let Err(error) = drop_view_trigger_dependencies(storage, wal, txn, slot) {
+                    return sql_fail(error);
+                }
+                if !temporary {
+                    let lsn = storage.bump_lsn();
+                    if let Err(e) = wal.stage_reserved(
+                        txn.txid,
+                        lsn,
+                        &WalOp::DropView {
+                            schema: schema.as_str(),
+                            name: view_name.as_str(),
+                        },
+                    ) {
+                        return sql_fail(e);
+                    }
+                }
+                let dropped = match storage.drop_view(schema.as_str(), view_name.as_str(), txn.txid)
+                {
+                    Ok(d) => d,
+                    Err(e) => return sql_fail(e),
+                };
+                if let Some(undo) = dropped
+                    && let Err(error) =
+                        txn.record_ddl(storage, super::txn::DdlUndo::ViewDropped(undo))
+                {
+                    storage.rollback_view_drop(undo);
+                    return sql_fail(error);
+                }
+            } else if if_exists {
+                responder.notice(
+                    crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(128, "view \"{}\" does not exist, skipping", name.name).as_str(),
+                )?;
+            } else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "view \"{}\" does not exist",
+                    name.name
+                ));
+            }
         }
-    }
-    responder.command_complete("DROP VIEW")?;
-    sql_ok()
+        responder.command_complete("DROP VIEW")?;
+        sql_ok()
+    })
 }
 
 fn generated_index_name<Definition0: crate::storage::DefinitionBacking>(

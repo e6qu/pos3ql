@@ -10,9 +10,10 @@ rows as each Execute asks for them), and a join (pos3ql queues it in the
 result spool; a paged join buffers in portal_result_bytes, so it is not paged
 here).
 Client B, a psycopg session, must keep completing queries while A is stalled.
-A then reads everything: exactly one RowDescription per simple query, every
-row once and in order, PortalSuspended after each full page, one
-CommandComplete and one ReadyForQuery. With --pg, the same protocol
+A `COPY ... TO STDOUT` of the table is stalled the same way. A then reads
+everything: exactly one RowDescription per simple query, every row once and
+in order, PortalSuspended after each full page, one CommandComplete and one
+ReadyForQuery. With --pg, the same protocol
 transcript summary is compared with PostgreSQL 18.
 
 PostgreSQL references:
@@ -32,6 +33,7 @@ TABLE_ROWS = 5000
 # Results must exceed what loopback socket buffers can absorb (Linux grows a
 # send buffer to 4 MiB), so the server really holds output for a stalled client.
 ALL_PROTOCOLS = ("simple", "extended", "paged")
+COPY_TABLE = "COPY result_stream_rows TO STDOUT"
 QUERIES = (
     (f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g", ROWS, ALL_PROTOCOLS),
     ("SELECT id, payload FROM result_stream_rows", TABLE_ROWS, ALL_PROTOCOLS),
@@ -40,6 +42,8 @@ QUERIES = (
         ROWS,
         ("simple", "extended"),
     ),
+    # COPY TO STDOUT of one table resumes row by row too.
+    (COPY_TABLE, TABLE_ROWS, ("simple",)),
 )
 OTHER_QUERIES = 100
 STALL_SECONDS = 2.0
@@ -95,15 +99,20 @@ def summarize(messages):
     shape = []
     expected = 1
     for kind, payload in messages:
-        if kind == b"D":
-            (length,) = struct.unpack("!i", payload[2:6])
-            value = int(payload[6 : 6 + length])
+        if kind in (b"D", b"d"):
+            if kind == b"D":
+                (length,) = struct.unpack("!i", payload[2:6])
+                value = int(payload[6 : 6 + length])
+            else:
+                # A COPY text line: the first field, then a tab.
+                value = int(payload.split(b"\t", 1)[0])
             assert value == expected, f"row {value} arrived where {expected} was due"
             expected += 1
-            if shape and shape[-1][0] == "D":
-                shape[-1] = ("D", shape[-1][1] + 1)
+            label = kind.decode()
+            if shape and shape[-1][0] == label:
+                shape[-1] = (label, shape[-1][1] + 1)
             else:
-                shape.append(("D", 1))
+                shape.append((label, 1))
             continue
         # A suspended portal continues its numbering on the next Execute.
         if kind != b"s":
@@ -201,7 +210,19 @@ def probe(host, port, user, database):
         sock.close()
         results[(query, protocol)] = transcript
         print(f"{protocol} {query!r}: {transcript} (other session {elapsed:.2f}s)", flush=True)
-        if protocol == "simple":
+        if query == COPY_TABLE:
+            expected = [
+                ("H", None),
+                ("d", rows),
+                ("c", None),
+                ("C", f"COPY {rows}"),
+                ("Z", None),
+                ("T", None),
+                ("D", 1),
+                ("C", "SELECT 1"),
+                ("Z", None),
+            ]
+        elif protocol == "simple":
             expected = [
                 ("T", None),
                 ("D", rows),

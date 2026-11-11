@@ -71,6 +71,60 @@ pub(crate) enum CommonTypeError {
 
 /// PostgreSQL 18.6 `pg_type.typispreferred`: bool, text, oid, float8, inet,
 /// timestamptz, interval and varbit.
+/// PostgreSQL 18.6's pseudo-types (`pg_type.typtype = 'p'`).
+const PSEUDO_TYPE_NAMES: [&str; 25] = [
+    "pg_ddl_command",
+    "table_am_handler",
+    "index_am_handler",
+    "unknown",
+    "record",
+    "cstring",
+    "any",
+    "anyarray",
+    "void",
+    "trigger",
+    "language_handler",
+    "internal",
+    "anyelement",
+    "anynonarray",
+    "fdw_handler",
+    "tsm_handler",
+    "anyenum",
+    "anyrange",
+    "event_trigger",
+    "anymultirange",
+    "anycompatiblemultirange",
+    "anycompatible",
+    "anycompatiblearray",
+    "anycompatiblenonarray",
+    "anycompatiblerange",
+];
+
+/// The name PostgreSQL reports when a column is declared with a pseudo-type
+/// (`column "c" has pseudo-type cstring`). Only `record` and `cstring` have
+/// array types: `record[]` is itself a pseudo-type, and an array of `cstring`
+/// is rejected for its element.
+pub(crate) fn pseudo_type_column_name(type_name: &str) -> Option<&'static str> {
+    let name = type_name.strip_prefix("pg_catalog.").unwrap_or(type_name);
+    let (base, array) = match name.strip_suffix("[]") {
+        Some(base) => (base, true),
+        None => match name.strip_prefix('_') {
+            Some(base @ ("record" | "cstring")) => (base, true),
+            _ => (name, false),
+        },
+    };
+    let base = PSEUDO_TYPE_NAMES
+        .into_iter()
+        .find(|candidate| *candidate == base)?;
+    Some(match (base, array) {
+        ("record", true) => "record[]",
+        ("cstring", _) => "cstring",
+        (_, true) => return None,
+        ("any", false) => "\"any\"",
+        (base, false) => base,
+    })
+}
+
 pub(crate) fn preferred_type_oid(type_oid: i32) -> bool {
     matches!(type_oid, 16 | 25 | 26 | 701 | 869 | 1184 | 1186 | 1562)
 }
@@ -301,12 +355,12 @@ pub mod oid {
     /// stamp; the bands are independent of configured catalog positions. A
     /// relation's row type is a composite identified by the relation's stamp,
     /// which shares the same creation sequence.
-    pub const FIRST_DOMAIN: i32 = 180_000_000;
-    pub const FIRST_ENUM: i32 = 200_000_000;
-    pub const FIRST_COMPOSITE: i32 = 220_000_000;
-    pub const FIRST_DOMAIN_ARRAY: i32 = 240_000_000;
-    pub const FIRST_ENUM_ARRAY: i32 = 260_000_000;
-    pub const FIRST_COMPOSITE_ARRAY: i32 = 280_000_000;
+    pub const FIRST_DOMAIN: i32 = crate::storage::OidBand::Domain.base();
+    pub const FIRST_ENUM: i32 = crate::storage::OidBand::Enum.base();
+    pub const FIRST_COMPOSITE: i32 = crate::storage::OidBand::Composite.base();
+    pub const FIRST_DOMAIN_ARRAY: i32 = crate::storage::OidBand::DomainArray.base();
+    pub const FIRST_ENUM_ARRAY: i32 = crate::storage::OidBand::EnumArray.base();
+    pub const FIRST_COMPOSITE_ARRAY: i32 = crate::storage::OidBand::CompositeArray.base();
     pub fn domain_oid(creation: crate::storage::TypeCreation) -> i32 {
         FIRST_DOMAIN + creation.created_at() as i32
     }

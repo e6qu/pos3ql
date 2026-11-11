@@ -356,10 +356,13 @@ function fails with `0A000` when called; `DROP ROLE`'s `DETAIL` lists
 owners by OID and privileges by grant order, where PostgreSQL lists
 `pg_shdepend` rows in their physical order (insertion order in a fresh
 catalog), which needs a durable stamp for each owner change;
-`pg_attrdef` OIDs derive from
-table slots rather than creation identities; built-in operators, types and other
+built-in operators, types and other
 catalog objects have no shipped `pg_description` text (built-in routines
-do). A SQL function whose earlier
+do). Parameter inference walks a statement in its own order rather than
+PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
+untyped to an `"any"` argument by another can be accepted where PostgreSQL
+reports `42P18`, and a user-defined polymorphic argument left untyped becomes
+`text` where PostgreSQL reports `42804`. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

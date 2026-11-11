@@ -87,7 +87,7 @@ impl EnumLabelIdentity {
         self.0.created_at()
     }
     pub(crate) fn oid(self) -> i32 {
-        360_000_000 + self.created_at() as i32
+        super::OidBand::EnumLabel.oid(self.created_at())
     }
     pub(super) fn reserve(sequence: &super::CatalogSequence) -> Result<Self, SqlError> {
         let created_at = sequence.next_bounded(MAX_TYPE_CREATION, "enum label")?;

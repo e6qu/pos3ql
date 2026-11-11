@@ -12,7 +12,7 @@ pub(crate) struct PartitionTriggerImage {
 
 impl PartitionTriggerImage {
     pub(crate) fn oid(self) -> i32 {
-        FIRST_PARTITION_TRIGGER_OID + self.creation.get() as i32
+        OidBand::PartitionTrigger.oid(self.creation.created_at())
     }
 }
 

@@ -228,6 +228,9 @@ impl ParameterInference<'_> {
         oids: &mut [i32],
         infer: &impl Fn(&Expr<'a>) -> Option<i32>,
     ) {
+        // `"any"` marks a parameter first reached, still untyped, by a
+        // position imposing no type. PostgreSQL then rejects it even when a
+        // later use would type it (`pg_typeof($1), $1 + 1`).
         let assign = |expression: &Expr, type_oid: i32, oids: &mut [i32]| {
             if let Expr::Param(index) = expression
                 && *index >= 1
@@ -324,6 +327,7 @@ impl ParameterInference<'_> {
                     assign(operand, type_oid, oids);
                 }
             }
+            Expr::IsNull { operand, .. } => assign(operand, types::oid::ANY, oids),
             Expr::Like {
                 operand, pattern, ..
             }

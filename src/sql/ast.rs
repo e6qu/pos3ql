@@ -253,7 +253,7 @@ impl CatalogCollation {
         matches!(self.algorithm, CollationAlgorithm::UnicodeCaseMapping)
     }
     pub(crate) const fn oid(self) -> i32 {
-        580_000_000 + self.created_at() as i32
+        crate::storage::OidBand::Collation.oid(self.created_at())
     }
 }
 

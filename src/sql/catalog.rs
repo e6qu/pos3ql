@@ -11564,7 +11564,6 @@ fn pg_default_acl<'a>(
     finish(definition, rows, arena)
 }
 
-use crate::storage::FIRST_TEMP_NAMESPACE_OID;
 /// Durable schema identities survive renames, slot reuse and database clones.
 pub(crate) fn namespace_oid_for_slot(storage: &Storage, slot: usize) -> i32 {
     storage
@@ -11581,8 +11580,12 @@ fn namespace_oid(storage: &Storage, schema: &str, txid: u32) -> i32 {
         _ if schema.starts_with("pg_temp_") => schema[8..]
             .parse::<i32>()
             .ok()
-            .and_then(|connection| connection.checked_add(FIRST_TEMP_NAMESPACE_OID))
-            .unwrap_or(0),
+            .and_then(|connection| {
+                storage.find_temporary_namespace(txid, |namespace| {
+                    namespace.connection_id() == connection
+                })
+            })
+            .map_or(0, crate::storage::TemporaryNamespaceIdentity::oid),
         _ => storage
             .find_schema_visible(schema, txid)
             .map(|slot| namespace_oid_for_slot(storage, slot))
@@ -11736,7 +11739,7 @@ pub(crate) fn domain_oid(storage: &Storage, slot: usize, txid: u32) -> i32 {
     crate::sql::types::oid::domain_oid(storage.domain_for(slot, txid).creation())
 }
 
-pub(crate) const FIRST_TOAST_RELATION_OID: i32 = 320_000_000;
+pub(crate) const FIRST_TOAST_RELATION_OID: i32 = crate::storage::OidBand::ToastRelation.base();
 pub(crate) const FIRST_TOAST_INDEX_OID: i32 = crate::storage::FIRST_TOAST_INDEX_OID;
 
 pub(crate) fn toast_relation_oid(storage: &Storage, slot: usize) -> i32 {
@@ -22705,10 +22708,9 @@ fn pg_constraint_values<'a>(
         let root_row = n;
         out[n] = row(
             &[
-                Datum::Int4(
-                    crate::storage::trigger_oid(&trigger)
-                        + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
-                ),
+                Datum::Int4(crate::storage::trigger_constraint_oid(
+                    crate::storage::trigger_oid(&trigger),
+                )),
                 text(trigger.name_to(txid).as_str(), arena)?,
                 Datum::Int4(user_table_oid(storage, table)),
                 Datum::Int4(0),
@@ -22759,13 +22761,13 @@ fn pg_constraint_values<'a>(
             }
             let mut clone = [Datum::Null; 29];
             clone.copy_from_slice(out[root_row]);
-            clone[0] = Datum::Int4(
+            clone[0] = Datum::Int4(crate::storage::trigger_constraint_oid(
                 storage.partition_trigger_oid_to(
                     trigger.position(trigger_slot),
                     storage.table_position(child),
                     txid,
-                )? + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
-            );
+                )?,
+            ));
             clone[2] = Datum::Int4(user_table_oid(storage, child));
             clone[18] = Datum::Int4(namespace_oid(
                 storage,
@@ -23629,10 +23631,9 @@ fn pg_depend<'a>(
             for sequence in &sequences[..count?] {
                 push(
                     2604,
-                    400_000_000
-                        + table as i32 * crate::storage::MAX_RELATION_COLUMNS as i32
-                        + i32::from(definition.attribute_number(column_index))
-                        - 1,
+                    definition
+                        .attribute_default_oid(column_index)
+                        .expect("a sequence-dependent column has a default"),
                     PG_CLASS_OID,
                     sequence_oid(storage, *sequence),
                     0,
@@ -24159,7 +24160,7 @@ fn pg_depend<'a>(
             }
             push(
                 2606,
-                trigger_oid + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
+                crate::storage::trigger_constraint_oid(trigger_oid),
                 2620,
                 trigger_oid,
                 0,
@@ -24232,7 +24233,7 @@ fn pg_depend<'a>(
                 }
                 push(
                     2606,
-                    clone_oid + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
+                    crate::storage::trigger_constraint_oid(clone_oid),
                     2620,
                     clone_oid,
                     0,
@@ -25360,39 +25361,30 @@ pub(crate) fn attribute_default_column(
     txid: u32,
     oid: i32,
 ) -> Option<(i32, i32)> {
-    let width = crate::storage::MAX_RELATION_COLUMNS as i32;
-    let (offset, view) = if (400_000_000..600_000_000).contains(&oid) {
-        (oid - 400_000_000, false)
-    } else if oid >= 600_000_000 {
-        (oid - 600_000_000, true)
-    } else {
-        return None;
-    };
-    let slot = usize::try_from(offset / width).ok()?;
-    let attribute = offset % width + 1;
-    if view {
-        let (_, definition) = storage
-            .views_visible_to(txid)
-            .find(|(candidate, _)| *candidate == slot)?;
+    crate::storage::OidBand::AttributeDefault.ordinal(oid)?;
+    for (slot, definition) in storage.views_visible_to(txid) {
         let columns = definition.columns_for(txid);
-        let column = usize::try_from(attribute - 1).ok()?;
-        (column < columns.len() && columns.default_at_ref(column).is_some())
-            .then(|| (view_oid(storage, slot), attribute))
-    } else {
-        if slot >= storage.table_count() || !storage.table_slot_visible_to(slot, txid) {
-            return None;
+        if let Some(column) = (0..columns.len()).find(|column| {
+            columns
+                .default_identity(*column)
+                .is_some_and(|identity| identity.attribute_default_oid() == oid)
+        }) {
+            return Some((view_oid(storage, slot), column as i32 + 1));
         }
-        let table = storage.table_def(slot, txid);
-        table
-            .columns()
-            .iter()
-            .enumerate()
-            .any(|(index, column)| {
-                i32::from(table.attribute_number(index)) == attribute
-                    && column.default.expression().is_some()
-            })
-            .then(|| (user_table_oid(storage, slot), attribute))
     }
+    (0..storage.table_count())
+        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
+        .find_map(|slot| {
+            let table = storage.table_def(slot, txid);
+            (0..table.columns().len())
+                .find(|column| table.attribute_default_oid(*column) == Some(oid))
+                .map(|column| {
+                    (
+                        user_table_oid(storage, slot),
+                        i32::from(table.attribute_number(column)),
+                    )
+                })
+        })
 }
 
 fn pg_attrdef<'a>(
@@ -25453,10 +25445,10 @@ fn pg_attrdef<'a>(
             out[n] = row(
                 &[
                     Datum::Oid(
-                        (400_000_000
-                            + slot as i32 * crate::storage::MAX_RELATION_COLUMNS as i32
-                            + i32::from(table.attribute_number(ci))
-                            - 1) as u32,
+                        table
+                            .attribute_default_oid(ci)
+                            .expect("a column with a default expression has a default OID")
+                            as u32,
                     ),
                     Datum::Oid(relid as u32),
                     Datum::Int2(table.attribute_number(ci) as i16),
@@ -25506,9 +25498,10 @@ fn pg_attrdef<'a>(
             out[n] = row(
                 &[
                     Datum::Oid(
-                        (600_000_000
-                            + slot as i32 * crate::storage::MAX_RELATION_COLUMNS as i32
-                            + column as i32) as u32,
+                        columns
+                            .default_identity(column)
+                            .expect("admitted view default has a creation identity")
+                            .attribute_default_oid() as u32,
                     ),
                     Datum::Oid(relid as u32),
                     Datum::Int2(column as i16 + 1),
@@ -27821,8 +27814,7 @@ fn pg_trigger<'a>(
                 referenced_table,
                 timing,
             } => (
-                crate::storage::trigger_oid(&trigger)
-                    + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
+                crate::storage::trigger_constraint_oid(crate::storage::trigger_oid(&trigger)),
                 timing,
                 referenced_table.map_or(0, |slot| user_table_oid(storage, usize::from(slot))),
             ),
@@ -28003,7 +27995,7 @@ fn pg_trigger<'a>(
                 },
             );
             if matches!(trigger.kind, crate::storage::TriggerKind::Constraint { .. }) {
-                clone[11] = Datum::Int4(clone_oid + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET);
+                clone[11] = Datum::Int4(crate::storage::trigger_constraint_oid(clone_oid));
             }
             rows[count] = row(&clone, arena)?;
             count += 1;

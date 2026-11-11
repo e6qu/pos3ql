@@ -1385,7 +1385,7 @@ fn catalog_creation_role_oid_exhaustion_preserves_the_catalog() {
     let mut budget = test_budget(&config);
     let storage = Storage::new(&config, &mut budget, 0).unwrap();
     storage
-        .restore_role_identity_sequence(i32::MAX as u64)
+        .restore_role_identity_sequence(RoleOid::LAST_USER)
         .unwrap();
     let sequence = storage.catalog_identity_sequence();
     crate::mem::guard::forbid_alloc(|| {
@@ -1400,7 +1400,7 @@ fn catalog_creation_role_oid_exhaustion_preserves_the_catalog() {
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(error.message.as_str(), "role identity space exhausted");
             assert!(storage.find_role_visible("exhausted_actor", 7).is_none());
-            assert_eq!(storage.role_identity_sequence(), i32::MAX as u64);
+            assert_eq!(storage.role_identity_sequence(), RoleOid::LAST_USER);
             assert_eq!(storage.catalog_identity_sequence(), sequence);
             assert_eq!(storage.role_oid(0), 10);
         }
@@ -2214,9 +2214,19 @@ fn database_reservation_rejects_pending_and_recovery_collisions() {
         assert_eq!(storage.databases_visible_to(12).count(), 4);
         storage.retire_database(first, true);
         storage.retire_database(second, true);
-        let maximum = storage
+        // A client-chosen OID outside the automatic band leaves the allocator alone.
+        let chosen = storage
             .reserve_database(
                 Some(DatabaseOid(i32::MAX)),
+                test_database_definition("chosen_oid"),
+                0,
+                13,
+            )
+            .unwrap();
+        storage.retire_database(chosen, true);
+        let maximum = storage
+            .reserve_database(
+                Some(DatabaseOid(crate::storage::OidBand::UserDatabase.last())),
                 test_database_definition("maximum_oid"),
                 0,
                 13,
@@ -6058,6 +6068,7 @@ fn routine_candidate_lookup_preserves_visibility_identity_and_guard_release() {
             catalog[slot].schema = SqlName::parse("public").unwrap();
             catalog[slot].name = SqlName::parse("probe").unwrap();
             catalog[slot].ddl_state = CatalogDdlState::Present;
+            catalog[slot].created_at = slot as u64;
         }
         catalog[1].pending_identity = Some(PendingRoutineIdentity {
             txid: 7,

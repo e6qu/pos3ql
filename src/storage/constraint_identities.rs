@@ -7,11 +7,23 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
 pub(crate) const MAX_CONSTRAINT_CREATION: u64 = 9_999_999;
-const FIRST_CONSTRAINT_OID: i32 = 380_000_000;
-const FIRST_FOREIGN_KEY_TRIGGER_OID: i32 = 400_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConstraintIdentity(NonZeroU32);
+
+/// Per-attribute stamps of a table's NOT NULL constraint and column default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttributeIdentities {
+    pub(crate) not_null: Option<ConstraintIdentity>,
+    pub(crate) default: Option<ConstraintIdentity>,
+}
+
+impl AttributeIdentities {
+    pub(crate) const NONE: Self = Self {
+        not_null: None,
+        default: None,
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForeignKeyTrigger {
@@ -62,11 +74,16 @@ impl ConstraintIdentity {
     }
 
     pub(crate) fn oid(self) -> i32 {
-        FIRST_CONSTRAINT_OID + self.0.get() as i32
+        super::OidBand::Constraint.oid(self.created_at())
+    }
+
+    /// The `pg_attrdef` OID of a default identified by this stamp.
+    pub(crate) fn attribute_default_oid(self) -> i32 {
+        super::OidBand::AttributeDefault.oid(self.created_at())
     }
 
     pub(crate) fn foreign_key_trigger_oid(self, trigger: ForeignKeyTrigger) -> i32 {
-        FIRST_FOREIGN_KEY_TRIGGER_OID + self.0.get() as i32 * 4 + trigger.ordinal() as i32
+        super::OidBand::ForeignKeyTrigger.oid(self.created_at() * 4 + trigger.ordinal() as u64)
     }
 
     fn reserve(storage: &Storage) -> Result<Self, SqlError> {
@@ -110,7 +127,8 @@ impl DetachedPartitionBound {
 impl<B: super::DefinitionBacking> super::TableDefinition<B> {
     pub(crate) fn not_null_constraint_oid(&self, column: usize) -> i32 {
         let attribute = usize::from(self.attribute_number(column) - 1);
-        self.not_null_identities.as_ref()[attribute]
+        self.attribute_identities.as_ref()[attribute]
+            .not_null
             .expect("admitted NOT NULL has a creation identity")
             .oid()
     }
@@ -120,6 +138,21 @@ impl<B: super::DefinitionBacking> super::TableDefinition<B> {
         self.inline_constraint_identities.as_ref()[attribute]
     }
 
+    /// The default OID of the column, when it has a default or generation
+    /// expression.
+    pub(crate) fn attribute_default_oid(&self, column: usize) -> Option<i32> {
+        let attribute = usize::from(self.attributes.number(column)? - 1);
+        self.columns.as_ref()[column].default.expression()?;
+        Some(
+            self.attribute_identities.as_ref()[attribute]
+                .default
+                .expect("admitted column default has a creation identity")
+                .attribute_default_oid(),
+        )
+    }
+
+    /// Stamps of every constraint and column default, in durable order. A
+    /// `pg_attrdef` row draws from the same sequence as its table's constraints.
     pub(crate) fn constraint_identities(
         &self,
     ) -> impl Iterator<Item = Option<ConstraintIdentity>> + Clone + '_ {
@@ -128,19 +161,25 @@ impl<B: super::DefinitionBacking> super::TableDefinition<B> {
             .map(|check| check.identity)
             .chain(self.fkeys().iter().map(|key| key.identity))
             .chain(
-                self.not_null_identities
+                self.attribute_identities
                     .as_ref()
                     .iter()
                     .zip(self.attributes.slots.as_ref())
-                    .filter_map(|(identity, slot)| match *slot {
-                        super::column_attributes::AttributeSlot::Live(column)
-                            if self.columns.as_ref()[usize::from(column)]
-                                .not_null
-                                .is_required() =>
-                        {
-                            Some(*identity)
-                        }
-                        _ => None,
+                    .flat_map(|(identity, slot)| {
+                        let (not_null, default) = match *slot {
+                            super::column_attributes::AttributeSlot::Live(column) => {
+                                let column = &self.columns.as_ref()[usize::from(column)];
+                                (
+                                    column.not_null.is_required(),
+                                    column.default.expression().is_some(),
+                                )
+                            }
+                            _ => (false, false),
+                        };
+                        not_null
+                            .then_some(identity.not_null)
+                            .into_iter()
+                            .chain(default.then_some(identity.default))
                     }),
             )
             .chain(
@@ -191,16 +230,28 @@ impl super::TableDefBuilder {
                     .map(|key| &mut key.identity),
             )
             .chain(
-                self.not_null_identities
+                self.attribute_identities
                     .iter_mut()
                     .zip(&self.attributes.slots)
-                    .filter_map(move |(identity, slot)| match *slot {
-                        super::column_attributes::AttributeSlot::Live(column)
-                            if columns[usize::from(column)].not_null.is_required() =>
-                        {
-                            Some(identity)
-                        }
-                        _ => None,
+                    .flat_map(move |(identity, slot)| {
+                        let (not_null, default) = match *slot {
+                            super::column_attributes::AttributeSlot::Live(column) => {
+                                let column = &columns[usize::from(column)];
+                                (
+                                    column.not_null.is_required(),
+                                    column.default.expression().is_some(),
+                                )
+                            }
+                            _ => (false, false),
+                        };
+                        let AttributeIdentities {
+                            not_null: not_null_identity,
+                            default: default_identity,
+                        } = identity;
+                        not_null
+                            .then_some(not_null_identity)
+                            .into_iter()
+                            .chain(default.then_some(default_identity))
                     }),
             )
             .chain(
@@ -330,19 +381,21 @@ impl Storage {
         definition: &mut super::TableDefBuilder,
     ) -> Result<(), SqlError> {
         for (identity, slot) in definition
-            .not_null_identities
+            .attribute_identities
             .iter_mut()
             .zip(&definition.attributes.slots)
         {
-            let active = match *slot {
-                super::column_attributes::AttributeSlot::Live(column) => definition.columns
-                    [usize::from(column)]
-                .not_null
-                .is_required(),
-                _ => false,
+            let column = match *slot {
+                super::column_attributes::AttributeSlot::Live(column) => {
+                    Some(&definition.columns[usize::from(column)])
+                }
+                _ => None,
             };
-            if !active {
-                *identity = None;
+            if !column.is_some_and(|column| column.not_null.is_required()) {
+                identity.not_null = None;
+            }
+            if !column.is_some_and(|column| column.default.expression().is_some()) {
+                identity.default = None;
             }
         }
         for (identity, slot) in definition
@@ -367,6 +420,34 @@ impl Storage {
             }
         }
         validate_constraint_identities(definition.constraint_identities())
+    }
+
+    /// Reserves a stamp for every view column default that lacks one. A
+    /// replaced view keeps the stamp of a default it carries over unchanged.
+    pub(super) fn reserve_view_default_identities(
+        &self,
+        columns: &mut super::ViewColumns,
+        prior: Option<&super::ViewColumns>,
+    ) -> Result<(), SqlError> {
+        if let Some(prior) = prior {
+            for index in 0..columns.len() {
+                if columns.default_identity(index).is_none()
+                    && columns.default_at_ref(index).is_some()
+                    && columns.default_at_ref(index) == prior.default_at_ref(index)
+                    && let Some(identity) = prior.default_identity(index)
+                {
+                    *columns = columns
+                        .with_default_identity(index, identity)
+                        .expect("a carried default has an entry");
+                }
+            }
+        }
+        for identity in columns.default_identities_mut() {
+            if identity.is_none() {
+                *identity = Some(ConstraintIdentity::reserve(self)?);
+            }
+        }
+        validate_constraint_identities(columns.default_identities())
     }
 
     pub(super) fn reserve_domain_constraint_identities(
@@ -460,6 +541,28 @@ impl Storage {
                         *all |= owner;
                     }
                 }
+                let views = self
+                    .view_rule_catalog
+                    .lock()
+                    .expect("view and rule catalog lock poisoned");
+                for view in views.views.iter().filter(|view| {
+                    view.database == database.oid
+                        && view.ddl_state != super::CatalogDdlState::Absent
+                }) {
+                    owned.fill(0);
+                    validate_window(
+                        view.columns.default_identities(),
+                        view.created_at,
+                        saved_sequence,
+                        first,
+                        &seen,
+                        &mut owned,
+                    )?;
+                    for (all, owner) in seen.iter_mut().zip(&owned) {
+                        *all |= owner;
+                    }
+                }
+                drop(views);
                 let types = self
                     .type_catalog
                     .lock()
@@ -651,7 +754,7 @@ mod tests {
                     _ => {
                         let duplicate = ConstraintIdentity::parse(position.created_at() + 1);
                         rejected.checks[0].identity = duplicate;
-                        rejected.not_null_identities[0] = duplicate;
+                        rejected.attribute_identities[0].not_null = duplicate;
                     }
                 }
                 assert_eq!(
@@ -666,8 +769,8 @@ mod tests {
                 let current = storage.table_def(slot, 0);
                 assert_eq!(current.checks[0].identity, original.checks[0].identity);
                 assert_eq!(
-                    current.not_null_identities[0],
-                    original.not_null_identities[0]
+                    current.attribute_identities[0],
+                    original.attribute_identities[0]
                 );
             }
             let next = storage

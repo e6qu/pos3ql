@@ -468,6 +468,34 @@ impl Storage {
         explicit_variadic: bool,
         txid: u32,
     ) -> Option<[i32; MAX_ROUTINE_ARGUMENTS]> {
+        self.builtin_call_parameter_oids(
+            routine_oid,
+            argument_names,
+            actual_oids,
+            explicit_variadic,
+            txid,
+        )
+        .map(|mut expected| {
+            for oid in &mut expected {
+                if *oid == oid::ANY {
+                    *oid = oid::UNKNOWN;
+                }
+            }
+            expected
+        })
+    }
+
+    /// The input types a built-in call imposes on its arguments; an unknown
+    /// argument of pseudo-type `"any"` stays `"any"`, which leaves a parameter
+    /// in that position undetermined, as in PostgreSQL (`pg_typeof($1)`).
+    pub(crate) fn builtin_call_parameter_oids(
+        &self,
+        routine_oid: i32,
+        argument_names: &[Option<&str>],
+        actual_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+    ) -> Option<[i32; MAX_ROUTINE_ARGUMENTS]> {
         let signature = crate::sql::catalog::builtin_callable_by_oid(routine_oid)?;
         let candidate = Candidate::builtin(0, signature, false);
         if !candidate.accepts(self, txid, argument_names, actual_oids, explicit_variadic) {
@@ -479,36 +507,6 @@ impl Storage {
             *input = candidate.parameter_oid(usize::from(mapped), !explicit_variadic);
         }
         self.bind_builtin_input_types(&declared[..actual_oids.len()], actual_oids, txid)
-    }
-
-    /// The types a selected built-in gives its untyped parameter inputs. An
-    /// input declared `"any"` stays `"any"`: it does not determine a type.
-    pub(crate) fn builtin_call_parameter_oids(
-        &self,
-        routine_oid: i32,
-        argument_names: &[Option<&str>],
-        actual_oids: &[i32],
-        explicit_variadic: bool,
-        txid: u32,
-    ) -> Option<[i32; MAX_ROUTINE_ARGUMENTS]> {
-        let mut expected = self.builtin_call_input_oids(
-            routine_oid,
-            argument_names,
-            actual_oids,
-            explicit_variadic,
-            txid,
-        )?;
-        let signature = crate::sql::catalog::builtin_callable_by_oid(routine_oid)?;
-        let candidate = Candidate::builtin(0, signature, false);
-        let mapping = candidate.mapping(argument_names, actual_oids.len(), explicit_variadic)?;
-        for ((output, mapped), &actual) in expected.iter_mut().zip(mapping).zip(actual_oids) {
-            if actual == oid::UNKNOWN
-                && candidate.parameter_oid(usize::from(mapped), !explicit_variadic) == oid::ANY
-            {
-                *output = oid::ANY;
-            }
-        }
-        Some(expected)
     }
 
     fn bind_builtin_input_types(
@@ -532,7 +530,11 @@ impl Storage {
         let mut expected = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
         for ((output, &declared), &actual) in expected.iter_mut().zip(declared).zip(actual) {
             *output = if declared == oid::ANY {
-                actual
+                if actual == oid::UNKNOWN {
+                    oid::ANY
+                } else {
+                    actual
+                }
             } else if let Some(kind) = polymorphic(declared) {
                 binding.concrete_oid(kind)?
             } else {
@@ -571,10 +573,11 @@ impl Storage {
             }
         }
         let bound = self.bind_builtin_input_types(&declared[..count], &actual[..count], txid)?;
-        Some((
-            positions[0].map(|index| bound[index]),
-            positions[1].map(|index| bound[index]),
-        ))
+        let input = |index: usize| match bound[index] {
+            oid::ANY => oid::UNKNOWN,
+            bound => bound,
+        };
+        Some((positions[0].map(input), positions[1].map(input)))
     }
 
     /// The common element type that PostgreSQL selects for one call's

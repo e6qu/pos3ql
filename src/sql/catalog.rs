@@ -31780,6 +31780,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "synchronize_seqscans" => "on",
             "track_functions" => "none",
             "TimeZone" => "UTC",
+            "work_mem" => "4096",
             "transaction_isolation" => "read committed",
             "transaction_deferrable" | "transaction_read_only" => "off",
             "xmloption" => "content",
@@ -31817,7 +31818,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "max_connections"
                 | "max_locks_per_transaction"
                 | "max_prepared_transactions"
-        ) {
+        ) || crate::sql::guc::int_setting_metadata(name).is_some()
+        {
             "integer"
         } else {
             "string"
@@ -31842,7 +31844,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         } else {
             "user"
         };
-        let unit = if name.ends_with("timeout") { "ms" } else { "" };
+        let unit = crate::sql::guc::int_setting_metadata(name).map_or("", |(unit, ..)| unit);
         (boot, vartype, context, unit)
     }
     let mut count = 0;
@@ -31881,6 +31883,29 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         let (reset_value, source) = crate::sql::eval::funcs::system::session_setting_metadata(name)
             .unwrap_or((value, "default"));
         let (boot, vartype, context, unit) = metadata(name);
+        let base_value = |shown: &str| {
+            crate::sql::guc::int_setting_base_value(name, shown).map_or_else(
+                || crate::util::StackStr::<256>::from_str(shown),
+                |base| {
+                    let mut value = crate::util::StackStr::<256>::new();
+                    let _ = core::fmt::Write::write_fmt(&mut value, format_args!("{base}"));
+                    value
+                },
+            )
+        };
+        let (value, reset_value) = (base_value(value.as_str()), base_value(reset_value.as_str()));
+        let (min_value, max_value) = match crate::sql::guc::int_setting_metadata(name) {
+            Some((_, min, max)) => {
+                let mut bounds = [crate::util::StackStr::<16>::new(); 2];
+                let _ = core::fmt::Write::write_fmt(&mut bounds[0], format_args!("{min}"));
+                let _ = core::fmt::Write::write_fmt(&mut bounds[1], format_args!("{max}"));
+                (
+                    text(bounds[0].as_str(), arena)?,
+                    text(bounds[1].as_str(), arena)?,
+                )
+            }
+            None => (Datum::Null, Datum::Null),
+        };
         let enum_values = if name == "track_functions" {
             let values = [
                 text("none", arena)?,
@@ -31904,10 +31929,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                     text(unit, arena)?
                 },
                 text(
-                    if name == "track_functions" {
-                        "Statistics / Monitoring"
-                    } else {
-                        "Client Connection Defaults"
+                    match name {
+                        "track_functions" => "Statistics / Monitoring",
+                        "work_mem" => "Resource Usage / Memory",
+                        _ => "Client Connection Defaults",
                     },
                     arena,
                 )?,
@@ -31916,8 +31941,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 text(context, arena)?,
                 text(vartype, arena)?,
                 text(source, arena)?,
-                Datum::Null,
-                Datum::Null,
+                min_value,
+                max_value,
                 enum_values,
                 text(boot, arena)?,
                 text(reset_value.as_str(), arena)?,

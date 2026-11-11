@@ -34254,7 +34254,7 @@ fn session_gucs_honored_or_rejected_faithfully() {
     }
     // SET then SHOW within one message (GUC state is per session/message).
     assert!(run("SET extra_float_digits = 2; SHOW extra_float_digits").contains('2'));
-    assert!(run("SET lock_timeout = 5000; SHOW lock_timeout").contains("5000"));
+    assert!(run("SET lock_timeout = 5000; SHOW lock_timeout").contains("5s"));
     assert!(run("SET lock_timeout = '50ms'; SHOW lock_timeout").contains("50ms"));
     assert!(run("SET row_security = off; SHOW row_security").contains("off"));
     for style in ["postgres", "postgres_verbose", "sql_standard", "iso_8601"] {
@@ -34278,7 +34278,7 @@ fn session_gucs_honored_or_rejected_faithfully() {
     );
     // statement_timeout is now accepted (enforced at scan boundaries); a
     // malformed value is still rejected loudly.
-    assert!(run("SET statement_timeout = 5000; SHOW statement_timeout").contains("5000"));
+    assert!(run("SET statement_timeout = 5000; SHOW statement_timeout").contains("5s"));
     assert!(
         run("SET lock_timeout = 'bogus'").contains("22023"),
         "bad lock timeout"
@@ -34310,6 +34310,128 @@ fn session_gucs_honored_or_rejected_faithfully() {
         run("SET default_table_access_method = columnar").contains("0A000"),
         "unsupported table access method"
     );
+}
+
+/// Integer settings parse, round, range-check and show as PostgreSQL 18's
+/// `parse_int` and `ShowGUCOption` do; `pg_settings` reports base units.
+#[test]
+fn integer_settings_parse_and_show_like_postgresql() {
+    let (mut e, mut b) = test_engine();
+    let mut t = TxnState::new(&mut b, 256).unwrap();
+    let mut run = |sql: &str| run_txn(&mut e, &mut b, &mut t, sql);
+    for (value, shown) in [
+        ("'1.5MB'", "1536kB"),
+        ("'65537B'", "64kB"),
+        ("2048", "2MB"),
+        ("'3000kB'", "3000kB"),
+        ("'2GB'", "2GB"),
+        ("'1TB'", "1TB"),
+        ("'2147483647kB'", "2147483647kB"),
+        ("' 64 kB '", "64kB"),
+        ("'1048576kB'", "1GB"),
+        ("'64.4'", "64kB"),
+        ("'1e3'", "1000kB"),
+        ("'0x100'", "256kB"),
+        ("'1 MB'", "1MB"),
+        ("default", "4MB"),
+    ] {
+        let out = run(&format!("SET work_mem = {value}; SHOW work_mem"));
+        assert!(
+            out.contains(&format!("D{shown}")) || out.contains(shown),
+            "{value}: {out}"
+        );
+        assert!(!out.contains("ERROR"), "{value}: {out}");
+    }
+    for (value, message) in [
+        (
+            "'10'",
+            "10 kB is outside the valid range for parameter \"work_mem\" (64 kB .. 2147483647 kB)",
+        ),
+        ("'100B'", "0 kB is outside the valid range"),
+        ("1.5", "2 kB is outside the valid range"),
+        ("'-1'", "-1 kB is outside the valid range"),
+        ("'1mb'", "invalid value for parameter \"work_mem\": \"1mb\""),
+        (
+            "'2147483648kB'",
+            "invalid value for parameter \"work_mem\": \"2147483648kB\"",
+        ),
+        (
+            "'1e10'",
+            "invalid value for parameter \"work_mem\": \"1e10\"",
+        ),
+        ("'abc'", "invalid value for parameter \"work_mem\": \"abc\""),
+    ] {
+        let out = run(&format!("SET work_mem = {value}"));
+        assert!(
+            out.contains("22023") && out.contains(message),
+            "{value}: {out}"
+        );
+    }
+    let out = run("SET work_mem = '1mb'");
+    assert!(
+        out.contains(
+            "Valid units for this parameter are \"B\", \"kB\", \"MB\", \"GB\", and \"TB\"."
+        ),
+        "{out}"
+    );
+    let out = run("SET work_mem = '2147483648kB'");
+    assert!(out.contains("Value exceeds integer range."), "{out}");
+    for (value, shown) in [
+        ("5000", "5s"),
+        ("'60000ms'", "1min"),
+        ("'1.5s'", "1500ms"),
+        ("'100us'", "0"),
+        ("'1500us'", "2ms"),
+        ("'3d'", "3d"),
+        ("'1 h'", "1h"),
+        ("'1e2'", "100ms"),
+        ("'+5'", "5ms"),
+    ] {
+        let out = run(&format!(
+            "SET statement_timeout = {value}; SHOW statement_timeout"
+        ));
+        assert!(
+            out.contains(shown) && !out.contains("ERROR"),
+            "{value}: {out}"
+        );
+    }
+    let out = run("SET statement_timeout = '1H'");
+    assert!(
+        out.contains(
+            "Valid units for this parameter are \"us\", \"ms\", \"s\", \"min\", \"h\", and \"d\"."
+        ),
+        "{out}"
+    );
+    let out = run("SET statement_timeout = '-1'");
+    assert!(
+        out.contains("-1 ms is outside the valid range for parameter \"statement_timeout\" (0 ms .. 2147483647 ms)"),
+        "{out}"
+    );
+    let out = run("SET extra_float_digits = '2.6'; SHOW extra_float_digits");
+    assert!(out.contains('3') && !out.contains("ERROR"), "{out}");
+    let out = run("SET extra_float_digits = '2kB'");
+    assert!(
+        out.contains("invalid value for parameter \"extra_float_digits\""),
+        "{out}"
+    );
+    let out = run(
+        "SET statement_timeout = '1.5s'; SET work_mem = '8MB'; SELECT name || '=' || setting || '/' || unit || '/' || vartype || '/' || min_val || '/' || max_val || '/' || boot_val || '/' || category FROM pg_settings WHERE name IN ('work_mem', 'statement_timeout') ORDER BY name",
+    );
+    assert!(
+        out.contains("statement_timeout=1500/ms/integer/0/2147483647/0/")
+            && out.contains("work_mem=8192/kB/integer/64/2147483647/4096/Resource Usage / Memory"),
+        "{out}"
+    );
+    let out = run("BEGIN; SET LOCAL work_mem = '8MB'; SHOW work_mem; ROLLBACK; SHOW work_mem");
+    assert!(out.contains("8MB") && out.contains("4MB"), "{out}");
+    let out = run(
+        "CREATE FUNCTION configured_work_mem() RETURNS text LANGUAGE sql SET work_mem = '64MB' AS 'SELECT current_setting(''work_mem'')'; SELECT configured_work_mem() || ',' || current_setting('work_mem') || ',' || array_to_string(proconfig, ';') FROM pg_proc WHERE proname = 'configured_work_mem'",
+    );
+    assert!(out.contains("64MB,4MB,work_mem=64MB"), "{out}");
+    let out = run(
+        "CREATE PROCEDURE bad_work_mem() LANGUAGE plpgsql SET work_mem = '1mb' AS $$BEGIN END$$",
+    );
+    assert!(out.contains("22023") && out.contains("\"1mb\""), "{out}");
 }
 
 #[test]

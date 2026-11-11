@@ -24037,6 +24037,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "transaction_read_only",
     "transaction_timeout",
     "track_functions",
+    "work_mem",
     "xmloption",
 ];
 

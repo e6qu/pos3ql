@@ -305,7 +305,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 
 | Setting(s) | Bounds |
 |---|---|
-| `sql_arena_bytes` (per-connection statement memory), `work_arena_bytes` (per query workspace, like PostgreSQL's `work_mem`) | Row images, joins, lists, programs, JSON/XML work, table-function rows, sorts and aggregates, retained scan/COPY/validation records (32 bytes per resident row) |
+| `sql_arena_bytes` (per-connection statement memory), `work_arena_bytes` (per query workspace; see [`work_mem`](#work_mem)) | Row images, joins, lists, programs, JSON/XML work, table-function rows, sorts and aggregates, retained scan/COPY/validation records (32 bytes per resident row) |
 | `max_tables`, `max_extended_statistics`, other catalog `max_*` | One capacity per catalog family; omitting `max_extended_statistics` derives it from `max_tables`, so set it explicitly |
 | `max_connections`, `max_prepared_transactions`, `max_subscriptions` | Transaction identity registry has `max_connections + max_prepared_transactions` entries |
 | `max_catalog_versions_per_object`, `max_ddl_per_transaction` | Retained definition/undo versions. Enum label images use `max_enums + P` slots, `P = min(max_enums * max_catalog_versions_per_object, (max_connections + max_prepared_transactions + max_subscriptions) * max_ddl_per_transaction)`, each holding `max_enum_labels_per_type` labels |
@@ -332,6 +332,22 @@ Fixed per-query-workspace limits: 1,024 snapshot and file-owner slots, 64 scan
 sources, 64 point-read sources, and 64 copied point reads. At 85% heap use,
 writing commands wait for cache reclamation before taking effect; reads,
 commits, and cancellation proceed.
+
+### `work_mem`
+
+PostgreSQL's `work_mem` is a per-session hint: how much memory a sort or hash
+may use before it spills to temporary files. It never changes query results.
+pos3ql accepts and reports it exactly like PostgreSQL 18, with the same units
+(`B`, `kB`, `MB`, `GB`, `TB`), rounding, range (64 kB to 2,147,483,647 kB),
+default (`4MB`), errors, `SHOW`, `pg_settings` row and routine `SET` clause.
+For example, `CREATE PROCEDURE nightly() ... SET work_mem = '256MB'` works,
+and `SHOW work_mem` inside it reports `256MB`.
+
+The value does not size memory in pos3ql. Each query runs in a workspace of
+`work_arena_bytes`, fixed at startup, and pos3ql never spills to temporary
+files: a sort, grouping or hash table that outgrows the workspace fails with
+`54000` whatever `work_mem` says. Raise `work_arena_bytes` in the configuration
+file and restart to let larger sorts run.
 
 ### Cursor capacity
 

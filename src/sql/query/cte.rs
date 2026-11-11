@@ -1429,6 +1429,237 @@ pub(crate) fn rule_transition_source<'a>(
     })
 }
 
+/// The relation a rule fires on, as the triggering statement's RETURNING
+/// list names it.
+#[derive(Clone, Copy)]
+pub(crate) struct RuleReturningRelation<'a> {
+    /// The visible name: the statement's alias, else the relation's name.
+    pub name: &'a str,
+    /// The relation's schema when it is not aliased.
+    pub schema: Option<&'a str>,
+    pub columns: &'a [&'a str],
+    /// `UPDATE ... FROM` or `DELETE ... USING` sources beside the relation.
+    pub other_sources: bool,
+}
+
+fn rule_returning_unsupported() -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "RETURNING through a rule's RETURNING list can reference only the rule's relation"
+    )
+}
+
+/// A rule action's RETURNING entries, one expression per entry, with `*` and
+/// `target.*` spelled out as the action target's columns.
+pub(crate) fn rule_returning_entries<'a>(
+    action: &'a Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    let (returning, table, alias) = match action {
+        Stmt::Insert(insert) => (insert.returning, insert.table, None),
+        Stmt::Update(update) => (update.returning, update.table, update.alias),
+        Stmt::Delete(delete) => (delete.returning, delete.table, delete.alias),
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "rule RETURNING action is not INSERT, UPDATE or DELETE"
+            ));
+        }
+    };
+    let visible = alias.unwrap_or(table.name);
+    let mut entries: ArenaList<'a, &'a Expr<'a>> = ArenaList::new(arena);
+    for item in returning.items {
+        match item {
+            SelectItem::Expr { expression, .. } => {
+                entries.push(expression).map_err(|_| arena_full())?;
+            }
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                if let SelectItem::TableWildcard(qualifier) = item
+                    && *qualifier != visible
+                {
+                    return Err(rule_returning_unsupported());
+                }
+                let single = arena
+                    .alloc_slice_copy(core::slice::from_ref(item))
+                    .map_err(|_| arena_full())?;
+                let described = match action {
+                    Stmt::Insert(insert) => Stmt::Insert(Insert {
+                        returning: Returning {
+                            items: single,
+                            ..insert.returning
+                        },
+                        ..*insert
+                    }),
+                    Stmt::Update(update) => Stmt::Update(Update {
+                        returning: Returning {
+                            items: single,
+                            ..update.returning
+                        },
+                        ..*update
+                    }),
+                    Stmt::Delete(delete) => Stmt::Delete(Delete {
+                        returning: Returning {
+                            items: single,
+                            ..delete.returning
+                        },
+                        ..*delete
+                    }),
+                    _ => unreachable!("matched above"),
+                };
+                let described = &*arena.alloc(described).map_err(|_| arena_full())?;
+                let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+                let count = crate::sql::exec::describe_data_modification_columns(
+                    storage,
+                    described,
+                    arena,
+                    txid,
+                    &mut columns,
+                    crate::sql::exec::DescriptionTarget::Sql,
+                )?;
+                for column in &columns[..count] {
+                    let expression = arena
+                        .alloc(Expr::Column {
+                            qualifier: Some(visible),
+                            name: arena.alloc_str(column.name).map_err(|_| arena_full())?,
+                        })
+                        .map_err(|_| arena_full())?;
+                    entries.push(&*expression).map_err(|_| arena_full())?;
+                }
+            }
+            SelectItem::RecordStar(_) => return Err(rule_returning_unsupported()),
+        }
+    }
+    Ok(entries.as_slice())
+}
+
+/// The triggering statement's RETURNING list rewritten over a rule action's
+/// RETURNING entries, as PostgreSQL's `rewriteRuleAction` does: a reference
+/// to the rule's relation (by its name, alias, `old` or `new`) reads the
+/// action's entry at that column's position, and each output keeps the name
+/// the triggering statement gives it.
+pub(crate) fn rule_returning_items<'a>(
+    outer: Returning<'a>,
+    relation: RuleReturningRelation<'a>,
+    entries: &'a [&'a Expr<'a>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [SelectItem<'a>], SqlError> {
+    if entries.len() != relation.columns.len() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "rule RETURNING entries do not match the rule's relation"
+        ));
+    }
+    let names: &'a [&'a str] = arena
+        .alloc_slice_copy(&[relation.name, outer.old_name(), outer.new_name()])
+        .map_err(|_| arena_full())?;
+    let known = |qualifier: &str| names.contains(&qualifier);
+    let context = Subst {
+        ctes: &[],
+        materialized: &[],
+        storage,
+        txid,
+        depth: 0,
+        path: None,
+        dependencies: None,
+        authorization_role: None,
+        qualifier: Some(ViewQualifier {
+            from: relation.name,
+            from_schema: relation.schema,
+            to: "",
+            to_schema: "",
+            exposed_columns: relation.columns,
+            base_columns: &[],
+            projected_columns: Some(entries),
+            projected_aliases: &names[1..],
+        }),
+        rule_transition: None,
+        recursive_state: None,
+        execution: None,
+    };
+    let mut items: ArenaList<'a, SelectItem<'a>> = ArenaList::new(arena);
+    let expand = |items: &mut ArenaList<'a, SelectItem<'a>>| -> Result<(), SqlError> {
+        for (index, name) in relation.columns.iter().enumerate() {
+            items
+                .push(SelectItem::Expr {
+                    expression: entries[index],
+                    alias: Some(name),
+                })
+                .map_err(|_| arena_full())?;
+        }
+        Ok(())
+    };
+    for item in outer.items {
+        match item {
+            SelectItem::Wildcard if !relation.other_sources => expand(&mut items)?,
+            SelectItem::TableWildcard(qualifier) if known(qualifier) => expand(&mut items)?,
+            SelectItem::TableWildcard(qualifier) if !relation.other_sources => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    qualifier
+                ));
+            }
+            SelectItem::Expr { expression, alias } => {
+                // Substitution does not follow a subquery's own scope.
+                if expression.contains_subquery() {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "subqueries in RETURNING are not supported through a rule's RETURNING list"
+                    ));
+                }
+                let mut invalid = None;
+                expression.for_each_column_reference(&mut |qualifier, name| {
+                    if invalid.is_some() {
+                        return;
+                    }
+                    let column = relation.columns.contains(&name);
+                    invalid = match qualifier {
+                        None if column => None,
+                        Some(qualifier) if known(qualifier) && column => None,
+                        _ if relation.other_sources => Some(rule_returning_unsupported()),
+                        None => Some(sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" does not exist",
+                            name
+                        )),
+                        Some(qualifier) if known(qualifier) => Some(sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column {}.{} does not exist",
+                            qualifier,
+                            name
+                        )),
+                        Some(qualifier) => Some(sql_err!(
+                            sqlstate::UNDEFINED_TABLE,
+                            "missing FROM-clause entry for table \"{}\"",
+                            qualifier
+                        )),
+                    };
+                });
+                if let Some(error) = invalid {
+                    return Err(error);
+                }
+                if let Expr::WholeRow(_) = expression {
+                    return Err(rule_returning_unsupported());
+                }
+                items
+                    .push(SelectItem::Expr {
+                        expression: subst_expr(expression, context, arena)?,
+                        alias: Some(alias.unwrap_or(crate::sql::exec::derived_name(expression))),
+                    })
+                    .map_err(|_| arena_full())?;
+            }
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
+                return Err(rule_returning_unsupported());
+            }
+        }
+    }
+    Ok(items.as_slice())
+}
+
 /// Attaches the original statement's transition-row source to one rebound
 /// action. OLD/NEW have already become columns of `source`; this step keeps
 /// the action set-oriented, so its statement triggers still fire once.
@@ -1894,6 +2125,7 @@ pub(crate) fn filter_view_rows<'a>(
         exposed_columns: names.as_slice(),
         base_columns: &[],
         projected_columns: Some(projected),
+        projected_aliases: &[],
     };
     let context = Subst {
         ctes: &[],
@@ -2095,6 +2327,7 @@ fn filter_set_view_conjunct<'a>(
                 exposed_columns: names.as_slice(),
                 base_columns: &[],
                 projected_columns: None,
+                projected_aliases: &[],
             };
             if !view_predicate_columns_safe(predicate, qualifier, &matching_types[..count]) {
                 return Ok(None);
@@ -2322,6 +2555,7 @@ pub fn rewrite_view_dml<'a>(
             exposed_columns,
             base_columns,
             projected_columns: None,
+            projected_aliases: &[],
         }),
         rule_transition: None,
         recursive_state: None,
@@ -2980,6 +3214,9 @@ struct ViewQualifier<'a> {
     exposed_columns: &'a [&'a str],
     base_columns: &'a [&'a str],
     projected_columns: Option<&'a [&'a Expr<'a>]>,
+    /// Further names that reach the projected columns (a RETURNING list's
+    /// `old` and `new` spellings).
+    projected_aliases: &'a [&'a str],
 }
 
 #[derive(Clone, Copy)]
@@ -6532,7 +6769,9 @@ fn subst_expr<'a>(
     {
         let name = match e {
             Expr::Column { qualifier, name }
-                if qualifier.is_none_or(|written| written == rewrite.from) =>
+                if qualifier.is_none_or(|written| {
+                    written == rewrite.from || rewrite.projected_aliases.contains(&written)
+                }) =>
             {
                 Some(*name)
             }

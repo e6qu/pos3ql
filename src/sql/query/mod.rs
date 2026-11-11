@@ -87,10 +87,10 @@ pub(super) mod predicate_safety;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
-    RuleTransitionType, attach_rule_source, expand_set_tree, expand_stored_query,
-    expand_stored_query_exec, expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
-    expand_stored_statement_exec, restrict_rule_original, rule_original_transition,
-    rule_transition_source,
+    RuleReturningRelation, RuleTransitionType, attach_rule_source, expand_set_tree,
+    expand_stored_query, expand_stored_query_exec, expand_stored_rule_action_exec,
+    expand_stored_rule_expression_exec, expand_stored_statement_exec, restrict_rule_original,
+    rule_original_transition, rule_returning_entries, rule_returning_items, rule_transition_source,
 };
 pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,

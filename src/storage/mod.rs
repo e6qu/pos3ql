@@ -47706,10 +47706,12 @@ impl Storage {
             .iter()
             .any(|trigger| same_identity(trigger) && trigger.visible_to(txid))
         {
+            drop(catalog);
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation already exists",
-                spec.name.as_str()
+                "trigger \"{}\" for relation \"{}\" already exists",
+                spec.name.as_str(),
+                self.trigger_target_name(spec.target, txid).as_str()
             ));
         }
         let Some(slot) = catalog
@@ -47826,10 +47828,13 @@ impl Storage {
                     && candidate.name_to(txid) == name
             })
         {
+            let target = trigger.target;
+            drop(catalog);
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation already exists",
-                name.as_str()
+                "trigger \"{}\" for relation \"{}\" already exists",
+                name.as_str(),
+                self.trigger_target_name(target, txid).as_str()
             ));
         }
         let trigger = &mut catalog.definitions[slot];
@@ -54539,6 +54544,8 @@ impl Storage {
         txid: u32,
     ) -> Result<RulePublication, SqlError> {
         validate_stored_search_path(&definition.creation_path)?;
+        // Named before the rule catalog lock, which the view's names share.
+        let (_, target_name) = self.rule_target_names(definition.target, txid);
         let target = self.query_rule_target(definition.target, txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
@@ -54556,8 +54563,9 @@ impl Storage {
             if !or_replace {
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,
-                    "rule \"{}\" for relation already exists",
-                    definition.name.as_str()
+                    "rule \"{}\" for relation \"{}\" already exists",
+                    definition.name.as_str(),
+                    target_name.as_str()
                 ));
             }
             let prior = catalog.rules[slot].pending;
@@ -54893,6 +54901,14 @@ impl Storage {
                 let view = self.view(usize::from(slot));
                 view.names_for(txid)
             }
+        }
+    }
+
+    /// The relation name PostgreSQL's duplicate-trigger errors print.
+    pub(crate) fn trigger_target_name(&self, target: TriggerTarget, txid: u32) -> SqlName {
+        match target {
+            TriggerTarget::Table(slot) => self.table_def(usize::from(slot), txid).name,
+            TriggerTarget::View(slot) => self.view(usize::from(slot)).names_for(txid).1,
         }
     }
 

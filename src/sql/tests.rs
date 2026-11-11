@@ -13601,8 +13601,24 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
         ),
         (
             "CREATE RULE second_returning AS ON INSERT TO rule_redirect DO INSTEAD \
-             INSERT INTO rule_destination VALUES (NEW.id) RETURNING id",
-            "multiple RETURNING lists",
+             INSERT INTO rule_destination VALUES (NEW.id) RETURNING id; \
+             INSERT INTO rule_redirect VALUES (1) RETURNING id",
+            "cannot have RETURNING lists in multiple rules",
+        ),
+        (
+            "CREATE RULE wide_returning AS ON INSERT TO rule_defaults DO INSTEAD \
+             INSERT INTO rule_default_log VALUES (NEW.id, NEW.label) RETURNING id, label, 1",
+            "RETURNING list has too many entries",
+        ),
+        (
+            "CREATE RULE narrow_returning AS ON INSERT TO rule_defaults DO INSTEAD \
+             INSERT INTO rule_default_log VALUES (NEW.id, NEW.label) RETURNING id",
+            "RETURNING list has too few entries",
+        ),
+        (
+            "CREATE RULE typed_returning AS ON INSERT TO rule_defaults DO INSTEAD \
+             INSERT INTO rule_default_log VALUES (NEW.id, NEW.label) RETURNING label, id",
+            "RETURNING list's entry 1 has different type from column \"id\"",
         ),
         (
             "CREATE RULE update_guard AS ON UPDATE TO rule_defaults DO ALSO NOTHING; \

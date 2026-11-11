@@ -34705,14 +34705,16 @@ pub fn create_trigger(
         return sql_fail(if trigger.or_replace {
             sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation is an internal or a child trigger",
-                trigger.name
+                "trigger \"{}\" for relation \"{}\" is an internal or a child trigger",
+                trigger.name,
+                storage.trigger_target_name(target, txn.txid).as_str()
             )
         } else {
             sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation already exists",
-                trigger.name
+                "trigger \"{}\" for relation \"{}\" already exists",
+                trigger.name,
+                storage.trigger_target_name(target, txn.txid).as_str()
             )
         });
     }
@@ -34743,8 +34745,9 @@ pub fn create_trigger(
         if !trigger.or_replace {
             return sql_fail(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation already exists",
-                trigger.name
+                "trigger \"{}\" for relation \"{}\" already exists",
+                trigger.name,
+                storage.trigger_target_name(target, txn.txid).as_str()
             ));
         }
         if matches!(
@@ -35692,8 +35695,9 @@ pub fn alter_trigger(
             {
                 return sql_fail(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,
-                    "trigger \"{}\" for relation already exists",
-                    name.as_str()
+                    "trigger \"{}\" for relation \"{}\" already exists",
+                    name.as_str(),
+                    storage.trigger_target_name(target, txn.txid).as_str()
                 ));
             }
             (name, trigger.enabled_to(txn.txid))
@@ -45563,20 +45567,6 @@ fn stored_rule_definition(
             ));
         }
     }
-    if returning_action.is_some()
-        && storage
-            .rules_for(target, event, txn.txid)
-            .any(|(_, existing)| {
-                let existing = existing.definition_for(txn.txid);
-                existing.returning_action.is_some()
-                    && !(rule.or_replace && existing.name.as_str() == rule.name)
-            })
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot have multiple RETURNING lists in rules for the same relation and event"
-        ));
-    }
     if let Some(condition) = rule.condition {
         if condition.contains_subquery() {
             return Err(sql_err!(
@@ -45742,9 +45732,29 @@ fn stored_rule_definition(
             "permanent rules cannot reference temporary relations"
         ));
     }
-    let transition_values = [&Expr::Null; crate::storage::MAX_COLUMNS];
-    for action in rule.actions {
-        super::query::expand_stored_rule_action_exec(
+    // OLD and NEW are typed NULLs here, so RETURNING items that read them
+    // describe with the relation's column types.
+    let mut transition_values = [&Expr::Null; crate::storage::MAX_COLUMNS];
+    for (index, metadata) in condition_columns.metadata[..condition_columns.count]
+        .iter()
+        .enumerate()
+    {
+        let type_name =
+            super::catalog::user_type_name_text(storage, txn.txid, metadata.type_oid, arena)?
+                .unwrap_or(metadata.ctype.name());
+        transition_values[index] = arena
+            .alloc(Expr::Cast {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                operand: &Expr::Null,
+                type_name,
+                type_mod: metadata.type_mod,
+                binding: crate::sql::ast::CastBinding::Resolve,
+            })
+            .map(|expression| &*expression)
+            .map_err(|_| arena_full())?;
+    }
+    for (index, action) in rule.actions.iter().enumerate() {
+        let expanded = super::query::expand_stored_rule_action_exec(
             action.statement,
             storage,
             txn.txid,
@@ -45760,6 +45770,16 @@ fn stored_rule_definition(
             condition_columns.old,
             condition_columns.new,
         )?;
+        if returning_action == Some(index as u8) {
+            check_rule_returning_list(
+                storage,
+                txn.txid,
+                target,
+                &condition_columns,
+                expanded,
+                arena,
+            )?;
+        }
     }
     Ok((
         crate::storage::RuleDefinition {
@@ -45777,6 +45797,78 @@ fn stored_rule_definition(
         },
         dependencies,
     ))
+}
+
+/// PostgreSQL's `checkRuleResultList` for a rule's RETURNING list: one entry
+/// per relation attribute (dropped ones included), each of the column's type,
+/// with typmods equal unless either is unspecified.
+fn check_rule_returning_list(
+    storage: &Storage,
+    txid: u32,
+    target: crate::storage::RuleTarget,
+    relation: &RuleConditionColumns<'_>,
+    action: &Stmt<'_>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mut entries = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let count = describe_data_modification_columns(
+        storage,
+        action,
+        arena,
+        txid,
+        &mut entries,
+        DescriptionTarget::Wire,
+    )?;
+    let definitions = storage.table_definition_images();
+    let table = match target {
+        crate::storage::RuleTarget::Table(slot) => {
+            Some(definitions.definition(storage, usize::from(slot), txid)?)
+        }
+        crate::storage::RuleTarget::View(_) => None,
+    };
+    let attributes = table.map_or(relation.count, |table| usize::from(table.attributes.count));
+    for (position, entry) in entries[..count].iter().enumerate() {
+        if position >= attributes {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "RETURNING list has too many entries"
+            ));
+        }
+        let column = match table {
+            Some(table) => table.attribute_column(position as u16 + 1).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot create a RETURNING list for a relation containing dropped columns"
+                )
+            })?,
+            None => position,
+        };
+        let name = relation.names[column];
+        let metadata = relation.metadata[column];
+        if entry.type_oid != metadata.type_oid {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "RETURNING list's entry {} has different type from column \"{}\"",
+                position + 1,
+                name
+            ));
+        }
+        if entry.type_mod != metadata.type_mod && entry.type_mod != -1 && metadata.type_mod != -1 {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "RETURNING list's entry {} has different size from column \"{}\"",
+                position + 1,
+                name
+            ));
+        }
+    }
+    if count != attributes {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "RETURNING list has too few entries"
+        ));
+    }
+    Ok(())
 }
 
 pub fn create_rule(

@@ -116,10 +116,15 @@ is owned.
     its input from the first row; retained position checkpoints would bound
     that reread.
   - PL/pgSQL `FOR rec IN c LOOP` over a bound cursor is rejected with
-    `0A000`; it needs a loop frame that opens, fetches and closes the cursor
-    across waits in every procedural executor.
-  - Saving a held cursor at commit reads storage synchronously: commit callers
-    do not yet accept a wait before the commit is staged.
+    `0A000`; it needs a loop frame that opens the cursor (a real portal, so
+    `pg_cursors`, `42P03` for an open cursor and the cursor variable behave as
+    in PostgreSQL), fetches one row per iteration and closes it on every exit,
+    across waits in every procedural executor. Materializing the query like
+    `FOR ... IN SELECT` would differ from PostgreSQL in those three ways.
+  - Saving a held cursor at commit reads storage synchronously: the fourteen
+    callers of the commit path (statement, protocol, procedure and
+    replication commits) do not yet accept a wait before the commit is
+    staged.
 
 **Done when:**
 

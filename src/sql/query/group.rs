@@ -469,9 +469,14 @@ pub(super) fn groups_for_mask<'a>(
     let states: &mut [AggState] = arena
         .alloc_slice_with(n_groups * n_aggs.max(1), |_| AggState::default())
         .map_err(|_| arena_full())?;
+    // Each aggregate initializes once; other groups copy the fresh state.
     for g in 0..n_groups {
         for (i, (_, node)) in agg_nodes.iter().enumerate() {
-            states[g * n_aggs.max(1) + i].init(node, storage, txid, aggregate_columns, arena)?;
+            if g == 0 {
+                states[i].init(node, storage, txid, aggregate_columns, arena)?;
+            } else {
+                states[g * n_aggs.max(1) + i] = states[i].fresh_copy(arena)?;
+            }
         }
     }
     let partial_execution = storage.spill_attached()
@@ -490,14 +495,8 @@ pub(super) fn groups_for_mask<'a>(
         .map_err(|_| arena_full())?;
     if partial_execution {
         for g in 0..n_groups {
-            for (i, (_, node)) in agg_nodes.iter().enumerate() {
-                partial_states[g * n_aggs.max(1) + i].init(
-                    node,
-                    storage,
-                    txid,
-                    aggregate_columns,
-                    arena,
-                )?;
+            for i in 0..n_aggs {
+                partial_states[g * n_aggs.max(1) + i] = states[i].fresh_copy(arena)?;
             }
         }
     }

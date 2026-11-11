@@ -3691,7 +3691,13 @@ pub(crate) fn routine_input_handoff(
                     schema == Some("pg_catalog")
                         && catalog.is_none_or(|catalog| !catalog.has_operator_candidate(symbol))
                 });
+            // A builtin aggregate folds in the executor and runs no routine
+            // body; its arguments may still call one.
+            let builtin_aggregate = expression.is_aggregate_use()
+                && bound_oid.is_none()
+                && catalog.is_none_or(|catalog| !catalog.has_routine_candidate(name, args.len()));
             if !builtin_operator
+                && !builtin_aggregate
                 && (bound_oid.is_some()
                     || catalog
                         .is_some_and(|catalog| catalog.has_routine_candidate(name, args.len()))

@@ -21513,6 +21513,14 @@ fn resolve_plpgsql_local(
     txid: u32,
 ) -> Result<TriggerLocalDecl, SqlError> {
     let (ctype, user_type, type_mod, record_shape) = match local.ty {
+        // A table's name also names its row type, as with `%ROWTYPE`.
+        ParsedPlpgsqlLocalType::Named { name, type_mod }
+            if type_mod < 0
+                && relation_row_type_exists(storage, txid, name)
+                && !composite_type_exists(storage, txid, name) =>
+        {
+            resolve_plpgsql_rowtype(storage, txid, name)?
+        }
         ParsedPlpgsqlLocalType::Named { name, type_mod } => {
             let result = resolve_routine_type(storage, txid, name)?;
             (result.ctype, result.user_type, type_mod, None)
@@ -21636,30 +21644,26 @@ fn validate_plpgsql_constant_assignments(
                 "variable \"{}\" is declared CONSTANT",
                 target.name.as_str()
             )),
-            None if let Some(label) = target.label => {
-                if binding_constant(
-                    PlpgsqlVariableName::plain(label),
-                    locals,
-                    shadowed,
-                    has_parameter,
-                )
-                .is_some()
-                {
-                    Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "assigning to field \"{}\" of PL/pgSQL record \"{}\" is not supported",
-                        target.name.as_str(),
-                        label.as_str()
-                    ))
-                } else {
-                    Err(sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "\"{}.{}\" is not a known variable",
-                        label.as_str(),
-                        target.name.as_str()
-                    ))
-                }
-            }
+            // `r.f` assigns field `f` of row variable `r`.
+            None if let Some(label) = target.label => match binding_constant(
+                PlpgsqlVariableName::plain(label),
+                locals,
+                shadowed,
+                has_parameter,
+            ) {
+                Some(true) => Err(sql_err!(
+                    sqlstate::ERROR_IN_ASSIGNMENT,
+                    "variable \"{}\" is declared CONSTANT",
+                    label.as_str()
+                )),
+                Some(false) => Ok(()),
+                None => Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "\"{}.{}\" is not a known variable",
+                    label.as_str(),
+                    target.name.as_str()
+                )),
+            },
             _ => Ok(()),
         }
     }
@@ -21913,8 +21917,8 @@ fn resolve_plpgsql_rowtype(
     ) {
         let crate::storage::ResolvedRelation::Table(slot) = resolved else {
             return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "\"{}\" is not a table row type",
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "PL/pgSQL variables of the row type of view \"{}\" are not supported",
                 written
             ));
         };
@@ -23109,6 +23113,16 @@ where
         {
             let fields = match self.values[index] {
                 Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+                // A row-typed variable that was never assigned reads its
+                // fields as NULL. Its declared fields are not in scope here.
+                Datum::Null
+                    if matches!(
+                        self.locals[index].record_shape,
+                        Some(PlpgsqlRecordShape::Table(_))
+                    ) || matches!(self.locals[index].ctype, ColType::Composite(_)) =>
+                {
+                    return Ok(Datum::Null);
+                }
                 _ => {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,
@@ -27063,7 +27077,60 @@ fn coerce_plpgsql_local<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let value = match local.record_shape {
         Some(PlpgsqlRecordShape::Table(slot)) => {
+            let definition = storage.table_def(usize::from(slot), txid);
+            let mut target_oids = [0; MAX_COLUMNS];
+            for (oid, column) in target_oids.iter_mut().zip(definition.columns()) {
+                *oid = column.ctype.oid();
+            }
+            let value = fit_plpgsql_row(
+                value,
+                &target_oids[..definition.n_columns],
+                storage,
+                txid,
+                arena,
+            )?;
             coerce_plpgsql_table_rowtype(slot, value, storage, txid, arena, sequences)?
+        }
+        None if let ColType::Composite(Some(creation)) = local.ctype
+            && match value {
+                Datum::Record(_) => true,
+                Datum::Composite { slot, .. } => slot != creation,
+                _ => false,
+            } =>
+        {
+            let definition = storage
+                .read_composite_definition(
+                    crate::storage::TypeDefinitionTarget::by_creation(
+                        storage,
+                        crate::storage::NamedTypeKind::Composite,
+                        creation,
+                    )?,
+                    txid,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist")
+                })?;
+            let mut target_oids = [0; MAX_COLUMNS];
+            let mut width = 0;
+            for (oid, field) in target_oids.iter_mut().zip(definition.active_fields()) {
+                *oid = storage
+                    .routine_type_oid(field.ctype, field.user_type, txid)
+                    .unwrap_or(field.ctype.oid());
+                width += 1;
+            }
+            let value = fit_plpgsql_row(value, &target_oids[..width], storage, txid, arena)?;
+            coerce_routine_argument(
+                value,
+                crate::storage::RoutineArgumentDef {
+                    name: local.name,
+                    ctype: local.ctype,
+                    user_type: local.user_type,
+                },
+                storage,
+                txid,
+                arena,
+                Some(sequences),
+            )?
         }
         Some(PlpgsqlRecordShape::Dynamic) | None => coerce_routine_argument(
             plpgsql_conversion_input(
@@ -27093,6 +27160,44 @@ fn coerce_plpgsql_local<'a>(
         ));
     }
     Ok(value)
+}
+
+/// PL/pgSQL moves a row into a row-typed variable by position
+/// (`exec_move_row`): missing fields become NULL, extra ones are ignored and
+/// each field converts as an assignment would. A composite value of another
+/// type is taken apart the same way; a scalar keeps its ordinary conversion.
+fn fit_plpgsql_row<'a>(
+    value: Datum<'a>,
+    target_oids: &[i32],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let (Datum::Record(fields) | Datum::Composite { fields, .. }) = value else {
+        return Ok(value);
+    };
+    let fitted = arena
+        .alloc_slice_with(target_oids.len(), |index| RecordField {
+            name: "",
+            type_oid: target_oids[index],
+            value: Datum::Null,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    for ((out, &target), source) in fitted.iter_mut().zip(target_oids).zip(fields) {
+        let converted = plpgsql_conversion_input(source.value, Some(target), storage, txid, arena)?;
+        *out = RecordField {
+            name: source.name,
+            type_oid: if matches!(converted, Datum::Text(_))
+                && !matches!(source.value, Datum::Text(_))
+            {
+                crate::sql::types::oid::TEXT
+            } else {
+                source.type_oid
+            },
+            value: converted,
+        };
+    }
+    Ok(Datum::Record(&*fitted))
 }
 
 /// PL/pgSQL converts a value to a declared type (`exec_cast_value`) with an
@@ -27197,7 +27302,26 @@ fn assign_trigger_local<'a>(
     target: PlpgsqlVariableName,
     value: Datum<'a>,
 ) -> Result<(), SqlError> {
-    let index = trigger_local_index(locals, target)?;
+    let index = match trigger_local_index(locals, target) {
+        Ok(index) => index,
+        // `r.f := ...` names field `f` of row variable `r` when no block
+        // labelled `r` declares `f`.
+        Err(error) => {
+            let Some(record) = target.label.and_then(|label| {
+                trigger_local_index(locals, PlpgsqlVariableName::plain(label)).ok()
+            }) else {
+                return Err(error);
+            };
+            return assign_trigger_record_field(
+                context,
+                locals,
+                values,
+                record,
+                target.name,
+                value,
+            );
+        }
+    };
     if locals[index].constant {
         return Err(sql_err!(
             sqlstate::ERROR_IN_ASSIGNMENT,
@@ -27219,6 +27343,158 @@ fn assign_trigger_local<'a>(
         &sequences,
     )?;
     Ok(())
+}
+
+/// Replaces one field of a row or record variable and stores the row through
+/// the variable's ordinary conversion. A record variable's field keeps its
+/// current type, as in PostgreSQL.
+fn assign_trigger_record_field<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    locals: &[TriggerLocalDecl],
+    values: &mut [Datum<'a>],
+    record: usize,
+    field: SqlName,
+    value: Datum<'a>,
+) -> Result<(), SqlError> {
+    let local = locals[record];
+    if local.constant {
+        return Err(sql_err!(
+            sqlstate::ERROR_IN_ASSIGNMENT,
+            "variable \"{}\" is declared CONSTANT",
+            local.name.as_str()
+        ));
+    }
+    let storage = context.storage();
+    let txid = context.txn.txid;
+    let arena = context.arena;
+    let declared = |names: &mut dyn Iterator<Item = (&str, i32)>| {
+        let mut fields = [RecordField {
+            name: "",
+            type_oid: 0,
+            value: Datum::Null,
+        }; MAX_COLUMNS];
+        let mut count = 0;
+        for (slot, (name, type_oid)) in fields.iter_mut().zip(names) {
+            *slot = RecordField {
+                name: arena
+                    .alloc_str(name)
+                    .map_err(|_| super::query::arena_full_pub())?,
+                type_oid,
+                value: Datum::Null,
+            };
+            count += 1;
+        }
+        arena
+            .alloc_slice_copy(&fields[..count])
+            .map(|fields| &*fields)
+            .map_err(|_| super::query::arena_full_pub())
+    };
+    let current: &[RecordField<'a>] = match (values[record], local.record_shape, local.ctype) {
+        (Datum::Record(fields) | Datum::Composite { fields, .. }, _, _) => fields,
+        (Datum::Null, Some(PlpgsqlRecordShape::Table(slot)), _) => {
+            let definition = storage.table_def(usize::from(slot), txid);
+            declared(
+                &mut definition
+                    .columns()
+                    .iter()
+                    .map(|column| (column.name.as_str(), column.ctype.oid())),
+            )?
+        }
+        (Datum::Null, None, ColType::Composite(Some(creation))) => {
+            let definition = storage
+                .read_composite_definition(
+                    crate::storage::TypeDefinitionTarget::by_creation(
+                        storage,
+                        crate::storage::NamedTypeKind::Composite,
+                        creation,
+                    )?,
+                    txid,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist")
+                })?;
+            declared(&mut definition.active_fields().map(|field| {
+                (
+                    field.name.as_str(),
+                    storage
+                        .routine_type_oid(field.ctype, field.user_type, txid)
+                        .unwrap_or(field.ctype.oid()),
+                )
+            }))?
+        }
+        (Datum::Null, Some(PlpgsqlRecordShape::Dynamic), _) => {
+            crate::sql::eval::stash_diagnostic(
+                Some(crate::util::StackStr::from_str(
+                    "The tuple structure of a not-yet-assigned record is indeterminate.",
+                )),
+                None,
+            );
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "record \"{}\" is not assigned yet",
+                local.name.as_str()
+            ));
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "\"{}.{}\" is not a known variable",
+                local.name.as_str(),
+                field.as_str()
+            ));
+        }
+    };
+    let Some(position) = current
+        .iter()
+        .position(|candidate| candidate.name == field.as_str())
+    else {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "record \"{}\" has no field \"{}\"",
+            local.name.as_str(),
+            field.as_str()
+        ));
+    };
+    let fields = arena
+        .alloc_slice_copy(current)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let old = fields[position];
+    fields[position] = if matches!(local.record_shape, Some(PlpgsqlRecordShape::Dynamic))
+        && let Some((ctype, user_type)) = catalog_column_type(storage, txid, old.type_oid)
+    {
+        let sequences = crate::sql::sequence::SeqEval::new(storage, context.seq_session(), txid);
+        RecordField {
+            value: coerce_routine_argument(
+                plpgsql_conversion_input(value, Some(old.type_oid), storage, txid, arena)?,
+                crate::storage::RoutineArgumentDef {
+                    name: field,
+                    ctype,
+                    user_type,
+                },
+                storage,
+                txid,
+                arena,
+                Some(&sequences),
+            )?,
+            ..old
+        }
+    } else {
+        RecordField {
+            type_oid: value.type_oid(),
+            value,
+            ..old
+        }
+    };
+    assign_trigger_local(
+        context,
+        locals,
+        values,
+        PlpgsqlVariableName {
+            label: local.label,
+            name: local.name,
+        },
+        Datum::Record(&*fields),
+    )
 }
 
 /// A `RAISE` format with its `%` placeholders replaced by the arguments'
@@ -28383,7 +28659,12 @@ fn execute_trigger_step_in<'a>(
             };
             if folded
                 && let Some(statement) = crate::sql::error_context::innermost_assignment()
-                && locals.iter().any(|local| assignment.name.names(local))
+                && (locals.iter().any(|local| assignment.name.names(local))
+                    || assignment.name.label.is_some_and(|label| {
+                        locals
+                            .iter()
+                            .any(|local| PlpgsqlVariableName::plain(label).names(local))
+                    }))
             {
                 // PostgreSQL folds a constant's conversion to the target's
                 // (or a subscripted target's element) type while planning
@@ -33925,6 +34206,11 @@ pub(crate) fn resolve_routine_type(
         txid,
     )?;
     storage.bind_routine_result(result, txid)
+}
+
+/// Whether `written` names a standalone composite type.
+fn composite_type_exists(storage: &Storage, txid: u32, written: &str) -> bool {
+    storage.resolve_composite_slot(written, txid).is_some()
 }
 
 /// Whether `written` names a table or view whose row type would resolve here.
@@ -79276,7 +79562,7 @@ fn coerce_column_value<'a>(
                 physical_fields: 0,
                 text,
             } if actual == slot => {
-                decode_composite_text(text, slot, storage, txid, arena, sequences)?
+                decode_retained_composite_text(text, slot, storage, txid, arena, sequences)?
             }
             value @ Datum::CompositeText { slot: actual, .. } if actual == slot => {
                 return Ok(value);
@@ -79389,7 +79675,7 @@ pub(crate) fn coerce_routine_argument<'a>(
             Datum::CompositeText {
                 slot: actual, text, ..
             } if Some(actual) == slot => {
-                decode_composite_text(text, actual, storage, txid, arena, sequences)
+                decode_retained_composite_text(text, actual, storage, txid, arena, sequences)
             }
             value => coerce_composite_value(value, slot, storage, txid, arena, sequences),
         },
@@ -79741,12 +80027,19 @@ fn coerce_composite_value_inner<'a>(
             ))
         };
     }
-    let Datum::Record(input) = value else {
-        return Err(sql_err!(
-            sqlstate::CANNOT_COERCE,
-            "cannot cast non-record value to named composite"
-        ));
-    };
+    // Text converts through the record input routine, as PostgreSQL's I/O
+    // conversion cast does.
+    if let (Datum::Text(text), CompositeEncoding::Input) = (value, encoding) {
+        return decode_composite_text_inner(
+            text,
+            slot,
+            CompositeTextSource::Client,
+            storage,
+            txid,
+            arena,
+            sequences,
+        );
+    }
     let definition = storage
         .read_composite_definition(
             crate::storage::TypeDefinitionTarget::by_creation(
@@ -79763,6 +80056,14 @@ fn coerce_composite_value_inner<'a>(
             "composite type does not exist"
         ));
     }
+    let Datum::Record(input) = value else {
+        return Err(sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "cannot cast type {} to {}",
+            crate::sql::eval::type_name_of_pub(&value),
+            definition.name.as_str()
+        ));
+    };
     if input.len() != definition.active_field_count() {
         return Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
@@ -79870,6 +80171,29 @@ fn coerce_composite_value_inner<'a>(
 /// Parses PostgreSQL's composite text form stored in a row. This parser keeps
 /// quoting at the boundary: commas and parentheses inside quoted fields never
 /// leak into type coercion as separate attributes.
+/// Decodes a composite retained in its text form before the type gained
+/// fields: the text may name fewer fields than the type now has.
+fn decode_retained_composite_text<'a>(
+    text: &'a str,
+    slot: crate::storage::TypeCreation,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<Datum<'a>, SqlError> {
+    decode_composite_text_inner(
+        text,
+        slot,
+        CompositeTextSource::Retained {
+            physical_fields: None,
+        },
+        storage,
+        txid,
+        arena,
+        sequences,
+    )
+}
+
 pub(crate) fn decode_composite_text<'a>(
     text: &'a str,
     slot: crate::storage::TypeCreation,
@@ -79878,11 +80202,130 @@ pub(crate) fn decode_composite_text<'a>(
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
-    decode_composite_text_inner(text, slot, None, storage, txid, arena, sequences)
+    decode_composite_text_inner(
+        text,
+        slot,
+        CompositeTextSource::Client,
+        storage,
+        txid,
+        arena,
+        sequences,
+    )
 }
 
 /// Decodes a row-encoded composite. Its physical field count is part of the
 /// durable datum so an old layout remains unambiguous after ALTER TYPE.
+/// Splits a record literal as PostgreSQL's `record_in` does: an empty field
+/// is NULL, double quotes and backslashes protect any text, and a client
+/// literal must name exactly `expected` fields. A retained image may name
+/// fewer. Returns the number of fields read into `values`.
+fn parse_record_literal<'a>(
+    text: &'a str,
+    expected: usize,
+    retained: bool,
+    values: &mut [Option<&'a str>],
+    arena: &'a Arena,
+) -> Result<usize, SqlError> {
+    let malformed = |detail: &str| {
+        crate::sql::eval::stash_diagnostic(Some(crate::util::StackStr::from_str(detail)), None);
+        sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "malformed record literal: \"{}\"",
+            text
+        )
+    };
+    let bytes = text.as_bytes();
+    let mut at = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    if bytes.get(at) != Some(&b'(') {
+        return Err(malformed("Missing left parenthesis."));
+    }
+    at += 1;
+    let mut count = 0usize;
+    while count < expected {
+        if count > 0 {
+            match bytes.get(at) {
+                Some(b',') => at += 1,
+                Some(b')') if retained => break,
+                _ => return Err(malformed("Too few columns.")),
+            }
+        }
+        if count == values.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "composite literal has too many fields"
+            ));
+        }
+        values[count] = if matches!(bytes.get(at), Some(b',' | b')')) {
+            None
+        } else {
+            let decoded = arena
+                .alloc_slice_with(bytes.len() - at, |_| 0u8)
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "composite literal exceeds statement arena"
+                    )
+                })?;
+            let mut written = 0usize;
+            let mut quoted = false;
+            loop {
+                let Some(&byte) = bytes.get(at) else {
+                    return Err(malformed("Unexpected end of input."));
+                };
+                if !quoted && matches!(byte, b',' | b')') {
+                    break;
+                }
+                at += 1;
+                match byte {
+                    b'\\' => {
+                        let Some(&escaped) = bytes.get(at) else {
+                            return Err(malformed("Unexpected end of input."));
+                        };
+                        decoded[written] = escaped;
+                        written += 1;
+                        at += 1;
+                    }
+                    b'"' if !quoted => quoted = true,
+                    b'"' if bytes.get(at) == Some(&b'"') => {
+                        decoded[written] = b'"';
+                        written += 1;
+                        at += 1;
+                    }
+                    b'"' => quoted = false,
+                    byte => {
+                        decoded[written] = byte;
+                        written += 1;
+                    }
+                }
+            }
+            Some(core::str::from_utf8(&decoded[..written]).map_err(|_| {
+                sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "composite field is not valid UTF-8"
+                )
+            })?)
+        };
+        count += 1;
+    }
+    if retained && bytes.get(at) != Some(&b')') {
+        return Err(sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "wrong number of composite fields"
+        ));
+    }
+    if bytes.get(at) != Some(&b')') {
+        return Err(malformed("Too many columns."));
+    }
+    at += 1;
+    if bytes[at..].iter().any(|byte| !byte.is_ascii_whitespace()) {
+        return Err(malformed("Junk after right parenthesis."));
+    }
+    Ok(count)
+}
+
 pub(crate) fn decode_stored_composite_text<'a>(
     text: &'a str,
     slot: crate::storage::TypeCreation,
@@ -79894,7 +80337,9 @@ pub(crate) fn decode_stored_composite_text<'a>(
     decode_composite_text_inner(
         text,
         slot,
-        (physical_fields != 0).then_some(physical_fields as usize),
+        CompositeTextSource::Retained {
+            physical_fields: (physical_fields != 0).then_some(physical_fields as usize),
+        },
         storage,
         txid,
         arena,
@@ -79902,15 +80347,28 @@ pub(crate) fn decode_stored_composite_text<'a>(
     )
 }
 
+/// Where composite text comes from: a client literal names exactly the
+/// type's fields; retained text may predate fields added since and, with a
+/// physical field count, lists them by attribute number.
+#[derive(Clone, Copy)]
+enum CompositeTextSource {
+    Client,
+    Retained { physical_fields: Option<usize> },
+}
+
 fn decode_composite_text_inner<'a>(
     text: &'a str,
     slot: crate::storage::TypeCreation,
-    stored_physical_fields: Option<usize>,
+    source: CompositeTextSource,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
+    let (retained, stored_physical_fields) = match source {
+        CompositeTextSource::Client => (false, None),
+        CompositeTextSource::Retained { physical_fields } => (true, physical_fields),
+    };
     let encoding = match stored_physical_fields {
         None => CompositeEncoding::Input,
         Some(count) if count & usize::from(COMPOSITE_MEMBER_IDENTITIES) != 0 => {
@@ -79920,15 +80378,6 @@ fn decode_composite_text_inner<'a>(
     };
     let stored_physical_fields =
         stored_physical_fields.map(|count| count & !usize::from(COMPOSITE_MEMBER_IDENTITIES));
-    let body = text
-        .strip_prefix('(')
-        .and_then(|body| body.strip_suffix(')'))
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::INVALID_TEXT_REPRESENTATION,
-                "malformed composite literal"
-            )
-        })?;
     let definition = storage
         .read_composite_definition(
             crate::storage::TypeDefinitionTarget::by_creation(
@@ -79939,110 +80388,12 @@ fn decode_composite_text_inner<'a>(
             txid,
         )?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
-    let mut raw_values = [""; crate::storage::MAX_COMPOSITE_FIELDS];
-    let mut quoted_values = [false; crate::storage::MAX_COMPOSITE_FIELDS];
-    let mut count = 0usize;
-    let mut at = 0usize;
-    while at < body.len() {
-        if count == raw_values.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "composite literal has too many fields"
-            ));
-        }
-        let rest = &body[at..];
-        let (raw, used, quoted) = if let Some(source) = rest.strip_prefix('"') {
-            let mut read = 0;
-            let mut written = 0;
-            let decoded = arena.alloc_slice_with(source.len(), |_| 0u8).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "composite literal exceeds statement arena"
-                )
-            })?;
-            let mut closed = false;
-            while read < source.len() {
-                match source.as_bytes()[read] {
-                    b'\\' => {
-                        read += 1;
-                        let Some(&byte) = source.as_bytes().get(read) else {
-                            return Err(sql_err!(
-                                sqlstate::INVALID_TEXT_REPRESENTATION,
-                                "unterminated composite field escape"
-                            ));
-                        };
-                        decoded[written] = byte;
-                        written += 1;
-                        read += 1;
-                    }
-                    b'"' if source.as_bytes().get(read + 1) == Some(&b'"') => {
-                        decoded[written] = b'"';
-                        written += 1;
-                        read += 2;
-                    }
-                    b'"' => {
-                        read += 1;
-                        closed = true;
-                        break;
-                    }
-                    byte => {
-                        decoded[written] = byte;
-                        written += 1;
-                        read += 1;
-                    }
-                }
-            }
-            if !closed {
-                return Err(sql_err!(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                    "unterminated composite field"
-                ));
-            }
-            let raw = core::str::from_utf8(&decoded[..written]).map_err(|_| {
-                sql_err!(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                    "composite field is not valid UTF-8"
-                )
-            })?;
-            (raw, read + 1, true)
-        } else {
-            let end = rest.find(',').unwrap_or(rest.len());
-            (&rest[..end], end, false)
-        };
-        raw_values[count] = raw;
-        quoted_values[count] = quoted;
-        count += 1;
-        at += used;
-        if at == body.len() {
-            break;
-        }
-        if body.as_bytes().get(at) != Some(&b',') {
-            return Err(sql_err!(
-                sqlstate::INVALID_TEXT_REPRESENTATION,
-                "malformed composite literal"
-            ));
-        }
-        at += 1;
-        if at == body.len() {
-            raw_values[count] = "";
-            quoted_values[count] = false;
-            count += 1;
-            break;
-        }
-    }
     let physical = stored_physical_fields.is_some();
-    if physical && count > stored_physical_fields.expect("checked physical layout") {
-        return Err(sql_err!(
-            sqlstate::INVALID_TEXT_REPRESENTATION,
-            "wrong number of composite fields"
-        ));
-    }
-    if !physical && count > definition.active_field_count() {
-        return Err(sql_err!(
-            sqlstate::INVALID_TEXT_REPRESENTATION,
-            "wrong number of composite fields"
-        ));
-    }
+    // Client input names exactly the active fields; a stored image may predate
+    // fields added later and lists them by attribute number.
+    let expected = stored_physical_fields.unwrap_or(definition.active_field_count());
+    let mut raw_values = [None; crate::storage::MAX_COMPOSITE_FIELDS];
+    let count = parse_record_literal(text, expected, retained, &mut raw_values, arena)?;
     let values = arena
         .alloc_slice_with(definition.active_field_count(), |_| RecordField {
             name: "",
@@ -80065,18 +80416,13 @@ fn decode_composite_text_inner<'a>(
         } else {
             active_index
         };
-        let (raw, quoted) = if source_index < count {
-            (raw_values[source_index], quoted_values[source_index])
-        } else {
-            ("", false)
-        };
         out.name = "";
         out.type_oid = 0;
-        out.value = if raw.is_empty() && !quoted {
-            Datum::Null
-        } else {
-            Datum::Text(raw)
-        };
+        out.value = raw_values[..count]
+            .get(source_index)
+            .copied()
+            .flatten()
+            .map_or(Datum::Null, Datum::Text);
     }
     coerce_composite_value_inner(
         Datum::Record(values),
@@ -80183,7 +80529,7 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                     physical_fields: 0,
                     text,
                 } if actual == slot => {
-                    decode_composite_text(text, slot, storage, txid, arena, sequences)?
+                    decode_retained_composite_text(text, slot, storage, txid, arena, sequences)?
                 }
                 Datum::CompositeText { slot: actual, .. } if actual == slot => value,
                 Datum::Text(text) => {

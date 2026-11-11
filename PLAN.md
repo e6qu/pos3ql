@@ -307,13 +307,16 @@ aliased table (`UPDATE t x ... RETURNING t.a`) reports `missing FROM-clause
 entry` without PostgreSQL's alias hint, and a qualified star's error
 (`RETURNING missing.*`) has no position. A four-part column name (`a.b.c.d`) is a syntax error where
 PostgreSQL reports `cross-database references are not implemented`.
-`SELECT ... INTO` a composite PL/pgSQL variable from one composite column
-reports a field-count error where PostgreSQL assigns the column to the first
-field. An `INSERT ... SELECT *` assignment error has no position where PostgreSQL
+An `INSERT ... SELECT *` assignment error has no position where PostgreSQL
 points at the `*` (a qualified `t.*` is positioned), and `UPDATE t SET (a,
 b) = (SELECT * FROM s)` does not check the subquery's column types against
-the targets. A PL/pgSQL variable declared with a table's row type (`r t;`) is
-rejected as a routine argument type. `pg_sleep` and its
+the targets. A PL/pgSQL variable declared with a view's row type (`r v;` or
+`r v%ROWTYPE`) fails with `0A000`; a table's works. In a PL/pgSQL statement,
+`VALUES (r.*)` does not expand the row variable `r` into its fields, and a
+whole-row star in an expression (`t.* IS NULL`) is a syntax error. Reading
+a field of a row variable that was never assigned returns NULL without
+checking that the field exists. A `CONSTANT` assignment error has no cursor
+position. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,

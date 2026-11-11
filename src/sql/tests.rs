@@ -28,6 +28,7 @@ mod nested_planner_inputs;
 pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
+mod plpgsql_row_variables;
 mod prepared_object_capacity;
 mod procedural_expression_calls;
 mod procedural_progress;

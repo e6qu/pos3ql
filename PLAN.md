@@ -81,7 +81,11 @@ is owned.
 
 **Remaining:**
 
-- **Functions:** PL/pgSQL return conversion that can wait.
+- **Functions:** a PL/pgSQL function's domain result runs its `CHECK`
+  constraints after the body has finished, so a routine called by such a
+  check that waits cannot resume: it fails with `0A000` (`expression wait
+  requires an owned invocation log`), and inside a procedure the whole `CALL`
+  runs again, which after the procedure's first `COMMIT` fails with `0A000`.
   Writes inside a procedure body still read storage synchronously. A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
   grouping, subqueries) restarts once for each first call of a SQL-language
   routine, so its work grows with the square of those calls; single-table,

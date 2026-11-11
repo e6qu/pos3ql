@@ -4567,6 +4567,67 @@ fn procedure_statements_after_transaction_control_see_committed_rows() {
     ]);
 }
 
+/// A PL/pgSQL function's return value is cast to a domain result type with
+/// the domain's `NOT NULL` and `CHECK` constraints, including a check that
+/// calls a function, as in PostgreSQL 18.6.
+#[test]
+fn plpgsql_domain_results_enforce_constraints() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    check(&[
+        (
+            "CREATE DOMAIN result_positive AS integer CHECK (VALUE > 0); \
+             CREATE DOMAIN result_present AS text NOT NULL; \
+             CREATE FUNCTION result_checked(integer) RETURNS boolean LANGUAGE plpgsql \
+             AS $$BEGIN RAISE NOTICE 'checked %', $1; RETURN $1 < 10; END$$; \
+             CREATE DOMAIN result_small AS integer CHECK (result_checked(VALUE)); \
+             CREATE FUNCTION result_negative() RETURNS result_positive LANGUAGE plpgsql \
+             AS $$BEGIN RETURN -1; END$$; \
+             CREATE FUNCTION result_one() RETURNS result_positive LANGUAGE plpgsql \
+             AS $$BEGIN RETURN 1; END$$; \
+             CREATE FUNCTION result_null() RETURNS result_present LANGUAGE plpgsql \
+             AS $$BEGIN RETURN NULL; END$$; \
+             CREATE FUNCTION result_value(n integer) RETURNS result_small \
+             LANGUAGE plpgsql AS $$BEGIN RETURN n; END$$",
+            NONE,
+        ),
+        (
+            "SELECT result_negative()",
+            &[(
+                'E',
+                "23514",
+                "value for domain result_positive violates check constraint \"result_positive_check\"",
+            )],
+        ),
+        (
+            "DO $$BEGIN RAISE NOTICE '%', result_one(); END$$",
+            &[('N', "00000", "1")],
+        ),
+        (
+            "SELECT result_null()",
+            &[(
+                'E',
+                "23502",
+                "domain result_present does not allow null values",
+            )],
+        ),
+        (
+            "DO $$BEGIN RAISE NOTICE '%', result_value(3); END$$",
+            &[('N', "00000", "checked 3"), ('N', "00000", "3")],
+        ),
+        (
+            "SELECT result_value(30)",
+            &[
+                ('N', "00000", "checked 30"),
+                (
+                    'E',
+                    "23514",
+                    "value for domain result_small violates check constraint \"result_small_check\"",
+                ),
+            ],
+        ),
+    ]);
+}
+
 /// A PL/pgSQL variable in a grouped `SELECT ... INTO` is a constant within
 /// every group, in the select list, `HAVING`, aggregate and window function
 /// arguments, over tables, derived tables and no `FROM` at all, as in

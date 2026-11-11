@@ -154,6 +154,40 @@ impl ReturnBinding {
     }
 }
 
+/// The declared result type, including a domain, enum or composite identity.
+fn declared_result(routine: &crate::storage::RoutineDef) -> Result<RoutineArgumentDef, SqlError> {
+    Ok(RoutineArgumentDef {
+        name: SqlName::EMPTY,
+        ctype: routine.kind.function_result().ok_or_else(changed)?,
+        user_type: routine
+            .function_result_contract()
+            .and_then(|result| result.user_type),
+    })
+}
+
+/// Converts a scalar result to a declared user type as PostgreSQL's return
+/// cast does: a domain result enforces `NOT NULL` and its `CHECK`
+/// constraints, which may call routines. A routine called there that waits
+/// fails loudly, because the finished body has no statement to resume.
+fn convert_result<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    output: FunctionOutput<'a>,
+    result: RoutineArgumentDef,
+) -> Result<FunctionOutput<'a>, SqlError> {
+    let FunctionOutput::Scalar(value) = output else {
+        return Ok(output);
+    };
+    if result.user_type.is_none() {
+        return Ok(output);
+    }
+    let arena = context.arena;
+    let txid = context.txn.txid;
+    execute_procedural_query(context, None, |storage, sequences| {
+        coerce_routine_argument(value, result, storage, txid, arena, Some(sequences))
+    })
+    .map(FunctionOutput::Scalar)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct FunctionOwner {
     identity: super::super::ExecutionIdentity,
@@ -184,7 +218,7 @@ struct FunctionBinding {
     parameters: SharedSlice<RoutineArgumentDef>,
     inputs: local_values::SavedValues,
     returns: ReturnBinding,
-    result_type: ColType,
+    result_type: RoutineArgumentDef,
     environment: SavedCallEnvironment,
     owner: FunctionOwner,
     boundary: super::super::txn::StatementMark,
@@ -434,10 +468,11 @@ impl SuspendedFunctionState {
         }
         match result {
             Ok(flow) => {
-                let output =
-                    self.binding
-                        .returns
-                        .finish(&execution, flow, self.binding.result_type, arena);
+                let output = self
+                    .binding
+                    .returns
+                    .finish(&execution, flow, self.binding.result_type.ctype, arena)
+                    .and_then(|output| convert_result(context, output, self.binding.result_type));
                 self.binding.environment.complete();
                 Ok(output)
             }
@@ -757,12 +792,11 @@ pub(crate) fn execute<'a>(
     );
     drop(seeded);
     match result {
-        Ok(flow) => returns.finish(
-            &execution,
-            flow,
-            routine.kind.function_result().ok_or_else(changed)?,
-            arena,
-        ),
+        Ok(flow) => {
+            let result = declared_result(routine)?;
+            let output = returns.finish(&execution, flow, result.ctype, arena)?;
+            convert_result(&mut context, output, result)
+        }
         Err(error) if control_flow::is_execution_wait(&error) => {
             if policy == super::super::query::RoutineExecution::StatementReplay {
                 return Err(error);
@@ -796,7 +830,7 @@ pub(crate) fn execute<'a>(
                         parameters,
                         inputs: saved_inputs,
                         returns,
-                        result_type: routine.kind.function_result().ok_or_else(changed)?,
+                        result_type: declared_result(routine)?,
                         environment,
                         owner,
                         boundary,

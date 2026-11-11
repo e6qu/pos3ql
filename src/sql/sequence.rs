@@ -41,6 +41,7 @@ struct SequenceEffect {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatementEffectKind {
     StatisticsVoid,
+    FunctionCall,
     Cursor,
     RoutineInput,
     PlanAllocation,

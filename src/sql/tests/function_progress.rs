@@ -1265,3 +1265,76 @@ fn unowned_expression_waits_roll_back_instead_of_repeating_completed_child_write
         }
     }
 }
+
+/// A SQL function that waits, called once per row, counts each completed call
+/// once in `pg_stat_user_functions`.
+#[test]
+fn waiting_sql_function_calls_count_once_per_row() {
+    for (label, body) in [
+        (
+            "direct",
+            "SELECT pg_advisory_xact_lock(410 + k)::text || 'x'",
+        ),
+        ("nested", "SELECT row_counted_child(k)"),
+    ] {
+        let config = test_config(&format!("row-function-count-{label}"));
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let mut holder =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(
+            &mut engine,
+            &format!(
+                "SET track_functions = 'all'; \
+                 CREATE FUNCTION row_counted_child(k int) RETURNS text LANGUAGE plpgsql AS $$ \
+                 BEGIN PERFORM pg_advisory_xact_lock(410 + k); RETURN 'x'; END$$; \
+                 CREATE FUNCTION row_counted(k int) RETURNS text LANGUAGE sql AS $${body}$$"
+            ),
+            true,
+        );
+        holder.success(
+            &mut engine,
+            "SELECT pg_advisory_lock(411), pg_advisory_lock(412)",
+            true,
+        );
+        let sql = "SELECT row_counted(k) FROM generate_series(1, 2) AS k";
+        let mut status = writer.execute_status(&mut engine, sql, true);
+        for key in [411, 412] {
+            assert!(
+                matches!(status, ExecutionStatus::Blocked { .. }),
+                "{label}: {status:?}: {}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            holder.success(
+                &mut engine,
+                &format!("SELECT pg_advisory_unlock({key})"),
+                true,
+            );
+            status = resume_function_progress_wait(&mut engine, &mut writer, sql, status);
+        }
+        assert_eq!(status, ExecutionStatus::Complete, "{label}");
+        assert!(
+            error_sqlstates(writer.send.readable()).is_empty(),
+            "{label}: {}",
+            String::from_utf8_lossy(writer.send.readable())
+        );
+        assert_eq!(data_rows(writer.send.readable()).len(), 2, "{label}");
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT funcname, calls FROM pg_stat_user_functions ORDER BY funcname",
+                true
+            )),
+            if label == "direct" {
+                vec!["row_counted|2"]
+            } else {
+                vec!["row_counted|2", "row_counted_child|2"]
+            },
+            "{label}"
+        );
+        drop((holder, writer, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}

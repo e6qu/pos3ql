@@ -84,6 +84,31 @@ impl Drop for FunctionTiming {
     }
 }
 
+/// Counts one completed routine call in `pg_stat_user_functions`. Inside a
+/// statement the count is a journaled effect, so a call that runs again while
+/// its statement replays after a wait is still counted once.
+pub(crate) fn record_completed_call(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    oid: i32,
+    (total, own): (u64, u64),
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    super::sequence::statement_effect(
+        super::sequence::StatementEffectKind::FunctionCall,
+        &[Datum::Int4(oid)],
+        super::sequence::StatementEffectRetry::Continue,
+        arena,
+        || super::sequence::StatementEffectAttempt {
+            result: storage
+                .record_function_call(txid, oid, total, own)
+                .map(|()| &[][..]),
+            rewound_state: false,
+        },
+    )
+    .map(|_| ())
+}
+
 pub(crate) fn begin_function_timing(enabled: bool) -> Result<FunctionTiming, SqlError> {
     if !enabled {
         return Ok(FunctionTiming {

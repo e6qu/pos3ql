@@ -18590,6 +18590,7 @@ fn execute_plpgsql_call<'a>(
     let parameters = arena
         .alloc_slice_with(arguments.len(), |index| &parameters[index])
         .map_err(|_| super::query::arena_full_pub())?;
+    let mut outputs = ProcedureOutputs::new(writable);
     let PlpgsqlExecHost::Routine {
         engine,
         guc,
@@ -18598,12 +18599,22 @@ fn execute_plpgsql_call<'a>(
         transaction_context,
     } = &mut context.host
     else {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "CALL is not supported in a trigger function"
-        ));
+        execute_atomic_procedure_call(
+            context,
+            *name,
+            parameters,
+            argument_names,
+            *variadic,
+            &values[..arguments.len()],
+            &types[..arguments.len()],
+            &mut outputs,
+        )?;
+        return Ok(PlpgsqlCallOutputs {
+            arguments: targets,
+            assigned: outputs.assigned,
+            values: outputs.values,
+        });
     };
-    let mut outputs = ProcedureOutputs::new(writable);
     let outcome = with_bound_parameter_types(&types[..arguments.len()], || {
         engine.execute_call(
             *name,
@@ -18627,6 +18638,173 @@ fn execute_plpgsql_call<'a>(
         assigned: outputs.assigned,
         values: outputs.values,
     })
+}
+
+/// Runs a `CALL` from a trigger fired inside a write, whose host has storage
+/// but no engine. As in PostgreSQL, such a call is atomic: transaction
+/// control inside the procedure fails with `2D000`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an atomic call carries its selected arguments, types and output targets"
+)]
+fn execute_atomic_procedure_call<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    name: crate::sql::ast::QualName<'_>,
+    parameters: &'a [&'a Expr<'a>],
+    argument_names: &[Option<&str>],
+    variadic: bool,
+    values: &[Datum<'a>],
+    types: &[i32],
+    outputs: &mut ProcedureOutputs<'a>,
+) -> Result<(), SqlError> {
+    let arena = context.arena;
+    let txid = context.txn.txid;
+    let qualified = match name.schema {
+        Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
+        None => stack_format!(260, "{}", name.name),
+    };
+    let slot = match context.storage().select_routine_call(
+        qualified.as_str(),
+        argument_names,
+        types,
+        variadic,
+        txid,
+        crate::storage::RoutineCallKind::Procedure,
+    ) {
+        crate::storage::RoutineCallSelection::Stored(slot) => slot,
+        failure => {
+            let columns = CatalogCols {
+                definition: None,
+                alias: None,
+                output_aliases: &[],
+                storage: context.storage(),
+                txid,
+                arena,
+            };
+            return Err(procedure_lookup_error(
+                qualified.as_str(),
+                types,
+                argument_names,
+                match failure {
+                    crate::storage::RoutineCallSelection::Ambiguous => {
+                        FunctionLookupFailure::Ambiguous
+                    }
+                    crate::storage::RoutineCallSelection::WrongKind { .. } => {
+                        FunctionLookupFailure::NotProcedure
+                    }
+                    _ => FunctionLookupFailure::Missing,
+                },
+                &columns,
+            ));
+        }
+    };
+    let mut declared = context.storage().routine_for(slot, txid);
+    outputs.bind(&declared, argument_names, parameters.len(), variadic)?;
+    if declared.language != crate::storage::RoutineLanguage::PlPgSql {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "a trigger fired during a write can call only PL/pgSQL procedures"
+        ));
+    }
+    let mapping = declared
+        .procedure_call_mapping(argument_names, parameters.len(), variadic)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "selected procedure has no CALL argument mapping"
+            )
+        })?;
+    let completed = {
+        let catalog = super::query::storage_catalog(context.storage(), arena, txid);
+        let sequences =
+            crate::sql::sequence::SeqEval::new(context.storage(), context.seq_session(), txid);
+        let hooks = crate::sql::eval::EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequences),
+            ..crate::sql::eval::NO_HOOKS
+        };
+        catalog
+            .prepare_routine_inputs(
+                slot,
+                &mut declared,
+                super::query::RoutineCallInputs {
+                    arguments: parameters,
+                    argument_type_oids: types,
+                    argument_collation: &|argument| {
+                        crate::sql::eval::routine_argument_collation(
+                            argument,
+                            &NoColumns,
+                            hooks.catalog,
+                        )
+                    },
+                    mapping: &mapping,
+                    variadic,
+                    context: super::query::RoutineInputContext::Procedure,
+                },
+                &mut |argument| eval_full(argument, arena, values, &NoColumns, &hooks),
+                arena,
+            )?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "procedure has an invalid strict input contract"
+                )
+            })?
+    };
+    let routine = &declared;
+    let owner = crate::storage::SessionIdentity::bound(
+        context
+            .storage()
+            .capture_role_slot(routine.ownership.owner_to(txid).into(), txid)?,
+    );
+    let _security = routine
+        .attributes
+        .security_definer
+        .then(|| super::eval::funcs::system::enter_current_user(owner));
+    let _config = (!routine.configs().is_empty())
+        .then(|| super::guc::enter_active_routine_configs(routine.configs()))
+        .transpose()?;
+    let track = match super::guc::active_track_functions() {
+        super::guc::TrackFunctions::None => false,
+        super::guc::TrackFunctions::Pl | super::guc::TrackFunctions::All => true,
+    };
+    let procedure_oid = crate::storage::routine_oid(routine);
+    let timed = super::statistics::begin_function_timing(track)?;
+    if track {
+        context
+            .storage()
+            .ensure_function_statistics(procedure_oid)?;
+    }
+    let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let host = context.host.reborrow();
+    let output_count = run_plpgsql_procedure(
+        &mut TriggerExecContext {
+            host,
+            txn: context.txn,
+            arena,
+            params: &completed.values[..routine.argument_count],
+            responder: context.responder,
+        },
+        routine,
+        completed.input_collation,
+        &mut output_values,
+    )?;
+    if let Some((total, own)) = timed.finish() {
+        super::statistics::record_completed_call(
+            context.storage(),
+            txid,
+            procedure_oid,
+            (total, own),
+            arena,
+        )?;
+    }
+    outputs.record(
+        routine,
+        &output_values[..output_count],
+        context.storage(),
+        txid,
+        arena,
+    )
 }
 
 /// Output parameters of a procedure called from PL/pgSQL. Static `CALL`
@@ -21774,20 +21952,51 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     responder: &mut Responder<'_>,
     outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
 ) -> Result<usize, SqlError> {
+    run_plpgsql_procedure(
+        &mut TriggerExecContext {
+            host: PlpgsqlExecHost::Routine {
+                engine,
+                guc,
+                sqlprep,
+                cursors,
+                transaction_context,
+            },
+            txn,
+            arena,
+            params: inputs,
+            responder,
+        },
+        routine,
+        input_collation,
+        outputs,
+    )
+}
+
+/// Runs a PL/pgSQL procedure body on `context`'s host with `context.params`
+/// as its inputs, returning the number of output values written.
+fn run_plpgsql_procedure<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    routine: &crate::storage::RoutineDef,
+    input_collation: crate::sql::ast::Collation,
+    outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+) -> Result<usize, SqlError> {
+    let arena = context.arena;
+    let inputs = context.params;
+    let txid = context.txn.txid;
     let _formal_scope = enter_routine_parameter_types(
         routine.arguments(),
         Some(&super::query::storage_catalog(
-            &engine.storage,
+            context.storage(),
             arena,
-            txn.txid,
+            txid,
         )),
         input_collation,
     )?;
     let (program, code) = compile_plpgsql_execution(
         routine.body.as_str(),
         PlpgsqlProgramKind::Procedure,
-        &engine.storage,
-        txn.txid,
+        context.storage(),
+        txid,
         arena,
         &|name| {
             routine
@@ -21809,7 +22018,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         .alloc_slice_with(declaration_capacity, |_| empty_plpgsql_local())
         .map_err(|_| super::query::arena_full_pub())?;
     let mut seeded = allocate_plpgsql_local_values(
-        &engine.storage.execution_control,
+        &context.storage().execution_control,
         routine
             .parameters()
             .iter()
@@ -21861,19 +22070,6 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     let definition = crate::storage::RelationDefinition::EMPTY;
     let invocation = TriggerInvocation::procedure(routine, input_collation, arena)?
         .with_input_sites(program.input_sites);
-    let mut context = TriggerExecContext {
-        host: PlpgsqlExecHost::Routine {
-            engine,
-            guc,
-            sqlprep,
-            cursors,
-            transaction_context,
-        },
-        txn,
-        arena,
-        params: inputs,
-        responder,
-    };
     let mut execution = execution_frame::ExecutionFrame::new(
         context.arena,
         &code,
@@ -21883,7 +22079,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         &context.storage().row_work,
     )?;
     execution.initialize(
-        &mut context,
+        context,
         invocation,
         TriggerTransition {
             definition,
@@ -21896,7 +22092,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     drop(seeded);
     let mut no_new = None;
     match execution.execute_block(
-        &mut context,
+        context,
         definition,
         invocation,
         None,

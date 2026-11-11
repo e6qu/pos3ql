@@ -77,10 +77,7 @@ is owned.
 **Remaining:**
 
 - **Functions:** callers and expression positions that have no owning query;
-  PL/pgSQL return conversion that can wait. A SQL function that waits, called
-  once per row of a multi-row statement, adds one extra call to
-  `pg_stat_user_functions` (`SELECT f() FROM generate_series(1, 2)` counts 3).
-  A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
+  PL/pgSQL return conversion that can wait. A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
   grouping, subqueries) restarts once for each first call of a SQL-language
   routine, so its work grows with the square of those calls; single-table,
   `VALUES` and `generate_series` sources hand each call off on its row.
@@ -300,8 +297,10 @@ still fail with `42601` and `syntax error: <description>`: type modifiers
 role and large-object values, and SQL/JSON result types. An unsupported cast
 reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
 `42846` `cannot cast type integer to timestamp without time zone`.
-PL/pgSQL `CALL` in a trigger function fails with `0A000`, and a procedure
-called from PL/pgSQL that waits for storage or a lock runs again from its
+A trigger fired inside a write (a BEFORE row trigger, a deferred constraint
+trigger at `COMMIT`) can `CALL` only PL/pgSQL procedures; a SQL-language
+procedure fails with `0A000` because that trigger runs without the engine's
+statement executor. A procedure called from PL/pgSQL that waits for storage or a lock runs again from its
 start when its statement resumes (finished effects replay from the statement
 journal) instead of resuming at a saved position inside the procedure. A table's or view's row type cannot
 appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`

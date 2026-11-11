@@ -3751,11 +3751,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if let Some((total, own)) = timed.finish()
             && output.is_ok()
         {
-            self.storage.record_function_call(
+            super::statistics::record_completed_call(
+                self.storage,
                 self.txid,
                 crate::storage::routine_oid(routine),
-                total,
-                own,
+                (total, own),
+                self.routine_workspace,
             )?;
         }
         output

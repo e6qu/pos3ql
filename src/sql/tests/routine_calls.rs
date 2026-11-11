@@ -4384,3 +4384,61 @@ fn unassigned_record_fields_report_postgresql_state() {
         ),
     ]);
 }
+
+/// A trigger fired inside a write may `CALL` a PL/pgSQL procedure. The call
+/// is atomic, so transaction control inside it fails as in PostgreSQL 18.6.
+#[test]
+fn trigger_functions_call_procedures_atomically() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    let invalid = &[('E', "2D000", "invalid transaction termination")][..];
+    check(&[
+        (
+            "CREATE TABLE trigger_calls(a integer); CREATE TABLE trigger_call_log(msg text, v integer); \
+             CREATE PROCEDURE trigger_logged(m text, INOUT v integer) LANGUAGE plpgsql AS \
+                 $$BEGIN INSERT INTO trigger_call_log VALUES (m, v); v := v * 10; END$$; \
+             CREATE PROCEDURE trigger_commits() LANGUAGE plpgsql AS \
+                 $$BEGIN INSERT INTO trigger_call_log VALUES ('c', 0); COMMIT; END$$; \
+             CREATE PROCEDURE trigger_sql(x integer) LANGUAGE sql AS \
+                 $$INSERT INTO trigger_call_log VALUES ('sql', x)$$; \
+             CREATE FUNCTION trigger_caller() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$DECLARE r integer; BEGIN r := NEW.a; CALL trigger_logged(TG_OP, r); \
+                 NEW.a := r; RETURN NEW; END$$; \
+             CREATE TRIGGER trigger_caller BEFORE INSERT ON trigger_calls \
+                 FOR EACH ROW EXECUTE FUNCTION trigger_caller(); \
+             INSERT INTO trigger_calls VALUES (1), (2)",
+            NONE,
+        ),
+        (
+            "DO $$DECLARE rows text; logged text; BEGIN \
+             SELECT string_agg(a::text, ',' ORDER BY a) INTO rows FROM trigger_calls; \
+             SELECT string_agg(msg || v, ',' ORDER BY v) INTO logged FROM trigger_call_log; \
+             RAISE NOTICE '% %', rows, logged; END$$",
+            &[('N', "00000", "10,20 INSERT1,INSERT2")],
+        ),
+        (
+            "CREATE FUNCTION trigger_committer() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$BEGIN CALL trigger_commits(); RETURN NEW; END$$; \
+             CREATE TABLE trigger_commit_rows(a integer); \
+             CREATE TRIGGER trigger_committer BEFORE INSERT ON trigger_commit_rows \
+                 FOR EACH ROW EXECUTE FUNCTION trigger_committer()",
+            NONE,
+        ),
+        ("INSERT INTO trigger_commit_rows VALUES (1)", invalid),
+        (
+            "CREATE FUNCTION trigger_sql_caller() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$BEGIN CALL trigger_sql(NEW.a); RETURN NEW; END$$; \
+             CREATE TABLE trigger_sql_rows(a integer); \
+             CREATE TRIGGER trigger_sql_caller BEFORE INSERT ON trigger_sql_rows \
+                 FOR EACH ROW EXECUTE FUNCTION trigger_sql_caller()",
+            NONE,
+        ),
+        (
+            "INSERT INTO trigger_sql_rows VALUES (1)",
+            &[(
+                'E',
+                "0A000",
+                "a trigger fired during a write can call only PL/pgSQL procedures",
+            )],
+        ),
+    ]);
+}

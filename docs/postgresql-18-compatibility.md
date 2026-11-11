@@ -106,7 +106,11 @@ Functions and expressions:
   when every caller up to the top-level `CALL` or `DO` could; from a function,
   an explicit transaction block, an exception block, or a `SECURITY DEFINER`
   or `SET` procedure it fails with `2D000` (`invalid transaction
-  termination`). `CALL` in a trigger function fails with `0A000`.
+  termination`). A trigger function may `CALL` a procedure; the call is
+  atomic, so its `COMMIT` fails with `2D000`. A trigger fired inside a write
+  (a BEFORE row trigger, or a deferred constraint trigger at `COMMIT`) can
+  call only PL/pgSQL procedures; a SQL-language procedure fails there with
+  `0A000`.
 - A built-in function cannot implement `CREATE CAST` or `CREATE OPERATOR`
   (`0A000`). Aggregate support functions can name supported built-ins.
 - A missing-function message that does not fit the fixed 192-byte error

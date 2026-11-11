@@ -16221,11 +16221,12 @@ impl Engine {
             let succeeded = executed.is_ok();
             if let Some((total, own)) = timed.finish()
                 && succeeded
-                && let Err(error) = self.storage.record_function_call(
+                && let Err(error) = statistics::record_completed_call(
+                    &self.storage,
                     txn.txid,
                     crate::storage::routine_oid(&routine),
-                    total,
-                    own,
+                    (total, own),
+                    work,
                 )
             {
                 return Ok(Err(error));
@@ -16325,9 +16326,13 @@ impl Engine {
             }
             if let Some((total, own)) = timed.finish()
                 && retained.is_ok()
-                && let Err(error) =
-                    self.storage
-                        .record_function_call(transaction.txid, oid, total, own)
+                && let Err(error) = statistics::record_completed_call(
+                    &self.storage,
+                    transaction.txid,
+                    oid,
+                    (total, own),
+                    work,
+                )
             {
                 return Ok(Err(error));
             }
@@ -18220,9 +18225,13 @@ impl Engine {
             })();
             if let Some((total, own)) = timed.finish()
                 && matches!(executed, Ok(Ok(())))
-                && let Err(error) =
-                    self.storage
-                        .record_function_call(txn.txid, procedure_oid, total, own)
+                && let Err(error) = statistics::record_completed_call(
+                    &self.storage,
+                    txn.txid,
+                    procedure_oid,
+                    (total, own),
+                    arena,
+                )
             {
                 return Ok(Err(error));
             }

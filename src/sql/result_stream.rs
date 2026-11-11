@@ -10,11 +10,21 @@
 
 use super::*;
 use crate::pg::respond::SpoolReason;
-use cursor::{ResultStream, StreamProtocol, StreamState};
+use cursor::{FetchStream, ResultStream, StreamProtocol, StreamState};
 
 /// Scope, description and plan headroom of a bound stream query beyond its
 /// captured row positions.
 const STREAM_PLAN_HEADROOM: usize = 32 * 1024;
+
+/// How a top-level statement's output may resume as a result stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamChoice {
+    /// A `SELECT` reopens as a stream if its output first overflows.
+    Promote,
+    /// A FETCH streams its cursor's rows from the start: they are evaluated
+    /// as the client reads them and never saved in `cursor_bytes`.
+    Fetch(FetchStream),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamStep {
@@ -77,7 +87,23 @@ impl Engine {
         typed_inputs: bool,
         txid: u32,
         source_len: usize,
-    ) -> Result<(), SpoolReason> {
+        cursors: &cursor::CursorPool,
+    ) -> Result<StreamChoice, SpoolReason> {
+        if let Stmt::FetchCursor {
+            name,
+            motion,
+            move_only,
+        } = statement
+        {
+            let slot = cursors
+                .stream_fetch_slot(name, *motion, *move_only)
+                .ok_or(SpoolReason::Shape)?;
+            let limit = match motion {
+                cursor::FetchMotion::Count(count) => Some(*count as u64),
+                _ => None,
+            };
+            return Ok(StreamChoice::Fetch(FetchStream { slot, limit }));
+        }
         let Stmt::Select(select) = statement else {
             return Err(SpoolReason::Shape);
         };
@@ -108,7 +134,7 @@ impl Engine {
             .and_then(|positions| positions.checked_add(source_len.saturating_mul(16)))
             .and_then(|bytes| bytes.checked_add(STREAM_PLAN_HEADROOM));
         match estimate {
-            Some(bytes) if bytes <= self.result_stream_bytes => Ok(()),
+            Some(bytes) if bytes <= self.result_stream_bytes => Ok(StreamChoice::Promote),
             _ => Err(SpoolReason::Capacity),
         }
     }
@@ -142,6 +168,7 @@ impl Engine {
         stream: &mut ResultStream,
         protocol: StreamProtocol,
         page_limit: Option<u64>,
+        fetch: Option<FetchStream>,
         sql: &str,
         params: &[Datum],
         parameter_types: &[i32],
@@ -154,6 +181,11 @@ impl Engine {
         conn_id: i32,
     ) -> Result<(), SqlError> {
         stream.release(cursors);
+        if let Some(fetch) = fetch {
+            return self.open_fetch_stream(
+                stream, protocol, fetch, deadline, txn, cursors, responder, conn_id,
+            );
+        }
         let txid = txn.txid;
         let source_snapshot = txn.command_id().saturating_add(1);
         let _guc_eval_scope = guc::enter_eval_scope(guc, txn);
@@ -195,9 +227,83 @@ impl Engine {
             emitted: 0,
             page_limit,
             suspended: false,
+            fetch: None,
             resumed: false,
         });
         cursors.hold_stream_table(stream.source_table());
+        self.result_streams_opened = self.result_streams_opened.saturating_add(1);
+        Ok(())
+    }
+
+    /// Opens a FETCH stream over its cursor's retained query: sends the
+    /// cursor's RowDescription (extended Execute suppresses it) and delivers
+    /// rows from the cursor's current position.
+    #[allow(clippy::too_many_arguments)]
+    fn open_fetch_stream(
+        &mut self,
+        stream: &mut ResultStream,
+        protocol: StreamProtocol,
+        fetch: FetchStream,
+        deadline: i64,
+        txn: &mut TxnState,
+        cursors: &mut cursor::CursorPool,
+        responder: &mut Responder,
+        conn_id: i32,
+    ) -> Result<(), SqlError> {
+        let name = SqlName::parse(cursors.slot_name(fetch.slot))
+            .map_err(|_| sql_err!(sqlstate::INTERNAL_ERROR, "streamed cursor name is invalid"))?;
+        let (description, formats) = cursors
+            .fetch_description(name.as_str(), responder.result_formats())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_CURSOR,
+                    "cursor \"{}\" does not exist",
+                    name.as_str()
+                )
+            })?;
+        let mut type_oids = [0i32; crate::pg::respond::MAX_RESULT_COLS];
+        let columns = cursor::description_type_oids(description, &mut type_oids)?;
+        for (index, oid) in type_oids[..columns].iter().enumerate() {
+            if !formats.is_binary(index) {
+                continue;
+            }
+            match exec::binary_output_capability(&self.storage, *oid, txn.txid) {
+                exec::BinaryOutputCapability::Supported
+                | exec::BinaryOutputCapability::MissingAclItemElementSend => {}
+                exec::BinaryOutputCapability::MissingAclItemSend => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "no binary output function available for type aclitem"
+                    ));
+                }
+                exec::BinaryOutputCapability::Unsupported => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "binary output is not supported for type oid {}",
+                        oid
+                    ));
+                }
+            }
+        }
+        let mut formatted = responder.result_format_scope(formats);
+        formatted
+            .cursor_row_description(description, formats)
+            .map_err(|_| super::cursor_description_too_large())?;
+        drop(formatted);
+        cursors.begin_streamed_fetch(fetch.slot);
+        stream.state = Some(StreamState {
+            connection: conn_id,
+            txid: txn.txid,
+            command: txn.command_id(),
+            protocol,
+            source_snapshot: self.storage.read_snapshot(),
+            deadline,
+            emitted: 0,
+            page_limit: fetch.limit,
+            suspended: false,
+            fetch: Some(fetch),
+            resumed: false,
+        });
         self.result_streams_opened = self.result_streams_opened.saturating_add(1);
         Ok(())
     }
@@ -303,6 +409,45 @@ impl Engine {
             if let Err(error) = self.enter_stream_environment(guc, txn, responder) {
                 return Ok(Err(error));
             }
+            if let Some(fetch) = state.fetch {
+                // A FETCH's rows take its cursor's types and formats.
+                let formats = {
+                    let name = cursors.slot_name(fetch.slot);
+                    let Some((description, formats)) =
+                        cursors.fetch_description(name, responder.result_formats())
+                    else {
+                        return Ok(Err(sql_err!(
+                            sqlstate::UNDEFINED_CURSOR,
+                            "cursor \"{}\" does not exist",
+                            name
+                        )));
+                    };
+                    let mut types = [0i32; crate::pg::respond::MAX_RESULT_COLS];
+                    match cursor::description_type_oids(description, &mut types) {
+                        Ok(columns) => responder.restore_result_types(&types[..columns]),
+                        Err(error) => return Ok(Err(error)),
+                    }
+                    formats
+                };
+                let owner = match cursors.plan_owner(fetch.slot) {
+                    Ok(owner) => owner,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let mut formatted = responder.result_format_scope(formats);
+                return type_input_plans::with_owner(owner, || {
+                    self.deliver_stream_rows(
+                        stream,
+                        &mut state,
+                        arena,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        &mut formatted,
+                        lock_timeout_expired,
+                    )
+                });
+            }
             match stream.query.result_type_oids() {
                 Ok(Some(types)) => responder.restore_result_types(types),
                 Ok(None) => {}
@@ -323,9 +468,23 @@ impl Engine {
                 )
             })
         })()?;
+        let outcome = match (outcome, state.fetch) {
+            // A FETCH's count ends it like the end of its rows, but leaves
+            // the cursor on its last row.
+            (Ok(DeliveryStop::PageFull), Some(_)) => Ok(DeliveryStop::End),
+            (Ok(DeliveryStop::End), Some(fetch)) => {
+                cursors.finish_streamed_fetch(fetch.slot);
+                Ok(DeliveryStop::End)
+            }
+            (outcome, _) => outcome,
+        };
         match outcome {
             Ok(DeliveryStop::End) => {
-                let tag = stack_format!(48, "SELECT {}", state.emitted);
+                let tag = if state.fetch.is_some() {
+                    stack_format!(48, "FETCH {}", state.emitted)
+                } else {
+                    stack_format!(48, "SELECT {}", state.emitted)
+                };
                 stream.release(cursors);
                 txn.release_suspended_statement();
                 responder.command_complete(tag.as_str())?;
@@ -354,7 +513,15 @@ impl Engine {
                 }
                 Ok(StreamStep::Wait(wait))
             }
-            Err(error) => self.fail_result_stream(stream, error, txn, cursors, guc, responder),
+            Err(error) => {
+                if let Some(fetch) = state.fetch {
+                    // PostgreSQL marks a portal that failed during a FETCH.
+                    let name = SqlName::parse(cursors.slot_name(fetch.slot))
+                        .expect("an open cursor's name is valid");
+                    cursors.fail(name.as_str());
+                }
+                self.fail_result_stream(stream, error, txn, cursors, guc, responder)
+            }
         }
     }
 
@@ -476,16 +643,28 @@ impl Engine {
             if let Err(error) = self.storage.begin_advisory_statement() {
                 return Ok(Err(error));
             }
-            let row = self.advance_stream_row(
-                &mut stream.query,
-                state.source_snapshot,
-                arena,
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                responder,
-            )?;
+            let row = match state.fetch {
+                Some(fetch) => self.advance_fetch_row(
+                    fetch.slot,
+                    state.source_snapshot,
+                    arena,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                )?,
+                None => self.advance_stream_row(
+                    &mut stream.query,
+                    state.source_snapshot,
+                    arena,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                )?,
+            };
             match row {
                 Ok(Some(emitted)) => {
                     if let Err(error) = sequence_scope.finish(guc.seq_session()) {
@@ -526,6 +705,59 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Evaluates the next row of a streamed FETCH from its cursor's retained
+    /// query, as [`Self::advance_stream_row`] does for a stream's own query.
+    #[allow(clippy::too_many_arguments)]
+    fn advance_fetch_row(
+        &mut self,
+        slot: usize,
+        source_snapshot: u32,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<Option<bool>, SqlError>, WireFull> {
+        let row = (|| {
+            let owner = cursors.plan_owner(slot)?;
+            self.storage.set_read_snapshot(source_snapshot);
+            let ready = {
+                let (work, buffers) = self.work.cursor_parts();
+                let (query, _, _) = cursors.execution_parts(slot);
+                query.prepare_row(
+                    &self.storage,
+                    txn.txid,
+                    datetime::now_micros(),
+                    work,
+                    buffers,
+                )?
+            };
+            if !ready {
+                return Ok(None);
+            }
+            let emitted = self.evaluate_cursor_row(
+                slot,
+                true,
+                CursorRowSink::Emit,
+                owner,
+                source_snapshot,
+                arena,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            )?;
+            cursors.execution_parts(slot).0.finish_row(emitted);
+            if emitted {
+                cursors.record_streamed_row(slot)?;
+            }
+            Ok(Some(emitted))
+        })();
+        Ok(row)
     }
 
     /// Evaluates the next row of a stream. `Ok(Some(true))` emitted a row,

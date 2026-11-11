@@ -21,7 +21,7 @@ mod scroll;
 mod stream;
 pub(crate) use query::{CursorLocal, CursorQuery, CursorStatement};
 pub(crate) use scroll::{Revisit, ScrollAction, ScrollInput, ScrollScan, VisitOutcome};
-pub(crate) use stream::{ResultStream, StreamProtocol, StreamState};
+pub(crate) use stream::{FetchStream, ResultStream, StreamProtocol, StreamState};
 
 /// One FETCH/MOVE motion, normalized by the parser: positive counts move
 /// forward, negative backward (`NEXT` is `Count(1)`, `PRIOR` is `Count(-1)`,
@@ -1165,6 +1165,61 @@ impl CursorPool {
         }
         slot.request = Some((motion, move_only));
         Ok(())
+    }
+
+    /// The slot of a cursor whose forward FETCH can stream its rows to the
+    /// client as they are evaluated: a retained source that saves neither
+    /// history nor locks, with no interrupted FETCH. Other cursors buffer a
+    /// FETCH's rows in `cursor_bytes`.
+    pub(crate) fn stream_fetch_slot(
+        &self,
+        name: &str,
+        motion: FetchMotion,
+        move_only: bool,
+    ) -> Option<usize> {
+        let at = self.find(name)?;
+        let slot = &self.slots[at];
+        let forward = matches!(motion, FetchMotion::All)
+            || matches!(motion, FetchMotion::Count(count) if count > 0);
+        (!move_only
+            && forward
+            && !slot.failed
+            && slot.scroll != CursorScroll::Scroll
+            && slot.scan.is_none()
+            && slot.request.is_none()
+            && slot
+                .query
+                .retained
+                .as_ref()
+                .is_some_and(|query| !query.locks_rows()))
+        .then_some(at)
+    }
+
+    /// Starts a streamed FETCH: no row of it is saved.
+    pub(crate) fn begin_streamed_fetch(&mut self, at: usize) {
+        let slot = &mut self.slots[at];
+        slot.rows.clear();
+        slot.spans.clear();
+        slot.row_base = slot.produced;
+    }
+
+    /// A streamed row reached the client: the cursor is now on it.
+    pub(crate) fn record_streamed_row(&mut self, at: usize) -> Result<(), SqlError> {
+        self.record_row(at, false)?;
+        let slot = &mut self.slots[at];
+        slot.position = slot.produced as i64;
+        Ok(())
+    }
+
+    /// A streamed FETCH reached the end of its cursor's rows: the cursor is
+    /// after the last row.
+    pub(crate) fn finish_streamed_fetch(&mut self, at: usize) {
+        let slot = &mut self.slots[at];
+        slot.position = slot.produced as i64 + 1;
+    }
+
+    pub(crate) fn slot_name(&self, at: usize) -> &str {
+        self.slots[at].name.as_str()
     }
 
     pub(crate) fn record_row(&mut self, at: usize, saved: bool) -> Result<(), SqlError> {

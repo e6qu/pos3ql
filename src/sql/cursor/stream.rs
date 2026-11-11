@@ -25,6 +25,14 @@ pub(crate) enum StreamProtocol {
     Extended { portal: usize },
 }
 
+/// A FETCH whose rows stream from its cursor's retained query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FetchStream {
+    pub(crate) slot: usize,
+    /// `FETCH n` delivers at most `n` rows; `FETCH ALL` has no limit.
+    pub(crate) limit: Option<u64>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct StreamState {
     pub(crate) connection: i32,
@@ -39,6 +47,8 @@ pub(crate) struct StreamState {
     pub(crate) page_limit: Option<u64>,
     /// A paged portal between Executes.
     pub(crate) suspended: bool,
+    /// Rows come from this cursor instead of the stream's own query.
+    pub(crate) fetch: Option<FetchStream>,
     /// Whether a previous turn already entered the statement's effect scope.
     pub(crate) resumed: bool,
 }
@@ -85,7 +95,7 @@ impl ResultStream {
         }
     }
 
-    /// The table a held stream reads.
+    /// The table a held stream reads; a FETCH stream's cursor holds its own.
     pub(crate) fn source_table(&self) -> Option<usize> {
         self.state?;
         self.query.retained.as_ref()?.source_table()

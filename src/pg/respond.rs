@@ -1037,6 +1037,22 @@ impl<'b> Responder<'b> {
         }
     }
 
+    /// Requests a stream before the statement emits anything: a FETCH whose
+    /// rows are evaluated only as its client reads them. A paged portal
+    /// buffers a FETCH's rows instead, as PostgreSQL runs a FETCH portal to
+    /// completion before paging it. Returns whether the stream was requested.
+    pub(crate) fn request_stream(&mut self) -> bool {
+        if self.promotion != Promotion::Allowed {
+            return false;
+        }
+        if self.promotion_trigger == PromotionTrigger::FirstRow {
+            self.promotion = Promotion::Declined(SpoolReason::Shape);
+            return false;
+        }
+        self.promotion = Promotion::Requested { mark: self.mark() };
+        true
+    }
+
     /// Whether this output may resume a `SELECT` as a result stream.
     pub(crate) fn promotion_allowed(&self) -> bool {
         self.promotion == Promotion::Allowed

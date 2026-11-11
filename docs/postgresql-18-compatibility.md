@@ -310,7 +310,11 @@ description, and `floor(cursor_bytes / 6)` row positions. Each saved row costs
 its data plus six bytes. Long column names can fill the description even when
 rows fit; raising `cursor_bytes` does not help there.
 
-- `NO SCROLL`: `cursor_bytes` bounds one fetched batch and is reused.
+- `NO SCROLL` (and forward-only by shape): a top-level forward `FETCH n` or
+  `FETCH ALL` from a cursor that reads as you fetch streams its rows to the
+  client without saving them, so any count works; other fetches, such as a
+  `FETCH` inside a routine, `RELATIVE`/`ABSOLUTE` or one over a row-locking
+  cursor, buffer one batch in `cursor_bytes`, which is reused.
 - `SCROLL`: every visited row stays in `cursor_bytes`, so history can exhaust it.
   When revisited rows are evaluated again, the history holds each row's input
   columns plus 17 bytes of row identity, and a volatile filter adds the rows it

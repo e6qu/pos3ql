@@ -64,7 +64,7 @@ pub mod query;
 pub mod range;
 pub mod regex;
 mod result_stream;
-pub(crate) use result_stream::StreamStep;
+pub(crate) use result_stream::{StreamChoice, StreamStep};
 mod routine_input_identity;
 pub mod ryu;
 pub mod sequence;
@@ -932,6 +932,8 @@ pub enum ExecutionStatus {
 pub(crate) struct PendingResultStream {
     pub(crate) source_start: usize,
     pub(crate) source_end: usize,
+    /// A FETCH that streams its cursor's rows instead of a reopened query.
+    pub(crate) fetch: Option<cursor::FetchStream>,
     pub(crate) owner: type_input_plans::Owner,
     /// The statement's original deadline; the stream keeps it across waits.
     pub(crate) deadline: i64,
@@ -2819,6 +2821,9 @@ fn cursor_result_too_large() -> SqlError {
 /// Where an evaluated cursor row goes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CursorRowSink {
+    /// Streamed to the statement's own output: a FETCH whose rows are not
+    /// saved.
+    Emit,
     Save,
     /// Saved after releasing an earlier output nothing emitted.
     SaveReplacing,
@@ -11857,18 +11862,25 @@ impl Engine {
                     .transient_owner(statement_index)
                     .and_then(|owner| self.storage.begin_advisory_statement().map(|()| owner));
                 let stream_owner = plan_owner.as_ref().ok().copied();
+                let mut fetch_stream = None;
                 if responder.promotion_allowed() {
                     match self.result_stream_choice(
                         statement,
                         !source_bindings.is_empty(),
                         txn.txid,
                         source.len(),
+                        cursors,
                     ) {
-                        Ok(()) => responder.arm_promotion(),
+                        Ok(StreamChoice::Promote) => responder.arm_promotion(),
+                        Ok(StreamChoice::Fetch(fetch)) => {
+                            fetch_stream = responder.request_stream().then_some(fetch);
+                        }
                         Err(reason) => responder.decline_promotion(reason),
                     }
                 }
                 let executed = match plan_owner {
+                    // A streamed FETCH evaluates its rows only in the stream.
+                    Ok(_) if fetch_stream.is_some() => Err(WireFull),
                     Ok(owner) => type_input_plans::with_owner(owner, || {
                         type_inputs::with_source(
                             type_inputs::Source::RootCommand {
@@ -11906,6 +11918,7 @@ impl Engine {
                     self.pending_result_stream = Some(PendingResultStream {
                         source_start: *source_start,
                         source_end: *source_end,
+                        fetch: fetch_stream,
                         owner,
                         deadline: query::statement_deadline(),
                         output_mark: promoted,
@@ -12478,14 +12491,20 @@ impl Engine {
                                 Ok(()) => {
                                     let streamable =
                                         immediate.is_none() && index_completion.is_none();
+                                    let mut fetch_stream = None;
                                     if streamable && responder.promotion_allowed() {
                                         match self.result_stream_choice(
                                             &statement,
                                             !source_bindings.is_empty(),
                                             txn.txid,
                                             text.len(),
+                                            cursors,
                                         ) {
-                                            Ok(()) => responder.arm_promotion(),
+                                            Ok(StreamChoice::Promote) => responder.arm_promotion(),
+                                            Ok(StreamChoice::Fetch(fetch)) => {
+                                                fetch_stream =
+                                                    responder.request_stream().then_some(fetch);
+                                            }
                                             Err(reason) => responder.decline_promotion(reason),
                                         }
                                     }
@@ -12503,7 +12522,11 @@ impl Engine {
                                             StatementTimeoutEntry::Nested,
                                         )
                                     };
-                                    let executed = if streamable {
+                                    let executed = if fetch_stream.is_some() {
+                                        // A streamed FETCH evaluates its rows
+                                        // only in the stream.
+                                        Err(WireFull)
+                                    } else if streamable {
                                         execute(responder)
                                     } else {
                                         responder.without_command_complete(execute)
@@ -12540,6 +12563,7 @@ impl Engine {
                                         self.pending_result_stream = Some(PendingResultStream {
                                             source_start: 0,
                                             source_end: text.len(),
+                                            fetch: fetch_stream,
                                             owner,
                                             deadline: query::statement_deadline(),
                                             output_mark: promoted,
@@ -23381,6 +23405,24 @@ impl Engine {
                 }
                 if output != CursorRowSink::Locking && cursors.execution_parts(at).0.skip_row() {
                     return Ok(Ok(false));
+                }
+                if output == CursorRowSink::Emit {
+                    return match query::emit_data_row(
+                        &self.storage,
+                        txid,
+                        frame,
+                        responder,
+                        projected.as_slice(),
+                    ) {
+                        Ok(Ok(())) => Ok(Ok(true)),
+                        Ok(Err(error)) => Ok(Err(error)),
+                        // The row could not queue whole behind the send
+                        // buffer and its private reserve.
+                        Err(WireFull) => Ok(Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "a result message exceeds conn_send_buffer_bytes"
+                        ))),
+                    };
                 }
                 if output == CursorRowSink::SaveReplacing {
                     cursors.release_unemitted_output(at);

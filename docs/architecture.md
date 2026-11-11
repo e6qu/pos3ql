@@ -112,6 +112,15 @@ receipts however long the stream runs. Every other large result uses the spool a
 any of its rows reach the client; `pos3ql_result_stream_spooled_total` counts
 those by reason (`shape`, `capacity`, `effects`).
 
+A forward `FETCH n` or `FETCH ALL` (simple Query or unpaged `Execute`) from
+a cursor that reads as it fetches and saves no history (`NO SCROLL`, or a
+forward-only shape) opens such a stream over the cursor's own retained query
+before its first row: rows are evaluated as the client reads them, none is
+saved in `cursor_bytes`, and the cursor's position advances with each
+delivered row. A failure after delivered rows marks the cursor failed, as
+PostgreSQL does. Scrollable cursors still buffer a `FETCH` in `cursor_bytes`,
+because they save every visited row for backward motion.
+
 **Paged portals evaluate rows per `Execute`.** An `Execute` with a row limit
 opens such a statement's stream before its first row. Each `Execute`
 evaluates only the rows it returns, then the portal suspends with

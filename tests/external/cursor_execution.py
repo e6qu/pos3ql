@@ -115,6 +115,31 @@ def probe(args, trace):
             error(owner, "error.waits_for_affected_fetch", "FETCH NEXT FROM later_error", "22012")
             owner.execute("ROLLBACK")
 
+            # A forward FETCH larger than pos3ql's cursor_bytes streams its
+            # rows; each is projected when it is fetched.
+            owner.execute("SELECT setval('calls',1000,false)")
+            owner.execute("BEGIN")
+            owner.execute(
+                "DECLARE large NO SCROLL CURSOR FOR "
+                "SELECT g, nextval('calls'), repeat('x', 500) FROM generate_series(1,3000) g"
+            )
+            rows(owner, "large.first_rows", "FETCH 2 FROM large", [(1, 1000, "x" * 500), (2, 1001, "x" * 500)])
+            with owner.cursor() as cursor:
+                cursor.execute("FETCH ALL FROM large")
+                fetched = cursor.fetchall()
+                entry = {
+                    "case": "large.fetch_all_streams",
+                    "count": len(fetched),
+                    "last": list(fetched[-1][:2]),
+                    "tag": cursor.statusmessage,
+                }
+                trace.append(entry)
+                assert fetched == [(g, 999 + g, "x" * 500) for g in range(3, 3001)], json.dumps(entry)
+                assert cursor.statusmessage == "FETCH 2998", json.dumps(entry)
+            rows(owner, "large.after_end", "FETCH NEXT FROM large", [])
+            rows(owner, "large.projected_once", "SELECT last_value,is_called FROM calls", [(3999, True)])
+            owner.execute("COMMIT")
+
             owner.execute("BEGIN")
             owner.execute("DECLARE locked NO SCROLL CURSOR FOR SELECT id FROM source_rows ORDER BY id FOR UPDATE")
             observer.execute("BEGIN")

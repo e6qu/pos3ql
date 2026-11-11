@@ -235,7 +235,10 @@ FETCH 2 FROM c;  -- reads two rows
 
 - `FETCH 0` before the first row reads nothing; `MOVE` skips without saving
   output. Each batch reuses the result buffer, so many small fetches do not
-  accumulate memory.
+  accumulate memory. A forward `FETCH n` or `FETCH ALL` sent by the client
+  from a `NO SCROLL` cursor saves no rows at all: each row is evaluated as the
+  client reads it, like a large `SELECT`, so `FETCH ALL` returns any number
+  of rows and other sessions keep running while the client reads slowly.
 - `SELECT 100/id FROM orders WHERE id<>0` divides only fetched rows.
   `CASE WHEN id<>0 THEN 100/id END` evaluates only the chosen branch.
 - `DECLARE c NO SCROLL CURSOR FOR SELECT nextval('order_numbers')` issues no

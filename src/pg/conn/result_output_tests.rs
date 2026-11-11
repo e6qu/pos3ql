@@ -1593,3 +1593,100 @@ fn buffered_paged_portals_name_portal_result_bytes_when_full() {
     let message = String::from_utf8_lossy(response[2].1);
     assert!(message.contains("portal_result_bytes"), "{message}");
 }
+
+#[test]
+fn forward_fetches_stream_cursor_rows_as_the_client_reads() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let (mut fixture, mut conn, mut client, mut other, mut other_client) =
+            stream_fixture(mode, "fetch-stream");
+        run(
+            &mut conn,
+            &mut fixture.engine,
+            &mut client,
+            "CREATE SEQUENCE numbers",
+        );
+        let opened = fixture.engine.result_stream_metrics().opened;
+        // FETCH ALL's megabyte exceeds cursor_bytes; streamed, no row of it
+        // is saved, and each row takes its number as it is evaluated.
+        let mut input = query(
+            "BEGIN; DECLARE c NO SCROLL CURSOR FOR \
+             SELECT id, nextval('numbers'), payload FROM big; FETCH 10 c; FETCH ALL c",
+        );
+        input.extend_from_slice(&query("FETCH 5 c; COMMIT"));
+        client.write_all(&input).unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        assert_eq!(
+            conn.parked_wait(),
+            Some(crate::sql::StatementWait::ClientOutput)
+        );
+        assert!(conn.result_stream.is_active());
+        assert!(conn.overflow_bytes() < 1024);
+        let progress = if mode == crate::config::TransactionMode::Mvcc {
+            "SELECT count(*) FROM big"
+        } else {
+            "SELECT 1"
+        };
+        let response = run(&mut other, &mut fixture.engine, &mut other_client, progress);
+        assert!(messages(&response).iter().all(|message| message.0 != b'E'));
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 2);
+        let response = messages(&response);
+        let tags: Vec<&[u8]> = response
+            .iter()
+            .filter(|message| message.0 == b'C')
+            .map(|message| message.1)
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                &b"BEGIN\0"[..],
+                b"DECLARE CURSOR\0",
+                b"FETCH 10\0",
+                b"FETCH 4990\0",
+                b"FETCH 0\0",
+                b"COMMIT\0"
+            ]
+        );
+        let rows: Vec<_> = response
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .collect();
+        assert_rows(&rows, 5000);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(second_text(row.1), Some((index + 1).to_string().as_str()));
+        }
+        assert_eq!(
+            response.iter().filter(|message| message.0 == b'T').count(),
+            3
+        );
+        assert!(fixture.engine.result_stream_metrics().opened >= opened + 2);
+        assert!(!conn.result_stream.is_held());
+    }
+}
+
+#[test]
+fn streamed_fetches_fail_their_cursor_after_delivered_rows() {
+    let (mut fixture, mut conn, mut client, _, _) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "fetch-stream-error");
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "BEGIN; DECLARE c NO SCROLL CURSOR FOR SELECT id, 1 / (id - 3001), payload FROM big; \
+         FETCH ALL c",
+    );
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert_eq!(&kinds[kinds.len() - 2..], b"EZ");
+    assert_eq!(sqlstate_of(response[kinds.len() - 2].1), "22012");
+    let rows: Vec<_> = response
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .collect();
+    assert_rows(&rows, 3000);
+    assert_eq!(response[kinds.len() - 1].1, b"E");
+    let response = run(&mut conn, &mut fixture.engine, &mut client, "ROLLBACK");
+    assert!(messages(&response).iter().all(|message| message.0 != b'E'));
+}

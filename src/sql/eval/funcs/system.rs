@@ -1670,13 +1670,9 @@ pub(crate) fn dispatch<'a>(
                     .copied()
                     .unwrap_or(Datum::Null))
             }
-            "pg_partition_ancestors" => Err(sql_err!(
+            "pg_partition_ancestors" | "pg_partition_tree" => Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "set-valued function called in context that cannot accept a set"
-            )),
-            "pg_partition_tree" => Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "pg_partition_tree is not supported"
             )),
             _ if predicate == Some(CatalogPredicateKind::Privilege) => {
                 let name = name.strip_prefix("pg_catalog.").unwrap_or(name);

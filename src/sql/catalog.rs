@@ -10339,6 +10339,87 @@ pub(crate) fn partition_ancestors<'a>(
     Ok(values)
 }
 
+/// `pg_partition_tree(regclass)`: the relation and every partition below it,
+/// level by level with siblings in OID order, as PostgreSQL's
+/// `find_all_inheritors` lists them. Each row is `relid`, `parentrelid`,
+/// `isleaf` and `level`; a relation outside any partition tree has none.
+pub(crate) fn partition_tree<'a>(
+    storage: &Storage,
+    transaction: u32,
+    relation: i32,
+    arena: &'a Arena,
+) -> Result<&'a [[Datum<'a>; 4]], SqlError> {
+    let Some(root) = table_slot_by_oid(storage, transaction, relation) else {
+        return Ok(&[]);
+    };
+    let partitioned = |slot: usize| {
+        storage
+            .table_def(slot, transaction)
+            .partition
+            .scheme
+            .is_some()
+    };
+    let parent = |slot: usize| {
+        storage
+            .table_def(slot, transaction)
+            .partition
+            .attachment
+            .map(|attachment| usize::from(attachment.parent))
+    };
+    if parent(root).is_none() && !partitioned(root) {
+        return Ok(&[]);
+    }
+    let order = arena
+        .alloc_slice_with(storage.table_count(), |_| (0usize, 0usize))
+        .map_err(|_| arena_full())?;
+    order[0] = (root, 0);
+    let (mut count, mut next) = (1, 0);
+    while next < count {
+        let (slot, level) = order[next];
+        next += 1;
+        let first_child = count;
+        for child in 0..storage.table_count() {
+            if storage.table_slot_visible_to(child, transaction) && parent(child) == Some(slot) {
+                if count == order.len() {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "partition tree of relation {} is cyclic",
+                        relation
+                    ));
+                }
+                order[count] = (child, level + 1);
+                count += 1;
+            }
+        }
+        order[first_child..count]
+            .sort_unstable_by_key(|(child, _)| user_table_oid(storage, *child));
+    }
+    let catalog = super::query::storage_catalog(storage, arena, transaction);
+    let regclass = |slot: usize| {
+        super::eval::regobject_cast(
+            Datum::Oid(user_table_oid(storage, slot) as u32),
+            ColType::Regclass,
+            Some(&catalog),
+            arena,
+        )
+    };
+    let rows = arena
+        .alloc_slice_with(count, |_| [Datum::Null; 4])
+        .map_err(|_| arena_full())?;
+    for (row, (slot, level)) in rows.iter_mut().zip(order.iter().copied()) {
+        *row = [
+            regclass(slot)?,
+            match parent(slot) {
+                Some(parent) => regclass(parent)?,
+                None => Datum::Null,
+            },
+            Datum::Bool(!partitioned(slot)),
+            Datum::Int4(level as i32),
+        ];
+    }
+    Ok(rows)
+}
+
 pub(crate) fn table_slot_by_oid(storage: &Storage, transaction: u32, oid: i32) -> Option<usize> {
     (0..storage.table_count()).find(|slot| {
         storage.table_slot_visible_to(*slot, transaction) && user_table_oid(storage, *slot) == oid

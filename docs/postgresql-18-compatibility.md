@@ -51,7 +51,9 @@ Schemas and catalogs:
   `information_schema.sql_identifier`; the wire type is the base type), casts
   and table columns check them (`(-1)::information_schema.cardinal_number`
   fails with `23514`), and `pg_type`, `pg_constraint` and the domain views list
-  them. Casts to arrays of these domains fail with `0A000`.
+  them. Arrays of these domains work the same way:
+  `'{-1}'::information_schema.cardinal_number[]` fails with `23514`, and an
+  element of such an array has the domain's type.
 - `information_schema` views can be queried, but their relation OIDs cannot:
   `'information_schema.columns'::regclass` and `to_regclass(...)` fail with
   `0A000` (`relation OIDs for information_schema views are not supported`).

@@ -77,10 +77,34 @@ fn information_schema_domains_resolve_check_and_describe_like_postgresql() {
         ),
         ("SELECT 1::cardinal_number", "42704"),
         ("SELECT 1::information_schema.int4", "42704"),
+        (
+            "SELECT '{-1}'::information_schema.cardinal_number[]",
+            "23514",
+        ),
+        ("SELECT '{maybe}'::information_schema.yes_or_no[]", "22001"),
+        (
+            "SELECT ARRAY['maybe']::information_schema.yes_or_no[]",
+            "23514",
+        ),
+        (
+            "CREATE TABLE isd_array_rejects(a information_schema.cardinal_number[]); \
+             INSERT INTO isd_array_rejects VALUES ('{-3}')",
+            "23514",
+        ),
     ] {
         let output = run_with(&mut engine, &mut budget, sql);
         assert_eq!(error_sqlstates(&output), [state], "{sql}");
     }
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT '{1,2}'::information_schema.cardinal_number[], \
+                    pg_typeof('{a}'::information_schema.sql_identifier[]), \
+                    pg_typeof(('{1}'::information_schema.cardinal_number[])[1])"
+        ),
+        ["{1,2}|information_schema.sql_identifier[]|information_schema.cardinal_number"]
+    );
     assert_eq!(
         rows(
             &mut engine,

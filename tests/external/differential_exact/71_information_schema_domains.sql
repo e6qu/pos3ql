@@ -26,3 +26,9 @@ SELECT constraint_name, domain_name FROM information_schema.domain_constraints W
 SELECT typname, typtype, typbasetype::regtype, typtypmod, typcollation, typelem::regtype, typcategory, typdefault FROM pg_type WHERE typname IN ('cardinal_number', 'character_data', 'sql_identifier', 'time_stamp', 'yes_or_no', '_cardinal_number', '_yes_or_no') ORDER BY typname;
 SELECT conname, contypid::regtype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname IN ('cardinal_number_domain_check', 'yes_or_no_check') ORDER BY conname;
 DROP TABLE isd_answers;
+SELECT '{1,2}'::information_schema.cardinal_number[], pg_typeof('{a}'::information_schema.sql_identifier[]);
+SELECT ARRAY['YES', 'NO']::information_schema.yes_or_no[], pg_typeof(('{1}'::information_schema.cardinal_number[])[1]);
+CREATE TABLE isd_arrays(a information_schema.cardinal_number[]);
+INSERT INTO isd_arrays VALUES ('{3}');
+SELECT a, pg_typeof(a), pg_typeof(a[1]) FROM isd_arrays;
+DROP TABLE isd_arrays;

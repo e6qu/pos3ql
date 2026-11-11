@@ -309,8 +309,22 @@ pub(crate) fn check_domain_constraints(
             .user_type
             .and_then(crate::storage::UserTypeName::information_schema_domain_binding)
         {
-            if !matches!(col.ctype, ColType::Array(_)) {
-                domain.validate(&values.get(i).copied().unwrap_or(Datum::Null))?;
+            match (col.ctype, values.get(i).copied().unwrap_or(Datum::Null)) {
+                (ColType::Array(element), Datum::Array { raw, .. }) => {
+                    for item in crate::sql::array::elements(raw, element) {
+                        // The element's declared length applies as it does
+                        // to a scalar of the domain.
+                        let item = crate::sql::exec::apply_typmod(
+                            item,
+                            domain.base(),
+                            domain.base_type_mod(),
+                            arena,
+                        )?;
+                        domain.validate(&item)?;
+                    }
+                }
+                (ColType::Array(_), _) => {}
+                (_, value) => domain.validate(&value)?,
             }
             continue;
         }

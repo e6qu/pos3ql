@@ -274,9 +274,7 @@ with `0A000` where PostgreSQL changes the catalog entry; a revoked built-in
 `DROP ROLE` reports dependent objects without PostgreSQL's `DETAIL` list
 (`owner of function lower(text)`); built-in functions have no
 `pg_description` text of their own (`obj_description('lower(text)'::regprocedure)`
-is NULL where PostgreSQL returns `lowercase`); arrays of
-`information_schema` domains (`information_schema.cardinal_number[]`) are
-rejected with `0A000`. A parameter typed from a called
+is NULL where PostgreSQL returns `lowercase`). A parameter typed from a called
 built-in (`PREPARE q AS SELECT round($1)`) is not recorded as that type:
 `pg_prepared_statements.parameter_types` is empty, `pg_typeof($1)` is
 `unknown`, and `round($1)` with `2.5` rounds as `numeric` (3) where
@@ -327,9 +325,12 @@ MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
 column uses its row type, fail with `0A000`; a `DROP TABLE ... CASCADE` that
 reaches both columns and routines, or names several tables, reports one notice
 per table or dependency kind where PostgreSQL reports one for the statement, and a routine's dependency on a row type is described as depending on the
-table. `pg_partition_tree` is rejected (`0A000` in `FROM`, `42883` in a select
-list). In a SQL-language function, `o.note` for a composite parameter `o` fails
-with `42P01` (`(o).note` works). The
+table. Values and columns of a view's row type need the view's column types,
+which pos3ql derives from the view's query on each use instead of storing them
+as PostgreSQL's `pg_attribute` rows do. In a SQL-language function, `o.note`
+for a composite parameter `o` fails with `42P01` (`(o).note` works): the
+reference must fall back from a column to the parameter's field in every typing
+pass, as PostgreSQL's `sql_fn_post_column_ref` does. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

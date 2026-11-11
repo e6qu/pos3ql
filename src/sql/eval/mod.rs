@@ -682,6 +682,15 @@ pub(crate) fn expression_type_identity<'a>(
                 )
             });
     }
+    // An element of an `information_schema` domain array keeps the domain,
+    // which its base-typed array representation does not record.
+    if let Expr::Subscript { base, .. } = expression
+        && let ExpressionTypeIdentity::Known(array) = expression_type_identity(base, row, hooks)?
+        && let Some((domain, true)) =
+            super::information_schema_domains::InformationSchemaDomain::from_oid(array)
+    {
+        return Ok(ExpressionTypeIdentity::Known(domain.oid()));
+    }
     if let Expr::Array(elements) = expression {
         let plan = array_constructor_type(
             elements,

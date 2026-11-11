@@ -6500,11 +6500,33 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             })
         {
             if array {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "arrays of domain information_schema.{} are not supported",
-                    domain.name()
-                ));
+                let element = super::types::ArrElem::from_coltype(domain.base())
+                    .expect("information_schema domains have array element bases");
+                // Array text is element input, which rejects an overlong value
+                // where a cast from another array truncates it.
+                let input = matches!(value, Datum::Text(_));
+                let array = super::eval::cast_to(value, ColType::Array(element), arena)?;
+                let array = if input {
+                    super::exec::apply_typmod(
+                        array,
+                        ColType::Array(element),
+                        domain.base_type_mod(),
+                        arena,
+                    )?
+                } else {
+                    super::exec::apply_cast_typmod(
+                        array,
+                        ColType::Array(element),
+                        domain.base_type_mod(),
+                        arena,
+                    )?
+                };
+                if let Datum::Array { raw, .. } = array {
+                    for item in super::array::elements(raw, element) {
+                        domain.validate(&item)?;
+                    }
+                }
+                return Ok(Some(array));
             }
             let base = super::eval::cast_to(value, domain.base(), arena)?;
             let base =

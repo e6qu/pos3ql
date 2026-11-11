@@ -310,7 +310,9 @@ is NULL where PostgreSQL returns `lowercase`). PL/pgSQL compile errors in a
 same errors in `CREATE FUNCTION` do; a block label before `DECLARE` is
 rejected with `0A000`, and a label-qualified loop variable (`<<l>> FOR i IN
 1..2 LOOP ... l.i`) fails as an unknown table; exception conditions are
-limited to a fixed list of names (`SQLSTATE` codes work for every condition). A SQL function whose earlier
+limited to a fixed list of names (`SQLSTATE` codes work for every condition);
+trigger functions cannot open cursors (`OPEN`, cursor `FOR` loops) and fail
+with `0A000`. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

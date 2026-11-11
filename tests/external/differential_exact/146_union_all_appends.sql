@@ -33,4 +33,11 @@ FETCH 2 FROM union_cursor;
 MOVE 38 IN union_cursor;
 FETCH 3 FROM union_cursor;
 COMMIT;
-DROP TABLE union_a, union_b;
+-- A type modifier survives only when every query has the same type and
+-- modifier.
+CREATE TABLE union_shape AS
+  SELECT note AS same, note AS mixed, id::numeric(8,2) AS amount FROM union_b
+  UNION ALL SELECT note, payload, 1.5 FROM union_a, union_b WHERE false;
+SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute
+  WHERE attrelid = 'union_shape'::regclass AND attnum > 0 ORDER BY attnum;
+DROP TABLE union_a, union_b, union_shape;

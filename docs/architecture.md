@@ -359,6 +359,10 @@ no routine body; its values are coerced to the combined column types (as the
 general executor coerces them) before the row goes up. The physical tables
 of all queries together are limited to eight, as a retained join's are. A
 `LIMIT` or `OFFSET` on the whole `UNION ALL` applies to the combined rows.
+A paged portal opens it before running; a simple Query, unpaged Execute or
+`COPY` first runs the general executor's attempt, which materializes every
+query (in external runs in object-store mode) before its first row can
+overflow, so such a result is computed twice.
 
 **Built: sorts in local mode.** At its first row a sort reads its whole input
 (yielding on storage waits with the rows saved so far kept), filters it, and

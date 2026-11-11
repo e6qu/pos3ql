@@ -161,6 +161,9 @@ pub(super) enum BlockEdge<'a> {
     Numeric,
     /// A nested block that declares variables.
     Scope(&'a [ParsedTriggerLocalDecl<'a>]),
+    /// A cursor `FOR` loop, which declares its record and keeps its portal's
+    /// name in a hidden slot.
+    Cursor,
     Handler,
 }
 
@@ -169,6 +172,7 @@ impl BlockEdge<'_> {
     fn declared(self) -> usize {
         match self {
             Self::Numeric => 1,
+            Self::Cursor => 2,
             Self::Scope(declarations) => declarations.len(),
             Self::Ordinary | Self::Handler => 0,
         }
@@ -184,10 +188,13 @@ pub(super) fn visit_nested_blocks<'a>(
         match statement {
             TriggerStatement::For(program) => visit(
                 program.block,
-                if matches!(program.source, TriggerForSource::Numeric { .. }) {
-                    BlockEdge::Numeric
-                } else {
-                    BlockEdge::Ordinary
+                match program.source {
+                    TriggerForSource::Numeric { .. } => BlockEdge::Numeric,
+                    TriggerForSource::Cursor { .. } => BlockEdge::Cursor,
+                    TriggerForSource::Query(_)
+                    | TriggerForSource::Dml(_)
+                    | TriggerForSource::DynamicQuery(_)
+                    | TriggerForSource::Array { .. } => BlockEdge::Ordinary,
                 },
             ),
             TriggerStatement::Block(program) => visit(

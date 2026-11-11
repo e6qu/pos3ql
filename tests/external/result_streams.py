@@ -89,6 +89,12 @@ QUERIES = (
         TABLE_ROWS,
         ALL_PROTOCOLS,
     ),
+    # DISTINCT ON keeps each first row of a local-mode sort.
+    (
+        "SELECT DISTINCT ON (-id) id, payload FROM result_stream_rows ORDER BY -id DESC",
+        TABLE_ROWS,
+        LOCAL_PAGED,
+    ),
     # COPY TO STDOUT of one table resumes row by row too.
     (COPY_TABLE, TABLE_ROWS, ("simple",)),
 )

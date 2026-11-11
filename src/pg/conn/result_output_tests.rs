@@ -835,6 +835,26 @@ fn sorted_results_stream_rows_as_the_client_reads() {
             ),
             3000,
         ),
+        (
+            "SELECT id, payload FROM big ORDER BY payload, id DESC",
+            5000,
+        ),
+        // DISTINCT ON returns each first row of the sort.
+        ("SELECT DISTINCT ON (id / 2) id, payload FROM big", 2501),
+        (
+            "SELECT DISTINCT ON (b.id / 4, t.label IS NULL) b.id, b.payload, t.label \
+             FROM big b LEFT JOIN tags t ON t.k = b.id % 4 \
+             ORDER BY t.label IS NULL, b.id / 4 DESC, b.id DESC",
+            2501,
+        ),
+        (
+            &*format!(
+                "SELECT DISTINCT ON (g / 3) g, '{}' FROM generate_series(1, 9000) g \
+                 ORDER BY g / 3 DESC, g LIMIT 2000 OFFSET 3",
+                "x".repeat(200)
+            ),
+            2000,
+        ),
     ] {
         let opened = fixture.engine.result_stream_metrics().opened;
         client.write_all(&query(sql)).unwrap();

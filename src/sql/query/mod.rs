@@ -8736,7 +8736,46 @@ pub(super) fn resolve_sort_key<'a>(
     txid: u32,
     earlier: &[Option<ResolvedSortKey<'a>>],
 ) -> Result<ResolvedSortKey<'a>, SqlError> {
-    let expression = resolve_order_target(original, items, scope, arena, storage, txid)?;
+    resolve_clause_key(
+        original, items, scope, arena, storage, txid, earlier, "ORDER BY",
+    )
+}
+
+/// A `DISTINCT ON` expression, resolved as an `ORDER BY` key.
+pub(super) fn resolve_distinct_on_key<'a>(
+    original: &'a Expr<'a>,
+    items: &'a [SelectItem<'a>],
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+    earlier: &[Option<ResolvedSortKey<'a>>],
+) -> Result<ResolvedSortKey<'a>, SqlError> {
+    resolve_clause_key(
+        original,
+        items,
+        scope,
+        arena,
+        storage,
+        txid,
+        earlier,
+        "DISTINCT ON",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_clause_key<'a>(
+    original: &'a Expr<'a>,
+    items: &'a [SelectItem<'a>],
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+    earlier: &[Option<ResolvedSortKey<'a>>],
+    clause: &str,
+) -> Result<ResolvedSortKey<'a>, SqlError> {
+    let expression =
+        resolve_position_target(original, items, Some(scope), arena, storage, txid, clause)?;
     let source = if let Expr::Int(position) = original {
         // Resolution above checked this against the expanded output width.
         SortKeySource::Projection(*position as usize - 1)
@@ -8787,7 +8826,7 @@ pub(super) fn resolve_sort_key<'a>(
 /// An `ORDER BY` / `GROUP BY` target: a bare integer is a 1-based position in
 /// the select list (a star item expanding to its columns), anything else is the
 /// expression itself, matched against the select list's aliases.
-fn resolve_position_target<'a>(
+pub(super) fn resolve_position_target<'a>(
     expression: &'a Expr<'a>,
     items: &'a [SelectItem<'a>],
     scope: Option<&QueryScope<'_>>,
@@ -8801,11 +8840,14 @@ fn resolve_position_target<'a>(
     };
     let index = *n;
     let position_error = || {
-        sql_err!(
-            sqlstate::INVALID_COLUMN_REFERENCE,
-            "{} position {} is not in select list",
-            clause,
-            index
+        crate::sql::error_position::at_expression(
+            sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "{} position {} is not in select list",
+                clause,
+                index
+            ),
+            expression,
         )
     };
     if index < 1 {

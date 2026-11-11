@@ -103,7 +103,8 @@ is owned.
 **Remaining:**
 
 - **Functions:** writes inside a procedure body still read storage
-  synchronously. A top-level `SELECT` that the retained reader cannot hold
+  synchronously, as do PL/pgSQL cursor reads (`OPEN`, `FETCH` and cursor
+  `FOR` loops), whose lock waits already park. A top-level `SELECT` that the retained reader cannot hold
   (`DISTINCT` over routine output, grouping sets, groupings whose keys or aggregate inputs call
   routines, subqueries, sorts in object-store mode or over non-volatile
   routine output, joins it would probe through an index) restarts once for
@@ -156,13 +157,13 @@ is owned.
 - **Results and cursors:** large results resume row by row for `SELECT`
   from one table or builtin set-returning functions with constant arguments,
   or a nested-loop or hash join of up to eight such items and `VALUES` lists,
-  with an `ORDER BY` sorted in `plan_build_bytes` in local mode or a
+  with an `ORDER BY` or `DISTINCT ON` sorted in `plan_build_bytes` in local mode or a
   `GROUP BY`, `HAVING`, aggregates and plain `DISTINCT` computed there, including
   paged portals, forward `FETCH` from `NO SCROLL` cursors and
   `COPY ... TO STDOUT` of such a query or one table. Remaining:
   - More retained shapes, by the
     [retained plan tree design](docs/architecture.md#retained-plan-tree-partly-built):
-    index-probed joins, RIGHT and FULL joins, `DISTINCT ON`, grouping sets,
+    index-probed joins, RIGHT and FULL joins, grouping sets,
     subqueries, set operations, sorts in object-store mode (external runs
     with a run reader per stream; a large ordered `SELECT` there still
     spools, and a paged portal of one buffers in `portal_result_bytes`),
@@ -184,12 +185,6 @@ is owned.
     their history in `cursor_bytes`. A scrollable cursor moving back rereads
     its input from the first row; retained position checkpoints would bound
     that reread.
-  - PL/pgSQL `FOR rec IN c LOOP` over a bound cursor is rejected with
-    `0A000`; it needs a loop frame that opens the cursor (a real portal, so
-    `pg_cursors`, `42P03` for an open cursor and the cursor variable behave as
-    in PostgreSQL), fetches one row per iteration and closes it on every exit,
-    across waits in every procedural executor. Materializing the query like
-    `FOR ... IN SELECT` would differ from PostgreSQL in those three ways.
   - Saving a held cursor at commit reads storage synchronously: the fourteen
     callers of the commit path (statement, protocol, procedure and
     replication commits) do not yet accept a wait before the commit is
@@ -374,7 +369,8 @@ do). Parameter inference walks a statement in its own order rather than
 PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
 untyped to an `"any"` argument by another can be accepted where PostgreSQL
 reports `42P18`, and a user-defined polymorphic argument left untyped becomes
-`text` where PostgreSQL reports `42804`. A SQL function whose earlier
+`text` where PostgreSQL reports `42804`. Trigger functions cannot open cursors (`OPEN`, cursor `FOR` loops) and fail
+with `0A000`. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

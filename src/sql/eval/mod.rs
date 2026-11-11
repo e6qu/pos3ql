@@ -397,6 +397,7 @@ pub mod sqlstate {
     pub const INVALID_CURSOR_DEFINITION: &str = "42P11";
     pub const DUPLICATE_FUNCTION: &str = "42723";
     pub const UNDEFINED_CURSOR: &str = "34000";
+    pub const INVALID_CURSOR_STATE: &str = "24000";
     pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
     pub const UNSAFE_NEW_ENUM_VALUE_USAGE: &str = "55P04";
     pub const AMBIGUOUS_ALIAS: &str = "42P09";

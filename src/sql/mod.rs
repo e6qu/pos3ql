@@ -10479,11 +10479,13 @@ impl Engine {
         }
         match target {
             ast::DiscardTarget::All => {
+                if let Err(error) = cursors.close_all() {
+                    return Ok(Err(error));
+                }
                 self.storage
                     .release_connection_advisory_locks(self.work.connection_id());
                 sqlprep.clear();
                 sqlprep.routine_inputs.clear();
-                cursors.close_all();
                 guc.discard_all();
                 if let Err(error) = self.apply_system_settings(guc) {
                     return Ok(Err(error));
@@ -25392,15 +25394,22 @@ impl Engine {
             }
             Stmt::CloseCursor(name) => {
                 match name {
-                    Some(name) if !cursors.close(name) => {
-                        return Ok(Err(sql_err!(
-                            crate::sql::eval::sqlstate::UNDEFINED_CURSOR,
-                            "cursor \"{}\" does not exist",
-                            name
-                        )));
+                    Some(name) => match cursors.close(name) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Ok(Err(sql_err!(
+                                crate::sql::eval::sqlstate::UNDEFINED_CURSOR,
+                                "cursor \"{}\" does not exist",
+                                name
+                            )));
+                        }
+                        Err(error) => return Ok(Err(error)),
+                    },
+                    None => {
+                        if let Err(error) = cursors.close_all() {
+                            return Ok(Err(error));
+                        }
                     }
-                    Some(_) => {}
-                    None => cursors.close_all(),
                 }
                 responder.command_complete(if name.is_some() {
                     "CLOSE CURSOR"

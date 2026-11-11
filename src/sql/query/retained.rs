@@ -1190,7 +1190,7 @@ fn join_clauses_retained(statement: &Select<'_>, self_sorts: bool, groups_itself
         && statement.with.is_empty()
         && statement.set_body.is_none()
         && (groups_itself || !statement.distinct)
-        && statement.distinct_on.is_empty()
+        && (statement.distinct_on.is_empty() || self_sorts)
         && (groups_itself || statement.group_by.is_empty() && statement.having.is_none())
         && statement.grouping_sets.is_empty()
         && statement.locking.is_empty()
@@ -1360,7 +1360,7 @@ fn retained_join_scope<'a>(
     };
     if !scope_expressions_retained(statement, &columns, &catalog, aggregates.is_some())?
         || aggregates.is_none()
-            && !statement.order_by.is_empty()
+            && sort::sorts(statement)
             && !sort::sort_admitted(statement, &columns, &catalog)?
     {
         return Ok(None);
@@ -2089,7 +2089,6 @@ impl<'a> RetainedSelect<'a> {
             || from.base.sample.is_some()
             || !statement.with.is_empty()
             || statement.set_body.is_some()
-            || !statement.distinct_on.is_empty()
             || !statement.grouping_sets.is_empty()
             || !statement.locking.is_empty()
             || statement.with_ties
@@ -2151,9 +2150,7 @@ impl<'a> RetainedSelect<'a> {
                     return Ok(None);
                 }
             }
-            if !statement.order_by.is_empty()
-                && !sort::sort_admitted(statement, &columns, &catalog)?
-            {
+            if sort::sorts(statement) && !sort::sort_admitted(statement, &columns, &catalog)? {
                 return Ok(None);
             }
         }
@@ -2259,7 +2256,7 @@ impl<'a> RetainedSelect<'a> {
     ) -> Result<Option<Self>, SqlError> {
         // A stream or statement returns its rows once, in order: it sorts
         // them itself. A declared cursor keeps its own ordered path.
-        let self_sorts = !statement.order_by.is_empty()
+        let self_sorts = sort::sorts(statement)
             && (mode == RetainedMode::Statement || reader_use == RetainedUse::Stream);
         // Likewise it groups them itself.
         let groups_itself = mode == RetainedMode::Statement || reader_use == RetainedUse::Stream;
@@ -2302,7 +2299,7 @@ impl<'a> RetainedSelect<'a> {
                 )
         }) || !statement.with.is_empty()
             || statement.set_body.is_some()
-            || !statement.distinct_on.is_empty()
+            || !statement.distinct_on.is_empty() && !self_sorts
             || !groups_itself
                 && (statement.distinct
                     || !statement.group_by.is_empty()
@@ -3142,7 +3139,10 @@ impl<'a> RetainedSelect<'a> {
             pushed?;
             self.finish_input_row(state_arena);
         }
-        Ok(self.sort.as_mut().expect("sorted reader").advance())
+        self.sort
+            .as_mut()
+            .expect("sorted reader")
+            .advance(storage, txid)
     }
 
     /// Reads and saves the grouping's whole input at its first row, folds

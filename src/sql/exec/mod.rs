@@ -18202,6 +18202,12 @@ fn with_bound_plpgsql_cursors<'a, T>(
 
 /// The bound cursor declared as `name` in the program being parsed.
 fn bound_plpgsql_cursor<'a>(name: SqlName, _arena: &'a Arena) -> Option<BoundPlpgsqlCursor<'a>> {
+    plpgsql_cursor_variable(name).flatten()
+}
+
+/// The `refcursor` local declared as `name` in the program being parsed:
+/// `Some(Some(_))` when it is bound to a query, `Some(None)` when unbound.
+fn plpgsql_cursor_variable<'a>(name: SqlName) -> Option<Option<BoundPlpgsqlCursor<'a>>> {
     let (pointer, len) = BOUND_CURSORS.with(core::cell::Cell::get);
     if pointer.is_null() {
         return None;
@@ -18212,10 +18218,16 @@ fn bound_plpgsql_cursor<'a>(name: SqlName, _arena: &'a Arena) -> Option<BoundPlp
     // in that window borrow the arena for the declarations' lifetime.
     let locals =
         unsafe { core::slice::from_raw_parts(pointer.cast::<ParsedTriggerLocalDecl<'a>>(), len) };
-    locals
-        .iter()
-        .find(|local| local.name == name)
-        .and_then(|local| local.bound)
+    let local = locals.iter().find(|local| local.name == name)?;
+    match (local.bound, local.ty) {
+        (Some(bound), _) => Some(Some(bound)),
+        (None, ParsedPlpgsqlLocalType::Named { name, .. })
+            if name.eq_ignore_ascii_case("refcursor") =>
+        {
+            Some(None)
+        }
+        _ => None,
+    }
 }
 
 /// A local declaration has either a complete type spelling or a catalog
@@ -19020,6 +19032,21 @@ enum TriggerForSource<'a> {
         expression: &'a Expr<'a>,
         slice: Option<NonZeroU8>,
     },
+    /// `FOR rec IN c [(arguments)] LOOP` over a bound cursor: the loop opens
+    /// the cursor as a portal, fetches one row into its own record `rec`
+    /// per iteration, and closes it on every exit, as PostgreSQL's
+    /// `exec_stmt_forc` does. `fetch` reads the next row through the
+    /// loop's own portal reference, which the body cannot reassign.
+    Cursor {
+        open: PlpgsqlCursorOpen<'a>,
+        fetch: PlpgsqlCursorMotion<'a>,
+    },
+}
+
+/// The hidden local a cursor `FOR` loop keeps its portal's name in. A NUL
+/// byte cannot appear in an SQL identifier, so no statement can name it.
+fn cursor_loop_portal_local() -> SqlName {
+    SqlName::parse("\0portal").expect("short hidden local name")
 }
 
 #[derive(Clone, Copy)]
@@ -22323,13 +22350,41 @@ fn parse_trigger_for_header<'a>(
         )));
     }
     if let Ok((cursor, split)) = parse_plpgsql_identifier_prefix(source, arena)
-        && bound_plpgsql_cursor(cursor, arena).is_some()
         && (source[split..].trim().is_empty() || source[split..].trim_start().starts_with('('))
     {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "FOR loops over bound cursors are not supported; OPEN the cursor and FETCH in a LOOP"
-        ));
+        match plpgsql_cursor_variable(cursor) {
+            Some(Some(bound)) => {
+                if variable.label.is_some() {
+                    // The loop declares its record, which a qualified name
+                    // cannot spell.
+                    return Err(super::error_position::at_subject(
+                        sql_err!(sqlstate::SYNTAX_ERROR, "syntax error at or near \"IN\""),
+                        target_source,
+                    ));
+                }
+                let open = parse_bound_cursor_open(cursor, bound, source[split..].trim(), arena)?;
+                let targets = arena
+                    .alloc_slice_copy(&[PlpgsqlVariableName::plain(variable.name)])
+                    .map_err(|_| super::query::arena_full_pub())?;
+                let fetch = PlpgsqlCursorMotion {
+                    variable: cursor_loop_portal_local(),
+                    motion: super::cursor::FetchMotion::Count(1),
+                    move_only: false,
+                    targets,
+                };
+                return Ok(Some((variable, TriggerForSource::Cursor { open, fetch })));
+            }
+            Some(None) => {
+                return Err(super::error_position::at_subject(
+                    sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "cursor FOR loop must use a bound cursor variable"
+                    ),
+                    &source[..split],
+                ));
+            }
+            None => {}
+        }
     }
     if ["insert", "update", "delete", "merge"]
         .iter()
@@ -22752,10 +22807,14 @@ fn parse_bound_cursor_open<'a>(
     body: &'a str,
     arena: &'a Arena,
 ) -> Result<PlpgsqlCursorOpen<'a>, SqlError> {
+    // PostgreSQL points at the argument list, or where it is missing.
     let syntax = |message: core::fmt::Arguments<'_>| {
         let mut text = StackStr::<256>::new();
         let _ = core::fmt::Write::write_fmt(&mut text, message);
-        sql_err!(sqlstate::SYNTAX_ERROR, "{}", text.as_str())
+        super::error_position::at_subject(
+            sql_err!(sqlstate::SYNTAX_ERROR, "{}", text.as_str()),
+            &body[..0],
+        )
     };
     let name = variable.as_str();
     if body.is_empty() {
@@ -24090,6 +24149,15 @@ fn validate_plpgsql_constant_assignments(
                                 keyword
                             ));
                         }
+                        let local = ScopedLocal {
+                            label: statement.label,
+                            name: statement.target.name,
+                            constant: false,
+                            parent: shadowed,
+                        };
+                        validate_block(statement.block, locals, Some(&local), has_parameter)?;
+                    } else if let TriggerForSource::Cursor { .. } = statement.source {
+                        // The loop declares its own record.
                         let local = ScopedLocal {
                             label: statement.label,
                             name: statement.target.name,
@@ -26407,6 +26475,9 @@ impl PlpgsqlExecHost<'_> {
         let prior_configuration = txn.capture_configuration();
         let next = match command {
             PlpgsqlTransactionCommand::Commit(next) => {
+                // A cursor FOR loop keeps reading its portal in the next
+                // transaction: commit saves it as a holdable cursor.
+                cursors.hold_pinned();
                 // The procedure stack cannot be replayed after transaction
                 // control. Drain this explicit boundary, promoting all earlier
                 // commits in log order before continuing the same invocation.
@@ -26433,6 +26504,13 @@ impl PlpgsqlExecHost<'_> {
                 next
             }
             PlpgsqlTransactionCommand::Rollback(next) => {
+                // As PostgreSQL holds pinned portals before a procedure's
+                // ROLLBACK, a cursor FOR loop's remaining rows are saved
+                // from the transaction that opened it, and survive it.
+                if cursors.hold_pinned() {
+                    engine.save_hold_cursors(txn, cursors, sqlprep, guc, arena, responder)?;
+                    cursors.keep_held_pinned();
+                }
                 engine.rollback_txn_within_statement(txn, guc);
                 cursors.on_rollback();
                 next
@@ -31643,6 +31721,20 @@ fn execute_trigger_step<'a>(
     status: &mut TriggerExecutionStatus<'a>,
     exception: Option<diagnostics::CaughtDiagnostic<'_>>,
 ) -> Result<control_flow::Step<'a, 'a>, SqlError> {
+    // OPEN checks a named portal before it runs its query, as PostgreSQL's
+    // `exec_stmt_open` and `exec_stmt_forc` do.
+    if let TriggerStatement::CursorOpen(open) = statement
+        && let Ok(local) = trigger_local_index(locals, PlpgsqlVariableName::plain(open.variable))
+        && let Datum::Text(name) = local_values[local]
+        && let PlpgsqlExecHost::Routine { cursors, .. } = &context.host
+        && cursors.exists(name)
+    {
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_CURSOR,
+            "cursor \"{}\" already in use",
+            name
+        ));
+    }
     let run = || {
         execute_trigger_step_in(
             context,
@@ -32675,14 +32767,6 @@ fn execute_trigger_step_in<'a>(
                                 }
                                 count
                             };
-                            if !record_target && column_count != statement.targets.len() {
-                                return Err(sql_err!(
-                                    sqlstate::DATATYPE_MISMATCH,
-                                    "cursor returned {} columns but FETCH INTO expects {}",
-                                    column_count,
-                                    statement.targets.len()
-                                ));
-                            }
                             let mut values = [Datum::Null; MAX_COLUMNS];
                             let mut decoded = [Datum::Null; MAX_COLUMNS];
                             if let Some(row) = rows.first().copied() {
@@ -32781,7 +32865,7 @@ fn execute_trigger_step_in<'a>(
                                 "SQL cursors are not available in trigger execution"
                             )));
                         };
-                        if !cursors.close(name) {
+                        if !cursors.close(name)? {
                             return Err(sql_err!(
                                 sqlstate::UNDEFINED_CURSOR,
                                 "cursor \"{}\" does not exist",
@@ -34648,6 +34732,15 @@ fn execute_trigger_step_in<'a>(
                 Ok(None)
             }),
             TriggerStatement::For(program) => {
+                if let TriggerForSource::Cursor { .. } = program.source {
+                    return control_flow::start_cursor_loop(
+                        program,
+                        child_scope,
+                        locals,
+                        local_values,
+                        status,
+                    );
+                }
                 if let TriggerForSource::Numeric {
                     counter_keyword: _,
                     lower,
@@ -34996,8 +35089,9 @@ fn execute_trigger_step_in<'a>(
                                 TriggerForSource::Dml(_) => {
                                     dml_rows.expect("data change rows run before the loop")
                                 }
-                                TriggerForSource::Numeric { .. } => {
-                                    unreachable!("numeric loop handled above")
+                                TriggerForSource::Numeric { .. }
+                                | TriggerForSource::Cursor { .. } => {
+                                    unreachable!("numeric and cursor loops are handled above")
                                 }
                             };
                             loop_rows::LoopRows::capture(&pool, values)

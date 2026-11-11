@@ -1051,7 +1051,7 @@ impl<'a> Parser<'a> {
                 // first. A `can be function or type name` keyword may continue:
                 // it is exactly the category PostgreSQL allows to name one.
                 if self.peeked == Tok::Op("(") && self.typed_literal_with_modifier_ahead(name)? {
-                    return self.modified_typed_literal(name);
+                    return self.modified_typed_literal(name, true, name_at);
                 }
                 if self.peeked == Tok::Op("(")
                     && matches!(
@@ -1122,7 +1122,7 @@ impl<'a> Parser<'a> {
                     // that field, so it is folded into the literal before
                     // the cast rather than left dangling.
                     let (lit, type_mod) = if name.eq_ignore_ascii_case("interval") {
-                        self.interval_with_qualifier(lit)?
+                        self.interval_with_qualifier(lit, Some(name_at))?
                     } else {
                         (lit, -1)
                     };
@@ -1146,7 +1146,9 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::WholeRow(name));
                     }
                     let column = self.any_ident("column name")?;
-                    if let Some(literal) = self.qualified_builtin_type_literal(name, column)? {
+                    if let Some(literal) =
+                        self.qualified_builtin_type_literal(name, column, name_at)?
+                    {
                         self.record_namespace(namespace_source)?;
                         return Ok(literal);
                     }
@@ -1257,7 +1259,9 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::WholeRow(name));
                     }
                     let column = self.any_ident("column name")?;
-                    if let Some(literal) = self.qualified_builtin_type_literal(name, column)? {
+                    if let Some(literal) =
+                        self.qualified_builtin_type_literal(name, column, name_at)?
+                    {
                         self.record_namespace(namespace_source)?;
                         return Ok(literal);
                     }
@@ -2700,6 +2704,7 @@ impl<'a> Parser<'a> {
     pub(super) fn interval_with_qualifier(
         &mut self,
         lit: &'a str,
+        type_at: Option<usize>,
     ) -> Result<(&'a str, i32), ParseError> {
         let Some((word, _)) = self.peek_interval_field() else {
             return Ok((lit, -1));
@@ -2714,7 +2719,7 @@ impl<'a> Parser<'a> {
                     "interval precision is allowed only when SECOND is the trailing field",
                 ));
             }
-            precision = Some(self.interval_precision()?);
+            precision = Some(self.interval_precision(type_at)?);
         }
         // PostgreSQL's grammar starts a range only at YEAR, DAY, HOUR or
         // MINUTE, and ends it at a finer field; anything else fails at the
@@ -2762,7 +2767,7 @@ impl<'a> Parser<'a> {
                         "interval precision is allowed only when SECOND is the trailing field",
                     ));
                 }
-                precision = Some(self.interval_precision()?);
+                precision = Some(self.interval_precision(type_at)?);
             }
             let last = crate::sql::types::IntervalField::parse(end_word)
                 .expect("interval keyword maps to a typed field");
@@ -2797,10 +2802,10 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn interval_precision(&mut self) -> Result<u8, ParseError> {
+    fn interval_precision(&mut self, type_at: Option<usize>) -> Result<u8, ParseError> {
         match crate::sql::types::TypeMod::decode(
             crate::sql::types::ColType::Interval,
-            self.type_modifier("interval")?,
+            self.type_modifier("interval", true, type_at)?,
         ) {
             crate::sql::types::TypeMod::IntervalMod {
                 precision: Some(precision),
@@ -2816,6 +2821,7 @@ impl<'a> Parser<'a> {
         &mut self,
         schema: &str,
         name: &'a str,
+        type_at: usize,
     ) -> Result<Option<&'a Expr<'a>>, ParseError> {
         let source_position = SourcePosition::new(Some(self.peek_at));
         if schema != "pg_catalog" || crate::sql::types::ColType::from_sql_name(name).is_none() {
@@ -2828,14 +2834,19 @@ impl<'a> Parser<'a> {
         {
             return Err(ParseError {
                 at: self.peek_at,
-                message: crate::stack_format!(96, "type \"pg_catalog.{}\" does not exist", name),
+                message: crate::stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "type \"pg_catalog.{}\" does not exist",
+                    name
+                ),
                 sqlstate: crate::sql::eval::sqlstate::UNDEFINED_OBJECT,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         if modified {
-            return self.modified_typed_literal(name).map(Some);
+            return self.modified_typed_literal(name, false, type_at).map(Some);
         }
         let Tok::Str(literal) = self.peeked else {
             return Ok(None);
@@ -2913,19 +2924,33 @@ impl<'a> Parser<'a> {
         Ok(matches!(token, Tok::Str(_)))
     }
 
-    fn modified_typed_literal(&mut self, mut name: &'a str) -> Result<&'a Expr<'a>, ParseError> {
+    /// `name(modifiers) 'literal'`, with `name` starting at `type_at`; a
+    /// keyword spelling (`varchar(3) 'x'`) takes PostgreSQL's keyword grammar.
+    fn modified_typed_literal(
+        &mut self,
+        mut name: &'a str,
+        keyword_spelling: bool,
+        type_at: usize,
+    ) -> Result<&'a Expr<'a>, ParseError> {
         let source_position = SourcePosition::new(Some(self.peek_at));
-        let type_mod = if name.eq_ignore_ascii_case("float") {
+        let float = keyword_spelling && name.eq_ignore_ascii_case("float");
+        let typmods = if float {
             name = self.float_precision_type()?;
-            -1
+            None
         } else {
-            self.type_modifier(name)?
+            Some(self.written_typmods(
+                keyword_spelling
+                    && matches!(
+                        name,
+                        "varchar" | "char" | "character" | "timestamp" | "time" | "interval"
+                    ),
+            )?)
         };
-        if name.eq_ignore_ascii_case("timestamp") || name.eq_ignore_ascii_case("time") {
+        if keyword_spelling && matches!(name, "timestamp" | "time") {
             if self.eat_ident("with")? {
                 self.expect_ident("time")?;
                 self.expect_ident("zone")?;
-                name = if name.eq_ignore_ascii_case("timestamp") {
+                name = if name == "timestamp" {
                     "timestamptz"
                 } else {
                     "timetz"
@@ -2935,21 +2960,20 @@ impl<'a> Parser<'a> {
                 self.expect_ident("zone")?;
             }
         }
+        let type_mod = match typmods {
+            Some(typmods) => {
+                self.checked_typmod(name, typmods, Some(type_at), format_args!("{name}"))?
+            }
+            None => -1,
+        };
         let Tok::Str(literal) = self.peeked else {
             return Err(self.syntax_error_here());
         };
         self.advance()?;
-        let (literal, type_mod) = if name.eq_ignore_ascii_case("interval") {
-            let (literal, qualifier_mod) = self.interval_with_qualifier(literal)?;
-            if qualifier_mod != -1 {
-                return Err(
-                    self.unexpected("an interval qualifier cannot follow INTERVAL precision")
-                );
-            }
-            (literal, type_mod)
-        } else {
-            (literal, type_mod)
-        };
+        // PostgreSQL's `INTERVAL (p) 'literal'` takes no trailing field.
+        if name == "interval" && self.peek_interval_field().is_some() {
+            return Err(self.syntax_error_here());
+        }
         let operand = self.arena_expr(Expr::Str(literal))?;
         self.arena_expr(Expr::Cast {
             source_position,
@@ -2968,23 +2992,29 @@ impl<'a> Parser<'a> {
     fn year_to_month(&mut self, lit: &'a str) -> Result<&'a str, ParseError> {
         let out_of_range = || ParseError {
             at: self.peek_at,
-            message: crate::stack_format!(96, "interval field value out of range: \"{}\"", lit),
+            message: crate::stack_format!(
+                super::PARSE_MESSAGE_BYTES,
+                "interval field value out of range: \"{}\"",
+                lit
+            ),
             sqlstate: sqlstate::INTERVAL_FIELD_OVERFLOW,
             cursor: None,
             hint: None,
+            near: None,
         };
         // A part that is not a number at all is malformed input (22007); a
         // number that is simply too large for its field is out of range (22015).
         let bad_syntax = || ParseError {
             at: self.peek_at,
             message: crate::stack_format!(
-                96,
+                super::PARSE_MESSAGE_BYTES,
                 "invalid input syntax for type interval: \"{}\"",
                 lit
             ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
             cursor: None,
             hint: None,
+            near: None,
         };
         let value = lit.trim();
         let (sign, rest) = match value.strip_prefix('-') {
@@ -3035,13 +3065,14 @@ impl<'a> Parser<'a> {
         let bad = || ParseError {
             at: self.peek_at,
             message: crate::stack_format!(
-                96,
+                super::PARSE_MESSAGE_BYTES,
                 "invalid input syntax for type interval: \"{}\"",
                 lit
             ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
             cursor: None,
             hint: None,
+            near: None,
         };
         let value = lit.trim();
 
@@ -3135,7 +3166,7 @@ impl<'a> Parser<'a> {
         // fractional-only negative second (`-0.5`) keeps its sign.
         let sec_sign = if clock_neg { "-" } else { "" };
         let combined = crate::stack_format!(
-            96,
+            super::PARSE_MESSAGE_BYTES,
             "{} day {} hour {} minute {}{}.{} second",
             days,
             hours,
@@ -3166,13 +3197,14 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: crate::stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "invalid input syntax for type interval: \"{}\"",
                     lit
                 ),
                 sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         let (word, keep_fraction) = clock_field_word(field);

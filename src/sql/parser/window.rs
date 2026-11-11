@@ -109,10 +109,15 @@ impl<'a> Parser<'a> {
         }
         Err(ParseError {
             at: self.peek_at,
-            message: stack_format!(96, "window \"{}\" does not exist", name),
+            message: stack_format!(
+                super::PARSE_MESSAGE_BYTES,
+                "window \"{}\" does not exist",
+                name
+            ),
             sqlstate: sqlstate::UNDEFINED_OBJECT,
             cursor: None,
             hint: None,
+            near: None,
         })
     }
 
@@ -138,10 +143,15 @@ impl<'a> Parser<'a> {
             if self.named_window(name).is_ok() {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "window \"{}\" is already defined", name),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "window \"{}\" is already defined",
+                        name
+                    ),
                     sqlstate: sqlstate::WINDOWING_ERROR,
                     cursor: None,
                     hint: None,
+                    near: None,
                 });
             }
             self.expect_ident("as")?;
@@ -285,39 +295,42 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "cannot override PARTITION BY clause of window \"{}\"",
                     name
                 ),
                 sqlstate: sqlstate::WINDOWING_ERROR,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         if !base.order_by.is_empty() && !order_by.is_empty() {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "cannot override ORDER BY clause of window \"{}\"",
                     name
                 ),
                 sqlstate: sqlstate::WINDOWING_ERROR,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         if base.frame.is_some() {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "cannot copy window \"{}\" because it has a frame clause",
                     name
                 ),
                 sqlstate: sqlstate::WINDOWING_ERROR,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         Ok(WindowSpec {

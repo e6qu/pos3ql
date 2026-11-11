@@ -10401,10 +10401,12 @@ fn type_mismatch(operator: &str, d: &Datum) -> SqlError {
     )
 }
 
-fn cast_unsupported(from: &Datum, to: &'static str) -> SqlError {
+/// PostgreSQL's error for a cast with no conversion path, naming both types
+/// as `format_type` does.
+fn cast_unsupported(from: &Datum, to: &str) -> SqlError {
     sql_err!(
-        sqlstate::DATATYPE_MISMATCH,
-        "cannot cast {} to {}",
+        sqlstate::CANNOT_COERCE,
+        "cannot cast type {} to {}",
         type_name_of(from),
         to
     )

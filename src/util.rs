@@ -114,8 +114,8 @@ impl<const N: usize> fmt::Write for StackStr<N> {
 /// Formats any Display value into a StackStr.
 #[macro_export]
 macro_rules! stack_format {
-    ($n:literal, $($arg:tt)*) => {{
-        let mut s = $crate::util::StackStr::<$n>::new();
+    ($n:expr, $($arg:tt)*) => {{
+        let mut s = $crate::util::StackStr::<{ $n }>::new();
         let _ = core::fmt::Write::write_fmt(&mut s, format_args!($($arg)*));
         s
     }};

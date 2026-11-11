@@ -287,23 +287,20 @@ type, function or failed constant (`SELECT * FROM missing_table` reports
 position 15), maps a syntax error inside a SQL function body to its place in the
 `CREATE FUNCTION` text, and reports dynamic SQL failures (`EXECUTE 'SELEC 1'`)
 with an internal query and position (`q`, `p`) plus a `CONTEXT` line, which
-pos3ql does not send. An echoed token longer than the 96-byte parser message is
-cut short. The scanner does not read Unicode-escape literals (`U&'\0041'`,
-`U&"\0041"`, `UESCAPE`), so `SELECT U&'\0041'` fails as an unknown column
-`u`, and an identifier longer than 63 bytes is rejected (`name ... is longer
-than 63 bytes`) where PostgreSQL truncates it with a `NOTICE`. Assigning to an
+pos3ql does not send. Assigning to an
 array element or slice (`UPDATE t SET a[1] = 9`) fails with `0A000`. A slice
 followed by an index (`a[1:1][1]`) indexes the slice where PostgreSQL treats the
 whole list as a slice, and a subscripted scalar subquery is named `?column?`
 where PostgreSQL names it after the subquery's column. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks the parser makes where PostgreSQL checks later
-still fail with `42601` and `syntax error: <description>`: type modifiers
-(`numeric(2000)` is `22023` `NUMERIC precision 2000 must be between 1 and
-1000` in PostgreSQL), COPY targets and options, storage parameters, sequence,
-role and large-object values, and SQL/JSON result types. An unsupported cast
-reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
-`42846` `cannot cast type integer to timestamp without time zone`.
+still fail with `42601` and `syntax error: <description>`: COPY targets and
+options, storage parameters, sequence, role and large-object values, and
+SQL/JSON result types. A type modifier error is reported when its statement
+would run, but before analysis errors PostgreSQL finds first in the same
+statement (`SELECT 1::numeric(5000) FROM missing` reports the modifier, not the
+missing relation), and a modifier on an unknown type reports `type modifier is
+not allowed` rather than `type ... does not exist`.
 PL/pgSQL `CALL`, written directly or run with `EXECUTE`, fails with `0A000`
 (`CALL is not supported in PL/pgSQL`); supporting it needs output parameters
 assigned to the caller's variables, PostgreSQL's transaction-control rules for

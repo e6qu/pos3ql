@@ -2179,7 +2179,33 @@ impl<'b> Responder<'b> {
         if !self.render_context().min_message_level.allows(level) {
             return Ok(());
         }
-        self.write_notice_response(severity, sqlstate.as_ref(), message, diagnostic.as_ref())
+        self.write_notice_response(
+            severity,
+            sqlstate.as_ref(),
+            message,
+            diagnostic.as_ref(),
+            None,
+        )
+    }
+
+    /// A NOTICE or WARNING raised while parsing a statement, with the cursor
+    /// position PostgreSQL reports for it, subject to `client_min_messages`.
+    pub fn parse_notice(
+        &mut self,
+        warning: bool,
+        sqlstate: &str,
+        message: &str,
+        cursor: Option<CursorPosition>,
+    ) -> Result<(), WireFull> {
+        let (level, severity) = if warning {
+            (crate::sql::guc::MessageLevel::Warning, "WARNING")
+        } else {
+            (crate::sql::guc::MessageLevel::Notice, "NOTICE")
+        };
+        if !self.render_context().min_message_level.allows(level) {
+            return Ok(());
+        }
+        self.write_notice_response(severity, sqlstate, message, None, cursor)
     }
 
     fn diagnostic_unfiltered<S: AsRef<str>>(
@@ -2189,7 +2215,13 @@ impl<'b> Responder<'b> {
         message: &str,
     ) -> Result<(), WireFull> {
         let diagnostic = crate::sql::eval::take_diagnostic();
-        self.write_notice_response(severity, sqlstate.as_ref(), message, diagnostic.as_ref())
+        self.write_notice_response(
+            severity,
+            sqlstate.as_ref(),
+            message,
+            diagnostic.as_ref(),
+            None,
+        )
     }
 
     fn write_notice_response(
@@ -2198,6 +2230,7 @@ impl<'b> Responder<'b> {
         sqlstate: &str,
         message: &str,
         diagnostic: Option<&crate::sql::eval::Diagnostic>,
+        cursor: Option<CursorPosition>,
     ) -> Result<(), WireFull> {
         self.control(|buffer| {
             let mut m = MsgOut::begin(buffer, wire::MSG_NOTICE_RESPONSE);
@@ -2219,6 +2252,10 @@ impl<'b> Responder<'b> {
                     m.cstr(h.as_str());
                 }
             }
+            if let Some(cursor) = cursor {
+                m.u8(b'P');
+                m.cstr(stack_format!(20, "{}", cursor.get()).as_str());
+            }
             m.u8(0);
             m.finish()
         })
@@ -2227,7 +2264,7 @@ impl<'b> Responder<'b> {
     /// ErrorResponse with the fields every client expects: severity (twice,
     /// localized and not), SQLSTATE, and message.
     pub fn error<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
-        self.error_severity("ERROR", sqlstate.as_ref(), message, None)
+        self.error_severity("ERROR", sqlstate.as_ref(), &message, None)
     }
 
     /// [`Self::error`] with the cursor position PostgreSQL reports for it.
@@ -2237,18 +2274,28 @@ impl<'b> Responder<'b> {
         message: &str,
         cursor: CursorPosition,
     ) -> Result<(), WireFull> {
-        self.error_severity("ERROR", sqlstate.as_ref(), message, Some(cursor))
+        self.error_severity("ERROR", sqlstate.as_ref(), &message, Some(cursor))
+    }
+
+    /// [`Self::error`] with formatted text and an optional cursor position.
+    pub fn error_display(
+        &mut self,
+        sqlstate: &str,
+        message: &dyn core::fmt::Display,
+        cursor: Option<CursorPosition>,
+    ) -> Result<(), WireFull> {
+        self.error_severity("ERROR", sqlstate, message, cursor)
     }
 
     pub fn fatal<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
-        self.error_severity("FATAL", sqlstate.as_ref(), message, None)
+        self.error_severity("FATAL", sqlstate.as_ref(), &message, None)
     }
 
     fn error_severity(
         &mut self,
         severity: &str,
         sqlstate: &str,
-        message: &str,
+        message: &dyn core::fmt::Display,
         cursor: Option<CursorPosition>,
     ) -> Result<(), WireFull> {
         let diagnostic = crate::sql::eval::take_diagnostic();
@@ -2261,7 +2308,7 @@ impl<'b> Responder<'b> {
             m.u8(b'C');
             m.cstr(sqlstate);
             m.u8(b'M');
-            m.cstr(message);
+            m.cstr_display(message);
             if let Some(d) = &diagnostic {
                 if let Some(detail) = &d.detail {
                     m.u8(b'D');

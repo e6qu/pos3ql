@@ -13,6 +13,7 @@ mod builtin_argument_binding;
 mod canonical_sequences;
 mod catalog_identity_lookup;
 mod client_catalog;
+mod compatibility_diagnostics;
 mod constraint_index_identity;
 mod cursor_execution;
 mod foreign_parent_admission;

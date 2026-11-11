@@ -77487,7 +77487,7 @@ pub(crate) fn coerce_user_type_array<'a>(
         Datum::Null => return Ok(Datum::Null),
         other => {
             return Err(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
+                sqlstate::CANNOT_COERCE,
                 "cannot cast type {} to {}",
                 crate::sql::eval::type_name_of_pub(&other),
                 target.array_name()
@@ -77817,7 +77817,7 @@ pub fn apply_typmod<'a>(
             }
         }
         (_, TypeMod::NumericPS { precision, scale }, Datum::Numeric(n)) => {
-            apply_numeric_typmod(&n, precision as usize, scale as usize, arena).map(Datum::Numeric)
+            apply_numeric_typmod(&n, precision, scale, arena).map(Datum::Numeric)
         }
         (ColType::Bit { varying }, TypeMod::BitLength(n), Datum::Bit { bits, .. }) => {
             let invalid = if varying {
@@ -77957,53 +77957,80 @@ fn round_micros(micros: i64, p: u8) -> i64 {
     }
 }
 
-/// Rounds to `scale` fractional digits (half away from zero) and checks that
-/// the result fits in `precision` significant digits, as PostgreSQL does when
-/// storing into numeric(precision, scale). Works on the decimal text so the
-/// base-10000 carry logic lives in one place (Numeric::parse). NaN carries no
-/// scale.
+/// Rounds to `scale` fractional digits (half away from zero; a negative scale
+/// rounds to tens) and checks that the result has fewer than `precision -
+/// scale` digits before the decimal point, as PostgreSQL's `apply_typmod`
+/// does when storing into numeric(precision, scale). Works on the decimal
+/// text so the base-10000 carry logic lives in one place (Numeric::parse).
+/// NaN carries no scale.
 fn apply_numeric_typmod<'a>(
     n: &super::numeric::Numeric,
-    precision: usize,
-    scale: usize,
+    precision: u16,
+    scale: i16,
     arena: &'a Arena,
 ) -> Result<super::numeric::Numeric<'a>, SqlError> {
     use super::numeric::Numeric;
+    let overflow = |detail: core::fmt::Arguments<'_>| {
+        crate::sql::eval::stash_diagnostic(
+            Some(stack_format!(
+                crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+                "{}",
+                detail
+            )),
+            None,
+        );
+        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "numeric field overflow")
+    };
     if n.is_nan() {
         return Numeric::parse("NaN", arena);
     }
     if n.is_infinite() {
-        return Err(sql_err!(
-            sqlstate::NUMERIC_OUT_OF_RANGE,
-            "numeric field overflow"
-        ));
+        return Err(overflow(format_args!(
+            "A field with precision {precision}, scale {scale} cannot hold an infinite value."
+        )));
     }
-    const DIG: usize = 2100;
-    let text = stack_format!(2100, "{}", n);
+    // A typmod allows 1000 integer digits; a longer value overflows below
+    // whatever digits follow it, so the formatted text may stop early.
+    const DIG: usize = 4200;
+    let text = stack_format!(DIG, "{}", n);
     let s = text.as_str();
     let (neg, body) = match s.strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, s),
     };
     let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
-    let (int_b, frac_b) = (int_part.as_bytes(), frac_part.as_bytes());
-    let int_len = int_b.len();
-    if int_len + scale + 2 >= DIG {
-        return Err(sql_err!(
-            sqlstate::NUMERIC_OUT_OF_RANGE,
-            "numeric field overflow"
-        ));
-    }
-
-    // Kept digits: every integer digit, then `scale` fractional digits (padded
-    // with zeros), then round based on the first dropped fractional digit.
+    let int_part = int_part.trim_start_matches('0');
+    let source = |index: usize| -> u8 {
+        if index < int_part.len() {
+            int_part.as_bytes()[index]
+        } else {
+            *frac_part
+                .as_bytes()
+                .get(index - int_part.len())
+                .unwrap_or(&b'0')
+        }
+    };
+    // Kept digits run from the first integer digit to `scale` places after
+    // the point; a kept count at or below zero rounds everything away.
+    let kept = int_part.len() as isize + isize::from(scale);
+    let max_digits = i32::from(precision) - i32::from(scale);
+    let overflow_detail = |max_digits: i32| {
+        overflow(format_args!(
+            "A field with precision {precision}, scale {scale} must round to an absolute value less than {}{}.",
+            if max_digits != 0 { "10^" } else { "" },
+            if max_digits != 0 { max_digits } else { 1 }
+        ))
+    };
     let mut digits = [b'0'; DIG];
-    digits[..int_len].copy_from_slice(int_b);
-    for i in 0..scale {
-        digits[int_len + i] = *frac_b.get(i).unwrap_or(&b'0');
+    let kept_len = kept.max(0) as usize;
+    if kept_len + 2 >= DIG {
+        return Err(overflow_detail(max_digits));
     }
-    let mut carry = frac_b.get(scale).is_some_and(|&d| d >= b'5');
-    let mut i = int_len + scale;
+    for (index, digit) in digits[..kept_len].iter_mut().enumerate() {
+        *digit = source(index);
+    }
+    let mut carry = kept >= 0 && source(kept_len) >= b'5';
+    let mut i = kept_len;
     while carry && i > 0 {
         i -= 1;
         if digits[i] == b'9' {
@@ -78013,24 +78040,24 @@ fn apply_numeric_typmod<'a>(
             carry = false;
         }
     }
-
-    // Significant integer digits: a carry out of the integer part means the
-    // value rolled up to 1 followed by `int_len` zeros.
-    let sig_int = if carry {
-        int_len + 1
-    } else {
-        let lead_zeros = digits[..int_len].iter().take_while(|&&d| d == b'0').count();
-        int_len - lead_zeros
-    };
-    if sig_int > precision - scale {
-        return Err(sql_err!(
-            sqlstate::NUMERIC_OUT_OF_RANGE,
-            "numeric field overflow"
-        ));
+    // The rounded magnitude is the kept digits (with a leading 1 on carry)
+    // times 10^-scale. Its digits before the point, PostgreSQL's `ddigits`,
+    // count leading fractional zeros as negative.
+    let significant_from = digits[..kept_len].iter().position(|digit| *digit != b'0');
+    if carry || significant_from.is_some() {
+        let length = if carry {
+            kept_len as i32 + 1
+        } else {
+            (kept_len - significant_from.expect("checked above")) as i32
+        };
+        let before_point = length - i32::from(scale);
+        if before_point > max_digits {
+            return Err(overflow_detail(max_digits));
+        }
     }
 
     // Reassemble and re-parse (parse sets dscale = scale, matching PostgreSQL).
-    let mut out = [0u8; DIG + 8];
+    let mut out = [b'0'; DIG + 1100];
     let mut k = 0;
     if neg {
         out[k] = b'-';
@@ -78040,15 +78067,44 @@ fn apply_numeric_typmod<'a>(
         out[k] = b'1';
         k += 1;
     }
-    out[k..k + int_len].copy_from_slice(&digits[..int_len]);
-    k += int_len;
-    if scale > 0 {
-        out[k] = b'.';
-        k += 1;
-        out[k..k + scale].copy_from_slice(&digits[int_len..int_len + scale]);
-        k += scale;
+    out[k..k + kept_len].copy_from_slice(&digits[..kept_len]);
+    k += kept_len;
+    if scale < 0 {
+        // Rounded tens: the dropped places are zeros, with no fraction.
+        k += usize::from(scale.unsigned_abs());
     }
-    let rounded = core::str::from_utf8(&out[..k]).expect("ascii digits");
+    // Digits written so far, split at the point when the scale is positive.
+    let integer_digits = k - usize::from(neg);
+    let fraction = usize::try_from(scale).unwrap_or(0);
+    let mut rounded = [b'0'; DIG + 1200];
+    let mut w = 0;
+    if neg {
+        rounded[w] = b'-';
+        w += 1;
+    }
+    let body = &out[usize::from(neg)..k];
+    if integer_digits <= fraction {
+        rounded[w] = b'0';
+        w += 1;
+        if fraction > 0 {
+            rounded[w] = b'.';
+            w += 1;
+            w += fraction - integer_digits;
+            rounded[w..w + integer_digits].copy_from_slice(body);
+            w += integer_digits;
+        }
+    } else {
+        let point = integer_digits - fraction;
+        rounded[w..w + point].copy_from_slice(&body[..point]);
+        w += point;
+        if fraction > 0 {
+            rounded[w] = b'.';
+            w += 1;
+            rounded[w..w + fraction].copy_from_slice(&body[point..]);
+            w += fraction;
+        }
+    }
+    let rounded = core::str::from_utf8(&rounded[..w]).expect("ascii digits");
     Numeric::parse(rounded, arena)
 }
 

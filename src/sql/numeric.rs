@@ -215,11 +215,10 @@ impl<'a> Numeric<'a> {
         if t.eq_ignore_ascii_case("nan") {
             return Ok(Numeric::NAN);
         }
-        if t.eq_ignore_ascii_case("infinity") || t.eq_ignore_ascii_case("+infinity") {
-            return Ok(Numeric::POS_INFINITY);
-        }
-        if t.eq_ignore_ascii_case("-infinity") {
-            return Ok(Numeric::NEG_INFINITY);
+        match infinity_sign(t) {
+            Some(false) => return Ok(Numeric::POS_INFINITY),
+            Some(true) => return Ok(Numeric::NEG_INFINITY),
+            None => {}
         }
         let bad = || {
             sql_err!(
@@ -817,11 +816,23 @@ pub fn cmp_decimal_str(a: &str, b: &str) -> Option<Ordering> {
     })
 }
 
+/// PostgreSQL's numeric infinity spellings (`Infinity`, `inf`, signed, any
+/// case): `Some(negative)`.
+fn infinity_sign(text: &str) -> Option<bool> {
+    let (negative, unsigned) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    (unsigned.eq_ignore_ascii_case("infinity") || unsigned.eq_ignore_ascii_case("inf"))
+        .then_some(negative)
+}
+
 fn special_decimal_rank(s: &str) -> Option<u8> {
     let text = s.trim();
-    if text.eq_ignore_ascii_case("-infinity") {
+    if infinity_sign(text) == Some(true) {
         Some(0)
-    } else if text.eq_ignore_ascii_case("infinity") || text.eq_ignore_ascii_case("+infinity") {
+    } else if infinity_sign(text) == Some(false) {
         Some(2)
     } else if text.eq_ignore_ascii_case("nan") {
         Some(3)

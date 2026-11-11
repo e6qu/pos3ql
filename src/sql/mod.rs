@@ -11632,10 +11632,18 @@ impl Engine {
                     }
                 };
             let mut statement_count = 0usize;
+            // A statement that fails parse analysis runs no later statement,
+            // but PostgreSQL still parses the whole text first, so a syntax
+            // error after it wins.
+            parser.defer_analysis_errors();
+            let mut rejected = None;
             loop {
                 let source_start = parser.source_position();
                 let input_start = parser.string_literals().len();
                 match parser.next_stmt() {
+                    Ok(Some(_)) if rejected.is_some() => {}
+                    Err(_) if parser.analysis_error_reported() && rejected.is_some() => {}
+                    Err(error) if parser.analysis_error_reported() => rejected = Some(error),
                     Ok(Some(statement)) => {
                         debug_assert!(statement_count < statements.len());
                         statements[statement_count] = Some((
@@ -11654,12 +11662,18 @@ impl Engine {
                             cursors.on_rollback();
                             self.rollback_txn(txn, guc);
                         }
+                        if resume_statement == 0 {
+                            emit_parse_notices(parser.take_warnings(), text, responder, true)?;
+                        }
                         report_parse_error(responder, &error, text)?;
                         return Ok(ExecutionStatus::Complete);
                     }
                 }
             }
-            emit_parse_warnings(&mut parser, responder)?;
+            // A resumed request already reported its notices.
+            if resume_statement == 0 {
+                emit_parse_warnings(&mut parser, responder)?;
+            }
             let routine_transaction_context = if !txn.is_transaction_block() && statement_count == 1
             {
                 exec::PlpgsqlTransactionContext::NonAtomic
@@ -12100,6 +12114,16 @@ impl Engine {
                     });
                 }
                 txn.compact_completed_constraints();
+            }
+            if let Some(error) = &rejected {
+                if txn.is_explicit() {
+                    txn.failed = true;
+                } else {
+                    cursors.on_rollback();
+                    self.rollback_txn(txn, guc);
+                }
+                report_parse_error(responder, error, text)?;
+                return Ok(ExecutionStatus::Complete);
             }
             if !executed_any {
                 responder.empty_query_response()?;
@@ -23946,9 +23970,27 @@ fn emit_parse_warnings(
     parser: &mut parser::Parser,
     responder: &mut Responder,
 ) -> Result<(), WireFull> {
-    let messages = parser.take_warnings();
-    for message in messages {
-        responder.warning(eval::sqlstate::INVALID_PARAMETER_VALUE, message.as_str())?;
+    let text = parser.text();
+    emit_parse_notices(parser.take_warnings(), text, responder, false)
+}
+
+/// Reports `notices` raised while parsing `text`; with `raw_only`, just those
+/// PostgreSQL's raw parser raises, which precede a later syntax error.
+fn emit_parse_notices(
+    notices: &[parser::ParseNotice<'_>],
+    text: &str,
+    responder: &mut Responder,
+    raw_only: bool,
+) -> Result<(), WireFull> {
+    for notice in notices.iter().filter(|notice| notice.raw || !raw_only) {
+        responder.parse_notice(
+            notice.warning,
+            notice.sqlstate,
+            notice.message,
+            notice
+                .cursor
+                .map(|at| crate::pg::respond::CursorPosition::in_text(text, at)),
+        )?;
     }
     Ok(())
 }
@@ -23963,14 +24005,13 @@ pub(crate) fn report_parse_error(
     if let Some(hint) = e.hint {
         eval::stash_diagnostic(None, Some(crate::util::StackStr::from_str(hint)));
     }
-    match e.cursor {
-        Some(at) => responder.error_at(
-            e.sqlstate,
-            e.message.as_str(),
-            crate::pg::respond::CursorPosition::in_text(text, at),
-        ),
-        None => responder.error(e.sqlstate, e.message.as_str()),
-    }
+    let message = e.render(text);
+    responder.error_display(
+        e.sqlstate,
+        &message,
+        e.cursor
+            .map(|at| crate::pg::respond::CursorPosition::in_text(text, at)),
+    )
 }
 
 pub(crate) fn parse_error_to_sql(error: &ParseError) -> SqlError {

@@ -616,7 +616,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             }
             Datum::Date(d) => Datum::Timestamp(date_to_timestamp(d)?),
             Datum::Text(s) => Datum::Timestamp(crate::sql::datetime::parse_timestamp(s, false)?),
-            _ => return Err(cast_unsupported(&v, "timestamp")),
+            _ => return Err(cast_unsupported(&v, "timestamp without time zone")),
         },
         ColType::Timestamptz => match v {
             Datum::Timestamptz(_) => v,
@@ -778,7 +778,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 element,
                 raw: crate::sql::array::parse_literal(s, element, arena)?,
             },
-            _ => return Err(cast_unsupported(&v, "array")),
+            _ => return Err(cast_unsupported(&v, target.name())),
         },
         ColType::Uuid => match v {
             Datum::Uuid(_) => v,

@@ -218,10 +218,33 @@ pub(crate) fn keyword_needs_quotes(word: &str) -> bool {
     keyword_category(word).is_some()
 }
 
+/// A NOTICE or WARNING raised while parsing. The engine reports these
+/// before the statement's own output, as PostgreSQL does.
+#[derive(Clone, Copy, Debug)]
+pub struct ParseNotice<'a> {
+    pub warning: bool,
+    pub sqlstate: &'static str,
+    pub message: &'a str,
+    /// Byte offset in the parsed text PostgreSQL reports as the cursor.
+    pub cursor: Option<usize>,
+    /// Raised by PostgreSQL's raw parser rather than parse analysis, so it is
+    /// reported even when a later part of the query text fails to parse.
+    pub raw: bool,
+}
+
+/// Capacity of a parse error message: PostgreSQL's fixed wording plus three
+/// names of up to `NAMEDATALEN - 1` bytes, the most any parser message names.
+/// Echoed query text has no such bound; see [`ParseError::near`].
+pub const PARSE_MESSAGE_BYTES: usize = 128 + 3 * crate::sql::lexer::MAX_IDENTIFIER_BYTES;
+
 #[derive(Debug)]
 pub struct ParseError {
     pub at: usize,
-    pub message: StackStr<96>,
+    pub message: StackStr<PARSE_MESSAGE_BYTES>,
+    /// The range of query text a scanner or grammar error echoes as `at or
+    /// near "..."`, which [`Self::render`] reproduces in full even when it
+    /// does not fit `message`.
+    pub near: Option<(usize, usize)>,
     /// SQLSTATE; almost always 42601 (syntax error), but some parse-analysis
     /// errors carry their own (e.g. 42P20 for window-frame shape).
     pub sqlstate: &'static str,
@@ -236,7 +259,8 @@ impl ParseError {
     fn new(at: usize, text: &str) -> Self {
         Self {
             at,
-            message: stack_format!(96, "{}", text),
+            near: None,
+            message: stack_format!(PARSE_MESSAGE_BYTES, "{}", text),
             sqlstate: sqlstate::SYNTAX_ERROR,
             cursor: None,
             hint: None,
@@ -250,14 +274,37 @@ impl ParseError {
         Self {
             at: error.at,
             message: error.render(text),
+            near: error.echo(text),
             sqlstate: error.kind.sqlstate(),
             cursor: error.cursor(),
             hint: error.hint,
         }
     }
+
+    /// The complete message for an error raised parsing `text`.
+    pub(crate) fn render<'t>(&'t self, text: &'t str) -> impl core::fmt::Display + 't {
+        struct Rendered<'t>(&'t ParseError, &'t str);
+        impl core::fmt::Display for Rendered<'_> {
+            fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                let Rendered(error, text) = *self;
+                match error.near.and_then(|(start, end)| text.get(start..end)) {
+                    Some(near) if error.message.is_truncated() => {
+                        let message = error.message.as_str();
+                        let prefix = message
+                            .find(" at or near \"")
+                            .map_or(message, |index| &message[..index]);
+                        write!(formatter, "{prefix} at or near \"{near}\"")
+                    }
+                    _ => formatter.write_str(error.message.as_str()),
+                }
+            }
+        }
+        Rendered(self, text)
+    }
 }
 
 mod expr;
+mod typmod;
 mod window;
 
 mod ddl;
@@ -298,7 +345,19 @@ pub struct Parser<'a> {
     /// Warnings raised while parsing. PostgreSQL reports these before the
     /// statement's own output, so the engine drains them after each
     /// `next_stmt` and emits them ahead of executing it.
-    warnings: ArenaList<'a, StackStr<96>>,
+    warnings: ArenaList<'a, ParseNotice<'a>>,
+    /// End of the furthest identifier whose truncation NOTICE was recorded,
+    /// so a token scanned again after lookahead is reported once.
+    truncation_reported_to: usize,
+    /// Report errors PostgreSQL raises during parse analysis when the
+    /// statement ends instead of immediately, so the caller can still find
+    /// syntax errors later in the query text, which PostgreSQL reports first.
+    defer_analysis_errors: bool,
+    /// The first analysis error in the statement being parsed.
+    analysis_error: Option<ParseError>,
+    /// The last `next_stmt` failure was a deferred analysis error, and the
+    /// parser stands at the end of that statement.
+    analysis_error_reported: bool,
     /// True while parsing a position where `SELECT ... INTO table` is legal (a
     /// top-level query). A subquery / CTE / set-op branch clears it, so an
     /// `INTO` there is rejected as PostgreSQL rejects it.
@@ -338,6 +397,19 @@ struct WrittenTypeName<'a> {
     schema: Option<&'a str>,
     name: &'a str,
     array: bool,
+}
+
+impl core::fmt::Display for WrittenTypeName<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if let Some(schema) = self.schema {
+            write!(formatter, "{schema}.")?;
+        }
+        formatter.write_str(self.name)?;
+        if self.array {
+            formatter.write_str("[]")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -853,7 +925,7 @@ impl<'a> Parser<'a> {
             .next_token()
             .map_err(|error| ParseError::lexical(error, text))?;
         let peek_at = lexer.token_start();
-        Ok(Self {
+        let mut parser = Self {
             text,
             lexer,
             peeked,
@@ -868,6 +940,10 @@ impl<'a> Parser<'a> {
             type_inputs: &[],
             windows: ArenaList::new(arena),
             warnings: ArenaList::new(arena),
+            truncation_reported_to: 0,
+            defer_analysis_errors: false,
+            analysis_error: None,
+            analysis_error_reported: false,
             allow_into: false,
             into_clause: None,
             stop_default_at_not_null: false,
@@ -875,6 +951,37 @@ impl<'a> Parser<'a> {
             routine_parameters: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
             routine_name: None,
             named_parameters: &[],
+        };
+        parser.note_truncated_identifier()?;
+        Ok(parser)
+    }
+
+    /// Records PostgreSQL's scanner NOTICE for an identifier the lexer cut
+    /// to 63 bytes.
+    fn note_truncated_identifier(&mut self) -> Result<(), ParseError> {
+        let Some(full) = self.lexer.truncated_identifier() else {
+            return Ok(());
+        };
+        let end = self.lexer.token_end();
+        if end <= self.truncation_reported_to {
+            return Ok(());
+        }
+        self.truncation_reported_to = end;
+        let (Tok::Ident(truncated) | Tok::QuotedIdent(truncated)) = self.peeked else {
+            unreachable!("only identifiers are truncated");
+        };
+        let message = self
+            .arena
+            .alloc_str_display(format_args!(
+                "identifier \"{full}\" will be truncated to \"{truncated}\""
+            ))
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        self.notice(ParseNotice {
+            warning: false,
+            sqlstate: sqlstate::NAME_TOO_LONG,
+            message,
+            cursor: None,
+            raw: true,
         })
     }
 
@@ -1169,6 +1276,8 @@ impl<'a> Parser<'a> {
 
     /// Next statement, or None at end of input. Consumes separators.
     pub fn next_stmt(&mut self) -> Result<Option<Stmt<'a>>, ParseError> {
+        self.analysis_error_reported = false;
+        self.analysis_error = None;
         while self.peeked == Tok::Op(";") {
             self.advance()?;
         }
@@ -1177,9 +1286,46 @@ impl<'a> Parser<'a> {
         }
         let statement = self.statement()?;
         match self.peeked {
-            Tok::Op(";") | Tok::Eof => Ok(Some(statement)),
+            Tok::Op(";") | Tok::Eof => match self.analysis_error.take() {
+                Some(error) => {
+                    self.analysis_error_reported = true;
+                    Err(error)
+                }
+                None => Ok(Some(statement)),
+            },
             _ => Err(self.syntax_error_here()),
         }
+    }
+
+    /// The text this parser reads; notice and error offsets index it.
+    pub(crate) fn text(&self) -> &'a str {
+        self.text
+    }
+
+    /// Makes [`Self::next_stmt`] finish a statement that fails parse analysis
+    /// before reporting the failure; see [`Self::analysis_error_reported`].
+    pub(crate) fn defer_analysis_errors(&mut self) {
+        self.defer_analysis_errors = true;
+    }
+
+    /// Whether the last [`Self::next_stmt`] error is one PostgreSQL raises
+    /// during analysis: parsing can continue with the next statement, and
+    /// the error belongs where that statement would have run.
+    pub(crate) fn analysis_error_reported(&self) -> bool {
+        self.analysis_error_reported
+    }
+
+    /// Reports an error PostgreSQL raises during parse analysis rather than
+    /// in its grammar: immediately, or at the end of the statement when the
+    /// caller asked to defer it.
+    pub(super) fn analysis_error(&mut self, error: ParseError) -> Result<(), ParseError> {
+        if !self.defer_analysis_errors {
+            return Err(error);
+        }
+        if self.analysis_error.is_none() {
+            self.analysis_error = Some(error);
+        }
+        Ok(())
     }
 
     /// TRUNCATE [TABLE] name [, ...] [RESTART IDENTITY | CONTINUE IDENTITY]
@@ -1259,6 +1405,7 @@ impl<'a> Parser<'a> {
                         sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
                         cursor: None,
                         hint: None,
+                        near: None,
                     });
                 }
                 scroll = crate::sql::cursor::CursorScroll::Scroll;
@@ -1271,6 +1418,7 @@ impl<'a> Parser<'a> {
                         sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
                         cursor: None,
                         hint: None,
+                        near: None,
                     });
                 }
                 scroll = crate::sql::cursor::CursorScroll::NoScroll;
@@ -1285,6 +1433,7 @@ impl<'a> Parser<'a> {
                 sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         self.expect_ident("cursor")?;
@@ -1310,6 +1459,7 @@ impl<'a> Parser<'a> {
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         if let Some(clause) = query.locking.first() {
@@ -1342,7 +1492,7 @@ impl<'a> Parser<'a> {
                 return Err(ParseError {
                     at: statement_start,
                     message: stack_format!(
-                        96,
+                        PARSE_MESSAGE_BYTES,
                         "{} ... {} is {}",
                         prefix,
                         clause.strength.keyword(),
@@ -1351,6 +1501,7 @@ impl<'a> Parser<'a> {
                     sqlstate: state,
                     cursor: None,
                     hint: None,
+                    near: None,
                 });
             }
         }
@@ -1668,49 +1819,63 @@ impl<'a> Parser<'a> {
         if options.buffers && !options.analyze {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "EXPLAIN option BUFFERS requires ANALYZE"),
+                message: stack_format!(
+                    PARSE_MESSAGE_BYTES,
+                    "EXPLAIN option BUFFERS requires ANALYZE"
+                ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         if options.wal && !options.analyze {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "EXPLAIN option WAL requires ANALYZE"),
+                message: stack_format!(PARSE_MESSAGE_BYTES, "EXPLAIN option WAL requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         if timing_enabled_explicitly && !options.analyze {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "EXPLAIN option TIMING requires ANALYZE"),
+                message: stack_format!(
+                    PARSE_MESSAGE_BYTES,
+                    "EXPLAIN option TIMING requires ANALYZE"
+                ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         if options.serialize != ExplainSerialize::None && !options.analyze {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "EXPLAIN option SERIALIZE requires ANALYZE"),
+                message: stack_format!(
+                    PARSE_MESSAGE_BYTES,
+                    "EXPLAIN option SERIALIZE requires ANALYZE"
+                ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         if options.plan_mode == ExplainPlanMode::Generic && options.analyze {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    PARSE_MESSAGE_BYTES,
                     "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together"
                 ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         let statement = self.statement()?;
@@ -1984,7 +2149,7 @@ impl<'a> Parser<'a> {
                 };
                 if syntax == SettingSyntax::TimeZone && self.eat_ident("interval")? {
                     let precision = if self.peeked == Tok::Op("(") {
-                        Some(self.type_modifier("interval")?)
+                        Some(self.type_modifier("interval", true, None)?)
                     } else {
                         None
                     };
@@ -1992,7 +2157,7 @@ impl<'a> Parser<'a> {
                     let (value, type_mod) = if let Some(type_mod) = precision {
                         (literal, type_mod)
                     } else {
-                        let (value, type_mod) = self.interval_with_qualifier(literal)?;
+                        let (value, type_mod) = self.interval_with_qualifier(literal, None)?;
                         let valid_range = matches!(
                             TypeMod::decode(super::types::ColType::Interval, type_mod),
                             TypeMod::None
@@ -2190,13 +2355,14 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    PARSE_MESSAGE_BYTES,
                     "language \"{}\" does not support inline code execution",
                     language
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         Ok(Stmt::Do { body })
@@ -2669,10 +2835,16 @@ impl<'a> Parser<'a> {
             {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "operator {}.{} does not exist", schema, operator),
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "operator {}.{} does not exist",
+                        schema,
+                        operator
+                    ),
                     sqlstate: sqlstate::UNDEFINED_FUNCTION,
                     cursor: None,
                     hint: None,
+                    near: None,
                 });
             }
             match operator {
@@ -2681,13 +2853,14 @@ impl<'a> Parser<'a> {
                 _ => Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(
-                        96,
+                        PARSE_MESSAGE_BYTES,
                         "operator {} is not a valid ordering operator",
                         operator
                     ),
                     sqlstate: sqlstate::WRONG_OBJECT_TYPE,
                     cursor: None,
                     hint: None,
+                    near: None,
                 }),
             }
         } else if self.eat_ident("desc")? {
@@ -3705,6 +3878,7 @@ impl<'a> Parser<'a> {
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                         cursor: None,
                         hint: None,
+                        near: None,
                     });
                 }
                 let uri = self.expression(0)?;
@@ -4013,10 +4187,15 @@ impl<'a> Parser<'a> {
             _ => {
                 return Err(ParseError {
                     at: method_at,
-                    message: stack_format!(96, "tablesample method {} does not exist", method_name),
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "tablesample method {} does not exist",
+                        method_name
+                    ),
                     sqlstate: sqlstate::UNDEFINED_OBJECT,
                     cursor: None,
                     hint: None,
+                    near: None,
                 });
             }
         };
@@ -4035,7 +4214,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: method_at,
                 message: stack_format!(
-                    96,
+                    PARSE_MESSAGE_BYTES,
                     "tablesample method {} requires 1 argument, not {}",
                     method_name,
                     count
@@ -4043,6 +4222,7 @@ impl<'a> Parser<'a> {
                 sqlstate: sqlstate::INVALID_TABLESAMPLE_ARGUMENT,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         self.expect_op(")")?;
@@ -4312,10 +4492,15 @@ impl<'a> Parser<'a> {
                     other => {
                         return Err(ParseError {
                             at: self.peek_at,
-                            message: stack_format!(96, "COPY format \"{}\" does not exist", other),
+                            message: stack_format!(
+                                PARSE_MESSAGE_BYTES,
+                                "COPY format \"{}\" does not exist",
+                                other
+                            ),
                             sqlstate: sqlstate::UNDEFINED_OBJECT,
                             cursor: None,
                             hint: None,
+                            near: None,
                         });
                     }
                 };
@@ -4431,10 +4616,15 @@ impl<'a> Parser<'a> {
             if let Some(name) = text_only {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "cannot specify {} in BINARY mode", name),
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "cannot specify {} in BINARY mode",
+                        name
+                    ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
                 });
             }
         }
@@ -4455,10 +4645,11 @@ impl<'a> Parser<'a> {
             if let Some(name) = csv_only {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "COPY {} requires CSV mode", name),
+                    message: stack_format!(PARSE_MESSAGE_BYTES, "COPY {} requires CSV mode", name),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
                 });
             }
         }
@@ -4489,10 +4680,15 @@ impl<'a> Parser<'a> {
         if bytes.len() != 1 {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "COPY {} must be a single one-byte character", what),
+                message: stack_format!(
+                    PARSE_MESSAGE_BYTES,
+                    "COPY {} must be a single one-byte character",
+                    what
+                ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         Ok(bytes[0])
@@ -4520,10 +4716,15 @@ impl<'a> Parser<'a> {
             }
             _ => Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "COPY {} requires a quoted string", what),
+                message: stack_format!(
+                    PARSE_MESSAGE_BYTES,
+                    "COPY {} requires a quoted string",
+                    what
+                ),
                 sqlstate: sqlstate::SYNTAX_ERROR,
                 cursor: None,
                 hint: None,
+                near: None,
             }),
         }
     }
@@ -4603,20 +4804,26 @@ impl<'a> Parser<'a> {
     fn copy_unsupported_option(&self, option: &str) -> ParseError {
         ParseError {
             at: self.peek_at,
-            message: stack_format!(96, "COPY option \"{}\" is not supported", option),
+            message: stack_format!(
+                PARSE_MESSAGE_BYTES,
+                "COPY option \"{}\" is not supported",
+                option
+            ),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
             cursor: None,
             hint: None,
+            near: None,
         }
     }
 
     fn copy_unsupported(&self, what: &str) -> ParseError {
         ParseError {
             at: self.peek_at,
-            message: stack_format!(96, "{} is not supported", what),
+            message: stack_format!(PARSE_MESSAGE_BYTES, "{} is not supported", what),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
             cursor: None,
             hint: None,
+            near: None,
         }
     }
 
@@ -4678,7 +4885,7 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            PARSE_MESSAGE_BYTES,
                             "unsupported {} option \"{}\"",
                             if is_vacuum { "VACUUM" } else { "ANALYZE" },
                             option
@@ -4686,6 +4893,7 @@ impl<'a> Parser<'a> {
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                         cursor: None,
                         hint: None,
+                        near: None,
                     });
                 }
                 if self.eat_op(")")? {
@@ -4706,10 +4914,14 @@ impl<'a> Parser<'a> {
                     if !is_vacuum {
                         return Err(ParseError {
                             at: self.peek_at,
-                            message: stack_format!(96, "unsupported ANALYZE option \"ANALYZE\""),
+                            message: stack_format!(
+                                PARSE_MESSAGE_BYTES,
+                                "unsupported ANALYZE option \"ANALYZE\""
+                            ),
                             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                             cursor: None,
                             hint: None,
+                            near: None,
                         });
                     }
                     if core::mem::replace(&mut saw_analyze, true) {
@@ -4740,7 +4952,7 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            PARSE_MESSAGE_BYTES,
                             "unsupported {} option \"{}\"",
                             if is_vacuum { "VACUUM" } else { "ANALYZE" },
                             option
@@ -4748,6 +4960,7 @@ impl<'a> Parser<'a> {
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                         cursor: None,
                         hint: None,
+                        near: None,
                     });
                 }
                 break;
@@ -5391,10 +5604,15 @@ impl<'a> Parser<'a> {
                 } else {
                     return Err(ParseError {
                         at: self.peek_at,
-                        message: stack_format!(96, "unrecognized REINDEX option \"{}\"", option),
+                        message: stack_format!(
+                            PARSE_MESSAGE_BYTES,
+                            "unrecognized REINDEX option \"{}\"",
+                            option
+                        ),
                         sqlstate: sqlstate::SYNTAX_ERROR,
                         cursor: None,
                         hint: None,
+                        near: None,
                     });
                 }
                 if !self.eat_op(",")? {
@@ -6662,6 +6880,7 @@ impl<'a> Parser<'a> {
                 sqlstate: sqlstate::INVALID_GRANT_OPERATION,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         if grant {
@@ -7253,10 +7472,15 @@ impl<'a> Parser<'a> {
         let value = if negative { -value } else { value };
         StatisticsDistinct::new(value).ok_or_else(|| ParseError {
             at: self.peek_at,
-            message: stack_format!(96, "statistics option value {} is out of range", value),
+            message: stack_format!(
+                PARSE_MESSAGE_BYTES,
+                "statistics option value {} is out of range",
+                value
+            ),
             sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
             cursor: None,
             hint: None,
+            near: None,
         })
     }
 
@@ -7279,10 +7503,15 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", name),
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        name
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -7304,10 +7533,15 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", name),
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        name
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
                 });
             };
             if core::mem::replace(selected, true) {
@@ -7409,10 +7643,15 @@ impl<'a> Parser<'a> {
         let value = self.str_literal("transaction identifier")?;
         PreparedTransactionId::parse(value).ok_or(ParseError {
             at: self.peek_at,
-            message: stack_format!(96, "transaction identifier \"{}\" is too long", value),
+            message: stack_format!(
+                PARSE_MESSAGE_BYTES,
+                "transaction identifier \"{}\" is too long",
+                value
+            ),
             sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
             cursor: None,
             hint: None,
+            near: None,
         })
     }
 
@@ -7625,10 +7864,14 @@ impl<'a> Parser<'a> {
                 }
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "number of columns does not match number of values"),
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "number of columns does not match number of values"
+                    ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
                 });
             }
             for (name, value) in names.as_slice().iter().zip(values.as_slice()) {
@@ -8493,10 +8736,10 @@ impl<'a> Parser<'a> {
         if (name == "character" || name == "char") && self.eat_ident("varying")? {
             name = "varchar";
         }
-        let standard_temporal = name == "timestamp" || name == "time";
-        let mut leading_type_mod = None;
+        let standard_temporal = keyword && (name == "timestamp" || name == "time");
+        let mut leading_typmods = None;
         if standard_temporal && self.peeked == Tok::Op("(") {
-            leading_type_mod = Some(self.type_modifier(name)?);
+            leading_typmods = Some(self.written_typmods(true)?);
         }
         if standard_temporal {
             if self.eat_ident("with")? {
@@ -8512,17 +8755,39 @@ impl<'a> Parser<'a> {
                 self.expect_ident("zone")?;
             }
         }
-        let type_mod = if let Some(type_mod) = leading_type_mod {
-            type_mod
+        let mut typmods = leading_typmods;
+        let type_mod = if typmods.is_some() {
+            -1
         } else if standard_temporal && self.peeked == Tok::Op("(") {
-            return Err(self.unexpected("precision must precede WITH/WITHOUT TIME ZONE"));
-        } else if name == "float" && self.peeked == Tok::Op("(") {
+            return Err(self.syntax_error_here());
+        } else if keyword && name == "float" && self.peeked == Tok::Op("(") {
             name = self.float_precision_type()?;
             -1
         } else if self.peeked == Tok::Op("(") {
-            self.type_modifier(name)?
+            // PostgreSQL's keyword spellings without modifiers (`integer`,
+            // `boolean`, `double precision`, `json`) end before `(`.
+            if keyword
+                && !matches!(
+                    name,
+                    "numeric"
+                        | "decimal"
+                        | "dec"
+                        | "bit"
+                        | "varbit"
+                        | "character"
+                        | "char"
+                        | "varchar"
+                        | "interval"
+                )
+            {
+                return Err(self.syntax_error_here());
+            }
+            let integer_constant_only =
+                keyword && matches!(name, "character" | "char" | "varchar" | "interval");
+            typmods = Some(self.written_typmods(integer_constant_only)?);
+            -1
         } else if name == "interval" {
-            self.interval_range_modifier()?.unwrap_or(-1)
+            self.interval_range_modifier(source.start)?.unwrap_or(-1)
         } else if name == "char" || name == "character" {
             // Bare `char`/`character` is char(1) in PostgreSQL (`'ab'::char`
             // is 'a'); only the internal name `bpchar` means unlimited.
@@ -8563,12 +8828,19 @@ impl<'a> Parser<'a> {
                 self.array_bound()?;
             }
         }
+        written.array = array;
+        let type_mod = match typmods {
+            Some(typmods) => {
+                let display = written;
+                self.checked_typmod(name, typmods, Some(source.start), format_args!("{display}"))?
+            }
+            None => type_mod,
+        };
         if array {
             let array = self
                 .arena
                 .alloc_str(stack_format!(132, "{}[]", name).as_str())
                 .map_err(|_| self.err_here("type name too long"))?;
-            written.array = true;
             return Ok((array, type_mod, written));
         }
         Ok((name, type_mod, written))
@@ -8591,31 +8863,29 @@ impl<'a> Parser<'a> {
     /// catalogs never carry an unvalidated precision beside a float value.
     fn float_precision_type(&mut self) -> Result<&'a str, ParseError> {
         self.expect_op("(")?;
-        let Tok::Num(text) = self.peeked else {
-            return Err(self.unexpected("float precision must be an integer"));
+        let precision_at = self.peek_at;
+        let Some(precision) = (match self.peeked {
+            Tok::Num(text) => crate::sql::eval::parse_int_literal(text)
+                .and_then(|value| i32::try_from(value).ok()),
+            _ => None,
+        }) else {
+            return Err(self.syntax_error_here());
         };
-        let precision = text
-            .parse::<u32>()
-            .map_err(|_| self.unexpected("float precision must be an integer"))?;
         self.advance()?;
         self.expect_op(")")?;
-        if precision == 0 {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "precision for type float must be at least 1 bit"),
-                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                cursor: None,
-                hint: None,
-            });
+        let error = |message: &str| ParseError {
+            at: precision_at,
+            message: StackStr::from_str(message),
+            sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            cursor: Some(precision_at),
+            hint: None,
+            near: None,
+        };
+        if precision < 1 {
+            return Err(error("precision for type float must be at least 1 bit"));
         }
         if precision > 53 {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "precision for type float must be less than 54 bits"),
-                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                cursor: None,
-                hint: None,
-            });
+            return Err(error("precision for type float must be less than 54 bits"));
         }
         Ok(if precision <= 24 { "float4" } else { "float8" })
     }
@@ -8624,7 +8894,7 @@ impl<'a> Parser<'a> {
     /// `interval` type name. The raw bit mask is produced only by
     /// `IntervalRange::encode`, so invalid field combinations cannot enter a
     /// stored or wire type modifier.
-    fn interval_range_modifier(&mut self) -> Result<Option<i32>, ParseError> {
+    fn interval_range_modifier(&mut self, type_at: usize) -> Result<Option<i32>, ParseError> {
         let Tok::Ident(first_name) = self.peeked else {
             return Ok(None);
         };
@@ -8655,7 +8925,7 @@ impl<'a> Parser<'a> {
             }
             match TypeMod::decode(
                 super::types::ColType::Interval,
-                self.type_modifier("interval")?,
+                self.type_modifier("interval", true, Some(type_at))?,
             ) {
                 TypeMod::IntervalMod {
                     precision: Some(precision),
@@ -8676,134 +8946,6 @@ impl<'a> Parser<'a> {
     fn type_name(&mut self) -> Result<&'a str, ParseError> {
         let (name, _type_mod) = self.type_name_mod()?;
         Ok(name)
-    }
-
-    /// Parses `(n)` or `(p[,s])` and encodes PostgreSQL's atttypmod. Only
-    /// varchar/char (length) and numeric/decimal (precision, scale) take one.
-    fn type_modifier(&mut self, base: &str) -> Result<i32, ParseError> {
-        self.expect_op("(")?;
-        let mut nums = [0i64; 2];
-        let mut n = 0;
-        loop {
-            match self.peeked {
-                Tok::Num(t) => {
-                    if n == 2 {
-                        return Err(self.unexpected("too many type-modifier arguments"));
-                    }
-                    let Ok(v) = t.parse::<i64>() else {
-                        return Err(self.unexpected("type modifier must be an integer"));
-                    };
-                    nums[n] = v;
-                    n += 1;
-                    self.advance()?;
-                }
-                Tok::Op(",") => self.advance()?,
-                Tok::Op(")") => {
-                    self.advance()?;
-                    break;
-                }
-                _ => return Err(self.syntax_error_here()),
-            }
-        }
-        match base {
-            "varchar" | "char" | "character" | "bpchar" => {
-                if n != 1 {
-                    return Err(self.unexpected("length for character type takes one argument"));
-                }
-                if !(1..=10_485_760).contains(&nums[0]) {
-                    return Err(self.unexpected("length for character type must be 1..10485760"));
-                }
-                Ok(TypeMod::Length(nums[0] as usize).encode())
-            }
-            "numeric" | "decimal" | "dec" => {
-                if n < 1 {
-                    return Err(self.unexpected("numeric type modifier requires a precision"));
-                }
-                let p = nums[0];
-                let s = if n == 2 { nums[1] } else { 0 };
-                if !(1..=1000).contains(&p) {
-                    return Err(self.unexpected("numeric precision must be between 1 and 1000"));
-                }
-                if !(0..=p).contains(&s) {
-                    return Err(self.unexpected("numeric scale must be between 0 and precision"));
-                }
-                Ok(TypeMod::NumericPS {
-                    precision: p as u16,
-                    scale: s as u16,
-                }
-                .encode())
-            }
-            "bit" | "varbit" => {
-                if n != 1 {
-                    return Err(self.unexpected("length for bit type takes one argument"));
-                }
-                if nums[0] < 1 {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(96, "length for type {} must be at least 1", base),
-                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                        cursor: None,
-                        hint: None,
-                    });
-                }
-                // PostgreSQL 18.6 varbit.c: MaxAttrSize * BITS_PER_BYTE.
-                if nums[0] > 83_886_080 {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(
-                            96,
-                            "length for type {} cannot exceed 83886080",
-                            base
-                        ),
-                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                        cursor: None,
-                        hint: None,
-                    });
-                }
-                Ok(TypeMod::BitLength(nums[0] as usize).encode())
-            }
-            // Fractional-second precision, 0..=6. A larger value is clamped to
-            // 6, and PostgreSQL warns when it does so.
-            "timestamp" | "timestamptz" | "time" | "timetz" | "interval" => {
-                if n != 1 {
-                    return Err(self.unexpected("precision for this type takes one argument"));
-                }
-                if nums[0] < 0 {
-                    return Err(self.unexpected("precision must be between 0 and 6"));
-                }
-                if nums[0] > 6 {
-                    // PostgreSQL names the SQL type, not the alias written:
-                    // `timestamptz(7)` is reported as TIMESTAMP(7) WITH TIME ZONE.
-                    let (sql_name, zoned) = match base {
-                        "timestamp" => ("TIMESTAMP", false),
-                        "timestamptz" => ("TIMESTAMP", true),
-                        "time" => ("TIME", false),
-                        "timetz" => ("TIME", true),
-                        _ => ("INTERVAL", false),
-                    };
-                    self.warn(stack_format!(
-                        96,
-                        "{}({}){} precision reduced to maximum allowed, 6",
-                        sql_name,
-                        nums[0],
-                        if zoned { " WITH TIME ZONE" } else { "" }
-                    ))?;
-                }
-                let precision = nums[0].min(6) as u8;
-                // A plain `interval(p)` carries the full field range beside its
-                // precision; the other temporal types carry the precision bare.
-                if base == "interval" {
-                    Ok(TypeMod::IntervalMod {
-                        range: IntervalRange::Full,
-                        precision: Some(precision),
-                    }
-                    .encode())
-                } else {
-                    Ok(TypeMod::TemporalPrecision(precision).encode())
-                }
-            }
-            _ => Err(self.unexpected("type modifier is not supported for this type yet")),
-        }
     }
 
     fn alias(&mut self) -> Result<Option<&'a str>, ParseError> {
@@ -8940,10 +9082,14 @@ impl<'a> Parser<'a> {
             if path && identifier && value.len() > 63 {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "search_path identifier is longer than 63 bytes"),
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "search_path identifier is longer than 63 bytes"
+                    ),
                     sqlstate: sqlstate::NAME_TOO_LONG,
                     cursor: None,
                     hint: None,
+                    near: None,
                 });
             }
             if count != 0 {
@@ -8991,10 +9137,15 @@ impl<'a> Parser<'a> {
             {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "parameter \"{}\" requires a single value", name),
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "parameter \"{}\" requires a single value",
+                        name
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
                 });
             }
         }
@@ -9094,7 +9245,7 @@ impl<'a> Parser<'a> {
             .next_token()
             .map_err(|error| ParseError::lexical(error, self.text))?;
         self.peek_at = self.lexer.token_start();
-        Ok(())
+        self.note_truncated_identifier()
     }
 
     /// Looks past the current token without consuming it.  The only caller
@@ -9162,17 +9313,17 @@ impl<'a> Parser<'a> {
         self.any_ident(what)
     }
 
-    /// Records a warning for the engine to emit before this statement runs.
-    fn warn(&mut self, message: StackStr<96>) -> Result<(), ParseError> {
+    /// Records a notice for the engine to emit before this statement runs.
+    fn notice(&mut self, notice: ParseNotice<'a>) -> Result<(), ParseError> {
         self.warnings
-            .push(message)
+            .push(notice)
             .map_err(|_| self.arena_full("statement too large for SQL arena"))
     }
 
-    /// Takes the warnings raised since the last call, in the order parsed.
+    /// Takes the notices raised since the last call, in the order parsed.
     /// The returned slice stays valid: the replacement list starts empty, so
-    /// later warnings allocate fresh arena storage.
-    pub fn take_warnings(&mut self) -> &'a [StackStr<96>] {
+    /// later notices allocate fresh arena storage.
+    pub fn take_warnings(&mut self) -> &'a [ParseNotice<'a>] {
         let taken = core::mem::replace(&mut self.warnings, ArenaList::new(self.arena));
         taken.as_slice()
     }
@@ -9200,10 +9351,11 @@ impl<'a> Parser<'a> {
         let text = crate::stack_format!(130, "{}.{}", schema, table);
         self.arena.alloc_str(text.as_str()).map_err(|_| ParseError {
             at: self.peek_at,
-            message: crate::stack_format!(96, "statement too large for SQL arena"),
+            message: crate::stack_format!(PARSE_MESSAGE_BYTES, "statement too large for SQL arena"),
             sqlstate: crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
             cursor: None,
             hint: None,
+            near: None,
         })
     }
 
@@ -9445,10 +9597,14 @@ impl<'a> Parser<'a> {
         if flat.len() == MAX_GROUP_TERMS {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "target lists can have at most 1664 entries"),
+                message: stack_format!(
+                    PARSE_MESSAGE_BYTES,
+                    "target lists can have at most 1664 entries"
+                ),
                 sqlstate: sqlstate::TOO_MANY_COLUMNS,
                 cursor: None,
                 hint: None,
+                near: None,
             });
         }
         let index = flat.len();
@@ -9508,10 +9664,11 @@ impl<'a> Parser<'a> {
             if terms.len() > MAX_CUBE_TERMS {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "CUBE is limited to 12 elements"),
+                    message: stack_format!(PARSE_MESSAGE_BYTES, "CUBE is limited to 12 elements"),
                     sqlstate: sqlstate::TOO_MANY_COLUMNS,
                     cursor: None,
                     hint: None,
+                    near: None,
                 });
             }
             for subset in 0usize..(1usize << terms.len()) {
@@ -9560,10 +9717,14 @@ impl<'a> Parser<'a> {
     fn grouping_sets_limit(&self) -> ParseError {
         ParseError {
             at: self.peek_at,
-            message: stack_format!(96, "too many grouping sets present (maximum 4096)"),
+            message: stack_format!(
+                PARSE_MESSAGE_BYTES,
+                "too many grouping sets present (maximum 4096)"
+            ),
             sqlstate: sqlstate::STATEMENT_TOO_COMPLEX,
             cursor: None,
             hint: None,
+            near: None,
         }
     }
 
@@ -9637,10 +9798,11 @@ impl<'a> Parser<'a> {
     fn unexpected(&self, expected: &str) -> ParseError {
         ParseError {
             at: self.peek_at,
-            message: stack_format!(96, "syntax error: {}", expected),
+            message: stack_format!(PARSE_MESSAGE_BYTES, "syntax error: {}", expected),
             sqlstate: sqlstate::SYNTAX_ERROR,
             cursor: None,
             hint: None,
+            near: None,
         }
     }
 
@@ -9653,6 +9815,7 @@ impl<'a> Parser<'a> {
                 cursor: Some(self.peek_at),
                 hint: None,
                 message: StackStr::from_str("syntax error at end of input"),
+                near: None,
                 sqlstate: sqlstate::SYNTAX_ERROR,
             }
         } else {
@@ -9667,7 +9830,12 @@ impl<'a> Parser<'a> {
             at: start,
             cursor: Some(start),
             hint: None,
-            message: stack_format!(96, "syntax error at or near \"{}\"", &self.text[start..end]),
+            message: stack_format!(
+                PARSE_MESSAGE_BYTES,
+                "syntax error at or near \"{}\"",
+                &self.text[start..end]
+            ),
+            near: Some((start, end)),
             sqlstate: sqlstate::SYNTAX_ERROR,
         }
     }
@@ -9679,12 +9847,13 @@ impl<'a> Parser<'a> {
             cursor: Some(at),
             hint: None,
             message: stack_format!(
-                96,
+                PARSE_MESSAGE_BYTES,
                 "conflicting NULL/NOT NULL declarations for column \"{}\" of table \"{}\"",
                 column,
                 table
             ),
             sqlstate: sqlstate::SYNTAX_ERROR,
+            near: None,
         }
     }
 
@@ -9696,6 +9865,7 @@ impl<'a> Parser<'a> {
             hint: None,
             message: StackStr::from_str("conflicting NULL/NOT NULL constraints"),
             sqlstate: sqlstate::SYNTAX_ERROR,
+            near: None,
         }
     }
 
@@ -9712,6 +9882,7 @@ impl<'a> Parser<'a> {
             sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
             cursor: None,
             hint: None,
+            near: None,
         }
     }
 
@@ -9719,20 +9890,27 @@ impl<'a> Parser<'a> {
     fn arena_full(&self, message: &'static str) -> ParseError {
         ParseError {
             at: self.peek_at,
-            message: stack_format!(96, "{}", message),
+            message: stack_format!(PARSE_MESSAGE_BYTES, "{}", message),
             sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
             cursor: None,
             hint: None,
+            near: None,
         }
     }
 
     fn limit(&self, what: &'static str, max: usize) -> ParseError {
         ParseError {
             at: self.peek_at,
-            message: stack_format!(96, "{} exceeds fixed limit of {}", what, max),
+            message: stack_format!(
+                PARSE_MESSAGE_BYTES,
+                "{} exceeds fixed limit of {}",
+                what,
+                max
+            ),
             sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
             cursor: None,
             hint: None,
+            near: None,
         }
     }
 }
@@ -12400,8 +12578,15 @@ mod tests {
                 assert_eq!(error.cursor, Some(cursor), "{sql}");
             });
         }
+        // Type modifiers fail in parse analysis, pointing at the type name.
         with_parser("SELECT 1::numeric(2000)", |parser| {
-            assert_eq!(parser.next_stmt().unwrap_err().cursor, None);
+            let error = parser.next_stmt().unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::INVALID_PARAMETER_VALUE);
+            assert_eq!(
+                error.message.as_str(),
+                "NUMERIC precision 2000 must be between 1 and 1000"
+            );
+            assert_eq!(error.cursor, Some(10));
         });
     }
 
@@ -12491,7 +12676,7 @@ mod tests {
                 assert!(
                     warnings
                         .iter()
-                        .all(|warning| warning.as_str().contains("precision reduced"))
+                        .all(|warning| warning.message.contains("precision reduced"))
                 );
             },
         );
@@ -12908,7 +13093,7 @@ mod tests {
                 assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
                 assert_eq!(
                     error.message,
-                    stack_format!(96, "syntax error at or near \"{}\"", token)
+                    stack_format!(PARSE_MESSAGE_BYTES, "syntax error at or near \"{}\"", token)
                 );
                 assert_eq!(&sql[error.at..error.at + token.len()], token);
             });

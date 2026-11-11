@@ -228,3 +228,33 @@ fn object_definitions_deparse_conditions_and_wrap_view_targets() {
         assert_eq!(rows(&mut engine, &mut budget, sql), [expected], "{sql}");
     }
 }
+
+/// `IS [NOT] DISTINCT FROM` and `IS [NOT] TRUE/FALSE` print as PostgreSQL's
+/// DistinctExpr and BooleanTest nodes, plain and pretty.
+#[test]
+fn distinct_and_boolean_tests_print_postgresql_nodes() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE tested(a integer, b integer, c boolean, \
+         CONSTRAINT d1 CHECK (a IS DISTINCT FROM b), \
+         CONSTRAINT d2 CHECK (a IS NOT DISTINCT FROM 1), \
+         CONSTRAINT d3 CHECK (c IS NOT TRUE OR a > 0), \
+         CONSTRAINT d4 CHECK (NOT c IS FALSE))",
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_constraintdef(oid), pg_get_constraintdef(oid, true) \
+             FROM pg_constraint WHERE conrelid = 'tested'::regclass ORDER BY conname"
+        ),
+        [
+            "CHECK ((a IS DISTINCT FROM b))|CHECK (a IS DISTINCT FROM b)",
+            "CHECK ((NOT (a IS DISTINCT FROM 1)))|CHECK (NOT a IS DISTINCT FROM 1)",
+            "CHECK (((c IS NOT TRUE) OR (a > 0)))|CHECK (c IS NOT TRUE OR a > 0)",
+            "CHECK ((NOT (c IS FALSE)))|CHECK (NOT c IS FALSE)",
+        ]
+    );
+}

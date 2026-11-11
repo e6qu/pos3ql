@@ -293,10 +293,13 @@ statement runs. Column defaults, CHECK constraints, routine parameter defaults
 `RETURN` bodies, index predicates, trigger `WHEN` conditions and rule
 conditions are printed in PostgreSQL's analyzed form (`'x'::text`,
 `((k >= 1) AND (k <= 5))`), but only for literals, columns, parameters,
-operators, `IN`, `LIKE`, `IS NULL`, `CASE`, casts, SQL value functions and
-built-in function calls; other expressions (subqueries, user-defined function
-calls, `$n` parameters, array constructors, whole-row references and `IS
-DISTINCT FROM`) are still printed as stored. `pg_get_viewdef` uses PostgreSQL's
+operators, `IN`, `LIKE`, `IS NULL`, `IS [NOT] DISTINCT FROM`, `IS [NOT]
+TRUE/FALSE`, `CASE`, casts, SQL value functions and built-in function calls;
+other expressions (subqueries, user-defined function calls, `$n` parameters,
+array constructors and whole-row references) are still printed as stored, and
+an index expression or view that passes a whole-row reference to a function
+taking the table's row type (`CREATE INDEX ON t (f(t.*))`) fails with `42883`
+because its validation types the reference as `record`. `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their

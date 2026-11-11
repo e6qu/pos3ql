@@ -215,7 +215,10 @@ impl<'a> Parser<'a> {
                         operand: None,
                         whens,
                         otherwise: Some(else_v),
-                        origin: crate::sql::ast::CaseOrigin::BooleanTest,
+                        origin: crate::sql::ast::CaseOrigin::BooleanTest {
+                            value: is_true,
+                            negated,
+                        },
                     })?;
                     continue;
                 }

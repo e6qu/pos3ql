@@ -1624,7 +1624,7 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         // PostgreSQL labels those `?column?`; a real CASE forwards to its ELSE.
         Expr::Case {
             origin:
-                crate::sql::ast::CaseOrigin::BooleanTest
+                crate::sql::ast::CaseOrigin::BooleanTest { .. }
                 | crate::sql::ast::CaseOrigin::DistinctFrom { .. },
             ..
         } => None,

@@ -5879,8 +5879,9 @@ pub enum Expr<'a> {
 pub enum CaseOrigin {
     /// A `CASE` expression the query wrote.
     Written,
-    /// `x IS [NOT] TRUE` or `x IS [NOT] FALSE`.
-    BooleanTest,
+    /// `x IS [NOT] TRUE` (`value`) or `x IS [NOT] FALSE`: one `WHEN` whose
+    /// condition is `x`, or `NOT x` for `FALSE`.
+    BooleanTest { value: bool, negated: bool },
     /// `x IS [NOT] DISTINCT FROM y`: `WHEN x IS NULL AND y IS NULL`, then
     /// `WHEN x IS NULL OR y IS NULL`, else the `=` comparison of `x` and `y`
     /// (negated for `IS DISTINCT FROM`), as PostgreSQL's `DistinctExpr` calls
@@ -6040,6 +6041,33 @@ impl<'a> Expr<'a> {
             } => Some((left, right, *negated)),
             _ => None,
         }
+    }
+
+    /// The operand of `x IS [NOT] TRUE/FALSE`, the tested value and whether
+    /// the test is negated.
+    pub(crate) fn boolean_test_operand(&self) -> Option<(&'a Expr<'a>, bool, bool)> {
+        let Expr::Case {
+            origin: CaseOrigin::BooleanTest { value, negated },
+            whens: [(condition, _)],
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let condition: &'a Expr<'a> = condition;
+        let operand = if *value {
+            condition
+        } else {
+            match condition {
+                Expr::Unary {
+                    operator: UnaryOp::Not,
+                    operand,
+                    ..
+                } => operand,
+                _ => return None,
+            }
+        };
+        Some((operand, *value, *negated))
     }
 
     pub(crate) const fn source_position(&self) -> SourcePosition {

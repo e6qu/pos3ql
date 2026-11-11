@@ -160,8 +160,9 @@ For example, reading a cached invoice continues while another connection's
 commit uploads, and while cleanup lists or deletes old files. Two behaviors are
 worth knowing:
 
-- A large single-table `SELECT` (no sorting, grouping, joins or subqueries)
-  resumes row by row: a cold block after delivered rows yields like any other
+- A large `SELECT` from one table, a retained join or a grouping (no
+  sorting, subqueries or set operations in object-store mode) resumes row by
+  row: a cold block after delivered rows yields like any other
   download. Other large results, once their first bytes have reached the
   client, finish their remaining reads synchronously, because a sent prefix
   cannot be withdrawn. Rows the client has not yet read never hold the worker;

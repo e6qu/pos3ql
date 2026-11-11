@@ -100,6 +100,8 @@ enum ColdRequest {
     Select,
     Paged,
     Copy,
+    /// A paged portal of a grouping, which reads its whole input first.
+    Grouped,
 }
 
 #[test]
@@ -117,8 +119,13 @@ fn copy_to_stdout_yields_on_cold_reads_after_delivered_rows() {
     cold_result_stream("result-stream-cold-copy", ColdRequest::Copy);
 }
 
+#[test]
+fn grouped_paged_portals_yield_on_cold_reads_and_read_each_object_once() {
+    cold_result_stream("result-stream-cold-grouped", ColdRequest::Grouped);
+}
+
 fn cold_result_stream(name: &str, request: ColdRequest) {
-    let paged = request == ColdRequest::Paged;
+    let paged = matches!(request, ColdRequest::Paged | ColdRequest::Grouped);
     let mut config = test_config(name);
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -192,6 +199,10 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             ColdRequest::Select => query(sql),
             ColdRequest::Paged => paged_request(sql, 50),
             ColdRequest::Copy => query("COPY cold_orders TO STDOUT"),
+            ColdRequest::Grouped => paged_request(
+                "SELECT id, max(code), count(*) FROM cold_orders GROUP BY id",
+                50,
+            ),
         })
         .unwrap();
     let mut poll = libc::pollfd {
@@ -207,6 +218,8 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
 
     let mut received = Vec::new();
     let mut yielded_after_rows = false;
+    let mut fetched = std::collections::HashSet::new();
+    let mut gets = 0usize;
     let mut deadline = Instant::now() + Duration::from_secs(10);
     loop {
         read_available(&mut client, &mut received);
@@ -221,10 +234,13 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             Instant::now() < deadline,
             "cold result stream did not finish"
         );
+        // A grouping reads its whole input before its first row: its waits
+        // come before any row.
+        let grouped = request == ColdRequest::Grouped;
         if conn.parked_wait() == Some(StatementWait::ObjectIo)
             && conn.result_stream_active()
-            && (!paged || delivered > 50)
-            && delivered > 0
+            && (grouped || !paged || delivered > 50)
+            && (grouped || delivered > 0)
             && !yielded_after_rows
         {
             yielded_after_rows = true;
@@ -250,6 +266,8 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
                     .strip_prefix(&prefix)
                     .unwrap()
                     .to_owned();
+                gets += 1;
+                fetched.insert(key.clone());
                 let body = namespace.borrow().object_bytes(&key).unwrap().to_vec();
                 reply(&mut stream, &request, &body);
                 deadline = Instant::now() + Duration::from_secs(10);
@@ -280,6 +298,19 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         String::from_utf8_lossy(response[kinds.len() - 2].1)
     );
     match request {
+        ColdRequest::Grouped => {
+            assert_eq!(kinds.iter().filter(|kind| **kind == b's').count(), 3);
+            assert_eq!(response[kinds.len() - 2].1, b"SELECT 170\0");
+            // The portal opens its stream before running, and the input read
+            // position survives each wait. Its one repeated GET matches an
+            // ungrouped paged stream of the same table; a restarted
+            // statement would read every object again.
+            assert!(
+                gets <= fetched.len() + 1,
+                "{gets} GETs of {}",
+                fetched.len()
+            );
+        }
         ColdRequest::Paged => {
             // Each full page suspends; the unlimited Execute returns the rest.
             assert_eq!(kinds.iter().filter(|kind| **kind == b's').count(), 3);
@@ -317,10 +348,13 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         let values = fields(row.1);
         assert_eq!(values[0], (index + 1).to_string().as_bytes());
         assert_eq!(checksum(values[1]), expected[index]);
+        if request == ColdRequest::Grouped {
+            assert_eq!(values[2], b"1");
+        }
     }
     assert!(
         yielded_after_rows,
-        "a cold read after delivered rows must yield instead of blocking"
+        "a cold read after delivered rows, or a grouping's input read, must yield instead of blocking"
     );
     assert!(engine.result_stream_metrics().opened >= 1);
     drop(conn.close());

@@ -204,8 +204,17 @@ pub(super) fn groups_for_mask<'a>(
     let (n_groups, rep_keys): (usize, &[&[u8]]) = if storage.spill_attached() && n_keys > 0 {
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
-        let mut compare =
-            |a: &[u8], b: &[u8]| compare_group_rows(storage, txid, group_collations, a, b);
+        // Equal keys keep input order, so each group reports its first input
+        // row's key, as PostgreSQL's hashed grouping does.
+        let input_position = |row: &[u8]| match crate::sql::exec::decode_projected_pub(row, n_keys)
+        {
+            Datum::Int4(position) => position,
+            _ => 0,
+        };
+        let mut compare = |a: &[u8], b: &[u8]| {
+            compare_group_rows(storage, txid, group_collations, a, b)
+                .map(|ordering| ordering.then_with(|| input_position(a).cmp(&input_position(b))))
+        };
         let mut at = 0u32;
         scan_source_recycling_with_pax_columns(
             storage,
@@ -411,9 +420,12 @@ pub(super) fn groups_for_mask<'a>(
                 },
             )?;
         }
+        // Equal keys keep input order, so each group reports its first input
+        // row's key, as PostgreSQL's hashed grouping does.
         keys.sort_unstable_by(|left, right| {
             compare_group_rows(storage, txid, group_collations, left.0, right.0)
                 .expect("validated group keys compare without error")
+                .then(left.1.cmp(&right.1))
         });
         let ng = {
             let mut g = 0usize;
@@ -443,20 +455,22 @@ pub(super) fn groups_for_mask<'a>(
         {
             let mut g = 0usize;
             for i in 0..keys.len() {
-                if i > 0
-                    && !compare_group_rows(
+                let first = i == 0
+                    || !compare_group_rows(
                         storage,
                         txid,
                         group_collations,
                         keys[i].0,
                         keys[i - 1].0,
                     )?
-                    .is_eq()
-                {
+                    .is_eq();
+                if i > 0 && first {
                     g += 1;
                 }
                 group_of[keys[i].1 as usize] = g as u32;
-                rep_keys_buf[g] = keys[i].0;
+                if first {
+                    rep_keys_buf[g] = keys[i].0;
+                }
             }
         }
         (ng, &rep_keys_buf[..ng])
@@ -1365,7 +1379,7 @@ fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
 /// ungrouped-column error, so this reports which one rather than only whether
 /// there was one; a whole expression matching a grouping key is covered
 /// outright, and an aggregate's arguments are covered by the aggregate.
-fn ungrouped_column<'e, 'a>(
+pub(super) fn ungrouped_column<'e, 'a>(
     expression: &'e Expr<'a>,
     group_by: &[&Expr<'a>],
     scope: &QueryScope<'a>,

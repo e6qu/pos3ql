@@ -1728,6 +1728,29 @@ impl<'d> QueryScope<'d> {
         arena: &'a Arena,
         outer: Option<&dyn ColumnLookup<'_>>,
     ) -> Result<QueryScope<'a>, SqlError> {
+        Self::resolve_schema_joins(storage, from, txid, arena, outer, false)
+    }
+
+    /// [`Self::resolve_schema`] that also synthesizes the `USING` and
+    /// `NATURAL` join conditions, for a reader that evaluates its joins
+    /// without executing the general executor's scope.
+    pub(super) fn resolve_schema_with_join_conditions<'a>(
+        storage: &'a Storage,
+        from: &'a FromClause<'a>,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<QueryScope<'a>, SqlError> {
+        Self::resolve_schema_joins(storage, from, txid, arena, None, true)
+    }
+
+    fn resolve_schema_joins<'a>(
+        storage: &'a Storage,
+        from: &'a FromClause<'a>,
+        txid: u32,
+        arena: &'a Arena,
+        outer: Option<&dyn ColumnLookup<'_>>,
+        join_conditions: bool,
+    ) -> Result<QueryScope<'a>, SqlError> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
         scope.add_schema(storage, &from.base, txid, arena, outer)?;
         for j in from.joins {
@@ -1738,7 +1761,7 @@ impl<'d> QueryScope<'d> {
             scope.add_schema(storage, &j.table, txid, arena, outer)?;
         }
         scope.check_join_conditions(from, outer, None)?;
-        scope.build_merges(from, arena, None)?;
+        scope.build_merges(from, arena, join_conditions.then_some(arena))?;
         scope.name_repeated_columns(arena)?;
         Ok(scope)
     }

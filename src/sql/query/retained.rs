@@ -3,6 +3,7 @@
 use super::*;
 use crate::mem::arena::ArenaMark;
 
+mod grouping;
 mod join;
 mod sort;
 pub(crate) use join::MAX_RETAINED_SOURCES;
@@ -256,6 +257,10 @@ pub(crate) struct RetainedSelect<'a> {
     saves_scroll_output: bool,
     /// An ORDER BY the reader sorts itself in `plan_build_bytes`.
     sort: Option<sort::SortState<'a>>,
+    /// Grouping and aggregates the reader computes itself in
+    /// `plan_build_bytes`; `predicate` is then the WHERE run as input is
+    /// read.
+    grouping: Option<grouping::GroupState<'a>>,
     /// A statement's RowDescription, sent once its first row is prepared:
     /// a sort or hash table that does not fit leaves nothing queued, and the
     /// statement runs in the general executor instead.
@@ -299,7 +304,41 @@ fn retained_expression(
     catalog: &dyn super::super::eval::CatalogAccess,
     statement: Option<(&Storage, u32)>,
 ) -> bool {
+    retained_expression_with(expression, catalog, statement, Leaves::Scalar)
+}
+
+/// Which calls [`retained_expression_with`] accepts besides scalar ones.
+#[derive(Clone, Copy)]
+enum Leaves<'s> {
+    Scalar,
+    /// Any call without `OVER`, before scope resolution tells aggregates
+    /// apart; a grouped reader checks them once it does.
+    Calls,
+    /// These aggregate calls, whose inputs a grouped reader checks itself.
+    Aggregates(&'s [*const Expr<'s>]),
+}
+
+fn same_node(pointer: *const Expr<'_>, expression: &Expr<'_>) -> bool {
+    core::ptr::eq(
+        pointer.cast::<u8>(),
+        (expression as *const Expr<'_>).cast::<u8>(),
+    )
+}
+
+fn retained_expression_with(
+    expression: &Expr<'_>,
+    catalog: &dyn super::super::eval::CatalogAccess,
+    statement: Option<(&Storage, u32)>,
+    leaves: Leaves<'_>,
+) -> bool {
     use crate::sql::ast::UnaryOp;
+    if let Leaves::Aggregates(pointers) = leaves
+        && pointers
+            .iter()
+            .any(|pointer| same_node(*pointer, expression))
+    {
+        return true;
+    }
     match expression {
         Expr::Column { .. }
         | Expr::SchemaColumn { .. }
@@ -318,7 +357,9 @@ fn retained_expression(
             operand,
             ..
         }
-        | Expr::IsNull { operand, .. } => retained_expression(operand, catalog, statement),
+        | Expr::IsNull { operand, .. } => {
+            retained_expression_with(operand, catalog, statement, leaves)
+        }
         Expr::Binary {
             operator,
             left,
@@ -328,8 +369,8 @@ fn retained_expression(
             operator
                 .operator_name()
                 .is_none_or(|name| !catalog.has_operator_candidate(name))
-                && retained_expression(left, catalog, statement)
-                && retained_expression(right, catalog, statement)
+                && retained_expression_with(left, catalog, statement, leaves)
+                && retained_expression_with(right, catalog, statement, leaves)
         }
         Expr::Case {
             operand: None,
@@ -338,27 +379,30 @@ fn retained_expression(
             ..
         } => {
             whens.iter().all(|(condition, value)| {
-                retained_expression(condition, catalog, statement)
-                    && retained_expression(value, catalog, statement)
-            }) && otherwise.is_none_or(|value| retained_expression(value, catalog, statement))
+                retained_expression_with(condition, catalog, statement, leaves)
+                    && retained_expression_with(value, catalog, statement, leaves)
+            }) && otherwise
+                .is_none_or(|value| retained_expression_with(value, catalog, statement, leaves))
         }
         Expr::Array(items) => items
             .iter()
-            .all(|item| retained_expression(item, catalog, statement)),
+            .all(|item| retained_expression_with(item, catalog, statement, leaves)),
         Expr::Subscript { base, index } => {
-            retained_expression(base, catalog, statement)
-                && retained_expression(index, catalog, statement)
+            retained_expression_with(base, catalog, statement, leaves)
+                && retained_expression_with(index, catalog, statement, leaves)
         }
         Expr::Slice { base, lower, upper } => {
-            retained_expression(base, catalog, statement)
-                && lower.is_none_or(|bound| retained_expression(bound, catalog, statement))
-                && upper.is_none_or(|bound| retained_expression(bound, catalog, statement))
+            retained_expression_with(base, catalog, statement, leaves)
+                && lower
+                    .is_none_or(|bound| retained_expression_with(bound, catalog, statement, leaves))
+                && upper
+                    .is_none_or(|bound| retained_expression_with(bound, catalog, statement, leaves))
         }
         Expr::Cast {
             operand, type_name, ..
         } if statement.is_some() => {
             ColType::from_sql_name(type_name).is_some()
-                && retained_expression(operand, catalog, statement)
+                && retained_expression_with(operand, catalog, statement, leaves)
         }
         Expr::Call {
             args,
@@ -370,7 +414,19 @@ fn retained_expression(
             ..
         } if statement.is_some() && order_by.is_empty() => args
             .iter()
-            .all(|argument| retained_expression(argument, catalog, statement)),
+            .all(|argument| retained_expression_with(argument, catalog, statement, leaves)),
+        Expr::Call {
+            args,
+            order_by,
+            over: None,
+            filter,
+            ..
+        } if statement.is_some() && matches!(leaves, Leaves::Calls) => args
+            .iter()
+            .copied()
+            .chain(order_by.iter().map(|order| order.expression))
+            .chain(*filter)
+            .all(|argument| retained_expression_with(argument, catalog, statement, leaves)),
         _ => false,
     }
 }
@@ -379,6 +435,22 @@ fn retained_scalar_calls(
     expression: &Expr<'_>,
     columns: &CatalogScopeCols<'_, '_, '_, '_>,
 ) -> Result<bool, SqlError> {
+    retained_scalar_calls_except(expression, columns, &[])
+}
+
+/// [`retained_scalar_calls`], skipping the aggregate calls `aggregates`
+/// whose inputs a grouped reader checks itself.
+fn retained_scalar_calls_except(
+    expression: &Expr<'_>,
+    columns: &CatalogScopeCols<'_, '_, '_, '_>,
+    aggregates: &[*const Expr<'_>],
+) -> Result<bool, SqlError> {
+    if aggregates
+        .iter()
+        .any(|pointer| same_node(*pointer, expression))
+    {
+        return Ok(true);
+    }
     if super::super::eval::is_sql_syntax_call(expression) && expression.is_aggregate_use() {
         return Ok(false);
     }
@@ -448,7 +520,7 @@ fn retained_scalar_calls(
     }
     let mut scalar = true;
     walk_children(expression, &mut |child| {
-        scalar &= retained_scalar_calls(child, columns)?;
+        scalar &= retained_scalar_calls_except(child, columns, aggregates)?;
         Ok(())
     })?;
     Ok(scalar)
@@ -1113,15 +1185,14 @@ fn retained_function_source<'a>(
 
 /// Clauses a retained reader of a join cannot hold: the general executor
 /// groups, orders, deduplicates or locks them.
-fn join_clauses_retained(statement: &Select<'_>, self_sorts: bool) -> bool {
+fn join_clauses_retained(statement: &Select<'_>, self_sorts: bool, groups_itself: bool) -> bool {
     (statement.order_by.is_empty() || self_sorts)
         && statement.with.is_empty()
         && statement.set_body.is_none()
         && !statement.distinct
         && statement.distinct_on.is_empty()
-        && statement.group_by.is_empty()
+        && (groups_itself || statement.group_by.is_empty() && statement.having.is_none())
         && statement.grouping_sets.is_empty()
-        && statement.having.is_none()
         && statement.locking.is_empty()
         && !statement.with_ties
 }
@@ -1133,12 +1204,13 @@ fn expressions_retained(
     catalog: &dyn super::super::eval::CatalogAccess,
     storage: &Storage,
     txid: u32,
+    leaves: Leaves<'_>,
 ) -> bool {
     let expression_mode = Some((storage, txid));
     statement.items.iter().all(|item| match item {
         SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => true,
         SelectItem::Expr { expression, .. } => {
-            retained_expression(expression, catalog, expression_mode)
+            retained_expression_with(expression, catalog, expression_mode, leaves)
         }
         SelectItem::RecordStar(_) => false,
     }) && statement
@@ -1156,7 +1228,9 @@ fn scope_expressions_retained(
     statement: &Select<'_>,
     columns: &CatalogScopeCols<'_, '_, '_, '_>,
     catalog: &dyn super::super::eval::CatalogAccess,
+    grouped: bool,
 ) -> Result<bool, SqlError> {
+    // A grouping's admission checked its output, HAVING and WHERE.
     for expression in statement
         .items
         .iter()
@@ -1165,6 +1239,7 @@ fn scope_expressions_retained(
             _ => None,
         })
         .chain(statement.where_clause)
+        .filter(|_| !grouped)
     {
         if !retained_scalar_calls(expression, columns)? {
             return Ok(false);
@@ -1186,8 +1261,50 @@ fn scope_expressions_retained(
     Ok(true)
 }
 
+/// The grouping a reader computes itself, once its scope is resolved.
+/// `None` leaves the statement to the general executor. Otherwise: the
+/// statement, with its `GROUP BY` positions resolved when grouped, and its
+/// aggregate calls when grouped.
+#[allow(clippy::type_complexity)]
+fn reader_grouping<'a>(
+    statement: &'a Select<'a>,
+    columns: &CatalogScopeCols<'_, 'a, '_, '_>,
+    catalog: &dyn super::super::eval::CatalogAccess,
+    groups_itself: bool,
+    arena: &'a Arena,
+) -> Result<Option<(&'a Select<'a>, Option<grouping::AggregateNodes<'a>>)>, SqlError> {
+    if !groups_itself {
+        return Ok(Some((statement, None)));
+    }
+    Ok(
+        match grouping::admit_grouping(statement, columns, catalog, arena)? {
+            None => None,
+            Some(grouping::Grouping::Grouped {
+                statement,
+                aggregates,
+            }) => Some((statement, Some(aggregates))),
+            Some(grouping::Grouping::Plain) => {
+                // Calls passed before scope resolution only as possible
+                // aggregates.
+                let mode = Some((columns.storage, columns.txid));
+                statement
+                    .items
+                    .iter()
+                    .all(|item| match item {
+                        SelectItem::Expr { expression, .. } => {
+                            retained_expression(expression, catalog, mode)
+                        }
+                        _ => true,
+                    })
+                    .then_some((statement, None))
+            }
+        },
+    )
+}
+
 /// Resolves a joined FROM clause for a retained reader: its scope with
 /// literal items encoded, and its admitted join shape.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn retained_join_scope<'a>(
     storage: &'a Storage,
     txid: u32,
@@ -1195,11 +1312,26 @@ fn retained_join_scope<'a>(
     from: &'a FromClause<'a>,
     params: Option<&[Datum<'a>]>,
     self_sorts: bool,
+    groups_itself: bool,
     arena: &'a Arena,
-) -> Result<Option<(QueryScope<'a>, join::JoinShape<'a>)>, SqlError> {
+) -> Result<
+    Option<(
+        QueryScope<'a>,
+        join::JoinShape<'a>,
+        &'a Select<'a>,
+        Option<grouping::AggregateNodes<'a>>,
+    )>,
+    SqlError,
+> {
     let catalog = storage_catalog(storage, arena, txid);
-    if !join_clauses_retained(statement, self_sorts)
-        || !expressions_retained(statement, &catalog, storage, txid)
+    let leaves = if groups_itself {
+        Leaves::Calls
+    } else {
+        Leaves::Scalar
+    };
+    if from.joins.len() >= MAX_RETAINED_SOURCES
+        || !join_clauses_retained(statement, self_sorts, groups_itself)
+        || !expressions_retained(statement, &catalog, storage, txid, leaves)
     {
         return Ok(None);
     }
@@ -1213,7 +1345,7 @@ fn retained_join_scope<'a>(
             return Ok(None);
         }
     }
-    let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+    let scope = QueryScope::resolve_schema_with_join_conditions(storage, from, txid, arena)?;
     let columns = CatalogScopeCols {
         scope: &scope,
         outer_scope: None,
@@ -1221,8 +1353,15 @@ fn retained_join_scope<'a>(
         txid,
         arena,
     };
-    if !scope_expressions_retained(statement, &columns, &catalog)?
-        || !statement.order_by.is_empty() && !sort::sort_admitted(statement, &columns, &catalog)?
+    let Some((statement, aggregates)) =
+        reader_grouping(statement, &columns, &catalog, groups_itself, arena)?
+    else {
+        return Ok(None);
+    };
+    if !scope_expressions_retained(statement, &columns, &catalog, aggregates.is_some())?
+        || aggregates.is_none()
+            && !statement.order_by.is_empty()
+            && !sort::sort_admitted(statement, &columns, &catalog)?
     {
         return Ok(None);
     }
@@ -1249,7 +1388,7 @@ fn retained_join_scope<'a>(
             }
         }
     }
-    Ok(Some((scope, shape)))
+    Ok(Some((scope, shape, statement, aggregates)))
 }
 
 /// Encodes a literal VALUES source's rows in the reader's memory.
@@ -1595,7 +1734,12 @@ impl<'a> RetainedSelect<'a> {
     }
 
     pub(crate) fn has_pending(&self) -> bool {
-        if self.sort.as_ref().is_some_and(sort::SortState::has_current) {
+        if self.sort.as_ref().is_some_and(sort::SortState::has_current)
+            || self
+                .grouping
+                .as_ref()
+                .is_some_and(grouping::GroupState::has_current)
+        {
             return true;
         }
         match &self.joins {
@@ -1621,7 +1765,10 @@ impl<'a> RetainedSelect<'a> {
     /// non-locking source of one table, literal rows, generated rows or a
     /// single row. The same snapshot then yields the same rows in order.
     pub(crate) fn rewindable(&self) -> bool {
-        self.order.is_empty() && self.locking.is_empty() && !self.saves_scroll_output
+        self.order.is_empty()
+            && self.locking.is_empty()
+            && !self.saves_scroll_output
+            && self.grouping.is_none()
     }
 
     /// Keeps the input readable after its last row, so a scrollable cursor
@@ -1951,8 +2098,8 @@ impl<'a> RetainedSelect<'a> {
             return Ok(None);
         };
         if !from.joins.is_empty() {
-            let Some((scope, shape)) =
-                retained_join_scope(storage, txid, statement, from, None, true, arena)?
+            let Some((scope, shape, ..)) =
+                retained_join_scope(storage, txid, statement, from, None, true, true, arena)?
             else {
                 return Ok(None);
             };
@@ -1976,9 +2123,7 @@ impl<'a> RetainedSelect<'a> {
             || statement.set_body.is_some()
             || statement.distinct
             || !statement.distinct_on.is_empty()
-            || !statement.group_by.is_empty()
             || !statement.grouping_sets.is_empty()
-            || statement.having.is_some()
             || !statement.locking.is_empty()
             || statement.with_ties
             || !generated
@@ -1994,7 +2139,7 @@ impl<'a> RetainedSelect<'a> {
         if !statement.items.iter().all(|item| match item {
             SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => true,
             SelectItem::Expr { expression, .. } => {
-                retained_expression(expression, &catalog, expression_mode)
+                retained_expression_with(expression, &catalog, expression_mode, Leaves::Calls)
             }
             SelectItem::RecordStar(_) => false,
         }) || statement
@@ -2020,21 +2165,30 @@ impl<'a> RetainedSelect<'a> {
             txid,
             arena,
         };
-        for expression in statement
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                SelectItem::Expr { expression, .. } => Some(*expression),
-                _ => None,
-            })
-            .chain(statement.where_clause)
-        {
-            if !retained_scalar_calls(expression, &columns)? {
+        let Some((statement, aggregates)) =
+            reader_grouping(statement, &columns, &catalog, true, arena)?
+        else {
+            return Ok(None);
+        };
+        if aggregates.is_none() {
+            for expression in statement
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    SelectItem::Expr { expression, .. } => Some(*expression),
+                    _ => None,
+                })
+                .chain(statement.where_clause)
+            {
+                if !retained_scalar_calls(expression, &columns)? {
+                    return Ok(None);
+                }
+            }
+            if !statement.order_by.is_empty()
+                && !sort::sort_admitted(statement, &columns, &catalog)?
+            {
                 return Ok(None);
             }
-        }
-        if !statement.order_by.is_empty() && !sort::sort_admitted(statement, &columns, &catalog)? {
-            return Ok(None);
         }
         for bound in [statement.limit, statement.offset].into_iter().flatten() {
             let (oid, _) = super::super::exec::infer_type_res(bound, &columns)?;
@@ -2140,11 +2294,22 @@ impl<'a> RetainedSelect<'a> {
         // them itself. A declared cursor keeps its own ordered path.
         let self_sorts = !statement.order_by.is_empty()
             && (mode == RetainedMode::Statement || reader_use == RetainedUse::Stream);
+        // Likewise it groups them itself.
+        let groups_itself = mode == RetainedMode::Statement || reader_use == RetainedUse::Stream;
         if let Some(from) = statement.from.as_ref()
             && !from.joins.is_empty()
         {
             return Self::open_join(
-                storage, txid, statement, from, params, arena, responder, mode, self_sorts,
+                storage,
+                txid,
+                statement,
+                from,
+                params,
+                arena,
+                responder,
+                mode,
+                self_sorts,
+                groups_itself,
             );
         }
         let from = statement.from.as_ref();
@@ -2172,9 +2337,8 @@ impl<'a> RetainedSelect<'a> {
             || statement.set_body.is_some()
             || statement.distinct
             || !statement.distinct_on.is_empty()
-            || !statement.group_by.is_empty()
+            || !groups_itself && (!statement.group_by.is_empty() || statement.having.is_some())
             || !statement.grouping_sets.is_empty()
-            || statement.having.is_some()
             || statement.with_ties
         {
             return Ok(None);
@@ -2194,10 +2358,15 @@ impl<'a> RetainedSelect<'a> {
         }
         let catalog = storage_catalog(storage, arena, txid);
         let expression_mode = Some((storage, txid));
+        let leaves = if groups_itself {
+            Leaves::Calls
+        } else {
+            Leaves::Scalar
+        };
         if !statement.items.iter().all(|item| match item {
             SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => true,
             SelectItem::Expr { expression, .. } => {
-                retained_expression(expression, &catalog, expression_mode)
+                retained_expression_with(expression, &catalog, expression_mode, leaves)
             }
             SelectItem::RecordStar(_) => false,
         }) || statement
@@ -2244,17 +2413,27 @@ impl<'a> RetainedSelect<'a> {
             txid,
             arena,
         };
-        for expression in statement
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                SelectItem::Expr { expression, .. } => Some(*expression),
-                _ => None,
-            })
-            .chain(statement.where_clause)
-        {
-            if !retained_scalar_calls(expression, &columns)? {
-                return Ok(None);
+        let Some((statement, aggregates)) =
+            reader_grouping(statement, &columns, &catalog, groups_itself, arena)?
+        else {
+            return Ok(None);
+        };
+        if aggregates.is_some() && from.is_none() {
+            return Ok(None);
+        }
+        if aggregates.is_none() {
+            for expression in statement
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    SelectItem::Expr { expression, .. } => Some(*expression),
+                    _ => None,
+                })
+                .chain(statement.where_clause)
+            {
+                if !retained_scalar_calls(expression, &columns)? {
+                    return Ok(None);
+                }
             }
         }
         for bound in [statement.limit, statement.offset].into_iter().flatten() {
@@ -2312,7 +2491,10 @@ impl<'a> RetainedSelect<'a> {
         } else {
             None
         };
-        if self_sorts && !sort::sort_admitted(statement, &columns, &catalog)? {
+        if self_sorts
+            && aggregates.is_none()
+            && !sort::sort_admitted(statement, &columns, &catalog)?
+        {
             return Ok(None);
         }
         let order = if self_sorts {
@@ -2338,15 +2520,19 @@ impl<'a> RetainedSelect<'a> {
         } else {
             &[][..]
         };
-        let demand = from.filter(|_| table.is_some()).map(|from| {
-            streaming_pax_columns_ordered(
-                &scope,
-                from,
-                statement.items,
-                statement.where_clause,
-                statement.order_by,
-            )
-        });
+        let demand = from
+            .filter(|_| table.is_some())
+            .map(|from| match aggregates {
+                Some(_) => grouping::input_demand(&scope, from, statement, arena),
+                None => Ok(streaming_pax_columns_ordered(
+                    &scope,
+                    from,
+                    statement.items,
+                    statement.where_clause,
+                    statement.order_by,
+                )),
+            })
+            .transpose()?;
         if let Some(demand) = demand {
             scan::admit_sources(storage, &scope, txid, demand)?;
         }
@@ -2395,15 +2581,21 @@ impl<'a> RetainedSelect<'a> {
                 error
             )
         })?;
-        for item in items.iter_mut() {
-            if let SelectItem::Expr { expression, .. } = item {
-                *expression = bind_expression(expression, arena, binding_columns, None)?;
+        // Grouped output evaluates per group as written: aggregate results
+        // are found by their call's address.
+        if aggregates.is_none() {
+            for item in items.iter_mut() {
+                if let SelectItem::Expr { expression, .. } = item {
+                    *expression = bind_expression(expression, arena, binding_columns, None)?;
+                }
             }
         }
         let predicate = statement
             .where_clause
             .map(|predicate| {
-                if mode == RetainedMode::Statement {
+                // A grouping filters its input as the general executor's
+                // scan does, with the same planning-time folding.
+                if mode == RetainedMode::Statement && aggregates.is_none() {
                     return Ok(predicate);
                 }
                 let predicate = simplify_qual(predicate, arena)?;
@@ -2448,6 +2640,9 @@ impl<'a> RetainedSelect<'a> {
             })
             && !predicate.is_some_and(|predicate| {
                 super::super::eval::routine_input_handoff(predicate, Some(&catalog))
+            })
+            && !statement.having.is_some_and(|having| {
+                super::super::eval::routine_input_handoff(having, Some(&catalog))
             })
         {
             // Binding can prove a cast/operator cannot suspend. Keep such
@@ -2525,7 +2720,7 @@ impl<'a> RetainedSelect<'a> {
                 available: !eliminated,
             }
         };
-        let sort = if self_sorts {
+        let sort = if self_sorts && aggregates.is_none() {
             Some(sort::SortState::new(
                 storage,
                 txid,
@@ -2543,6 +2738,12 @@ impl<'a> RetainedSelect<'a> {
             )?)
         } else {
             None
+        };
+        let grouping = match (aggregates, from) {
+            (Some(aggregates), Some(from)) => Some(grouping::GroupState::new(
+                storage, statement, from, aggregates, &scope, arena,
+            )?),
+            _ => None,
         };
         let revisit = cursor_revisit(
             &source,
@@ -2581,6 +2782,7 @@ impl<'a> RetainedSelect<'a> {
             joins: None,
             saves_scroll_output: false,
             sort,
+            grouping,
             description,
             state: if eliminated {
                 ReaderState::Eliminated
@@ -2604,14 +2806,16 @@ impl<'a> RetainedSelect<'a> {
         responder: &mut Responder<'_>,
         mode: RetainedMode,
         self_sorts: bool,
+        groups_itself: bool,
     ) -> Result<Option<Self>, SqlError> {
-        let Some((scope, shape)) = retained_join_scope(
+        let Some((scope, shape, statement, aggregates)) = retained_join_scope(
             storage,
             txid,
             statement,
             from,
             Some(params),
             self_sorts,
+            groups_itself,
             arena,
         )?
         else {
@@ -2645,13 +2849,16 @@ impl<'a> RetainedSelect<'a> {
         let binding_columns = Some(&columns);
         check_select_types(statement, &scope, storage, txid, arena, None)?;
         check_select_constants(statement, arena, storage, txid)?;
-        let demand = streaming_pax_columns_ordered(
-            &scope,
-            from,
-            statement.items,
-            statement.where_clause,
-            statement.order_by,
-        );
+        let demand = match aggregates {
+            Some(_) => grouping::input_demand(&scope, from, statement, arena)?,
+            None => streaming_pax_columns_ordered(
+                &scope,
+                from,
+                statement.items,
+                statement.where_clause,
+                statement.order_by,
+            ),
+        };
         scan::admit_sources(storage, &scope, txid, demand)?;
         let mut description = [ColDesc::new("", 0, 0); MAX_PROJ];
         let width = describe_scope_items(
@@ -2686,15 +2893,19 @@ impl<'a> RetainedSelect<'a> {
                 error
             )
         })?;
-        for item in items.iter_mut() {
-            if let SelectItem::Expr { expression, .. } = item {
-                *expression = bind_expression(expression, arena, binding_columns, None)?;
+        if aggregates.is_none() {
+            for item in items.iter_mut() {
+                if let SelectItem::Expr { expression, .. } = item {
+                    *expression = bind_expression(expression, arena, binding_columns, None)?;
+                }
             }
         }
         let predicate = statement
             .where_clause
             .map(|predicate| {
-                if mode == RetainedMode::Statement {
+                // A grouping filters its input as the general executor's
+                // scan does, with the same planning-time folding.
+                if mode == RetainedMode::Statement && aggregates.is_none() {
                     return Ok(predicate);
                 }
                 let predicate = simplify_qual(predicate, arena)?;
@@ -2738,6 +2949,9 @@ impl<'a> RetainedSelect<'a> {
             })
             && !predicate.is_some_and(|predicate| {
                 super::super::eval::routine_input_handoff(predicate, Some(&catalog))
+            })
+            && !statement.having.is_some_and(|having| {
+                super::super::eval::routine_input_handoff(having, Some(&catalog))
             })
         {
             return Ok(None);
@@ -2810,13 +3024,18 @@ impl<'a> RetainedSelect<'a> {
         let joins = join::open_levels(
             storage, txid, from, &scope, &shape, demand, &columns, eliminated, arena,
         )?;
-        let sort = if self_sorts {
+        let sort = if self_sorts && aggregates.is_none() {
             Some(sort::SortState::new(
                 storage, txid, statement, items, &scope, &columns, arena,
             )?)
         } else {
             None
         };
+        let grouping = aggregates
+            .map(|aggregates| {
+                grouping::GroupState::new(storage, statement, from, aggregates, &scope, arena)
+            })
+            .transpose()?;
         crate::sql::exec::DescriptionTarget::Wire.finish(
             &mut description[..width],
             Some(storage),
@@ -2839,6 +3058,7 @@ impl<'a> RetainedSelect<'a> {
             joins: Some(joins),
             saves_scroll_output,
             sort,
+            grouping,
             description,
             state: if eliminated {
                 ReaderState::Eliminated
@@ -2876,9 +3096,20 @@ impl<'a> RetainedSelect<'a> {
             if !matches!(self.state, ReaderState::Eliminated) {
                 self.state = ReaderState::Complete;
             }
-            if self.sort.is_some() {
+            if self.sort.is_some() || self.grouping.is_some() {
                 return Ok(false);
             }
+        }
+        if self.grouping.is_some() {
+            return self.prepare_grouped_row(
+                storage,
+                txid,
+                observed_at,
+                state_arena,
+                buffers,
+                work,
+                params,
+            );
         }
         if self.sort.is_some() {
             return self.prepare_sorted_row(
@@ -2943,6 +3174,85 @@ impl<'a> RetainedSelect<'a> {
             self.finish_input_row(state_arena);
         }
         Ok(self.sort.as_mut().expect("sorted reader").advance())
+    }
+
+    /// Reads and saves the grouping's whole input at its first row, folds
+    /// its groups, then returns them one by one.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_grouped_row(
+        &mut self,
+        storage: &Storage,
+        txid: u32,
+        observed_at: i64,
+        state_arena: &'a Arena,
+        buffers: &mut RowCursorBuffers,
+        work: &Arena,
+        params: &[Datum<'_>],
+    ) -> Result<bool, SqlError> {
+        while self.grouping.as_ref().expect("grouped reader").filling() {
+            if !self.prepare_input_row(
+                storage,
+                txid,
+                observed_at,
+                state_arena,
+                buffers,
+                work,
+                params,
+            )? {
+                self.grouping
+                    .as_mut()
+                    .expect("grouped reader")
+                    .finish_input(storage, txid)?;
+                break;
+            }
+            let mark = work.mark();
+            let mut grouping = self.grouping.take().expect("grouped reader");
+            let pushed = self
+                .encode_group_input(&grouping, storage, txid, work, params)
+                .and_then(|encoded| encoded.map_or(Ok(()), |row| grouping.push_input(row)));
+            self.grouping = Some(grouping);
+            // SAFETY: the encoded row was copied into the grouping's lease.
+            unsafe { work.rewind_to(mark) };
+            pushed?;
+            self.finish_input_row(state_arena);
+        }
+        let scope = &self.scope;
+        let grouping = self.grouping.as_mut().expect("grouped reader");
+        grouping.fold(scope, storage, txid, work, params)?;
+        Ok(grouping.advance())
+    }
+
+    /// Filters the pending input row and encodes its grouping keys and the
+    /// columns its aggregates read.
+    fn encode_group_input<'work>(
+        &'work self,
+        grouping: &grouping::GroupState<'a>,
+        storage: &'work Storage,
+        txid: u32,
+        work: &'work Arena,
+        params: &[Datum<'work>],
+    ) -> Result<Option<&'work [u8]>, SqlError> {
+        self.with_input_row(work, |row| {
+            let catalog = StorageCatalog {
+                storage,
+                routine_workspace: work,
+                txid,
+                invocations: None,
+                statement_arena: None,
+            };
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..super::super::eval::NO_HOOKS
+            };
+            if let Some(predicate) = self.predicate
+                && !where_passes(predicate, work, params, row, &hooks)?
+            {
+                return Ok(None);
+            }
+            grouping
+                .encode_input(&self.scope, storage, row, work, params, &hooks)
+                .map(Some)
+        })
     }
 
     /// Filters the pending input row and encodes its sort keys, saved
@@ -3190,6 +3500,21 @@ impl<'a> RetainedSelect<'a> {
         invocations: Option<&RoutineInvocationState>,
         frame_arena: &Arena,
     ) -> Result<bool, SqlError> {
+        if let Some(grouping) = &self.grouping {
+            let catalog = StorageCatalog {
+                storage,
+                routine_workspace: work,
+                txid,
+                invocations,
+                statement_arena: Some(frame_arena),
+            };
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                sequences: sequence,
+                ..super::super::eval::NO_HOOKS
+            };
+            return grouping.having_passes(&self.scope, work, params, &hooks);
+        }
         let Some(predicate) = self.predicate else {
             return Ok(true);
         };
@@ -3238,6 +3563,34 @@ impl<'a> RetainedSelect<'a> {
             && !sort.postponed(index)
         {
             return sort.saved_item(index, frame_arena);
+        }
+        if let Some(grouping) = &self.grouping {
+            let SelectItem::Expr { expression, .. } = self.items[index] else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "grouped output item is not an expression"
+                ));
+            };
+            let catalog = StorageCatalog {
+                storage,
+                routine_workspace: work,
+                txid,
+                invocations,
+                statement_arena: Some(frame_arena),
+            };
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                sequences: sequence,
+                ..super::super::eval::NO_HOOKS
+            };
+            let value = grouping.with_group(&self.scope, work, &hooks, |row, hooks| {
+                eval_full(expression, work, params, row, hooks)
+            })?;
+            let detached = frame_arena
+                .alloc_slice_with(1, |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            detached[0] = super::super::exec::detach_routine_datum(value, frame_arena)?;
+            return Ok(&*detached);
         }
         let catalog = StorageCatalog {
             storage,
@@ -3294,6 +3647,10 @@ impl<'a> RetainedSelect<'a> {
         }
         if let Some(sort) = &mut self.sort {
             sort.finish_row();
+            return;
+        }
+        if let Some(grouping) = &mut self.grouping {
+            grouping.finish_row();
             return;
         }
         self.finish_input_row(state_arena);

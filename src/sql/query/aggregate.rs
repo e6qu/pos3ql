@@ -716,6 +716,24 @@ impl<'a> AggState<'a> {
         Ok(())
     }
 
+    /// The support functions a custom aggregate calls: transition, final,
+    /// combine, serialization and moving-aggregate functions.
+    pub(crate) fn custom_support_oids(&self) -> impl Iterator<Item = i32> + '_ {
+        let routine = self.custom.map(|(_, routine)| *routine);
+        let partial = routine.and_then(|routine| routine.partial);
+        let moving = routine.and_then(|routine| routine.moving);
+        routine
+            .map(|routine| routine.transition_oid)
+            .into_iter()
+            .chain(routine.and_then(|routine| routine.final_function.map(|f| f.function_oid)))
+            .chain(partial.map(|partial| partial.combine_oid))
+            .chain(partial.and_then(|partial| partial.serde.map(|serde| serde.serialize_oid)))
+            .chain(partial.and_then(|partial| partial.serde.map(|serde| serde.deserialize_oid)))
+            .chain(moving.map(|moving| moving.transition_oid))
+            .chain(moving.map(|moving| moving.inverse_oid))
+            .chain(moving.and_then(|moving| moving.final_function.map(|f| f.function_oid)))
+    }
+
     pub(crate) fn supports_partial(&self) -> bool {
         self.custom.is_some_and(|(_, aggregate)| {
             matches!(aggregate.kind, crate::storage::AggregateKind::Normal)

@@ -147,8 +147,9 @@ builtin set-returning functions with constant arguments (`generate_series`,
 ORDINALITY`), or a **retained join** of up to eight such items or literal
 `VALUES` lists (a nested loop, or a hash join built in `plan_build_bytes`
 where the general executor would hash), optionally with an `ORDER BY` the
-stream sorts itself (local mode); without grouping, `DISTINCT`, set
-operations, subqueries, CTEs, row locking or row security, whose read position (one
+stream sorts itself (local mode), or a **retained grouping** of such a
+source (`GROUP BY`, `HAVING` and aggregates, below); without grouping sets,
+`DISTINCT`, set operations, subqueries, CTEs, row locking or row security, whose read position (one
 record per resident row of each table plus the query text) fits
 `result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins
 whose `ON`/`USING` conditions are scalar, non-volatile and call no
@@ -172,11 +173,16 @@ receipts however long the stream runs. Every other large result uses the spool a
 any of its rows reach the client; `pos3ql_result_stream_spooled_total` counts
 those by reason (`shape`, `capacity`, `effects`). A spooled result yields on
 cold storage only until its first byte reaches the client, then reads
-synchronously until it ends. Today that covers other joins, grouping, sorted
+synchronously until it ends. Today that covers other joins, other groupings, sorted
 results in object-store mode, subqueries, set operations, `VALUES` lists, other function sources,
 row locking, row security, a result that started an effect before it
 overflowed, and a `FETCH` from a scrollable cursor that saves its history. A buffered paged portal
 sends nothing before its first page, so its reads yield throughout.
+
+A paged portal whose statement can stream opens its stream before the
+statement runs: its attempt would stop at its first row anyway, so a sort,
+grouping or hash table is built once, in the stream, and its input reads
+resume instead of restarting the statement on each cold read.
 
 A forward `FETCH n` or `FETCH ALL` (simple Query or unpaged `Execute`) from
 a cursor that reads as it fetches and saves no history opens such a stream
@@ -198,7 +204,7 @@ filter saves its output rows, as PostgreSQL's Material node does, so a
 revisited row returns its first values.
 
 **Paged portals evaluate rows per `Execute`.** An `Execute` with a row limit
-opens such a statement's stream before its first row. Each `Execute`
+opens such a statement's stream before running it. Each `Execute`
 evaluates only the rows it returns, then the portal suspends with
 `PortalSuspended`, keeping its read position and snapshot while other
 statements of the transaction run. The connection has `result_stream_slots`
@@ -252,8 +258,8 @@ a filter, projection and LIMIT above it. Every other shape runs in the
 general executor, which materializes in the statement arena and cannot pause
 after its first byte. The retained plan tree generalizes these readers into a
 tree of nodes that pull one row at a time, each owning a fixed control record
-and fixed buffers reserved at startup. It is the planned route for grouping,
-subqueries, set operations and sorts of results, for removing the per-call
+and fixed buffers reserved at startup. It is the planned route for
+subqueries, set operations and sorts of results in object-store mode, for removing the per-call
 restart of a top-level `SELECT` in those shapes (each routine call then hands
 off on its row, as single sources and retained joins already do), and for
 removing synchronous cold reads from spooled results after their first byte.
@@ -287,6 +293,30 @@ not fit the free `plan_build_bytes` runs the statement the general executor's
 way instead (below), which builds the same table in statement memory
 (`sql_arena_bytes`).
 
+**Built: grouping.** A stream or a top-level `SELECT` run in place (not a
+declared cursor) groups a single source or retained join itself when its
+keys, `WHERE` and aggregate inputs are non-volatile and call no SQL-language
+routine, its custom aggregates' support functions are builtins (in
+object-store mode, also not combined in parts), and its `ORDER BY`, if any,
+is a prefix of its keys ascending with NULLs last; without grouping sets or
+`DISTINCT`. At its first row it reads its whole input, filters it and saves
+each row's keys and the input columns its aggregates read in two
+`plan_build_bytes` leases; a storage wait keeps those rows and the input
+position. It then orders the rows by key (equal keys keep input order) and
+folds each group with the general executor's aggregate states over that
+group's rows in input order, saving the keys and results in two more leases
+and releasing the input. Transition states never cross a wait: only reading
+input waits, and folding reads saved rows and calls no routine body. Groups
+come out in the general executor's order (keys ascending, NULLs last), each
+reporting its first input row's key as PostgreSQL's hashed grouping does
+(the general executor now does too). `HAVING` and the output list run per
+group as its row is returned, so a routine call there hands off on its row.
+An error in an aggregate's input is reported before the first row, as the
+general executor reports it; one in `HAVING` or the output list follows the
+groups already returned, as PostgreSQL's executor returns them. A grouping
+that does not fit `plan_build_bytes` runs in the general executor, as a sort
+does.
+
 **Nodes.** Each node implements one step: `next(row slot) -> Row | End |
 Wait(kind)`. A wait returns up the tree without discarding state; the
 connection parks and the same call resumes. A node never repeats an effect:
@@ -299,8 +329,8 @@ delivered, as streams do now.
 | Filter, projection, `LIMIT`/`OFFSET` | Remaining counts | Node record |
 | Nested-loop join (built: inner, cross and `LEFT`) | Each level's row bytes, position and matched flag | The stream or cursor allocation; the inner source rewinds as scrollable cursors do |
 | Hash join (built: two tables, inner, cross and `LEFT`) | Build-side rows, entries and bucket heads | `plan_build_bytes` / `plan_build_leases`; exhaustion is `54000` naming them |
-| Sorted aggregation and `DISTINCT` | Current group key and transition values | Node record |
-| Hash aggregation | Groups and transition values | `plan_build_bytes` |
+| Grouping (built: `GROUP BY`, `HAVING`, aggregates) | Input rows' keys and aggregated columns, then each group's keys and results | `plan_build_bytes` |
+| `DISTINCT` (not built) | Output rows, deduplicated as the general executor orders them | `plan_build_bytes` |
 | Sort (built: local mode) | Sort keys, saved output and input columns of every row | `plan_build_bytes`; object-store mode: the external sorter's runs on the block grid (not built) |
 | Set operations | `UNION ALL`: child cursor; others: sorted runs of both inputs with counts | External runs |
 | Scalar, `IN`/`EXISTS` subquery | Per-outer-row child tree, rewound per row, or a cached sorted run when uncorrelated | Node record or external run |

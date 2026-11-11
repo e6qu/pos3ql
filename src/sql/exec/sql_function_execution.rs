@@ -878,7 +878,7 @@ impl SqlExecution {
                         && changed_effects
                         && !calls.pending_firing_started_at(effects.transaction)
                     {
-                        break Err(super::write_attempts::retained_progress_required());
+                        break Err(progress.progress_required());
                     }
                     let PlpgsqlExecHost::Routine {
                         engine,

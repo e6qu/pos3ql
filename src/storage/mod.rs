@@ -46855,6 +46855,16 @@ impl Storage {
         Ok(found)
     }
 
+    /// Whether a visible user routine of any schema with this name is volatile.
+    pub(crate) fn has_volatile_routine_named(&self, name: &str, txid: u32) -> bool {
+        self.routine_entries().any(|(slot, routine)| {
+            routine.database == current_database()
+                && routine.visible_to(txid)
+                && routine.name_for(txid).as_str() == name
+                && self.routine_for(slot, txid).attributes.volatility == RoutineVolatility::Volatile
+        })
+    }
+
     /// Visible routines with this schema and name, in catalog order.
     pub(crate) fn routine_slots_named<'s>(
         &'s self,

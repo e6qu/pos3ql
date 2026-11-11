@@ -16480,7 +16480,7 @@ impl Engine {
             {
                 // Running the call after a rollback would hide the attempt's
                 // changes from it, unlike PostgreSQL.
-                return Ok(Err(exec::retained_progress_required()));
+                return Ok(Err(progress.progress_required()));
             }
             // A write that kept rows undoes only its unfinished row.
             let (rollback, output_mark) =

@@ -170,6 +170,9 @@ pub(crate) struct RowProgress {
     steps: [StepProgress; STEP_LEVELS],
     /// The level a data-modifying `WITH` claimed in this attempt.
     implicit_level: usize,
+    /// A multi-step statement of this attempt nested deeper than
+    /// `STEP_LEVELS` and runs its steps without progress.
+    steps_exhausted: bool,
 }
 
 impl RowProgress {
@@ -186,6 +189,7 @@ impl RowProgress {
             unrestartable: false,
             steps: [StepProgress::EMPTY; STEP_LEVELS],
             implicit_level: 0,
+            steps_exhausted: false,
         }
     }
 
@@ -194,8 +198,24 @@ impl RowProgress {
     pub(crate) fn begin_attempt(&mut self, wal: usize, lock: u64) {
         self.journal = Some((wal, lock));
         self.running = None;
+        self.steps_exhausted = false;
         for level in &mut self.steps {
             level.running = false;
+        }
+    }
+
+    /// The error for a routine call that running after a rollback would
+    /// hide this attempt's changed rows from: the step nesting capacity when
+    /// a statement nested past it, else the missing row progress.
+    pub(crate) fn progress_required(&self) -> SqlError {
+        if self.steps_exhausted {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "multi-step statements nest deeper than the {} levels write progress keeps",
+                STEP_LEVELS
+            )
+        } else {
+            super::write_attempts::retained_progress_required()
         }
     }
 
@@ -211,6 +231,7 @@ impl RowProgress {
             .iter()
             .rposition(|level| level.running)
             .map_or(0, |running| running + 1);
+        self.steps_exhausted |= level >= STEP_LEVELS;
         (level < STEP_LEVELS).then_some(level)
     }
 
@@ -815,9 +836,9 @@ impl RowProgress {
                 mark: resume.start.mark,
                 output: resume.start.output,
             })),
-            _ if self.unrestartable => Err(super::write_attempts::retained_progress_required()),
+            _ if self.unrestartable => Err(self.progress_required()),
             (None, Some(start)) if txn.transaction_effect_mark() != start.effects => {
-                Err(super::write_attempts::retained_progress_required())
+                Err(self.progress_required())
             }
             (None, Some(start)) => Ok(Some(UnfinishedRow {
                 mark: start.mark,

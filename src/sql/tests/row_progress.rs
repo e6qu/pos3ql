@@ -194,3 +194,93 @@ fn schema_drop_commits_view_trigger_once() {
     drop((writer, engine));
     std::fs::remove_dir_all(config.data_dir).unwrap();
 }
+
+/// Multi-step statements nested in one another's steps keep their progress
+/// up to four levels; a routine call after rows changed one level deeper
+/// fails with the named capacity instead of hiding those rows.
+#[test]
+fn nested_step_progress_beyond_its_capacity_fails_loudly() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE a1(n int); CREATE TABLE a2(n int); CREATE TABLE a3(n int); \
+         CREATE TABLE a4(n int); CREATE TABLE a5(n int); CREATE TABLE a6(n int, c bigint); \
+         CREATE FUNCTION cnt() RETURNS bigint LANGUAGE plpgsql AS \
+           $$BEGIN RETURN (SELECT count(*) FROM a6); END$$; \
+         CREATE RULE r1 AS ON INSERT TO a1 DO ALSO INSERT INTO a2 VALUES (new.n); \
+         CREATE RULE r2 AS ON INSERT TO a2 DO ALSO INSERT INTO a3 VALUES (new.n); \
+         CREATE RULE r3 AS ON INSERT TO a3 DO ALSO INSERT INTO a4 VALUES (new.n); \
+         CREATE RULE r4 AS ON INSERT TO a4 DO ALSO INSERT INTO a5 VALUES (new.n); \
+         CREATE RULE r5 AS ON INSERT TO a5 DO ALSO \
+           INSERT INTO a6 VALUES (new.n, cnt()), (new.n + 1, cnt()); \
+         INSERT INTO a3 VALUES (2); SELECT n, c FROM a6 ORDER BY n, c",
+    );
+    assert!(
+        error_sqlstates(&output).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["2|0", "3|1"]);
+    let output = run_with(&mut engine, &mut budget, "INSERT INTO a1 VALUES (3)");
+    assert_eq!(
+        error_sqlstates(&output),
+        ["54000"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output)
+            .contains("multi-step statements nest deeper than the 4 levels write progress keeps")
+    );
+}
+
+/// A call in an `INSERT ... SELECT` output list runs as its row is
+/// inserted, so it sees the rows before it; a lock wait inside it restarts
+/// the statement, and every row and call happens once.
+#[test]
+fn insert_select_output_calls_see_earlier_rows_across_lock_waits() {
+    let sql =
+        "INSERT INTO items SELECT g + 10, step(g) FROM generate_series(1, 3) g RETURNING id, a";
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("insert-source-calls-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut holder =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, SETUP, true);
+        holder.success(&mut engine, "SELECT pg_advisory_lock(7)", true);
+        let completed = blocked_on_lock(writer.execute_status(&mut engine, sql, true), &writer);
+        holder.success(&mut engine, "SELECT pg_advisory_unlock(7)", true);
+        writer.send.clear();
+        assert_eq!(
+            resume(&mut engine, &mut writer, sql, completed),
+            ExecutionStatus::Complete,
+            "{mode:?}"
+        );
+        let output = writer.send.readable().to_vec();
+        assert!(
+            error_sqlstates(&output).is_empty(),
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(data_rows(&output), ["11|3", "12|6", "13|12"], "{mode:?}");
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT id, a FROM items WHERE id > 10 ORDER BY id; \
+                 SELECT id, seen FROM calls ORDER BY id",
+                true
+            )),
+            ["11|3", "12|6", "13|12", "1|1", "2|2", "3|3"],
+            "{mode:?}"
+        );
+        drop((holder, writer, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}

@@ -107,10 +107,11 @@ unfinished step continues at its row, or runs again from its own start.
 A multi-step statement inside another's step (a rule action whose target
 has rules of its own) keeps its steps one level deeper, up to four levels;
 a step that is resumed keeps the effects of the calls that ran before it
-resumed. Where a write cannot keep its rows (a foreign table, a fifth
-nested level, or a step that changed rows without row progress), a call
-after its first change fails with `0A000` instead of running after a
-rollback that would hide those changes. Writes that rules rewrite into
+resumed. Where a write cannot keep its rows (a foreign table, or a step
+that changed rows without row progress), a call after its first change
+fails with `0A000` instead of running after a rollback that would hide
+those changes; at a fifth nested level it fails with `54000`, naming the
+four-level capacity. Writes that rules rewrite into
 several steps finish each step's `AFTER` triggers before the next step, so
 they never hand their completion to the caller.
 
@@ -129,6 +130,11 @@ them on the engine too. So does a PL/pgSQL or SQL-language function called
 from a query (`SELECT f()`): its writes' `AFTER` triggers can run DDL and
 call routines; a wait inside them restarts the statement, as any wait in
 such a call does.
+
+`INSERT ... SELECT` materializes its source first; an output item that
+calls a volatile user routine is split so that the source reads only its
+other parts, and the row phase runs the calls as each row is inserted, as
+PostgreSQL computes its output list.
 
 **Example:** `UPDATE items SET total = running_total()`, where
 `running_total()` sums `items`, gives each row the sum including the rows

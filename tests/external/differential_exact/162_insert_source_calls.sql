@@ -1,0 +1,48 @@
+-- A volatile routine call in an INSERT ... SELECT output list runs as each
+-- row is inserted and sees the rows before it, as in PostgreSQL; a call the
+-- source sorts, groups or deduplicates by runs before the first row.
+CREATE SCHEMA source_calls;
+SET search_path = source_calls, public;
+CREATE TABLE t (a int, c bigint);
+CREATE TABLE log (m text);
+CREATE FUNCTION cnt() RETURNS bigint LANGUAGE plpgsql AS $$BEGIN INSERT INTO log VALUES ('c'); RETURN (SELECT count(*) FROM t); END$$;
+CREATE FUNCTION scnt() RETURNS bigint LANGUAGE sql AS $$SELECT count(*) FROM t$$;
+INSERT INTO t SELECT g, cnt() FROM generate_series(1, 3) g RETURNING *;
+INSERT INTO t SELECT g, scnt() FROM generate_series(4, 5) g RETURNING *;
+INSERT INTO t VALUES (6, cnt()), (7, cnt()) RETURNING *;
+INSERT INTO t SELECT a + 10, cnt() FROM t WHERE a < 3 ORDER BY a RETURNING *;
+CREATE TABLE r (a int, c bigint);
+CREATE RULE rr AS ON INSERT TO r DO INSTEAD INSERT INTO t VALUES (new.a, cnt()), (new.a + 100, cnt());
+INSERT INTO r VALUES (1, 0);
+SELECT * FROM t ORDER BY a, c;
+DO $$BEGIN INSERT INTO t SELECT g, cnt() FROM generate_series(30, 31) g; END$$;
+SELECT * FROM t WHERE a >= 30 ORDER BY a;
+DROP TABLE t, log, r CASCADE;
+DROP FUNCTION cnt(), scnt();
+CREATE TABLE t (id serial, a int, c bigint, s text);
+CREATE SEQUENCE sq;
+CREATE FUNCTION cnt() RETURNS bigint LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'cnt %', (SELECT count(*) FROM t); RETURN (SELECT count(*) FROM t); END$$;
+CREATE FUNCTION f(x int) RETURNS text LANGUAGE plpgsql AS $$BEGIN RETURN 'int ' || x || ' ' || (SELECT count(*) FROM t); END$$;
+CREATE FUNCTION f(x text) RETURNS text LANGUAGE plpgsql AS $$BEGIN RETURN 'text ' || x || ' ' || (SELECT count(*) FROM t); END$$;
+CREATE FUNCTION g(x int) RETURNS int LANGUAGE plpgsql AS $$BEGIN RETURN x * 10 + (SELECT count(*) FROM t); END$$;
+CREATE FUNCTION bt() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'before % %', NEW.a, NEW.c; RETURN NEW; END$$;
+CREATE TRIGGER bt BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION bt();
+INSERT INTO t (a, c, s) SELECT nextval('sq'), cnt() + g, f(g) FROM generate_series(1, 3) g RETURNING id, a, c, s;
+INSERT INTO t (a, s) SELECT g(g), f('5') FROM generate_series(1, 2) g RETURNING a, s;
+INSERT INTO t (a, c) SELECT max(g), cnt() FROM generate_series(1, 4) g GROUP BY g % 2 ORDER BY 1 RETURNING a, c;
+INSERT INTO t (a, c) SELECT g, cnt() FROM generate_series(1, 3) g ORDER BY 2 RETURNING a, c;
+INSERT INTO t (a, c) SELECT g, cnt() FROM generate_series(1, 5) g LIMIT 2 RETURNING a, c;
+INSERT INTO t (a, c) SELECT g, CASE WHEN g > 1 THEN cnt() ELSE 0 END FROM generate_series(1, 2) g RETURNING a, c;
+INSERT INTO t (a, s) SELECT g, f(g)::int FROM generate_series(1, 2) g;
+INSERT INTO t (a, s) SELECT g, cnt() FROM generate_series(1, 2) g RETURNING a, s;
+INSERT INTO t (a, c) SELECT g, cnt() FROM generate_series(1, 2) g UNION ALL SELECT 10, cnt() RETURNING a, c;
+CREATE UNIQUE INDEX ON t (a);
+INSERT INTO t (a, c) SELECT 1, cnt() FROM generate_series(1, 2) ON CONFLICT (a) DO UPDATE SET c = excluded.c RETURNING a, c;
+CREATE FUNCTION w() RETURNS bigint LANGUAGE plpgsql AS $$DECLARE base int := 100; BEGIN INSERT INTO t (a, c) SELECT base + g, cnt() FROM generate_series(1, 2) g; RETURN (SELECT max(c) FROM t); END$$;
+SELECT w();
+SELECT a, c, s FROM t ORDER BY id;
+INSERT INTO t (a, c) SELECT g, CASE WHEN g > 0 THEN cnt() ELSE 10 / (g - g) END FROM generate_series(1, 2) g RETURNING a, c;
+INSERT INTO t (a, c) SELECT g, COALESCE(cnt(), 1 / 0) FROM generate_series(1, 2) g RETURNING a, c;
+INSERT INTO t (a, c) SELECT g, CASE g WHEN 1 THEN cnt() WHEN 2 THEN cnt() + g END FROM generate_series(1, 3) g RETURNING a, c;
+RESET search_path;
+DROP SCHEMA source_calls CASCADE;

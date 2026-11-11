@@ -1660,9 +1660,15 @@ impl<'d> QueryScope<'d> {
             out[n_out] = ResolvedColumn::Table(0, c);
             n_out += 1;
         }
+        // Output position where the current comma-separated FROM item starts:
+        // a USING or NATURAL join sees only its own item's join tree.
+        let mut group_start = 0usize;
         for (join_index, join) in from.joins.iter().enumerate() {
             let right_t = join_index + 1;
             let right_def = self.defs.get(right_t).expect("resolved");
+            if join.kind == crate::sql::ast::JoinKind::Comma {
+                group_start = n_out;
+            }
             if !(join.natural || join.using.is_some()) {
                 for c in 0..right_def.n_columns {
                     out[n_out] = ResolvedColumn::Table(right_t, c);
@@ -1677,7 +1683,7 @@ impl<'d> QueryScope<'d> {
                 clause.columns
             } else {
                 let mut n_using = 0usize;
-                for entry in &out[..n_out] {
+                for entry in &out[group_start..n_out] {
                     let name = self.output_name(*entry);
                     if right_def.column_index(name).is_some()
                         && !natural_using[..n_using].contains(&name)
@@ -1694,7 +1700,7 @@ impl<'d> QueryScope<'d> {
                 // The name must be unique in the left tree and present on
                 // the right (empirically pinned against PostgreSQL 18.4).
                 let mut left_entry = None;
-                for (k, entry) in out[..n_out].iter().enumerate() {
+                for (k, entry) in out[..n_out].iter().enumerate().skip(group_start) {
                     if self.output_name(*entry) == name {
                         if left_entry.is_some() {
                             return Err(sql_err!(
@@ -1783,9 +1789,9 @@ impl<'d> QueryScope<'d> {
                     });
                 }
             }
-            // New output: this join's merged columns first, then the
-            // remaining left-tree output, then the right table's columns
-            // minus the consumed ones.
+            // New output: this join's merged columns first within its FROM
+            // item, then the item's remaining left-tree output, then the right
+            // table's columns minus the consumed ones.
             let n_new = self.n_merged - first_new_merge;
             if let Some(alias) = join.using.and_then(|using| using.alias) {
                 if self.names[..self.n].contains(&alias)
@@ -1806,8 +1812,8 @@ impl<'d> QueryScope<'d> {
                     n_columns: n_new,
                 });
             }
-            out.copy_within(0..n_out, n_new);
-            for (k, slot) in out[..n_new].iter_mut().enumerate() {
+            out.copy_within(group_start..n_out, group_start + n_new);
+            for (k, slot) in out[group_start..group_start + n_new].iter_mut().enumerate() {
                 *slot = ResolvedColumn::Merged(first_new_merge + k);
             }
             n_out += n_new;
@@ -1928,6 +1934,58 @@ impl<'d> QueryScope<'d> {
                             name: self.defs.column_name(t, c),
                         })
                         .map_err(|_| arena_full())?;
+                }
+                Ok(&*arena
+                    .alloc(Expr::Call {
+                        kind: crate::sql::ast::CallKind::SqlSyntax,
+                        bound_oid: None,
+                        bound_strict: None,
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                        name: "coalesce",
+                        args,
+                        argument_names: &[],
+                        variadic: false,
+                        star: false,
+                        distinct: false,
+                        order_by: &[],
+                        over: None,
+                        filter: None,
+                    })
+                    .map_err(|_| arena_full())?)
+            }
+        }
+    }
+
+    /// `output_expression` with its names copied into `arena`, for a caller
+    /// whose expressions outlive this scope.
+    pub(crate) fn copied_output_expression<'a>(
+        &self,
+        entry: ResolvedColumn,
+        arena: &'a Arena,
+    ) -> Result<&'a Expr<'a>, SqlError> {
+        let column = |table: usize, column: usize| -> Result<&'a Expr<'a>, SqlError> {
+            let qualifier = arena
+                .alloc_str(self.names[table])
+                .map_err(|_| arena_full())?;
+            let name = arena
+                .alloc_str(self.defs.column_name(table, column))
+                .map_err(|_| arena_full())?;
+            Ok(&*arena
+                .alloc(Expr::Column {
+                    qualifier: Some(qualifier),
+                    name,
+                })
+                .map_err(|_| arena_full())?)
+        };
+        match entry {
+            ResolvedColumn::Table(table, index) => column(table, index),
+            ResolvedColumn::Merged(merged) => {
+                let parts = self.merged[merged].parts;
+                let args = arena
+                    .alloc_slice_with(parts.len(), |_| &Expr::Null as &'a Expr<'a>)
+                    .map_err(|_| arena_full())?;
+                for (argument, &(table, index)) in args.iter_mut().zip(parts) {
+                    *argument = column(table, index)?;
                 }
                 Ok(&*arena
                     .alloc(Expr::Call {

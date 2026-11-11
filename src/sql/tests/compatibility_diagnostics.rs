@@ -6,7 +6,7 @@ use super::*;
 /// Each ErrorResponse and NoticeResponse as `SEVERITY SQLSTATE message`,
 /// followed by ` @position` when it carries a cursor and ` hint: ...` when
 /// it carries a hint, interleaved with the command tags of the response.
-fn diagnostics(bytes: &[u8]) -> Vec<String> {
+pub(super) fn diagnostics(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut offset = 0;
     while offset < bytes.len() {
@@ -48,7 +48,7 @@ fn diagnostics(bytes: &[u8]) -> Vec<String> {
     out
 }
 
-fn with_engine(name: &str, run: impl FnOnce(&mut Engine, &mut Budget)) {
+pub(super) fn with_engine(name: &str, run: impl FnOnce(&mut Engine, &mut Budget)) {
     let config = test_config(name);
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();

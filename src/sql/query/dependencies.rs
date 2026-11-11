@@ -8,8 +8,8 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{
-    Expr, FrameBound, FromClause, Join, JoinKind, QualName, RelationInheritance, Select,
-    SelectItem, SetQuery, SetTree, Stmt, TableRef,
+    Expr, FrameBound, FromClause, Join, JoinKind, QualName, Select, SelectItem, SetQuery, SetTree,
+    Stmt, TableRef,
 };
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::exec::{ColTypeResolver, StaticTypeMeta, intrinsic_record_field_meta};
@@ -2340,7 +2340,7 @@ fn validate_assignment_type(
     ))
 }
 
-pub(super) fn dml_dependency_scope<'a>(
+pub(crate) fn dml_dependency_scope<'a>(
     storage: &'a Storage,
     target: QualName<'a>,
     alias: Option<&'a str>,
@@ -2348,26 +2348,7 @@ pub(super) fn dml_dependency_scope<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<super::QueryScope<'a>, SqlError> {
-    let base = TableRef {
-        schema: target.schema,
-        table: target.name,
-        alias,
-        subquery: None,
-        func_args: None,
-        func_argument_names: &[],
-        func_variadic: false,
-        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-        rows_from: None,
-        col_alias: None,
-        inheritance: RelationInheritance::Descendants,
-        sample: None,
-        cte: None,
-        with_ordinality: false,
-        lateral: false,
-        authorization_role: None,
-        bound_table: None,
-        view_access: None,
-    };
+    let base = super::dml_target_ref(target, alias);
     let joins = match extra {
         None => &[][..],
         Some(extra) => {
@@ -2376,7 +2357,7 @@ pub(super) fn dml_dependency_scope<'a>(
                     if index == 0 {
                         Join {
                             table: extra.base,
-                            kind: JoinKind::Cross,
+                            kind: JoinKind::Comma,
                             on: None,
                             using: None,
                             natural: false,

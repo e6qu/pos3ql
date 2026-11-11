@@ -2527,10 +2527,12 @@ pub(crate) fn parameterized_index_access_plan<'a>(
             .is_some_and(|(tables, _)| tables & target_bit == 0 && tables & !bound_tables == 0)
     };
     if (outer_available
-        || from
-            .joins
-            .iter()
-            .all(|join| matches!(join.kind, JoinKind::Inner | JoinKind::Cross)))
+        || from.joins.iter().all(|join| {
+            matches!(
+                join.kind,
+                JoinKind::Inner | JoinKind::Cross | JoinKind::Comma
+            )
+        }))
         && let Some(predicate) = where_clause
     {
         collect_index_constraints(
@@ -4182,6 +4184,28 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
     }
 }
 
+impl<'v> JoinRow<'_, 'v, '_> {
+    /// The value of one join-tree output column: a merged USING column is its
+    /// first non-null contributor.
+    pub(crate) fn output_value(&self, entry: ResolvedColumn) -> Datum<'v> {
+        let one = |(table, column): (usize, usize)| {
+            self.table_values(table)
+                .and_then(|values| values.get(column))
+                .copied()
+                .unwrap_or(Datum::Null)
+        };
+        match entry {
+            ResolvedColumn::Table(table, column) => one((table, column)),
+            ResolvedColumn::Merged(merged) => self.scope.merged[merged]
+                .parts
+                .iter()
+                .map(|&part| one(part))
+                .find(|value| !value.is_null())
+                .unwrap_or(Datum::Null),
+        }
+    }
+}
+
 impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
@@ -5516,7 +5540,7 @@ pub(crate) fn select_hash_join_plan<'a>(
     let join = &from.joins[0];
     if !matches!(
         join.kind,
-        JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+        JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left
     ) {
         return Ok(None);
     }
@@ -5529,8 +5553,10 @@ pub(crate) fn select_hash_join_plan<'a>(
     // source is derived. Otherwise probe the first source in its own row order.
     let (probe_table, build_table) = if scope.derived[first_table].is_some()
         && scope.derived[second_table].is_none()
-        && matches!(join.kind, JoinKind::Inner | JoinKind::Cross)
-    {
+        && matches!(
+            join.kind,
+            JoinKind::Inner | JoinKind::Cross | JoinKind::Comma
+        ) {
         (second_table, first_table)
     } else {
         (first_table, second_table)
@@ -7570,7 +7596,7 @@ fn scan_source_mode<'a>(
     let all_inner = from
         .joins
         .iter()
-        .all(|j| matches!(j.kind, JoinKind::Inner | JoinKind::Cross));
+        .all(|j| matches!(j.kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Comma));
     // Cost-based execution order: only cross joins (no ON clause, no nullable
     // side) may be reordered freely — an explicit JOIN ... ON's condition is tied
     // to its position. Everything else keeps FROM order (identity). A LATERAL
@@ -7579,6 +7605,23 @@ fn scan_source_mode<'a>(
     let any_lateral = scope.lateral[..scope.n].iter().any(|&l| l);
     // A LATERAL item references the tables to its left, so it cannot be the
     // right side of a RIGHT/FULL join (PostgreSQL rejects this too).
+    // Joins run as one left-deep chain. That equals PostgreSQL's tree for a
+    // RIGHT or FULL join only within the first comma-separated FROM item: in
+    // `a, b RIGHT JOIN c ON ...` an unmatched `c` row must still pair with
+    // every `a` row.
+    if let Some(after_comma) = from
+        .joins
+        .iter()
+        .position(|join| join.kind == JoinKind::Comma)
+        && from.joins[after_comma..]
+            .iter()
+            .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full))
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "RIGHT and FULL joins are supported only in the first FROM item"
+        ));
+    }
     for j in from.joins {
         if j.table.lateral && matches!(j.kind, JoinKind::Right | JoinKind::Full) {
             return Err(sql_err!(
@@ -7587,7 +7630,7 @@ fn scan_source_mode<'a>(
             ));
         }
     }
-    let all_cross = from.joins.iter().all(|j| matches!(j.kind, JoinKind::Cross));
+    let all_cross = from.joins.iter().all(|j| j.kind.is_cross());
     let order = arena
         .alloc_slice_with(scope.n, |index| index)
         .map_err(|_| arena_full())?;

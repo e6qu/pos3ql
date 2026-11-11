@@ -332,25 +332,25 @@ pub(crate) fn describe_data_modification_columns<'a>(
             description_target,
         );
     }
-    let (target, returning, target_alias) = match statement {
+    let (target, returning, target_alias, from) = match statement {
         Stmt::Insert(insert) => {
             let insert = *insert;
-            (insert.table, insert.returning, None)
+            (insert.table, insert.returning, None, None)
         }
         Stmt::Update(update) => {
             let update = *update;
-            (update.table, update.returning, update.alias)
+            (update.table, update.returning, update.alias, update.from)
         }
         Stmt::Delete(delete) => {
             let delete = *delete;
-            (delete.table, delete.returning, delete.alias)
+            (delete.table, delete.returning, delete.alias, delete.using)
         }
         _ => return Ok(0),
     };
     if returning.is_empty() {
         return Ok(0);
     }
-    let (target, returning, target_alias) =
+    let (target, returning, target_alias, from) =
         match crate::sql::query::resolve_view_for_dml(storage, target, txid, arena) {
             Ok(Some(view)) => {
                 let rewritten = crate::sql::query::rewrite_view_dml(
@@ -364,17 +364,30 @@ pub(crate) fn describe_data_modification_columns<'a>(
                     txid,
                     arena,
                 )?;
-                let (returning, target_alias) = match rewritten {
-                    Stmt::Insert(insert) => (insert.returning, None),
-                    Stmt::Update(update) => (update.returning, update.alias),
-                    Stmt::Delete(delete) => (delete.returning, delete.alias),
+                let (returning, target_alias, from) = match rewritten {
+                    Stmt::Insert(insert) => (insert.returning, None, None),
+                    Stmt::Update(update) => (update.returning, update.alias, update.from),
+                    Stmt::Delete(delete) => (delete.returning, delete.alias, delete.using),
                     _ => unreachable!("view rewrite keeps its statement kind"),
                 };
-                (view.base, returning, target_alias)
+                (view.base, returning, target_alias, from)
             }
-            Ok(None) => (target, returning, target_alias),
+            Ok(None) => (target, returning, target_alias, from),
             Err(error) => return Err(error),
         };
+    if let Some(from) = from {
+        return crate::sql::exec::describe_dml_from_returning(
+            storage,
+            txid,
+            target,
+            target_alias,
+            from,
+            returning,
+            arena,
+            columns,
+            description_target,
+        );
+    }
     let table_index = crate::sql::exec::resolve_dml_table(storage, &target, txid)?;
     storage.with_retained_table_definition(table_index, txid, |definition| {
         crate::sql::exec::describe_returning_items(

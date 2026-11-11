@@ -22,6 +22,7 @@ mod function_progress;
 mod geometric_casts;
 mod geometry_assignments;
 mod index_parent_ownership;
+mod joined_dml_returning;
 mod key_preparation;
 mod nested_planner_inputs;
 pub(super) mod object_reads;

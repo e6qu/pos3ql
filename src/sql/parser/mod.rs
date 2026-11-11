@@ -4480,7 +4480,7 @@ impl<'a> Parser<'a> {
                     JoinKind::Inner
                 }
             } else if self.eat_op(",")? {
-                JoinKind::Cross
+                JoinKind::Comma
             } else if self.eat_ident("cross")? {
                 self.expect_ident("join")?;
                 JoinKind::Cross
@@ -4506,7 +4506,7 @@ impl<'a> Parser<'a> {
             };
             let table = self.table_ref()?;
             let mut using = None;
-            let on = if natural || kind == JoinKind::Cross {
+            let on = if natural || kind.is_cross() {
                 None
             } else if self.eat_ident("using")? {
                 // The merged-column semantics (single output column, resolved

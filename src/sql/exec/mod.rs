@@ -756,6 +756,114 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
     }
 }
 
+/// The FROM items' matched values for one `UPDATE ... FROM` or
+/// `DELETE ... USING` row, in the order of `join`'s FROM items.
+#[derive(Clone, Copy)]
+struct JoinedReturningValues<'r, 'a> {
+    table: crate::sql::ast::QualName<'a>,
+    alias: Option<&'a str>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    values: &'r [Datum<'r>],
+}
+
+/// `RETURNING` of `UPDATE ... FROM` or `DELETE ... USING`: `old` and `new`
+/// name the target's images; every other name resolves in the joined row of
+/// the target and the FROM items, where an unqualified name present in two
+/// of them is ambiguous.
+struct JoinedReturningLookup<'r, 'd, 'v> {
+    returning: &'r ReturningLookup<'d, 'v>,
+    joined: &'r dyn ColumnLookup<'v>,
+}
+
+impl<'v> JoinedReturningLookup<'_, '_, 'v> {
+    fn image(&self, qualifier: Option<&str>) -> bool {
+        qualifier.is_some_and(|qualifier| self.returning.image(qualifier).is_some())
+    }
+
+    fn row(&self, qualifier: Option<&str>) -> &dyn ColumnLookup<'v> {
+        if self.image(qualifier) {
+            self.returning
+        } else {
+            self.joined
+        }
+    }
+}
+
+impl<'v> ColumnLookup<'v> for JoinedReturningLookup<'_, '_, 'v> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        self.row(qualifier).lookup(qualifier, name)
+    }
+
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.row(qualifier).column_type_mod(qualifier, name)
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.row(qualifier).resolve_column_type(qualifier, name)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        false
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<Option<&'v [super::types::RecordField<'v>]>, SqlError> {
+        self.row(Some(table)).whole_row_fields(table, arena)
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::eval::CatalogAccess>,
+    ) -> Option<(StackStr<64>, StaticTypeMeta)> {
+        self.row(Some(table))
+            .whole_row_field_metadata(table, index, catalog)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        if self.image(Some(table)) {
+            return Ok(true);
+        }
+        self.joined.whole_row_present(table)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.row(qualifier).col_type(qualifier, name)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.row(qualifier).collation(qualifier, name)
+    }
+
+    fn record_field_collation(&self, base: &Expr<'v>, field: &str) -> crate::sql::ast::Collation {
+        self.joined.record_field_collation(base, field)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        self.row(qualifier).column_user_type(qualifier, name)
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.row(Some(table)).whole_row_is_scalar(table)
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.row(Some(table)).whole_row_type(table)
+    }
+}
+
 type Outcome = Result<Result<(), SqlError>, WireFull>;
 
 fn sql_ok() -> Outcome {
@@ -22678,7 +22786,8 @@ mod trigger_program_tests {
     }
 }
 
-fn detached_trigger_row<'a>(
+/// Copies values into the arena so they outlive the rows they were read from.
+pub(crate) fn detached_values<'a>(
     values: &[Datum<'_>],
     arena: &'a Arena,
 ) -> Result<&'a mut [Datum<'a>], SqlError> {
@@ -22688,7 +22797,7 @@ fn detached_trigger_row<'a>(
         .map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "trigger row exceeds the statement arena"
+                "detached row exceeds the statement arena"
             )
         })?;
     projected::decode_projected_row_into(encoded, arena, row)?;
@@ -63697,57 +63806,118 @@ pub fn describe_merge_returning<'a>(
     out: &mut [ColDesc<'a>],
     description_target: crate::sql::exec::DescriptionTarget,
 ) -> Result<usize, SqlError> {
-    use crate::sql::ast::{FromClause, Join, JoinKind, RelationInheritance, TableRef};
+    let target = super::query::dml_target_ref(statement.target, statement.target_alias);
+    let source_star =
+        SelectItem::TableWildcard(statement.source.alias.unwrap_or(statement.source.table));
+    let target_star =
+        SelectItem::TableWildcard(statement.target_alias.unwrap_or(statement.target.name));
+    describe_joined_returning(
+        storage,
+        txid,
+        target,
+        core::slice::from_ref(&statement.source),
+        &[],
+        statement.returning,
+        Some(&[source_star, target_star]),
+        arena,
+        out,
+        description_target,
+    )
+}
 
-    let target = TableRef {
-        schema: statement.target.schema,
-        table: statement.target.name,
-        alias: statement.target_alias,
-        subquery: None,
-        func_args: None,
-        func_argument_names: &[],
-        func_variadic: false,
-        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-        rows_from: None,
-        col_alias: None,
-        inheritance: RelationInheritance::Descendants,
-        sample: None,
-        cte: None,
-        with_ordinality: false,
-        lateral: false,
-        authorization_role: None,
-        bound_table: None,
-        view_access: None,
+/// Describes `RETURNING` of `UPDATE ... FROM` and `DELETE ... USING`: the
+/// target and every FROM item, in that order for an unqualified star.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "description explicitly selects SQL identities or protocol types"
+)]
+pub(crate) fn describe_dml_from_returning<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    table: crate::sql::ast::QualName<'a>,
+    alias: Option<&'a str>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    returning: crate::sql::ast::Returning<'a>,
+    arena: &'a Arena,
+    out: &mut [ColDesc<'a>],
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
+    describe_joined_returning(
+        storage,
+        txid,
+        super::query::dml_target_ref(table, alias),
+        core::slice::from_ref(&from.base),
+        from.joins,
+        returning,
+        None,
+        arena,
+        out,
+        description_target,
+    )
+}
+
+/// Describes a `RETURNING` list whose output scope is the target followed by
+/// the FROM items `items` (each a separate FROM entry) and the joins that
+/// continue the last of them. `star` replaces an unqualified `*`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "description explicitly selects SQL identities or protocol types"
+)]
+fn describe_joined_returning<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    target: crate::sql::ast::TableRef<'a>,
+    items: &[crate::sql::ast::TableRef<'a>],
+    item_joins: &[crate::sql::ast::Join<'a>],
+    returning: crate::sql::ast::Returning<'a>,
+    star: Option<&[SelectItem<'a>]>,
+    arena: &'a Arena,
+    out: &mut [ColDesc<'a>],
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
+    use crate::sql::ast::{FromClause, Join, JoinKind, TableRef};
+
+    let item_join = |table: TableRef<'a>| Join {
+        table,
+        kind: JoinKind::Comma,
+        on: None,
+        using: None,
+        natural: false,
     };
-    let joins = arena
-        .alloc_slice_copy(&[Join {
-            table: statement.source,
-            kind: JoinKind::Cross,
-            on: None,
-            using: None,
-            natural: false,
-        }])
-        .map_err(|_| super::query::arena_full_pub())?;
-    let from = arena
-        .alloc(FromClause {
-            base: target,
-            joins,
-        })
-        .map_err(|_| super::query::arena_full_pub())?;
+    let scope_from = |extra: &[TableRef<'a>]| -> Result<&'a FromClause<'a>, SqlError> {
+        let width = items.len() + item_joins.len() + extra.len();
+        let joins = arena
+            .alloc_slice_with(width, |index| {
+                if index < items.len() {
+                    item_join(items[index])
+                } else if index < items.len() + item_joins.len() {
+                    item_joins[index - items.len()]
+                } else {
+                    item_join(extra[index - items.len() - item_joins.len()])
+                }
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        let from = arena
+            .alloc(FromClause {
+                base: target,
+                joins,
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        super::query::expand_from_schema(from, storage, txid, arena)
+    };
+    let from = scope_from(&[])?;
     let scope = super::query::QueryScope::resolve_schema(storage, from, txid, arena, None)?;
     let output_alias = |item: &SelectItem<'a>| {
         let mut alias = None;
         let mut conflicting = false;
         let mut note = |qualifier: &str| {
-            if qualifier != statement.returning.old_name()
-                && qualifier != statement.returning.new_name()
-            {
+            if qualifier != returning.old_name() && qualifier != returning.new_name() {
                 return;
             }
-            let name = if qualifier == statement.returning.old_name() {
-                statement.returning.old_name()
+            let name = if qualifier == returning.old_name() {
+                returning.old_name()
             } else {
-                statement.returning.new_name()
+                returning.new_name()
             };
             if alias.is_some_and(|known| known != name) {
                 conflicting = true;
@@ -63774,14 +63944,12 @@ pub fn describe_merge_returning<'a>(
         let mut found = false;
         match item {
             SelectItem::TableWildcard(qualifier) => {
-                found = *qualifier == statement.returning.old_name()
-                    || *qualifier == statement.returning.new_name();
+                found = *qualifier == returning.old_name() || *qualifier == returning.new_name();
             }
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                 expression.for_each_column_reference(&mut |qualifier, _| {
                     found |= qualifier.is_some_and(|qualifier| {
-                        qualifier == statement.returning.old_name()
-                            || qualifier == statement.returning.new_name()
+                        qualifier == returning.old_name() || qualifier == returning.new_name()
                     });
                 });
             }
@@ -63790,7 +63958,7 @@ pub fn describe_merge_returning<'a>(
         found
     };
     let mut count = 0usize;
-    for item in statement.returning.items {
+    for item in returning.items {
         if let Some(alias) = output_alias(item) {
             let saved_name = scope.names[0];
             scope.names[0] = alias;
@@ -63808,44 +63976,14 @@ pub fn describe_merge_returning<'a>(
             count += width?;
         } else if uses_output_alias(item) {
             let old_target = TableRef {
-                alias: Some(statement.returning.old_name()),
+                alias: Some(returning.old_name()),
                 ..target
             };
             let new_target = TableRef {
-                alias: Some(statement.returning.new_name()),
+                alias: Some(returning.new_name()),
                 ..target
             };
-            let joins = arena
-                .alloc_slice_copy(&[
-                    Join {
-                        table: statement.source,
-                        kind: JoinKind::Cross,
-                        on: None,
-                        using: None,
-                        natural: false,
-                    },
-                    Join {
-                        table: old_target,
-                        kind: JoinKind::Cross,
-                        on: None,
-                        using: None,
-                        natural: false,
-                    },
-                    Join {
-                        table: new_target,
-                        kind: JoinKind::Cross,
-                        on: None,
-                        using: None,
-                        natural: false,
-                    },
-                ])
-                .map_err(|_| super::query::arena_full_pub())?;
-            let output_from = arena
-                .alloc(FromClause {
-                    base: target,
-                    joins,
-                })
-                .map_err(|_| super::query::arena_full_pub())?;
+            let output_from = scope_from(&[old_target, new_target])?;
             let output_scope =
                 super::query::QueryScope::resolve_schema(storage, output_from, txid, arena, None)?;
             count += super::query::describe_scope_items(
@@ -63858,31 +63996,19 @@ pub fn describe_merge_returning<'a>(
                 &mut out[count..],
                 description_target,
             )?;
-        } else if matches!(item, SelectItem::Wildcard) {
-            let source_star =
-                SelectItem::TableWildcard(statement.source.alias.unwrap_or(statement.source.table));
-            let target_star =
-                SelectItem::TableWildcard(statement.target_alias.unwrap_or(statement.target.name));
-            count += super::query::describe_scope_items(
-                core::slice::from_ref(&source_star),
-                &scope,
-                None,
-                storage,
-                txid,
-                arena,
-                &mut out[count..],
-                description_target,
-            )?;
-            count += super::query::describe_scope_items(
-                core::slice::from_ref(&target_star),
-                &scope,
-                None,
-                storage,
-                txid,
-                arena,
-                &mut out[count..],
-                description_target,
-            )?;
+        } else if let Some(star) = star.filter(|_| matches!(item, SelectItem::Wildcard)) {
+            for star_item in star {
+                count += super::query::describe_scope_items(
+                    core::slice::from_ref(star_item),
+                    &scope,
+                    None,
+                    storage,
+                    txid,
+                    arena,
+                    &mut out[count..],
+                    description_target,
+                )?;
+            }
         } else {
             let width = super::query::describe_scope_items(
                 core::slice::from_ref(item),
@@ -66361,6 +66487,7 @@ where
                         statement.returning,
                         None,
                         Some(logical_values),
+                        None,
                         arena,
                         params,
                         responder,
@@ -66599,18 +66726,38 @@ pub(crate) fn instead_of_view_dml<'a>(
         Stmt::Delete(s) => s.alias,
         _ => None,
     };
+    let joined_from = match statement {
+        Stmt::Update(s) => s.from.map(|from| (s.table, from)),
+        Stmt::Delete(s) => s.using.map(|from| (s.table, from)),
+        _ => None,
+    };
     if !returning.is_empty() && !capturing {
         let mut description = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let count = match super::query::describe_catalog_items_as(
-            returning.items,
-            Some(crate::storage::RelationDefinition::from_definition(&def)),
-            alias,
-            storage,
-            txn.txid,
-            arena,
-            &mut description,
-            crate::sql::exec::DescriptionTarget::Wire,
-        ) {
+        let described = if let Some((table, from)) = joined_from {
+            describe_dml_from_returning(
+                storage,
+                txn.txid,
+                table,
+                alias,
+                from,
+                returning,
+                arena,
+                &mut description,
+                crate::sql::exec::DescriptionTarget::Wire,
+            )
+        } else {
+            super::query::describe_catalog_items_as(
+                returning.items,
+                Some(crate::storage::RelationDefinition::from_definition(&def)),
+                alias,
+                storage,
+                txn.txid,
+                arena,
+                &mut description,
+                crate::sql::exec::DescriptionTarget::Wire,
+            )
+        };
+        let count = match described {
             Ok(count) => count,
             Err(error) => return sql_fail(error),
         };
@@ -66859,6 +67006,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                 Err(error) => return sql_fail(error),
             };
             for bytes in rows.as_slice() {
+                let mut matched_from: &[Datum] = &[];
                 let mut old = [Datum::Null; MAX_COLUMNS];
                 if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
                     return sql_fail(error);
@@ -66915,6 +67063,10 @@ pub(crate) fn instead_of_view_dml<'a>(
                             seq_session,
                             txn.txid,
                         )),
+                        (!returning.is_empty()).then_some(super::query::MatchedFromRow {
+                            arena,
+                            values: &mut matched_from,
+                        }),
                     ) {
                         Ok(matched) => matched,
                         Err(error) => return sql_fail(error),
@@ -66972,7 +67124,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                 }
                 // A joined source can expose storage-backed datums. Detach the
                 // completed NEW image before the trigger body mutates storage.
-                let new = match detached_trigger_row(&new[..def.n_columns], arena) {
+                let new = match detached_values(&new[..def.n_columns], arena) {
                     Ok(values) => values,
                     Err(error) => return sql_fail(error),
                 };
@@ -67002,6 +67154,12 @@ pub(crate) fn instead_of_view_dml<'a>(
                         returning,
                         Some(&old[..def.n_columns]),
                         Some(new),
+                        update.from.map(|from| JoinedReturningValues {
+                            table: update.table,
+                            alias: update.alias,
+                            from,
+                            values: matched_from,
+                        }),
                         arena,
                         params,
                         responder,
@@ -67037,6 +67195,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                 Err(error) => return sql_fail(error),
             };
             for bytes in rows.as_slice() {
+                let mut matched_from: &[Datum] = &[];
                 let mut old = [Datum::Null; MAX_COLUMNS];
                 if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
                     return sql_fail(error);
@@ -67062,6 +67221,10 @@ pub(crate) fn instead_of_view_dml<'a>(
                             seq_session,
                             txn.txid,
                         )),
+                        (!returning.is_empty()).then_some(super::query::MatchedFromRow {
+                            arena,
+                            values: &mut matched_from,
+                        }),
                     ) {
                         Ok(matched) => matched,
                         Err(error) => return sql_fail(error),
@@ -67123,6 +67286,12 @@ pub(crate) fn instead_of_view_dml<'a>(
                         returning,
                         Some(&old[..def.n_columns]),
                         None,
+                        delete.using.map(|from| JoinedReturningValues {
+                            table: delete.table,
+                            alias: delete.alias,
+                            from,
+                            values: matched_from,
+                        }),
                         arena,
                         params,
                         responder,
@@ -67316,6 +67485,7 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
             returning,
             None,
             Some(values),
+            None,
             arena,
             params,
             responder,
@@ -68167,6 +68337,7 @@ fn emit_conflict_returning<Definition0: crate::storage::DefinitionBacking>(
         returning,
         old,
         Some(&updated[..def.n_columns]),
+        None,
         arena,
         params,
         responder,
@@ -68185,6 +68356,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     returning: crate::sql::ast::Returning<'_>,
     old: Option<&[Datum]>,
     new: Option<&[Datum]>,
+    joined: Option<JoinedReturningValues<'_, '_>>,
     arena: &Arena,
     params: &[Datum],
     responder: &mut Responder,
@@ -68202,9 +68374,42 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
         new_name: returning.new_name(),
         new,
     };
+    let join = match joined
+        .map(|joined| {
+            super::query::ReturningJoin::resolve(
+                storage,
+                joined.table,
+                joined.alias,
+                joined.from,
+                txid,
+                arena,
+            )
+        })
+        .transpose()
+    {
+        Ok(join) => join,
+        Err(error) => return Ok(Err(error)),
+    };
+    let joined_row = match join
+        .as_ref()
+        .zip(joined)
+        .map(|(join, joined)| join.row(current, joined.values, arena))
+        .transpose()
+    {
+        Ok(row) => row,
+        Err(error) => return Ok(Err(error)),
+    };
+    let joined_context = joined_row.as_ref().map(|joined| JoinedReturningLookup {
+        returning: &context,
+        joined,
+    });
+    let row: &dyn ColumnLookup<'_> = match &joined_context {
+        Some(joined) => joined,
+        None => &context,
+    };
     let catalog = super::query::storage_catalog(storage, arena, txid);
     let columns = super::eval::RuntimeColumnTypes {
-        row: &context,
+        row,
         catalog: Some(&catalog),
     };
     let items = match expand_record_call_items(returning.items, &columns, storage, txid, arena) {
@@ -68231,7 +68436,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
         txid,
         arena,
         params,
-        &context,
+        row,
         Some(&crate::sql::sequence::SeqEval::new(
             storage,
             seq_session,
@@ -68253,8 +68458,31 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     for item in items {
         match item {
             SelectItem::Wildcard => {
-                for v in current {
-                    projected[n] = *v;
+                if let Some(joined) = &joined_row {
+                    for index in 0..joined.scope.star_columns() {
+                        projected[n] = joined.output_value(joined.scope.star_entry(index));
+                        n += 1;
+                    }
+                } else {
+                    for v in current {
+                        projected[n] = *v;
+                        n += 1;
+                    }
+                }
+            }
+            SelectItem::TableWildcard(q)
+                if context.image(q).is_none()
+                    && let Some(joined) = &joined_row =>
+            {
+                let width = match joined.scope.qualified_star_columns(q) {
+                    Ok(width) => width,
+                    Err(error) => return Ok(Err(error)),
+                };
+                for index in 0..width {
+                    projected[n] = match joined.scope.qualified_star_entry(q, index) {
+                        Ok(entry) => joined.output_value(entry),
+                        Err(error) => return Ok(Err(error)),
+                    };
                     n += 1;
                 }
             }
@@ -68281,7 +68509,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                match super::eval::record_star_expand(base, arena, params, &context, &hooks) {
+                match super::eval::record_star_expand(base, arena, params, &row, &hooks) {
                     Ok(fields) => {
                         for f in fields {
                             projected[n] = f.value;
@@ -68292,7 +68520,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
                 }
             }
             SelectItem::Expr { expression, .. } => {
-                match eval_full(expression, arena, params, &context, &hooks) {
+                match eval_full(expression, arena, params, &row, &hooks) {
                     Ok(v) => {
                         projected[n] = v;
                         n += 1;
@@ -69052,16 +69280,31 @@ pub(crate) fn update<'a>(
 
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_returning_items(
-            statement.returning,
-            Some(def),
-            statement.alias,
-            Some(storage),
-            txn.txid,
-            arena,
-            &mut columns,
-            crate::sql::exec::DescriptionTarget::Wire,
-        ) {
+        let described = if let Some(from) = statement.from {
+            describe_dml_from_returning(
+                storage,
+                txn.txid,
+                statement.table,
+                statement.alias,
+                from,
+                statement.returning,
+                arena,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Wire,
+            )
+        } else {
+            describe_returning_items(
+                statement.returning,
+                Some(def),
+                statement.alias,
+                Some(storage),
+                txn.txid,
+                arena,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Wire,
+            )
+        };
+        match described {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -69069,6 +69312,8 @@ pub(crate) fn update<'a>(
 
     let mut updated = 0u64;
     for i in 0..scratch.len() {
+        let mut matched_from: &[Datum<'a>] = &[];
+        let returning_from = statement.from.filter(|_| !statement.returning.is_empty());
         match dml_row_available(storage, txn, scratch[i], "updated") {
             Ok(true) => {}
             Ok(false) => continue,
@@ -69263,6 +69508,10 @@ pub(crate) fn update<'a>(
                             seq_session,
                             txn.txid,
                         )),
+                        returning_from.map(|_| super::query::MatchedFromRow {
+                            arena,
+                            values: &mut matched_from,
+                        }),
                     );
                     match r {
                         Ok(matched) => matched,
@@ -69379,12 +69628,12 @@ pub(crate) fn update<'a>(
             let mut physical_new = physical_old;
             row_layout.overlay(&logical_new, &mut physical_new);
             let old_transition =
-                match detached_trigger_row(&physical_old[..row_definition.n_columns], arena) {
+                match detached_values(&physical_old[..row_definition.n_columns], arena) {
                     Ok(values) => values,
                     Err(error) => return sql_fail(error),
                 };
             let new_physical =
-                match detached_trigger_row(&physical_new[..row_definition.n_columns], arena) {
+                match detached_values(&physical_new[..row_definition.n_columns], arena) {
                     Ok(values) => values,
                     Err(error) => return sql_fail(error),
                 };
@@ -69647,6 +69896,12 @@ pub(crate) fn update<'a>(
                     statement.returning,
                     Some(&old_transition[..def.n_columns]),
                     Some(&new_values[..def.n_columns]),
+                    returning_from.map(|from| JoinedReturningValues {
+                        table: statement.table,
+                        alias: statement.alias,
+                        from,
+                        values: matched_from,
+                    }),
                     arena,
                     params,
                     responder,
@@ -69808,6 +70063,12 @@ pub(crate) fn update<'a>(
                 statement.returning,
                 Some(&logical_old[..def.n_columns]),
                 Some(&logical_new[..def.n_columns]),
+                returning_from.map(|from| JoinedReturningValues {
+                    table: statement.table,
+                    alias: statement.alias,
+                    from,
+                    values: matched_from,
+                }),
                 arena,
                 params,
                 responder,
@@ -69847,6 +70108,69 @@ pub(crate) fn update<'a>(
             write_completion::CompletionReply::Command
         },
     )
+}
+
+/// The FROM items' values joined to a deleted row for `RETURNING` of
+/// `DELETE ... USING`, found as the row selection found them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the match repeats the row selection's explicit inputs"
+)]
+fn delete_returning_from<'r, Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txn: &TxnState,
+    statement: &Delete<'r>,
+    def: &crate::storage::TableDefinition<Definition0>,
+    old: &[Datum<'_>],
+    arena: &'r Arena,
+    params: &[Datum<'_>],
+    seq_session: &crate::sql::guc::SeqSession,
+) -> Result<Option<JoinedReturningValues<'r, 'r>>, SqlError> {
+    let Some(using) = statement.using.filter(|_| !statement.returning.is_empty()) else {
+        return Ok(None);
+    };
+    let txid = txn.txid;
+    // Read the USING items as the row selection did, before this statement's
+    // own changes.
+    let _snapshot = storage.dml_expression_snapshot(txn.command_id());
+    let mut values: &[Datum<'r>] = &[];
+    let context = RowCtx {
+        def: crate::storage::RelationDefinition::from_definition(def),
+        values: old,
+        alias: statement.alias,
+    };
+    let found = super::query::first_from_match(
+        storage,
+        using,
+        txid,
+        statement.where_clause,
+        &[],
+        arena,
+        params,
+        &context,
+        &mut |_| Ok(()),
+        Some(&crate::sql::sequence::SeqEval::new(
+            storage,
+            seq_session,
+            txid,
+        )),
+        Some(super::query::MatchedFromRow {
+            arena,
+            values: &mut values,
+        }),
+    )?;
+    if !found {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "deleted row lost its USING match before RETURNING"
+        ));
+    }
+    Ok(Some(JoinedReturningValues {
+        table: statement.table,
+        alias: statement.alias,
+        from: using,
+        values,
+    }))
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -70116,16 +70440,31 @@ pub(crate) fn delete<'a>(
     }
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_returning_items(
-            statement.returning,
-            Some(def),
-            statement.alias,
-            Some(storage),
-            txn.txid,
-            arena,
-            &mut columns,
-            crate::sql::exec::DescriptionTarget::Wire,
-        ) {
+        let described = if let Some(from) = statement.using {
+            describe_dml_from_returning(
+                storage,
+                txn.txid,
+                statement.table,
+                statement.alias,
+                from,
+                statement.returning,
+                arena,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Wire,
+            )
+        } else {
+            describe_returning_items(
+                statement.returning,
+                Some(def),
+                statement.alias,
+                Some(storage),
+                txn.txid,
+                arena,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Wire,
+            )
+        };
+        match described {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -70278,6 +70617,19 @@ pub(crate) fn delete<'a>(
                     statement.returning,
                     Some(&old_transition[..def.n_columns]),
                     None,
+                    match delete_returning_from(
+                        storage,
+                        txn,
+                        statement,
+                        def,
+                        &old_transition[..def.n_columns],
+                        arena,
+                        params,
+                        seq_session,
+                    ) {
+                        Ok(joined) => joined,
+                        Err(error) => return sql_fail(error),
+                    },
                     arena,
                     params,
                     responder,
@@ -70409,6 +70761,19 @@ pub(crate) fn delete<'a>(
                 statement.returning,
                 Some(&logical_old[..def.n_columns]),
                 None,
+                match delete_returning_from(
+                    storage,
+                    txn,
+                    statement,
+                    def,
+                    &logical_old[..def.n_columns],
+                    arena,
+                    params,
+                    seq_session,
+                ) {
+                    Ok(joined) => joined,
+                    Err(error) => return sql_fail(error),
+                },
                 arena,
                 params,
                 responder,
@@ -77802,6 +78167,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                     &context,
                     &mut |_| Ok(()),
                     None,
+                    None,
                 )? {
                     scratch
                         .push(PhysicalRow::Foreign {
@@ -77869,6 +78235,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                             params,
                             &context,
                             &mut |_| Ok(()),
+                            None,
                             None,
                         )
                     })();
@@ -77971,6 +78338,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                     &scope,
                     &mut |_| Ok(()),
                     None,
+                    None,
                 )? {
                     scratch
                         .push(PhysicalRow::Foreign {
@@ -78040,6 +78408,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                             params,
                             &scope,
                             &mut |_| Ok(()),
+                            None,
                             None,
                         )
                     })();

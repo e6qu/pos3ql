@@ -85,6 +85,7 @@ pub(crate) use type_inputs::{
     capture_contextual_type_inputs, visit_planner_calls, visit_planner_expression,
 };
 pub(super) mod predicate_safety;
+pub(crate) use cte::expand_from_schema;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
@@ -8177,8 +8178,11 @@ fn resolve_position_target<'a>(
                         ResolvedColumn::Table(t, c) => {
                             column_ref(Some(scope.names[t]), scope.defs.column_name(t, c))
                         }
-                        // Unqualified: resolves back to the merged column.
-                        ResolvedColumn::Merged(m) => column_ref(None, scope.merged[m].name),
+                        // The merged column as the star produced it. Its bare
+                        // name can be ambiguous with another FROM item's column.
+                        merged @ ResolvedColumn::Merged(_) => {
+                            scope.copied_output_expression(merged, arena)
+                        }
                     };
                 }
                 remaining -= width;
@@ -14333,7 +14337,7 @@ fn expr_contains_node<'a>(e: &'a Expr<'a>, target: *const Expr<'a>) -> bool {
 /// scope), and invokes `on_match` with a combined lookup for the FIRST joined
 /// row that satisfies `where_clause`. Returns whether any match was found.
 #[allow(clippy::too_many_arguments)]
-pub fn first_from_match<'a>(
+pub fn first_from_match<'a, 'r>(
     storage: &'a Storage,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -14344,6 +14348,7 @@ pub fn first_from_match<'a>(
     target: &dyn ColumnLookup<'a>,
     on_match: &mut dyn FnMut(&dyn ColumnLookup<'a>) -> Result<(), SqlError>,
     sequences: Option<&dyn SequenceAccess>,
+    matched_row: Option<MatchedFromRow<'_, 'r>>,
 ) -> Result<bool, SqlError> {
     let scope = QueryScope::resolve_exec_outer(
         storage,
@@ -14400,6 +14405,7 @@ pub fn first_from_match<'a>(
     }
     let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
     let retain_match = core::cell::Cell::new(false);
+    let mut matched_row = matched_row;
     scan_source_recycling_retaining_match_with_pax_columns(
         storage,
         &scope,
@@ -14413,6 +14419,9 @@ pub fn first_from_match<'a>(
         pax_columns,
         &retain_match,
         &mut |jr| {
+            if let Some(matched_row) = matched_row.as_mut() {
+                *matched_row.values = detached_join_values(jr, arena, matched_row.arena)?;
+            }
             let chained_row = Chained {
                 inner: jr,
                 outer: Some(target),
@@ -14424,6 +14433,132 @@ pub fn first_from_match<'a>(
         },
     )?;
     Ok(found)
+}
+
+/// Receives the FROM items' values of the row `first_from_match` selects.
+pub struct MatchedFromRow<'m, 'r> {
+    pub arena: &'r Arena,
+    pub values: &'m mut &'r [Datum<'r>],
+}
+
+/// Copies every source's visible columns of a joined row, in FROM order and
+/// with a null-extended source as NULLs, so they outlive the scan and any
+/// storage change made before the row is used.
+fn detached_join_values<'a, 'r>(
+    row: &JoinRow<'_, 'a, '_>,
+    scratch: &'a Arena,
+    arena: &'r Arena,
+) -> Result<&'r [Datum<'r>], SqlError> {
+    let values = scratch
+        .alloc_slice_with(row.scope.total_columns(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let mut offset = 0;
+    for table in 0..row.scope.n {
+        let width = row.scope.defs.get(table).expect("resolved").n_columns;
+        if let Some(source) = row.table_values(table).filter(|source| !source.is_empty()) {
+            values[offset..offset + width].copy_from_slice(&source[..width]);
+        }
+        offset += width;
+    }
+    Ok(crate::sql::exec::detached_values(values, arena)?)
+}
+
+/// The FROM item for a DML target, which includes inheritance descendants.
+pub(crate) fn dml_target_ref<'a>(target: QualName<'a>, alias: Option<&'a str>) -> TableRef<'a> {
+    TableRef {
+        schema: target.schema,
+        table: target.name,
+        alias,
+        subquery: None,
+        func_args: None,
+        func_argument_names: &[],
+        func_variadic: false,
+        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+        rows_from: None,
+        col_alias: None,
+        inheritance: crate::sql::ast::RelationInheritance::Descendants,
+        sample: None,
+        cte: None,
+        with_ordinality: false,
+        lateral: false,
+        authorization_role: None,
+        bound_table: None,
+        view_access: None,
+    }
+}
+
+/// The output namespace of `RETURNING` in `UPDATE ... FROM` and
+/// `DELETE ... USING`: the target followed by every FROM item, as
+/// PostgreSQL's range table orders them for `*`.
+pub(crate) struct ReturningJoin<'a> {
+    scope: QueryScope<'a>,
+    offsets: &'a [usize],
+    rowids: &'a [Option<u64>],
+}
+
+impl<'a> ReturningJoin<'a> {
+    pub(crate) fn resolve(
+        storage: &'a Storage,
+        target: QualName<'a>,
+        alias: Option<&'a str>,
+        from: &'a FromClause<'a>,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let scope =
+            dependencies::dml_dependency_scope(storage, target, alias, Some(from), txid, arena)?;
+        let mut offset = 0;
+        let offsets = arena
+            .alloc_slice_with(scope.n, |table| {
+                let start = offset;
+                offset += scope.defs.get(table).expect("resolved").n_columns;
+                start
+            })
+            .map_err(|_| arena_full())?;
+        let rowids = arena
+            .alloc_slice_with(scope.n, |_| None)
+            .map_err(|_| arena_full())?;
+        Ok(Self {
+            scope,
+            offsets,
+            rowids,
+        })
+    }
+
+    /// Joins the target's output image with the FROM items' matched values.
+    pub(crate) fn row<'s, 'v>(
+        &'s self,
+        target: &[Datum<'v>],
+        from: &[Datum<'v>],
+        arena: &'v Arena,
+    ) -> Result<JoinRow<'s, 'v, 'a>, SqlError> {
+        let total = self.scope.total_columns();
+        if target.len() + from.len() != total {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "RETURNING join row has {} of {} columns",
+                target.len() + from.len(),
+                total
+            ));
+        }
+        let values = arena
+            .alloc_slice_with(total, |index| {
+                if index < target.len() {
+                    target[index]
+                } else {
+                    from[index - target.len()]
+                }
+            })
+            .map_err(|_| arena_full())?;
+        Ok(JoinRow {
+            scope: &self.scope,
+            values: scan::JoinRowValues::Flat {
+                values,
+                offsets: self.offsets,
+            },
+            rowids: self.rowids,
+        })
+    }
 }
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]

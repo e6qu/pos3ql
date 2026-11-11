@@ -3647,6 +3647,17 @@ pub enum JoinKind {
     Right,
     Full,
     Cross,
+    /// A comma in the FROM list: a cross join that also starts a new FROM
+    /// item, so later USING, NATURAL and ON clauses cannot see the tables
+    /// before it.
+    Comma,
+}
+
+impl JoinKind {
+    /// Whether the join pairs every left row with every right row.
+    pub const fn is_cross(self) -> bool {
+        matches!(self, Self::Cross | Self::Comma)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

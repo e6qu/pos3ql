@@ -434,7 +434,7 @@ pub(crate) fn expand_dml_ctes_schema<'a>(
 }
 
 /// Expand stored-view sources for metadata-only DML target/source lookup.
-pub(super) fn expand_from_schema<'a>(
+pub(crate) fn expand_from_schema<'a>(
     from: &'a FromClause<'a>,
     storage: &Storage,
     txid: u32,
@@ -896,7 +896,7 @@ fn prepend_rule_source<'a>(
             if index == 0 {
                 Join {
                     table: existing.base,
-                    kind: JoinKind::Cross,
+                    kind: JoinKind::Comma,
                     on: None,
                     using: None,
                     natural: false,
@@ -976,7 +976,7 @@ fn append_rule_input_from<'a>(
             if index == 0 {
                 Join {
                     table: existing.base,
-                    kind: JoinKind::Cross,
+                    kind: JoinKind::Comma,
                     on: None,
                     using: None,
                     natural: false,
@@ -2327,8 +2327,39 @@ pub fn rewrite_view_dml<'a>(
         recursive_state: None,
         execution: None,
     };
+    // `*` also covers the FROM items of `UPDATE ... FROM` and `DELETE ... USING`.
+    let (returning, from) = match statement {
+        Stmt::Update(update) => (update.returning, update.from),
+        Stmt::Delete(delete) => (delete.returning, delete.using),
+        _ => (Returning::NONE, None),
+    };
+    let from_star = match from {
+        Some(from)
+            if returning
+                .items
+                .iter()
+                .any(|item| matches!(item, SelectItem::Wildcard)) =>
+        {
+            let from = expand_from_schema(from, storage, txid, arena)?;
+            let scope = super::QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+            let star = arena
+                .alloc_slice_with(scope.star_columns(), |_| (&Expr::Null as &Expr, ""))
+                .map_err(|_| arena_full())?;
+            for (index, slot) in star.iter_mut().enumerate() {
+                let entry = scope.star_entry(index);
+                *slot = (
+                    scope.copied_output_expression(entry, arena)?,
+                    arena
+                        .alloc_str(scope.output_name(entry))
+                        .map_err(|_| arena_full())?,
+                );
+            }
+            &*star
+        }
+        _ => &[],
+    };
     let expanded_returning =
-        |items| expand_view_returning(items, visible_name, exposed_columns, arena);
+        |items| expand_view_returning(items, visible_name, exposed_columns, from_star, arena);
     let rewritten = match statement {
         Stmt::Insert(insert) => {
             for column in insert.columns {
@@ -2470,12 +2501,13 @@ fn expand_view_returning<'a>(
     items: &'a [SelectItem<'a>],
     view_name: &'a str,
     exposed_columns: &'a [&'a str],
+    from_star: &[(&'a Expr<'a>, &'a str)],
     arena: &'a Arena,
 ) -> Result<&'a [SelectItem<'a>], SqlError> {
     let extra = items.iter().fold(0usize, |count, item| {
         count
             + match item {
-                SelectItem::Wildcard => exposed_columns.len().saturating_sub(1),
+                SelectItem::Wildcard => (exposed_columns.len() + from_star.len()).saturating_sub(1),
                 SelectItem::TableWildcard(qualifier) if *qualifier == view_name => {
                     exposed_columns.len().saturating_sub(1)
                 }
@@ -2507,6 +2539,15 @@ fn expand_view_returning<'a>(
                     alias: Some(column),
                 };
                 count += 1;
+            }
+            if matches!(item, SelectItem::Wildcard) {
+                for &(expression, name) in from_star {
+                    output[count] = SelectItem::Expr {
+                        expression,
+                        alias: Some(name),
+                    };
+                    count += 1;
+                }
             }
         } else {
             // Binding a view column to storage must preserve its output name.

@@ -295,10 +295,17 @@ data-changing one. A data-changing `WITH` inside a routine body fails
 unsupported body, `RETURN QUERY` reports the query unknown and a SQL-language
 function reports an internal error). An `IN`, `ANY` or `ALL` subquery that
 calls a volatile function runs before the expression containing it, where
-PostgreSQL runs it when evaluation reaches it. `RETURNING *` of an `UPDATE ...
-FROM` or `DELETE ... USING` returns only the target's columns, and `RETURNING
-s.*` for a `FROM` item `s` fails, where PostgreSQL returns every item's
-columns. A four-part column name (`a.b.c.d`) is a syntax error where
+PostgreSQL runs it when evaluation reaches it. FROM-list items separated by
+commas run as one left-deep join chain, so a `RIGHT` or `FULL` join after a
+comma (`FROM a, b RIGHT JOIN c ON ...`) is rejected with `0A000`, a
+parenthesized join (`FROM a JOIN (b JOIN c ON ...) ON ...`) is a syntax error,
+and an `ON` condition can name a table from an earlier comma-separated item
+where PostgreSQL reports `invalid reference to FROM-clause entry`. A
+whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
+PostgreSQL types it as the table's row type `t`. A qualifier naming an
+aliased table (`UPDATE t x ... RETURNING t.a`) reports `missing FROM-clause
+entry` without PostgreSQL's alias hint, and a qualified star's error
+(`RETURNING missing.*`) has no position. A four-part column name (`a.b.c.d`) is a syntax error where
 PostgreSQL reports `cross-database references are not implemented`.
 `SELECT ... INTO` a composite PL/pgSQL variable from one composite column
 reports a field-count error where PostgreSQL assigns the column to the first

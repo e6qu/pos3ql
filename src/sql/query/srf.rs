@@ -1334,10 +1334,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     Datum::Json { text, .. } | Datum::Text(text) => text,
                     Datum::Null => return Ok(&[]),
                     other => {
-                        return Err(crate::sql::eval::type_mismatch_pub(
-                            "populate_recordset requires JSON",
-                            &other,
-                        ));
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
                     }
                 };
                 let crate::sql::json::Json::Array(items) = crate::sql::json::parse(source, arena)?
@@ -1981,10 +1978,7 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             Datum::Json { text, .. } | Datum::Text(text) => text,
             Datum::Null => return Ok(0),
             other => {
-                return Err(crate::sql::eval::type_mismatch_pub(
-                    "populate_recordset requires JSON",
-                    &other,
-                ));
+                return Err(crate::sql::eval::function_argument_mismatch(name, &other));
             }
         };
         match crate::sql::json::parse(source, arena)? {
@@ -6305,10 +6299,7 @@ fn json_to_record_rows<'a, C: ColumnLookup<'a>>(
                 .map_err(|_| arena_full());
         }
         other => {
-            return Err(crate::sql::eval::type_mismatch_pub(
-                "JSON record conversion requires JSON",
-                &other,
-            ));
+            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
         }
     };
     let parsed = crate::sql::json::parse(source, arena)?;
@@ -6427,10 +6418,7 @@ fn populate_record_rows<'a, C: ColumnLookup<'a>>(
         Datum::Json { text, .. } | Datum::Text(text) => text,
         Datum::Null => return Ok(&[]),
         other => {
-            return Err(crate::sql::eval::type_mismatch_pub(
-                "populate_record requires JSON",
-                &other,
-            ));
+            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
         }
     };
     let parsed = crate::sql::json::parse(source, arena)?;

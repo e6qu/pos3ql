@@ -633,3 +633,277 @@ fn long_messages_are_reported_whole() {
         );
     });
 }
+
+#[test]
+fn runtime_type_checks_report_postgresql_errors() {
+    with_engine("runtime-type-checks", |engine, budget| {
+        let binary_hint = " hint: No operator matches the given name and argument types. You might need to add explicit type casts.";
+        let unary_hint = " hint: No operator matches the given name and argument type. You might need to add an explicit type cast.";
+        // Messages, SQLSTATEs and hints from PostgreSQL 18.6.
+        for (sql, expected) in [
+            (
+                "SELECT '{}'::jsonb ? 1",
+                format!("ERROR 42883 operator does not exist: jsonb ? integer @20{binary_hint}"),
+            ),
+            (
+                "SELECT 1 -> 'a'",
+                format!("ERROR 42883 operator does not exist: integer -> unknown @10{binary_hint}"),
+            ),
+            (
+                "SELECT '{}'::jsonb #- 1",
+                format!("ERROR 42883 operator does not exist: jsonb #- integer @20{binary_hint}"),
+            ),
+            (
+                "SELECT 'x'::text ! 1",
+                "ERROR 42883 operator does not exist: text ! integer".to_owned(),
+            ),
+            (
+                "SELECT int4range(1,2) * 1",
+                format!("ERROR 42883 operator does not exist: int4range * integer @23{binary_hint}"),
+            ),
+            (
+                "SELECT ~ 'a'::text",
+                format!("ERROR 42883 operator does not exist: ~ text @8{unary_hint}"),
+            ),
+            (
+                "SELECT xmlconcat(1)",
+                "ERROR 42804 argument of XMLCONCAT must be type xml, not type integer".to_owned(),
+            ),
+            (
+                "SELECT (1)[1]",
+                "ERROR 42804 cannot subscript type integer because it does not support subscripting".to_owned(),
+            ),
+            (
+                "SELECT 1 = ANY(1)",
+                "ERROR 42809 op ANY/ALL (array) requires array on right side".to_owned(),
+            ),
+            (
+                "SELECT ('{}'::jsonb)[true]",
+                "ERROR 42804 subscript type boolean is not supported hint: jsonb subscript must be coercible to either integer or text.".to_owned(),
+            ),
+            (
+                "SELECT ('{1}'::int[])[1:true]",
+                "ERROR 42804 array subscript must have type integer".to_owned(),
+            ),
+            (
+                "SELECT JSON(1)",
+                "ERROR 42846 cannot cast type integer to json".to_owned(),
+            ),
+            (
+                "SELECT 1 IS JSON",
+                "ERROR 42804 cannot use type integer in IS JSON predicate".to_owned(),
+            ),
+        ] {
+            let reported = diagnostics(&run_with(engine, budget, sql));
+            assert_eq!(
+                reported[0]
+                    .split(" hint:")
+                    .next()
+                    .map(|line| if expected.contains(" @") || expected.contains(" hint:") {
+                        reported[0].clone()
+                    } else {
+                        line.split(" @").next().unwrap().to_owned()
+                    }),
+                Some(expected.clone()),
+                "{sql}"
+            );
+        }
+    });
+}
+
+#[test]
+fn array_elements_and_slices_assign_and_read_as_postgresql_does() {
+    with_engine("array-subscript-assignment", |engine, budget| {
+        let setup = run_with(
+            engine,
+            budget,
+            "CREATE TABLE at (id int, a int[], m int[][], t text[]); \
+             INSERT INTO at VALUES (1, '{1,2,3}', '{{1,2},{3,4}}', '{a,b}'), \
+             (2, NULL, NULL, NULL), (3, '{}', '{}', '{}')",
+        );
+        assert!(error_sqlstates(&setup).is_empty());
+        let value = |engine: &mut Engine, budget: &mut Budget, column: &str, id: i32| {
+            data_rows(&run_with(
+                engine,
+                budget,
+                &format!("SELECT {column} FROM at WHERE id = {id}"),
+            ))
+        };
+        // Results from PostgreSQL 18.6, applied in order.
+        for (statement, column, id, expected) in [
+            ("UPDATE at SET a[2] = 9 WHERE id = 1", "a", 1, "{1,9,3}"),
+            (
+                "UPDATE at SET a[5] = 7 WHERE id = 1",
+                "a",
+                1,
+                "{1,9,3,NULL,7}",
+            ),
+            (
+                "UPDATE at SET a[0] = 0 WHERE id = 1",
+                "a",
+                1,
+                "[0:5]={0,1,9,3,NULL,7}",
+            ),
+            (
+                "UPDATE at SET a[-2] = -2 WHERE id = 1",
+                "a",
+                1,
+                "[-2:5]={-2,NULL,0,1,9,3,NULL,7}",
+            ),
+            ("UPDATE at SET a[3] = 5 WHERE id = 2", "a", 2, "[3:3]={5}"),
+            ("UPDATE at SET a[2] = 5 WHERE id = 3", "a", 3, "[2:2]={5}"),
+            (
+                "UPDATE at SET a[1:2] = '{10,20}' WHERE id = 3",
+                "a",
+                3,
+                "{10,20}",
+            ),
+            (
+                "UPDATE at SET a[2:3] = '{7,8,9}' WHERE id = 3",
+                "a",
+                3,
+                "{10,7,8}",
+            ),
+            (
+                "UPDATE at SET m[1][2] = 20 WHERE id = 1",
+                "m",
+                1,
+                "{{1,20},{3,4}}",
+            ),
+            (
+                "UPDATE at SET m[1:2][1] = '{{7},{8}}' WHERE id = 1",
+                "m",
+                1,
+                "{{7,20},{8,4}}",
+            ),
+            (
+                "UPDATE at SET a[1] = '5', a[2] = 6 WHERE id = 1",
+                "a",
+                1,
+                "[-2:5]={-2,NULL,0,5,6,3,NULL,7}",
+            ),
+            ("UPDATE at SET t[3] = 'c' WHERE id = 1", "t", 1, "{a,b,c}"),
+        ] {
+            let output = run_with(engine, budget, statement);
+            assert!(
+                error_sqlstates(&output).is_empty(),
+                "{statement}: {:?}",
+                diagnostics(&output)
+            );
+            assert_eq!(value(engine, budget, column, id), [expected], "{statement}");
+        }
+        for (statement, expected) in [
+            (
+                "UPDATE at SET a[5:6] = '{1}' WHERE id = 3",
+                "ERROR 2202E source array too small",
+            ),
+            (
+                "UPDATE at SET m[3][1] = 20 WHERE id = 1",
+                "ERROR 2202E array subscript out of range",
+            ),
+            (
+                "UPDATE at SET m[1] = 20 WHERE id = 1",
+                "ERROR 2202E wrong number of array subscripts",
+            ),
+            (
+                "UPDATE at SET a[NULL] = 6 WHERE id = 1",
+                "ERROR 22004 array subscript in assignment must not be null",
+            ),
+            (
+                "UPDATE at SET a[:2] = '{6,6}' WHERE id = 1",
+                "ERROR 2202E source array too small",
+            ),
+            (
+                "UPDATE at SET a[1] = 'x' WHERE id = 1",
+                "ERROR 22P02 invalid input syntax for type integer: \"x\"",
+            ),
+            (
+                "UPDATE at SET id[1] = 3",
+                "ERROR 42804 cannot subscript type integer because it does not support subscripting",
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, statement))[0]
+                    .split(" @")
+                    .next()
+                    .unwrap(),
+                expected,
+                "{statement}"
+            );
+        }
+        let output = run_with(
+            engine,
+            budget,
+            "INSERT INTO at (id, a[1], t[2]) VALUES (4, 5, 'z'); \
+             INSERT INTO at (id, a[2:3]) VALUES (5, '{1,2}'); \
+             SELECT a, t FROM at WHERE id >= 4 ORDER BY id",
+        );
+        assert_eq!(data_rows(&output), ["{5}|[2:2]={z}", "[2:3]={1,2}|NULL"]);
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE DOMAIN posarr AS int[] CHECK (VALUE[1] > 0); \
+             CREATE TABLE dt (d posarr); INSERT INTO dt VALUES ('{1,2}')",
+        );
+        assert!(error_sqlstates(&output).is_empty());
+        assert_eq!(
+            error_sqlstates(&run_with(engine, budget, "UPDATE dt SET d[1] = -1")),
+            ["23514"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                engine,
+                budget,
+                "UPDATE dt SET d[2] = -1; SELECT d FROM dt"
+            )),
+            ["{1,-1}"]
+        );
+        // A subscript list holding a slice is a slice throughout; otherwise it
+        // addresses one element and a partial list yields NULL.
+        let output = run_with(
+            engine,
+            budget,
+            "SELECT ('{{1,2},{3,4}}'::int[])[1] AS a, ('{{1,2},{3,4}}'::int[])[1][2] AS b, \
+             ('{{1,2},{3,4}}'::int[])[1:1][1] AS c, ('{{1,2},{3,4}}'::int[])[1:1][2] AS d, \
+             ('{{1,2},{3,4}}'::int[])[2][1:2] AS e, ('{1,2,3}'::int[])[1][1] AS f, \
+             ('[2:4]={1,2,3}'::int[])[2:3] AS g, pg_typeof(('{{1,2},{3,4}}'::int[])[1:1][1])",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["NULL|2|{{1}}|{{1,2}}|{{1,2},{3,4}}|NULL|{1,2}|integer[]"]
+        );
+        let output = run_with(
+            engine,
+            budget,
+            "SELECT (SELECT ARRAY[1,2] AS x)[1], (SELECT ARRAY[1,2])[1], (SELECT ARRAY[1,2] AS y)[1:1]",
+        );
+        assert_eq!(row_description_names(&output), ["x", "array", "y"]);
+    });
+}
+
+#[test]
+fn function_body_syntax_errors_point_into_create_function() {
+    with_engine("function-body-positions", |engine, budget| {
+        // Positions from PostgreSQL 18.6.
+        for (sql, expected) in [
+            (
+                "CREATE FUNCTION sf1() RETURNS int LANGUAGE sql AS 'SELEC 1'",
+                "ERROR 42601 syntax error at or near \"SELEC\" @52",
+            ),
+            (
+                "CREATE FUNCTION sf2() RETURNS int LANGUAGE sql AS $$\n  SELECT 1 +;\n$$",
+                "ERROR 42601 syntax error at or near \";\" @66",
+            ),
+            (
+                "CREATE FUNCTION sf4() RETURNS text LANGUAGE sql AS 'SELECT ''a'' +'",
+                "ERROR 42601 syntax error at end of input @67",
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [expected],
+                "{sql}"
+            );
+        }
+    });
+}

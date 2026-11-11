@@ -20,7 +20,7 @@ use super::super::{
     ColumnLookup, EvalHooks, SqlError, alloc_text, arena_full, arity_err, datum_to_text, eval_full,
     ident_needs_quotes, int_arg, overflow, parse_qualified_ident, quote_ident_str,
     quote_literal_str, regex_substring, resolved_expression_collation, sql_regex_substring,
-    sqlstate, text_arg, text_view, type_mismatch,
+    sqlstate, text_arg, text_view,
 };
 
 fn is_cased(character: char) -> bool {
@@ -309,7 +309,9 @@ pub(crate) fn dispatch<'a>(
                                     value
                                 )
                             })?,
-                        other => return Err(type_mismatch(name, &other)),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
                     }
                 };
                 to_ascii(input, encoding, arena).map(Datum::Text)
@@ -389,7 +391,7 @@ pub(crate) fn dispatch<'a>(
                             ascii_case(s, upper, arena).map(Datum::Text)
                         }
                     }
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "trim" | "btrim" | "ltrim" | "rtrim" => {
@@ -470,7 +472,10 @@ pub(crate) fn dispatch<'a>(
                         Datum::Text(e) => e,
                         Datum::Null => return Ok(Datum::Null),
                         other => {
-                            return Err(type_mismatch("substring escape must be text", &other));
+                            return Err(crate::sql::eval::function_argument_mismatch(
+                                "substring",
+                                &other,
+                            ));
                         }
                     };
                     return sql_regex_substring(s, pattern, escape, arena);
@@ -480,7 +485,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int4(v) => v as i64,
                     Datum::Int8(v) => v,
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let count = if args.len() == 3 {
                     match int_arg(name, args, 2, arena, params, row, hooks)? {
@@ -828,7 +835,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Bytea(b) => Ok(Datum::Int4(b.len() as i32)),
                     // octets needed to hold the bits.
                     Datum::Bit { bits, .. } => Ok(Datum::Int4(bits.len().div_ceil(8) as i32)),
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "lpad" | "rpad" => {
@@ -966,7 +973,10 @@ pub(crate) fn dispatch<'a>(
                         (s.trim_end_matches(' ').len() as i64 * 8) as i32,
                     )),
                     Datum::Bytea(b) => Ok(Datum::Int4((b.len() as i64 * 8) as i32)),
-                    other => Err(type_mismatch("bit_length", &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(
+                        "bit_length",
+                        &other,
+                    )),
                 }
             }
             "starts_with" => {
@@ -1021,7 +1031,9 @@ pub(crate) fn dispatch<'a>(
                     match eval_full(args[1], arena, params, row, hooks)? {
                         Datum::Bool(value) => value,
                         Datum::Null => return Ok(Datum::Null),
-                        other => return Err(type_mismatch(name, &other)),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
                     }
                 } else {
                     true

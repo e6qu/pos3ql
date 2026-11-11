@@ -1423,6 +1423,7 @@ pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
             | "__json_table_exists"
             | "__json_table_value"
             | "__jsonb_subscript_set"
+            | "__array_subscript_set"
     )
 }
 
@@ -3497,8 +3498,332 @@ pub fn eval_full<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    eval_full_unpositioned(expression, arena, params, row, hooks)
-        .map_err(|error| crate::sql::error_position::expression_error(error, expression))
+    eval_full_unpositioned(expression, arena, params, row, hooks).map_err(|error| {
+        let error = complete_function_mismatch(error, expression, row, hooks);
+        crate::sql::error_position::expression_error(error, expression)
+    })
+}
+
+/// Completes the signature of a [`function_argument_mismatch`] raised by a
+/// call with several arguments, naming every argument's type as PostgreSQL's
+/// `function f(type, ...) does not exist` does.
+fn complete_function_mismatch<'a>(
+    error: SqlError,
+    expression: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> SqlError {
+    let type_of = |argument: &Expr<'a>| match argument {
+        Expr::Str(_) | Expr::Null => "unknown",
+        argument => match expression_type_identity(argument, row, hooks) {
+            Ok(ExpressionTypeIdentity::Known(oid)) => ColType::from_oid(oid).map(ColType::name),
+            _ => None,
+        }
+        .or_else(|| static_type(argument, row).map(ColType::name))
+        .unwrap_or("unknown"),
+    };
+    // An operand check names one type, or the lookup only the symbol; PostgreSQL
+    // names the operator with every operand type.
+    let operator = match expression {
+        Expr::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } => operator
+            .operator_name()
+            .map(|symbol| (symbol, Some(*left), *right)),
+        Expr::Unary {
+            operator, operand, ..
+        } => match operator {
+            UnaryOp::Neg => Some("-"),
+            UnaryOp::BitNot => Some("~"),
+            UnaryOp::SquareRoot => Some("|/"),
+            UnaryOp::CubeRoot => Some("||/"),
+            UnaryOp::AbsoluteValue => Some("@"),
+            UnaryOp::TextSearchNot => Some("!!"),
+            UnaryOp::Not => None,
+        }
+        .map(|symbol| (symbol, None, *operand)),
+        Expr::Call { name, args, .. } => match (super::ast::catalog_operator_call(name), args) {
+            (Some((_, symbol)), [left, right]) => Some((symbol, Some(*left), *right)),
+            (Some((_, symbol)), [operand]) => Some((symbol, None, *operand)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((symbol, left, right)) = operator {
+        let named = error
+            .message
+            .as_str()
+            .strip_prefix("operator does not exist: ")
+            .filter(|_| error.sqlstate == sqlstate::UNDEFINED_FUNCTION);
+        let left_type = left.map(type_of);
+        let right_type = type_of(right);
+        if let Some(named) = named
+            && (named == symbol || Some(named) == left_type || named == right_type)
+        {
+            return match left_type {
+                Some(left_type) => sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} {} {}",
+                    left_type,
+                    symbol,
+                    right_type
+                ),
+                None => sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} {}",
+                    symbol,
+                    right_type
+                ),
+            };
+        }
+        return error;
+    }
+    let Expr::Call { name, args, .. } = expression else {
+        return error;
+    };
+    if error.sqlstate != sqlstate::UNDEFINED_FUNCTION || args.len() == 1 {
+        return error;
+    }
+    let message = error.message.as_str();
+    let single_type = message
+        .strip_prefix("function ")
+        .and_then(|rest| rest.strip_prefix(*name))
+        .and_then(|rest| rest.strip_prefix('('))
+        .and_then(|rest| rest.strip_suffix(") does not exist"));
+    if single_type.is_none_or(|types| types.contains(", ")) {
+        return error;
+    }
+    crate::sql::error_position::full_message_error(sqlstate::UNDEFINED_FUNCTION, |text| {
+        let _ = write!(text, "function {name}(");
+        for (index, argument) in args.iter().enumerate() {
+            if index != 0 {
+                let _ = text.write_str(", ");
+            }
+            let _ = text.write_str(type_of(argument));
+        }
+        let _ = text.write_str(") does not exist");
+        Ok(())
+    })
+}
+
+/// A function argument of a type no overload of `name` accepts: PostgreSQL's
+/// `function name(type) does not exist`, completed with every argument's
+/// type when the call has several.
+pub(crate) fn function_argument_mismatch(name: &str, value: &Datum) -> SqlError {
+    sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "function {}({}) does not exist",
+        name,
+        type_name_of(value)
+    )
+}
+
+/// PostgreSQL's 42883 for an operator no overload of which takes `operand`;
+/// the operator's expression completes the message with its symbol and
+/// every operand's type.
+pub(crate) fn operand_type_mismatch(operand: &Datum) -> SqlError {
+    sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "operator does not exist: {}",
+        type_name_of(operand)
+    )
+}
+
+/// PostgreSQL's 42804 for a SQL construct's argument of the wrong type.
+pub(crate) fn argument_type_mismatch(construct: &str, expected: &str, value: &Datum) -> SqlError {
+    sql_err!(
+        sqlstate::DATATYPE_MISMATCH,
+        "argument of {} must be type {}, not type {}",
+        construct,
+        expected,
+        type_name_of(value)
+    )
+}
+
+/// One subscript of an array reference: a bound is absent when omitted and
+/// `None` inside when its value is NULL.
+#[derive(Clone, Copy)]
+struct ReadSubscript {
+    lower: Option<Option<i64>>,
+    upper: Option<Option<i64>>,
+    slice: bool,
+}
+
+/// Evaluates a subscript list on an array-typed value the way PostgreSQL
+/// does: the whole list addresses one element, or, when any subscript is a
+/// slice, one slice in which a plain `[i]` means `[1:i]`. Returns `None` for
+/// a base that is not statically an array, which subscripts one at a time.
+fn array_subscripts<'a>(
+    expression: &Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<Datum<'a>>, SqlError> {
+    const MAX_DIMENSIONS: usize = 6;
+    let mut chain = [None::<&Expr<'a>>; MAX_DIMENSIONS + 1];
+    let mut count = 0;
+    let mut base = expression;
+    while let Expr::Subscript { base: inner, .. } | Expr::Slice { base: inner, .. } = base {
+        if count == chain.len() {
+            return Ok(None);
+        }
+        chain[count] = Some(base);
+        count += 1;
+        base = inner;
+    }
+    if !matches!(static_type(base, row), Some(ColType::Array(_))) {
+        return Ok(None);
+    }
+    let value = eval_full(base, arena, params, row, hooks)?;
+    let bound = |bound: &Expr<'a>| -> Result<Option<i64>, SqlError> {
+        match eval_full(bound, arena, params, row, hooks)? {
+            Datum::Int2(value) => Ok(Some(i64::from(value))),
+            Datum::Int4(value) => Ok(Some(i64::from(value))),
+            Datum::Int8(value) => Ok(Some(value)),
+            Datum::Null => Ok(None),
+            _ => Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "array subscript must have type integer"
+            )),
+        }
+    };
+    // The chain runs outermost first; subscripts apply innermost first.
+    let mut subscripts = [ReadSubscript {
+        lower: None,
+        upper: None,
+        slice: false,
+    }; MAX_DIMENSIONS + 1];
+    for (slot, node) in subscripts
+        .iter_mut()
+        .zip(chain[..count].iter().rev().flatten())
+    {
+        *slot = match node {
+            Expr::Subscript { index, .. } => ReadSubscript {
+                lower: None,
+                upper: Some(bound(index)?),
+                slice: false,
+            },
+            Expr::Slice { lower, upper, .. } => ReadSubscript {
+                lower: lower.map(&bound).transpose()?,
+                upper: upper.map(&bound).transpose()?,
+                slice: true,
+            },
+            _ => unreachable!("the chain holds subscripts"),
+        };
+    }
+    let subscripts = &subscripts[..count];
+    let Datum::Array { element, raw } = value else {
+        return Ok(Some(Datum::Null));
+    };
+    let any_null = subscripts
+        .iter()
+        .any(|subscript| subscript.lower == Some(None) || subscript.upper == Some(None));
+    if any_null {
+        return Ok(Some(Datum::Null));
+    }
+    let shape = super::array::shape(raw).expect("array datum invariant");
+    let dimensions = shape.dimension_count();
+    let empty = || Datum::Array {
+        element,
+        raw: super::array::EMPTY,
+    };
+    if !subscripts.iter().any(|subscript| subscript.slice) {
+        if dimensions == 0 || dimensions != subscripts.len() {
+            return Ok(Some(Datum::Null));
+        }
+        let mut offset = 0usize;
+        for (dimension, subscript) in subscripts.iter().enumerate() {
+            let position = subscript
+                .upper
+                .flatten()
+                .expect("element subscripts are set");
+            let lower = i64::from(shape.lower_bound(dimension).expect("in range"));
+            let upper = i64::from(shape.upper_bound(dimension).expect("in range"));
+            if position < lower || position > upper {
+                return Ok(Some(Datum::Null));
+            }
+            offset = offset * shape.dimension(dimension).expect("in range")
+                + (position - lower) as usize;
+        }
+        return Ok(super::array::get(raw, element, offset));
+    }
+    if dimensions == 0 || subscripts.len() > dimensions {
+        return Ok(Some(empty()));
+    }
+    let mut lower = [0i64; MAX_DIMENSIONS];
+    let mut upper = [0i64; MAX_DIMENSIONS];
+    for dimension in 0..dimensions {
+        let current_lower = i64::from(shape.lower_bound(dimension).expect("in range"));
+        let current_upper = i64::from(shape.upper_bound(dimension).expect("in range"));
+        let (given_lower, given_upper) = match subscripts.get(dimension) {
+            Some(ReadSubscript {
+                upper,
+                slice: false,
+                ..
+            }) => (Some(1), upper.flatten()),
+            Some(ReadSubscript { lower, upper, .. }) => (lower.flatten(), upper.flatten()),
+            None => (None, None),
+        };
+        lower[dimension] = given_lower.unwrap_or(current_lower).max(current_lower);
+        upper[dimension] = given_upper.unwrap_or(current_upper).min(current_upper);
+        if lower[dimension] > upper[dimension] {
+            return Ok(Some(empty()));
+        }
+    }
+    let mut lengths = [0usize; MAX_DIMENSIONS];
+    let ones = [1i32; MAX_DIMENSIONS];
+    for dimension in 0..dimensions {
+        lengths[dimension] = (upper[dimension] - lower[dimension] + 1) as usize;
+    }
+    let result = super::array::Shape::new(&lengths[..dimensions], &ones[..dimensions])?;
+    let items = super::array::alloc_items(arena, result.element_count())?;
+    let mut position = [0i64; MAX_DIMENSIONS];
+    position[..dimensions].copy_from_slice(&lower[..dimensions]);
+    for item in items.iter_mut() {
+        let mut offset = 0usize;
+        for (dimension, at) in position.iter().enumerate().take(dimensions) {
+            let current_lower = i64::from(shape.lower_bound(dimension).expect("in range"));
+            offset = offset * shape.dimension(dimension).expect("in range")
+                + (at - current_lower) as usize;
+        }
+        *item = super::array::get(raw, element, offset).expect("slice within bounds");
+        for dimension in (0..dimensions).rev() {
+            if position[dimension] < upper[dimension] {
+                position[dimension] += 1;
+                break;
+            }
+            position[dimension] = lower[dimension];
+        }
+    }
+    Ok(Some(Datum::Array {
+        element,
+        raw: super::array::build_shaped(items, result, arena)?,
+    }))
+}
+
+/// PostgreSQL's 42804 for a jsonb subscript of a type it cannot coerce.
+fn jsonb_subscript_mismatch(value: &Datum) -> SqlError {
+    crate::sql::error_position::with_hint(
+        sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "subscript type {} is not supported",
+            type_name_of(value)
+        ),
+        "jsonb subscript must be coercible to either integer or text.",
+    )
+}
+
+/// PostgreSQL's 42804 for subscripting a value whose type has no subscripts.
+pub(crate) fn not_subscriptable(value: &Datum) -> SqlError {
+    sql_err!(
+        sqlstate::DATATYPE_MISMATCH,
+        "cannot subscript type {} because it does not support subscripting",
+        type_name_of(value)
+    )
 }
 
 fn eval_full_unpositioned<'a>(
@@ -4703,7 +5028,12 @@ fn eval_full_inner<'a>(
                     Datum::Bool(false) if all => return Ok(Datum::Bool(false)),
                     Datum::Null => saw_unknown = true,
                     Datum::Bool(_) => {}
-                    other => return Err(type_mismatch("quantified comparison", &other)),
+                    _other => {
+                        return Err(sql_err!(
+                            sqlstate::WRONG_OBJECT_TYPE,
+                            "op ANY/ALL (array) requires operator to yield boolean"
+                        ));
+                    }
                 }
             }
             if let Some(probe) = list.probe {
@@ -4757,6 +5087,9 @@ fn eval_full_inner<'a>(
             hooks,
         ),
         Expr::Subscript { base, index } => {
+            if let Some(value) = array_subscripts(expression, arena, params, row, hooks)? {
+                return Ok(value);
+            }
             let b = eval_full(base, arena, params, row, hooks)?;
             let i = eval_full(index, arena, params, row, hooks)?;
             if i.is_null() {
@@ -4766,7 +5099,10 @@ fn eval_full_inner<'a>(
                 Datum::Int2(x) => Ok(i64::from(*x)),
                 Datum::Int4(x) => Ok(i64::from(*x)),
                 Datum::Int8(x) => Ok(*x),
-                _ => Err(type_mismatch("array subscript must be integer", value)),
+                _ => Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "array subscript must have type integer"
+                )),
             };
             match b {
                 Datum::Array { element, raw } => {
@@ -4868,10 +5204,7 @@ fn eval_full_inner<'a>(
                                     arena.alloc_str_display(value).map_err(|_| arena_full())?
                                 }
                                 other => {
-                                    return Err(type_mismatch(
-                                        "jsonb object subscript must be text",
-                                        &other,
-                                    ));
+                                    return Err(jsonb_subscript_mismatch(&other));
                                 }
                             };
                             tree.get_field(key)
@@ -4888,10 +5221,7 @@ fn eval_full_inner<'a>(
                                     index
                                 }
                                 other => {
-                                    return Err(type_mismatch(
-                                        "jsonb array subscript must be coercible to integer or text",
-                                        &other,
-                                    ));
+                                    return Err(jsonb_subscript_mismatch(&other));
                                 }
                             };
                             tree.get_index(index)
@@ -4915,15 +5245,18 @@ fn eval_full_inner<'a>(
                     funcs::geometry::subscript(kind, text, index, arena)
                 }
                 Datum::Null => Ok(Datum::Null),
-                _ => Err(type_mismatch("cannot subscript a non-array", &b)),
+                _ => Err(not_subscriptable(&b)),
             }
         }
         Expr::Slice { base, lower, upper } => {
+            if let Some(value) = array_subscripts(expression, arena, params, row, hooks)? {
+                return Ok(value);
+            }
             let b = eval_full(base, arena, params, row, hooks)?;
             let (element, raw) = match b {
                 Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
-                _ => return Err(type_mismatch("cannot slice a non-array", &b)),
+                _ => return Err(not_subscriptable(&b)),
             };
             // Resolve the leading-dimension bounds; chained slices address the
             // remaining dimensions.
@@ -4933,7 +5266,10 @@ fn eval_full_inner<'a>(
                     Datum::Int4(x) => Ok(Some(x as i64)),
                     Datum::Int8(x) => Ok(Some(x)),
                     Datum::Null => Ok(None),
-                    other => Err(type_mismatch("array slice bound must be integer", &other)),
+                    _other => Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "array subscript must have type integer"
+                    )),
                 }
             };
             let shape = super::array::shape(raw).expect("array datum invariant");
@@ -5164,7 +5500,12 @@ fn eval_full_inner<'a>(
                     let raw = super::array::parse_literal(s, element, arena)?;
                     (element, raw)
                 }
-                _ => return Err(type_mismatch("ANY/ALL requires an array", &array)),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "op ANY/ALL (array) requires array on right side"
+                    ));
+                }
             };
             let mut saw_null = false;
             for el in super::array::elements(raw, element) {
@@ -7199,12 +7540,12 @@ fn call<'a>(
                         Datum::Int2(value) => i64::from(value),
                         Datum::Int4(value) => i64::from(value),
                         Datum::Int8(value) => value,
-                        other => return Err(type_mismatch(name, &other)),
+                        other => return Err(function_argument_mismatch(name, &other)),
                     };
                     let is_called = if args.len() == 3 {
                         match values[2] {
                             Datum::Bool(value) => value,
-                            other => return Err(type_mismatch(name, &other)),
+                            other => return Err(function_argument_mismatch(name, &other)),
                         }
                     } else {
                         true
@@ -7250,7 +7591,7 @@ fn call<'a>(
                     },
                 ),
                 Datum::Null => Ok(Datum::Null),
-                _ => Err(type_mismatch("unnest requires an array or multirange", &a)),
+                _ => Err(function_argument_mismatch("unnest", &a)),
             }
         }
         "generate_series" => {
@@ -7435,7 +7776,7 @@ fn call<'a>(
                     super::types::oid::OID,
                 ),
                 Datum::Null => return Ok(Datum::Null),
-                _ => return Err(type_mismatch("_pg_expandarray requires an array", &array)),
+                _ => return Err(function_argument_mismatch("_pg_expandarray", &array)),
             };
             let ordinal = i32::try_from(k).map_err(|_| {
                 sql_err!(
@@ -7533,9 +7874,8 @@ fn call<'a>(
             }
             let input = match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Null => return Ok(Datum::Null),
-                value => super::array::Input::from_datum(value).ok_or_else(|| {
-                    type_mismatch("generate_subscripts requires an array", &value)
-                })?,
+                value => super::array::Input::from_datum(value)
+                    .ok_or_else(|| function_argument_mismatch("generate_subscripts", &value))?,
             };
             let dim = match eval_full(args[1], arena, params, row, hooks)? {
                 Datum::Int2(v) => v as i64,
@@ -7543,10 +7883,7 @@ fn call<'a>(
                 Datum::Int8(v) => v,
                 Datum::Null => return Ok(Datum::Null),
                 other => {
-                    return Err(type_mismatch(
-                        "generate_subscripts dim must be an integer",
-                        &other,
-                    ));
+                    return Err(function_argument_mismatch("generate_subscripts", &other));
                 }
             };
             let k = hooks.srf_index.ok_or_else(|| {
@@ -7560,10 +7897,7 @@ fn call<'a>(
                     Datum::Bool(reverse) => reverse,
                     Datum::Null => return Ok(Datum::Null),
                     other => {
-                        return Err(type_mismatch(
-                            "generate_subscripts reverse must be boolean",
-                            &other,
-                        ));
+                        return Err(function_argument_mismatch("generate_subscripts", &other));
                     }
                 }
             } else {
@@ -7635,7 +7969,7 @@ fn call<'a>(
                 Datum::Json { text, .. } => text,
                 Datum::Text(s) => s,
                 Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("object_keys requires an object", &other)),
+                other => return Err(function_argument_mismatch(name, &other)),
             };
             let k = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
@@ -7677,7 +8011,7 @@ fn call<'a>(
                 Datum::Json { text, .. } => text,
                 Datum::Text(s) => s,
                 Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("array_elements requires an array", &other)),
+                other => return Err(function_argument_mismatch(name, &other)),
             };
             let k = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
@@ -7789,7 +8123,7 @@ fn call<'a>(
                     raw,
                 } => raw,
                 Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("aclexplode", &other)),
+                other => return Err(function_argument_mismatch("aclexplode", &other)),
             };
             let index = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
@@ -7840,7 +8174,7 @@ fn call<'a>(
                     raw,
                 } => raw,
                 Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("pg_options_to_table", &other)),
+                other => return Err(function_argument_mismatch("pg_options_to_table", &other)),
             };
             let index = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
@@ -7857,7 +8191,9 @@ fn call<'a>(
                     ));
                 }
                 None => return Ok(Datum::Null),
-                Some(other) => return Err(type_mismatch("pg_options_to_table", &other)),
+                Some(other) => {
+                    return Err(function_argument_mismatch("pg_options_to_table", &other));
+                }
             };
             let (option_name, option_value) = match option.split_once('=') {
                 Some((name, value)) => (Datum::Text(name), Datum::Text(value)),
@@ -8423,7 +8759,7 @@ fn json_get<'a>(
     let (text, jsonb) = match l {
         Datum::Json { text, jsonb } => (text, jsonb),
         Datum::Null => return Ok(Datum::Null),
-        other => return Err(type_mismatch("-> requires json/jsonb", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     if r.is_null() {
         return Ok(Datum::Null);
@@ -8434,7 +8770,7 @@ fn json_get<'a>(
         Datum::Int2(i) => tree.get_index(i as i64),
         Datum::Int4(i) => tree.get_index(i as i64),
         Datum::Int8(i) => tree.get_index(i),
-        other => return Err(type_mismatch("-> key must be text or integer", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     let Some(child) = child else {
         return Ok(Datum::Null);
@@ -8593,9 +8929,10 @@ pub fn record_star_expand<'a>(
                     )
                 })
         }
-        other => Err(type_mismatch(
-            "record expansion of a non-composite value",
-            &other,
+        other => Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "type {} is not composite",
+            type_name_of(&other)
         )),
     }
 }
@@ -8829,7 +9166,7 @@ fn jsonb_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
             // An unknown text literal (`'{"b":2}'`) coerces to jsonb.
             Datum::Text(s) => Ok(Some(s)),
             Datum::Null => Ok(None),
-            other => Err(type_mismatch("|| requires jsonb", &other)),
+            other => Err(operand_type_mismatch(&other)),
         }
     };
     let (Some(lt), Some(rt)) = (text_of(l)?, text_of(r)?) else {
@@ -8905,7 +9242,7 @@ fn json_path_parts<'a>(r: Datum<'a>, arena: &'a Arena) -> Result<&'a [&'a str], 
             super::types::ArrElem::Text,
             super::array::parse_literal(lit, super::types::ArrElem::Text, arena)?,
         ),
-        other => return Err(type_mismatch("path must be a text array", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     let n = super::array::len(raw);
     if n > 64 {
@@ -8935,7 +9272,7 @@ fn json_path_parts<'a>(r: Datum<'a>, arena: &'a Arena) -> Result<&'a [&'a str], 
 fn jsonb_delete<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     jsonb_operator_left("-", &l)?;
     let Datum::Json { text, .. } = l else {
-        return Err(type_mismatch("- requires jsonb", &l));
+        return Err(operand_type_mismatch(&l));
     };
     let root = super::json::parse(text, arena)?;
     let result = match r {
@@ -8954,7 +9291,7 @@ fn jsonb_delete<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
             }
             node
         }
-        other => return Err(type_mismatch("- requires text, text[], or integer", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     Ok(Datum::Json {
         text: json_to_text(&result, arena)?,
@@ -8972,7 +9309,7 @@ fn jsonb_delete_path<'a>(
     let text = match l {
         Datum::Json { text, .. } => text,
         Datum::Null => return Ok(Datum::Null),
-        other => return Err(type_mismatch("#- requires jsonb", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     if r.is_null() {
         return Ok(Datum::Null);
@@ -8991,7 +9328,7 @@ fn json_tree_arg<'a>(d: Datum<'a>, arena: &'a Arena) -> Result<super::json::Json
     match d {
         Datum::Json { text, .. } => super::json::parse(text, arena),
         Datum::Text(s) => super::json::parse(s, arena),
-        other => Err(type_mismatch("argument is not jsonb", &other)),
+        other => Err(operand_type_mismatch(&other)),
     }
 }
 
@@ -9004,7 +9341,7 @@ fn json_path<'a>(
     let (text, jsonb) = match l {
         Datum::Json { text, jsonb } => (text, jsonb),
         Datum::Null => return Ok(Datum::Null),
-        other => return Err(type_mismatch("#> requires json/jsonb", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     // The path is a `text[]`; an unknown literal (`'{a,b}'`) arrives as text
     // and is parsed as a text-array literal, as PostgreSQL coerces it.
@@ -9015,7 +9352,7 @@ fn json_path<'a>(
             super::array::parse_literal(lit, super::types::ArrElem::Text, arena)?,
         ),
         Datum::Null => return Ok(Datum::Null),
-        other => return Err(type_mismatch("#> path must be a text array", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     let mut node = super::json::parse(text, arena)?;
     for step in super::array::elements(raw, element) {
@@ -9067,7 +9404,7 @@ fn json_exists<'a>(
     let text = match l {
         Datum::Json { text, .. } => text,
         Datum::Null => return Ok(Datum::Null),
-        other => return Err(type_mismatch("? requires jsonb", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     let node = super::json::parse(text, arena)?;
     // Does a single string key exist (object key, or array string element)?
@@ -9086,7 +9423,7 @@ fn json_exists<'a>(
                 if r.is_null() {
                     return Ok(Datum::Null);
                 }
-                return Err(type_mismatch("? key must be text", &r));
+                return Err(operand_type_mismatch(&r));
             };
             Ok(Datum::Bool(has(key)))
         }
@@ -9098,7 +9435,7 @@ fn json_exists<'a>(
                     super::array::parse_literal(lit, super::types::ArrElem::Text, arena)?,
                 ),
                 Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("?|/?& require a text array", &other)),
+                other => return Err(operand_type_mismatch(&other)),
             };
             let all = operator == JsonExistsAll;
             let mut result = all;
@@ -9129,17 +9466,14 @@ fn jsonpath_operator<'a>(
     let target = match left {
         Datum::Json { text, jsonb: true } => text,
         Datum::Null => return Ok(Datum::Null),
-        other => return Err(type_mismatch("JSON path operator requires jsonb", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     let path = match right {
         Datum::JsonPath(text) => text,
         Datum::Text(text) => super::jsonpath::canonicalize(text, arena)?,
         Datum::Null => return Ok(Datum::Null),
         other => {
-            return Err(type_mismatch(
-                "JSON path operator requires jsonpath",
-                &other,
-            ));
+            return Err(operand_type_mismatch(&other));
         }
     };
     let outcome = super::jsonpath::query_outcome(target, path, None, true, false, arena)?;
@@ -9408,7 +9742,7 @@ fn timestamp_micros(name: &str, d: Datum) -> Result<i64, SqlError> {
     match d {
         Datum::Timestamp(t) | Datum::Timestamptz(t) => Ok(t),
         Datum::Date(day) => Ok(i64::from(day) * 86_400_000_000),
-        other => Err(type_mismatch(name, &other)),
+        other => Err(function_argument_mismatch(name, &other)),
     }
 }
 
@@ -10382,20 +10716,6 @@ fn division_by_zero() -> SqlError {
     sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero")
 }
 
-/// [`type_mismatch`] for callers outside this module (table-function args).
-/// Assigning through an array subscript (`SET a[1] = 9`) is not implemented;
-/// it must not fall through to jsonb subscripting.
-pub(crate) fn array_element_assignment_unsupported() -> SqlError {
-    sql_err!(
-        sqlstate::FEATURE_NOT_SUPPORTED,
-        "assignment to array elements and slices is not supported"
-    )
-}
-
-pub fn type_mismatch_pub(operator: &str, d: &Datum) -> SqlError {
-    type_mismatch(operator, d)
-}
-
 pub(crate) fn sequence_data_oid(value: Datum<'_>) -> Result<Option<i32>, SqlError> {
     match value {
         Datum::Oid(oid) => Ok(Some(oid as i32)),
@@ -10406,15 +10726,6 @@ pub(crate) fn sequence_data_oid(value: Datum<'_>) -> Result<Option<i32>, SqlErro
             "function pg_get_sequence_data does not exist for the supplied argument type"
         )),
     }
-}
-
-fn type_mismatch(operator: &str, d: &Datum) -> SqlError {
-    sql_err!(
-        sqlstate::DATATYPE_MISMATCH,
-        "operator {} does not accept {}",
-        operator,
-        type_name_of(d)
-    )
 }
 
 /// PostgreSQL's error for a cast with no conversion path, naming both types

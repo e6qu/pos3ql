@@ -14,7 +14,7 @@ use crate::sql_err;
 
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, eval_full, range_mismatch, sqlstate,
-    text_arg, type_mismatch,
+    text_arg,
 };
 
 /// Handles the range/multirange family. Returns `None` if `name` is not one of
@@ -264,7 +264,7 @@ pub(crate) fn dispatch<'a>(
                             }
                             Ok(false)
                         }
-                        other => Err(type_mismatch(name, &other)),
+                        other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                     }
                 };
                 if args.len() == 1 {
@@ -274,7 +274,7 @@ pub(crate) fn dispatch<'a>(
                             return Err(arity_err(name, args.len()));
                         }
                         if element.to_coltype() != crate::sql::types::ColType::Range(kind) {
-                            return Err(type_mismatch(name, &value));
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &value));
                         }
                         for value in crate::sql::array::elements(raw, element) {
                             if add(value)? {
@@ -306,7 +306,7 @@ pub(crate) fn dispatch<'a>(
                         text: range::multirange_from_range(text, kind, arena)?,
                         kind,
                     }),
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "isempty" => {
@@ -315,7 +315,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => Ok(Datum::Null),
                     Datum::Range { text, .. } => Ok(Datum::Bool(range::is_empty(text))),
                     Datum::Multirange { text, .. } => Ok(Datum::Bool(text.trim() == "{}")),
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "lower_inc" | "upper_inc" => {
@@ -341,7 +341,7 @@ pub(crate) fn dispatch<'a>(
                             Ok(Datum::Bool(false))
                         }
                     }
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "lower_inf" | "upper_inf" => {
@@ -370,7 +370,7 @@ pub(crate) fn dispatch<'a>(
                             Ok(Datum::Bool(false))
                         }
                     }
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "range_merge" => {
@@ -393,7 +393,7 @@ pub(crate) fn dispatch<'a>(
                                 })
                             }
                         }
-                        other => Err(type_mismatch(name, &other)),
+                        other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                     };
                 }
                 arity(2)?;
@@ -405,7 +405,7 @@ pub(crate) fn dispatch<'a>(
                 let (Datum::Range { text: at, kind: ak }, Datum::Range { text: bt, kind: bk }) =
                     (a, b)
                 else {
-                    return Err(type_mismatch(name, &a));
+                    return Err(crate::sql::eval::function_argument_mismatch(name, &a));
                 };
                 if ak != bk {
                     return Err(range_mismatch());
@@ -562,7 +562,9 @@ pub(crate) fn dispatch<'a>(
                         Datum::Int8(seed) => Some(seed),
                         Datum::Int4(seed) => Some(i64::from(seed)),
                         Datum::Null => return Ok(Datum::Null),
-                        other => return Err(type_mismatch(name, &other)),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
                     }
                 } else {
                     None
@@ -572,7 +574,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Multirange { text, kind } => {
                         range::hash_multirange(text, kind, seed, arena)?
                     }
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 Ok(if extended {
                     Datum::Int8(hash as i64)
@@ -585,7 +589,7 @@ pub(crate) fn dispatch<'a>(
                 match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
                     value @ Datum::Range { .. } => Ok(value),
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "int4range_subdiff" | "int8range_subdiff" | "numrange_subdiff"
@@ -605,7 +609,7 @@ pub(crate) fn dispatch<'a>(
                     | (Datum::Timestamptz(a), Datum::Timestamptz(b)) => {
                         (a as f64 - b as f64) / 1_000_000.0
                     }
-                    _ => return Err(type_mismatch(name, &left)),
+                    _ => return Err(crate::sql::eval::function_argument_mismatch(name, &left)),
                 };
                 Ok(Datum::Float8(difference))
             }

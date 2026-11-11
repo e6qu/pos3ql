@@ -174,7 +174,24 @@ pub(crate) fn at_subject(error: SqlError, subject: &str) -> SqlError {
     error
 }
 
-/// [`at_subject`] or [`at_offset`] with PostgreSQL's hint for the error.
+/// Attaches PostgreSQL's `hint` to `error`.
+pub(crate) fn with_hint(error: SqlError, hint: &'static str) -> SqlError {
+    record(&error, None, Some(hint));
+    error
+}
+
+/// A position at byte `at` of the parsed source.
+fn at_parsed_offset(error: SqlError, at: Option<usize>) -> SqlError {
+    let source = SOURCE.with(Cell::get);
+    let position = at
+        .map(|at| at + source.offset_base)
+        .filter(|at| !source.text.is_null() && *at <= source.len)
+        .map(|at| character_position(source, at));
+    record(&error, position, None);
+    error
+}
+
+/// A position at byte `at` of the parsed source with PostgreSQL's hint.
 fn annotated(error: SqlError, at: Option<usize>, hint: &'static str) -> SqlError {
     let source = SOURCE.with(Cell::get);
     let position = at
@@ -199,10 +216,15 @@ pub(crate) fn expression_error(
     match expression {
         Expr::Column { qualifier, name } => column_reference(error, *qualifier, name),
         Expr::Cast {
-            type_name, operand, ..
+            type_name,
+            operand,
+            source_position,
+            ..
         } => {
             if state == sqlstate::UNDEFINED_OBJECT && message.starts_with("type \"") {
                 at_subject(error, type_name)
+            } else if state == sqlstate::CANNOT_COERCE && message.starts_with("cannot cast type ") {
+                at_parsed_offset(error, source_position.get())
             } else if let Expr::Str(literal) = operand
                 && state.starts_with("22")
                 && !is_type_modifier_failure(message)
@@ -211,6 +233,22 @@ pub(crate) fn expression_error(
             } else {
                 error
             }
+        }
+        Expr::Call {
+            name,
+            source_position,
+            args,
+            ..
+        } if state == sqlstate::UNDEFINED_FUNCTION
+            && message.starts_with("operator ")
+            && crate::sql::ast::catalog_operator_call(name).is_some() =>
+        {
+            let hint = if args.len() == 1 {
+                UNARY_OPERATOR_HINT
+            } else {
+                BINARY_OPERATOR_HINT
+            };
+            annotated(error, source_position.get(), hint)
         }
         Expr::Call {
             name,
@@ -369,4 +407,34 @@ pub(crate) fn with_full_message<R>(
         full.sqlstate = None;
         report(matches.then_some(full.text.as_str()))
     })
+}
+
+/// A syntax error in a routine body written in the statement text, at its
+/// place in that text, as PostgreSQL's `function_parse_error_transpose`
+/// reports it. `body` is the parsed body and `error` indexes it.
+pub(crate) fn body_parse_error(error: &crate::sql::parser::ParseError, body: &str) -> SqlError {
+    let sql_error = crate::sql::parse_error_to_sql(error);
+    let position = error.cursor.and_then(|cursor| {
+        let (token_at, source) = locate(body)?;
+        let text = unsafe { core::slice::from_raw_parts(source.text, source.len) };
+        let at = match text.get(token_at) {
+            // A dollar-quoted body is written verbatim after its tag.
+            Some(b'$') => {
+                let tag = text[token_at + 1..].iter().position(|byte| *byte == b'$')?;
+                token_at + tag + 2 + cursor
+            }
+            // A plain string literal: each doubled quote is one body quote.
+            Some(b'\'') => {
+                let mut at = token_at + 1;
+                for _ in 0..cursor {
+                    at += if text.get(at) == Some(&b'\'') { 2 } else { 1 };
+                }
+                at
+            }
+            _ => return None,
+        };
+        (at <= source.len).then(|| character_position(source, at))
+    });
+    record(&sql_error, position, error.hint);
+    sql_error
 }

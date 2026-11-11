@@ -17,8 +17,7 @@ use super::{
     SqlError, arena_full, as_f64, as_i64, bad_text, cast_to_text, concat, datum_f64, datum_numeric,
     division_by_zero, interval_cmp_value, json_exists, json_get, json_path, jsonb_concat,
     jsonb_delete, jsonb_delete_path, jsonpath_operator, like_match, num_factor, out_of_range,
-    overflow, parse_bool, parse_uuid, sqlstate, to_numeric, type_mismatch, type_name_of,
-    validate_bits,
+    overflow, parse_bool, parse_uuid, sqlstate, to_numeric, type_name_of, validate_bits,
 };
 
 /// Only ordering and equality can enter the collated comparator. Quantified
@@ -135,13 +134,13 @@ fn acl_contains(left: Datum<'_>, right: Datum<'_>) -> Result<Datum<'static>, Sql
         raw,
     } = left
     else {
-        return Err(type_mismatch("aclcontains", &left));
+        return Err(super::operand_type_mismatch(&left));
     };
     crate::sql::acl::validate_array_shape(raw)?;
     let right_item = match right {
         Datum::AclItem(item) => Some(item),
         Datum::Text(_) => None,
-        _ => return Err(type_mismatch("aclcontains", &right)),
+        _ => return Err(super::operand_type_mismatch(&right)),
     };
     let right_text = match right {
         Datum::Text(value) => Some(crate::sql::acl::parse(value)?),
@@ -340,7 +339,7 @@ pub(crate) fn range_setop<'a>(
         BinaryOp::Add => range::union(lt, rt, lk, arena)?,
         BinaryOp::Sub => range::difference(lt, rt, lk, arena)?,
         BinaryOp::Mul => range::intersect(lt, rt, lk, arena)?,
-        _ => return Err(type_mismatch("range operator", &l)),
+        _ => return Err(super::operand_type_mismatch(&l)),
     };
     Ok(Datum::Range { text, kind: lk })
 }
@@ -385,7 +384,7 @@ fn range_contains<'a>(
 fn as_range<'a>(d: &Datum<'a>) -> Result<(&'a str, RangeKind), SqlError> {
     match d {
         Datum::Range { text, kind } => Ok((text, *kind)),
-        other => Err(type_mismatch("range operator", other)),
+        other => Err(super::operand_type_mismatch(other)),
     }
 }
 
@@ -488,9 +487,9 @@ pub(crate) fn bit_shift<'a>(
         return Ok(Datum::Null);
     }
     let Datum::Bit { bits, varying } = l else {
-        return Err(type_mismatch("bit-string shift", &l));
+        return Err(super::operand_type_mismatch(&l));
     };
-    let count = as_i64(&r).ok_or_else(|| type_mismatch("bit-string shift amount", &r))?;
+    let count = as_i64(&r).ok_or_else(|| super::operand_type_mismatch(&r))?;
     // `<<` moves bits toward the most-significant (left) end.
     let left = if matches!(operator, BinaryOp::Shl) {
         count
@@ -1932,7 +1931,7 @@ fn narrow_int<'a>(v: i64, l: &Datum, r: &Datum) -> Result<Datum<'a>, SqlError> {
 fn as_multirange<'a>(d: &Datum<'a>) -> Result<(&'a str, RangeKind), SqlError> {
     match d {
         Datum::Multirange { text, kind } => Ok((text, *kind)),
-        other => Err(type_mismatch("multirange operator", other)),
+        other => Err(super::operand_type_mismatch(other)),
     }
 }
 
@@ -1947,7 +1946,7 @@ fn as_multirange_coerce<'a>(
         Datum::Range { text, kind } => {
             Ok((range::multirange_from_range(text, *kind, arena)?, *kind))
         }
-        other => Err(type_mismatch("multirange operator", other)),
+        other => Err(super::operand_type_mismatch(other)),
     }
 }
 
@@ -1972,7 +1971,7 @@ pub(crate) fn multirange_setop<'a>(
         BinaryOp::Add => range::multirange_union(lt, rt, lk, arena)?,
         BinaryOp::Sub => range::multirange_difference(lt, rt, lk, arena)?,
         BinaryOp::Mul => range::multirange_intersect(lt, rt, lk, arena)?,
-        _ => return Err(type_mismatch("multirange operator", &l)),
+        _ => return Err(super::operand_type_mismatch(&l)),
     };
     Ok(Datum::Multirange { text, kind: lk })
 }
@@ -2018,7 +2017,7 @@ pub(crate) fn multirange_op<'a>(
                 lt, rt, lk, predicate,
             )?))
         }
-        _ => Err(type_mismatch("multirange operator", &l)),
+        _ => Err(super::operand_type_mismatch(&l)),
     }
 }
 
@@ -2064,7 +2063,7 @@ pub(crate) fn bitwise<'a>(
             Datum::Int2(v) => Ok(i64::from(*v)),
             Datum::Int4(v) => Ok(i64::from(*v)),
             Datum::Int8(v) => Ok(*v),
-            other => Err(type_mismatch("bitwise operator requires integers", other)),
+            other => Err(super::operand_type_mismatch(other)),
         }
     };
     if l.is_null() || r.is_null() {
@@ -2186,13 +2185,13 @@ pub(crate) fn unary<'a>(
             bytes.iter_mut().for_each(|byte| *byte = !*byte);
             Ok(Datum::Macaddr8(bytes))
         }
-        (UnaryOp::Neg, other) => Err(type_mismatch("-", &other)),
+        (UnaryOp::Neg, other) => Err(super::operand_type_mismatch(&other)),
         (UnaryOp::Not, other) => match super::boolean_argument(other, "NOT")? {
             Datum::Bool(b) => Ok(Datum::Bool(!b)),
             _ => Ok(Datum::Null),
         },
-        (UnaryOp::BitNot, other) => Err(type_mismatch("~", &other)),
-        (UnaryOp::TextSearchNot, other) => Err(type_mismatch("!!", &other)),
+        (UnaryOp::BitNot, other) => Err(super::operand_type_mismatch(&other)),
+        (UnaryOp::TextSearchNot, other) => Err(super::operand_type_mismatch(&other)),
         // The prefix arithmetic operators are evaluated through the functions
         // they compute, so a datum never reaches here wearing one.
         (UnaryOp::SquareRoot | UnaryOp::CubeRoot | UnaryOp::AbsoluteValue, _) => {

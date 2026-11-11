@@ -16,7 +16,7 @@ use crate::sql_err;
 
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, cast_to, compare_datums, eval_full,
-    load_array, sqlstate, text_arg, text_view, type_mismatch, unify_arr_elem,
+    load_array, sqlstate, text_arg, text_view, unify_arr_elem,
 };
 
 /// Compatible-array declarations promote PostgreSQL's catalog vectors to
@@ -165,7 +165,7 @@ fn vector_bounds<'a>(
         Datum::Int4(value) => value as i64,
         Datum::Int8(value) => value,
         Datum::Null => return Ok(Datum::Null),
-        value => return Err(type_mismatch("array dimension must be an integer", &value)),
+        value => return Err(crate::sql::eval::function_argument_mismatch(name, &value)),
     };
     if dimension != 1 {
         return Ok(Datum::Null);
@@ -280,10 +280,7 @@ pub(crate) fn dispatch<'a>(
                 let (Datum::Array { element: left, .. }, Datum::Array { element: right, .. }) =
                     (values[0], values[1])
                 else {
-                    return Err(type_mismatch(
-                        "array comparison requires arrays",
-                        &values[0],
-                    ));
+                    return Err(crate::sql::eval::operand_type_mismatch(&values[0]));
                 };
                 if left != right {
                     return Err(arity_err(name, args.len()));
@@ -319,9 +316,8 @@ pub(crate) fn dispatch<'a>(
                             Datum::Int8(value) => value,
                             Datum::Null => return Ok(Datum::Null),
                             value => {
-                                return Err(type_mismatch(
-                                    "array dimension must be an integer",
-                                    &value,
+                                return Err(crate::sql::eval::function_argument_mismatch(
+                                    name, &value,
                                 ));
                             }
                         };
@@ -357,7 +353,10 @@ pub(crate) fn dispatch<'a>(
                         hooks,
                     ),
                     Datum::Null => Ok(Datum::Null),
-                    _ => Err(type_mismatch("array_length requires an array", &a)),
+                    _ => Err(crate::sql::eval::function_argument_mismatch(
+                        "array_length",
+                        &a,
+                    )),
                 }
             }
             "array_position" => {
@@ -376,7 +375,12 @@ pub(crate) fn dispatch<'a>(
                 let (element, raw) = match a {
                     Datum::Array { element, raw } => (element, raw),
                     Datum::Null => return Ok(Datum::Null),
-                    _ => return Err(type_mismatch("array_position requires an array", &a)),
+                    _ => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "array_position",
+                            &a,
+                        ));
+                    }
                 };
                 let shape = array::shape(raw).expect("array datum invariant");
                 if shape.dimension_count() > 1 {
@@ -399,8 +403,8 @@ pub(crate) fn dispatch<'a>(
                             ));
                         }
                         value => {
-                            return Err(type_mismatch(
-                                "array_position initial position must be an integer",
+                            return Err(crate::sql::eval::function_argument_mismatch(
+                                "array_position",
                                 &value,
                             ));
                         }
@@ -443,7 +447,12 @@ pub(crate) fn dispatch<'a>(
                 let (element, raw) = match a {
                     Datum::Array { element, raw } => (element, raw),
                     Datum::Null => return Ok(Datum::Null),
-                    _ => return Err(type_mismatch("array_positions requires an array", &a)),
+                    _ => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "array_positions",
+                            &a,
+                        ));
+                    }
                 };
                 let shape = array::shape(raw).expect("array datum invariant");
                 if shape.dimension_count() > 1 {
@@ -510,10 +519,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Array { element, raw } => (element, Some(raw)),
                     Datum::Null => (ArrElem::from_datum(&elem).unwrap_or(ArrElem::Text), None),
                     _ => {
-                        return Err(type_mismatch(
-                            "array_append/prepend requires an array",
-                            &arr,
-                        ));
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &arr));
                     }
                 };
                 // The result element type promotes to hold both the array's elements
@@ -586,7 +592,10 @@ pub(crate) fn dispatch<'a>(
                         Ok(Datum::Array { element, raw })
                     }
                     (Datum::Null, Datum::Null) => Ok(Datum::Null),
-                    _ => Err(type_mismatch("array_cat requires arrays", &a)),
+                    _ => Err(crate::sql::eval::function_argument_mismatch(
+                        "array_cat",
+                        &a,
+                    )),
                 }
             }
             // `array_remove(arr, elem)`: drop every element equal to `elem`
@@ -600,7 +609,7 @@ pub(crate) fn dispatch<'a>(
                 let (source, raw) = match arr {
                     Datum::Array { element, raw } => (element, raw),
                     Datum::Null => return Ok(Datum::Null),
-                    _ => return Err(type_mismatch(name, &arr)),
+                    _ => return Err(crate::sql::eval::function_argument_mismatch(name, &arr)),
                 };
                 let shape = array::shape(raw).expect("array datum invariant");
                 if !is_replace && shape.dimension_count() > 1 {
@@ -678,7 +687,12 @@ pub(crate) fn dispatch<'a>(
                 let (element, raw) = match arr {
                     Datum::Array { element, raw } => (element, raw),
                     Datum::Null => return Ok(Datum::Null),
-                    _ => return Err(type_mismatch("trim_array requires an array", &arr)),
+                    _ => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "trim_array",
+                            &arr,
+                        ));
+                    }
                 };
                 if array::shape(raw)
                     .expect("array datum invariant")
@@ -698,7 +712,12 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int2(v) => v as i64,
                     Datum::Int4(v) => v as i64,
                     Datum::Int8(v) => v,
-                    _ => return Err(type_mismatch("trim_array count must be an integer", &count)),
+                    _ => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "trim_array",
+                            &count,
+                        ));
+                    }
                 };
                 if trim < 0 || trim as usize > total {
                     return Err(sql_err!(
@@ -751,7 +770,7 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                     Datum::Null => return Ok(Datum::Null),
-                    _ => return Err(type_mismatch(name, &arr)),
+                    _ => return Err(crate::sql::eval::function_argument_mismatch(name, &arr)),
                 };
                 let shape = array::shape(raw).expect("array datum invariant");
                 if shape.dimension_count() == 0 {
@@ -791,7 +810,12 @@ pub(crate) fn dispatch<'a>(
                     match text_view(eval_full(args[2], arena, params, row, hooks)?) {
                         Datum::Null => None,
                         Datum::Text(s) => Some(s),
-                        other => return Err(type_mismatch("array_to_string null string", &other)),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(
+                                "array_to_string",
+                                &other,
+                            ));
+                        }
                     }
                 } else {
                     None
@@ -799,12 +823,22 @@ pub(crate) fn dispatch<'a>(
                 let (element, raw) = match a {
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Array { element, raw } => (element, raw),
-                    other => return Err(type_mismatch("array_to_string", &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "array_to_string",
+                            &other,
+                        ));
+                    }
                 };
                 let delim = match text_view(delim) {
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Text(s) => s,
-                    other => return Err(type_mismatch("array_to_string delimiter", &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "array_to_string",
+                            &other,
+                        ));
+                    }
                 };
                 // Renders the i-th element as text, or `None` to omit it (a NULL
                 // element with no null-string replacement).
@@ -814,7 +848,10 @@ pub(crate) fn dispatch<'a>(
                         v => match cast_to(v, ColType::Text, arena)? {
                             Datum::Text(s) => Ok(Some(s)),
                             Datum::Null => Ok(nullrep),
-                            other => Err(type_mismatch("array_to_string element", &other)),
+                            other => Err(crate::sql::eval::function_argument_mismatch(
+                                "array_to_string",
+                                &other,
+                            )),
                         },
                     }
                 };
@@ -861,12 +898,12 @@ pub(crate) fn dispatch<'a>(
                     ));
                 }
                 let Datum::Array { element, raw } = dims else {
-                    return Err(type_mismatch(name, &dims));
+                    return Err(crate::sql::eval::function_argument_mismatch(name, &dims));
                 };
                 let dims_shape = array::shape(raw).expect("array datum invariant");
                 if dims_shape.dimension_count() > 1 || element != ArrElem::Int4 {
-                    return Err(type_mismatch(
-                        "array_fill dimensions must be an integer array",
+                    return Err(crate::sql::eval::function_argument_mismatch(
+                        "array_fill",
                         &dims,
                     ));
                 }
@@ -902,8 +939,8 @@ pub(crate) fn dispatch<'a>(
                         raw: low_raw,
                     } = lows
                     else {
-                        return Err(type_mismatch(
-                            "array_fill lower bounds must be an integer array",
+                        return Err(crate::sql::eval::function_argument_mismatch(
+                            "array_fill",
                             &lows,
                         ));
                     };

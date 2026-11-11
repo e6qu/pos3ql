@@ -15,6 +15,7 @@ pub(crate) mod commit;
 mod concurrent_index;
 #[cfg(all(test, not(miri)))]
 pub(crate) use concurrent_index::CommitPhase as IndexCommitPhaseForTests;
+pub(crate) mod array_assignment;
 pub mod copy;
 pub mod cursor;
 pub mod datetime;
@@ -11596,6 +11597,10 @@ impl Engine {
                     return Ok(ExecutionStatus::Complete);
                 }
             };
+            if let Err(e) = parser.record_source_copies() {
+                report_parse_error(responder, &e, text)?;
+                return Ok(ExecutionStatus::Complete);
+            }
             parser.capture_type_inputs();
             // One Query message owns an implicit transaction until an explicit
             // BEGIN boundary. PostgreSQL commits preceding simple-query commands
@@ -12355,6 +12360,10 @@ impl Engine {
                         return Ok(ExtendedExecutionStatus::Complete(false));
                     }
                 };
+                if let Err(e) = parser.record_source_copies() {
+                    report_parse_error(responder, &e, text)?;
+                    return Ok(ExtendedExecutionStatus::Complete(false));
+                }
                 let source_bindings = match type_inputs::decode(bound_inputs, arena) {
                     Ok(bindings) => bindings,
                     Err(error) => {
@@ -13074,6 +13083,9 @@ impl Engine {
                     Ok(parser) => parser,
                     Err(error) => return Ok(Err(parse_error_to_sql(&error))),
                 };
+                if let Err(error) = parser.record_source_copies() {
+                    return Ok(Err(parse_error_to_sql(&error)));
+                }
                 guc.refresh_identities(&self.storage, txn.txid);
                 eval::funcs::system::set_session_user(guc.session_identity());
                 eval::funcs::system::set_current_user(guc.current_identity());
@@ -13429,6 +13441,9 @@ impl Engine {
                 Ok(parser) => parser,
                 Err(error) => return Ok(Err(parse_error_to_sql(&error))),
             };
+            if let Err(error) = parser.record_source_copies() {
+                return Ok(Err(parse_error_to_sql(&error)));
+            }
             parser.set_type_inputs(bindings);
             let statement = match parser.next_stmt() {
                 Ok(Some(statement)) => statement,
@@ -16482,6 +16497,9 @@ impl Engine {
                     Err(error) => return Ok(Err(error)),
                 };
                 let parsed = (|| {
+                    // A syntax error points into the CREATE text the body
+                    // was written in.
+                    let written_body = body;
                     let body = arena.alloc_str(body).map_err(|_| eval::arena_full())?;
                     let name = arena
                         .alloc_str(routine.name.name)
@@ -16493,11 +16511,11 @@ impl Engine {
                                 &declaration.arguments[..declaration.argument_count],
                             )
                         })
-                        .map_err(|error| parse_error_to_sql(&error))?;
+                        .map_err(|error| error_position::body_parse_error(&error, written_body))?;
                     parser.capture_type_inputs();
                     while let Some(statement) = parser
                         .next_stmt()
-                        .map_err(|error| parse_error_to_sql(&error))?
+                        .map_err(|error| error_position::body_parse_error(&error, written_body))?
                     {
                         query::capture_contextual_type_inputs(
                             &parser,

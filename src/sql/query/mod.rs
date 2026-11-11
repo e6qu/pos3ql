@@ -1866,7 +1866,7 @@ pub(crate) fn parse_routine_function_program<'a>(
 ) -> Result<RoutineFunctionProgram<'a>, SqlError> {
     let mut parser = super::parser::Parser::new(body, arena)
         .and_then(|parser| parser.with_routine_parameters(routine_name, parameters))
-        .map_err(|error| super::parse_error_to_sql(&error))?;
+        .map_err(|error| super::error_position::body_parse_error(&error, body))?;
     parser.set_type_inputs(inputs);
     let parsed = arena
         .alloc_slice_with(super::parser::statement_capacity(body), |_| None)
@@ -1875,7 +1875,7 @@ pub(crate) fn parse_routine_function_program<'a>(
     loop {
         let statement = parser
             .next_stmt()
-            .map_err(|error| super::parse_error_to_sql(&error))?;
+            .map_err(|error| super::error_position::body_parse_error(&error, body))?;
         let Some(statement) = statement else { break };
         let step = if let Some(name) = routine_statement_forbidden(&statement) {
             RoutinePrelude::Forbidden(name)

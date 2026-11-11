@@ -54,6 +54,25 @@ LINE 1: SELECT count(*), id FROM t_err;
                          ^
 DROP TABLE missing_table;
 psql:tests/external/sql/errors.sql:23: ERROR:  42P01: table "missing_table" does not exist
+-- Unicode escapes, type modifiers checked after parsing, operator and cast
+-- errors with PostgreSQL's position and hint.
+SELECT U&'\D83D';
+psql:tests/external/sql/errors.sql:26: ERROR:  42601: invalid Unicode surrogate pair
+LINE 1: SELECT U&'\D83D';
+                       ^
+SELECT 1::numeric(2000);
+psql:tests/external/sql/errors.sql:27: ERROR:  22023: NUMERIC precision 2000 must be between 1 and 1000
+LINE 1: SELECT 1::numeric(2000);
+                  ^
+SELECT '{}'::jsonb ? 1;
+psql:tests/external/sql/errors.sql:28: ERROR:  42883: operator does not exist: jsonb ? integer
+LINE 1: SELECT '{}'::jsonb ? 1;
+                           ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+SELECT 1::int::timestamp;
+psql:tests/external/sql/errors.sql:29: ERROR:  42846: cannot cast type integer to timestamp without time zone
+LINE 1: SELECT 1::int::timestamp;
+                     ^
 -- psql sends each ;-separated statement as its own Query message and
 -- (with ON_ERROR_STOP off) continues after errors; the wire_probe covers
 -- true multi-statement strings in one message.
@@ -63,7 +82,7 @@ SELECT 'before'; SELECT 1/0; SELECT 'after';
  before
 (1 row)
 
-psql:tests/external/sql/errors.sql:27: ERROR:  22012: division by zero
+psql:tests/external/sql/errors.sql:33: ERROR:  22012: division by zero
  ?column? 
 ----------
  after

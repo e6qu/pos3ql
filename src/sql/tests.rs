@@ -82198,28 +82198,23 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
 }
 
 #[test]
-fn array_element_assignment_is_rejected_instead_of_treated_as_jsonb() {
+fn array_element_assignment_is_not_treated_as_jsonb() {
     let config = test_config("array-element-assignment");
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE element_targets (a int[], j jsonb); \
-         INSERT INTO element_targets VALUES ('{1,2}', '{}'), (NULL, NULL)",
+        "CREATE TABLE element_targets (id int, a int[], j jsonb); \
+         INSERT INTO element_targets VALUES (1, '{1,2}', '{}'), (2, NULL, NULL)",
     );
-    for statement in [
-        "UPDATE element_targets SET a[1] = 9 WHERE a IS NOT NULL",
-        "UPDATE element_targets SET a[1] = 9 WHERE a IS NULL",
-    ] {
-        let output = run_with(&mut engine, &mut budget, statement);
-        assert_eq!(error_sqlstates(&output), ["0A000"], "{statement}");
-        assert!(
-            String::from_utf8_lossy(&output)
-                .contains("assignment to array elements and slices is not supported"),
-            "{statement}"
-        );
-    }
+    // A NULL array column takes the shape of its subscripts, as in PostgreSQL.
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE element_targets SET a[1] = 9; SELECT a FROM element_targets ORDER BY id",
+    );
+    assert_eq!(data_rows(&output), ["{9,2}", "{9}"]);
     let output = run_with(
         &mut engine,
         &mut budget,

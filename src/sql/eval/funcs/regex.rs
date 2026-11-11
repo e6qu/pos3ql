@@ -275,7 +275,9 @@ pub(crate) fn dispatch<'a>(
                             Datum::Int4(value) => i64::from(value),
                             Datum::Int8(value) => value,
                             Datum::Oid(value) => i64::from(value),
-                            other => return Err(super::super::type_mismatch_pub(name, &other)),
+                            other => {
+                                return Err(super::super::function_argument_mismatch(name, &other));
+                            }
                         }
                     } else {
                         let Some(value) = int_arg(name, args, 3, arena, params, row, hooks)? else {
@@ -604,7 +606,7 @@ pub(crate) fn dispatch<'a>(
                     match eval_full(args[i], arena, params, row, hooks)? {
                         Datum::Null => Ok(None),
                         Datum::Text(s) | Datum::Bpchar(s) => Ok(Some(s)),
-                        other => Err(super::super::type_mismatch_pub(name, &other)),
+                        other => Err(super::super::function_argument_mismatch(name, &other)),
                     }
                 };
                 let (Some(text), Some(pattern)) = (raw_text(0)?, raw_text(1)?) else {

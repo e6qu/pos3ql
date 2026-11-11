@@ -72,6 +72,38 @@ Identity, inheritance, and partitions:
   parent's sequence, but `pg_get_serial_sequence` returns NULL for a child.
   Detaching a partition clears its inherited identity; rolling back restores it.
 
+Syntax and errors:
+
+- `U&'d\0061t\+000061'` and `U&"d!0061t" UESCAPE '!'` read Unicode escapes
+  as PostgreSQL does, with its errors (`invalid Unicode escape`, `invalid
+  Unicode surrogate pair`, `invalid Unicode escape character`). The
+  `standard_conforming_strings` setting is always on, so these forms are always
+  allowed.
+- An identifier longer than 63 bytes is cut to 63 bytes at a character
+  boundary, and the server sends `NOTICE: identifier "..." will be truncated
+  to "..."` before running the query, as PostgreSQL does.
+- Errors point at their cause, as psql's `LINE 1:` and caret show: syntax
+  errors, unknown relations, columns, types, functions and operators (with
+  PostgreSQL's hints), failed constant input (`SELECT 'zap'::int`) and syntax
+  errors inside a SQL function body given to `CREATE FUNCTION`. An error
+  about an expression that keeps no source position, such as the integer in
+  `SELECT 1 WHERE 1`, has no position. PL/pgSQL errors carry no `CONTEXT`
+  line, and a failing `EXECUTE` does not report the dynamic query as
+  PostgreSQL's `QUERY:` field.
+- Checks PostgreSQL makes after parsing are reported when the statement would
+  run, with PostgreSQL's code and message: type modifiers (`numeric(2000)` is
+  `22023`, `NUMERIC precision 2000 must be between 1 and 1000`; `numeric(5,-2)`
+  and `numeric(3,5)` are accepted), COPY options, storage parameters and
+  sequence, database and large-object values. An earlier statement in the same
+  query string still runs, and a syntax error anywhere in the string is
+  reported first.
+- An unsupported cast reports `42846` with both types as `format_type` names
+  them (`cannot cast type integer to timestamp without time zone`).
+- Array elements and slices can be assigned (`UPDATE t SET a[2] = 9`,
+  `a[1:2] = '{1,2}'`, `INSERT INTO t (a[1]) VALUES (5)`): a one-dimensional
+  array grows with NULLs, other arrays stay within their bounds, and a slice
+  anywhere in a subscript list makes the whole list a slice (`a[1:1][1]`).
+
 Functions and expressions:
 
 - Named arguments and omitted defaults run in declared input order and share
@@ -95,10 +127,11 @@ Functions and expressions:
   body`).
 - A built-in function cannot implement `CREATE CAST` or `CREATE OPERATOR`
   (`0A000`). Aggregate support functions can name supported built-ins.
-- A missing-function message that does not fit the fixed 192-byte error
-  message returns `54000`. This includes the signature that `DROP`, `ALTER`,
+- A missing-function message names the whole signature however long it is,
+  as PostgreSQL does, including the signature that `DROP`, `ALTER`,
   `COMMENT ON` and `GRANT` quote for a routine they cannot find, such as
-  `function f(integer) does not exist`.
+  `function f(integer) does not exist`. Messages up to 100 arguments of
+  schema-qualified type names fit; a longer one fails with `54000`.
 - Built-in functions cannot be changed: `ALTER FUNCTION lower(text) STABLE`,
   `COMMENT ON FUNCTION lower(text)` and `GRANT EXECUTE ON FUNCTION
   lower(text)` fail with `0A000`. Dropping one fails with `2BP01`, as in
@@ -254,13 +287,13 @@ why none of these numbers is a throughput rate.
 | LIST partition bounds, inheritance parents, trigger arguments, routine configuration entries | 64 each | named error |
 | Constraint and other catalog creation numbers (statistics, extensions, FDW objects, publications, subscriptions) | 1–9,999,999 | `54000` |
 | Stored default expression, including saved display text | 120 bytes | `54000` |
-| Identifier length | 63 bytes | `42622` (PostgreSQL truncates with a notice instead) |
+| Identifier length | 63 bytes | Truncated at a character boundary with PostgreSQL's `NOTICE` (`42622`) |
 | `search_path` | 128 bytes | `22023` |
 | `application_name` after PostgreSQL's [ASCII cleaning](https://github.com/postgres/postgres/blob/REL_18_6/src/common/string.c#L81) (`\xhh` escapes) | 64 bytes | `22023`, prior value kept |
 | Connection startup option word | 256 bytes | `54000` |
 | Timeout settings | 2,147,483,647 ms | `22023`; enabling a disabled-only timeout is `0A000` |
 | Simultaneously tracked function calls (`track_functions`) per SQL worker | 1,024 | `54000` |
-| Missing-function error text | 192 bytes | `54000` |
+| Error message text | 27,824 bytes | `54000` |
 | Transaction identities and command counters | 32-bit, checked | `54000` before reuse |
 | JSON nesting / jsonpath depth | 1,000 / 128 | see [SQL/JSON](sql-json.md) |
 | XML nesting, XPath work, constructor output | see [SQL/XML](sql-xml.md) | program-limit error |

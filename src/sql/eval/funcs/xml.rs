@@ -7,9 +7,7 @@ use crate::sql::types::{ColType, Datum};
 use crate::sql::xml::{self, Mode};
 use crate::sql_err;
 
-use super::super::{
-    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, eval_full, sqlstate, type_mismatch,
-};
+use super::super::{ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, eval_full, sqlstate};
 
 const XML_RESULT_MAX: usize = 65_536;
 
@@ -206,7 +204,11 @@ pub(crate) fn dispatch<'a>(
             }
             let text = match value {
                 Datum::Text(text) | Datum::Xml(text) => text,
-                other => return Err(type_mismatch("XMLPARSE input must be text", &other)),
+                other => {
+                    return Err(crate::sql::eval::argument_type_mismatch(
+                        "XMLPARSE", "text", &other,
+                    ));
+                }
             };
             xml::validate(
                 text,
@@ -226,7 +228,13 @@ pub(crate) fn dispatch<'a>(
             }
             let text = match value {
                 Datum::Xml(text) => text,
-                other => return Err(type_mismatch("XMLSERIALIZE input must be xml", &other)),
+                other => {
+                    return Err(crate::sql::eval::argument_type_mismatch(
+                        "XMLSERIALIZE",
+                        "xml",
+                        &other,
+                    ));
+                }
             };
             let target = match *args[1] {
                 Expr::Str(target) => ColType::from_sql_name(target).unwrap(),
@@ -337,7 +345,13 @@ pub(crate) fn dispatch<'a>(
                         let text = xml::without_declaration(text);
                         out.write_str(text).map_err(|_| arena_full())?;
                     }
-                    other => return Err(type_mismatch("XMLCONCAT arguments must be xml", &other)),
+                    other => {
+                        return Err(crate::sql::eval::argument_type_mismatch(
+                            "XMLCONCAT",
+                            "xml",
+                            &other,
+                        ));
+                    }
                 }
             }
             finish(&out, arena)
@@ -406,7 +420,11 @@ pub(crate) fn dispatch<'a>(
             }
             let text = match value {
                 Datum::Xml(text) => text,
-                other => return Err(type_mismatch("XMLROOT input must be xml", &other)),
+                other => {
+                    return Err(crate::sql::eval::argument_type_mismatch(
+                        "XMLROOT", "xml", &other,
+                    ));
+                }
             };
             let version_value = eval_full(args[1], arena, params, row, hooks)?;
             let version = if version_value.is_null() {
@@ -469,7 +487,7 @@ pub(crate) fn dispatch<'a>(
             let path = crate::sql::eval::cast::cast_to_text(path, arena)?;
             let document = match document {
                 Datum::Xml(text) => text,
-                other => return Err(type_mismatch("XPath document must be xml", &other)),
+                other => return Err(crate::sql::eval::function_argument_mismatch(name, &other)),
             };
             let mut namespace_pairs = [("", ""); 128];
             let namespace_count = if args.len() == 3 {
@@ -503,7 +521,7 @@ pub(crate) fn dispatch<'a>(
             let path = crate::sql::eval::cast::cast_to_text(path, arena)?;
             let document = match document {
                 Datum::Xml(text) => text,
-                other => return Err(type_mismatch("XPath document must be xml", &other)),
+                other => return Err(crate::sql::eval::function_argument_mismatch(name, &other)),
             };
             let mut namespace_pairs = [("", ""); 128];
             let namespace_count = if args.len() == 3 {

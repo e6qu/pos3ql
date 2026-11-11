@@ -352,8 +352,9 @@ pub struct Parser<'a> {
     /// `next_stmt` and emits them ahead of executing it.
     warnings: ArenaList<'a, ParseNotice<'a>>,
     /// Tokens whose text does not start at their token (strings, quoted and
-    /// copied identifiers), for positioning analysis errors.
-    source_copies: ArenaList<'a, crate::sql::error_position::SourceCopy>,
+    /// copied identifiers), for positioning analysis errors. Recorded only
+    /// when the caller keeps the parser's arena for the whole text.
+    source_copies: Option<ArenaList<'a, crate::sql::error_position::SourceCopy>>,
     /// End of the furthest identifier whose truncation NOTICE was recorded,
     /// so a token scanned again after lookahead is reported once.
     truncation_reported_to: usize,
@@ -390,6 +391,16 @@ pub struct Parser<'a> {
     routine_name: Option<&'a str>,
     /// Local variables and record fields captured by a procedural OPEN.
     named_parameters: &'a [NamedParameter<'a>],
+}
+
+/// One subscript of an assignment target.
+#[derive(Clone, Copy)]
+enum AssignmentSubscript<'a> {
+    Element(&'a Expr<'a>),
+    Slice {
+        lower: Option<&'a Expr<'a>>,
+        upper: Option<&'a Expr<'a>>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -948,7 +959,7 @@ impl<'a> Parser<'a> {
             type_inputs: &[],
             windows: ArenaList::new(arena),
             warnings: ArenaList::new(arena),
-            source_copies: ArenaList::new(arena),
+            source_copies: None,
             truncation_reported_to: 0,
             defer_analysis_errors: false,
             analysis_error: None,
@@ -968,7 +979,16 @@ impl<'a> Parser<'a> {
     /// Tokens copied or offset from their token start, recorded while
     /// parsing, which [`crate::sql::error_position`] maps back to the text.
     pub(crate) fn source_copies(&self) -> &'a [crate::sql::error_position::SourceCopy] {
-        self.source_copies.as_slice()
+        self.source_copies.as_ref().map_or(&[], ArenaList::as_slice)
+    }
+
+    /// Records where copied tokens came from, for [`Self::source_copies`].
+    /// The caller must not rewind the arena while this parser lives: the
+    /// record grows with every string and copied identifier.
+    pub(crate) fn record_source_copies(&mut self) -> Result<(), ParseError> {
+        self.source_copies = Some(ArenaList::new(self.arena));
+        // The first token was scanned before recording began.
+        self.note_token_source()
     }
 
     /// Records that `composed`, a name the parser built from several tokens,
@@ -979,9 +999,15 @@ impl<'a> Parser<'a> {
             len: composed.len(),
             at,
         };
-        self.source_copies
-            .push(copy)
-            .map_err(|_| self.arena_full("statement too large for SQL arena"))
+        let pushed = self
+            .source_copies
+            .as_mut()
+            .is_none_or(|copies| copies.push(copy).is_ok());
+        if pushed {
+            Ok(())
+        } else {
+            Err(self.arena_full("statement too large for SQL arena"))
+        }
     }
 
     /// Records where the current token's text came from, and PostgreSQL's
@@ -996,15 +1022,17 @@ impl<'a> Parser<'a> {
             }
             _ => None,
         };
-        if let Some(text) = text {
+        if let Some(text) = text
+            && let Some(copies) = self.source_copies.as_mut()
+        {
             let copy = crate::sql::error_position::SourceCopy {
                 address: text.as_ptr() as usize,
                 len: text.len(),
                 at: self.peek_at,
             };
-            self.source_copies
-                .push(copy)
-                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+            if copies.push(copy).is_err() {
+                return Err(self.arena_full("statement too large for SQL arena"));
+            }
         }
         self.note_truncated_identifier()
     }
@@ -7456,10 +7484,17 @@ impl<'a> Parser<'a> {
         self.expect_ident("into")?;
         let table = self.qual_name("table name")?;
         let mut column_names = ArenaList::new(self.arena);
+        // Subscripted targets (`INSERT INTO t (a[1]) ...`) by column position.
+        let mut column_subscripts: ArenaList<'a, (usize, &'a [AssignmentSubscript<'a>])> =
+            ArenaList::new(self.arena);
         if self.peeked == Tok::Op("(") {
             self.advance()?;
             loop {
                 let column = self.col_ident("column name")?;
+                let subscripts = self.assignment_subscripts()?;
+                if !subscripts.is_empty() {
+                    self.push(&mut column_subscripts, (column_names.len(), subscripts))?;
+                }
                 self.push(&mut column_names, column)?;
                 if !self.eat_op(",")? {
                     break;
@@ -7519,6 +7554,43 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        if !column_subscripts.is_empty() {
+            if select.is_some() {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: StackStr::from_str(
+                        "INSERT ... SELECT into a subscripted target column is not supported",
+                    ),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
+                    hint: None,
+                    near: None,
+                    detail: None,
+                });
+            }
+            // PostgreSQL assigns into a NULL of the column's type.
+            let rows = rows
+                .as_mut_slice()
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+            for row in rows.iter_mut() {
+                let mut values = ArenaList::new(self.arena);
+                for (index, value) in row.iter().enumerate() {
+                    let value = match column_subscripts
+                        .as_slice()
+                        .iter()
+                        .find(|(column, _)| *column == index)
+                    {
+                        Some((_, subscripts)) => {
+                            let base = self.arena_expr(Expr::Null)?;
+                            self.subscript_assignment(base, value, subscripts)?
+                        }
+                        None => *value,
+                    };
+                    self.push(&mut values, value)?;
+                }
+                *row = values.as_slice();
+            }
+        }
         let on_conflict = self.on_conflict()?;
         let returning = self.returning()?;
         Ok(Stmt::Insert(Insert {
@@ -7552,10 +7624,8 @@ impl<'a> Parser<'a> {
             } else {
                 let name = self.col_ident("column name")?;
                 self.push(&mut names, name)?;
-                while self.eat_op("[")? {
-                    let subscript = self.expression(0)?;
-                    self.push(&mut subscripts, subscript)?;
-                    self.expect_op("]")?;
+                for subscript in self.assignment_subscripts()? {
+                    self.push(&mut subscripts, *subscript)?;
                 }
             }
             self.expect_op("=")?;
@@ -7573,7 +7643,7 @@ impl<'a> Parser<'a> {
                                 && matches!(
                                     **assigned,
                                     Expr::Call {
-                                        name: "__jsonb_subscript_set",
+                                        name: "__jsonb_subscript_set" | "__array_subscript_set",
                                         ..
                                     }
                                 ))
@@ -7588,13 +7658,7 @@ impl<'a> Parser<'a> {
                             },
                             Ok,
                         )?;
-                    let mut call_args = ArenaList::new(self.arena);
-                    self.push(&mut call_args, base)?;
-                    self.push(&mut call_args, value)?;
-                    for subscript in subscripts.as_slice() {
-                        self.push(&mut call_args, *subscript)?;
-                    }
-                    value = self.plain_call("__jsonb_subscript_set", call_args.as_slice())?;
+                    value = self.subscript_assignment(base, value, subscripts.as_slice())?;
                 }
                 self.push(&mut values, value)?;
                 1
@@ -7657,7 +7721,7 @@ impl<'a> Parser<'a> {
                         && matches!(
                             *assignments.borrowed_slice()[previous].1,
                             Expr::Call {
-                                name: "__jsonb_subscript_set",
+                                name: "__jsonb_subscript_set" | "__array_subscript_set",
                                 ..
                             }
                         )
@@ -7678,6 +7742,104 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(assignments.as_slice())
+    }
+
+    /// The `[i]`, `[lower:upper]` subscripts after an assignment target.
+    fn assignment_subscripts(&mut self) -> Result<&'a [AssignmentSubscript<'a>], ParseError> {
+        let mut subscripts = ArenaList::new(self.arena);
+        while self.eat_op("[")? {
+            let lower = if self.peeked == Tok::Op(":") {
+                None
+            } else {
+                Some(self.expression(0)?)
+            };
+            let subscript = if self.eat_op(":")? {
+                let upper = if self.peeked == Tok::Op("]") {
+                    None
+                } else {
+                    Some(self.expression(0)?)
+                };
+                AssignmentSubscript::Slice { lower, upper }
+            } else {
+                AssignmentSubscript::Element(lower.expect("an element subscript has a value"))
+            };
+            self.expect_op("]")?;
+            self.push(&mut subscripts, subscript)?;
+        }
+        Ok(subscripts.as_slice())
+    }
+
+    /// `base[subscripts] := value` as the call execution evaluates: element
+    /// subscripts serve arrays, jsonb and geometric types alike; a slice is
+    /// array-only and carries each subscript's kind.
+    fn subscript_assignment(
+        &mut self,
+        base: &'a Expr<'a>,
+        value: &'a Expr<'a>,
+        subscripts: &[AssignmentSubscript<'a>],
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let mut call_args = ArenaList::new(self.arena);
+        self.push(&mut call_args, base)?;
+        self.push(&mut call_args, value)?;
+        let sliced = subscripts
+            .iter()
+            .any(|subscript| matches!(subscript, AssignmentSubscript::Slice { .. }));
+        if !sliced {
+            for subscript in subscripts {
+                if let AssignmentSubscript::Element(index) = subscript {
+                    self.push(&mut call_args, *index)?;
+                }
+            }
+            return self.plain_call("__jsonb_subscript_set", call_args.as_slice());
+        }
+        let mut kinds = StackStr::<16>::new();
+        let mut bounds = ArenaList::new(self.arena);
+        for subscript in subscripts {
+            use core::fmt::Write as _;
+            let kind = match subscript {
+                AssignmentSubscript::Element(index) => {
+                    self.push(&mut bounds, *index)?;
+                    'e'
+                }
+                AssignmentSubscript::Slice { lower, upper } => {
+                    if let Some(lower) = lower {
+                        self.push(&mut bounds, *lower)?;
+                    }
+                    if let Some(upper) = upper {
+                        self.push(&mut bounds, *upper)?;
+                    }
+                    match (lower, upper) {
+                        (Some(_), Some(_)) => 's',
+                        (Some(_), None) => 'l',
+                        (None, Some(_)) => 'u',
+                        (None, None) => 'a',
+                    }
+                }
+            };
+            let _ = kinds.write_char(kind);
+        }
+        if kinds.is_truncated() {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(
+                    PARSE_MESSAGE_BYTES,
+                    "number of array dimensions ({}) exceeds the maximum allowed (6)",
+                    subscripts.len()
+                ),
+                sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                cursor: None,
+                hint: None,
+                near: None,
+                detail: None,
+            });
+        }
+        let kinds = self.arena_str(kinds.as_str())?;
+        let kinds = self.arena_expr(Expr::Str(kinds))?;
+        self.push(&mut call_args, kinds)?;
+        for bound in bounds.as_slice() {
+            self.push(&mut call_args, *bound)?;
+        }
+        self.plain_call("__array_subscript_set", call_args.as_slice())
     }
 
     /// Parses the comma-separated body after a multi-column assignment's

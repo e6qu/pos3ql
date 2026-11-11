@@ -286,19 +286,22 @@ caret) for syntax errors and for unknown relations, columns, types, functions
 and operators and failed constant input, except where the AST keeps no
 position: an operand of `WHERE` that is not boolean (`SELECT 1 WHERE 1`), an
 integer constant, and a folded or quoted identifier in a statement that waited
-for typed inputs. pos3ql also does not map a syntax error inside a SQL function
-body to its place in the `CREATE FUNCTION` text or report dynamic SQL failures
-(`EXECUTE 'SELEC 1'`) with an internal query and position (`q`, `p`) plus a
-`CONTEXT` line. A constant compared with a column is checked only when a row is
+for typed inputs. A SQL function body is not analysed at `CREATE FUNCTION`
+(`AS 'SELECT * FROM missing'` succeeds where PostgreSQL reports the missing
+relation at its place in the `CREATE` text; syntax errors are reported there).
+PL/pgSQL errors carry no `CONTEXT` line (`PL/pgSQL function f() line 1 at
+EXECUTE`), and a failing `EXECUTE 'SELEC 1'` does not report the dynamic query
+and its position as the internal query fields (`q`, `p`): the PL/pgSQL program
+keeps no source line per statement, and the error path carries no context. A constant compared with a column is checked only when a row is
 compared, so `SELECT a FROM t WHERE a = 'abc'` on an empty integer column
 returns no rows where PostgreSQL rejects `'abc'`, and a `WITH` query no
 statement references is not analysed (`WITH x AS (SELECT * FROM missing)
 SELECT 1` succeeds). A not-null violation lacks PostgreSQL's `DETAIL` (`Failing
-row contains ...`) and schema, table and column fields. Assigning to an
-array element or slice (`UPDATE t SET a[1] = 9`) fails with `0A000`. A slice
-followed by an index (`a[1:1][1]`) indexes the slice where PostgreSQL treats the
-whole list as a slice, and a subscripted scalar subquery is named `?column?`
-where PostgreSQL names it after the subquery's column. `pg_sleep` and its
+row contains ...`) and schema, table and column fields, and a domain check
+violation lacks the schema, data type and constraint fields. `INSERT ...
+SELECT` into a subscripted target column (`INSERT INTO t (a[1]) SELECT 5`) is
+rejected with `0A000`, and a subscripted jsonb target in an `INSERT` column
+list builds an array where PostgreSQL builds a jsonb value. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,

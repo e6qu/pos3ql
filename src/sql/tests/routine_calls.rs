@@ -1432,9 +1432,13 @@ fn routine_arguments_run_once_and_preserve_strict_null_effects() {
         "SELECT dispatch_missing({})",
         vec!["nextval('dispatch_effects')"; 24].join(",")
     );
+    // The whole signature is reported, and no argument runs.
     let rejected = session.execute(&mut engine, &oversized, true);
-    assert_eq!(error_sqlstates(&rejected), ["54000"]);
-    assert!(String::from_utf8_lossy(&rejected).contains("192 bytes"));
+    assert_eq!(error_sqlstates(&rejected), ["42883"]);
+    assert!(String::from_utf8_lossy(&rejected).contains(&format!(
+        "function dispatch_missing({}) does not exist",
+        vec!["bigint"; 24].join(", ")
+    )));
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT last_value FROM dispatch_effects", true)),
         ["18"]

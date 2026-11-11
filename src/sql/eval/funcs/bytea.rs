@@ -12,7 +12,7 @@ use crate::{sql_err, stack_format};
 
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, bytea_arg, eval_full, int_arg, sqlstate,
-    text_arg, type_mismatch,
+    text_arg,
 };
 
 /// Handles the binary-string/encoding/hashing family. Returns `None` if `name`
@@ -203,7 +203,7 @@ pub(crate) fn dispatch<'a>(
                         .alloc_slice_copy(&value.to_bits().to_be_bytes())
                         .map(|bytes| Datum::Bytea(&*bytes))
                         .map_err(|_| arena_full()),
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "byteaeq" | "byteane" | "bytealt" | "byteale" | "byteagt" | "byteage" | "byteacmp"
@@ -312,7 +312,7 @@ pub(crate) fn dispatch<'a>(
                 match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
                     Datum::Bit { bits, .. } => Ok(Datum::Text(bits)),
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "bit_send" | "varbit_send" => {
@@ -322,7 +322,7 @@ pub(crate) fn dispatch<'a>(
                     return if value.is_null() {
                         Ok(Datum::Null)
                     } else {
-                        Err(type_mismatch(name, &value))
+                        Err(crate::sql::eval::function_argument_mismatch(name, &value))
                     };
                 };
                 let out = arena
@@ -410,7 +410,7 @@ pub(crate) fn dispatch<'a>(
                             varying: false,
                         })
                     }
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "to_hex" | "to_bin" | "to_oct" => {
@@ -428,7 +428,9 @@ pub(crate) fn dispatch<'a>(
                     }
                     Datum::Int4(value) => (u64::from(value as u32), 32),
                     Datum::Int8(value) => (value as u64, 64),
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let s = match (name, width) {
                     ("to_bin", 32) => stack_format!(64, "{:b}", value as u32),
@@ -450,7 +452,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Text(s) => s.as_bytes(),
                     Datum::Bpchar(s) => s.trim_end_matches(' ').as_bytes(),
                     Datum::Bytea(bytes) => bytes,
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let d = crate::sql::md5::digest(bytes);
                 let mut hexbuf = [0u8; 32];
@@ -670,7 +674,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Bpchar(text) => {
                         crate::sql::eval::parse_bytea(text.trim_end_matches(' '), arena)?
                     }
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let bit_len = bytes.len().saturating_mul(8);
                 if bit < 0 || (bit as usize) >= bit_len {
@@ -714,7 +720,10 @@ pub(crate) fn dispatch<'a>(
                     Datum::Bit { bits, .. } => Ok(Datum::Int8(
                         bits.bytes().filter(|c| *c == b'1').count() as i64,
                     )),
-                    other => Err(type_mismatch("bit_count requires bytea or bit", &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(
+                        "bit_count",
+                        &other,
+                    )),
                 }
             }
             "crc32" | "crc32c" => {
@@ -781,7 +790,7 @@ pub(crate) fn dispatch<'a>(
                             varying: false,
                         })
                     }
-                    other => Err(type_mismatch(name, &other)),
+                    other => Err(crate::sql::eval::function_argument_mismatch(name, &other)),
                 }
             }
             "overlay" => {
@@ -816,7 +825,9 @@ pub(crate) fn dispatch<'a>(
                 let replacement_len = match replacement {
                     Datum::Bytea(bytes) => bytes.len(),
                     Datum::Bit { bits, .. } => bits.len(),
-                    ref other => return Err(type_mismatch(name, other)),
+                    ref other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, other));
+                    }
                 };
                 let count = if args.len() == 4 {
                     let Some(count) = int_arg(name, args, 3, arena, params, row, hooks)? else {
@@ -978,10 +989,10 @@ fn binary_byte_comparison(left: &[u8], right: &[u8]) -> i32 {
 
 fn packed_bit_comparison(left: Datum<'_>, right: Datum<'_>) -> Result<i32, SqlError> {
     let Datum::Bit { bits: left, .. } = left else {
-        return Err(type_mismatch("bit comparison", &left));
+        return Err(crate::sql::eval::operand_type_mismatch(&left));
     };
     let Datum::Bit { bits: right, .. } = right else {
-        return Err(type_mismatch("bit comparison", &right));
+        return Err(crate::sql::eval::operand_type_mismatch(&right));
     };
     let common = left.len().min(right.len());
     for offset in (0..common).step_by(8) {

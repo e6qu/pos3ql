@@ -9332,13 +9332,14 @@ fn check_select_types<'a>(
     }
     if let Some(w) = statement.where_clause {
         check(w)?;
-        check_where_type(w, columns, storage, txid, arena)?;
+        check_condition_type("WHERE", w, columns, storage, txid, arena)?;
     }
     for g in statement.group_by {
         check(g)?;
     }
     if let Some(h) = statement.having {
         check(h)?;
+        check_condition_type("HAVING", h, columns, storage, txid, arena)?;
     }
     for ob in statement.order_by {
         check(resolve_order_target(
@@ -10292,7 +10293,9 @@ fn over_one_row<'a>(
 
 /// A WHERE condition must be boolean (or a literal that reads as one); its
 /// type is checked before any row is read.
-fn check_where_type<'a>(
+/// PostgreSQL's analysis requires a boolean `WHERE` or `HAVING` condition.
+fn check_condition_type<'a>(
+    clause: &str,
     w: &'a Expr<'a>,
     columns: &dyn super::exec::ColTypeResolver,
     storage: &Storage,
@@ -10312,7 +10315,8 @@ fn check_where_type<'a>(
         return Err(crate::sql::error_position::at_expression(
             sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
-                "argument of WHERE must be type boolean, not type {}",
+                "argument of {} must be type boolean, not type {}",
+                clause,
                 type_name
             ),
             w,
@@ -10408,7 +10412,8 @@ pub(crate) fn constant_select_resumable<'a>(
         arena,
     };
     if let Some(w) = statement.where_clause
-        && let Err(error) = check_where_type(w, &resolved_columns, storage, txid, arena)
+        && let Err(error) =
+            check_condition_type("WHERE", w, &resolved_columns, storage, txid, arena)
     {
         return sql_fail(error);
     }

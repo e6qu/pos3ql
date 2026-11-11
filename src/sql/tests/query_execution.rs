@@ -777,3 +777,68 @@ fn sorted_statements_postpone_volatile_output_and_hand_off_routines_per_row() {
         ]
     );
 }
+
+#[test]
+fn grouped_statements_hand_off_routines_per_group_after_one_scan() {
+    let config = test_config("grouped-statement-handoff");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE grouped_source(customer int, amount int); \
+         INSERT INTO grouped_source VALUES (1, 10), (2, 5), (1, 7), (NULL, 1), (2, 2); \
+         CREATE TABLE grouped_audit(value bigint); \
+         CREATE FUNCTION grouped_write(value bigint) RETURNS bigint \
+         LANGUAGE sql VOLATILE AS \
+         $$INSERT INTO grouped_audit VALUES ($1); SELECT $1$$",
+        true,
+    );
+    session.success(&mut engine, "BEGIN", true);
+    // PostgreSQL 18.6 returns these rows and counts one scan of the source:
+    // the routine runs once per group, after the input is read.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT customer, grouped_write(sum(amount)) FROM grouped_source \
+             GROUP BY customer HAVING grouped_write(count(*)) > 0 ORDER BY customer; \
+             SELECT seq_scan, seq_tup_read FROM pg_stat_xact_user_tables \
+             WHERE relid = 'grouped_source'::regclass; \
+             SELECT grouped_write(max(amount)) FROM grouped_source WHERE amount < 0; \
+             SELECT count(*), sum(value) FROM grouped_audit",
+            true,
+        )),
+        ["1|17", "2|7", "NULL|1", "1|5", "NULL", "7|30"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
+fn retained_joins_apply_using_and_natural_conditions() {
+    let config = test_config("retained-using-joins");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE ju_a (id int, x text, k int); CREATE TABLE ju_b (id int, y text, k int); \
+         INSERT INTO ju_a VALUES (1,'a1',10),(2,'a2',20); \
+         INSERT INTO ju_b VALUES (1,'b1',10),(2,'b2',99),(3,'b3',30); \
+         CREATE FUNCTION ju_tag(i int) RETURNS text LANGUAGE sql AS $$ SELECT 't' || i $$",
+        true,
+    );
+    // A retained reader evaluates the synthesized USING and NATURAL
+    // conditions, as PostgreSQL 18.6 and the general executor do.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM ju_a JOIN ju_b USING (id, k); \
+             SELECT count(*) FROM ju_a JOIN ju_b USING (id); \
+             SELECT count(*) FROM ju_a NATURAL JOIN ju_b; \
+             SELECT ju_tag(id), k FROM ju_a NATURAL JOIN ju_b; \
+             SELECT ju_tag(ju_a.id), ju_b.y FROM ju_a JOIN ju_b USING (id) ORDER BY 1",
+            true,
+        )),
+        ["1", "2", "1", "t1|10", "t1|b1", "t2|b2"]
+    );
+}

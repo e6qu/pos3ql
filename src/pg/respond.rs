@@ -1096,6 +1096,25 @@ impl<'b> Responder<'b> {
         true
     }
 
+    /// Requests a paged portal's stream before its statement runs. Its
+    /// attempt would stop at its first row anyway, so a sort, grouping or
+    /// hash table is built once, in the stream, and its input reads resume
+    /// instead of restarting the statement. Returns whether it was requested.
+    pub(crate) fn request_page_stream(&mut self) -> bool {
+        if self.promotion != Promotion::Allowed
+            || self.promotion_trigger != PromotionTrigger::FirstRow
+        {
+            return false;
+        }
+        self.promotion = Promotion::Requested { mark: self.mark() };
+        true
+    }
+
+    /// Whether a stream was requested before the statement ran.
+    pub(crate) fn stream_requested(&self) -> bool {
+        matches!(self.promotion, Promotion::Requested { .. })
+    }
+
     /// Whether this output may resume a `SELECT` as a result stream.
     pub(crate) fn promotion_allowed(&self) -> bool {
         self.promotion == Promotion::Allowed

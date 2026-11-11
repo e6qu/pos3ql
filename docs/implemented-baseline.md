@@ -146,8 +146,8 @@ reads it gradually. Meanwhile other applications keep inserting orders. If the
 tool falls behind by more than `result_spool_bytes`, it receives the rows
 already queued followed by `54000` naming that setting, and its session stays
 usable. A large `SELECT` from one ordinary table or one builtin series such
-as `generate_series`, without sorting, grouping or joins, resumes row by row
-instead: it waits for the client and for cold storage without holding the
+as `generate_series`, also joined, sorted (local mode) or grouped with
+`GROUP BY` and aggregates, resumes row by row instead: it waits for the client and for cold storage without holding the
 worker, and rows already delivered are never repeated. A paged portal (an
 extended `Execute` with a row limit) over such a query evaluates rows only as
 each `Execute` asks for them, as PostgreSQL does, so

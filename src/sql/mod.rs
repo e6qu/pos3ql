@@ -11991,8 +11991,11 @@ impl Engine {
                     responder,
                 );
                 let executed = match plan_owner {
-                    // A streamed FETCH evaluates its rows only in the stream.
-                    Ok(_) if fetch_stream.is_some() => Err(WireFull),
+                    // A streamed FETCH or paged portal evaluates its rows
+                    // only in the stream.
+                    Ok(_) if fetch_stream.is_some() || responder.stream_requested() => {
+                        Err(WireFull)
+                    }
                     Ok(owner) => type_input_plans::with_owner(owner, || {
                         type_inputs::with_source(
                             type_inputs::Source::RootCommand {
@@ -12710,15 +12713,17 @@ impl Engine {
                                             },
                                         )
                                     };
-                                    let executed = if fetch_stream.is_some() {
-                                        // A streamed FETCH evaluates its rows
-                                        // only in the stream.
-                                        Err(WireFull)
-                                    } else if streamable {
-                                        execute(responder)
-                                    } else {
-                                        responder.without_command_complete(execute)
-                                    };
+                                    let executed =
+                                        if fetch_stream.is_some() || responder.stream_requested() {
+                                            // A streamed FETCH or paged portal
+                                            // evaluates its rows only in the
+                                            // stream.
+                                            Err(WireFull)
+                                        } else if streamable {
+                                            execute(responder)
+                                        } else {
+                                            responder.without_command_complete(execute)
+                                        };
                                     let (promoted, spooled) = responder.finish_promotion();
                                     if let Some(reason) = spooled {
                                         self.record_result_spool(reason);
@@ -15688,7 +15693,9 @@ impl Engine {
             _ => false,
         }) || statement
             .where_clause
-            .is_some_and(|predicate| eval::routine_input_handoff(predicate, Some(&catalog)));
+            .into_iter()
+            .chain(statement.having)
+            .any(|predicate| eval::routine_input_handoff(predicate, Some(&catalog)));
         if can_handoff {
             let mark = arena.mark();
             let retained = match query::RetainedSelect::open_statement(

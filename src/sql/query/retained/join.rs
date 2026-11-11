@@ -350,19 +350,34 @@ pub(super) fn join_shape<'a>(
         let Some(on) = join.on.or(scope.join_on[index]) else {
             continue;
         };
-        if !retained_expression(on, &catalog, Some((storage, txid)))
-            || !retained_scalar_calls(on, &columns)?
-            || crate::sql::eval::routine_input_handoff(on, Some(&catalog))
-            || crate::sql::query::predicate_safety::expression_properties(
-                on,
-                &columns,
-                storage,
-                txid,
-                crate::sql::query::predicate_safety::AnalysisStage::RuntimeProjection,
-            )?
-            .volatile
-        {
+        // A USING or NATURAL condition is a chain of one equality per merged
+        // column: the reader checks and evaluates its equalities one by one,
+        // as the general executor's flattened join does, up to a WHERE
+        // clause's conjunct count; a wider one stays with that executor.
+        let mut conjuncts = [on; crate::sql::query::plan::MAX_CONJUNCTS];
+        let mut count = 0;
+        let conjuncts: &[&Expr] = if join.on.is_some() {
+            core::slice::from_ref(&on)
+        } else if crate::sql::query::plan::flatten_and(on, &mut conjuncts, &mut count) {
+            &conjuncts[..count]
+        } else {
             return Ok(None);
+        };
+        for &on in conjuncts {
+            if !retained_expression(on, &catalog, Some((storage, txid)))
+                || !retained_scalar_calls(on, &columns)?
+                || crate::sql::eval::routine_input_handoff(on, Some(&catalog))
+                || crate::sql::query::predicate_safety::expression_properties(
+                    on,
+                    &columns,
+                    storage,
+                    txid,
+                    crate::sql::query::predicate_safety::AnalysisStage::RuntimeProjection,
+                )?
+                .volatile
+            {
+                return Ok(None);
+            }
         }
     }
     let all_cross = from.joins.iter().all(|join| join.kind == JoinKind::Cross);
@@ -489,18 +504,41 @@ pub(super) fn open_levels<'a>(
     let mut masks: [Option<&'a [bool; MAX_COLUMNS]>; MAX_RETAINED_SOURCES] =
         [None; MAX_RETAINED_SOURCES];
     for (depth, &table) in shape.order.iter().enumerate() {
+        // A USING or NATURAL condition runs as its separate equalities,
+        // checked like the pushed-down conjuncts after them.
+        let mut synthesized = [&Expr::Null; crate::sql::query::plan::MAX_CONJUNCTS];
+        let mut synthesized_count = 0;
         if table > 0 {
             let join = &from.joins[table - 1];
-            on[depth] = join
-                .on
-                .or(scope.join_on[table - 1])
-                .map(|on| bind_expression(on, arena, Some(columns), None))
-                .transpose()?;
+            match (join.on, scope.join_on[table - 1]) {
+                (Some(condition), _) => {
+                    on[depth] = Some(bind_expression(condition, arena, Some(columns), None)?);
+                }
+                (None, Some(condition)) => {
+                    if !crate::sql::query::plan::flatten_and(
+                        condition,
+                        &mut synthesized,
+                        &mut synthesized_count,
+                    ) {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "retained join condition changed after admission"
+                        ));
+                    }
+                }
+                (None, None) => {}
+            }
         }
         let bound = arena
-            .alloc_slice_with(shape.pushdown[depth].len(), |_| &Expr::Null)
+            .alloc_slice_with(synthesized_count + shape.pushdown[depth].len(), |_| {
+                &Expr::Null
+            })
             .map_err(|_| arena_full())?;
-        for (target, conjunct) in bound.iter_mut().zip(shape.pushdown[depth]) {
+        for (target, conjunct) in bound.iter_mut().zip(
+            synthesized[..synthesized_count]
+                .iter()
+                .chain(shape.pushdown[depth]),
+        ) {
             *target = bind_expression(conjunct, arena, Some(columns), None)?;
         }
         pushdown[depth] = bound;

@@ -207,7 +207,9 @@ impl Engine {
         }
         match self.result_stream_choice(statement, typed_inputs, txid, source_len, cursors) {
             Ok(StreamChoice::Promote) => {
-                responder.arm_promotion();
+                if !responder.request_page_stream() {
+                    responder.arm_promotion();
+                }
                 None
             }
             Ok(StreamChoice::Fetch(fetch)) => responder.request_stream().then_some(fetch),

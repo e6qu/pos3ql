@@ -14947,6 +14947,7 @@ pub fn trigger_def_text<'a>(
     storage: &Storage,
     txid: u32,
     oid: i32,
+    pretty: bool,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let mut found = None;
@@ -15055,24 +15056,28 @@ pub fn trigger_def_text<'a>(
     output
         .write_str(" ON ")
         .map_err(|_| super::eval::arena_full())?;
-    match render_target {
+    // The pretty form omits the schema of a relation the search path finds.
+    let (schema, name, visible) = match render_target {
         crate::storage::TriggerTarget::Table(table) => {
             let definition = storage.table_def(usize::from(table), txid);
-            write_identifier(&mut output, definition.schema.as_str());
-            output
-                .write_char('.')
-                .map_err(|_| super::eval::arena_full())?;
-            write_identifier(&mut output, definition.name.as_str());
+            let visible = storage.resolve_relation(None, definition.name.as_str(), txid)
+                == Some(crate::storage::ResolvedRelation::Table(usize::from(table)));
+            (definition.schema, definition.name, visible)
         }
         crate::storage::TriggerTarget::View(view) => {
             let definition = storage.view(usize::from(view));
-            write_identifier(&mut output, definition.schema.as_str());
-            output
-                .write_char('.')
-                .map_err(|_| super::eval::arena_full())?;
-            write_identifier(&mut output, definition.name.as_str());
+            let visible = storage.resolve_relation(None, definition.name.as_str(), txid)
+                == Some(crate::storage::ResolvedRelation::View(usize::from(view)));
+            (definition.schema, definition.name, visible)
         }
+    };
+    if !(pretty && visible) {
+        write_identifier(&mut output, schema.as_str());
+        output
+            .write_char('.')
+            .map_err(|_| super::eval::arena_full())?;
     }
+    write_identifier(&mut output, name.as_str());
     output
         .write_char(' ')
         .map_err(|_| super::eval::arena_full())?;
@@ -15145,7 +15150,29 @@ pub fn trigger_def_text<'a>(
     )
     .map_err(|_| super::eval::arena_full())?;
     if let Some(when) = trigger.when {
-        write!(output, "WHEN ({}) ", when.as_str()).map_err(|_| super::eval::arena_full())?;
+        // `NEW` and `OLD` name the trigger relation's row in the condition.
+        let deparsed = match render_target {
+            crate::storage::TriggerTarget::Table(table) => {
+                let definition = storage.table_def(usize::from(table), txid);
+                let joined = [("new", &*definition), ("old", &*definition)];
+                deparse::deparse(
+                    &deparse::Context {
+                        storage,
+                        txid,
+                        table: Some(&definition),
+                        parameters: &[],
+                        joined: &joined,
+                        pretty,
+                    },
+                    when.as_str(),
+                    deparse::Destination::Condition,
+                    arena,
+                )?
+            }
+            crate::storage::TriggerTarget::View(_) => None,
+        };
+        write!(output, "WHEN ({}) ", deparsed.unwrap_or(when.as_str()))
+            .map_err(|_| super::eval::arena_full())?;
     }
     output
         .write_str("EXECUTE FUNCTION ")
@@ -15569,15 +15596,15 @@ pub fn view_def_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    view_def_text_pretty(storage, txid, oid, false, arena)
+    view_def_text_pretty(storage, txid, oid, deparse::ViewLayout::PLAIN, arena)
 }
 
 /// `pg_get_viewdef(view, pretty)`.
-pub fn view_def_text_pretty<'a>(
+pub(crate) fn view_def_text_pretty<'a>(
     storage: &Storage,
     txid: u32,
     oid: i32,
-    pretty: bool,
+    layout: deparse::ViewLayout,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     if let Some(name) = catalog_relation_name(oid) {
@@ -15618,7 +15645,7 @@ pub fn view_def_text_pretty<'a>(
         }
         let query = text.trim().trim_end_matches(';');
         if let Some(deparsed) =
-            deparse::view_definition(storage, txid, query, names, pretty, arena)?
+            deparse::view_definition(storage, txid, query, names, layout, arena)?
         {
             return Ok(Some(deparsed));
         }
@@ -18014,7 +18041,20 @@ pub fn index_def_text<'a>(
         }
         write_index_storage_options(&mut s, info.explicit_definition);
         if let Some(predicate) = info.predicate {
-            let _ = write!(s, " WHERE {}", predicate.as_str());
+            let deparsed = deparse::deparse(
+                &deparse::Context {
+                    storage,
+                    txid,
+                    table: Some(&def),
+                    parameters: &[],
+                    joined: &[],
+                    pretty,
+                },
+                predicate.as_str(),
+                deparse::Destination::Condition,
+                arena,
+            )?;
+            let _ = write!(s, " WHERE {}", deparsed.unwrap_or(predicate.as_str()));
         }
         return Ok(Some(alloc_rendered(
             &s,

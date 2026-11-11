@@ -283,17 +283,20 @@ statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final
 statement runs. Column defaults, CHECK constraints, routine parameter defaults
-and `RETURN` bodies are printed in PostgreSQL's analyzed form (`'x'::text`,
+`RETURN` bodies, index predicates, trigger `WHEN` conditions and rule
+conditions are printed in PostgreSQL's analyzed form (`'x'::text`,
 `((k >= 1) AND (k <= 5))`), but only for literals, columns, parameters,
 operators, `IN`, `LIKE`, `IS NULL`, `CASE`, casts, SQL value functions and
 built-in function calls; other expressions (subqueries, user-defined function
-calls, `$n` parameters, array constructors) are still printed as stored, and
-`pg_get_viewdef(view, wrap_column)` ignores the wrap column. `pg_get_viewdef` uses PostgreSQL's layout only for a view
+calls, `$n` parameters, array constructors, whole-row references and `IS
+DISTINCT FROM`) are still printed as stored. `pg_get_viewdef` uses PostgreSQL's
+layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their
-query text. A `BEGIN ATOMIC` body is printed as
-written rather than one deparsed statement per line,
-and index, trigger, rule and policy expressions are not deparsed. Syntax and scanner errors in a client's
+query text. A `BEGIN ATOMIC` body is printed as written rather than one
+deparsed statement per line, and `pg_get_function_sqlbody` returns NULL for
+it; rule actions (`DO INSERT ...`) are printed as written, and their pretty
+form fails with `0A000`; policy expressions are not deparsed. Syntax and scanner errors in a client's
 query report PostgreSQL's wording and cursor position (the `P` field that psql shows as `LINE 1:` and a caret), but
 other errors do not yet: PostgreSQL also points at the unknown relation, column,
 type, function or failed constant (`SELECT * FROM missing_table` reports

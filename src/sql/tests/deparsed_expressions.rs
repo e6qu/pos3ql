@@ -179,3 +179,52 @@ fn view_and_domain_defaults_deparse_as_assignments() {
         ["5"]
     );
 }
+
+/// Index predicates, trigger conditions, rule conditions and the view wrap
+/// column follow `ruleutils.c`.
+#[test]
+fn object_definitions_deparse_conditions_and_wrap_view_targets() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE objects(id integer PRIMARY KEY, a text, b integer); \
+         CREATE INDEX objects_partial ON objects (b) WHERE b > 0 AND a <> 'x'; \
+         CREATE FUNCTION objects_trigger() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; \
+         CREATE TRIGGER objects_when BEFORE INSERT ON objects FOR EACH ROW \
+           WHEN (NEW.b > 0 AND NEW.a IS NOT NULL) EXECUTE FUNCTION objects_trigger(); \
+         CREATE RULE objects_rule AS ON INSERT TO objects WHERE NEW.b < 0 DO INSTEAD NOTHING; \
+         CREATE VIEW objects_view AS SELECT id, a, b + 1 AS c FROM objects",
+    );
+    for (sql, expected) in [
+        (
+            "SELECT pg_get_indexdef('objects_partial'::regclass)",
+            "CREATE INDEX objects_partial ON public.objects USING btree (b) \
+             WHERE ((b > 0) AND (a <> 'x'::text))",
+        ),
+        (
+            "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'objects_when'",
+            "CREATE TRIGGER objects_when BEFORE INSERT ON public.objects FOR EACH ROW \
+             WHEN (((new.b > 0) AND (new.a IS NOT NULL))) EXECUTE FUNCTION objects_trigger()",
+        ),
+        (
+            "SELECT pg_get_triggerdef(oid, true) FROM pg_trigger WHERE tgname = 'objects_when'",
+            "CREATE TRIGGER objects_when BEFORE INSERT ON objects FOR EACH ROW \
+             WHEN (new.b > 0 AND new.a IS NOT NULL) EXECUTE FUNCTION objects_trigger()",
+        ),
+        (
+            "SELECT pg_get_ruledef(oid, true) FROM pg_rewrite WHERE rulename = 'objects_rule'",
+            "CREATE RULE objects_rule AS\n    ON INSERT TO objects\n   WHERE new.b < 0 DO INSTEAD NOTHING;",
+        ),
+        (
+            "SELECT pg_get_viewdef('objects_view'::regclass, 80)",
+            " SELECT id, a, b + 1 AS c\n   FROM objects;",
+        ),
+        (
+            "SELECT pg_get_viewdef('objects_view'::regclass, 14)",
+            " SELECT id, a,\n    b + 1 AS c\n   FROM objects;",
+        ),
+    ] {
+        assert_eq!(rows(&mut engine, &mut budget, sql), [expected], "{sql}");
+    }
+}

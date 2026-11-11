@@ -1001,6 +1001,23 @@ fn upper_ascii(name: &str) -> crate::util::StackStr<16> {
     upper
 }
 
+/// `pg_get_viewdef` formatting: the pretty flag (`PRETTYFLAG_PAREN`) and the
+/// target-list wrap column. Every form indents; PostgreSQL's default wrap
+/// column 0 starts each target on its own line, and a negative one never
+/// wraps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ViewLayout {
+    pub pretty: bool,
+    pub wrap_column: i32,
+}
+
+impl ViewLayout {
+    pub(crate) const PLAIN: Self = Self {
+        pretty: false,
+        wrap_column: 0,
+    };
+}
+
 /// The most FROM items a deparsed view may join.
 const MAX_JOINED: usize = 8;
 
@@ -1023,9 +1040,10 @@ pub(crate) fn view_definition<'a>(
     txid: u32,
     query: &str,
     column_names: &[&str],
-    pretty: bool,
+    layout: ViewLayout,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    let pretty = layout.pretty;
     let Ok(select) = crate::sql::parser::parse_query(query, arena) else {
         return Ok(None);
     };
@@ -1094,7 +1112,13 @@ pub(crate) fn view_definition<'a>(
     if wildcard && table.columns().len() < column_names.len() {
         return Ok(None);
     }
+    let mut last_multiline = false;
     for (index, name) in column_names.iter().enumerate() {
+        let mut target = Output {
+            arena,
+            text: ArenaString::new(arena),
+            supported: true,
+        };
         // `*` was expanded to the table's columns when the view was created.
         let expanded;
         let expression = if wildcard {
@@ -1116,22 +1140,43 @@ pub(crate) fn view_definition<'a>(
             synthetic: false,
         } = expression
         {
-            // The indented layout starts a searched CASE on its own line,
-            // dropping the trailing space of the line it leaves.
-            output.push(if index == 0 { " SELECT" } else { "," })?;
-            context.case_block(whens, *otherwise, 8, &mut output)?;
+            // The indented layout starts a searched CASE on its own line.
+            context.case_block(whens, *otherwise, 8, &mut target)?;
         } else {
-            output.push(if index == 0 { " SELECT " } else { ",\n    " })?;
             let natural = context.type_of(expression)?;
-            context.write(expression, natural, &mut output)?;
+            context.write(expression, natural, &mut target)?;
         }
         let bare_column = matches!(expression, Expr::Column { name: column, .. } if column == name);
         if !bare_column {
-            output.push(" AS ")?;
+            target.push(" AS ")?;
             let mut identifier = crate::util::StackStr::<130>::new();
             write_identifier(&mut identifier, name);
-            output.push(identifier.as_str())?;
+            target.push(identifier.as_str())?;
         }
+        output.supported &= target.supported;
+        let text = target.text.as_str();
+        // `get_target_list`: a target that starts a new line drops the
+        // separator's trailing space; another wraps when it would pass the
+        // wrap column or follows a multi-line target.
+        let leading_newline = text.starts_with('\n');
+        if index == 0 {
+            output.push(if leading_newline {
+                " SELECT"
+            } else {
+                " SELECT "
+            })?;
+        } else if leading_newline || layout.wrap_column < 0 {
+            output.push(if leading_newline { "," } else { ", " })?;
+        } else {
+            let current = output.text.as_str();
+            let line = current
+                .rfind('\n')
+                .map_or(current.len(), |at| current.len() - at - 1);
+            let wraps = last_multiline || line + 2 + text.len() > layout.wrap_column as usize;
+            output.push(if wraps { ",\n    " } else { ", " })?;
+        }
+        output.push(text)?;
+        last_multiline = text[usize::from(leading_newline)..].contains('\n');
     }
     output.push("\n   FROM ")?;
     if !pretty {

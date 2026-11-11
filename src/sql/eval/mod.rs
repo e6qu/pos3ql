@@ -2061,7 +2061,12 @@ pub trait CatalogAccess {
     fn function_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
-    fn trigger_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+    fn trigger_def<'a>(
+        &self,
+        _oid: i32,
+        _pretty: bool,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
     fn function_arguments<'a>(
@@ -2379,11 +2384,12 @@ pub trait CatalogAccess {
     fn view_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
-    /// `pg_get_viewdef` with PostgreSQL's pretty-printing flag.
+    /// `pg_get_viewdef` with PostgreSQL's pretty-printing flag and wrap column.
     fn view_def_pretty<'a>(
         &self,
         oid: i32,
         _pretty: bool,
+        _wrap_column: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
         self.view_def(oid, arena)

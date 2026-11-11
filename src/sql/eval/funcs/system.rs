@@ -2120,8 +2120,16 @@ pub(crate) fn dispatch<'a>(
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                let pretty = match args.get(1) {
+                    Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
+                        Datum::Bool(pretty) => pretty,
+                        Datum::Null => return Ok(Datum::Null),
+                        other => return Err(type_mismatch("pg_get_triggerdef", &other)),
+                    },
+                    None => false,
+                };
                 Ok(cat
-                    .trigger_def(oid, arena)?
+                    .trigger_def(oid, pretty, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2318,16 +2326,19 @@ pub(crate) fn dispatch<'a>(
                     None => return Ok(Datum::Null),
                 };
                 // `pretty` is a boolean, or a wrap column that implies it.
-                let pretty = match args.get(1) {
+                let (pretty, wrap_column) = match args.get(1) {
                     Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
                         Datum::Null => return Ok(Datum::Null),
-                        Datum::Bool(pretty) => pretty,
-                        _ => true,
+                        Datum::Bool(pretty) => (pretty, 0),
+                        value => match super::super::cast_to(value, ColType::Int4, arena)? {
+                            Datum::Int4(wrap_column) => (true, wrap_column),
+                            other => return Err(type_mismatch("pg_get_viewdef", &other)),
+                        },
                     },
-                    None => false,
+                    None => (false, 0),
                 };
                 Ok(cat
-                    .view_def_pretty(oid, pretty, arena)?
+                    .view_def_pretty(oid, pretty, wrap_column, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }

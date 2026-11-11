@@ -12,5 +12,6 @@ CREATE VIEW vdx8 AS SELECT vdx.id, vdx_customers.name FROM vdx LEFT JOIN vdx_cus
 CREATE VIEW vdx9 AS SELECT o.id, x.note FROM vdx o JOIN vdx_customers c ON c.id = o.b LEFT JOIN vdx_notes x ON x.oid = o.id AND x.note <> 'z' ORDER BY o.id;
 CREATE VIEW vdx0 AS SELECT x.oid AS id FROM vdx_notes x WHERE x.note IS NOT NULL;
 SELECT viewname, pg_get_viewdef(viewname::regclass), pg_get_viewdef(viewname::regclass, true), definition FROM pg_views WHERE viewname LIKE 'vdx_' ORDER BY viewname;
+SELECT pg_get_viewdef('vdx1'::regclass, 80), pg_get_viewdef('vdx1'::regclass, -1), pg_get_viewdef('vdx6'::regclass, 80), pg_get_viewdef('vdx7'::regclass, 30);
 DROP VIEW vdx0, vdx1, vdx2, vdx3, vdx4, vdx5, vdx6, vdx7, vdx8, vdx9;
 DROP TABLE vdx, vdx_customers, vdx_notes;

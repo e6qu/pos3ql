@@ -5502,8 +5502,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::function_def_text(self.storage, self.txid, oid, arena)
     }
 
-    fn trigger_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::trigger_def_text(self.storage, self.txid, oid, arena)
+    fn trigger_def<'a>(
+        &self,
+        oid: i32,
+        pretty: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::trigger_def_text(self.storage, self.txid, oid, pretty, arena)
     }
 
     fn function_arguments<'a>(
@@ -6348,9 +6353,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         &self,
         oid: i32,
         pretty: bool,
+        wrap_column: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::view_def_text_pretty(self.storage, self.txid, oid, pretty, arena)
+        super::catalog::view_def_text_pretty(
+            self.storage,
+            self.txid,
+            oid,
+            super::catalog::deparse::ViewLayout {
+                pretty,
+                wrap_column,
+            },
+            arena,
+        )
     }
 
     fn rule_def<'a>(

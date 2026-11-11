@@ -69,37 +69,6 @@ pub(crate) enum CommonTypeError {
     Conversion { from: ColType, to: ColType },
 }
 
-/// PostgreSQL 18.6 `pg_type.typispreferred`: bool, text, oid, float8, inet,
-/// timestamptz, interval and varbit.
-/// PostgreSQL 18.6's pseudo-types (`pg_type.typtype = 'p'`).
-const PSEUDO_TYPE_NAMES: [&str; 25] = [
-    "pg_ddl_command",
-    "table_am_handler",
-    "index_am_handler",
-    "unknown",
-    "record",
-    "cstring",
-    "any",
-    "anyarray",
-    "void",
-    "trigger",
-    "language_handler",
-    "internal",
-    "anyelement",
-    "anynonarray",
-    "fdw_handler",
-    "tsm_handler",
-    "anyenum",
-    "anyrange",
-    "event_trigger",
-    "anymultirange",
-    "anycompatiblemultirange",
-    "anycompatible",
-    "anycompatiblearray",
-    "anycompatiblenonarray",
-    "anycompatiblerange",
-];
-
 /// The name PostgreSQL reports when a column is declared with a pseudo-type
 /// (`column "c" has pseudo-type cstring`). Only `record` and `cstring` have
 /// array types: `record[]` is itself a pseudo-type, and an array of `cstring`
@@ -113,9 +82,10 @@ pub(crate) fn pseudo_type_column_name(type_name: &str) -> Option<&'static str> {
             _ => (name, false),
         },
     };
-    let base = PSEUDO_TYPE_NAMES
-        .into_iter()
-        .find(|candidate| *candidate == base)?;
+    let base = super::catalog::builtin_type_rows()
+        .iter()
+        .find(|row| row.kind == b'p' && row.name == base)?
+        .name;
     Some(match (base, array) {
         ("record", true) => "record[]",
         ("cstring", _) => "cstring",
@@ -125,8 +95,12 @@ pub(crate) fn pseudo_type_column_name(type_name: &str) -> Option<&'static str> {
     })
 }
 
+/// PostgreSQL 18.6 `pg_type.typispreferred`: bool, text, oid, float8, inet,
+/// timestamptz, interval and varbit.
 pub(crate) fn preferred_type_oid(type_oid: i32) -> bool {
-    matches!(type_oid, 16 | 25 | 26 | 701 | 869 | 1184 | 1186 | 1562)
+    let rows = super::catalog::builtin_type_rows();
+    rows.binary_search_by_key(&type_oid, |row| row.oid)
+        .is_ok_and(|position| rows[position].preferred)
 }
 
 pub(crate) fn type_category(ctype: ColType) -> &'static str {

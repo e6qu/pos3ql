@@ -100,6 +100,11 @@ python3 tools/generate-pg18-routine-descriptions.py --mode write \
   --signatures src/sql/catalog_callable_signatures.rs \
   --output src/sql/catalog_routine_descriptions.rs
 
+# Every pg_catalog pg_type row, all 32 columns (--mode check compares).
+python3 tools/generate-pg18-type-rows.py --mode write \
+  --dsn 'host=127.0.0.1 port=5432 user=postgres dbname=template1' \
+  --output src/sql/catalog_type_rows.rs
+
 # Built-in view SQL from retained catalog-metadata.json evidence (--mode check compares).
 python3 tools/generate-pg18-view-definitions.py --mode write \
   --metadata /path/to/catalog-metadata.json --source https://example/evidence \

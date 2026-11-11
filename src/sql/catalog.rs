@@ -87,6 +87,13 @@ mod routines;
 mod builtin_properties;
 #[path = "catalog_type_io.rs"]
 mod type_io;
+#[path = "catalog_type_rows.rs"]
+mod type_rows;
+
+/// Every pg_catalog `pg_type` row of PostgreSQL 18.6, in OID order.
+pub(crate) fn builtin_type_rows() -> &'static [type_rows::BuiltinTypeRow] {
+    type_rows::BUILTIN_TYPE_ROWS
+}
 
 /// A materialized catalog relation: its shape plus rows in the arena.
 #[derive(Clone, Copy)]
@@ -16503,20 +16510,24 @@ pub(crate) fn user_type_name_fixed(
         }
         return Ok(Some(rendered));
     }
-    let (schema, name, array) =
-        if let Some((_, _, array)) = crate::storage::NamedTypeKind::from_oid(oid) {
-            let Some(identity) = storage
-                .routine_result_for_oid(oid, txid)
-                .and_then(|source| source.user_type)
-            else {
-                return Ok(None);
-            };
-            (identity.schema, identity.name, array)
-        } else {
-            return Ok(None);
-        };
-    let written = stack_format!(160, "{}{}", name.as_str(), if array { "[]" } else { "" });
-    let unqualified_visible = user_type_oid(storage, txid, written.as_str()) == Some(oid);
+    let Some((kind, creation, array)) = crate::storage::NamedTypeKind::from_oid(oid) else {
+        return Ok(None);
+    };
+    // An array is named and found through its element, which also covers an
+    // array over a domain of an array type.
+    let element = match kind {
+        crate::storage::NamedTypeKind::Domain => super::types::oid::domain_oid(creation),
+        crate::storage::NamedTypeKind::Enum => super::types::oid::enum_oid(creation),
+        crate::storage::NamedTypeKind::Composite => super::types::oid::composite_oid(creation),
+    };
+    let Some(identity) = storage
+        .routine_result_for_oid(element, txid)
+        .and_then(|source| source.user_type)
+    else {
+        return Ok(None);
+    };
+    let (schema, name) = (identity.schema, identity.name);
+    let unqualified_visible = user_type_oid(storage, txid, name.as_str()) == Some(element);
     let mut rendered = StackStr::<260>::new();
     use core::fmt::Write as _;
     if !unqualified_visible {
@@ -30232,90 +30243,6 @@ fn pg_type<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_type", false);
-    let types = [
-        ColType::Void,
-        ColType::Internal,
-        ColType::PgDdlCommand,
-        ColType::Bool,
-        ColType::Int2,
-        ColType::Int2Vector,
-        ColType::OidVector,
-        ColType::PgNodeTree,
-        ColType::PgNdistinct,
-        ColType::PgDependencies,
-        ColType::PgMcvList,
-        ColType::Int4,
-        ColType::Oid,
-        ColType::Xid,
-        ColType::Xid8,
-        ColType::PgSnapshot,
-        ColType::TxidSnapshot,
-        ColType::PgLsn,
-        ColType::AclItem,
-        ColType::Money,
-        ColType::Tid,
-        ColType::Cid,
-        ColType::Regtype,
-        ColType::Regproc,
-        ColType::Regprocedure,
-        ColType::Regoper,
-        ColType::Regoperator,
-        ColType::Regclass,
-        ColType::Regnamespace,
-        ColType::Regrole,
-        ColType::Regconfig,
-        ColType::Regdictionary,
-        ColType::Regcollation,
-        ColType::Int8,
-        ColType::Float4,
-        ColType::Float8,
-        ColType::Text,
-        ColType::Refcursor,
-        ColType::Name,
-        ColType::Varchar,
-        ColType::Bpchar,
-        ColType::Date,
-        ColType::Timestamp,
-        ColType::Timestamptz,
-        ColType::Time,
-        ColType::Timetz,
-        ColType::Interval,
-        ColType::Json,
-        ColType::Jsonb,
-        ColType::Xml,
-        ColType::Jsonpath,
-        ColType::TsVector,
-        ColType::TsQuery,
-        ColType::Uuid,
-        ColType::Bytea,
-        ColType::Numeric,
-        ColType::Bit { varying: false },
-        ColType::Bit { varying: true },
-        ColType::Range(super::types::RangeKind::Int4),
-        ColType::Range(super::types::RangeKind::Int8),
-        ColType::Range(super::types::RangeKind::Num),
-        ColType::Range(super::types::RangeKind::Date),
-        ColType::Range(super::types::RangeKind::Ts),
-        ColType::Range(super::types::RangeKind::Tstz),
-        ColType::Multirange(super::types::RangeKind::Int4),
-        ColType::Multirange(super::types::RangeKind::Int8),
-        ColType::Multirange(super::types::RangeKind::Num),
-        ColType::Multirange(super::types::RangeKind::Date),
-        ColType::Multirange(super::types::RangeKind::Ts),
-        ColType::Multirange(super::types::RangeKind::Tstz),
-        ColType::Inet,
-        ColType::Cidr,
-        ColType::Macaddr,
-        ColType::Macaddr8,
-        ColType::Geometry(super::types::GeometryKind::Point),
-        ColType::Geometry(super::types::GeometryKind::Lseg),
-        ColType::Geometry(super::types::GeometryKind::Path),
-        ColType::Geometry(super::types::GeometryKind::Box),
-        ColType::Geometry(super::types::GeometryKind::Polygon),
-        ColType::Geometry(super::types::GeometryKind::Line),
-        ColType::Geometry(super::types::GeometryKind::Circle),
-        ColType::Record,
-    ];
     let category = |t: &ColType| super::types::type_category(*t);
     let visible_domains = (0..storage.domain_count())
         .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
@@ -30336,8 +30263,12 @@ fn pg_type<'a>(
         .checked_add(storage.views_visible_to(txid).count())
         .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| catalog_capacity_exceeded("pg_type"))?;
+    // pg_catalog's types come from the generated rows below; only
+    // information_schema's domains and their arrays are built here.
     let builtin_capacity = match purpose {
-        Materialization::Query => 512usize,
+        Materialization::Query => {
+            2 * super::information_schema_domains::InformationSchemaDomain::ALL.len()
+        }
         Materialization::History => 0,
     };
     let capacity = builtin_capacity
@@ -30349,247 +30280,6 @@ fn pg_type<'a>(
         .map_err(|_| arena_full())?;
     let mut n = 0;
     if matches!(purpose, Materialization::Query) {
-        for (i, t) in types.iter().enumerate() {
-            out[i] = row(
-                &[
-                    Datum::Int4(t.oid()),
-                    text(t.internal_name(), arena)?,
-                    Datum::Int4(i32::from(t.typlen())),
-                    Datum::Int4(if t.is_collatable() { 100 } else { 0 }),
-                    Datum::Int4(PG_CATALOG_NS_OID),
-                    text(if t.is_pseudo() { "p" } else { "b" }, arena)?,
-                    text(category(t), arena)?,
-                    Datum::Int4(0), // typbasetype
-                    Datum::Int4(0), // typelem
-                    Datum::Int4(
-                        super::types::ArrElem::from_coltype(*t)
-                            .map_or(0, super::types::ArrElem::array_oid),
-                    ), // typarray
-                    Datum::Int4(0), // typrelid
-                    Datum::Int4(-1), // typtypmod
-                    Datum::Bool(false),
-                    Datum::Null, // typdefault
-                    Datum::Null, // Input/output identities are assigned together below.
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Int4(PG_TYPE_OID),
-                    Datum::Int4(10),
-                    Datum::Bool(true),
-                    text(type_storage(*t), arena)?,
-                    Datum::Null,
-                ],
-                arena,
-            )?;
-        }
-        n = types.len();
-        for (oid, name, length, category, element, array, relation, kind) in [
-            (18, "char", 1, "Z", 0, 1002, 0, "b"),
-            (super::types::oid::TRIGGER, "trigger", 4, "P", 0, 0, 0, "p"),
-            (
-                super::types::oid::EVENT_TRIGGER,
-                "event_trigger",
-                4,
-                "P",
-                0,
-                0,
-                0,
-                "p",
-            ),
-            (
-                super::types::oid::FDW_HANDLER,
-                "fdw_handler",
-                4,
-                "P",
-                0,
-                0,
-                0,
-                "p",
-            ),
-            (
-                super::types::oid::ANYELEMENT,
-                "anyelement",
-                4,
-                "P",
-                0,
-                0,
-                0,
-                "p",
-            ),
-            (
-                super::types::oid::ANYARRAY,
-                "anyarray",
-                -1,
-                "P",
-                0,
-                0,
-                0,
-                "p",
-            ),
-            (
-                super::types::oid::ANYNONARRAY,
-                "anynonarray",
-                4,
-                "P",
-                0,
-                0,
-                0,
-                "p",
-            ),
-            (super::types::oid::ANYENUM, "anyenum", 4, "P", 0, 0, 0, "p"),
-            (
-                super::types::oid::ANYRANGE,
-                "anyrange",
-                -1,
-                "P",
-                0,
-                0,
-                0,
-                "p",
-            ),
-            (
-                super::types::oid::ANYMULTIRANGE,
-                "anymultirange",
-                -1,
-                "P",
-                0,
-                0,
-                0,
-                "p",
-            ),
-            (
-                super::types::oid::ANYCOMPATIBLE,
-                "anycompatible",
-                4,
-                "P",
-                0,
-                0,
-                0,
-                "p",
-            ),
-            (
-                super::types::oid::ANYCOMPATIBLEARRAY,
-                "anycompatiblearray",
-                -1,
-                "P",
-                0,
-                0,
-                0,
-                "p",
-            ),
-            (
-                super::types::oid::ANYCOMPATIBLENONARRAY,
-                "anycompatiblenonarray",
-                4,
-                "P",
-                0,
-                0,
-                0,
-                "p",
-            ),
-            (
-                super::types::oid::ANYCOMPATIBLERANGE,
-                "anycompatiblerange",
-                -1,
-                "P",
-                0,
-                0,
-                0,
-                "p",
-            ),
-            (
-                super::types::oid::ANYCOMPATIBLEMULTIRANGE,
-                "anycompatiblemultirange",
-                -1,
-                "P",
-                0,
-                0,
-                0,
-                "p",
-            ),
-            (
-                super::types::oid::PG_STATISTIC_ROW,
-                "pg_statistic",
-                -1,
-                "C",
-                0,
-                super::types::oid::PG_STATISTIC_ARRAY,
-                2619,
-                "c",
-            ),
-            (
-                super::types::oid::PG_STATISTIC_ARRAY,
-                "_pg_statistic",
-                -1,
-                "A",
-                super::types::oid::PG_STATISTIC_ROW,
-                0,
-                0,
-                "b",
-            ),
-        ] {
-            out[n] = row(
-                &[
-                    Datum::Int4(oid),
-                    text(name, arena)?,
-                    Datum::Int4(length),
-                    Datum::Int4(0),
-                    Datum::Int4(PG_CATALOG_NS_OID),
-                    text(kind, arena)?,
-                    text(category, arena)?,
-                    Datum::Int4(0),
-                    Datum::Int4(element),
-                    Datum::Int4(array),
-                    Datum::Int4(relation),
-                    Datum::Int4(-1),
-                    Datum::Bool(false),
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Int4(PG_TYPE_OID),
-                    Datum::Int4(10),
-                    Datum::Bool(true),
-                    text(if length < 0 { "x" } else { "p" }, arena)?,
-                    Datum::Null,
-                ],
-                arena,
-            )?;
-            n += 1;
-        }
-        // Arrays are catalog types in their own right. Keeping this inventory on
-        // `ArrElem` means an accepted array OID is simultaneously visible to
-        // `pg_type`, has a matching `typelem`, and is discoverable by catalog
-        // clients such as pg_dump.
-        for element in super::types::ArrElem::BUILTIN {
-            out[n] = row(
-                &[
-                    Datum::Int4(element.array_oid()),
-                    text(element.catalog_name(), arena)?,
-                    Datum::Int4(-1),
-                    Datum::Int4(0),
-                    Datum::Int4(PG_CATALOG_NS_OID),
-                    text("b", arena)?,
-                    text("A", arena)?,
-                    Datum::Int4(0),
-                    Datum::Int4(element.element_oid()),
-                    Datum::Int4(0),
-                    Datum::Int4(0),
-                    Datum::Int4(-1),
-                    Datum::Bool(false),
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Int4(PG_TYPE_OID),
-                    Datum::Int4(10),
-                    Datum::Bool(true),
-                    text("x", arena)?,
-                    Datum::Null,
-                ],
-                arena,
-            )?;
-            n += 1;
-        }
         // PostgreSQL's information_schema domains and their array types.
         for domain in super::information_schema_domains::InformationSchemaDomain::ALL {
             let base = domain.base();
@@ -30665,6 +30355,12 @@ fn pg_type<'a>(
         };
         let array_oid =
             crate::sql::types::oid::domain_array_oid(storage.domain_for(slot, txid).creation());
+        // A domain and its array take the base type's default collation.
+        let collation = if d.base.is_collatable() {
+            crate::sql::ast::Collation::Default.oid()
+        } else {
+            0
+        };
         out[n] = row(
             &[
                 Datum::Int4(domain_oid(storage, slot, txid)),
@@ -30673,7 +30369,7 @@ fn pg_type<'a>(
                     arena,
                 )?,
                 Datum::Int4(i32::from(d.base.typlen())),
-                Datum::Int4(0),
+                Datum::Int4(collation),
                 Datum::Int4(namespace_oid(storage, d.schema.as_str(), txid)),
                 text("d", arena)?,
                 text(category(&d.base), arena)?,
@@ -30738,7 +30434,7 @@ fn pg_type<'a>(
                     arena,
                 )?,
                 Datum::Int4(-1),
-                Datum::Int4(0),
+                Datum::Int4(collation),
                 Datum::Int4(namespace_oid(storage, d.schema.as_str(), txid)),
                 text("b", arena)?,
                 text("A", arena)?,
@@ -31133,46 +30829,153 @@ fn pg_type<'a>(
         )?;
         n += 1;
     }
-    let fields = ["oid", "typtype", "typelem", "typbasetype"].map(|name| {
-        def.columns
-            .iter()
-            .position(|(candidate, _)| *candidate == name)
-            .expect("pg_type source field exists")
-    });
-    let routines = ["typinput", "typoutput"].map(|name| {
-        def.columns
-            .iter()
-            .position(|(candidate, _)| *candidate == name)
-            .expect("pg_type routine field exists")
-    });
-    let compatible = catalog_rows(arena, n)?;
-    for (target, source) in compatible.iter_mut().zip(&out[..n]) {
-        let functions = type_io::functions(source, &out[..n], fields)?;
-        assert_eq!(
-            def.columns.len(),
-            source.len() + 1,
-            "pg_type delimiter extends each source row"
-        );
-        let values = arena
-            .alloc_slice_with(def.columns.len(), |index| {
-                if index < source.len() {
-                    source[index]
-                } else {
-                    Datum::Null
-                }
+    // The rows above follow this source layout. The result lists every
+    // pg_catalog type from PostgreSQL 18.6's generated rows, then each other
+    // type with the columns PostgreSQL derives for it, in pg_type's order.
+    const SOURCE: [&str; 23] = [
+        "oid",
+        "typname",
+        "typlen",
+        "typcollation",
+        "typnamespace",
+        "typtype",
+        "typcategory",
+        "typbasetype",
+        "typelem",
+        "typarray",
+        "typrelid",
+        "typtypmod",
+        "typnotnull",
+        "typdefault",
+        "typinput",
+        "typoutput",
+        "typacl",
+        "tableoid",
+        "typowner",
+        "typisdefined",
+        "typstorage",
+        "typdefaultbin",
+        "typdelim",
+    ];
+    let source_position = |name: &str| SOURCE.iter().position(|candidate| *candidate == name);
+    let fields = ["oid", "typtype", "typelem", "typbasetype"]
+        .map(|name| source_position(name).expect("pg_type source field exists"));
+    let builtin = |oid: i32| {
+        type_rows::BUILTIN_TYPE_ROWS
+            .binary_search_by_key(&oid, |row| row.oid)
+            .is_ok()
+    };
+    let source_oid = |row: &[Datum<'_>]| match row[fields[0]] {
+        Datum::Int4(oid) => Ok(oid),
+        _ => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "invalid pg_type source identity"
+        )),
+    };
+    let generated: &[type_rows::BuiltinTypeRow] = match purpose {
+        Materialization::Query => type_rows::BUILTIN_TYPE_ROWS,
+        Materialization::History => &[],
+    };
+    let mut derived_count = 0usize;
+    for source in &out[..n] {
+        if !builtin(source_oid(source)?) {
+            derived_count += 1;
+        }
+    }
+    let compatible = catalog_rows(arena, generated.len() + derived_count)?;
+    let regproc = |function: crate::sql::catalog_metadata::TypeIoRoutine| Datum::RegObject {
+        type_oid: crate::sql::types::oid::REGPROC,
+        referenced_oid: function.oid,
+        name: function.name,
+    };
+    let mut filled = 0usize;
+    for ty in generated {
+        let routine = |oid: i32, index: usize| {
+            regproc(crate::sql::catalog_metadata::TypeIoRoutine {
+                oid,
+                name: ty.routine_names[index],
             })
+        };
+        let text_or_null = |value: Option<&'static str>| value.map_or(Datum::Null, Datum::Text);
+        compatible[filled] = arena
+            .alloc_slice_copy(&[
+                Datum::Int4(ty.oid),
+                Datum::Text(ty.name),
+                Datum::Int4(ty.namespace),
+                Datum::Int4(ty.owner),
+                Datum::Int4(i32::from(ty.len)),
+                Datum::Bool(ty.by_value),
+                Datum::Char(ty.kind),
+                Datum::Char(ty.category),
+                Datum::Bool(ty.preferred),
+                Datum::Bool(ty.defined),
+                Datum::Char(ty.delimiter),
+                Datum::Int4(ty.relation),
+                routine(ty.subscript, 0),
+                Datum::Int4(ty.element),
+                Datum::Int4(ty.array),
+                routine(ty.input, 1),
+                routine(ty.output, 2),
+                routine(ty.receive, 3),
+                routine(ty.send, 4),
+                routine(ty.modifier_input, 5),
+                routine(ty.modifier_output, 6),
+                routine(ty.analyze, 7),
+                Datum::Char(ty.align),
+                Datum::Char(ty.storage),
+                Datum::Bool(ty.not_null),
+                Datum::Int4(ty.base_type),
+                Datum::Int4(ty.type_modifier),
+                Datum::Int4(ty.dimensions),
+                Datum::Int4(ty.collation),
+                text_or_null(ty.default_node),
+                text_or_null(ty.default),
+                text_or_null(ty.acl),
+                Datum::Int4(PG_TYPE_OID),
+            ])
             .map_err(|_| arena_full())?;
-        values[source.len()] = Datum::Char(type_io::delimiter(source, &out[..n], fields)?);
-        for (position, function) in routines.into_iter().zip(functions) {
-            values[position] = Datum::RegObject {
-                type_oid: crate::sql::types::oid::REGPROC,
-                referenced_oid: function.oid,
-                name: function.name,
+        filled += 1;
+    }
+    let no_routine = regproc(crate::sql::catalog_metadata::TypeIoRoutine { oid: 0, name: "-" });
+    for source in &out[..n] {
+        if builtin(source_oid(source)?) {
+            continue;
+        }
+        let [input, output] = type_io::functions(source, &out[..n], fields)?;
+        let derived = type_io::derived(source, &out[..n], fields)?;
+        let delimiter = type_io::delimiter(source, &out[..n], fields)?;
+        let values = arena
+            .alloc_slice_with(def.columns.len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (value, (name, _)) in values.iter_mut().zip(def.columns) {
+            *value = match *name {
+                "typbyval" => Datum::Bool(derived.by_value),
+                "typispreferred" => Datum::Bool(false),
+                "typdelim" => Datum::Char(delimiter),
+                "typsubscript" => regproc(derived.subscript),
+                "typinput" => regproc(input),
+                "typoutput" => regproc(output),
+                "typreceive" => regproc(derived.receive),
+                "typsend" => regproc(derived.send),
+                "typmodin" | "typmodout" => no_routine,
+                "typanalyze" => regproc(derived.analyze),
+                "typalign" => Datum::Char(derived.align),
+                "typndims" => Datum::Int4(derived.dimensions),
+                name => {
+                    source[source_position(name).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "pg_type column {} has no source",
+                            name
+                        )
+                    })?]
+                }
             };
         }
-        *target = values;
+        compatible[filled] = values;
+        filled += 1;
     }
-    finish(def, compatible, arena)
+    finish(def, &compatible[..filled], arena)
 }
 
 fn pg_namespace<'a>(

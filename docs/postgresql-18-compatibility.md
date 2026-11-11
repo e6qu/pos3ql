@@ -54,6 +54,12 @@ Schemas and catalogs:
   them. Arrays of these domains work the same way:
   `'{-1}'::information_schema.cardinal_number[]` fails with `23514`, and an
   element of such an array has the domain's type.
+- `pg_type` has PostgreSQL 18.6's 32 columns in its order and lists every
+  `pg_catalog` type exactly, pseudo-types (`cstring`, `"any"`) and catalog row
+  types included. User-defined types carry the routines and storage traits
+  PostgreSQL derives for them (a domain's `domain_recv` and its base type's
+  send routine, an array's `array_subscript_handler`). Of `information_schema`'s
+  types only its domains and their arrays are listed, not its views' row types.
 - `DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`, `FOREIGN TABLE`, `SEQUENCE`,
   `FUNCTION`, `PROCEDURE`, `ROUTINE`, `TYPE`, `DOMAIN` and `SCHEMA` report
   dependent objects as PostgreSQL does, from the rows `pg_depend` lists:

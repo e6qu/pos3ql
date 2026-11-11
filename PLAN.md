@@ -270,8 +270,10 @@ unsupported case into an explicit error. Known gaps: renaming or moving a
 built-in function fails with `0A000` where PostgreSQL changes the catalog
 entry (every built-in name lookup must consult a renamed or moved row); a routine signature naming `cstring` or `"any"` cannot be written
 (`GRANT ... ON FUNCTION int4in(cstring)` fails with `42883`) because those
-pseudo-types are not pos3ql column types, and `pg_type` lists 182 of
-PostgreSQL's 621 built-in types; a
+pseudo-types are not pos3ql column types, and `pg_type` lists all 473
+`pg_catalog` types but of `information_schema`'s 148 only its domains and their
+arrays (the row types of its views, whose OIDs initdb assigns after importing
+the platform's collations, need the pinned reference image); a
 listed built-in that is neither implemented nor an operator, cast or input
 function fails with `0A000` when called; `DROP ROLE`'s `DETAIL` lists
 owners by OID and privileges by grant order, where PostgreSQL lists

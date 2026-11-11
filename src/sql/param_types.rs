@@ -236,9 +236,13 @@ impl ParameterInference<'_> {
                 && *index >= 1
                 && (*index as usize) <= oids.len()
             {
-                // Another position's concrete type wins over a pseudo-type.
+                // The first use decides: a parameter that first reaches a
+                // pseudo-type position stays undetermined, as PostgreSQL's
+                // left-to-right analysis leaves it.
                 let slot = &mut oids[*index as usize - 1];
-                if !accepts_any_type(type_oid) || *slot == types::oid::UNKNOWN {
+                if !accepts_any_type(*slot)
+                    && (!accepts_any_type(type_oid) || *slot == types::oid::UNKNOWN)
+                {
                     *slot = type_oid;
                 }
             }

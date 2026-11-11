@@ -3998,9 +3998,9 @@ pub fn record_field_metadata(
             }
             Ok(ColType::Record) => match expr_record_handle(base, columns) {
                 Some(handle) => record_shape_field_metadata(handle, field).map(|value| value.0),
-                None if qualifier.is_none() && columns.is_whole_row(name) => {
-                    columns.column_meta(Some(name), field)
-                }
+                // A whole row, or a PL/pgSQL record variable holding a row,
+                // names its fields as `name.field`.
+                None if qualifier.is_none() => columns.column_meta(Some(name), field),
                 None => None,
             },
             Ok(_) => None,

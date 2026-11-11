@@ -196,6 +196,7 @@ impl<'a> Check<'a, '_> {
                 extra,
                 self.txid,
                 self.arena,
+                Some(self.variables),
             )
         })
     }
@@ -222,7 +223,13 @@ impl<'a> Check<'a, '_> {
             self.dml_scope(merge.target, merge.target_alias, Some(source)),
             self.dml_scope(merge.target, merge.target_alias, None),
             self.quietly(|| {
-                QueryScope::resolve_schema(self.storage, source, self.txid, self.arena, None)
+                QueryScope::resolve_schema(
+                    self.storage,
+                    source,
+                    self.txid,
+                    self.arena,
+                    Some(self.variables),
+                )
             }),
         ) else {
             return Ok(());
@@ -380,7 +387,13 @@ impl<'a> Check<'a, '_> {
                     let from = select.from.as_ref().expect("expansion keeps FROM");
                     let from =
                         super::cte::expand_from_schema(from, self.storage, self.txid, self.arena)?;
-                    QueryScope::resolve_schema(self.storage, from, self.txid, self.arena, None)
+                    QueryScope::resolve_schema(
+                        self.storage,
+                        from,
+                        self.txid,
+                        self.arena,
+                        Some(self.variables),
+                    )
                 });
                 match expanded {
                     Some(scope) => Some(scope),

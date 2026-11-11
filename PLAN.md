@@ -86,7 +86,10 @@ or `MERGE` (expressions, join conditions, row triggers, `RETURNING`) at top
 level, in PL/pgSQL statements (including static `RETURNING ... INTO`) and
 `EXECUTE`, and in SQL-language bodies, which keep the rows already changed so
 the call sees them, as in PostgreSQL; `MERGE` as a static PL/pgSQL statement
-and through `EXECUTE`. The
+and through `EXECUTE`;
+routine variables and a trigger's `NEW` and `OLD` read as the outer level of
+every subquery of a static statement (derived tables, `UPDATE ... FROM`,
+`MERGE` sources, correlated, grouped and set-operation subqueries). The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
 
@@ -129,14 +132,11 @@ is owned.
   `WITH ... INSERT/UPDATE/DELETE` statement fails with `0A000`. A `FOR` loop over a
   data change fails with `0A000` when an `AFTER` trigger of that change
   waits, since the loop has no owner for its returned rows.
-- **Routine variables in static statements:** a derived table in a static
-  PL/pgSQL statement (a `FROM` subquery, `UPDATE ... FROM`, or a `MERGE`
-  source) cannot read routine variables (`42703`): input preparation
-  describes it without the routine's scope. Binding variables as parameters
-  when the statement is parsed, as PostgreSQL's parser hook does and as
-  static writes to views and `FOR` loops over data changes already do,
-  fixes the class. In a trigger, `(new).f` fails in an `UPDATE` (`42703`),
-  and `(r).f` fails after `r := new` because the record loses its row type.
+- **Routine variables in `WITH`:** a `WITH` query that a static PL/pgSQL
+  statement materializes before its main query (`INSERT INTO t WITH c AS
+  (SELECT var) SELECT * FROM c`) cannot read routine variables (`42703`):
+  `WITH` materialization takes no enclosing row. A `WITH` inside a derived
+  table reads them.
 - **Triggers fired inside a write** run without the engine's utility
   executor, so DDL there (PL/pgSQL `CREATE TABLE`, `EXECUTE 'CREATE ...'`,
   or a SQL procedure that a BEFORE trigger calls) and writes to views or

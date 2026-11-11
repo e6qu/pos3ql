@@ -65,6 +65,7 @@ pub(super) fn row_passes_correlated_where<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     row: &JoinRow<'_, 'a, '_>,
+    enclosing: Option<&dyn ColumnLookup<'a>>,
     scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
     lists: &mut [SubqueryList<'a>],
 ) -> Result<bool, SqlError> {
@@ -79,6 +80,7 @@ pub(super) fn row_passes_correlated_where<'a>(
         correlated,
         base,
         row,
+        enclosing,
         storage,
         txid,
         arena,
@@ -91,16 +93,22 @@ pub(super) fn row_passes_correlated_where<'a>(
         subs: Some(&row_subs),
         ..*hooks
     };
-    where_passes(w, arena, params, row, &h)
+    let row = super::Chained {
+        inner: row,
+        outer: enclosing,
+    };
+    where_passes(w, arena, params, &row, &h)
 }
 
 /// The outer-row lookup for a correlated subquery re-evaluated per GROUP:
 /// a reference resolves to a grouping key's value for this group (a key
 /// collapsed by the current grouping set reads NULL). Anything else is
-/// PostgreSQL's ungrouped-column error (42803).
+/// PostgreSQL's ungrouped-column error (42803). A name that is not a column
+/// of the grouped query is left to the levels around it.
 struct GroupRow<'g, 'a> {
     group_by: &'a [&'a Expr<'a>],
     keys: &'g [Datum<'a>],
+    scope: &'g QueryScope<'a>,
 }
 
 impl<'a> ColumnLookup<'a> for GroupRow<'_, 'a> {
@@ -116,6 +124,7 @@ impl<'a> ColumnLookup<'a> for GroupRow<'_, 'a> {
                 return Ok(*v);
             }
         }
+        self.scope.find_column(qualifier, name)?;
         Err(sql_err!(
             sqlstate::GROUPING_ERROR,
             "subquery uses ungrouped column \"{}{}{}\" from outer query",
@@ -123,6 +132,30 @@ impl<'a> ColumnLookup<'a> for GroupRow<'_, 'a> {
             if qualifier.is_some() { "." } else { "" },
             name
         ))
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<crate::sql::types::ColType, SqlError> {
+        super::ScopeSchema(self.scope).resolve_column_type(qualifier, name)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
+        super::ScopeSchema(self.scope).col_type(qualifier, name)
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        super::ScopeSchema(self.scope).column_type_oid(qualifier, name)
+    }
+
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
+        super::ScopeSchema(self.scope).collation(qualifier, name)
     }
 }
 
@@ -195,6 +228,7 @@ pub(super) fn groups_for_mask<'a>(
                     params,
                     hooks,
                     row,
+                    outer,
                     &mut *where_scalars,
                     &mut *where_lists,
                 )? {
@@ -209,6 +243,7 @@ pub(super) fn groups_for_mask<'a>(
                         correlated,
                         hooks.subs.expect("outer subqueries prepared"),
                         row,
+                        outer,
                         storage,
                         txid,
                         arena,
@@ -323,6 +358,7 @@ pub(super) fn groups_for_mask<'a>(
                         params,
                         hooks,
                         row,
+                        outer,
                         &mut *where_scalars,
                         &mut *where_lists,
                     )? {
@@ -337,6 +373,7 @@ pub(super) fn groups_for_mask<'a>(
                             correlated,
                             hooks.subs.expect("outer subqueries prepared"),
                             row,
+                            outer,
                             storage,
                             txid,
                             arena,
@@ -503,6 +540,7 @@ pub(super) fn groups_for_mask<'a>(
                 params,
                 hooks,
                 row,
+                outer,
                 &mut *where_scalars,
                 &mut *where_lists,
             )? {
@@ -519,6 +557,7 @@ pub(super) fn groups_for_mask<'a>(
                     correlated,
                     hooks.subs.expect("outer subqueries prepared"),
                     row,
+                    outer,
                     storage,
                     txid,
                     arena,
@@ -647,11 +686,13 @@ pub(super) fn groups_for_mask<'a>(
             let group_row = GroupRow {
                 group_by: statement.group_by,
                 keys: &key_vals[..n_keys],
+                scope,
             };
             merged_subs = merge_correlated(
                 group_correlated,
                 hooks.subs.expect("outer subqueries prepared"),
                 &group_row,
+                outer,
                 storage,
                 txid,
                 arena,
@@ -865,6 +906,7 @@ pub(super) fn grouped_rows<'a>(
                     params,
                     hooks,
                     row,
+                    outer,
                     &mut *where_scalars,
                     &mut *where_lists,
                 )? {

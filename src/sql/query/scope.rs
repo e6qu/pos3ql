@@ -423,6 +423,51 @@ struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
 /// whose lifetime belongs to that caller's row scratch.
 struct OuterColumnTypes<'s, 'row>(&'s dyn ColumnLookup<'row>);
 
+/// The declared types of an enclosing level known only by type, such as a
+/// routine's variables during input and dependency analysis, as a row whose
+/// names resolve without values.
+pub(crate) struct ResolverColumns<'s>(pub(crate) &'s dyn crate::sql::exec::ColTypeResolver);
+
+impl<'a> ColumnLookup<'a> for ResolverColumns<'_> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        self.0.resolve(qualifier, name).map(|_| Datum::Null)
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.0.resolve(qualifier, name)
+    }
+
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.0
+            .column_meta(qualifier, name)
+            .map_or(-1, |meta| meta.type_mod)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.0.resolve(qualifier, name).ok()
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.0
+            .column_meta(qualifier, name)
+            .map(|meta| meta.type_oid)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.0
+            .column_meta(qualifier, name)
+            .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.0.is_empty_scope()
+    }
+}
+
 impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
     fn whole_row_field_metadata(
         &self,
@@ -958,7 +1003,7 @@ impl<'d> QueryScope<'d> {
         // (a body may project an outer column); a plain derived table is typed
         // on its own. Its rows are materialized per outer row by the scan, so
         // register an empty placeholder here rather than running it now.
-        let mut definition = super::srf::describe_derived_definition(
+        let mut definition = super::srf::describe_enclosed_derived_definition(
             storage,
             sub,
             exposed,
@@ -966,6 +1011,7 @@ impl<'d> QueryScope<'d> {
             txid,
             arena,
             tref.lateral.then_some(&*self),
+            outer,
         )?;
         if let Some(slot) = tref.view_access {
             let view = storage.view(usize::from(slot));
@@ -982,6 +1028,13 @@ impl<'d> QueryScope<'d> {
             self.n += 1;
             return Ok(());
         }
+        // A statement that was not expanded as a whole, such as a routine's
+        // static statement, still names the derived table's own `WITH`.
+        let sub = if sub.with.is_empty() {
+            sub
+        } else {
+            super::expand_ctes_exec(sub, storage, txid, arena, params, &[], sequences)?
+        };
         let rows: &'a [&'a [u8]];
         let external_run;
         if storage.spill_attached() {
@@ -996,7 +1049,7 @@ impl<'d> QueryScope<'d> {
                 sub,
                 arena,
                 params,
-                None,
+                outer,
                 sequences,
                 &mut |values| {
                     storage
@@ -1028,7 +1081,7 @@ impl<'d> QueryScope<'d> {
                 sub,
                 arena,
                 params,
-                None,
+                outer,
                 sequences,
                 &mut |values| {
                     let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
@@ -1163,7 +1216,8 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let mut definition = super::srf::describe_derived_definition(
+        let outer_types = outer.map(OuterColumnTypes);
+        let mut definition = super::srf::describe_enclosed_derived_definition(
             storage,
             sub,
             exposed,
@@ -1171,6 +1225,9 @@ impl<'d> QueryScope<'d> {
             txid,
             arena,
             tref.lateral.then_some(&*self),
+            outer_types
+                .as_ref()
+                .map(|columns| columns as &dyn ColumnLookup<'a>),
         )?;
         if let Some(slot) = tref.view_access {
             let view = storage.view(usize::from(slot));

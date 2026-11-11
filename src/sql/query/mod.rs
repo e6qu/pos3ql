@@ -840,7 +840,9 @@ use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
     prepare_outer_subqueries, subquery_witness,
 };
-pub(crate) use subquery::{expression_has_correlated_subquery, subquery_hooks_outer};
+pub(crate) use subquery::{
+    expression_has_correlated_subquery, subquery_hooks_outer, subquery_hooks_with_outer,
+};
 pub use subquery::{prepare_subqueries, subquery_hooks};
 pub(crate) use subquery::{type_witness, walk_children};
 
@@ -7888,6 +7890,7 @@ fn correlated_row_subqueries<'a, 'scratch>(
     correlated: &[&'a Expr<'a>],
     base: &SubqueryValues<'a, 'a>,
     row: &dyn ColumnLookup<'a>,
+    enclosing: Option<&dyn ColumnLookup<'a>>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
@@ -7903,6 +7906,7 @@ fn correlated_row_subqueries<'a, 'scratch>(
             correlated,
             base,
             row,
+            enclosing,
             storage,
             txid,
             arena,
@@ -10715,6 +10719,7 @@ pub(crate) fn select_query_resumable<'a>(
                         &outer_subs.base,
                         statement.where_clause,
                         row,
+                        None,
                         storage,
                         txid,
                         arena,
@@ -10731,6 +10736,7 @@ pub(crate) fn select_query_resumable<'a>(
                     correlated,
                     &outer_subs.base,
                     row,
+                    None,
                     storage,
                     txid,
                     arena,
@@ -12433,6 +12439,7 @@ fn select_into_rows_mode<'a>(
                 &outer_subs.base,
                 statement.where_clause,
                 row,
+                outer,
                 storage,
                 txid,
                 arena,
@@ -12448,6 +12455,7 @@ fn select_into_rows_mode<'a>(
             correlated,
             &outer_subs.base,
             row,
+            outer,
             storage,
             txid,
             arena,
@@ -14999,8 +15007,15 @@ impl<'a> ReturningJoin<'a> {
         txid: u32,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
-        let scope =
-            dependencies::dml_dependency_scope(storage, target, alias, Some(from), txid, arena)?;
+        let scope = dependencies::dml_dependency_scope(
+            storage,
+            target,
+            alias,
+            Some(from),
+            txid,
+            arena,
+            None,
+        )?;
         let mut offset = 0;
         let offsets = arena
             .alloc_slice_with(scope.n, |table| {

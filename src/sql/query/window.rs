@@ -1661,6 +1661,7 @@ pub(crate) fn project_window_rows<'a>(
                 params,
                 hooks,
                 row,
+                outer,
                 &mut *where_scalars,
                 &mut *where_lists,
             )? {
@@ -1697,6 +1698,7 @@ pub(crate) fn project_window_rows<'a>(
                 params,
                 hooks,
                 row,
+                outer,
                 &mut *where_scalars,
                 &mut *where_lists,
             )? {
@@ -1778,6 +1780,7 @@ pub(crate) fn project_window_rows<'a>(
                 correlated,
                 base,
                 &jr,
+                outer,
                 storage,
                 txid,
                 arena,
@@ -2071,6 +2074,7 @@ pub(crate) fn external_window_into<'a>(
                     params,
                     hooks,
                     row,
+                    outer,
                     &mut *where_scalars,
                     &mut *where_lists,
                 )? {
@@ -2325,6 +2329,7 @@ pub(crate) fn external_window_into<'a>(
                 params,
                 hooks,
                 row,
+                outer,
                 &mut *where_scalars,
                 &mut *where_lists,
             )? {
@@ -2368,6 +2373,7 @@ pub(crate) fn external_window_into<'a>(
                     correlated,
                     base,
                     row,
+                    outer,
                     storage,
                     txid,
                     arena,

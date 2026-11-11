@@ -4700,3 +4700,55 @@ fn plpgsql_variables_in_grouped_queries_are_constants() {
         ),
     ]);
 }
+
+/// Routine variables and a trigger's rows are the outer level of every
+/// subquery in a static statement: derived tables, correlated and grouped
+/// subqueries and set operations read them, as in PostgreSQL.
+#[test]
+fn static_statement_subqueries_read_routine_variables() {
+    let config = test_config("routine-variable-subqueries");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE t(a int, b text); INSERT INTO t VALUES (1, 'one'), (2, 'two'); \
+         CREATE FUNCTION w(x int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN \
+         INSERT INTO t SELECT v, 'ins' FROM (SELECT x AS v) s; \
+         UPDATE t SET b = b || '+upd' FROM (SELECT x AS v) s WHERE t.a = s.v; \
+         MERGE INTO t USING (SELECT x + 1 AS v) s ON t.a = s.v \
+         WHEN MATCHED THEN UPDATE SET b = b || '+merged'; \
+         RETURN (SELECT count(*) FROM (SELECT x AS v) s JOIN t ON t.a = s.v); END$$; \
+         CREATE FUNCTION r(x int) RETURNS SETOF int LANGUAGE plpgsql AS $$ BEGIN \
+         RETURN QUERY SELECT (SELECT t.a + x) FROM t GROUP BY a ORDER BY 1; \
+         RETURN QUERY SELECT a FROM t WHERE a IN \
+         (SELECT y FROM (SELECT x - 9 AS y UNION ALL SELECT x - 8) d) ORDER BY 1; END$$; \
+         CREATE TABLE tt(id int, v int); INSERT INTO tt VALUES (1, 10); \
+         CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         DECLARE rec record; BEGIN rec := new; \
+         UPDATE t SET b = b || '+' || (new).v WHERE a = (new).id; \
+         INSERT INTO t SELECT i, 'trg' FROM (SELECT (rec).id + 50 AS i) d; RETURN new; END$$; \
+         CREATE TRIGGER trg BEFORE UPDATE ON tt FOR EACH ROW EXECUTE FUNCTION trg()",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT w(1); SELECT * FROM r(10); UPDATE tt SET v = 20; \
+             SELECT a, b FROM t ORDER BY a, b",
+            true,
+        )),
+        [
+            "2",
+            "11",
+            "12",
+            "1",
+            "1",
+            "2",
+            "1|ins+upd+20",
+            "1|one+upd+20",
+            "2|two+merged",
+            "51|trg",
+        ]
+    );
+}

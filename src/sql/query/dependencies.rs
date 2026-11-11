@@ -815,7 +815,8 @@ fn collect_statement(
             let mark = arena.mark();
             let result = (|| {
                 record_routine_target(insert.table, storage, txid, path, dependencies)?;
-                let scope = dml_dependency_scope(storage, insert.table, None, None, txid, arena)?;
+                let scope =
+                    dml_dependency_scope(storage, insert.table, None, None, txid, arena, None)?;
                 let excluded = match storage.resolve_relation_under(
                     path,
                     insert.table.schema,
@@ -888,6 +889,11 @@ fn collect_statement(
                     update.from,
                     txid,
                     arena,
+                    context
+                        .transition
+                        .map(super::scope::ResolverColumns)
+                        .as_ref()
+                        .map(|columns| columns as &dyn crate::sql::eval::ColumnLookup<'_>),
                 )?;
                 if let Some(from) = update.from {
                     collect_table_ref(
@@ -954,6 +960,11 @@ fn collect_statement(
                     delete.using,
                     txid,
                     arena,
+                    context
+                        .transition
+                        .map(super::scope::ResolverColumns)
+                        .as_ref()
+                        .map(|columns| columns as &dyn crate::sql::eval::ColumnLookup<'_>),
                 )?;
                 if let Some(using) = delete.using {
                     collect_table_ref(
@@ -1032,6 +1043,11 @@ fn collect_statement(
                     Some(source),
                     txid,
                     arena,
+                    context
+                        .transition
+                        .map(super::scope::ResolverColumns)
+                        .as_ref()
+                        .map(|columns| columns as &dyn crate::sql::eval::ColumnLookup<'_>),
                 )?;
                 collect_expr!(merge.on, Some(&scope), no_excluded)?;
                 for when in merge.whens {
@@ -1293,7 +1309,7 @@ pub(crate) fn validate_dml_assignment_casts(
             _ => unreachable!(),
         };
         let target_name = target.name;
-        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena)?;
+        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena, transition)?;
         // Each subquery level converts a constant compared with its columns
         // before any row is read, as PostgreSQL's analysis does: the WHERE
         // clause first, then the assignments or inserted values.
@@ -1513,7 +1529,7 @@ pub(crate) fn require_dml_builtin_execute<'a>(
             ),
             _ => None,
         };
-        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena)?;
+        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena, None)?;
         let hooks = crate::sql::eval::EvalHooks {
             catalog: Some(&catalog),
             ..crate::sql::eval::NO_HOOKS
@@ -1954,7 +1970,7 @@ fn visit_dml_assignment_inputs(
             }
             _ => return Ok(()),
         };
-        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena)?;
+        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena, outer)?;
         visit_resolved_dml_assignment_inputs(
             statement, storage, txid, arena, outer, &scope, false, visit,
         )
@@ -2510,6 +2526,7 @@ pub(crate) fn dml_dependency_scope<'a>(
     extra: Option<&'a FromClause<'a>>,
     txid: u32,
     arena: &'a Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
 ) -> Result<super::QueryScope<'a>, SqlError> {
     let base = super::dml_target_ref(target, alias);
     let joins = match extra {
@@ -2537,7 +2554,7 @@ pub(crate) fn dml_dependency_scope<'a>(
         .alloc(FromClause { base, joins })
         .map_err(|_| super::arena_full())?;
     let from = super::cte::expand_from_schema(from, storage, txid, arena)?;
-    super::QueryScope::resolve_schema(storage, from, txid, arena, None)
+    super::QueryScope::resolve_schema(storage, from, txid, arena, outer)
 }
 
 fn collect_select<'a>(

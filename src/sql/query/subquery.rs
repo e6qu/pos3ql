@@ -18,7 +18,6 @@ use crate::sql_err;
 use crate::stack_format;
 use crate::storage::Storage;
 
-use super::setops::materialize_set_body;
 use super::{
     CatalogScopeCols, Chained, QueryScope, SUBQUERY_DEPTH, ScopeCols, ScopeSchema, arena_full,
     cmp_key_rows, collect_aggs, collect_table_sample_expressions, fold_aggregates,
@@ -1145,7 +1144,7 @@ fn subquery_collations<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
-            None,
+            outer,
         )?;
         if count == 1
             && let Some((ColType::Composite(slot), _)) =
@@ -1701,8 +1700,9 @@ fn subquery_exists<'a>(
         ));
     }
     if let Some(tree) = select.set_body {
-        let (vals, _, _) =
-            run_set_subquery(tree, select, storage, txid, arena, params, 1, sequences)?;
+        let (vals, _, _) = run_set_subquery(
+            tree, select, storage, txid, arena, params, outer, 1, sequences,
+        )?;
         return Ok(!vals.is_empty());
     }
     if !select.group_by.is_empty() || select.having.is_some() || select.distinct {
@@ -1876,6 +1876,34 @@ impl ScopeChain<'_, '_> {
     }
 }
 
+fn set_tree_has_outer_ref<'a>(
+    tree: &'a SetTree<'a>,
+    chain: &ScopeChain<'_, 'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    match tree {
+        SetTree::Select(select) => {
+            let scope = select
+                .from
+                .as_ref()
+                .map(|from| correlation_schema(storage, txid, from, arena))
+                .transpose()?
+                .flatten();
+            let child = ScopeChain {
+                scope: scope.as_ref(),
+                parent: Some(chain),
+            };
+            select_has_outer_ref(select, &child, storage, txid, arena)
+        }
+        SetTree::Op { left, right, .. } => {
+            Ok(set_tree_has_outer_ref(left, chain, storage, txid, arena)?
+                || set_tree_has_outer_ref(right, chain, storage, txid, arena)?)
+        }
+    }
+}
+
 /// Whether a top-level subquery node references any column from the enclosing
 /// query — i.e. is correlated and must be re-evaluated per outer row.
 fn subquery_node_correlated<'a>(
@@ -1893,6 +1921,16 @@ fn subquery_node_correlated<'a>(
         | Expr::ArraySubquery(s) => s,
         _ => return Ok(false),
     };
+    select_correlated(select, storage, txid, arena)
+}
+
+/// Whether `select` references a column of a query level around it.
+fn select_correlated<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
     let scope = select
         .from
         .as_ref()
@@ -1931,10 +1969,24 @@ fn correlation_schema<'a>(
     from: &'a crate::sql::ast::FromClause<'a>,
     arena: &'a Arena,
 ) -> Result<Option<QueryScope<'a>>, SqlError> {
-    let references_outer =
-        |table: &crate::sql::ast::TableRef<'_>| table.lateral || table.is_function_source();
-    if references_outer(&from.base) || from.joins.iter().any(|join| references_outer(&join.table)) {
+    // A derived table may read the levels around its query, though not the
+    // tables beside it; its columns then exist only per outer row.
+    let references_outer = |table: &'a crate::sql::ast::TableRef<'a>| {
+        if table.lateral || table.is_function_source() {
+            return Ok(true);
+        }
+        match table.subquery {
+            Some(select) => select_correlated(select, storage, txid, arena),
+            None => Ok(false),
+        }
+    };
+    if references_outer(&from.base)? {
         return Ok(None);
+    }
+    for join in from.joins {
+        if references_outer(&join.table)? {
+            return Ok(None);
+        }
     }
     QueryScope::resolve_schema(storage, from, txid, arena, None).map(Some)
 }
@@ -1948,6 +2000,10 @@ fn select_has_outer_ref<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
+    // Each branch of a set operation is a query level of its own.
+    if let Some(tree) = select.set_body {
+        return set_tree_has_outer_ref(tree, chain, storage, txid, arena);
+    }
     if let Some(from) = select.from.as_ref() {
         if table_ref_has_outer_ref(&from.base, chain, storage, txid, arena)? {
             return Ok(true);
@@ -2225,7 +2281,8 @@ pub(super) fn alloc_merge_scratch<'a>(
 pub(super) fn merge_correlated<'a, 'b>(
     correlated: &[&'a Expr<'a>],
     base: &SubqueryValues<'b, 'a>,
-    outer: &dyn ColumnLookup<'a>,
+    row: &dyn ColumnLookup<'a>,
+    enclosing: Option<&dyn ColumnLookup<'a>>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
@@ -2234,6 +2291,13 @@ pub(super) fn merge_correlated<'a, 'b>(
     lists: &'b mut [SubqueryList<'a>],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryValues<'b, 'a>, SqlError> {
+    // A correlated subquery reads the current row and every level around
+    // its query, such as a routine's variables.
+    let chained = super::Chained {
+        inner: row,
+        outer: enclosing,
+    };
+    let outer: &dyn ColumnLookup<'a> = &chained;
     let mut ns = 0;
     for (p, v, w) in base.scalars {
         // Node addresses are identity keys; every base value was built from
@@ -2463,7 +2527,8 @@ pub(super) fn correlated_where_passes<'a>(
     correlated: &[&'a Expr<'a>],
     base: &SubqueryValues<'a, 'a>,
     predicate: Option<&'a Expr<'a>>,
-    row: &impl ColumnLookup<'a>,
+    row: &dyn ColumnLookup<'a>,
+    enclosing: Option<&dyn ColumnLookup<'a>>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
@@ -2479,6 +2544,7 @@ pub(super) fn correlated_where_passes<'a>(
         correlated,
         base,
         row,
+        enclosing,
         storage,
         txid,
         arena,
@@ -2491,7 +2557,11 @@ pub(super) fn correlated_where_passes<'a>(
         subs: Some(&values),
         ..*hooks
     };
-    where_passes(predicate, arena, params, row, &where_hooks)
+    let row = super::Chained {
+        inner: row,
+        outer: enclosing,
+    };
+    where_passes(predicate, arena, params, &row, &where_hooks)
 }
 
 /// A representative zero value of a column type, used to coerce an IN operand
@@ -2681,6 +2751,52 @@ pub(super) struct SubqueryColumns<'scope, 'definition, 'outer, 'row, 'catalog> {
 }
 
 impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
+    /// A whole row of this level's tables, else of an enclosing level, such
+    /// as a trigger's `NEW` around a statement's subquery.
+    fn is_whole_row(&self, name: &str) -> bool {
+        match self.scope {
+            Some(scope) if scope.qualified_star_columns(name).is_ok() => true,
+            None if self.catalog.is_whole_row(name) => true,
+            _ => self
+                .outer
+                .is_some_and(|outer| outer.whole_row_type(name).is_some()),
+        }
+    }
+
+    fn whole_row_field(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        let own = match self.scope {
+            Some(scope) => scope.qualified_star_columns(name).is_ok(),
+            None => self.catalog.is_whole_row(name),
+        };
+        if own {
+            return match self.scope {
+                Some(scope) => CatalogScopeCols {
+                    scope,
+                    outer_scope: None,
+                    storage: self.catalog.storage,
+                    txid: self.catalog.txid,
+                    arena: self.catalog.arena,
+                }
+                .whole_row_field(name, index),
+                None => self.catalog.whole_row_field(name, index),
+            };
+        }
+        let catalog =
+            super::storage_catalog(self.catalog.storage, self.catalog.arena, self.catalog.txid);
+        crate::sql::exec::ColTypeResolver::whole_row_field(
+            &crate::sql::eval::RuntimeColumnTypes {
+                row: self.outer?,
+                catalog: Some(&catalog),
+            },
+            name,
+            index,
+        )
+    }
+
     fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
         self.catalog.validate_enum_input_literal(text, target_oid)
     }
@@ -2849,22 +2965,6 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
         self.catalog.visit_composite_fields(creation, visit)
     }
 
-    fn whole_row_field(
-        &self,
-        name: &str,
-        index: usize,
-    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
-        let scope = self.scope?;
-        CatalogScopeCols {
-            scope,
-            outer_scope: None,
-            storage: self.catalog.storage,
-            txid: self.catalog.txid,
-            arena: self.catalog.arena,
-        }
-        .whole_row_field(name, index)
-    }
-
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
         self.catalog.domain_base_type(type_oid)
     }
@@ -2914,11 +3014,6 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
             &outer,
         )
         .map(|oid| oid.map(|oid| (oid, ColType::from_oid(oid).map_or(-1, ColType::typlen))))
-    }
-
-    fn is_whole_row(&self, name: &str) -> bool {
-        self.scope
-            .is_some_and(|scope| scope.qualified_star_columns(name).is_ok())
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
@@ -3313,7 +3408,7 @@ fn run_row_subquery<'a>(
     }
     if let Some(tree) = select.set_body {
         let (values, saw_null, witness) = run_set_subquery(
-            tree, select, storage, txid, arena, params, row_arity, sequences,
+            tree, select, storage, txid, arena, params, outer, row_arity, sequences,
         )?;
         if values.len() > 1 {
             return Err(sql_err!(
@@ -3352,7 +3447,7 @@ fn run_subquery<'a>(
     }
     if let Some(tree) = select.set_body {
         return run_set_subquery(
-            tree, select, storage, txid, arena, params, row_arity, sequences,
+            tree, select, storage, txid, arena, params, outer, row_arity, sequences,
         );
     }
     if row_arity > 1 {
@@ -3780,6 +3875,7 @@ fn run_set_subquery<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    outer: Option<&dyn ColumnLookup<'a>>,
     row_arity: usize,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
@@ -3792,8 +3888,10 @@ fn run_set_subquery<'a>(
         ..crate::sql::eval::NO_HOOKS
     };
 
-    let (rows, target, n_cols) =
-        materialize_set_body(storage, txid, tree, arena, params, sequences)?;
+    // Each branch reads the levels around the subquery.
+    let (rows, target, n_cols) = super::setops::materialize_set_body_tied(
+        storage, txid, tree, arena, params, sequences, outer,
+    )?;
     if n_cols != row_arity {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -3985,7 +4083,7 @@ pub(crate) fn subquery_hooks_outer<'a>(
     subquery_hooks_with_outer(exprs, storage, txid, arena, params, Some(outer), sequences)
 }
 
-fn subquery_hooks_with_outer<'a>(
+pub(crate) fn subquery_hooks_with_outer<'a>(
     exprs: &[Option<&'a Expr<'a>>],
     storage: &Storage,
     txid: u32,

@@ -52,7 +52,7 @@ impl SubqueryListProbe for ExternalSubqueryList {
     fn probe<'a>(
         &self,
         value: Datum<'a>,
-        collations: &[Collation],
+        columns: crate::sql::eval::QuantifiedColumns<'_>,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
         arena: &'a Arena,
     ) -> Result<(bool, bool), SqlError> {
@@ -71,7 +71,8 @@ impl SubqueryListProbe for ExternalSubqueryList {
                     BinaryOp::Eq,
                     value,
                     member,
-                    collations,
+                    columns.row_constructor,
+                    columns.collations,
                     catalog,
                     arena,
                 )? {
@@ -98,7 +99,7 @@ impl SubqueryListProbe for ExternalSubqueryList {
         value: Datum<'a>,
         operator: BinaryOp,
         all: bool,
-        collations: &[Collation],
+        columns: crate::sql::eval::QuantifiedColumns<'_>,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -113,7 +114,13 @@ impl SubqueryListProbe for ExternalSubqueryList {
             let left = crate::sql::eval::coerce_unknown(value, &member)?;
             let right = crate::sql::eval::coerce_unknown(member, &left)?;
             let result = crate::sql::eval::quantified_comparison(
-                operator, left, right, collations, catalog, arena,
+                operator,
+                left,
+                right,
+                columns.row_constructor,
+                columns.collations,
+                catalog,
+                arena,
             )?;
             match result {
                 Datum::Bool(true) if !all => {

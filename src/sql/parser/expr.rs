@@ -2152,7 +2152,7 @@ impl<'a> Parser<'a> {
 
     /// Builds a simple function call `name(args)` (no star/distinct/over).
     pub(super) fn plain_call(
-        &mut self,
+        &self,
         name: &'a str,
         args: &[&'a Expr<'a>],
     ) -> Result<&'a Expr<'a>, ParseError> {
@@ -3332,6 +3332,20 @@ impl<'a> Parser<'a> {
         negated: bool,
     ) -> Result<&'a Expr<'a>, ParseError> {
         let source_position = SourcePosition::new(Some(self.peek_at));
+        if left.is_row_constructor() && right.is_row_constructor() {
+            // Row constructors are never NULL themselves; their fields are
+            // compared pairwise, so NULL fields make neither side unknown.
+            let same = self.plain_call(crate::sql::parser::ROWS_NOT_DISTINCT, &[left, right])?;
+            return if negated {
+                Ok(same)
+            } else {
+                self.arena_expr(Expr::Unary {
+                    source_position,
+                    operator: UnaryOp::Not,
+                    operand: same,
+                })
+            };
+        }
         let l_null = self.arena_expr(Expr::IsNull {
             operand: left,
             negated: false,

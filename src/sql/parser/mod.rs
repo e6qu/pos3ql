@@ -20,6 +20,9 @@ use super::types::{IntervalField, IntervalRange, TypeMod};
 /// Any future desugaring of syntax-only constructs belongs here too.
 pub(crate) const SIMILAR_TO: &str = "similar to";
 pub(crate) const OVERLAPS_PERIODS: &str = "overlaps periods";
+/// `ROW(...) IS NOT DISTINCT FROM ROW(...)`: field-by-field distinctness, where
+/// two NULL fields are not distinct.
+pub(crate) const ROWS_NOT_DISTINCT: &str = "rows not distinct";
 
 /// PostgreSQL's maximum target-list width also bounds the flat set of distinct
 /// grouping expressions, because grouping expressions absent from the visible

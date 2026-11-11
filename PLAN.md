@@ -303,9 +303,12 @@ reports a missing FROM-clause entry for `a` where PostgreSQL accepts it. An
 ungrouped-column error inside an aliased parenthesized join names the alias
 (`j.x`) where PostgreSQL names the member table (`a.x`). A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
-PostgreSQL types it as the table's row type `t`, and comparing two
-whole-row values (`t.* = t.*`) is row-wise, so NULL fields give NULL where
-PostgreSQL's composite comparison treats them as equal.
+PostgreSQL types it as the table's row type `t`. `ORDER BY`, `DISTINCT` and
+`UNION` over composite or record values order and match them by their text
+form, so `(1,2)` sorts after `(1,)` where PostgreSQL puts NULL fields last
+and compares fields by type; `x = ANY (ARRAY[...])` over composite or record
+arrays and casting a row constructor to a table's row type (`ROW(1, 'a')::t`)
+fail where PostgreSQL accepts them.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. In a PL/pgSQL statement,
 `VALUES (r.*)` does not expand the row variable `r` into its fields. Reading

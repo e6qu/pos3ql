@@ -3442,6 +3442,20 @@ impl PartialEq for MaterializedCteSource<'_> {
 }
 
 impl Expr<'_> {
+    /// A `ROW(...)` or `(a, b, ...)` constructor. PostgreSQL compares two of
+    /// these field by field with SQL-standard NULL semantics, while every
+    /// other composite comparison uses the record operators.
+    pub(crate) fn is_row_constructor(&self) -> bool {
+        matches!(
+            self,
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name,
+                ..
+            } if name.eq_ignore_ascii_case("row")
+        )
+    }
+
     /// Whether PostgreSQL's planner folds this expression to a constant, as
     /// it does a literal, a parameter of a custom plan, and operators and
     /// casts over them.

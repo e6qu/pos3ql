@@ -1526,6 +1526,7 @@ pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
             | "current_schema"
             | "similar to"
             | "overlaps periods"
+            | "rows not distinct"
             | "__is_json_scalar"
             | "__is_json_array"
             | "__is_json_object"
@@ -2682,7 +2683,7 @@ pub trait SubqueryListProbe: 'static {
     fn probe<'a>(
         &self,
         value: Datum<'a>,
-        collations: &[Collation],
+        columns: QuantifiedColumns<'_>,
         catalog: Option<&dyn CatalogAccess>,
         arena: &'a Arena,
     ) -> Result<(bool, bool), SqlError>;
@@ -2692,10 +2693,19 @@ pub trait SubqueryListProbe: 'static {
         value: Datum<'a>,
         operator: BinaryOp,
         all: bool,
-        collations: &[Collation],
+        columns: QuantifiedColumns<'_>,
         catalog: Option<&dyn CatalogAccess>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError>;
+}
+
+/// How a quantified subquery's operand meets each member: a `ROW(...)`
+/// operand compares field by field with a multi-column subquery, any other
+/// operand compares as one value.
+#[derive(Clone, Copy)]
+pub struct QuantifiedColumns<'c> {
+    pub row_constructor: bool,
+    pub collations: &'c [Collation],
 }
 
 /// One pre-evaluated `IN (subquery)` result.
@@ -3536,6 +3546,13 @@ fn eval_binary_expression<'a>(
         hooks,
         arena,
     )?;
+    if expression.left.is_row_constructor()
+        && expression.right.is_row_constructor()
+        && comparison_collation.is_some()
+        && let (Datum::Record(a), Datum::Record(b)) = (&left, &right)
+    {
+        return operators::row_constructor_compare(expression.operator, a, b);
+    }
     Ok(eval_binary_values(
         expression,
         left,
@@ -3546,6 +3563,20 @@ fn eval_binary_expression<'a>(
         hooks,
     )?
     .value)
+}
+
+/// The type name a record comparison error reports for a field type.
+fn record_field_type_name(
+    type_oid: i32,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &Arena,
+) -> Result<crate::util::StackStr<260>, SqlError> {
+    if let Some(catalog) = catalog
+        && let Some(name) = catalog.type_name(type_oid, arena)?
+    {
+        return Ok(crate::util::StackStr::from_str(name));
+    }
+    operators::builtin_record_field_type_name(type_oid)
 }
 
 fn eval_binary_values<'a>(
@@ -3691,6 +3722,18 @@ fn eval_binary_values<'a>(
         )?;
         return Ok(OperatorEvaluation {
             value,
+            first_argument: l,
+        });
+    }
+    if comparison.is_some()
+        && let (
+            Datum::Record(a) | Datum::Composite { fields: a, .. },
+            Datum::Record(b) | Datum::Composite { fields: b, .. },
+        ) = (&l, &r)
+    {
+        let type_name = |type_oid| record_field_type_name(type_oid, hooks.catalog, arena);
+        return Ok(OperatorEvaluation {
+            value: operators::record_compare(operator, a, b, &type_name)?,
             first_argument: l,
         });
     }
@@ -5119,6 +5162,17 @@ fn eval_full_inner<'a>(
                             return Ok(Datum::Bool(!negated));
                         }
                     }
+                    // `(a, b) IN ((c, d), ...)` compares each row constructor
+                    // field by field; any other member compares as a value.
+                    (Datum::Record(a), Datum::Record(b))
+                        if operand.is_row_constructor() && item.is_row_constructor() =>
+                    {
+                        match operators::row_constructor_compare(BinaryOp::Eq, a, b)? {
+                            Datum::Bool(true) => return Ok(Datum::Bool(!negated)),
+                            Datum::Bool(_) => {}
+                            _ => saw_null = true,
+                        }
+                    }
                     _ => match membership_eq(&l, &r)? {
                         Some(true) => return Ok(Datum::Bool(!negated)),
                         Some(false) => {}
@@ -5338,7 +5392,10 @@ fn eval_full_inner<'a>(
             // type-checks `x IN (...)` regardless of the set's contents, so a
             // string literal that cannot become the column type errors even
             // against an empty or all-NULL set.
-            let v = eval_full(operand, arena, params, row, hooks)?;
+            let v = single_column_row_constructor(
+                operand,
+                eval_full(operand, arena, params, row, hooks)?,
+            );
             let v = coerce_unknown(v, &witness)?;
             // A bit string is comparable only to another bit string; reject a
             // bit-vs-other membership test up front (PostgreSQL type-checks the
@@ -5374,7 +5431,15 @@ fn eval_full_inner<'a>(
                 }
                 let l = coerce_unknown(v, member)?;
                 let r = coerce_unknown(*member, &l)?;
-                match quantified_comparison(BinaryOp::Eq, l, r, collations, hooks.catalog, arena)? {
+                match quantified_comparison(
+                    BinaryOp::Eq,
+                    l,
+                    r,
+                    operand.is_row_constructor(),
+                    collations,
+                    hooks.catalog,
+                    arena,
+                )? {
                     Datum::Bool(true) => return Ok(Datum::Bool(!negated)),
                     Datum::Bool(false) => {}
                     Datum::Null => saw_null = true,
@@ -5383,8 +5448,15 @@ fn eval_full_inner<'a>(
             }
             if let Some(probe) = list.probe {
                 // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
-                let (matched, unknown) =
-                    unsafe { probe.as_ref() }.probe(v, collations, hooks.catalog, arena)?;
+                let (matched, unknown) = unsafe { probe.as_ref() }.probe(
+                    v,
+                    QuantifiedColumns {
+                        row_constructor: operand.is_row_constructor(),
+                        collations,
+                    },
+                    hooks.catalog,
+                    arena,
+                )?;
                 if matched {
                     return Ok(Datum::Bool(!negated));
                 }
@@ -5420,7 +5492,10 @@ fn eval_full_inner<'a>(
                     )
                 })?;
             let value = materialize_named_composite(
-                eval_full(operand, arena, params, row, hooks)?,
+                single_column_row_constructor(
+                    operand,
+                    eval_full(operand, arena, params, row, hooks)?,
+                ),
                 hooks,
                 arena,
             )?;
@@ -5438,6 +5513,7 @@ fn eval_full_inner<'a>(
                 operator,
                 value,
                 list.witness,
+                operand.is_row_constructor(),
                 collations,
                 hooks.catalog,
                 arena,
@@ -5450,6 +5526,7 @@ fn eval_full_inner<'a>(
                     operator,
                     left,
                     right,
+                    operand.is_row_constructor(),
                     collations,
                     hooks.catalog,
                     arena,
@@ -5472,7 +5549,10 @@ fn eval_full_inner<'a>(
                     value,
                     operator,
                     all,
-                    collations,
+                    QuantifiedColumns {
+                        row_constructor: operand.is_row_constructor(),
+                        collations,
+                    },
                     hooks.catalog,
                     arena,
                 )?;
@@ -6062,10 +6142,19 @@ fn quantified_scalar<'a>(
     }
 }
 
+/// `ROW(x) IN (SELECT y ...)` compares `x` with the single column `y`.
+fn single_column_row_constructor<'a>(operand: &Expr<'a>, value: Datum<'a>) -> Datum<'a> {
+    match value {
+        Datum::Record([field]) if operand.is_row_constructor() => field.value,
+        value => value,
+    }
+}
+
 pub(crate) fn quantified_comparison<'a>(
     operator: BinaryOp,
     left: Datum<'a>,
     right: Datum<'a>,
+    row_constructor: bool,
     collations: &[Collation],
     catalog: Option<&dyn CatalogAccess>,
     arena: &'a Arena,
@@ -6088,10 +6177,12 @@ pub(crate) fn quantified_comparison<'a>(
     let left = materialize(left)?;
     let right = materialize(right)?;
     match (left, right) {
+        // A row constructor meets a multi-column subquery field by field; a
+        // record-valued column compares as one record value.
         (
             Datum::Record(left) | Datum::Composite { fields: left, .. },
             Datum::Record(right) | Datum::Composite { fields: right, .. },
-        ) => {
+        ) if row_constructor => {
             if left.len() != right.len() {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,

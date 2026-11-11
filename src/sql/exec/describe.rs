@@ -1498,7 +1498,7 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         // column is anonymous, while PostgreSQL does label OVERLAPS.
         Expr::Call {
             kind: crate::sql::ast::CallKind::SqlSyntax,
-            name: crate::sql::parser::SIMILAR_TO,
+            name: crate::sql::parser::SIMILAR_TO | crate::sql::parser::ROWS_NOT_DISTINCT,
             ..
         } => None,
         Expr::Call {
@@ -6621,6 +6621,7 @@ fn infer_type_unpositioned(
                 crate::sql::types::RangeKind::from_multirange_name(name).expect("multirange name"),
             )),
             crate::sql::parser::SIMILAR_TO
+            | crate::sql::parser::ROWS_NOT_DISTINCT
             | "isempty"
             | "lower_inc"
             | "upper_inc"

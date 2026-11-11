@@ -111,7 +111,13 @@ synchronously. A delivered row's receipts (sequence values, routine results)
 are released before the next row starts, so statement memory holds one row's
 receipts however long the stream runs. Every other large result uses the spool above, decided before
 any of its rows reach the client; `pos3ql_result_stream_spooled_total` counts
-those by reason (`shape`, `capacity`, `effects`).
+those by reason (`shape`, `capacity`, `effects`). A spooled result yields on
+cold storage only until its first byte reaches the client, then reads
+synchronously until it ends. Today that covers joins, grouping, sorted
+results, subqueries, set operations, `VALUES` lists, other function sources,
+row locking, row security, a result that started an effect before it
+overflowed, and a `FETCH` from a scrollable cursor. A buffered paged portal
+sends nothing before its first page, so its reads yield throughout.
 
 A forward `FETCH n` or `FETCH ALL` (simple Query or unpaged `Execute`) from
 a cursor that reads as it fetches and saves no history (`NO SCROLL`, or a
@@ -178,7 +184,7 @@ replays instead of running the effect again.
 | Checked literal inputs saved with routines and stored definitions | `table_metadata_bytes` / `table_metadata_leases`, with `routine_input_slots` control records |
 | Execution schemas | `definition_image_slots` |
 | Result output queued for a slow client | Rows: `result_spool_bytes` / `result_spool_leases`, released as soon as the client drains them. Closing messages: a private reserve of `conn_send_buffer_bytes` per connection |
-| A result stream's query text, parameters, row positions and saved-file readers | `result_stream_bytes` per connection; released at completion, error, cancel, timeout or disconnect. Not visible in `pg_cursors` and not counted in `max_cursors` |
+| A result stream's query text, parameters, row positions and saved-file readers | `result_stream_bytes` per connection; released at completion, error, cancel, timeout or disconnect, and for a paged portal when the portal is closed or rebound or its transaction ends. Not visible in `pg_cursors` and not counted in `max_cursors`. A streamed `FETCH` keeps its rows' state in its cursor's own allocations |
 
 Further rules that apply to every saved owner:
 

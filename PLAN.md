@@ -78,10 +78,13 @@ is owned.
 
 - **Functions:** callers and expression positions that have no owning query;
   PL/pgSQL return conversion that can wait; one timing count per completed call.
-  A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
-  grouping, subqueries) restarts once for each first call of a SQL-language
-  routine, so its work grows with the square of those calls; single-table,
-  `VALUES` and `generate_series` sources hand each call off on its row.
+  A top-level `SELECT` that the retained reader cannot hold (joins, grouping,
+  subqueries, sorts of results) restarts once for each first call of a
+  SQL-language routine, so its work grows with the square of those calls;
+  single-table, `VALUES` and `generate_series` sources, and cursors ordered by
+  source columns, hand each call off on its row. Removing the restart needs
+  those shapes retained (above): the general executor cannot run a routine
+  body inside expression evaluation.
 - **Write phases:** BEFORE/INSTEAD triggers, source scans, row locks, partitions,
   constraints, transition tables, rules, data-modifying common table
   expressions (CTEs), COPY, replication apply and deferred triggers. Keep the
@@ -89,27 +92,28 @@ is owned.
   of row progress in multirow updates with saved progress: a child statement must
   see earlier changed rows before the next row is written, and each operation
   keeps its own transition table and firing order.
-- **Results and cursors:** resume more large results row by row; `SELECT`
-  from one table or one generated series does today, including paged
-  portals, forward `FETCH` from `NO SCROLL` cursors and `COPY ... TO STDOUT`
-  of such queries or one table. Remaining: a second
-  paged portal while one holds the connection's stream (it buffers into
-  `portal_result_bytes`); `FETCH` from scrollable cursors, including
-  PostgreSQL's default for table scans, which saves every visited row in
-  `cursor_bytes` because the retained read position cannot move backward over
-  spilled generations; and more retained shapes (joins, sorting, grouping, subqueries, set
-  operations, and more set-returning functions than `generate_series` and
-  one-array `unnest`).
-  Cursors over those shapes still run at `DECLARE`, so a scrollable cursor
-  ordered by an expression that is not a source column returns saved values
-  where PostgreSQL evaluates a volatile output list again, and a row-locking
-  cursor over a join, or ordered by such an expression, locks its rows at
-  `DECLARE`. A large ordered `SELECT` still spools: its sort input has no
-  size estimate to choose a stream before it runs.
-  PL/pgSQL `FOR rec IN c LOOP` over a bound cursor is rejected with `0A000`;
-  it needs a loop frame that opens, fetches and closes the cursor across
-  waits. Saving a held cursor at commit yields during storage waits. Cursors
-  keep declared record and domain types after their source query ends.
+- **Results and cursors:** large results resume row by row for `SELECT`
+  from one table or one generated series, including paged portals, forward
+  `FETCH` from `NO SCROLL` cursors and `COPY ... TO STDOUT` of such a query or
+  one table. Remaining:
+  - More retained shapes: joins, grouping, subqueries, set operations, sorts
+    of results (a large ordered `SELECT` still spools, because its sort input
+    has no size estimate to choose a stream before it runs), and more
+    set-returning functions than `generate_series` and one-array `unnest`.
+    Cursors over those shapes run at `DECLARE`: a scrollable cursor ordered by
+    an expression that is not a source column returns saved values where
+    PostgreSQL evaluates a volatile output list again, and a row-locking cursor
+    over a join, or ordered by such an expression, locks its rows at `DECLARE`.
+  - `FETCH` from scrollable cursors, including PostgreSQL's default for table
+    scans, saves every visited row in `cursor_bytes`: the retained read
+    position cannot move backward over saved generations.
+  - A second paged portal while one holds the connection's stream buffers
+    into `portal_result_bytes`.
+  - PL/pgSQL `FOR rec IN c LOOP` over a bound cursor is rejected with
+    `0A000`; it needs a loop frame that opens, fetches and closes the cursor
+    across waits in every procedural executor.
+  - Saving a held cursor at commit reads storage synchronously: commit callers
+    do not yet accept a wait before the commit is staged.
 
 **Done when:**
 

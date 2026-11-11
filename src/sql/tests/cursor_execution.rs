@@ -3054,3 +3054,29 @@ fn ordered_cursors_sort_at_the_first_fetch_and_project_each_row_when_fetched() {
         ]
     );
 }
+
+#[test]
+fn generate_subscripts_cursors_produce_rows_as_they_are_fetched() {
+    let config = test_config("subscript-cursor-generator");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // Expected rows come from PostgreSQL 18.6.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE SEQUENCE subscript_calls START 50; BEGIN; \
+             DECLARE subs NO SCROLL CURSOR FOR SELECT s, nextval('subscript_calls') \
+             FROM generate_subscripts('[3:5]={a,b,c}'::text[], 1, true) s; \
+             SELECT last_value, is_called FROM subscript_calls; FETCH 2 subs; FETCH ALL subs; \
+             DECLARE missing CURSOR FOR SELECT * FROM generate_subscripts(ARRAY[1,2], 2); \
+             FETCH ALL missing; \
+             DECLARE forward SCROLL CURSOR FOR \
+             SELECT s FROM generate_subscripts(ARRAY[[1,2],[3,4]], 2) s; \
+             FETCH ALL forward; FETCH PRIOR forward; \
+             SELECT is_scrollable FROM pg_cursors WHERE name = 'forward'; COMMIT",
+            true
+        )),
+        ["50|f", "5|50", "4|51", "3|52", "1", "2", "2", "t"]
+    );
+}

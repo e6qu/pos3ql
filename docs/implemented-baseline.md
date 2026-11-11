@@ -218,8 +218,8 @@ change the cursor. Dynamic SQL sees only the explicit `USING` arguments.
 ### Cursors that read as you fetch
 
 A cursor over one table, over constant `VALUES` rows, or over
-`generate_series` (integer, bigint, numeric or timestamp) or a one-array
-`unnest` with constant arguments, reads input only as rows are fetched when
+`generate_series` (integer, bigint, numeric or timestamp),
+`generate_subscripts` or a one-array `unnest` with constant arguments, reads input only as rows are fetched when
 its query uses only columns, constants, parameters,
 built-in operators and casts, boolean logic, `CASE`, `BETWEEN`, null tests,
 array construction, subscripts, slices, scalar function calls, `LIMIT` and

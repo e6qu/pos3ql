@@ -1,8 +1,9 @@
 //! Set-returning functions that advance one row at a time from fixed state.
 //!
-//! A retained cursor over `generate_series` or a one-array `unnest` keeps
-//! only the next value (or array position), so a long series costs no row
-//! memory and its rows are produced as FETCH reaches them. Materialized
+//! A retained cursor over `generate_series`, `generate_subscripts` or a
+//! one-array `unnest` keeps only the next value (or array position), so a
+//! long series costs no row memory and its rows are produced as FETCH
+//! reaches them. Materialized
 //! callers use the same arithmetic, so both paths yield identical rows.
 
 use super::*;
@@ -22,6 +23,8 @@ pub(crate) enum GeneratorKind {
     Timestamp,
     /// `unnest(anyarray)` with a single array argument.
     Unnest,
+    /// `generate_subscripts(anyarray, integer [, boolean])`.
+    Subscripts,
 }
 
 impl GeneratorKind {
@@ -38,6 +41,7 @@ impl GeneratorKind {
             "generate_series_numeric" | "generate_series_step_numeric" => Some(Self::Numeric),
             "generate_series_timestamp" | "generate_series_timestamptz" => Some(Self::Timestamp),
             "array_unnest" if arguments == 1 => Some(Self::Unnest),
+            "generate_subscripts" | "generate_subscripts_nodir" => Some(Self::Subscripts),
             _ => None,
         }
     }
@@ -94,6 +98,63 @@ impl<'a> RowGenerator<'a> {
                     "unnest requires an array or multirange argument"
                 )),
             },
+            GeneratorKind::Subscripts => {
+                // Declared subscripts along one dimension, as PostgreSQL's
+                // generate_subscripts; a NULL argument or a missing
+                // dimension yields no rows.
+                let input = match crate::sql::eval::text_view(arguments[0]) {
+                    Datum::Null => return Ok(empty()),
+                    value => crate::sql::array::Input::from_datum(value).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "generate_subscripts requires an array argument"
+                        )
+                    })?,
+                };
+                let dimension = match crate::sql::eval::text_view(arguments[1]) {
+                    Datum::Int4(value) => i64::from(value),
+                    Datum::Int8(value) => value,
+                    Datum::Null => return Ok(empty()),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "generate_subscripts requires an integer dimension"
+                        ));
+                    }
+                };
+                let reverse = match arguments.get(2) {
+                    None => false,
+                    Some(Datum::Bool(reverse)) => *reverse,
+                    Some(Datum::Null) => return Ok(empty()),
+                    Some(_) => {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "generate_subscripts requires a boolean direction"
+                        ));
+                    }
+                };
+                let bounds = match usize::try_from(dimension)
+                    .ok()
+                    .and_then(|dimension| dimension.checked_sub(1))
+                {
+                    Some(dimension) => input.bounds(dimension)?,
+                    None => None,
+                };
+                let Some((_, lower, upper)) = bounds else {
+                    return Ok(empty());
+                };
+                let (start, stop, step) = if reverse {
+                    (upper, lower, -1)
+                } else {
+                    (lower, upper, 1)
+                };
+                Ok(Self::integer(
+                    i64::from(start),
+                    i64::from(stop),
+                    step,
+                    false,
+                )?)
+            }
             GeneratorKind::Integer { wide } => {
                 let value = |datum: Datum<'a>| match datum {
                     Datum::Int2(value) => Ok(Some(i64::from(value))),

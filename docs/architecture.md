@@ -96,7 +96,8 @@ repeating them.
 `COPY ... TO STDOUT` runs (simple Query or extended `Execute`), the engine
 decides whether it (or the query a COPY reads: its own, or `SELECT columns
 FROM ONLY table` for a table) can become a **result stream**: one ordinary table, or one builtin set-returning function
-with constant arguments (`generate_series`, a one-array `unnest`), without
+with constant arguments (`generate_series`, `generate_subscripts`, a
+one-array `unnest`), without
 joins, grouping, sorting, `DISTINCT`, set operations, subqueries, CTEs, row
 locking or row security, whose read position (one record per resident row
 plus the query text) fits `result_stream_bytes`. If such a statement's output first outgrows

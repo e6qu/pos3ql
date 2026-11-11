@@ -99,7 +99,8 @@ is owned.
   - More retained shapes: joins, grouping, subqueries, set operations, sorts
     of results (a large ordered `SELECT` still spools, because its sort input
     has no size estimate to choose a stream before it runs), and more
-    set-returning functions than `generate_series` and one-array `unnest`.
+    set-returning functions than `generate_series`, `generate_subscripts` and
+    one-array `unnest`.
     Cursors over those shapes run at `DECLARE`: a scrollable cursor ordered by
     an expression that is not a source column returns saved values where
     PostgreSQL evaluates a volatile output list again, and a row-locking cursor

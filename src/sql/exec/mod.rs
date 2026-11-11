@@ -20877,9 +20877,12 @@ fn parse_trigger_raise<'a>(
         if argument_count != count - 1 {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
-                "RAISE format has {} placeholders but {} arguments",
-                argument_count,
-                count - 1
+                "too {} parameters specified for RAISE",
+                if argument_count < count - 1 {
+                    "many"
+                } else {
+                    "few"
+                }
             ));
         }
         let mut parsed = [None; MAX_COLUMNS];

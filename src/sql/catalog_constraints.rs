@@ -932,6 +932,10 @@ pub(super) fn dependencies<'a>(
         for &column in &index.include_columns[..index.n_include_cols] {
             referenced.insert(usize::from(column));
         }
+        // PostgreSQL's `index_create` gives an index without a simple key or
+        // INCLUDE column an automatic dependency on the whole table, besides
+        // those on the columns its expressions and predicate use.
+        let has_simple_column = !referenced.is_empty();
         for position in 0..index.n_cols {
             if index.expression_keys[position] {
                 let source = super::index_expression_source(storage, index, position, transaction)
@@ -949,7 +953,7 @@ pub(super) fn dependencies<'a>(
             let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
             referenced |= super::super::exec::check_referenced_columns(expression, &table)?;
         }
-        if referenced.is_empty() {
+        if !has_simple_column {
             push(
                 super::PG_CLASS_OID,
                 index.oid,

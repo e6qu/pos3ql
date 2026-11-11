@@ -8436,6 +8436,12 @@ impl<'a> Parser<'a> {
             end: self.lexer.token_end(),
         };
         let mut quoted = matches!(self.peeked, Tok::QuotedIdent(_));
+        // A fully reserved word never names a type (`f(x any)`); `"any"` does.
+        if let Tok::Ident(word) = self.peeked
+            && keyword_category(word) == Some(Keyword::Reserved)
+        {
+            return Err(self.syntax_error_here());
+        }
         let mut name = self.any_ident("type name")?;
         let mut written = WrittenTypeName {
             schema: None,

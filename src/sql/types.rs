@@ -106,7 +106,8 @@ pub(crate) fn preferred_type_oid(type_oid: i32) -> bool {
 pub(crate) fn type_category(ctype: ColType) -> &'static str {
     use ColType::*;
     match ctype {
-        Void | Internal | PgDdlCommand | Record | AnyArray => "P",
+        Pseudo(PseudoType::Unknown) => "X",
+        Void | Internal | PgDdlCommand | Record | AnyArray | Pseudo(_) => "P",
         Bool => "B",
         Int2 | Int4 | Int8 | Numeric | Float4 | Float8 | Money | Oid | Regtype | Regproc
         | Regprocedure | Regoper | Regoperator | Regclass | Regnamespace | Regrole | Regconfig
@@ -266,6 +267,11 @@ pub mod oid {
     /// PostgreSQL's opaque server-state pseudo-type.
     pub const INTERNAL: i32 = 2281;
     pub const FDW_HANDLER: i32 = 3115;
+    pub const CSTRING: i32 = 2275;
+    pub const LANGUAGE_HANDLER: i32 = 2280;
+    pub const INDEX_AM_HANDLER: i32 = 325;
+    pub const TABLE_AM_HANDLER: i32 = 269;
+    pub const TSM_HANDLER: i32 = 3310;
     pub const ANY: i32 = 2276;
     pub const ANYELEMENT: i32 = 2283;
     pub const ANYNONARRAY: i32 = 2776;
@@ -497,6 +503,91 @@ pub(crate) fn acl_identifier(name: &str) -> crate::util::StackStr<132> {
     quoted
 }
 
+/// PostgreSQL pseudo-types that name routine contracts rather than values:
+/// built-in input functions take `cstring`, `format` takes `"any"`, handlers
+/// return `fdw_handler`. They identify routine signatures (`int4in(cstring)`
+/// in `GRANT`, `regprocedure` input and object identities) and never reach a
+/// stored column, a value or durable state. Polymorphic types are
+/// [`crate::storage::PolymorphicType`]; `void`, `internal`, `record`,
+/// `anyarray` and `pg_ddl_command` keep their own [`ColType`] variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoType {
+    Cstring,
+    Any,
+    Trigger,
+    EventTrigger,
+    LanguageHandler,
+    FdwHandler,
+    IndexAmHandler,
+    TableAmHandler,
+    TsmHandler,
+    Unknown,
+}
+
+impl PseudoType {
+    pub const ALL: [Self; 10] = [
+        Self::Cstring,
+        Self::Any,
+        Self::Trigger,
+        Self::EventTrigger,
+        Self::LanguageHandler,
+        Self::FdwHandler,
+        Self::IndexAmHandler,
+        Self::TableAmHandler,
+        Self::TsmHandler,
+        Self::Unknown,
+    ];
+
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::Cstring => oid::CSTRING,
+            Self::Any => oid::ANY,
+            Self::Trigger => oid::TRIGGER,
+            Self::EventTrigger => oid::EVENT_TRIGGER,
+            Self::LanguageHandler => oid::LANGUAGE_HANDLER,
+            Self::FdwHandler => oid::FDW_HANDLER,
+            Self::IndexAmHandler => oid::INDEX_AM_HANDLER,
+            Self::TableAmHandler => oid::TABLE_AM_HANDLER,
+            Self::TsmHandler => oid::TSM_HANDLER,
+            Self::Unknown => oid::UNKNOWN,
+        }
+    }
+
+    /// `pg_type.typname`.
+    pub const fn catalog_name(self) -> &'static str {
+        match self {
+            Self::Cstring => "cstring",
+            Self::Any => "any",
+            Self::Trigger => "trigger",
+            Self::EventTrigger => "event_trigger",
+            Self::LanguageHandler => "language_handler",
+            Self::FdwHandler => "fdw_handler",
+            Self::IndexAmHandler => "index_am_handler",
+            Self::TableAmHandler => "table_am_handler",
+            Self::TsmHandler => "tsm_handler",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// `format_type` output: `any` is a reserved word and prints quoted.
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Any => "\"any\"",
+            other => other.catalog_name(),
+        }
+    }
+
+    pub fn from_catalog_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.catalog_name() == name)
+    }
+
+    pub fn from_oid(type_oid: i32) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.oid() == type_oid)
+    }
+}
+
 /// Column types the engine stores. A deliberately small, growing set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColType {
@@ -656,6 +747,8 @@ pub enum ColType {
     /// A named composite type (`CREATE TYPE ... AS (...)`). Unlike `Record`,
     /// this is durable and carries a catalog identity.
     Composite(Option<crate::storage::TypeCreation>),
+    /// A routine-contract pseudo-type; see [`PseudoType`].
+    Pseudo(PseudoType),
 }
 
 /// B-tree operator classes whose comparison semantics the executor implements.
@@ -751,7 +844,7 @@ impl BtreeOperatorClass {
             Bit { varying: true } => Self::Varbit,
             Void | Internal | PgDdlCommand | AnyArray | Int2Vector | OidVector | PgNodeTree
             | PgNdistinct | PgDependencies | PgMcvList | PgStatisticArray | Json | Xml
-            | Jsonpath => {
+            | Jsonpath | Pseudo(_) => {
                 return None;
             }
         })
@@ -1035,6 +1128,7 @@ impl HashOperatorClass {
             | Internal
             | PgDdlCommand
             | AnyArray
+            | Pseudo(_)
             | Int2Vector
             | PgNodeTree
             | PgNdistinct
@@ -2582,7 +2676,12 @@ impl ColType {
     pub const fn is_pseudo(self) -> bool {
         matches!(
             self,
-            Self::Void | Self::Internal | Self::PgDdlCommand | Self::AnyArray | Self::Record
+            Self::Void
+                | Self::Internal
+                | Self::PgDdlCommand
+                | Self::AnyArray
+                | Self::Record
+                | Self::Pseudo(_)
         )
     }
 
@@ -2723,7 +2822,7 @@ impl ColType {
             "macaddr" => Self::Macaddr,
             "macaddr8" => Self::Macaddr8,
             "record" => Self::Record,
-            _ => return None,
+            other => Self::Pseudo(PseudoType::from_catalog_name(other)?),
         })
     }
 
@@ -2806,6 +2905,7 @@ impl ColType {
             Self::Record => oid::RECORD,
             Self::Enum(slot) => oid::enum_oid(slot?),
             Self::Composite(slot) => oid::composite_oid(slot?),
+            Self::Pseudo(kind) => kind.oid(),
         })
     }
     /// Inverse of [`ColType::oid`]: the column type a PostgreSQL type OID names,
@@ -2881,7 +2981,10 @@ impl ColType {
             oid::MACADDR8 => Some(Self::Macaddr8),
             oid::RECORD => Some(Self::Record),
             oid::RECORD_ARRAY => Some(Self::Array(ArrElem::Record)),
-            _ => None,
+            // An untyped literal's `unknown` is not a column type here; only
+            // a written signature names it.
+            oid::UNKNOWN => None,
+            other => PseudoType::from_oid(other).map(Self::Pseudo),
         };
         if scalar.is_some() {
             return scalar;
@@ -3052,6 +3155,7 @@ impl ColType {
             // Resolve the current name through the bound creation identity.
             Self::Enum(_) => "enum",
             Self::Composite(_) => "record",
+            Self::Pseudo(kind) => kind.catalog_name(),
         }
     }
 
@@ -3138,6 +3242,7 @@ impl ColType {
             Self::Record => "record",
             Self::Enum(_) => "enum",
             Self::Composite(_) => "record",
+            Self::Pseudo(kind) => kind.display_name(),
         }
     }
 
@@ -3225,10 +3330,11 @@ impl ColType {
             Self::Geometry(GeometryKind::Circle) => 225,
             Self::Multirange(k) => MULTIRANGE_CODE_BASE + k.code(),
             Self::Array(e) => ARRAY_CODE_BASE + e.code(),
-            // Records are transient (never a stored column); the code is a
-            // loud sentinel with no `from_code` inverse, so any leak into the
-            // persistence layer fails visibly at reload.
-            Self::Record => 46,
+            // Records and routine-contract pseudo-types are transient (never a
+            // stored column or a durable routine); the code is a loud sentinel
+            // with no `from_code` inverse, so any leak into the persistence
+            // layer fails visibly at reload.
+            Self::Record | Self::Pseudo(_) => 46,
             // The code marks "an enum column"; *which* enum is carried
             // alongside as the type name (slots are not stable across restart),
             // and a stored enum value carries its own label + sort inline.

@@ -908,8 +908,9 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
     })
 }
 
+/// PostgreSQL's `quote_identifier`, which also quotes reserved words.
 fn identifier(value: &str) -> StackStr<132> {
-    crate::sql::types::acl_identifier(value)
+    crate::sql::eval::quote_identifier(value)
 }
 
 fn qualified(schema: &str, name: &str) -> Result<EventIdentity, SqlError> {
@@ -1540,8 +1541,32 @@ fn builtin_routine_type_name(
         }
         scalar => (scalar.name(), scalar.catalog_name()),
     };
-    // format_type prints `json` unqualified, as the SQL/JSON standard names it.
-    let name = if display.trim_end_matches("[]") == catalog_name && catalog_name != "json" {
+    qualified_type_display(display, catalog_name)
+}
+
+/// `format_type_be_qualified` of a built-in type OID: `pg_catalog.text`,
+/// `pg_catalog."any"`, `integer`, `pg_catalog.cstring[]`.
+fn builtin_type_identity_name(type_oid: i32) -> Result<EventAddressPart, SqlError> {
+    let display = catalog::intrinsic_type_name(type_oid).ok_or_else(graph_full)?;
+    let rows = catalog::builtin_type_rows();
+    let row = |oid: i32| {
+        rows.binary_search_by_key(&oid, |row| row.oid)
+            .ok()
+            .map(|index| &rows[index])
+    };
+    let mut base = row(type_oid).ok_or_else(graph_full)?;
+    if display.ends_with("[]") {
+        base = row(base.element).ok_or_else(graph_full)?;
+    }
+    qualified_type_display(display, base.name)
+}
+
+/// Types PostgreSQL spells with SQL syntax (`integer`, `character varying`)
+/// stay unqualified; every other type name is schema-qualified. `json` is
+/// printed bare, as the SQL/JSON standard names it.
+fn qualified_type_display(display: &str, catalog_name: &str) -> Result<EventAddressPart, SqlError> {
+    let quoted = crate::sql::eval::quote_identifier(catalog_name);
+    let name = if display.trim_end_matches("[]") == quoted.as_str() && catalog_name != "json" {
         crate::stack_format!(512, "pg_catalog.{display}")
     } else {
         StackStr::from_str(display)
@@ -2656,11 +2681,16 @@ fn type_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<Event
 }
 
 fn builtin_routine_object(object_id: i32) -> Result<Option<EventObject>, SqlError> {
-    let Some((name, arguments, object_type)) = catalog::intrinsic_routine_event_identity(object_id)
-    else {
+    let Some(routine) = catalog::builtin_callable_by_oid(object_id) else {
         return Ok(None);
     };
-    let mut identity = qualified("pg_catalog", name)?;
+    let name = routine.name;
+    let object_type = match routine.kind {
+        b'a' => "aggregate",
+        b'p' => "procedure",
+        _ => "function",
+    };
+    let mut identity = qualified(routine.schema, name)?;
     identity.write_char('(').map_err(|_| graph_full())?;
     let mut object = base_object(
         catalog::PG_PROC_OID,
@@ -2671,16 +2701,14 @@ fn builtin_routine_object(object_id: i32) -> Result<Option<EventObject>, SqlErro
         StackStr::new(),
         false,
     );
-    object.address_names[0] = StackStr::from_str("pg_catalog");
+    object.address_names[0] = StackStr::from_str(routine.schema);
     object.address_names[1] = StackStr::from_str(name);
     object.address_name_count = 2;
-    for (index, raw) in arguments.split_ascii_whitespace().enumerate() {
+    for (index, oid) in routine.arguments.iter().copied().enumerate() {
         if index != 0 {
             identity.write_char(',').map_err(|_| graph_full())?;
         }
-        let oid = raw.parse::<i32>().map_err(|_| graph_full())?;
-        let name = catalog::intrinsic_type_name(oid).ok_or_else(graph_full)?;
-        let qualified_name = crate::stack_format!(512, "pg_catalog.{name}");
+        let qualified_name = builtin_type_identity_name(oid)?;
         identity
             .write_str(qualified_name.as_str())
             .map_err(|_| graph_full())?;

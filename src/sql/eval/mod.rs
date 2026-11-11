@@ -2056,10 +2056,11 @@ pub trait CatalogAccess {
     fn statistics_object_is_visible(&self, _oid: i32) -> Option<bool> {
         None
     }
-    fn text_search_dictionary_is_visible(&self, _oid: i32) -> Option<bool> {
-        None
-    }
-    fn text_search_configuration_is_visible(&self, _oid: i32) -> Option<bool> {
+    fn text_search_is_visible(
+        &self,
+        _oid: i32,
+        _kind: crate::sql::ast::TextSearchObjectKind,
+    ) -> Option<bool> {
         None
     }
     fn catalog_object(
@@ -10640,6 +10641,8 @@ pub(crate) fn regtype_of_oid_with_catalog<'a>(
     } else if let Some(name) = super::catalog::intrinsic_type_name(referenced_oid) {
         // A pseudo-type or catalog row type a built-in routine declares.
         name
+    } else if let Some(name) = builtin_row_type_display(referenced_oid, arena)? {
+        name
     } else {
         return arena
             .alloc_str_display(unsigned)
@@ -10674,16 +10677,29 @@ pub(crate) fn regtype_cast<'a>(
                     identity
                 ));
             }
-            if let Some(catalog) = catalog
-                && let Some(referenced_oid) = catalog.user_type_oid(name)
-            {
-                return regtype_of_oid_with_catalog(
-                    i64::from(referenced_oid),
-                    Some(catalog),
-                    arena,
-                );
+            let (normalized, display) = written_type_name(name)?;
+            if let Some(catalog) = catalog {
+                if let Some(referenced_oid) = catalog.user_type_oid(normalized.as_str()) {
+                    return regtype_of_oid_with_catalog(
+                        i64::from(referenced_oid),
+                        Some(catalog),
+                        arena,
+                    );
+                }
+                let schema = &display.text.as_str()[..display.schema_len];
+                if !schema.is_empty()
+                    && catalog
+                        .written_schema_oid(quote_identifier(schema).as_str())
+                        .is_none()
+                {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_SCHEMA_NAME,
+                        "schema \"{}\" does not exist",
+                        schema
+                    ));
+                }
             }
-            regtype_of_name(name)
+            regtype_of_normalized_name(normalized.as_str(), display.text.as_str(), arena)
         }
         Datum::Oid(oid) => regtype_of_oid_with_catalog(i64::from(oid), catalog, arena),
         Datum::Int4(oid) => regtype_of_oid_with_catalog(i64::from(oid), catalog, arena),
@@ -11031,80 +11047,294 @@ fn regtype_builtin_name(type_oid: i32) -> Option<&'static str> {
     })
 }
 
-/// `'typename'::regtype`: resolves a spelled type name — with any `(...)`
-/// modifier ignored, as PostgreSQL ignores it — to its canonical SQL name.
-/// The serial pseudo-names are not types and are refused (42704), matching
-/// PostgreSQL; `name`, `oid` and the `reg*` identifiers resolve to themselves.
-pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> {
-    let mut base = spelled.trim();
-    if let Some(open) = base.find('(') {
-        // `varchar(5)` names varchar; the modifier plays no part.
-        let close = base.rfind(')').unwrap_or(base.len());
-        let tail = base[close..].trim_start_matches(')').trim();
-        if tail.is_empty() {
-            base = base[..open].trim_end();
-        }
-    }
-    let mut lowered = crate::util::StackStr::<128>::new();
+/// A type name written in catalog input text (`'x'::regtype`, the argument
+/// list of `'f(x)'::regprocedure`), normalized as the SQL parser normalizes
+/// a type name: unquoted words fold to lower case and multi-word spellings
+/// join with one space, quoted names keep their case, a `pg_catalog`
+/// qualification is dropped, a type modifier is ignored and any array bounds
+/// become one `[]` suffix. Another schema stays as `schema.name`. An unquoted
+/// reserved word is a syntax error, as in PostgreSQL's `parseTypeString`.
+pub(crate) fn normalize_written_type_name(
+    spelled: &str,
+) -> Result<crate::util::StackStr<192>, SqlError> {
+    written_type_name(spelled).map(|(normalized, _)| normalized)
+}
+
+/// PostgreSQL's `TypeNameToString` of a written type name and the length of
+/// its schema qualification, if any.
+struct WrittenTypeDisplay {
+    text: crate::util::StackStr<192>,
+    schema_len: usize,
+}
+
+/// [`normalize_written_type_name`] plus PostgreSQL's `TypeNameToString` of
+/// the same spelling (`pg_catalog.foo`, `public.foo[]`), which names a
+/// missing type.
+fn written_type_name(
+    spelled: &str,
+) -> Result<(crate::util::StackStr<192>, WrittenTypeDisplay), SqlError> {
     use core::fmt::Write as _;
-    for c in base.chars() {
-        let _ = lowered.write_char(c.to_ascii_lowercase());
+    #[derive(Clone, Copy, PartialEq)]
+    enum Token<'t> {
+        Word(&'t str),
+        Quoted(&'t str),
+        Symbol(u8),
     }
-    let unknown = || {
+    let bytes = spelled.as_bytes();
+    let mut tokens = [Token::Symbol(0); 24];
+    let mut count = 0;
+    let mut at = 0;
+    let too_long = || {
         sql_err!(
             sqlstate::UNDEFINED_OBJECT,
             "type \"{}\" does not exist",
             spelled.trim()
         )
     };
-    if lowered.is_truncated() {
-        return Err(unknown());
-    }
-    // Collapse interior whitespace runs so `timestamp   with time zone` reads.
-    let mut collapsed = crate::util::StackStr::<128>::new();
-    let mut last_space = false;
-    for c in lowered.as_str().chars() {
-        if c.is_whitespace() {
-            if !last_space {
-                let _ = collapsed.write_char(' ');
+    while at < bytes.len() {
+        let byte = bytes[at];
+        let token = if byte.is_ascii_whitespace() {
+            at += 1;
+            continue;
+        } else if byte == b'"' {
+            let start = at + 1;
+            at = start;
+            loop {
+                match bytes.get(at) {
+                    None => {
+                        return Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "unterminated quoted identifier"
+                        ));
+                    }
+                    Some(b'"') if bytes.get(at + 1) == Some(&b'"') => at += 2,
+                    Some(b'"') => break,
+                    Some(_) => at += 1,
+                }
             }
-            last_space = true;
+            at += 1;
+            Token::Quoted(&spelled[start..at - 1])
+        } else if byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80 {
+            let start = at;
+            while bytes.get(at).is_some_and(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || *byte >= 0x80
+            }) {
+                at += 1;
+            }
+            Token::Word(&spelled[start..at])
         } else {
-            let _ = collapsed.write_char(c);
-            last_space = false;
+            at += 1;
+            Token::Symbol(byte)
+        };
+        *tokens.get_mut(count).ok_or_else(too_long)? = token;
+        count += 1;
+    }
+    let tokens = &tokens[..count];
+    let syntax = |token: Option<&Token<'_>>| match token {
+        Some(Token::Word(word) | Token::Quoted(word)) => sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "syntax error at or near \"{}\"",
+            word
+        ),
+        Some(Token::Symbol(symbol)) => sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "syntax error at or near \"{}\"",
+            char::from(*symbol)
+        ),
+        None => sql_err!(sqlstate::SYNTAX_ERROR, "syntax error at end of input"),
+    };
+    let mut out = crate::util::StackStr::<192>::new();
+    let lowered = |out: &mut crate::util::StackStr<192>, word: &str| {
+        for character in word.chars() {
+            let _ = out.write_char(character.to_ascii_lowercase());
+        }
+    };
+    // A quoted identifier's doubled quote is one quote character.
+    let unquoted = |out: &mut crate::util::StackStr<192>, word: &str| {
+        let mut pending_quote = false;
+        for character in word.chars() {
+            if character == '"' && !pending_quote {
+                pending_quote = true;
+                continue;
+            }
+            pending_quote = false;
+            let _ = out.write_char(character);
+        }
+    };
+    let mut index = 0;
+    let mut catalog_prefix = 0;
+    let mut schema_len = 0;
+    let first = match tokens.first() {
+        Some(token @ Token::Word(word))
+            if crate::sql::parser::is_reserved_keyword(
+                {
+                    let mut folded = crate::util::StackStr::<192>::new();
+                    lowered(&mut folded, word);
+                    folded
+                }
+                .as_str(),
+            ) =>
+        {
+            return Err(syntax(Some(token)));
+        }
+        Some(token @ (Token::Word(_) | Token::Quoted(_))) => *token,
+        other => return Err(syntax(other)),
+    };
+    index += 1;
+    let mut base = first;
+    if tokens.get(index) == Some(&Token::Symbol(b'.')) {
+        let schema_is_catalog = match first {
+            Token::Word(word) => word.eq_ignore_ascii_case("pg_catalog"),
+            Token::Quoted(word) => word == "pg_catalog",
+            Token::Symbol(_) => false,
+        };
+        base = match tokens.get(index + 1) {
+            Some(token @ (Token::Word(_) | Token::Quoted(_))) => *token,
+            other => return Err(syntax(other)),
+        };
+        index += 2;
+        match first {
+            Token::Word(word) => lowered(&mut out, word),
+            Token::Quoted(word) => unquoted(&mut out, word),
+            Token::Symbol(_) => {}
+        }
+        schema_len = out.len();
+        let _ = out.write_char('.');
+        if schema_is_catalog {
+            catalog_prefix = out.len();
         }
     }
-    let name = collapsed.as_str();
+    let quoted = matches!(base, Token::Quoted(_));
+    match base {
+        Token::Word(word) => lowered(&mut out, word),
+        Token::Quoted("char") => {
+            let _ = out.write_str("\"char\"");
+        }
+        Token::Quoted(word) => unquoted(&mut out, word),
+        Token::Symbol(_) => {}
+    }
+    let mut array = false;
+    while let Some(token) = tokens.get(index) {
+        match token {
+            Token::Word(word) if !quoted && !array => {
+                let _ = out.write_char(' ');
+                lowered(&mut out, word);
+                index += 1;
+            }
+            Token::Symbol(b'(') => {
+                // A type modifier names the same type.
+                let close = tokens[index..]
+                    .iter()
+                    .position(|token| *token == Token::Symbol(b')'))
+                    .ok_or_else(|| syntax(None))?;
+                index += close + 1;
+            }
+            Token::Symbol(b'[') => {
+                let mut next = index + 1;
+                if matches!(tokens.get(next), Some(Token::Word(bound)) if bound.bytes().all(|byte| byte.is_ascii_digit()))
+                {
+                    next += 1;
+                }
+                if tokens.get(next) != Some(&Token::Symbol(b']')) {
+                    return Err(syntax(tokens.get(next)));
+                }
+                array = true;
+                index = next + 1;
+            }
+            other => return Err(syntax(Some(other))),
+        }
+    }
+    if array {
+        let _ = out.write_str("[]");
+    }
+    if out.is_truncated() {
+        return Err(too_long());
+    }
+    let normalized = crate::util::StackStr::from_str(&out.as_str()[catalog_prefix..]);
+    Ok((
+        normalized,
+        WrittenTypeDisplay {
+            text: out,
+            schema_len,
+        },
+    ))
+}
+
+/// The OID of a built-in `pg_catalog` type named by a normalized spelling:
+/// a modeled column type, a pseudo-type, or any other `pg_type` row
+/// (`_cstring`, `anyelement`, a catalog's row type), with `[]` naming the
+/// element's array type.
+pub(crate) fn builtin_type_oid_by_name(name: &str) -> Option<i32> {
     if matches!(
         name,
         "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial"
     ) {
-        return Err(unknown());
+        return None;
     }
     if let Some(ctype) = ColType::from_sql_name(name) {
-        return Ok(Datum::Regtype {
-            referenced_oid: ctype.oid(),
-            name: ctype.name(),
-        });
+        return ctype.try_oid();
     }
-    let referenced_oid = match name {
-        "anyelement" => crate::sql::types::oid::ANYELEMENT,
-        "anynonarray" => crate::sql::types::oid::ANYNONARRAY,
-        "anyenum" => crate::sql::types::oid::ANYENUM,
-        "anyrange" => crate::sql::types::oid::ANYRANGE,
-        "anymultirange" => crate::sql::types::oid::ANYMULTIRANGE,
-        "anycompatible" => crate::sql::types::oid::ANYCOMPATIBLE,
-        "anycompatiblearray" => crate::sql::types::oid::ANYCOMPATIBLEARRAY,
-        "anycompatiblenonarray" => crate::sql::types::oid::ANYCOMPATIBLENONARRAY,
-        "anycompatiblerange" => crate::sql::types::oid::ANYCOMPATIBLERANGE,
-        "anycompatiblemultirange" => crate::sql::types::oid::ANYCOMPATIBLEMULTIRANGE,
-        "fdw_handler" => crate::sql::types::oid::FDW_HANDLER,
-        _ => return Err(unknown()),
+    let rows = super::catalog::builtin_type_rows();
+    let row = |name: &str| rows.iter().find(|row| row.name == name);
+    if let Some(element) = name.strip_suffix("[]") {
+        let element = builtin_type_oid_by_name(element)?;
+        let array = rows.iter().find(|row| row.oid == element)?.array;
+        return (array != 0).then_some(array);
+    }
+    let name = if name == "\"char\"" { "char" } else { name };
+    row(name).map(|row| row.oid)
+}
+
+/// `'typename'::regtype` for a built-in type: the modifier is ignored and the
+/// serial pseudo-names are not types (42704), as in PostgreSQL.
+pub(crate) fn regtype_of_name<'a>(spelled: &str, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let (normalized, display) = written_type_name(spelled)?;
+    regtype_of_normalized_name(normalized.as_str(), display.text.as_str(), arena)
+}
+
+/// [`regtype_of_name`] for a name the SQL parser already normalized.
+pub(crate) fn regtype_of_normalized_name<'a>(
+    normalized: &str,
+    written: &str,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let referenced_oid = builtin_type_oid_by_name(normalized).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "type \"{}\" does not exist",
+            written
+        )
+    })?;
+    regtype_of_oid(i64::from(referenced_oid), arena)
+}
+
+/// `format_type` of a built-in `pg_type` row that no routine or column type
+/// names: arrays print as their element with `[]`, other names as quoted
+/// identifiers.
+fn builtin_row_type_display(type_oid: i32, arena: &Arena) -> Result<Option<&str>, SqlError> {
+    let rows = super::catalog::builtin_type_rows();
+    let Ok(index) = rows.binary_search_by_key(&type_oid, |row| row.oid) else {
+        return Ok(None);
     };
-    Ok(Datum::Regtype {
-        referenced_oid,
-        name: regtype_builtin_name(referenced_oid).expect("matched intrinsic type has a name"),
-    })
+    let row = &rows[index];
+    if row.category == b'A' && row.element != 0 && row.name.starts_with('_') {
+        let Some(Datum::Regtype { name, .. }) =
+            Some(regtype_of_oid(i64::from(row.element), arena)?)
+        else {
+            return Ok(None);
+        };
+        let mut text = crate::util::StackStr::<200>::new();
+        use core::fmt::Write as _;
+        let _ = write!(text, "{name}[]");
+        return arena
+            .alloc_str(text.as_str())
+            .map(Some)
+            .map_err(|_| arena_full());
+    }
+    arena
+        .alloc_str(quote_identifier(row.name).as_str())
+        .map(Some)
+        .map_err(|_| arena_full())
 }
 
 pub(crate) fn type_name_of_pub(d: &Datum) -> &'static str {

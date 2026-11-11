@@ -1635,6 +1635,28 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// [`Self::unmodified_type_name`] plus PostgreSQL's `TypeNameToString`
+    /// of the written name (`pg_catalog.int4` for `int`).
+    fn unmodified_type_name_written(&mut self) -> Result<(&'a str, &'a str), ParseError> {
+        let (name, modifier, written) = self.type_name_written()?;
+        if modifier != -1 {
+            return Err(self.err_here("type modifiers are not allowed in this definition"));
+        }
+        let text = stack_format!(
+            264,
+            "{}{}{}{}",
+            written.schema.unwrap_or(""),
+            if written.schema.is_some() { "." } else { "" },
+            written.name,
+            if written.array { "[]" } else { "" }
+        );
+        let written = self
+            .arena
+            .alloc_str(text.as_str())
+            .map_err(|_| self.err_here("type name too long"))?;
+        Ok((name, written))
+    }
+
     pub(super) fn unmodified_type_name(&mut self) -> Result<&'a str, ParseError> {
         let (name, modifier) = self.type_name_mod()?;
         if modifier != -1 {
@@ -4113,13 +4135,6 @@ impl<'a> Parser<'a> {
                 cursor: None,
                 hint: None,
             });
-        }
-        if matches!(
-            kind,
-            RoutineCreateKind::Trigger | RoutineCreateKind::EventTrigger
-        ) && language != crate::sql::ast::RoutineLanguage::PlPgSql
-        {
-            return Err(self.unexpected("trigger functions require LANGUAGE plpgsql"));
         }
         if language == crate::sql::ast::RoutineLanguage::PlPgSql
             && !matches!(
@@ -6987,9 +7002,9 @@ impl<'a> Parser<'a> {
                 false
             };
             self.expect_op("(")?;
-            let source_type = self.unmodified_type_name()?;
+            let (source_type, source_written) = self.unmodified_type_name_written()?;
             self.expect_ident("as")?;
-            let target_type = self.unmodified_type_name()?;
+            let (target_type, target_written) = self.unmodified_type_name_written()?;
             self.expect_op(")")?;
             let cascade = if self.eat_ident("cascade")? {
                 true
@@ -7000,6 +7015,8 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::DropCast(crate::sql::ast::DropCast {
                 source_type,
                 target_type,
+                source_written,
+                target_written,
                 if_exists,
                 cascade,
             }));

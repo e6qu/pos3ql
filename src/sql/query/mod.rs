@@ -5546,22 +5546,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::statistics_oid_visibility(self.storage, self.txid, oid)
     }
 
-    fn text_search_dictionary_is_visible(&self, oid: i32) -> Option<bool> {
-        super::catalog::text_search_oid_visibility(
-            self.storage,
-            self.txid,
-            oid,
-            super::ast::TextSearchObjectKind::Dictionary,
-        )
-    }
-
-    fn text_search_configuration_is_visible(&self, oid: i32) -> Option<bool> {
-        super::catalog::text_search_oid_visibility(
-            self.storage,
-            self.txid,
-            oid,
-            super::ast::TextSearchObjectKind::Configuration,
-        )
+    fn text_search_is_visible(
+        &self,
+        oid: i32,
+        kind: super::ast::TextSearchObjectKind,
+    ) -> Option<bool> {
+        super::catalog::text_search_oid_visibility(self.storage, self.txid, oid, kind)
     }
 
     fn catalog_object(

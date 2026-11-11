@@ -2652,6 +2652,9 @@ pub struct CreateCast<'a> {
 pub struct DropCast<'a> {
     pub source_type: &'a str,
     pub target_type: &'a str,
+    /// PostgreSQL's `TypeNameToString` spellings, for the skip notice.
+    pub source_written: &'a str,
+    pub target_written: &'a str,
     pub if_exists: bool,
     pub cascade: bool,
 }

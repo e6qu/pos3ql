@@ -205,19 +205,32 @@ connection's cached lookup and a third connection's commit can finish. If the
 first connection's statement had already called `nextval('order_ids')`, its
 remaining reads would instead block the worker.
 
-### Retained plan tree (partly built)
+### Retained plan tree
 
-A result stream or retained cursor holds one source (a table position, a
-literal list, or generator calls) or a nested-loop join of such sources, with
-a filter, projection and LIMIT above it. Every other shape runs in the
-general executor, which materializes in the statement arena and cannot pause
-after its first byte. The retained plan tree generalizes these readers into a
-tree of nodes that pull one row at a time, each owning a fixed control record
-and fixed buffers reserved at startup. It is the planned route for
-subqueries, set operations and sorts of results in object-store mode, for removing the per-call
-restart of a top-level `SELECT` in those shapes (each routine call then hands
-off on its row, as single sources and retained joins already do), and for
-removing synchronous cold reads from spooled results after their first byte.
+A result stream, a retained cursor and a top-level `SELECT` run in place
+read their rows through a **plan tree**: a chain of nodes that each produce
+one row at a time and keep their position between rows. The chain is a leaf
+(a scan of one table position, literal list, generator calls or FROM-less
+row; or a join whose levels are such scans), an optional filter, an optional
+sort or grouping, the projection and the limit. Each node is a fixed record
+inside the reader, which lives in the stream's `result_stream_bytes`
+allocation or the cursor's slot; sorts, groupings and hash joins keep their
+rows in `plan_build_bytes` leases. Every node implements the same steps:
+advance to the next row (or report the end), expose the current row, release
+it once the driver is done, rewind for a scrollable cursor. A wait inside any
+node returns to the driver with every node's state kept, and the same step
+resumes. The filter, projection and limit at the top run in the statement
+driver itself, so a routine call there hands off on its row; a filter under a
+sort or grouping runs as that node reads its input
+(`src/sql/query/retained/tree.rs`).
+
+Every other shape runs in the general executor, which materializes in the
+statement arena and cannot pause after its first byte. New node kinds are the
+planned route for subqueries, set operations and sorts of results in
+object-store mode, for removing the per-call restart of a top-level `SELECT`
+in those shapes (each routine call then hands off on its row, as single
+sources and retained joins already do), and for removing synchronous cold
+reads from spooled results after their first byte.
 
 **Built: nested-loop joins.** A retained join keeps one level per FROM item
 in the general executor's execution order (FROM order, or its cost order for
@@ -298,16 +311,13 @@ follows the groups already returned, as PostgreSQL's executor returns them
 hand a call off to a routine; builtin aggregate calls alone, as in `SELECT
 count(*) FROM t`, stay in the general executor.
 
-**Nodes.** Each node implements one step: `next(row slot) -> Row | End |
-Wait(kind)`. A wait returns up the tree without discarding state; the
-connection parks and the same call resumes. A node never repeats an effect:
-row receipts stay with the row being built and are released when it is
-delivered, as streams do now.
+**Nodes.** A node never repeats an effect: row receipts stay with the row
+being built and are released when it is delivered.
 
 | Node | State it retains | Memory owner |
 |---|---|---|
-| Scan, literal list, generator calls | Today's retained positions | Stream or cursor allocation |
-| Filter, projection, `LIMIT`/`OFFSET` | Remaining counts | Node record |
+| Scan (built: table, literal list, generator calls, FROM-less row) | The read position and current row | Stream or cursor allocation |
+| Filter, projection, `LIMIT`/`OFFSET` (built) | The condition, items, and remaining counts | Node record |
 | Nested-loop join (built: inner, cross and `LEFT`) | Each level's row bytes, position and matched flag | The stream or cursor allocation; the inner source rewinds as scrollable cursors do |
 | Hash join (built: two tables, inner, cross and `LEFT`) | Build-side rows, entries and bucket heads | `plan_build_bytes` / `plan_build_leases`; exhaustion is `54000` naming them |
 | Grouping (built: `GROUP BY`, `HAVING`, aggregates) | Each group's key, states and held values; or every input row's keys and aggregated columns, then each group's keys and results | `plan_build_bytes` |

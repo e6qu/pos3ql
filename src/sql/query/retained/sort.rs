@@ -33,6 +33,8 @@ pub(super) struct SortState<'a> {
     /// `DISTINCT ON`: the last `unique` keys are its expressions, and only
     /// the first sorted row of each run of equal values is returned.
     unique: usize,
+    /// The reader's bound output items, and where each one's values are.
+    outputs: &'a [SelectItem<'a>],
     items: &'a [ItemPlace],
     /// Saved values before the input columns: keys, then saved items.
     saved_values: usize,
@@ -275,6 +277,7 @@ impl<'a> SortState<'a> {
         Ok(Self {
             keys,
             unique: statement.distinct_on.len(),
+            outputs: items,
             items: places,
             saved_values,
             keeps_inputs,
@@ -288,10 +291,6 @@ impl<'a> SortState<'a> {
 
     pub(super) fn filled(&self) -> bool {
         self.filled
-    }
-
-    pub(super) fn keeps_inputs(&self) -> bool {
-        self.keeps_inputs
     }
 
     /// Values item `index` saves before the sort.
@@ -437,6 +436,91 @@ impl<'a> SortState<'a> {
             }
         }
         Ok(true)
+    }
+
+    /// Encodes one filtered input row: its sort keys, saved output values
+    /// and, for postponed items, its input columns.
+    pub(super) fn encode_input<'work>(
+        &self,
+        scope: &QueryScope<'_>,
+        storage: &'work Storage,
+        txid: u32,
+        row: &scan::JoinRow<'_, 'work, '_>,
+        work: &'work Arena,
+        params: &[Datum<'_>],
+    ) -> Result<&'work [u8], SqlError> {
+        let catalog = StorageCatalog {
+            storage,
+            routine_workspace: work,
+            txid,
+            invocations: None,
+            statement_arena: None,
+        };
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..crate::sql::eval::NO_HOOKS
+        };
+        let mut values = crate::mem::arena::ArenaList::new(work);
+        for key in self.key_expressions() {
+            let value = eval_full(key, work, params, row, &hooks)?;
+            values.push(value).map_err(|_| arena_full())?;
+        }
+        for index in 0..self.outputs.len() {
+            if self.postponed(index) {
+                continue;
+            }
+            let mut projected = [Datum::Null; MAX_PROJ];
+            let width = project_row(
+                &self.outputs[index..index + 1],
+                scope,
+                row,
+                work,
+                params,
+                &hooks,
+                &mut projected,
+                None,
+            )?;
+            if width != self.saved_width(index) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained sort item width changed"
+                ));
+            }
+            for value in &projected[..width] {
+                values.push(*value).map_err(|_| arena_full())?;
+            }
+        }
+        if self.keeps_inputs {
+            for table in 0..scope.n {
+                let width = scope.defs.get(table).expect("resolved").n_columns;
+                match row
+                    .table_values(table)
+                    .filter(|_| row.table_present(table) == Some(true))
+                {
+                    Some(columns) if !columns.is_empty() || width == 0 => {
+                        values.push(Datum::Bool(true)).map_err(|_| arena_full())?;
+                        for column in 0..width {
+                            values
+                                .push(columns.get(column).copied().unwrap_or(Datum::Null))
+                                .map_err(|_| arena_full())?;
+                        }
+                    }
+                    _ => {
+                        values.push(Datum::Bool(false)).map_err(|_| arena_full())?;
+                        for _ in 0..width {
+                            values.push(Datum::Null).map_err(|_| arena_full())?;
+                        }
+                    }
+                }
+            }
+        }
+        let values = values.as_slice();
+        let length = crate::sql::exec::projected_row_len(values)?;
+        let bytes = work
+            .alloc_slice_with(length, |_| 0u8)
+            .map_err(|_| arena_full())?;
+        crate::sql::exec::encode_projected_into(values, bytes)?;
+        Ok(&*bytes)
     }
 
     pub(super) fn finish_row(&mut self) {

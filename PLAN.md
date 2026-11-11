@@ -109,7 +109,7 @@ is owned.
   paged portals, forward `FETCH` from `NO SCROLL` cursors and
   `COPY ... TO STDOUT` of such a query or one table. Remaining:
   - More retained shapes, by the
-    [retained plan tree design](docs/architecture.md#retained-plan-tree-partly-built):
+    [retained plan tree design](docs/architecture.md#retained-plan-tree):
     index-probed joins, RIGHT and FULL joins, grouping sets,
     subqueries, set operations, sorts in object-store mode (external runs
     with a run reader per stream; a large ordered `SELECT` there still

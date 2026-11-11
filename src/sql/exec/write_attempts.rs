@@ -52,7 +52,7 @@ impl<'a> WriteAttemptEffects<'a> {
     }
 }
 
-pub(super) fn retained_progress_required() -> SqlError {
+pub(crate) fn retained_progress_required() -> SqlError {
     sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,
         "SQL row expression requires retained write progress"

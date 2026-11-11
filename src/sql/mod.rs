@@ -14173,6 +14173,7 @@ impl Engine {
                     guc,
                     responder,
                     Some(&mut sink),
+                    None,
                 ),
                 _ => Self::execute_data_modification(
                     &mut self.storage,
@@ -15167,6 +15168,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
+        progress: Option<&mut exec::RowProgress>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) =
             query::validate_dml_assignment_casts(statement, storage, txn.txid, arena, None)
@@ -15197,6 +15199,7 @@ impl Engine {
             guc.seq_session(),
             responder,
             capture,
+            progress,
         )
     }
 
@@ -15551,6 +15554,20 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if statement.with.iter().any(|cte| cte.dml.is_some()) {
+            // Its data-modifying CTEs make it a write: an attempt that stops
+            // for a routine call rolls their row changes back.
+            return self.execute_modification_resumable(
+                &Stmt::Select(*statement),
+                arena,
+                params,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            );
+        }
         let source_snapshot = txn.command_id().saturating_add(1);
         self.storage.set_read_snapshot(source_snapshot);
         let catalog = query::storage_catalog(&self.storage, &self.work, txn.txid);
@@ -16021,6 +16038,7 @@ impl Engine {
             let output_mark = responder.mark();
             let (wal, lock) = (self.wal.stage_mark(txn.txid), self.storage.lock_mark());
             let statement_mark = txn.statement_mark(wal, lock);
+            let effects = txn.transaction_effect_mark();
             progress.begin_attempt(wal, lock);
             // AFTER triggers of a write that kept rows belong to its first attempt.
             let start = *statement_start.get_or_insert(statement_mark);
@@ -16064,9 +16082,19 @@ impl Engine {
                                 guc,
                                 responder,
                                 None,
+                                Some(&mut progress),
                             )?,
                             Stmt::With { ctes, statement } => self.execute_with_data_modification(
                                 ctes, statement, arena, params, txn, guc, responder, None,
+                            )?,
+                            Stmt::Select(select) => self.execute_select_once(
+                                select,
+                                arena,
+                                params,
+                                txn,
+                                guc,
+                                Some(&invocations),
+                                responder,
                             )?,
                             _ => unreachable!("resumable modification has a mutation statement"),
                         })
@@ -16091,6 +16119,11 @@ impl Engine {
                 Ok(unfinished) => unfinished,
                 Err(error) => return Ok(Err(error)),
             };
+            if unfinished.is_none() && txn.transaction_effect_mark() != effects {
+                // Running the call after a rollback would hide the attempt's
+                // changes from it, unlike PostgreSQL.
+                return Ok(Err(exec::retained_progress_required()));
+            }
             // A write that kept rows undoes only its unfinished row.
             let (rollback, output_mark) =
                 unfinished.map_or((statement_mark, output_mark), |row| (row.mark, row.output));
@@ -17580,6 +17613,7 @@ impl Engine {
                 guc,
                 responder,
                 None,
+                None,
             ),
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
                 ctes, statement, arena, params, txn, guc, responder, None,
@@ -17657,6 +17691,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                None,
             ),
             _ => Ok(Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -20825,6 +20860,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                None,
             ),
             Stmt::Comment { target, text } => exec::comment(
                 &mut self.storage,

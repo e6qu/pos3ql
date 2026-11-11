@@ -85,7 +85,8 @@ then read synchronously until the statement ends. A `BEFORE STATEMENT` trigger
 therefore makes the whole scan synchronous.
 
 **Routine calls keep a write's changed rows.** A row expression, row trigger
-or `RETURNING` item of `INSERT`, `UPDATE` or `DELETE` that calls a PL/pgSQL or
+or `RETURNING` item of `INSERT`, `UPDATE`, `DELETE` or `MERGE` (including
+its join condition) that calls a PL/pgSQL or
 data-modifying function ends the write attempt, because the call runs on the
 engine. Before the first row change the attempt rolls back and runs again,
 replaying the call's saved result. After it, the write keeps its changed rows:
@@ -94,7 +95,10 @@ changes, and the next attempt selects its rows again under the same command,
 skips the changed ones and continues at that row, or at its `RETURNING`
 values when the call was there. Statement triggers, transition rows,
 sequence values and returned rows each happen once. A wait or error inside
-such a call still rolls the whole statement back.
+such a call still rolls the whole statement back. Where a write cannot keep
+its rows yet (rules, data-modifying `WITH`, `INSTEAD OF` view triggers,
+foreign tables), a call after its first change fails with `0A000` instead of
+running after a rollback that would hide those changes.
 
 **Example:** `UPDATE items SET total = running_total()`, where
 `running_total()` sums `items`, gives each row the sum including the rows

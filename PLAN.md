@@ -103,12 +103,11 @@ is owned.
   the next attempt selects the rows again under the original command and
   continues at the unfinished row). Move that progress into a startup-reserved
   owner so a storage or lock wait in the row phase also resumes at its row
-  instead of restarting the statement. Extend row progress to `MERGE`, rules,
+  instead of restarting the statement. Extend row progress to rules,
   data-modifying `WITH`, `INSTEAD OF` view triggers and foreign tables: a
-  routine call after their first row change still restarts a top-level
-  statement, so the call does not see the earlier rows, and fails with
-  `0A000` (`SQL row expression requires retained write progress`) inside a
-  routine. `INSERT ... SELECT` evaluates its whole source before writing, so a
+  routine call after their first row change fails with `0A000` (`SQL row
+  expression requires retained write progress`), at top level and inside a
+  routine, because restarting would hide the earlier rows from the call. `INSERT ... SELECT` evaluates its whole source before writing, so a
   volatile call in the source does not see rows inserted earlier by the same
   statement. A static PL/pgSQL `INSERT`, `UPDATE` or `DELETE` with
   `RETURNING` (with or without `INTO`) fails with `0A000`; dynamic `EXECUTE

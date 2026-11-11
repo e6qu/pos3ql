@@ -63,6 +63,8 @@ fn routine_lock_waits_after_kept_rows_restart_the_statement_once() {
     let statements = [
         "UPDATE items SET a = step(id) RETURNING id, a",
         "DO $$BEGIN UPDATE items SET a = step(id); END$$",
+        "MERGE INTO items t USING (SELECT id FROM items) s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET a = step(s.id) RETURNING t.id, t.a",
     ];
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -105,7 +107,7 @@ fn routine_lock_waits_after_kept_rows_restart_the_statement_once() {
                 "{mode:?}: {sql}: {}",
                 String::from_utf8_lossy(&output)
             );
-            if sql.starts_with("UPDATE") {
+            if sql.contains("RETURNING") {
                 assert_eq!(data_rows(&output), ["1|3", "2|5", "3|9"], "{mode:?}");
             }
             assert_eq!(

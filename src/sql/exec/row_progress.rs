@@ -58,16 +58,24 @@ struct RowStart {
 struct RowResume {
     start: RowStart,
     selected: usize,
-    transitions: [Option<transition_rows::SavedTransitionRows>; 2],
+    transitions: [Option<transition_rows::SavedTransitionRows>; CAPTURES],
     /// The changed row's old and new values, for its `RETURNING` stage.
     returning: Option<transition_rows::SavedTransitionRows>,
+    /// Statement-wide row state the write keeps besides its counters.
+    state: Option<transition_rows::SavedTransitionRows>,
 }
 
-/// Rows each of a write's transition captures (its own operation, and the
-/// update of `INSERT ... ON CONFLICT`) held when a row started.
-pub(super) type CaptureLengths = [(usize, usize); 2];
+/// A write's transition captures: one per operation it performs.
+pub(super) const CAPTURES: usize = 3;
 
-pub(super) fn capture_lengths(captures: [Option<&TransitionCapture<'_>>; 2]) -> CaptureLengths {
+/// Rows each of a write's transition captures (its own operation, the
+/// update of `INSERT ... ON CONFLICT`, or `MERGE`'s three) held when a row
+/// started.
+pub(super) type CaptureLengths = [(usize, usize); CAPTURES];
+
+pub(super) fn capture_lengths(
+    captures: [Option<&TransitionCapture<'_>>; CAPTURES],
+) -> CaptureLengths {
     captures.map(|capture| capture.map_or((0, 0), TransitionCapture::lengths))
 }
 
@@ -75,7 +83,7 @@ pub(super) fn capture_lengths(captures: [Option<&TransitionCapture<'_>>; 2]) -> 
 pub(super) struct ResumedRows<'p> {
     pub(super) first: usize,
     pub(super) changed: u64,
-    pub(super) transitions: [Option<&'p transition_rows::SavedTransitionRows>; 2],
+    pub(super) transitions: [Option<&'p transition_rows::SavedTransitionRows>; CAPTURES],
 }
 
 /// A changed row's values for its resumed `RETURNING` stage.
@@ -97,6 +105,7 @@ pub(crate) struct RowProgress {
     resume: Option<RowResume>,
     command: Option<SuspendedTriggerSql>,
     returning: Option<transition_rows::SavedTransitionRows>,
+    state: Option<transition_rows::SavedTransitionRows>,
     started: bool,
     unrestartable: bool,
 }
@@ -110,6 +119,7 @@ impl RowProgress {
             resume: None,
             command: None,
             returning: None,
+            state: None,
             started: false,
             unrestartable: false,
         }
@@ -161,7 +171,7 @@ impl RowProgress {
             return Ok(ResumedRows {
                 first: 0,
                 changed: 0,
-                transitions: [None, None],
+                transitions: [None; CAPTURES],
             });
         };
         if resume.selected != selected
@@ -177,10 +187,7 @@ impl RowProgress {
         Ok(ResumedRows {
             first: resume.start.index,
             changed: resume.start.changed,
-            transitions: [
-                resume.transitions[0].as_ref(),
-                resume.transitions[1].as_ref(),
-            ],
+            transitions: resume.transitions.each_ref().map(Option::as_ref),
         })
     }
 
@@ -258,6 +265,63 @@ impl RowProgress {
         Ok(())
     }
 
+    /// Saves statement-wide row state (as text) with the unfinished row, for
+    /// a write whose per-row loop carries more than counters, such as
+    /// `MERGE`'s matched target rows. A resumed row state is idempotent: the
+    /// unfinished row runs again and sets what it already set.
+    pub(super) fn keep_state(
+        &mut self,
+        state: &str,
+        arena: &Arena,
+        pool: &std::sync::Arc<LeasePool>,
+    ) -> Result<(), SqlError> {
+        if self.running.is_none() {
+            return Ok(());
+        }
+        let mark = arena.mark();
+        let saved = encode_projected_pub(&[Datum::Text(state)], arena).and_then(|row| {
+            transition_rows::SavedTransitionRows::capture(
+                TransitionRows {
+                    old: core::slice::from_ref(&row),
+                    new: &[],
+                },
+                pool,
+            )
+        });
+        // SAFETY: the encoded row was copied into the saved owner.
+        unsafe { arena.rewind_to(mark) };
+        self.state = Some(saved?);
+        Ok(())
+    }
+
+    /// The row state an interrupted attempt kept, decoded in `arena`.
+    pub(super) fn resumed_state<'out>(
+        &'out self,
+        arena: &'out Arena,
+    ) -> Result<Option<&'out str>, SqlError> {
+        let Some(saved) = self
+            .resume
+            .as_ref()
+            .and_then(|resume| resume.state.as_ref())
+        else {
+            return Ok(None);
+        };
+        let rows = saved.restore(arena)?;
+        let row = rows.old.first().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a resumed write lost its row state"
+            )
+        })?;
+        match decode_projected_col_record(row, 0, arena)? {
+            Datum::Text(text) => Ok(Some(text)),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a resumed write's row state is not text"
+            )),
+        }
+    }
+
     /// For the row a resumed attempt continues at its `RETURNING` stage:
     /// the saved old and new values, encoded in `arena`.
     pub(super) fn take_returning<'out>(
@@ -320,6 +384,7 @@ impl RowProgress {
         })?;
         self.resume = None;
         self.returning = None;
+        self.state = None;
         self.started = true;
         self.running = Some(RowStart {
             index,
@@ -356,13 +421,13 @@ impl RowProgress {
     pub(super) fn interrupt(
         &mut self,
         selected: usize,
-        captures: [Option<&TransitionCapture<'_>>; 2],
+        captures: [Option<&TransitionCapture<'_>>; CAPTURES],
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
         let Some(start) = self.running.take() else {
             return Ok(());
         };
-        let mut transitions = [None, None];
+        let mut transitions = [None, None, None];
         for (index, capture) in captures.into_iter().enumerate() {
             transitions[index] = capture
                 .map(|capture| {
@@ -385,6 +450,7 @@ impl RowProgress {
             selected,
             transitions,
             returning,
+            state: self.state.take(),
         });
         Ok(())
     }
@@ -457,7 +523,7 @@ pub(super) fn settle_rows(
     outcome: &Outcome,
     txn: &TxnState,
     selected: usize,
-    captures: [Option<&TransitionCapture<'_>>; 2],
+    captures: [Option<&TransitionCapture<'_>>; CAPTURES],
     pool: &std::sync::Arc<LeasePool>,
 ) -> Result<(), SqlError> {
     let Some(progress) = progress else {

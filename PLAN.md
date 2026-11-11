@@ -443,7 +443,11 @@ analysis order finds them; in other statements the modifier error comes first.
 A `RETURNING` list routed through a rule's `RETURNING` list reads the rule's
 relation only: `UPDATE v ... FROM o RETURNING o.label`, `*` beside `FROM` or
 `USING` sources, and subqueries in that list fail with `0A000` where
-PostgreSQL evaluates them.
+PostgreSQL evaluates them. A rule condition's `OLD` or `NEW` that the event
+lacks (`ON INSERT ... WHERE OLD.n > 0`) is reported without its cursor
+position, and a missing field of a PL/pgSQL record variable read in a `DO`
+body (`RAISE NOTICE '%', r.nope`) carries a position where PostgreSQL names
+the expression in `CONTEXT`.
 COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.

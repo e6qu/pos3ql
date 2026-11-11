@@ -3386,6 +3386,18 @@ pub(crate) enum MaterializedCteSource<'a> {
     External(Option<crate::sql::external::ExternalRun>),
     RecursiveInline(&'a core::sync::atomic::AtomicUsize),
     RecursiveExternal(&'a core::sync::atomic::AtomicUsize),
+    /// A data-modifying `WITH` query that runs when its rows are first read.
+    Write(WriteQuerySource<'a>),
+}
+
+/// A data-modifying `WITH` query bound into one statement attempt. The
+/// statement that owns `with` and its parameters outlives every attempt and
+/// every pending run of the query, so the run can borrow them again.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WriteQuerySource<'a> {
+    pub with: &'a [Cte<'a>],
+    pub index: usize,
+    pub params: (usize, usize),
 }
 
 #[derive(Clone, Copy)]
@@ -3405,6 +3417,34 @@ impl PartialEq for MaterializedCteSource<'_> {
             (Self::RecursiveExternal(left), Self::RecursiveExternal(right)) => {
                 core::ptr::eq(left, right)
             }
+            (Self::Write(left), Self::Write(right)) => {
+                core::ptr::eq(left.with, right.with) && left.index == right.index
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Expr<'_> {
+    /// Whether PostgreSQL's planner folds this expression to a constant, as
+    /// it does a literal, a parameter of a custom plan, and operators and
+    /// casts over them.
+    pub(crate) fn folds_to_constant(&self) -> bool {
+        match self {
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::Param(_)
+            | Expr::BoundLiteral { .. } => true,
+            Expr::Unary { operand, .. }
+            | Expr::Cast { operand, .. }
+            | Expr::Collate { operand, .. } => operand.folds_to_constant(),
+            Expr::Binary { left, right, .. } => {
+                left.folds_to_constant() && right.folds_to_constant()
+            }
             _ => false,
         }
     }
@@ -3414,19 +3454,25 @@ impl<'a> MaterializedCte<'a> {
     pub(crate) fn rows(&self) -> &'a [&'a [u8]] {
         match self.source {
             MaterializedCteSource::Inline(rows) => rows,
-            MaterializedCteSource::RecursiveInline(source) => {
-                let source = source.load(core::sync::atomic::Ordering::Relaxed);
-                if source == 0 {
-                    return &[];
-                }
-                // The selector names one immutable arena-owned descriptor, so
-                // an update cannot expose a pointer/length from different rows.
-                let source = unsafe { &*(source as *const MaterializedCteInlineSource) };
-                unsafe {
-                    core::slice::from_raw_parts(source.address as *const &'a [u8], source.length)
-                }
+            MaterializedCteSource::RecursiveInline(source) => inline_rows(source),
+            // Only a read runs the query; see `read_rows`.
+            MaterializedCteSource::Write(_)
+            | MaterializedCteSource::External(_)
+            | MaterializedCteSource::RecursiveExternal(_) => &[],
+        }
+    }
+
+    /// The rows a scan reads. A data-modifying `WITH` query runs here, when its
+    /// rows are first read, as PostgreSQL's CTE scan runs it.
+    pub(crate) fn read_rows(
+        &self,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<&'a [&'a [u8]], crate::sql::SqlError> {
+        match self.source {
+            MaterializedCteSource::Write(source) => {
+                crate::sql::query::read_write_query(&source, arena)
             }
-            MaterializedCteSource::External(_) | MaterializedCteSource::RecursiveExternal(_) => &[],
+            _ => Ok(self.rows()),
         }
     }
 
@@ -3442,9 +3488,22 @@ impl<'a> MaterializedCte<'a> {
                     Some(unsafe { *(address as *const crate::sql::external::ExternalRun) })
                 }
             }
-            MaterializedCteSource::Inline(_) | MaterializedCteSource::RecursiveInline(_) => None,
+            MaterializedCteSource::Inline(_)
+            | MaterializedCteSource::RecursiveInline(_)
+            | MaterializedCteSource::Write(_) => None,
         }
     }
+}
+
+fn inline_rows<'a>(source: &core::sync::atomic::AtomicUsize) -> &'a [&'a [u8]] {
+    let source = source.load(core::sync::atomic::Ordering::Relaxed);
+    if source == 0 {
+        return &[];
+    }
+    // The selector names one immutable arena-owned descriptor, so an update
+    // cannot expose a pointer/length from different rows.
+    let source = unsafe { &*(source as *const MaterializedCteInlineSource) };
+    unsafe { core::slice::from_raw_parts(source.address as *const &'a [u8], source.length) }
 }
 
 /// A base table plus a chain of joins (nested-loop order).
@@ -3588,12 +3647,23 @@ pub enum JoinKind {
     Right,
     Full,
     Cross,
+    /// A comma in the FROM list: a cross join that also starts a new FROM
+    /// item, so later USING, NATURAL and ON clauses cannot see the tables
+    /// before it.
+    Comma,
+}
+
+impl JoinKind {
+    /// Whether the join pairs every left row with every right row.
+    pub const fn is_cross(self) -> bool {
+        matches!(self, Self::Cross | Self::Comma)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SelectItem<'a> {
-    /// `*`
-    Wildcard,
+    /// `*`, with the position of the star where the statement was parsed.
+    Wildcard(SourcePosition),
     /// `t.*`: every column of the named FROM item (its own copies, even for
     /// USING/NATURAL-merged columns).
     TableWildcard(&'a str),

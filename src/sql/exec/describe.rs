@@ -200,7 +200,7 @@ fn describe_items_with_output_aliases<'q>(
             Ok(())
         };
         match item {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 let Some(def) = def else {
                     return Err(sql_err!(
                         sqlstate::SYNTAX_ERROR,
@@ -342,25 +342,25 @@ pub(crate) fn describe_data_modification_columns<'a>(
             description_target,
         );
     }
-    let (target, returning, target_alias) = match statement {
+    let (target, returning, target_alias, from) = match statement {
         Stmt::Insert(insert) => {
             let insert = *insert;
-            (insert.table, insert.returning, None)
+            (insert.table, insert.returning, None, None)
         }
         Stmt::Update(update) => {
             let update = *update;
-            (update.table, update.returning, update.alias)
+            (update.table, update.returning, update.alias, update.from)
         }
         Stmt::Delete(delete) => {
             let delete = *delete;
-            (delete.table, delete.returning, delete.alias)
+            (delete.table, delete.returning, delete.alias, delete.using)
         }
         _ => return Ok(0),
     };
     if returning.is_empty() {
         return Ok(0);
     }
-    let (target, returning, target_alias) =
+    let (target, returning, target_alias, from) =
         match crate::sql::query::resolve_view_for_dml(storage, target, txid, arena) {
             Ok(Some(view)) => {
                 let rewritten = crate::sql::query::rewrite_view_dml(
@@ -374,17 +374,30 @@ pub(crate) fn describe_data_modification_columns<'a>(
                     txid,
                     arena,
                 )?;
-                let (returning, target_alias) = match rewritten {
-                    Stmt::Insert(insert) => (insert.returning, None),
-                    Stmt::Update(update) => (update.returning, update.alias),
-                    Stmt::Delete(delete) => (delete.returning, delete.alias),
+                let (returning, target_alias, from) = match rewritten {
+                    Stmt::Insert(insert) => (insert.returning, None, None),
+                    Stmt::Update(update) => (update.returning, update.alias, update.from),
+                    Stmt::Delete(delete) => (delete.returning, delete.alias, delete.using),
                     _ => unreachable!("view rewrite keeps its statement kind"),
                 };
-                (view.base, returning, target_alias)
+                (view.base, returning, target_alias, from)
             }
-            Ok(None) => (target, returning, target_alias),
+            Ok(None) => (target, returning, target_alias, from),
             Err(error) => return Err(error),
         };
+    if let Some(from) = from {
+        return crate::sql::exec::describe_dml_from_returning(
+            storage,
+            txid,
+            target,
+            target_alias,
+            from,
+            returning,
+            arena,
+            columns,
+            description_target,
+        );
+    }
     let table_index = crate::sql::exec::resolve_dml_table(storage, &target, txid)?;
     storage.with_retained_table_definition(table_index, txid, |definition| {
         crate::sql::exec::describe_returning_items(
@@ -448,7 +461,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     let mut column = 0;
     for item in returning.items {
         match item {
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                 column += definition.map_or(0, |definition| definition.n_columns);
             }
             SelectItem::RecordStar(base) => {
@@ -1712,32 +1725,56 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
             }
         }
         // A scalar subquery is named by its single output column.
-        Expr::Subquery(select) => {
-            let mut select = *select;
-            while let Some(tree) = select.set_body {
-                let mut left = tree;
-                loop {
-                    match left {
-                        crate::sql::ast::SetTree::Select(leaf) => {
-                            select = leaf;
-                            break;
-                        }
-                        crate::sql::ast::SetTree::Op { left: branch, .. } => left = branch,
-                    }
+        Expr::Subquery(select) => first_output_name(select).unwrap_or("?column?"),
+        _ => "?column?",
+    }
+}
+
+/// The name of a query's first output column, as PostgreSQL names a scalar
+/// subquery after it. A star takes the first column of the relation it
+/// expands; a stored table's columns are not known here.
+fn first_output_name<'a>(select: &crate::sql::ast::Select<'a>) -> Option<&'a str> {
+    let mut select = select;
+    while let Some(tree) = select.set_body {
+        let mut left = tree;
+        loop {
+            match left {
+                crate::sql::ast::SetTree::Select(leaf) => {
+                    select = leaf;
+                    break;
                 }
-            }
-            match select.items.first() {
-                Some(SelectItem::Expr {
-                    alias: Some(alias), ..
-                }) => alias,
-                Some(SelectItem::Expr {
-                    expression,
-                    alias: None,
-                }) => derived_name(expression),
-                _ => "?column?",
+                crate::sql::ast::SetTree::Op { left: branch, .. } => left = branch,
             }
         }
-        _ => "?column?",
+    }
+    let relation_name = |table: &crate::sql::ast::TableRef<'a>| -> Option<&'a str> {
+        if let Some(name) = table.col_alias.and_then(|aliases| aliases.first()) {
+            return Some(name);
+        }
+        if let Some(subquery) = table.subquery {
+            return first_output_name(subquery);
+        }
+        table
+            .cte
+            .and_then(|materialized| materialized.column_names.first().copied())
+    };
+    match select.items.first()? {
+        SelectItem::Expr {
+            alias: Some(alias), ..
+        } => Some(alias),
+        SelectItem::Expr {
+            expression,
+            alias: None,
+        } => Some(derived_name(expression)),
+        SelectItem::Wildcard(_) => relation_name(&select.from?.base),
+        SelectItem::TableWildcard(qualifier) => {
+            let from = select.from?;
+            core::iter::once(&from.base)
+                .chain(from.joins.iter().map(|join| &join.table))
+                .find(|table| table.alias.unwrap_or(table.table) == *qualifier)
+                .and_then(relation_name)
+        }
+        SelectItem::RecordStar(_) => None,
     }
 }
 
@@ -5146,17 +5183,22 @@ fn infer_type_unpositioned(
             table,
             name,
         } => {
+            // PostgreSQL positions a three-part reference at its start.
+            let positioned =
+                |error| crate::sql::error_position::column_reference(error, Some(schema), name);
             if columns.is_empty_scope() {
-                return Err(crate::sql::eval::empty_scope_column_error(
+                return Err(positioned(crate::sql::eval::empty_scope_column_error(
                     Some(table),
                     name,
-                ));
+                )));
             }
             // Composed-qualifier resolution, as the evaluator binds it: only
             // an unaliased base table of that schema answers.
             let mut composed = crate::util::StackStr::<130>::new();
             let _ = core::fmt::Write::write_fmt(&mut composed, format_args!("{schema}.{table}"));
-            of(columns.resolve(Some(composed.as_str()), name)?)
+            of(columns
+                .resolve(Some(composed.as_str()), name)
+                .map_err(positioned)?)
         }
         Expr::BitLit(_) => (oid::BIT, -1),
         Expr::Bool(_) => of(ColType::Bool),
@@ -5489,6 +5531,12 @@ fn infer_type_unpositioned(
             .subquery_type(expression)?
             .unwrap_or((oid::UNKNOWN, -2)),
         Expr::RowSubquery { .. } => (oid::UNKNOWN, -2),
+        Expr::RecordFieldIndex {
+            base: Expr::RowSubquery { .. },
+            ..
+        } => columns
+            .subquery_type(expression)?
+            .unwrap_or((oid::UNKNOWN, -2)),
         Expr::RecordFieldIndex { base, index } => {
             record_field_index_metadata(base, usize::from(*index), columns)?
                 .map_or((oid::UNKNOWN, -2), |metadata| {
@@ -5862,6 +5910,13 @@ fn infer_type_unpositioned(
             "__json_serialize_bytea" => of(ColType::Bytea),
             name if name.starts_with("__json_exists_") => of(ColType::Bool),
             "__json_value" => of(ColType::Text),
+            // A path assignment yields its base's type; an INSERT base starts
+            // as a NULL whose type the third argument names.
+            "__assign_path" => match args {
+                [Expr::Null, _, Expr::Int(type_oid), ..] => (*type_oid as i32, -1),
+                [base, ..] => infer_type_res(base, columns)?,
+                [] => of(ColType::Text),
+            },
             "__jsonb_subscript_set" | "__array_subscript_set" => {
                 let base = args
                     .first()
@@ -6405,6 +6460,22 @@ fn infer_type_unpositioned(
                 }
             }
             "xmlagg" => of(ColType::Xml),
+            "json_agg"
+            | "json_agg_strict"
+            | "json_object_agg"
+            | "json_object_agg_strict"
+            | "json_object_agg_unique"
+            | "json_object_agg_unique_strict"
+            | "__json_arrayagg_absent_json"
+            | "__json_arrayagg_null_json" => of(ColType::Json),
+            "jsonb_agg"
+            | "jsonb_agg_strict"
+            | "jsonb_object_agg"
+            | "jsonb_object_agg_strict"
+            | "jsonb_object_agg_unique"
+            | "jsonb_object_agg_unique_strict"
+            | "__json_arrayagg_absent_jsonb"
+            | "__json_arrayagg_null_jsonb" => of(ColType::Jsonb),
             "array_agg" => {
                 // Element type from the argument; the result is elem[].
                 let elem = args

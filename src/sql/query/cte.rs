@@ -185,7 +185,7 @@ fn select_contains_with(select: &Select<'_>) -> bool {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                 expression_contains_with(expression)
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
         })
         || select.where_clause.is_some_and(expression_contains_with)
         || select.having.is_some_and(expression_contains_with)
@@ -433,7 +433,7 @@ pub(crate) fn expand_dml_ctes_schema<'a>(
 }
 
 /// Expand stored-view sources for metadata-only DML target/source lookup.
-pub(super) fn expand_from_schema<'a>(
+pub(crate) fn expand_from_schema<'a>(
     from: &'a FromClause<'a>,
     storage: &Storage,
     txid: u32,
@@ -512,7 +512,9 @@ fn analyze_unreferenced_ctes<'a>(
         }
         let probe = arena
             .alloc(Select {
-                items: &[SelectItem::Wildcard],
+                items: &[SelectItem::Wildcard(
+                    crate::sql::ast::SourcePosition::UNKNOWN,
+                )],
                 distinct: false,
                 distinct_on: &[],
                 from: Some(FromClause {
@@ -895,7 +897,7 @@ fn prepend_rule_source<'a>(
             if index == 0 {
                 Join {
                     table: existing.base,
-                    kind: JoinKind::Cross,
+                    kind: JoinKind::Comma,
                     on: None,
                     using: None,
                     natural: false,
@@ -975,7 +977,7 @@ fn append_rule_input_from<'a>(
             if index == 0 {
                 Join {
                     table: existing.base,
-                    kind: JoinKind::Cross,
+                    kind: JoinKind::Comma,
                     on: None,
                     using: None,
                     natural: false,
@@ -1175,7 +1177,7 @@ pub(crate) fn rule_transition_source<'a>(
         .map_err(|_| arena_full())?;
     let mut old = [&Expr::Null; crate::storage::MAX_COLUMNS];
     let mut new = [&Expr::Null; crate::storage::MAX_COLUMNS];
-    let mut items = [SelectItem::Wildcard; MAX_PROJ];
+    let mut items = [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     let mut item_count = 0usize;
     let mut add_output = |prefix: &str,
                           column: usize,
@@ -1509,7 +1511,7 @@ pub(crate) fn attach_rule_source<'a>(
                     tree = arena
                         .alloc(SetTree::Op {
                             operator: SetOp::Union,
-                            syntax: crate::sql::ast::SetOperationSyntax::Explicit,
+                            syntax: crate::sql::ast::SetOperationSyntax::Values,
                             all: true,
                             left: tree,
                             right: leaf,
@@ -2326,8 +2328,39 @@ pub fn rewrite_view_dml<'a>(
         recursive_state: None,
         execution: None,
     };
+    // `*` also covers the FROM items of `UPDATE ... FROM` and `DELETE ... USING`.
+    let (returning, from) = match statement {
+        Stmt::Update(update) => (update.returning, update.from),
+        Stmt::Delete(delete) => (delete.returning, delete.using),
+        _ => (Returning::NONE, None),
+    };
+    let from_star = match from {
+        Some(from)
+            if returning
+                .items
+                .iter()
+                .any(|item| matches!(item, SelectItem::Wildcard(_))) =>
+        {
+            let from = expand_from_schema(from, storage, txid, arena)?;
+            let scope = super::QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+            let star = arena
+                .alloc_slice_with(scope.star_columns(), |_| (&Expr::Null as &Expr, ""))
+                .map_err(|_| arena_full())?;
+            for (index, slot) in star.iter_mut().enumerate() {
+                let entry = scope.star_entry(index);
+                *slot = (
+                    scope.copied_output_expression(entry, arena)?,
+                    arena
+                        .alloc_str(scope.output_name(entry))
+                        .map_err(|_| arena_full())?,
+                );
+            }
+            &*star
+        }
+        _ => &[],
+    };
     let expanded_returning =
-        |items| expand_view_returning(items, visible_name, exposed_columns, arena);
+        |items| expand_view_returning(items, visible_name, exposed_columns, from_star, arena);
     let rewritten = match statement {
         Stmt::Insert(insert) => {
             for column in insert.columns {
@@ -2469,12 +2502,15 @@ fn expand_view_returning<'a>(
     items: &'a [SelectItem<'a>],
     view_name: &'a str,
     exposed_columns: &'a [&'a str],
+    from_star: &[(&'a Expr<'a>, &'a str)],
     arena: &'a Arena,
 ) -> Result<&'a [SelectItem<'a>], SqlError> {
     let extra = items.iter().fold(0usize, |count, item| {
         count
             + match item {
-                SelectItem::Wildcard => exposed_columns.len().saturating_sub(1),
+                SelectItem::Wildcard(_) => {
+                    (exposed_columns.len() + from_star.len()).saturating_sub(1)
+                }
                 SelectItem::TableWildcard(qualifier) if *qualifier == view_name => {
                     exposed_columns.len().saturating_sub(1)
                 }
@@ -2488,10 +2524,10 @@ fn expand_view_returning<'a>(
             "RETURNING list is too wide"
         ));
     }
-    let mut output = [SelectItem::Wildcard; MAX_PROJ];
+    let mut output = [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     let mut count = 0usize;
     for item in items {
-        if matches!(item, SelectItem::Wildcard)
+        if matches!(item, SelectItem::Wildcard(_))
             || matches!(item, SelectItem::TableWildcard(qualifier) if *qualifier == view_name)
         {
             for column in exposed_columns {
@@ -2506,6 +2542,15 @@ fn expand_view_returning<'a>(
                     alias: Some(column),
                 };
                 count += 1;
+            }
+            if matches!(item, SelectItem::Wildcard(_)) {
+                for &(expression, name) in from_star {
+                    output[count] = SelectItem::Expr {
+                        expression,
+                        alias: Some(name),
+                    };
+                    count += 1;
+                }
             }
         } else {
             // Binding a view column to storage must preserve its output name.
@@ -2608,20 +2653,23 @@ fn with_exec_context<'a, 's, 'e, R>(
             ));
         }
         if cte.dml.is_some() {
-            let materialized_cte = dml_mats
-                .iter()
-                .find(|(name, _)| *name == cte.name)
-                .map(|(_, materialized_cte)| *materialized_cte)
-                .ok_or_else(|| {
-                    sql_err!(
+            match dml_mats.iter().find(|(name, _)| *name == cte.name) {
+                Some(&(_, materialized_cte)) => materialized
+                    .push((cte.name, materialized_cte))
+                    .map_err(|_| arena_full())?,
+                // A query nothing reads runs after the main query.
+                None if root_references(cte.name) == 0
+                    && with
+                        .iter()
+                        .all(|other| cte_references(other, cte.name) == 0) => {}
+                None => {
+                    return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "data-modifying CTE \"{}\" was not materialized",
                         cte.name
-                    )
-                })?;
-            materialized
-                .push((cte.name, materialized_cte))
-                .map_err(|_| arena_full())?;
+                    ));
+                }
+            }
         } else if cte.recursive && self_references > 0 {
             let recursive =
                 materialize_recursive(cte, context, storage, txid, arena, params, sequences)?;
@@ -3045,6 +3093,28 @@ fn select_references(s: &Select, name: &str) -> usize {
     count
 }
 
+/// The query a `WITH` list belongs to.
+#[derive(Clone, Copy)]
+pub(crate) enum CteReader<'a> {
+    Select(&'a Select<'a>),
+    Statement(&'a Stmt<'a>),
+}
+
+/// PostgreSQL runs a data-modifying `WITH` query when its rows are first read,
+/// and one that nothing reads after the main query has finished.
+pub(crate) fn dml_cte_runs_after(with: &[Cte<'_>], index: usize, main: CteReader<'_>) -> bool {
+    let name = with[index].name;
+    let read_by_main = match main {
+        CteReader::Select(select) => select_references(select, name),
+        CteReader::Statement(statement) => statement_references(statement, name),
+    };
+    read_by_main == 0
+        && with
+            .iter()
+            .enumerate()
+            .all(|(other, cte)| other == index || cte_references(cte, name) == 0)
+}
+
 fn cte_references(cte: &Cte<'_>, name: &str) -> usize {
     cte.dml.map_or_else(
         || select_references(cte.query, name),
@@ -3057,7 +3127,7 @@ fn select_item_references(item: &SelectItem<'_>, name: &str) -> usize {
         SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
             expr_references(expression, name)
         }
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => 0,
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => 0,
     }
 }
 
@@ -3334,7 +3404,7 @@ fn select_mentions_column(select: &Select<'_>, qualifier: &str, name: &str) -> b
         SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
             expr_mentions_column(expression, qualifier, name)
         }
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
     }) || select
         .where_clause
         .is_some_and(|expression| expr_mentions_column(expression, qualifier, name))
@@ -3461,7 +3531,7 @@ fn frame_bound_mentions_column(
     }
 }
 
-fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
+pub(super) fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
     select_contains_function(select, &|name, arguments| {
         super::super::ast::is_volatile_function(name)
             || storage.has_volatile_function_routine_candidate(name, arguments, txid)
@@ -3513,7 +3583,7 @@ pub(super) fn select_contains_function(
         SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
             expression_has_it(expression)
         }
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
     }) || select.where_clause.is_some_and(expression_has_it)
         || select.having.is_some_and(expression_has_it)
         || select
@@ -4235,7 +4305,7 @@ fn append_recursive_state<'a>(
             "target lists can have at most 1664 entries"
         ));
     }
-    let mut items = [SelectItem::Wildcard; MAX_PROJ];
+    let mut items = [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     items[..select.items.len()].copy_from_slice(select.items);
     for state in 0..state_count {
         let ctype = decoration.state_types[state];
@@ -5295,7 +5365,7 @@ fn subst_select_items<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a [SelectItem<'a>], SqlError> {
-    let mut items = [SelectItem::Wildcard; MAX_PROJ];
+    let mut items = [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     let mut count = 0usize;
     for item in source {
         if let SelectItem::TableWildcard(qualifier) = item
@@ -5331,7 +5401,7 @@ fn subst_select_items<'a>(
             continue;
         }
         let rewritten = match item {
-            SelectItem::Wildcard => SelectItem::Wildcard,
+            SelectItem::Wildcard(at) => SelectItem::Wildcard(*at),
             SelectItem::TableWildcard(qualifier) => {
                 SelectItem::TableWildcard(match context.qualifier {
                     Some(rewrite) if *qualifier == rewrite.from => rewrite.to,
@@ -6573,7 +6643,14 @@ fn subst_expr<'a>(
         return Ok(e);
     }
     let rebuilt = match e {
-        Expr::Subquery(s) => Expr::Subquery(subst_select(s, context, arena)?),
+        Expr::Subquery(s) => {
+            let rebuilt = subst_select(s, context, arena)?;
+            // An unchanged subquery keeps its node, which locates its position.
+            if core::ptr::eq(rebuilt, *s) || rebuilt == *s {
+                return Ok(e);
+            }
+            Expr::Subquery(rebuilt)
+        }
         Expr::RowSubquery { select, arity } => Expr::RowSubquery {
             select: subst_select(select, context, arena)?,
             arity: *arity,

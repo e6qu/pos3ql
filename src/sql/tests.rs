@@ -8,6 +8,7 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 mod array_element_comparisons;
+mod assignment_and_name_diagnostics;
 mod builtin_aggregate_resolution;
 mod builtin_argument_binding;
 mod builtin_routine_changes;
@@ -26,12 +27,14 @@ mod geometric_casts;
 mod geometry_assignments;
 mod index_parent_ownership;
 mod information_schema_domains;
+mod joined_dml_returning;
 mod key_preparation;
 mod nested_planner_inputs;
 pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
 mod partition_ancestry;
+mod plpgsql_row_variables;
 mod polymorphic_resolution;
 mod prepared_object_capacity;
 mod prepared_parameter_types;
@@ -46306,16 +46309,21 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
         ["0"]
     );
 
+    // As in PostgreSQL, RETURNING without INTO is accepted when the function
+    // is created and fails when the statement has run.
     let rejected = run_with(
         &mut engine,
         &mut budget,
         "CREATE FUNCTION reject_trigger_returning() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN INSERT INTO trigger_body_audit VALUES (1, 1) RETURNING id; RETURN NEW; END'",
+           'BEGIN INSERT INTO trigger_body_audit VALUES (1, 1) RETURNING id; RETURN NEW; END';
+         CREATE TRIGGER reject_trigger_returning BEFORE INSERT ON trigger_body_target
+           FOR EACH ROW EXECUTE FUNCTION reject_trigger_returning();
+         INSERT INTO trigger_body_target (id, value) VALUES (3, 1);",
     );
+    let text = String::from_utf8_lossy(&rejected);
     assert!(
-        String::from_utf8_lossy(&rejected).contains("0A000"),
-        "{}",
-        String::from_utf8_lossy(&rejected)
+        text.contains("C42601") && text.contains("query has no destination for result data"),
+        "{text}"
     );
 }
 
@@ -51483,14 +51491,22 @@ fn merge_assignment_states_and_inheritance_selection_are_typed() {
         ["1|10"]
     );
 
-    for invalid in [
-        "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
-           ON target.id = source.id WHEN MATCHED THEN UPDATE SET value = 1, value = 2",
-        "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
-           ON target.id = source.id WHEN NOT MATCHED THEN INSERT (id, id) VALUES (1, 2)",
+    // PostgreSQL's rewriter and checkInsertTargets report these.
+    for (invalid, sqlstate) in [
+        (
+            "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
+               ON target.id = source.id WHEN MATCHED THEN UPDATE SET value = 1, value = 2",
+            "42601",
+        ),
+        (
+            "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
+               ON target.id = source.id WHEN NOT MATCHED THEN INSERT (id, id) VALUES (1, 2)",
+            "42701",
+        ),
     ] {
         assert!(
-            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, invalid)).contains("42601"),
+            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, invalid))
+                .contains(sqlstate),
             "{invalid}"
         );
     }

@@ -756,6 +756,114 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
     }
 }
 
+/// The FROM items' matched values for one `UPDATE ... FROM` or
+/// `DELETE ... USING` row, in the order of `join`'s FROM items.
+#[derive(Clone, Copy)]
+struct JoinedReturningValues<'r, 'a> {
+    table: crate::sql::ast::QualName<'a>,
+    alias: Option<&'a str>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    values: &'r [Datum<'r>],
+}
+
+/// `RETURNING` of `UPDATE ... FROM` or `DELETE ... USING`: `old` and `new`
+/// name the target's images; every other name resolves in the joined row of
+/// the target and the FROM items, where an unqualified name present in two
+/// of them is ambiguous.
+struct JoinedReturningLookup<'r, 'd, 'v> {
+    returning: &'r ReturningLookup<'d, 'v>,
+    joined: &'r dyn ColumnLookup<'v>,
+}
+
+impl<'v> JoinedReturningLookup<'_, '_, 'v> {
+    fn image(&self, qualifier: Option<&str>) -> bool {
+        qualifier.is_some_and(|qualifier| self.returning.image(qualifier).is_some())
+    }
+
+    fn row(&self, qualifier: Option<&str>) -> &dyn ColumnLookup<'v> {
+        if self.image(qualifier) {
+            self.returning
+        } else {
+            self.joined
+        }
+    }
+}
+
+impl<'v> ColumnLookup<'v> for JoinedReturningLookup<'_, '_, 'v> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        self.row(qualifier).lookup(qualifier, name)
+    }
+
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.row(qualifier).column_type_mod(qualifier, name)
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.row(qualifier).resolve_column_type(qualifier, name)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        false
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<Option<&'v [super::types::RecordField<'v>]>, SqlError> {
+        self.row(Some(table)).whole_row_fields(table, arena)
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::eval::CatalogAccess>,
+    ) -> Option<(StackStr<64>, StaticTypeMeta)> {
+        self.row(Some(table))
+            .whole_row_field_metadata(table, index, catalog)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        if self.image(Some(table)) {
+            return Ok(true);
+        }
+        self.joined.whole_row_present(table)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.row(qualifier).col_type(qualifier, name)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.row(qualifier).collation(qualifier, name)
+    }
+
+    fn record_field_collation(&self, base: &Expr<'v>, field: &str) -> crate::sql::ast::Collation {
+        self.joined.record_field_collation(base, field)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        self.row(qualifier).column_user_type(qualifier, name)
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.row(Some(table)).whole_row_is_scalar(table)
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.row(Some(table)).whole_row_type(table)
+    }
+}
+
 type Outcome = Result<Result<(), SqlError>, WireFull>;
 
 fn sql_ok() -> Outcome {
@@ -820,6 +928,7 @@ pub(super) use function_execution::execute as execute_plpgsql_function;
 pub(super) use function_execution::{FunctionOutput, SuspendedFunction};
 pub(super) use procedure_execution::SuspendedProcedure;
 pub(super) use sql_function_execution::execute_sql_function;
+pub(crate) use sql_function_execution::sql_function_inlining;
 mod trigger_firing;
 mod write_completion;
 pub(super) use write_completion::SuspendedWriteCompletion;
@@ -833,15 +942,14 @@ mod projected;
 use numeric_loops::NumericLoopFrames;
 pub(crate) use projected::{
     compare_projected_prefix, decode_projected_row_into, encode_projected_by_into,
-    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows, projected_row_len,
-    projected_row_len_by, projected_row_width, unpack_projected_rows,
+    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows,
+    pack_projected_rows_into, projected_row_len, projected_row_len_by, projected_row_width,
+    projected_rows_len, unpack_projected_rows,
 };
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,
     encode_projected_pub, projected_prefix_len, projected_value_len, sort_dedup_projected,
 };
-#[cfg(test)]
-pub(crate) use projected::{pack_projected_rows_into, projected_rows_len};
 
 mod ddl;
 pub(crate) use ddl::check_referenced_columns;
@@ -4013,7 +4121,7 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
         relation,
         event,
         &routine,
-        program.variable_conflict(super::guc::active_plpgsql_variable_conflict()?),
+        program.settings(super::guc::active_plpgsql_settings()?),
         context.arena,
     )?
     .with_input_sites(program.input_sites);
@@ -17419,9 +17527,27 @@ struct TriggerAssignment<'a> {
     exception_variables: bool,
 }
 
+/// A variable as a statement names it: `x`, or `label.x` for the `x` that
+/// the block, loop or routine labelled `label` declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlpgsqlVariableName {
+    label: Option<SqlName>,
+    name: SqlName,
+}
+
+impl PlpgsqlVariableName {
+    const fn plain(name: SqlName) -> Self {
+        Self { label: None, name }
+    }
+
+    fn names(self, local: &TriggerLocalDecl) -> bool {
+        local.name == self.name && self.label.is_none_or(|label| local.label == Some(label))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TriggerLocalAssignment<'a> {
-    name: SqlName,
+    name: PlpgsqlVariableName,
     expression: &'a Expr<'a>,
     // Dependencies include the original target's subscripts after lowering.
     exception_variables: bool,
@@ -17537,6 +17663,10 @@ impl PlpgsqlScope {
 #[derive(Clone, Copy)]
 struct TriggerLocalDecl {
     scope: PlpgsqlScope,
+    /// The label of the block, loop or routine that declares the variable,
+    /// which qualifies it as `label.name`. A routine labels its parameters
+    /// with its own name.
+    label: Option<SqlName>,
     name: SqlName,
     ctype: ColType,
     user_type: Option<crate::storage::UserTypeName>,
@@ -17566,6 +17696,9 @@ struct TriggerInvocation<'a> {
     /// a column: its `#variable_conflict` option, else the setting it was
     /// compiled under.
     variable_conflict: super::guc::VariableConflict,
+    /// `STRICT` failures list the statement's variables (`#print_strict_params`
+    /// or `plpgsql.print_strict_params`).
+    print_strict_params: bool,
     /// PostgreSQL runs each query of a volatile function, a procedure, a
     /// trigger or a DO block under a new snapshot that sees the transaction's
     /// earlier commands; a stable or immutable function reads its caller's.
@@ -17668,7 +17801,7 @@ impl<'a> TriggerInvocation<'a> {
         relation: TriggerRelationIdentity,
         event: u8,
         routine: &crate::storage::RoutineDef,
-        variable_conflict: super::guc::VariableConflict,
+        settings: super::guc::PlpgsqlSettings,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         let mut arguments = [Datum::Null; crate::storage::MAX_TRIGGER_ARGUMENTS];
@@ -17733,7 +17866,8 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::Owner::Backend,
             input_collation: crate::sql::ast::Collation::None,
             input_sites: &[],
-            variable_conflict,
+            variable_conflict: settings.variable_conflict,
+            print_strict_params: settings.print_strict_params,
             fresh_snapshots: true,
             materialized_relations: None,
             nargs: i32::try_from(trigger.arguments.values().len())
@@ -17755,7 +17889,7 @@ impl<'a> TriggerInvocation<'a> {
         })
     }
 
-    fn anonymous(variable_conflict: super::guc::VariableConflict) -> Result<Self, SqlError> {
+    fn anonymous(settings: super::guc::PlpgsqlSettings) -> Result<Self, SqlError> {
         Ok(Self {
             program_kind: PlpgsqlProgramKind::Anonymous,
             name: "",
@@ -17769,7 +17903,8 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::owner()?,
             input_collation: crate::sql::ast::Collation::None,
             input_sites: &[],
-            variable_conflict,
+            variable_conflict: settings.variable_conflict,
+            print_strict_params: settings.print_strict_params,
             fresh_snapshots: true,
             materialized_relations: None,
             nargs: 0,
@@ -17786,7 +17921,7 @@ impl<'a> TriggerInvocation<'a> {
     fn procedure(
         routine: &crate::storage::RoutineDef,
         input_collation: crate::sql::ast::Collation,
-        variable_conflict: super::guc::VariableConflict,
+        settings: super::guc::PlpgsqlSettings,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         Ok(Self {
@@ -17809,7 +17944,8 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::owner()?,
             input_collation,
             input_sites: &[],
-            variable_conflict,
+            variable_conflict: settings.variable_conflict,
+            print_strict_params: settings.print_strict_params,
             fresh_snapshots: true,
             materialized_relations: None,
             nargs: 0,
@@ -17827,7 +17963,7 @@ impl<'a> TriggerInvocation<'a> {
         routine: &crate::storage::RoutineDef,
         program_kind: PlpgsqlProgramKind,
         input_collation: crate::sql::ast::Collation,
-        variable_conflict: super::guc::VariableConflict,
+        settings: super::guc::PlpgsqlSettings,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         Ok(Self {
@@ -17850,7 +17986,8 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::owner()?,
             input_collation,
             input_sites: &[],
-            variable_conflict,
+            variable_conflict: settings.variable_conflict,
+            print_strict_params: settings.print_strict_params,
             fresh_snapshots: routine.attributes.volatility
                 == crate::storage::RoutineVolatility::Volatile,
             materialized_relations: None,
@@ -17870,7 +18007,7 @@ impl<'a> TriggerInvocation<'a> {
         routine: &crate::storage::RoutineDef,
         event: &'a str,
         tag: &'a str,
-        variable_conflict: super::guc::VariableConflict,
+        settings: super::guc::PlpgsqlSettings,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         Ok(Self {
@@ -17893,7 +18030,8 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::Owner::Backend,
             input_collation: crate::sql::ast::Collation::None,
             input_sites: &[],
-            variable_conflict,
+            variable_conflict: settings.variable_conflict,
+            print_strict_params: settings.print_strict_params,
             fresh_snapshots: true,
             materialized_relations: None,
             nargs: 0,
@@ -17965,7 +18103,7 @@ impl<'a> TriggerInvocation<'a> {
 #[derive(Clone, Copy)]
 struct TriggerSelectInto<'a> {
     query: &'a Select<'a>,
-    targets: &'a [SqlName],
+    targets: &'a [PlpgsqlVariableName],
     strict: bool,
 }
 
@@ -17981,7 +18119,7 @@ struct PlpgsqlDynamicQuery<'a> {
 #[derive(Clone, Copy)]
 struct PlpgsqlDynamicSelectInto<'a> {
     query: PlpgsqlDynamicQuery<'a>,
-    targets: &'a [SqlName],
+    targets: &'a [PlpgsqlVariableName],
     strict: bool,
 }
 
@@ -18005,7 +18143,7 @@ struct PlpgsqlCursorMotion<'a> {
     variable: SqlName,
     motion: super::cursor::FetchMotion,
     move_only: bool,
-    targets: &'a [SqlName],
+    targets: &'a [PlpgsqlVariableName],
 }
 
 #[derive(Clone, Copy)]
@@ -18107,7 +18245,7 @@ enum TriggerDiagnostic {
 
 #[derive(Clone, Copy)]
 struct TriggerDiagnosticAssignment {
-    target: SqlName,
+    target: PlpgsqlVariableName,
     item: TriggerDiagnostic,
 }
 
@@ -18118,7 +18256,7 @@ struct TriggerGetDiagnostics<'a> {
 
 #[derive(Clone, Copy)]
 struct TriggerStackedDiagnosticAssignment {
-    target: SqlName,
+    target: PlpgsqlVariableName,
     item: TriggerStackedDiagnostic,
 }
 
@@ -18178,7 +18316,11 @@ enum TriggerStatement<'a> {
     Dml {
         source: &'a str,
         statement: TriggerDml<'a>,
+        into: Option<PlpgsqlInto<'a>>,
     },
+    /// A nested `BEGIN ... END` block without exception handlers, or a
+    /// labelled block with or without them.
+    Block(TriggerNestedBlock<'a>),
     If(TriggerIf<'a>),
     Case(TriggerCase<'a>),
     For(TriggerFor<'a>),
@@ -18237,6 +18379,16 @@ struct TriggerBranch<'a> {
 }
 
 #[derive(Clone, Copy)]
+struct TriggerNestedBlock<'a> {
+    /// A labelled block is a target of `EXIT label`, and labels its
+    /// declarations.
+    label: Option<SqlName>,
+    /// Variables the block declares, initialized in order on each entry.
+    declarations: &'a [ParsedTriggerLocalDecl<'a>],
+    block: TriggerBlock<'a>,
+}
+
+#[derive(Clone, Copy)]
 struct TriggerIf<'a> {
     branches: &'a [TriggerBranch<'a>],
 }
@@ -18279,7 +18431,9 @@ enum TriggerForSource<'a> {
 
 #[derive(Clone, Copy)]
 struct TriggerFor<'a> {
-    target: SqlName,
+    /// A numeric loop declares its counter under the loop's label.
+    label: Option<SqlName>,
+    target: PlpgsqlVariableName,
     source: TriggerForSource<'a>,
     block: TriggerBlock<'a>,
 }
@@ -18341,25 +18495,43 @@ struct TriggerProgram<'a> {
     body: TriggerBlock<'a>,
     input_sites: &'a [super::plpgsql_inputs::Site<'a>],
     variable_conflict: Option<super::guc::VariableConflict>,
+    print_strict_params: Option<bool>,
 }
 
 impl TriggerProgram<'_> {
-    /// The body's `#variable_conflict` option, else `compiled`, the
-    /// `plpgsql.variable_conflict` value it was compiled under.
-    fn variable_conflict(
-        &self,
-        compiled: super::guc::VariableConflict,
-    ) -> super::guc::VariableConflict {
-        self.variable_conflict.unwrap_or(compiled)
+    /// The body's `#variable_conflict` and `#print_strict_params` options,
+    /// else `compiled`, the settings it was compiled under.
+    fn settings(&self, compiled: super::guc::PlpgsqlSettings) -> super::guc::PlpgsqlSettings {
+        super::guc::PlpgsqlSettings {
+            variable_conflict: self.variable_conflict.unwrap_or(compiled.variable_conflict),
+            print_strict_params: self
+                .print_strict_params
+                .unwrap_or(compiled.print_strict_params),
+        }
     }
 }
 
 #[derive(Clone, Copy)]
 struct ParsedTriggerProgram<'a> {
+    /// The outermost block's label, which also labels its declarations.
+    label: Option<SqlName>,
     locals: &'a [ParsedTriggerLocalDecl<'a>],
     body: TriggerBlock<'a>,
     input_sites: &'a [super::plpgsql_inputs::Site<'a>],
     variable_conflict: Option<super::guc::VariableConflict>,
+    print_strict_params: Option<bool>,
+}
+
+impl ParsedTriggerProgram<'_> {
+    /// [`TriggerProgram::settings`] for a program restored from its source.
+    fn settings(&self, compiled: super::guc::PlpgsqlSettings) -> super::guc::PlpgsqlSettings {
+        super::guc::PlpgsqlSettings {
+            variable_conflict: self.variable_conflict.unwrap_or(compiled.variable_conflict),
+            print_strict_params: self
+                .print_strict_params
+                .unwrap_or(compiled.print_strict_params),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -18385,8 +18557,6 @@ struct TriggerExceptionBinding<'a> {
 
 struct OutputBinding {
     local: usize,
-    value: local_values::SavedValues,
-    shadow_depth: u8,
 }
 
 /// Per-function state, separate from locals and transaction state.
@@ -18421,11 +18591,7 @@ impl<'a> TriggerExecutionStatus<'a> {
             .map_err(control_flow::execution_full)?;
         for _ in 0..output_count {
             outputs
-                .push_reserved(OutputBinding {
-                    local: 0,
-                    value: local_values::SavedValues::new(pool)?,
-                    shadow_depth: 0,
-                })
+                .push_reserved(OutputBinding { local: 0 })
                 .map_err(control_flow::execution_full)?;
         }
         Ok(Self {
@@ -18458,31 +18624,6 @@ impl<'a> TriggerExecutionStatus<'a> {
         );
         for (output, local) in self.outputs.iter_mut().zip(locals.iter().copied()) {
             output.local = local;
-        }
-    }
-
-    fn shadow_output_local(&mut self, local: usize, value: Datum<'_>) -> Result<(), SqlError> {
-        for output in self.outputs.iter_mut() {
-            if output.local == local {
-                if output.shadow_depth == 0 {
-                    output.value.replace(&[value])?;
-                }
-                output.shadow_depth = output.shadow_depth.checked_add(1).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "PL/pgSQL loop nesting exceeds the output-variable limit"
-                    )
-                })?;
-            }
-        }
-        Ok(())
-    }
-
-    fn unshadow_output_local(&mut self, local: usize) {
-        for output in self.outputs.iter_mut() {
-            if output.local == local {
-                output.shadow_depth -= 1;
-            }
         }
     }
 
@@ -18819,6 +18960,12 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
             self.outer.lookup(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.lookup(None, name)
+        } else if qualifier.is_some()
+            && self.row.col_type(qualifier, name).is_none()
+            && self.outer.procedural_variable(qualifier, name).is_some()
+        {
+            // A parameter qualified by its function's name (`f.a`).
+            self.outer.lookup(qualifier, name)
         } else if self.row.col_type(qualifier, name).is_none()
             || super::eval::column_precedes_variable(Some(self.outer), qualifier, name)?
         {
@@ -18909,6 +19056,12 @@ where
             self.outer.lookup(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.lookup(None, name)
+        } else if qualifier.is_some()
+            && self.row.col_type(qualifier, name).is_none()
+            && self.outer.procedural_variable(qualifier, name).is_some()
+        {
+            // A parameter qualified by its function's name (`f.a`).
+            self.outer.lookup(qualifier, name)
         } else if self.row.col_type(qualifier, name).is_none()
             || super::eval::column_precedes_variable(Some(self.outer), qualifier, name)?
         {
@@ -19115,7 +19268,8 @@ fn execute_plpgsql_call<'a>(
                 qualifier: None,
                 name,
             } = argument
-                && let Ok(local) = trigger_local_index(locals, SqlName::parse(name)?)
+                && let Ok(local) =
+                    trigger_local_index(locals, PlpgsqlVariableName::plain(SqlName::parse(name)?))
             {
                 writable[index] = true;
                 targets[index] = Some(locals[local].name);
@@ -19343,7 +19497,7 @@ fn execute_atomic_procedure_call<'a>(
             &mut procedure_context,
             routine,
             completed.input_collation,
-            super::guc::active_plpgsql_variable_conflict()?,
+            super::guc::active_plpgsql_settings()?,
             &mut output_values,
         )?
     };
@@ -19866,12 +20020,16 @@ fn unsupported_trigger_body() -> SqlError {
     )
 }
 
+/// The compile options written before a PL/pgSQL body's block.
+#[derive(Clone, Copy, Default)]
+struct PlpgsqlCompileOptions {
+    variable_conflict: Option<super::guc::VariableConflict>,
+    print_strict_params: Option<bool>,
+}
+
 /// The compile options that may precede a PL/pgSQL body's block, and the
-/// rest of `body`. Only `#variable_conflict` is supported; a later option
-/// overrides an earlier one.
-fn plpgsql_compile_options(
-    body: &str,
-) -> Result<(Option<super::guc::VariableConflict>, &str), SqlError> {
+/// rest of `body`. A later option overrides an earlier one.
+fn plpgsql_compile_options(body: &str) -> Result<(PlpgsqlCompileOptions, &str), SqlError> {
     fn skip_space(text: &str) -> &str {
         let mut rest = text;
         loop {
@@ -19941,24 +20099,43 @@ fn plpgsql_compile_options(
         super::error_position::at_subject(error, &text[..0])
     }
     let mut rest = skip_space(body);
-    let mut conflict = None;
+    let mut options = PlpgsqlCompileOptions::default();
     while let Some(option) = rest.strip_prefix('#') {
         let option_at = skip_space(option);
         let (name, after) = word(option_at);
-        if name.eq_ignore_ascii_case("option") || name.eq_ignore_ascii_case("print_strict_params") {
-            return Err(unsupported_trigger_body());
-        }
-        if !name.eq_ignore_ascii_case("variable_conflict") {
-            return Err(syntax_error_at(option_at));
-        }
         let value_at = skip_space(after);
         let (value, after) = word(value_at);
-        conflict = Some(
-            super::guc::VariableConflict::parse(value).ok_or_else(|| syntax_error_at(value_at))?,
-        );
+        if name.eq_ignore_ascii_case("option") {
+            // `#option dump` prints the compiled body to the server log.
+            if !value.eq_ignore_ascii_case("dump") {
+                return Err(syntax_error_at(value_at));
+            }
+        } else if name.eq_ignore_ascii_case("print_strict_params") {
+            if value.is_empty() {
+                return Err(syntax_error_at(value_at));
+            }
+            options.print_strict_params = Some(if value.eq_ignore_ascii_case("on") {
+                true
+            } else if value.eq_ignore_ascii_case("off") {
+                false
+            } else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "unrecognized print_strict_params option {}",
+                    value
+                ));
+            });
+        } else if name.eq_ignore_ascii_case("variable_conflict") {
+            options.variable_conflict = Some(
+                super::guc::VariableConflict::parse(value)
+                    .ok_or_else(|| syntax_error_at(value_at))?,
+            );
+        } else {
+            return Err(syntax_error_at(option_at));
+        }
         rest = skip_space(after);
     }
-    Ok((conflict, rest))
+    Ok((options, rest))
 }
 
 fn incomplete_trigger_body() -> SqlError {
@@ -20005,7 +20182,7 @@ fn trigger_control_header<'a>(
             content[when_at..].trim_start(),
         )));
     }
-    for keyword in ["loop", "else", "begin", "exception"] {
+    for keyword in ["loop", "else", "begin", "declare", "exception"] {
         if let Some(rest) = strip_trigger_keyword(content, keyword) {
             let rest = rest.trim();
             return Ok((!rest.is_empty())
@@ -20214,11 +20391,11 @@ fn parse_trigger_local_assignment<'a>(
     }
     let expression = parse_plpgsql_expression(expression, arena)?;
     let (qualifier, name, expression) = parse_plpgsql_assignment_target(name, expression, arena)?;
-    if qualifier.is_some() {
-        return Ok(None);
-    }
+    let label = qualifier
+        .map(|qualifier| parse_plpgsql_identifier(qualifier, arena).map(|label| label.name))
+        .transpose()?;
     Ok(Some(TriggerLocalAssignment {
-        name,
+        name: PlpgsqlVariableName { label, name },
         expression,
         exception_variables: super::plpgsql_inputs::references_exception_variables(
             statement, arena,
@@ -20360,6 +20537,25 @@ fn parse_plpgsql_identifier<'source>(
             })
         })
         .map_err(|_| super::query::arena_full_pub())?
+}
+
+/// Parses a variable target, `name` or `label.name`.
+fn parse_plpgsql_variable_name(
+    source: &str,
+    arena: &Arena,
+) -> Result<PlpgsqlVariableName, SqlError> {
+    let source = source.trim();
+    let first_end = parse_plpgsql_identifier_prefix(source, arena)?.1;
+    let rest = source[first_end..].trim_start();
+    let Some(name) = rest.strip_prefix('.') else {
+        return Ok(PlpgsqlVariableName::plain(
+            parse_plpgsql_identifier(source, arena)?.name,
+        ));
+    };
+    Ok(PlpgsqlVariableName {
+        label: Some(parse_plpgsql_identifier(&source[..first_end], arena)?.name),
+        name: parse_plpgsql_identifier(name.trim_start(), arena)?.name,
+    })
 }
 
 fn parse_trigger_local<'a>(
@@ -20535,58 +20731,81 @@ fn parse_trigger_select_into<'a>(
     let Some(into_at) = trigger_top_level_keyword(statement, "into", arena)? else {
         return Ok(None);
     };
+    let (source, into) = take_plpgsql_into(statement, into_at, arena)?;
+    let query = parse_plpgsql_query(source, statement, arena)?;
+    Ok(Some(TriggerSelectInto {
+        query,
+        targets: into.targets,
+        strict: into.strict,
+    }))
+}
+
+/// The `INTO [STRICT] target, ...` clause of a static PL/pgSQL statement.
+#[derive(Clone, Copy)]
+struct PlpgsqlInto<'a> {
+    targets: &'a [PlpgsqlVariableName],
+    strict: bool,
+}
+
+/// Splits the INTO clause starting at `into_at` out of `statement`. PostgreSQL
+/// blanks the clause, so positions in the query it runs and reports match
+/// the statement as written.
+fn take_plpgsql_into<'a>(
+    statement: &'a str,
+    into_at: usize,
+    arena: &'a Arena,
+) -> Result<(&'a str, PlpgsqlInto<'a>), SqlError> {
     let after_into = &statement[into_at + 4..];
-    let mut targets = [SqlName::EMPTY; MAX_COLUMNS];
+    let mut targets = [PlpgsqlVariableName::plain(SqlName::EMPTY); MAX_COLUMNS];
     let (count, strict, end) = arena
         .with_remaining_region(|scratch| {
             use crate::sql::lexer::{Lexer, Tok};
             let mut lexer = Lexer::new(after_into, scratch);
-            let mut token = lexer.next_token().map_err(|error| {
-                super::parse_error_to_sql(&super::parser::ParseError::lexical(error, after_into))
-            })?;
+            fn next<'l>(lexer: &mut Lexer<'l>, source: &str) -> Result<Tok<'l>, SqlError> {
+                lexer.next_token().map_err(|error| {
+                    super::parse_error_to_sql(&super::parser::ParseError::lexical(error, source))
+                })
+            }
+            let mut token = next(&mut lexer, after_into)?;
             let strict = matches!(token, Tok::Ident(word) if word.eq_ignore_ascii_case("strict"));
             if strict {
-                token = lexer.next_token().map_err(|error| {
-                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
-                        error, after_into,
-                    ))
-                })?;
+                token = next(&mut lexer, after_into)?;
             }
             let mut count = 0usize;
             loop {
                 if count == targets.len() {
                     return Err(unsupported_trigger_body());
                 }
-                targets[count] = match token {
-                    Tok::Ident(name) | Tok::QuotedIdent(name) => SqlName::parse(name)?,
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "expected a PL/pgSQL identifier"
-                        ));
+                let identifier = |token: Tok<'_>| match token {
+                    Tok::Ident(name) | Tok::QuotedIdent(name) => SqlName::parse(name),
+                    _ => Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "expected a PL/pgSQL identifier"
+                    )),
+                };
+                let first = identifier(token)?;
+                let mut end = lexer.token_end();
+                token = next(&mut lexer, after_into)?;
+                targets[count] = if matches!(token, Tok::Op(".")) {
+                    let name = identifier(next(&mut lexer, after_into)?)?;
+                    end = lexer.token_end();
+                    token = next(&mut lexer, after_into)?;
+                    PlpgsqlVariableName {
+                        label: Some(first),
+                        name,
                     }
+                } else {
+                    PlpgsqlVariableName::plain(first)
                 };
                 count += 1;
-                let end = lexer.token_end();
-                token = lexer.next_token().map_err(|error| {
-                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
-                        error, after_into,
-                    ))
-                })?;
                 if !matches!(token, Tok::Op(",")) {
                     return Ok((count, strict, end));
                 }
-                token = lexer.next_token().map_err(|error| {
-                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
-                        error, after_into,
-                    ))
-                })?;
+                token = next(&mut lexer, after_into)?;
             }
         })
         .map_err(|_| super::query::arena_full_pub())??;
     let tail = &after_into[end..];
-    // PostgreSQL blanks the INTO clause, so positions in the query it runs
-    // and reports match the statement as written.
     let mut source = StackStr::<ROUTINE_SQL_MAX>::new();
     use core::fmt::Write as _;
     let _ = source.write_str(&statement[..into_at]);
@@ -20599,27 +20818,28 @@ fn parse_trigger_select_into<'a>(
     if source.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "trigger SELECT INTO exceeds the routine SQL limit"
+            "PL/pgSQL INTO statement exceeds the routine SQL limit"
         ));
     }
     let source = arena.alloc_str(source.as_str()).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "trigger SELECT INTO exceeds the statement arena"
+            "PL/pgSQL INTO statement exceeds the statement arena"
         )
     })?;
-    let query = parse_plpgsql_query(source, statement, arena)?;
     let targets = arena.alloc_slice_copy(&targets[..count]).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "trigger SELECT INTO targets exceed the statement arena"
+            "PL/pgSQL INTO targets exceed the statement arena"
         )
     })?;
-    Ok(Some(TriggerSelectInto {
-        query,
-        targets: &*targets,
-        strict,
-    }))
+    Ok((
+        source,
+        PlpgsqlInto {
+            targets: &*targets,
+            strict,
+        },
+    ))
 }
 
 fn split_trigger_arguments<'a>(
@@ -20693,18 +20913,18 @@ fn parse_plpgsql_dynamic_query<'a>(
 fn parse_plpgsql_into_targets<'a>(
     source: &'a str,
     arena: &'a Arena,
-) -> Result<(&'a [SqlName], bool), SqlError> {
+) -> Result<(&'a [PlpgsqlVariableName], bool), SqlError> {
     let (strict, source) = match strip_trigger_keyword(source.trim(), "strict") {
         Some(source) => (true, source.trim()),
         None => (false, source.trim()),
     };
-    let mut targets = [SqlName::EMPTY; MAX_COLUMNS];
+    let mut targets = [PlpgsqlVariableName::plain(SqlName::EMPTY); MAX_COLUMNS];
     let mut count = 0usize;
     for target in source.split(',') {
         if count == targets.len() || target.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
-        targets[count] = parse_plpgsql_identifier(target.trim(), arena)?.name;
+        targets[count] = parse_plpgsql_variable_name(target, arena)?;
         count += 1;
     }
     if count == 0 {
@@ -21066,7 +21286,7 @@ fn parse_trigger_get_diagnostics<'a>(
             return Err(unsupported_trigger_body());
         };
         let (target, item) = (&part[..offset], &part[offset + width..]);
-        let target = parse_plpgsql_identifier(target.trim(), arena)?.name;
+        let target = parse_plpgsql_variable_name(target, arena)?;
         if item.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
@@ -21078,7 +21298,7 @@ fn parse_trigger_get_diagnostics<'a>(
             return Err(sql_err!(
                 sqlstate::DUPLICATE_COLUMN,
                 "trigger diagnostic target \"{}\" appears more than once",
-                target.as_str()
+                target.name.as_str()
             ));
         }
         assignments[index] = Some(TriggerDiagnosticAssignment {
@@ -21117,7 +21337,7 @@ fn parse_trigger_get_stacked_diagnostics<'a>(
             return Err(unsupported_trigger_body());
         };
         let (target, item) = (&part[..offset], &part[offset + width..]);
-        let target = parse_plpgsql_identifier(target.trim(), arena)?.name;
+        let target = parse_plpgsql_variable_name(target, arena)?;
         if item.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
@@ -21129,7 +21349,7 @@ fn parse_trigger_get_stacked_diagnostics<'a>(
             return Err(sql_err!(
                 sqlstate::DUPLICATE_COLUMN,
                 "trigger diagnostic target \"{}\" appears more than once",
-                target.as_str()
+                target.name.as_str()
             ));
         }
         assignments[index] = Some(TriggerStackedDiagnosticAssignment {
@@ -21197,15 +21417,9 @@ fn parse_trigger_dml<'a>(source: &'a str, arena: &'a Arena) -> Result<TriggerDml
         return Err(unsupported_trigger_body());
     }
     match statement {
-        Some(Stmt::Insert(statement)) if statement.returning.is_empty() => {
-            Ok(TriggerDml::Insert(statement))
-        }
-        Some(Stmt::Update(statement)) if statement.returning.is_empty() => {
-            Ok(TriggerDml::Update(statement))
-        }
-        Some(Stmt::Delete(statement)) if statement.returning.is_empty() => {
-            Ok(TriggerDml::Delete(statement))
-        }
+        Some(Stmt::Insert(statement)) => Ok(TriggerDml::Insert(statement)),
+        Some(Stmt::Update(statement)) => Ok(TriggerDml::Update(statement)),
+        Some(Stmt::Delete(statement)) => Ok(TriggerDml::Delete(statement)),
         _ => Err(unsupported_trigger_body()),
     }
 }
@@ -21294,7 +21508,7 @@ fn trigger_top_level_range(text: &str, arena: &Arena) -> Result<Option<usize>, S
 fn parse_trigger_for_header<'a>(
     segment: &'a str,
     arena: &'a Arena,
-) -> Result<Option<(SqlName, TriggerForSource<'a>)>, SqlError> {
+) -> Result<Option<(PlpgsqlVariableName, TriggerForSource<'a>)>, SqlError> {
     let Some(body) = strip_trigger_keyword(segment, "for") else {
         return Ok(None);
     };
@@ -21304,7 +21518,8 @@ fn parse_trigger_for_header<'a>(
     let Some(in_at) = trigger_top_level_keyword(body, "in", arena)? else {
         return Err(unsupported_trigger_body());
     };
-    let target = parse_plpgsql_identifier(body[..in_at].trim(), arena)?;
+    let target_source = body[..in_at].trim();
+    let variable = parse_plpgsql_variable_name(target_source, arena)?;
     let mut source = body[in_at + 2..].trim();
     if source.is_empty() {
         return Err(unsupported_trigger_body());
@@ -21316,11 +21531,11 @@ fn parse_trigger_for_header<'a>(
             using_at.map(|at| &command[at + "using".len()..]),
             arena,
         )?;
-        return Ok(Some((target.name, TriggerForSource::DynamicQuery(query))));
+        return Ok(Some((variable, TriggerForSource::DynamicQuery(query))));
     }
     if strip_trigger_keyword(source, "select").is_some() {
         return Ok(Some((
-            target.name,
+            variable,
             TriggerForSource::Query(parse_plpgsql_query(source, source, arena)?),
         )));
     }
@@ -21357,8 +21572,10 @@ fn parse_trigger_for_header<'a>(
             .alloc(Expr::Int(1))
             .map_err(|_| super::query::arena_full_pub())?,
     };
+    // An integer loop declares its counter, which a label cannot qualify.
+    let target = parse_plpgsql_identifier(target_source, arena)?;
     Ok(Some((
-        target.name,
+        variable,
         TriggerForSource::Numeric {
             counter_keyword: (!target.quoted && target.name.as_str() == "sqlstate")
                 .then_some(target.spelling),
@@ -21373,7 +21590,7 @@ fn parse_trigger_for_header<'a>(
 fn parse_trigger_foreach_header<'a>(
     segment: &'a str,
     arena: &'a Arena,
-) -> Result<Option<(SqlName, TriggerForSource<'a>)>, SqlError> {
+) -> Result<Option<(PlpgsqlVariableName, TriggerForSource<'a>)>, SqlError> {
     let Some(body) = strip_trigger_keyword(segment, "foreach") else {
         return Ok(None);
     };
@@ -21386,14 +21603,14 @@ fn parse_trigger_foreach_header<'a>(
     let target_source = body[..in_at].trim();
     let (target, slice) = match trigger_top_level_keyword(target_source, "slice", arena)? {
         Some(at) => {
-            let target = parse_plpgsql_identifier(target_source[..at].trim(), arena)?.name;
+            let target = parse_plpgsql_variable_name(&target_source[..at], arena)?;
             let slice = target_source[at + 5..].trim();
             let slice = slice
                 .parse::<u8>()
                 .map_err(|_| unsupported_trigger_body())?;
             (target, NonZeroU8::new(slice))
         }
-        None => (parse_plpgsql_identifier(target_source, arena)?.name, None),
+        None => (parse_plpgsql_variable_name(target_source, arena)?, None),
     };
     let array = strip_trigger_keyword(body[in_at + 2..].trim(), "array")
         .ok_or_else(unsupported_trigger_body)?
@@ -21441,10 +21658,17 @@ fn trigger_loop_label<'s>(
     }
 }
 
+/// A block or loop that EXIT and CONTINUE can name, innermost last.
+#[derive(Clone, Copy)]
+struct PlpgsqlExitTarget {
+    label: Option<SqlName>,
+    is_loop: bool,
+}
+
 fn parse_trigger_loop_control<'a>(
     segment: &'a str,
     arena: &'a Arena,
-    loop_labels: &[Option<SqlName>],
+    targets: &[PlpgsqlExitTarget],
 ) -> Result<Option<TriggerLoopControl<'a>>, SqlError> {
     let (is_exit, tail) = if let Some(tail) = strip_trigger_keyword(segment, "exit") {
         (true, tail.trim())
@@ -21453,58 +21677,72 @@ fn parse_trigger_loop_control<'a>(
     } else {
         return Ok(None);
     };
-    let (label, condition) = if tail.is_empty() {
-        (None, None)
-    } else if let Some(condition) = strip_trigger_keyword(tail, "when") {
-        let condition = condition.trim();
-        if condition.is_empty() {
-            return Err(unsupported_trigger_body());
-        }
-        (None, Some(parse_plpgsql_expression(condition, arena)?))
-    } else {
-        let Some(space) = tail.find(char::is_whitespace) else {
-            return Ok(Some(loop_control_for_label(
-                is_exit,
-                tail,
-                None,
-                loop_labels,
-                arena,
-            )?));
-        };
-        let label = tail[..space].trim();
-        let tail = tail[space..].trim();
-        if label.is_empty() {
-            return Err(unsupported_trigger_body());
-        }
-        let condition = if tail.is_empty() {
-            None
-        } else if let Some(condition) = strip_trigger_keyword(tail, "when") {
-            let condition = condition.trim();
-            if condition.is_empty() {
-                return Err(unsupported_trigger_body());
+    let (label, condition) = match strip_trigger_keyword(tail, "when") {
+        Some(condition) => (None, Some(condition)),
+        None => match tail.find(char::is_whitespace) {
+            Some(space) => {
+                let condition = strip_trigger_keyword(tail[space..].trim_start(), "when")
+                    .ok_or_else(unsupported_trigger_body)?;
+                (Some(&tail[..space]), Some(condition))
             }
-            Some(parse_plpgsql_expression(condition, arena)?)
-        } else {
-            return Err(unsupported_trigger_body());
-        };
-        (
-            Some(parse_plpgsql_identifier(label, arena)?.name),
-            condition,
-        )
+            None => ((!tail.is_empty()).then_some(tail), None),
+        },
     };
+    // PostgreSQL positions these at the label, or at the statement.
     let unwind = match label {
-        Some(label) => loop_labels
+        Some(written) => {
+            let label = parse_plpgsql_identifier(written, arena)?.name;
+            let unwind = targets
+                .iter()
+                .rev()
+                .position(|target| target.label == Some(label))
+                .ok_or_else(|| {
+                    crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "there is no label \"{}\" attached to any block or loop enclosing this statement",
+                            label.as_str()
+                        ),
+                        written,
+                    )
+                })?;
+            if !is_exit && !targets[targets.len() - 1 - unwind].is_loop {
+                return Err(crate::sql::error_position::at_reference(
+                    sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "block label \"{}\" cannot be used in CONTINUE",
+                        label.as_str()
+                    ),
+                    written,
+                ));
+            }
+            unwind
+        }
+        None => targets
             .iter()
             .rev()
-            .position(|candidate| *candidate == Some(label))
+            .position(|target| target.is_loop)
             .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "there is no label \"{}\" attached to any enclosing loop",
-                    label.as_str()
+                crate::sql::error_position::at_reference(
+                    if is_exit {
+                        sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "EXIT cannot be used outside a loop, unless it has a label"
+                        )
+                    } else {
+                        sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "CONTINUE cannot be used outside a loop"
+                        )
+                    },
+                    segment.trim_start(),
                 )
             })?,
-        None => 0,
+    };
+    let condition = match condition.map(str::trim) {
+        None => None,
+        Some("") => return Err(unsupported_trigger_body()),
+        Some(condition) => Some(parse_plpgsql_expression(condition, arena)?),
     };
     Ok(Some(if is_exit {
         TriggerLoopControl::Exit { condition, unwind }
@@ -21513,42 +21751,68 @@ fn parse_trigger_loop_control<'a>(
     }))
 }
 
-fn loop_control_for_label<'a>(
-    is_exit: bool,
-    label: &str,
-    condition: Option<&'a Expr<'a>>,
-    loop_labels: &[Option<SqlName>],
+/// Checks the optional label after `END` or `END LOOP` against the block's.
+fn check_plpgsql_end_label(
+    block: Option<SqlName>,
+    end: Option<&str>,
     arena: &Arena,
-) -> Result<TriggerLoopControl<'a>, SqlError> {
-    let label = parse_plpgsql_identifier(label, arena)?.name;
-    let unwind = loop_labels
-        .iter()
-        .rev()
-        .position(|candidate| *candidate == Some(label))
-        .ok_or_else(|| {
+) -> Result<(), SqlError> {
+    let Some(end) = end else {
+        return Ok(());
+    };
+    let written = end;
+    let end = parse_plpgsql_identifier(end, arena)?.name;
+    // PostgreSQL positions these at the end label.
+    match block {
+        None => Err(crate::sql::error_position::at_reference(
             sql_err!(
                 sqlstate::SYNTAX_ERROR,
-                "there is no label \"{}\" attached to any enclosing loop",
+                "end label \"{}\" specified for unlabeled block",
+                end.as_str()
+            ),
+            written,
+        )),
+        Some(label) if label != end => Err(crate::sql::error_position::at_reference(
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "end label \"{}\" differs from block's label \"{}\"",
+                end.as_str(),
                 label.as_str()
-            )
-        })?;
-    Ok(if is_exit {
-        TriggerLoopControl::Exit { condition, unwind }
+            ),
+            written,
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The block-closing segment `segment` is, if any.
+fn trigger_block_end(segment: &str) -> Option<TriggerBlockEnd<'_>> {
+    fn label(rest: &str) -> Option<&str> {
+        (!rest.is_empty()).then_some(rest)
+    }
+    let rest = strip_trigger_keyword(segment, "end")?.trim();
+    Some(if rest.eq_ignore_ascii_case("if") {
+        TriggerBlockEnd::EndIf
+    } else if rest.eq_ignore_ascii_case("case") {
+        TriggerBlockEnd::EndCase
+    } else if let Some(rest) = strip_trigger_keyword(rest, "loop") {
+        TriggerBlockEnd::EndLoop(label(rest.trim()))
     } else {
-        TriggerLoopControl::Continue { condition, unwind }
+        TriggerBlockEnd::End(label(rest))
     })
 }
 
 #[derive(Clone, Copy)]
 enum TriggerBlockEnd<'a> {
-    End,
+    /// `END`, with the label written after it.
+    End(Option<&'a str>),
     Exception,
     Else,
     Elsif(&'a str),
     When(&'a str),
     EndIf,
     EndCase,
-    EndLoop,
+    EndLoop(Option<&'a str>),
 }
 
 fn trigger_tail<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
@@ -21968,7 +22232,7 @@ fn parse_trigger_exception_conditions<'a>(
 fn parse_trigger_statement<'a>(
     segment: &'a str,
     arena: &'a Arena,
-    loop_labels: &[Option<SqlName>],
+    targets: &[PlpgsqlExitTarget],
     handler_active: bool,
     program_kind: PlpgsqlProgramKind,
 ) -> Result<TriggerStatement<'a>, SqlError> {
@@ -22039,33 +22303,38 @@ fn parse_trigger_statement<'a>(
     if let Some(raise) = parse_trigger_raise(segment, arena, handler_active)? {
         return Ok(TriggerStatement::Raise(raise));
     }
-    if let Some(control) = parse_trigger_loop_control(segment, arena, loop_labels)? {
-        if loop_labels.is_empty() {
-            return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "{} cannot be used outside a loop",
-                if matches!(control, TriggerLoopControl::Exit { .. }) {
-                    "EXIT"
-                } else {
-                    "CONTINUE"
-                }
-            ));
-        }
+    if let Some(control) = parse_trigger_loop_control(segment, arena, targets)? {
         return Ok(TriggerStatement::LoopControl(control));
     }
     if strip_trigger_keyword(segment, "insert").is_some()
         || strip_trigger_keyword(segment, "update").is_some()
         || strip_trigger_keyword(segment, "delete").is_some()
     {
-        super::plpgsql_inputs::record(
+        // `INSERT INTO` names the target; a later top-level INTO receives
+        // the RETURNING row.
+        let skipped = if strip_trigger_keyword(segment, "insert").is_some() {
+            trigger_top_level_keyword(segment, "into", arena)?.map_or(0, |at| at + 4)
+        } else {
+            0
+        };
+        let (source, into) = match trigger_top_level_keyword(&segment[skipped..], "into", arena)? {
+            Some(at) => {
+                let (source, into) = take_plpgsql_into(segment, skipped + at, arena)?;
+                (source, Some(into))
+            }
+            None => (segment, None),
+        };
+        super::plpgsql_inputs::record_rewritten(
             super::plpgsql_inputs::Kind::Statement,
-            segment.as_ptr() as usize,
+            source.as_ptr() as usize,
+            source,
             segment,
-            segment,
+            arena,
         )?;
         return Ok(TriggerStatement::Dml {
-            source: segment,
-            statement: parse_trigger_dml(segment, arena)?,
+            source,
+            statement: parse_trigger_dml(source, arena)?,
+            into,
         });
     }
     if [
@@ -22129,11 +22398,11 @@ fn parse_trigger_exception_handlers<'a>(
     segments: &[&'a str],
     at: &mut usize,
     arena: &'a Arena,
-    loop_labels: &mut [Option<SqlName>],
-    loop_depth: usize,
+    targets: &mut [PlpgsqlExitTarget],
+    depth: usize,
     program_kind: PlpgsqlProgramKind,
     protected: TriggerBlock<'a>,
-) -> Result<TriggerException<'a>, SqlError> {
+) -> Result<(TriggerException<'a>, Option<&'a str>), SqlError> {
     let mut handlers = ProgramList::new(arena);
     let Some(&header) = segments.get(*at) else {
         return Err(incomplete_trigger_body());
@@ -22146,37 +22415,34 @@ fn parse_trigger_exception_handlers<'a>(
     };
     *at += 1;
     loop {
-        let (block, ending) = parse_trigger_block(
-            segments,
-            at,
-            arena,
-            loop_labels,
-            loop_depth,
-            true,
-            program_kind,
-        )?;
+        let (block, ending) =
+            parse_trigger_block(segments, at, arena, targets, depth, true, program_kind)?;
         handlers.push(TriggerExceptionHandler {
             conditions: parse_trigger_exception_conditions(conditions, arena)?,
             block,
         })?;
         match ending {
-            TriggerBlockEnd::End => break,
+            TriggerBlockEnd::End(label) => {
+                return Ok((
+                    TriggerException {
+                        protected,
+                        handlers: handlers.as_slice(),
+                    },
+                    label,
+                ));
+            }
             TriggerBlockEnd::When(next) => conditions = next,
             _ => return Err(unsupported_trigger_body()),
         }
     }
-    Ok(TriggerException {
-        protected,
-        handlers: handlers.as_slice(),
-    })
 }
 
 fn parse_trigger_block<'a>(
     segments: &[&'a str],
     at: &mut usize,
     arena: &'a Arena,
-    loop_labels: &mut [Option<SqlName>],
-    loop_depth: usize,
+    targets: &mut [PlpgsqlExitTarget],
+    depth: usize,
     handler_active: bool,
     program_kind: PlpgsqlProgramKind,
 ) -> Result<(TriggerBlock<'a>, TriggerBlockEnd<'a>), SqlError> {
@@ -22194,44 +22460,14 @@ fn parse_trigger_block<'a>(
                 TriggerBlockEnd::Exception,
             ));
         }
-        if segment.eq_ignore_ascii_case("end") {
+        if let Some(ending) = trigger_block_end(segment) {
             *at += 1;
             return Ok((
                 TriggerBlock {
                     statements: statements.as_slice(),
                     sources: sources.as_slice(),
                 },
-                TriggerBlockEnd::End,
-            ));
-        }
-        if segment.eq_ignore_ascii_case("end if") {
-            *at += 1;
-            return Ok((
-                TriggerBlock {
-                    statements: statements.as_slice(),
-                    sources: sources.as_slice(),
-                },
-                TriggerBlockEnd::EndIf,
-            ));
-        }
-        if segment.eq_ignore_ascii_case("end case") {
-            *at += 1;
-            return Ok((
-                TriggerBlock {
-                    statements: statements.as_slice(),
-                    sources: sources.as_slice(),
-                },
-                TriggerBlockEnd::EndCase,
-            ));
-        }
-        if segment.eq_ignore_ascii_case("end loop") {
-            *at += 1;
-            return Ok((
-                TriggerBlock {
-                    statements: statements.as_slice(),
-                    sources: sources.as_slice(),
-                },
-                TriggerBlockEnd::EndLoop,
+                ending,
             ));
         }
         if segment.eq_ignore_ascii_case("else") {
@@ -22275,12 +22511,26 @@ fn parse_trigger_block<'a>(
         }
         *at += 1;
         let (loop_label, loop_header) = trigger_loop_label(segment, arena)?;
-        if loop_depth == loop_labels.len()
-            && (strip_trigger_keyword(loop_header, "for").is_some()
-                || strip_trigger_keyword(loop_header, "while").is_some()
-                || strip_trigger_keyword(loop_header, "foreach").is_some()
-                || is_trigger_loop_header(loop_header))
-        {
+        let is_loop = strip_trigger_keyword(loop_header, "for").is_some()
+            || strip_trigger_keyword(loop_header, "while").is_some()
+            || strip_trigger_keyword(loop_header, "foreach").is_some()
+            || is_trigger_loop_header(loop_header);
+        let declares = strip_trigger_keyword(loop_header, "declare").is_some();
+        let is_block = declares || strip_trigger_keyword(loop_header, "begin").is_some();
+        if loop_label.is_some() && !is_loop && !is_block {
+            // Only a block or a loop takes a label.
+            let word = loop_header
+                .split(|character: char| !super::lexer::is_identifier_continue(character))
+                .next()
+                .filter(|word| !word.is_empty())
+                .unwrap_or(loop_header);
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "syntax error at or near \"{}\"",
+                word
+            ));
+        }
+        if depth == targets.len() && (is_loop || (is_block && loop_label.is_some())) {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "PL/pgSQL program nesting exceeds the loop limit"
@@ -22297,8 +22547,8 @@ fn parse_trigger_block<'a>(
                     segments,
                     at,
                     arena,
-                    loop_labels,
-                    loop_depth,
+                    targets,
+                    depth,
                     handler_active,
                     program_kind,
                 )?;
@@ -22312,8 +22562,8 @@ fn parse_trigger_block<'a>(
                             segments,
                             at,
                             arena,
-                            loop_labels,
-                            loop_depth,
+                            targets,
+                            depth,
                             handler_active,
                             program_kind,
                         )?;
@@ -22354,8 +22604,8 @@ fn parse_trigger_block<'a>(
                     segments,
                     at,
                     arena,
-                    loop_labels,
-                    loop_depth,
+                    targets,
+                    depth,
                     handler_active,
                     program_kind,
                 )?;
@@ -22369,8 +22619,8 @@ fn parse_trigger_block<'a>(
                             segments,
                             at,
                             arena,
-                            loop_labels,
-                            loop_depth,
+                            targets,
+                            depth,
                             handler_active,
                             program_kind,
                         )?;
@@ -22393,117 +22643,186 @@ fn parse_trigger_block<'a>(
                     _ => return Err(unsupported_trigger_body()),
                 }
             }
-        } else if strip_trigger_keyword(segment, "begin").is_some() {
+        } else if is_block {
+            let inner = match loop_label {
+                Some(label) => {
+                    targets[depth] = PlpgsqlExitTarget {
+                        label: Some(label),
+                        is_loop: false,
+                    };
+                    depth + 1
+                }
+                None => depth,
+            };
+            let declarations = if declares {
+                let first = *at;
+                while segments
+                    .get(*at)
+                    .is_some_and(|segment| strip_trigger_keyword(segment, "begin").is_none())
+                {
+                    if segments[*at].starts_with("<<") {
+                        return Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "block label must be placed before DECLARE, not after"
+                        ));
+                    }
+                    *at += 1;
+                }
+                if *at == segments.len() {
+                    return Err(incomplete_trigger_body());
+                }
+                let declarations = parse_plpgsql_declarations(&segments[first..*at], arena)?;
+                *at += 1;
+                declarations
+            } else {
+                &[]
+            };
             let (protected, ending) = parse_trigger_block(
                 segments,
                 at,
                 arena,
-                loop_labels,
-                loop_depth,
+                targets,
+                inner,
                 handler_active,
                 program_kind,
             )?;
-            if matches!(ending, TriggerBlockEnd::Exception) {
-                TriggerStatement::Exception(parse_trigger_exception_handlers(
-                    segments,
-                    at,
-                    arena,
-                    loop_labels,
-                    loop_depth,
-                    program_kind,
-                    protected,
-                )?)
-            } else {
-                if !matches!(ending, TriggerBlockEnd::End) {
-                    return Err(unsupported_trigger_body());
+            let (statement, end_label) = match ending {
+                TriggerBlockEnd::Exception => {
+                    let (exception, end_label) = parse_trigger_exception_handlers(
+                        segments,
+                        at,
+                        arena,
+                        targets,
+                        inner,
+                        program_kind,
+                        protected,
+                    )?;
+                    (TriggerStatement::Exception(exception), end_label)
                 }
-                // A nested block is an always-selected branch, which preserves its
-                // lexical scope without introducing an executable no-op node.
-                let branches = arena
-                    .alloc_slice_copy(&[TriggerBranch {
-                        condition: None,
+                TriggerBlockEnd::End(end_label) => (
+                    TriggerStatement::Block(TriggerNestedBlock {
+                        label: loop_label,
+                        declarations,
                         block: protected,
-                    }])
-                    .map_err(|_| super::query::arena_full_pub())?;
-                TriggerStatement::If(TriggerIf { branches })
+                    }),
+                    end_label,
+                ),
+                _ => return Err(unsupported_trigger_body()),
+            };
+            check_plpgsql_end_label(loop_label, end_label, arena)?;
+            match statement {
+                // A labelled exception block is an EXIT target, and its
+                // declarations are initialized before its protected
+                // statements: the block's own frame encloses both.
+                TriggerStatement::Exception(_)
+                    if loop_label.is_some() || !declarations.is_empty() =>
+                {
+                    TriggerStatement::Block(TriggerNestedBlock {
+                        label: loop_label,
+                        declarations,
+                        block: TriggerBlock {
+                            statements: arena
+                                .alloc_slice_copy(&[statement])
+                                .map_err(|_| super::query::arena_full_pub())?,
+                            sources: arena
+                                .alloc_slice_copy(&[segment])
+                                .map_err(|_| super::query::arena_full_pub())?,
+                        },
+                    })
+                }
+                statement => statement,
             }
         } else if let Some((target, source)) = parse_trigger_for_header(loop_header, arena)? {
-            loop_labels[loop_depth] = loop_label;
+            targets[depth] = PlpgsqlExitTarget {
+                label: loop_label,
+                is_loop: true,
+            };
             let (block, ending) = parse_trigger_block(
                 segments,
                 at,
                 arena,
-                loop_labels,
-                loop_depth + 1,
+                targets,
+                depth + 1,
                 handler_active,
                 program_kind,
             )?;
-            loop_labels[loop_depth] = None;
-            if !matches!(ending, TriggerBlockEnd::EndLoop) {
+            let TriggerBlockEnd::EndLoop(end_label) = ending else {
                 return Err(unsupported_trigger_body());
-            }
+            };
+            check_plpgsql_end_label(loop_label, end_label, arena)?;
             TriggerStatement::For(TriggerFor {
+                label: loop_label,
                 target,
                 source,
                 block,
             })
         } else if let Some((target, source)) = parse_trigger_foreach_header(loop_header, arena)? {
-            loop_labels[loop_depth] = loop_label;
+            targets[depth] = PlpgsqlExitTarget {
+                label: loop_label,
+                is_loop: true,
+            };
             let (block, ending) = parse_trigger_block(
                 segments,
                 at,
                 arena,
-                loop_labels,
-                loop_depth + 1,
+                targets,
+                depth + 1,
                 handler_active,
                 program_kind,
             )?;
-            loop_labels[loop_depth] = None;
-            if !matches!(ending, TriggerBlockEnd::EndLoop) {
+            let TriggerBlockEnd::EndLoop(end_label) = ending else {
                 return Err(unsupported_trigger_body());
-            }
+            };
+            check_plpgsql_end_label(loop_label, end_label, arena)?;
             TriggerStatement::For(TriggerFor {
+                label: loop_label,
                 target,
                 source,
                 block,
             })
         } else if let Some(condition) = parse_trigger_while_header(loop_header, arena)? {
-            loop_labels[loop_depth] = loop_label;
+            targets[depth] = PlpgsqlExitTarget {
+                label: loop_label,
+                is_loop: true,
+            };
             let (block, ending) = parse_trigger_block(
                 segments,
                 at,
                 arena,
-                loop_labels,
-                loop_depth + 1,
+                targets,
+                depth + 1,
                 handler_active,
                 program_kind,
             )?;
-            loop_labels[loop_depth] = None;
-            if !matches!(ending, TriggerBlockEnd::EndLoop) {
+            let TriggerBlockEnd::EndLoop(end_label) = ending else {
                 return Err(unsupported_trigger_body());
-            }
+            };
+            check_plpgsql_end_label(loop_label, end_label, arena)?;
             TriggerStatement::While(TriggerWhile { condition, block })
         } else if is_trigger_loop_header(loop_header) {
-            loop_labels[loop_depth] = loop_label;
+            targets[depth] = PlpgsqlExitTarget {
+                label: loop_label,
+                is_loop: true,
+            };
             let (block, ending) = parse_trigger_block(
                 segments,
                 at,
                 arena,
-                loop_labels,
-                loop_depth + 1,
+                targets,
+                depth + 1,
                 handler_active,
                 program_kind,
             )?;
-            loop_labels[loop_depth] = None;
-            if !matches!(ending, TriggerBlockEnd::EndLoop) {
+            let TriggerBlockEnd::EndLoop(end_label) = ending else {
                 return Err(unsupported_trigger_body());
-            }
+            };
+            check_plpgsql_end_label(loop_label, end_label, arena)?;
             TriggerStatement::Loop(block)
         } else {
             parse_trigger_statement(
                 segment,
                 arena,
-                &loop_labels[..loop_depth],
+                &targets[..depth],
                 handler_active,
                 program_kind,
             )?
@@ -22552,11 +22871,47 @@ fn parse_plpgsql_program<'a>(
     arena: &'a Arena,
     program_kind: PlpgsqlProgramKind,
 ) -> Result<ParsedTriggerProgram<'a>, SqlError> {
-    let (mut program, sites) = super::plpgsql_inputs::capture(body, arena, || {
-        parse_plpgsql_program_inner(body, arena, program_kind)
+    // A compile error points into the body where the statement wrote it, as
+    // PostgreSQL's do; a body from the catalog is not in the statement.
+    let (mut program, sites) = crate::sql::error_position::with_analysis_in(body, || {
+        super::plpgsql_inputs::capture(body, arena, || {
+            parse_plpgsql_program_inner(body, arena, program_kind)
+        })
     })?;
     program.input_sites = sites;
     Ok(program)
+}
+
+/// One block's declarations, each name declared once.
+fn parse_plpgsql_declarations<'a>(
+    segments: &[&'a str],
+    arena: &'a Arena,
+) -> Result<&'a [ParsedTriggerLocalDecl<'a>], SqlError> {
+    let mut locals = ProgramList::new(arena);
+    for declaration in segments.iter().copied() {
+        let local = parse_trigger_local(declaration, arena)?;
+        if locals
+            .as_slice()
+            .iter()
+            .any(|prior: &ParsedTriggerLocalDecl<'_>| prior.name == local.name)
+        {
+            // PostgreSQL positions this at the second declaration's name.
+            let written = declaration.trim_start();
+            let name = written
+                .find(char::is_whitespace)
+                .map_or(written, |end| &written[..end]);
+            return Err(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "duplicate declaration at or near \"{}\"",
+                    local.name.as_str()
+                ),
+                name,
+            ));
+        }
+        locals.push(local)?;
+    }
+    Ok(locals.as_slice())
 }
 
 fn parse_plpgsql_program_inner<'a>(
@@ -22564,36 +22919,28 @@ fn parse_plpgsql_program_inner<'a>(
     arena: &'a Arena,
     program_kind: PlpgsqlProgramKind,
 ) -> Result<ParsedTriggerProgram<'a>, SqlError> {
-    let (variable_conflict, body) = plpgsql_compile_options(body)?;
+    let (options, body) = plpgsql_compile_options(body)?;
     let body = body.trim().strip_suffix(';').unwrap_or(body.trim()).trim();
     if body.is_empty() {
         return Err(incomplete_trigger_body());
     }
+    let (label, body) = trigger_loop_label(body, arena)?;
     let (locals, body, block_source) =
         if let Some(declarations) = strip_trigger_keyword(body, "declare") {
             let Some(begin_at) = trigger_top_level_keyword(declarations, "begin", arena)? else {
                 return Err(incomplete_trigger_body());
             };
             let declaration_source = declarations[..begin_at].trim();
-            let segments = split_trigger_statements(declaration_source, arena)?;
-            let mut locals = ProgramList::new(arena);
-            for declaration in segments.iter().copied() {
-                let local = parse_trigger_local(declaration, arena)?;
-                if locals
-                    .as_slice()
-                    .iter()
-                    .any(|prior: &ParsedTriggerLocalDecl<'_>| prior.name == local.name)
-                {
-                    return Err(sql_err!(
-                        sqlstate::DUPLICATE_COLUMN,
-                        "duplicate declaration of PL/pgSQL local \"{}\"",
-                        local.name.as_str()
-                    ));
-                }
-                locals.push(local)?;
+            if declaration_source.starts_with("<<") {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "block label must be placed before DECLARE, not after"
+                ));
             }
+            let segments = split_trigger_statements(declaration_source, arena)?;
+            let locals = parse_plpgsql_declarations(segments, arena)?;
             (
-                locals.as_slice(),
+                locals,
                 declarations[begin_at + 5..].trim(),
                 &declarations[begin_at..],
             )
@@ -22606,32 +22953,37 @@ fn parse_plpgsql_program_inner<'a>(
         };
     let segments = split_trigger_statements(body, arena)?;
     let mut at = 0;
-    let loop_labels = arena
-        .alloc_slice_with(segments.len().max(1), |_| None)
+    let targets = arena
+        .alloc_slice_with(segments.len() + 1, |_| PlpgsqlExitTarget {
+            label: None,
+            is_loop: false,
+        })
         .map_err(|_| super::query::arena_full_pub())?;
     with_bound_plpgsql_cursors(locals, || {
         parse_plpgsql_program_body(
             PlpgsqlProgramFrame {
+                label,
                 locals,
                 block_source,
-                variable_conflict,
+                options,
             },
             segments,
             &mut at,
             arena,
-            loop_labels,
+            targets,
             program_kind,
         )
     })
 }
 
-/// The declarations and options that surround a PL/pgSQL program's top-level
-/// statement list.
+/// The label, declarations and options that surround a PL/pgSQL program's
+/// top-level statement list.
 struct PlpgsqlProgramFrame<'a> {
+    label: Option<SqlName>,
     locals: &'a [ParsedTriggerLocalDecl<'a>],
     /// The outer block's text from `BEGIN`, reported for its handlers.
     block_source: &'a str,
-    variable_conflict: Option<super::guc::VariableConflict>,
+    options: PlpgsqlCompileOptions,
 }
 
 fn parse_plpgsql_program_body<'a>(
@@ -22639,42 +22991,72 @@ fn parse_plpgsql_program_body<'a>(
     segments: &'a [&'a str],
     at: &mut usize,
     arena: &'a Arena,
-    loop_labels: &mut [Option<SqlName>],
+    targets: &mut [PlpgsqlExitTarget],
     program_kind: PlpgsqlProgramKind,
 ) -> Result<ParsedTriggerProgram<'a>, SqlError> {
+    let label = frame.label;
+    let depth = match label {
+        Some(label) => {
+            targets[0].label = Some(label);
+            1
+        }
+        None => 0,
+    };
     let (body, ending) =
-        parse_trigger_block(segments, at, arena, loop_labels, 0, false, program_kind)?;
-    let body = match ending {
-        TriggerBlockEnd::End => body,
+        parse_trigger_block(segments, at, arena, targets, depth, false, program_kind)?;
+    let (body, end_label) = match ending {
+        TriggerBlockEnd::End(end_label) => (body, end_label),
         TriggerBlockEnd::Exception => {
-            let exception = parse_trigger_exception_handlers(
+            let (exception, end_label) = parse_trigger_exception_handlers(
                 segments,
                 at,
                 arena,
-                loop_labels,
-                0,
+                targets,
+                depth,
                 program_kind,
                 body,
             )?;
-            TriggerBlock {
-                statements: arena
-                    .alloc_slice_copy(&[TriggerStatement::Exception(exception)])
-                    .map_err(|_| super::query::arena_full_pub())?,
-                sources: arena
-                    .alloc_slice_copy(&[frame.block_source])
-                    .map_err(|_| super::query::arena_full_pub())?,
-            }
+            (
+                TriggerBlock {
+                    statements: arena
+                        .alloc_slice_copy(&[TriggerStatement::Exception(exception)])
+                        .map_err(|_| super::query::arena_full_pub())?,
+                    sources: arena
+                        .alloc_slice_copy(&[frame.block_source])
+                        .map_err(|_| super::query::arena_full_pub())?,
+                },
+                end_label,
+            )
         }
         _ => return Err(unsupported_trigger_body()),
     };
+    check_plpgsql_end_label(label, end_label, arena)?;
     if *at != segments.len() {
         return Err(unsupported_trigger_body());
     }
+    // `EXIT label` leaves a labelled outermost block through its own frame.
+    let body = match label {
+        Some(_) => TriggerBlock {
+            statements: arena
+                .alloc_slice_copy(&[TriggerStatement::Block(TriggerNestedBlock {
+                    label,
+                    declarations: &[],
+                    block: body,
+                })])
+                .map_err(|_| super::query::arena_full_pub())?,
+            sources: arena
+                .alloc_slice_copy(&[frame.block_source])
+                .map_err(|_| super::query::arena_full_pub())?,
+        },
+        None => body,
+    };
     Ok(ParsedTriggerProgram {
+        label,
         locals: frame.locals,
         body,
         input_sites: &[],
-        variable_conflict: frame.variable_conflict,
+        variable_conflict: frame.options.variable_conflict,
+        print_strict_params: frame.options.print_strict_params,
     })
 }
 
@@ -22691,6 +23073,7 @@ fn resolve_plpgsql_program_locals<'a>(
 ) -> Result<TriggerProgram<'a>, SqlError> {
     let resolved = arena
         .alloc_slice_with(program.locals.len(), |_| TriggerLocalDecl {
+            label: None,
             scope: PlpgsqlScope::Invocation,
             name: SqlName::EMPTY,
             ctype: ColType::Bool,
@@ -22702,55 +23085,106 @@ fn resolve_plpgsql_program_locals<'a>(
         })
         .map_err(|_| super::query::arena_full_pub())?;
     for (index, local) in program.locals.iter().copied().enumerate() {
-        let (ctype, user_type, type_mod, record_shape) = match local.ty {
-            ParsedPlpgsqlLocalType::Named { name, type_mod } => {
-                let result = resolve_routine_type(storage, txid, name)?;
-                (result.ctype, result.user_type, type_mod, None)
-            }
-            ParsedPlpgsqlLocalType::Column { relation, column } => {
-                resolve_plpgsql_column_type(storage, txid, relation, column)?
-            }
-            ParsedPlpgsqlLocalType::Row { relation } => {
-                resolve_plpgsql_rowtype(storage, txid, relation)?
-            }
-            ParsedPlpgsqlLocalType::Record => {
-                (ColType::Record, None, -1, Some(PlpgsqlRecordShape::Dynamic))
-            }
-        };
-        if ctype.is_pseudo() && ctype != ColType::Record {
-            return Err(sql_err!(
-                sqlstate::INVALID_FUNCTION_DEFINITION,
-                "PL/pgSQL local \"{}\" has pseudo-type {}",
-                local.name.as_str(),
-                ctype.name()
-            ));
-        }
-        if local.not_null && local.initial.is_none() {
-            return Err(sql_err!(
-                sqlstate::NULL_VALUE_NOT_ALLOWED,
-                "variable \"{}\" must have a default value, since it's declared NOT NULL",
-                local.name.as_str()
-            ));
-        }
-        resolved[index] = TriggerLocalDecl {
-            scope: PlpgsqlScope::Invocation,
-            name: local.name,
-            ctype,
-            user_type,
-            type_mod,
-            record_shape,
-            constant: local.constant,
-            not_null: local.not_null,
-        };
+        resolved[index] = resolve_plpgsql_local(
+            local,
+            program.label,
+            PlpgsqlScope::Invocation,
+            storage,
+            txid,
+        )?;
     }
+    // Nested blocks resolve their declarations on entry; resolving them here
+    // reports a missing type when the routine is created, as PostgreSQL does.
+    validate_plpgsql_nested_declarations(program.body, storage, txid)?;
     let program = TriggerProgram {
         locals: resolved,
         body: program.body,
         input_sites: program.input_sites,
         variable_conflict: program.variable_conflict,
+        print_strict_params: program.print_strict_params,
     };
     validate_plpgsql_constant_assignments(&program, has_parameter)?;
     Ok(program)
+}
+
+/// Resolves one declaration's type against the catalog.
+fn resolve_plpgsql_local(
+    local: ParsedTriggerLocalDecl<'_>,
+    label: Option<SqlName>,
+    scope: PlpgsqlScope,
+    storage: &Storage,
+    txid: u32,
+) -> Result<TriggerLocalDecl, SqlError> {
+    let (ctype, user_type, type_mod, record_shape) = match local.ty {
+        // A table's name also names its row type, as with `%ROWTYPE`.
+        ParsedPlpgsqlLocalType::Named { name, type_mod }
+            if type_mod < 0 && relation_row_type_exists(storage, txid, name) =>
+        {
+            resolve_plpgsql_rowtype(storage, txid, name)?
+        }
+        ParsedPlpgsqlLocalType::Named { name, type_mod } => {
+            let result = resolve_routine_type(storage, txid, name)?;
+            (result.ctype, result.user_type, type_mod, None)
+        }
+        ParsedPlpgsqlLocalType::Column { relation, column } => {
+            resolve_plpgsql_column_type(storage, txid, relation, column)?
+        }
+        ParsedPlpgsqlLocalType::Row { relation } => {
+            resolve_plpgsql_rowtype(storage, txid, relation)?
+        }
+        ParsedPlpgsqlLocalType::Record => {
+            (ColType::Record, None, -1, Some(PlpgsqlRecordShape::Dynamic))
+        }
+    };
+    if ctype.is_pseudo() && ctype != ColType::Record {
+        return Err(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "PL/pgSQL local \"{}\" has pseudo-type {}",
+            local.name.as_str(),
+            ctype.name()
+        ));
+    }
+    if local.not_null && local.initial.is_none() {
+        return Err(sql_err!(
+            sqlstate::NULL_VALUE_NOT_ALLOWED,
+            "variable \"{}\" must have a default value, since it's declared NOT NULL",
+            local.name.as_str()
+        ));
+    }
+    Ok(TriggerLocalDecl {
+        scope,
+        label,
+        name: local.name,
+        ctype,
+        user_type,
+        type_mod,
+        record_shape,
+        constant: local.constant,
+        not_null: local.not_null,
+    })
+}
+
+fn validate_plpgsql_nested_declarations(
+    block: TriggerBlock<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let mut result = Ok(());
+    numeric_loops::visit_nested_blocks(block, |child, edge| {
+        if result.is_err() {
+            return;
+        }
+        if let numeric_loops::BlockEdge::Scope(declarations) = edge {
+            result = declarations.iter().try_for_each(|local| {
+                resolve_plpgsql_local(*local, None, PlpgsqlScope::Invocation, storage, txid)
+                    .map(drop)
+            });
+        }
+        if result.is_ok() {
+            result = validate_plpgsql_nested_declarations(child, storage, txid);
+        }
+    });
+    result
 }
 
 fn compile_plpgsql_execution<'a>(
@@ -22772,42 +23206,67 @@ fn validate_plpgsql_constant_assignments(
     has_parameter: &dyn Fn(SqlName) -> bool,
 ) -> Result<(), SqlError> {
     struct ScopedLocal<'a> {
+        label: Option<SqlName>,
         name: SqlName,
         constant: bool,
         parent: Option<&'a ScopedLocal<'a>>,
     }
     fn binding_constant(
-        target: SqlName,
+        target: PlpgsqlVariableName,
         locals: &[TriggerLocalDecl],
         mut shadowed: Option<&ScopedLocal<'_>>,
         has_parameter: &dyn Fn(SqlName) -> bool,
     ) -> Option<bool> {
         while let Some(local) = shadowed {
-            if local.name == target {
+            if local.name == target.name
+                && target.label.is_none_or(|label| local.label == Some(label))
+            {
                 return Some(local.constant);
             }
             shadowed = local.parent;
         }
         locals
             .iter()
-            .find(|local| local.name == target)
+            .rfind(|local| target.names(local))
             .map(|local| local.constant)
-            .or_else(|| has_parameter(target).then_some(false))
+            // A parameter's label is its routine's name, which this check
+            // does not know; execution resolves the label.
+            .or_else(|| has_parameter(target.name).then_some(false))
     }
     fn reject(
-        target: SqlName,
+        target: PlpgsqlVariableName,
         locals: &[TriggerLocalDecl],
         shadowed: Option<&ScopedLocal<'_>>,
         has_parameter: &dyn Fn(SqlName) -> bool,
     ) -> Result<(), SqlError> {
-        if binding_constant(target, locals, shadowed, has_parameter) == Some(true) {
-            return Err(sql_err!(
+        match binding_constant(target, locals, shadowed, has_parameter) {
+            Some(true) => Err(sql_err!(
                 sqlstate::ERROR_IN_ASSIGNMENT,
                 "variable \"{}\" is declared CONSTANT",
-                target.as_str()
-            ));
+                target.name.as_str()
+            )),
+            // `r.f` assigns field `f` of row variable `r`.
+            None if let Some(label) = target.label => match binding_constant(
+                PlpgsqlVariableName::plain(label),
+                locals,
+                shadowed,
+                has_parameter,
+            ) {
+                Some(true) => Err(sql_err!(
+                    sqlstate::ERROR_IN_ASSIGNMENT,
+                    "variable \"{}\" is declared CONSTANT",
+                    label.as_str()
+                )),
+                Some(false) => Ok(()),
+                None => Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "\"{}.{}\" is not a known variable",
+                    label.as_str(),
+                    target.name.as_str()
+                )),
+            },
+            _ => Ok(()),
         }
-        Ok(())
     }
     fn validate_block(
         current: TriggerBlock<'_>,
@@ -22861,7 +23320,8 @@ fn validate_plpgsql_constant_assignments(
                             ));
                         }
                         let local = ScopedLocal {
-                            name: statement.target,
+                            label: statement.label,
+                            name: statement.target.name,
                             constant: false,
                             parent: shadowed,
                         };
@@ -22877,6 +23337,14 @@ fn validate_plpgsql_constant_assignments(
                 TriggerStatement::Loop(block_value) => {
                     validate_block(block_value, locals, shadowed, has_parameter)?
                 }
+                TriggerStatement::Block(statement) => validate_scope(
+                    statement.declarations,
+                    statement.label,
+                    statement.block,
+                    locals,
+                    shadowed,
+                    has_parameter,
+                )?,
                 TriggerStatement::If(statement) => {
                     for branch in statement.branches {
                         validate_block(branch.block, locals, shadowed, has_parameter)?;
@@ -22893,11 +23361,13 @@ fn validate_plpgsql_constant_assignments(
                 TriggerStatement::Exception(statement) => {
                     validate_block(statement.protected, locals, shadowed, has_parameter)?;
                     let state = ScopedLocal {
+                        label: None,
                         name: SqlName::parse("sqlstate").expect("static diagnostic name"),
                         constant: true,
                         parent: shadowed,
                     };
                     let message = ScopedLocal {
+                        label: None,
                         name: SqlName::parse("sqlerrm").expect("static diagnostic name"),
                         constant: true,
                         parent: Some(&state),
@@ -22926,6 +23396,28 @@ fn validate_plpgsql_constant_assignments(
             }
         }
         Ok(())
+    }
+    /// Validates `block` with each of a nested block's declarations in scope.
+    fn validate_scope(
+        declarations: &[ParsedTriggerLocalDecl<'_>],
+        label: Option<SqlName>,
+        block: TriggerBlock<'_>,
+        locals: &[TriggerLocalDecl],
+        shadowed: Option<&ScopedLocal<'_>>,
+        has_parameter: &dyn Fn(SqlName) -> bool,
+    ) -> Result<(), SqlError> {
+        match declarations.split_first() {
+            None => validate_block(block, locals, shadowed, has_parameter),
+            Some((first, rest)) => {
+                let local = ScopedLocal {
+                    label,
+                    name: first.name,
+                    constant: first.constant,
+                    parent: shadowed,
+                };
+                validate_scope(rest, label, block, locals, Some(&local), has_parameter)
+            }
+        }
     }
     validate_block(program.body, program.locals, None, has_parameter)
 }
@@ -23015,8 +23507,8 @@ fn resolve_plpgsql_rowtype(
     ) {
         let crate::storage::ResolvedRelation::Table(slot) = resolved else {
             return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "\"{}\" is not a table row type",
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "PL/pgSQL variables of the row type of view \"{}\" are not supported",
                 written
             ));
         };
@@ -23104,9 +23596,8 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         &|_| false,
     )?;
     let definition = crate::storage::RelationDefinition::EMPTY;
-    let invocation =
-        TriggerInvocation::anonymous(program.variable_conflict(guc.plpgsql_variable_conflict()))?
-            .with_input_sites(program.input_sites);
+    let invocation = TriggerInvocation::anonymous(program.settings(guc.plpgsql_settings()))?
+        .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
             engine,
@@ -23194,7 +23685,7 @@ pub(crate) fn execute_event_trigger<'a>(
         routine,
         event,
         tag,
-        program.variable_conflict(guc.plpgsql_variable_conflict()),
+        program.settings(guc.plpgsql_settings()),
         arena,
     )?
     .with_input_sites(program.input_sites);
@@ -23271,7 +23762,7 @@ pub(in crate::sql) fn execute_plpgsql_procedure<'a>(
     arena: &'a Arena,
     responder: &mut Responder<'_>,
     outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
-    compiled_conflict: super::guc::VariableConflict,
+    compiled_conflict: super::guc::PlpgsqlSettings,
     environment: &CallEnvironment,
     timing: Option<super::statistics::FunctionTiming>,
     retention: Option<&mut Option<SuspendedProcedure>>,
@@ -23325,14 +23816,14 @@ pub(in crate::sql) fn execute_plpgsql_procedure<'a>(
         (Some(saved), None) => saved.resume(
             &mut context,
             identity,
-            &|sites, variable_conflict| {
+            &|program| {
                 Ok(TriggerInvocation::procedure(
                     routine,
                     input_collation,
-                    variable_conflict.unwrap_or(compiled_conflict),
+                    program.settings(compiled_conflict),
                     arena,
                 )?
-                .with_input_sites(sites))
+                .with_input_sites(program.input_sites))
             },
             &|inputs| procedure_seeded_values(routine, inputs, arena),
             retention,
@@ -23345,7 +23836,7 @@ pub(in crate::sql) fn execute_plpgsql_procedure<'a>(
             let invocation = TriggerInvocation::procedure(
                 routine,
                 input_collation,
-                program.variable_conflict(compiled_conflict),
+                program.settings(compiled_conflict),
                 arena,
             )?
             .with_input_sites(program.input_sites);
@@ -23428,11 +23919,11 @@ pub(in crate::sql) fn execute_retained_anonymous_plpgsql<'a>(
         return saved.resume(
             &mut context,
             identity,
-            &|sites, variable_conflict| {
-                Ok(TriggerInvocation::anonymous(
-                    variable_conflict.unwrap_or(guc.plpgsql_variable_conflict()),
-                )?
-                .with_input_sites(sites))
+            &|program| {
+                Ok(
+                    TriggerInvocation::anonymous(program.settings(guc.plpgsql_settings()))?
+                        .with_input_sites(program.input_sites),
+                )
             },
             &|_| Ok(&[]),
             retention,
@@ -23447,9 +23938,8 @@ pub(in crate::sql) fn execute_retained_anonymous_plpgsql<'a>(
         arena,
         &|_| false,
     )?;
-    let invocation =
-        TriggerInvocation::anonymous(program.variable_conflict(guc.plpgsql_variable_conflict()))?
-            .with_input_sites(program.input_sites);
+    let invocation = TriggerInvocation::anonymous(program.settings(guc.plpgsql_settings()))?
+        .with_input_sites(program.input_sites);
     let execution = execution_frame::ExecutionFrame::new(
         arena,
         &code,
@@ -23531,6 +24021,7 @@ fn procedure_declarations<'a>(
             ));
         }
         declarations[count] = TriggerLocalDecl {
+            label: Some(routine.name),
             scope: PlpgsqlScope::Invocation,
             name: parameter.name,
             ctype: parameter.ctype,
@@ -23613,7 +24104,7 @@ fn run_plpgsql_procedure<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     routine: &crate::storage::RoutineDef,
     input_collation: crate::sql::ast::Collation,
-    compiled_conflict: super::guc::VariableConflict,
+    compiled_conflict: super::guc::PlpgsqlSettings,
     outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
 ) -> Result<usize, SqlError> {
     let arena = context.arena;
@@ -23685,6 +24176,7 @@ fn run_plpgsql_procedure<'a>(
             ));
         }
         declarations[declaration_count] = TriggerLocalDecl {
+            label: Some(routine.name),
             scope: PlpgsqlScope::Invocation,
             name: parameter.name,
             ctype: parameter.ctype,
@@ -23707,7 +24199,7 @@ fn run_plpgsql_procedure<'a>(
     let invocation = TriggerInvocation::procedure(
         routine,
         input_collation,
-        program.variable_conflict(compiled_conflict),
+        program.settings(compiled_conflict),
         arena,
     )?
     .with_input_sites(program.input_sites);
@@ -23808,7 +24300,7 @@ mod trigger_program_tests {
                 let parsed = parse_trigger_select_into(sql, &arena).unwrap().unwrap();
                 assert_eq!(parsed.targets.len(), names.len(), "{sql}");
                 for (target, expected) in parsed.targets.iter().zip(names) {
-                    assert_eq!(target.as_str(), *expected, "{sql}");
+                    assert_eq!(target.name.as_str(), *expected, "{sql}");
                 }
                 assert_eq!(parsed.strict, strict, "{sql}");
                 assert_eq!(parsed.query.set_body.is_some(), set, "{sql}");
@@ -24224,7 +24716,8 @@ mod trigger_program_tests {
     }
 }
 
-fn detached_trigger_row<'a>(
+/// Copies values into the arena so they outlive the rows they were read from.
+pub(crate) fn detached_values<'a>(
     values: &[Datum<'_>],
     arena: &'a Arena,
 ) -> Result<&'a mut [Datum<'a>], SqlError> {
@@ -24234,7 +24727,7 @@ fn detached_trigger_row<'a>(
         .map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "trigger row exceeds the statement arena"
+                "detached row exceeds the statement arena"
             )
         })?;
     projected::decode_projected_row_into(encoded, arena, row)?;
@@ -24301,6 +24794,63 @@ fn plpgsql_variable<'a>(
     })
 }
 
+/// The slot of `qualifier.name` as a labelled variable: the innermost `name`
+/// declared under the block, loop or routine label `qualifier`, unless a
+/// variable named `qualifier` is declared further in, which makes `name` its
+/// field.
+fn plpgsql_labeled_index(
+    locals: &[TriggerLocalDecl],
+    qualifier: &str,
+    name: &str,
+) -> Option<usize> {
+    let record = locals
+        .iter()
+        .rposition(|local| local.name.as_str() == qualifier);
+    locals
+        .iter()
+        .rposition(|local| {
+            local.name.as_str() == name
+                && local.label.is_some_and(|label| label.as_str() == qualifier)
+        })
+        .filter(|index| record.is_none_or(|record| record < *index))
+}
+
+/// The record variable whose field `qualifier.field` names: `record.field`,
+/// or `label.record.field` with a qualifier of two names.
+fn plpgsql_record_index(locals: &[TriggerLocalDecl], qualifier: &str) -> Option<usize> {
+    match qualifier.split_once('.') {
+        Some((label, record)) => plpgsql_labeled_index(locals, label, record),
+        None => locals
+            .iter()
+            .rposition(|local| local.name.as_str() == qualifier),
+    }
+}
+
+fn plpgsql_labeled_variable<'a>(
+    locals: &[TriggerLocalDecl],
+    values: &[Datum<'a>],
+    invocation: TriggerInvocation<'a>,
+    found: Option<bool>,
+    qualifier: &str,
+    name: &str,
+) -> Option<PlpgsqlVariable<'a>> {
+    if let Some(index) = plpgsql_labeled_index(locals, qualifier, name) {
+        return Some(PlpgsqlVariable {
+            value: values[index],
+            ctype: locals[index].ctype,
+            user_type: locals[index].user_type,
+        });
+    }
+    // The routine's label also names FOUND and its context variables.
+    (qualifier == invocation.routine_name
+        && !locals
+            .iter()
+            .any(|local| local.name.as_str() == name || local.name.as_str() == qualifier)
+        && TriggerExceptionVariable::parse(name).is_none())
+    .then(|| plpgsql_variable(locals, values, invocation, found, name))
+    .flatten()
+}
+
 struct TriggerLocalScope<'t, 'a> {
     locals: &'t [TriggerLocalDecl],
     values: &'t [Datum<'a>],
@@ -24318,6 +24868,31 @@ impl<'a> TriggerLocalScope<'_, 'a> {
         self.locals
             .iter()
             .rposition(|local| local.name.as_str() == name)
+    }
+
+    /// The variable `qualifier.name` names, unqualified or labelled.
+    fn named(&self, qualifier: Option<&str>, name: &str) -> Option<PlpgsqlVariable<'a>> {
+        match qualifier {
+            None => self.variable(name),
+            Some("old" | "new") => None,
+            Some(qualifier) => plpgsql_labeled_variable(
+                self.locals,
+                self.values,
+                self.invocation,
+                self.found,
+                qualifier,
+                name,
+            ),
+        }
+    }
+
+    /// The record variable whose field `qualifier.name` names.
+    fn record_index(&self, qualifier: Option<&str>, name: &str) -> Option<usize> {
+        let qualifier = qualifier.filter(|qualifier| !matches!(*qualifier, "old" | "new"))?;
+        if self.named(Some(qualifier), name).is_some() {
+            return None;
+        }
+        plpgsql_record_index(self.locals, qualifier)
     }
 
     fn cursor_locals(
@@ -24398,45 +24973,83 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<super::guc::VariableConflict> {
-        let answers = match qualifier {
-            None => self.variable(name).is_some(),
-            Some("old" | "new") => false,
-            Some(qualifier) => self
-                .local_index(qualifier)
+        let answers = self.named(qualifier, name).is_some()
+            || self
+                .record_index(qualifier, name)
                 .and_then(|index| match self.values[index] {
                     Datum::Record(fields) | Datum::Composite { fields, .. } => Some(fields),
                     _ => None,
                 })
-                .is_some_and(|fields| fields.iter().any(|field| field.name == name)),
-        };
+                .is_some_and(|fields| fields.iter().any(|field| field.name == name));
         answers.then_some(self.invocation.variable_conflict)
     }
 
-    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        if matches!(qualifier, Some("old" | "new")) {
-            return None;
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        if let Some(ctype) = self.col_type(qualifier, name) {
+            return Ok(ctype);
         }
-        self.variable(qualifier?)?
-            .record_field(name)
-            .map(|field| field.type_oid)
+        let error = match qualifier {
+            Some(qualifier @ ("old" | "new")) => sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column {}.{} does not exist",
+                qualifier,
+                name
+            ),
+            // A qualifier names a record variable or nothing in scope.
+            Some(qualifier) => match self.record_index(Some(qualifier), name) {
+                Some(_) => sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "record \"{}\" has no field \"{}\"",
+                    qualifier,
+                    name
+                ),
+                None => super::eval::empty_scope_column_error(Some(qualifier), name),
+            },
+            None => super::eval::empty_scope_column_error(None, name),
+        };
+        Err(crate::sql::error_position::column_reference(
+            error, qualifier, name,
+        ))
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        let index = self.record_index(qualifier, name)?;
+        PlpgsqlVariable {
+            value: self.values[index],
+            ctype: self.locals[index].ctype,
+            user_type: self.locals[index].user_type,
+        }
+        .record_field(name)
+        .map(|field| field.type_oid)
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if matches!(qualifier, Some("old" | "new")) {
             return self.transition.lookup(qualifier, name);
         }
-        if qualifier.is_none()
-            && let Some(variable) = self.variable(name)
-        {
+        if let Some(variable) = self.named(qualifier, name) {
             return Ok(variable.value);
         }
         if let Some(qualifier) = qualifier
-            && let Some(index) = self.local_index(qualifier)
+            && let Some(index) = self.record_index(Some(qualifier), name)
         {
             let fields = match self.values[index] {
                 Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
-                // An unassigned `record` has no field list yet; a NULL row of a
-                // declared row type reads its fields as NULL.
+                // A row-typed variable that was never assigned reads its
+                // fields as NULL. Its declared fields are not in scope here.
+                Datum::Null
+                    if matches!(
+                        self.locals[index].record_shape,
+                        Some(PlpgsqlRecordShape::Table(_))
+                    ) || matches!(self.locals[index].ctype, ColType::Composite(_)) =>
+                {
+                    return Ok(Datum::Null);
+                }
+                // An unassigned `record` has no field list yet.
                 Datum::Null if self.locals[index].ctype == ColType::Record => {
                     crate::sql::eval::stash_diagnostic(
                         Some(StackStr::from_str(
@@ -24449,9 +25062,6 @@ where
                         "record \"{}\" is not assigned yet",
                         qualifier
                     ));
-                }
-                Datum::Null if matches!(self.locals[index].ctype, ColType::Composite(_)) => {
-                    return Ok(Datum::Null);
                 }
                 _ => {
                     return Err(sql_err!(
@@ -24481,13 +25091,10 @@ where
         if matches!(qualifier, Some("old" | "new")) {
             return self.transition.col_type(qualifier, name);
         }
-        (qualifier.is_none())
-            .then(|| self.variable(name))
-            .flatten()
+        self.named(qualifier, name)
             .map(|variable| variable.ctype)
             .or_else(|| {
-                qualifier
-                    .and_then(|qualifier| self.local_index(qualifier))
+                self.record_index(qualifier, name)
                     .and_then(|index| match self.values[index] {
                         Datum::Record(fields) | Datum::Composite { fields, .. } => fields
                             .iter()
@@ -24503,19 +25110,7 @@ where
         if matches!(qualifier, Some("old" | "new")) {
             return self.transition.collation(qualifier, name);
         }
-        if qualifier.is_some_and(|qualifier| self.local_index(qualifier).is_some()) {
-            return if self
-                .col_type(qualifier, name)
-                .is_some_and(ColType::is_collatable)
-            {
-                crate::sql::ast::Collation::Default
-            } else {
-                crate::sql::ast::Collation::None
-            };
-        }
-        if qualifier.is_none()
-            && let Some(variable) = self.variable(name)
-        {
+        if let Some(variable) = self.named(qualifier, name) {
             let ctype = variable.ctype;
             return if ctype.is_collatable() {
                 if self.invocation.input_collation == crate::sql::ast::Collation::None {
@@ -24523,6 +25118,16 @@ where
                 } else {
                     self.invocation.input_collation
                 }
+            } else {
+                crate::sql::ast::Collation::None
+            };
+        }
+        if self.record_index(qualifier, name).is_some() {
+            return if self
+                .col_type(qualifier, name)
+                .is_some_and(ColType::is_collatable)
+            {
+                crate::sql::ast::Collation::Default
             } else {
                 crate::sql::ast::Collation::None
             };
@@ -24564,8 +25169,8 @@ where
         if matches!(qualifier, Some("old" | "new")) {
             return self.transition.column_user_type(qualifier, name);
         }
-        if qualifier.is_none() {
-            return self.variable(name).and_then(|variable| variable.user_type);
+        if let Some(variable) = self.named(qualifier, name) {
+            return variable.user_type;
         }
         self.transition.column_user_type(qualifier, name)
     }
@@ -24694,6 +25299,22 @@ impl<'a> TriggerDmlSnapshot<'a> {
     fn variable(&self, name: &str) -> Option<PlpgsqlVariable<'a>> {
         plpgsql_variable(self.locals, self.values, self.invocation, self.found, name)
     }
+
+    /// The variable `qualifier.name` names, unqualified or labelled.
+    fn named(&self, qualifier: Option<&str>, name: &str) -> Option<PlpgsqlVariable<'a>> {
+        match qualifier {
+            None => self.variable(name),
+            Some("old" | "new") => None,
+            Some(qualifier) => plpgsql_labeled_variable(
+                self.locals,
+                self.values,
+                self.invocation,
+                self.found,
+                qualifier,
+                name,
+            ),
+        }
+    }
 }
 
 impl<'stored, 'value> ColumnLookup<'value> for TriggerDmlSnapshot<'stored>
@@ -24701,7 +25322,7 @@ where
     'stored: 'value,
 {
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        if matches!(qualifier, Some("old" | "new")) {
+        if matches!(qualifier, Some("old" | "new")) || self.named(qualifier, name).is_some() {
             return None;
         }
         self.variable(qualifier?)?
@@ -24710,6 +25331,9 @@ where
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
+        if let Some(variable) = self.named(qualifier, name) {
+            return Ok(variable.value);
+        }
         if let Some(qualifier) = qualifier {
             if !matches!(qualifier, "old" | "new")
                 && let Some(variable) = self.variable(qualifier)
@@ -24753,9 +25377,6 @@ where
             };
             return Ok(values[column]);
         }
-        if let Some(variable) = self.variable(name) {
-            return Ok(variable.value);
-        }
         Err(sql_err!(
             sqlstate::UNDEFINED_COLUMN,
             "column \"{}\" does not exist",
@@ -24764,8 +25385,8 @@ where
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        if qualifier.is_none() {
-            return self.variable(name).map(|variable| variable.ctype);
+        if let Some(variable) = self.named(qualifier, name) {
+            return Some(variable.ctype);
         }
         self.definition
             .column_index(name)
@@ -24774,8 +25395,8 @@ where
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        if qualifier.is_none() {
-            let ctype = self.variable(name).map(|variable| variable.ctype);
+        {
+            let ctype = self.named(qualifier, name).map(|variable| variable.ctype);
             if let Some(ctype) = ctype {
                 return if ctype.is_collatable() {
                     if self.invocation.input_collation == crate::sql::ast::Collation::None {
@@ -24800,8 +25421,8 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        if qualifier.is_none() {
-            return self.variable(name).and_then(|variable| variable.user_type);
+        if let Some(variable) = self.named(qualifier, name) {
+            return variable.user_type;
         }
         self.definition
             .column_index(name)
@@ -25319,21 +25940,124 @@ fn in_simple_expression<T>(
 /// The error PostgreSQL's planner raises folding `expression`'s constant
 /// subexpressions (literals combined by operators and casts), in the order
 /// it folds them, if any.
-fn constant_fold_error(expression: &Expr<'_>, arena: &Arena) -> Option<SqlError> {
-    fn constant(expression: &Expr<'_>) -> bool {
-        match expression {
-            Expr::Null
-            | Expr::Bool(_)
-            | Expr::Int(_)
-            | Expr::Float(_)
-            | Expr::NumericLit(_)
-            | Expr::Str(_) => true,
-            Expr::Unary { operand, .. } | Expr::Cast { operand, .. } => constant(operand),
-            Expr::Binary { left, right, .. } => constant(left) && constant(right),
-            _ => false,
-        }
+/// Whether PostgreSQL's planner folds `expression` to a constant: literals
+/// combined by operators and casts.
+fn folds_to_constant(expression: &Expr<'_>) -> bool {
+    match expression {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_) => true,
+        Expr::Unary { operand, .. } | Expr::Cast { operand, .. } => folds_to_constant(operand),
+        Expr::Binary { left, right, .. } => folds_to_constant(left) && folds_to_constant(right),
+        _ => false,
     }
-    if constant(expression) {
+}
+
+/// PL/pgSQL converts a value assigned to an array element as it converts one
+/// assigned to a variable: with an assignment cast when one exists and
+/// otherwise through text, so `x[1] := true` for an integer array fails with
+/// `invalid input syntax for type integer: "t"`. The value is evaluated once
+/// here and the element setter receives the converted value.
+///
+/// Also returns whether planning could fold the conversion: PostgreSQL folds a
+/// constant's conversion through text only when the type's output function
+/// is immutable, which a date's, for example, is not.
+fn plpgsql_element_assignment<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    assignment: TriggerLocalAssignment<'a>,
+    locals: &[TriggerLocalDecl],
+    scope: &TriggerLocalScope<'_, 'a>,
+) -> Result<(&'a Expr<'a>, bool), SqlError> {
+    let Expr::Call {
+        name: "__jsonb_subscript_set",
+        args,
+        ..
+    } = assignment.expression
+    else {
+        return Ok((assignment.expression, true));
+    };
+    let element = match locals
+        .iter()
+        .rfind(|local| assignment.name.names(local))
+        .map(|local| (local.ctype, local.user_type))
+    {
+        Some((ColType::Array(element), None)) => element,
+        _ => return Ok((assignment.expression, true)),
+    };
+    let source = args[1];
+    let original = eval_procedural_expression(context, source, scope, None)?;
+    let arena = context.arena;
+    let value = plpgsql_conversion_input(
+        original,
+        Some(element.element_oid()),
+        context.storage(),
+        context.txn.txid,
+        arena,
+    )?;
+    let foldable = original.type_oid() == value.type_oid()
+        || !matches!(
+            original,
+            Datum::Date(_)
+                | Datum::Timestamp(_)
+                | Datum::Timestamptz(_)
+                | Datum::Interval(_)
+                | Datum::Money(_)
+                | Datum::Regtype { .. }
+                | Datum::RegObject { .. }
+                | Datum::AclItem(_)
+                | Datum::Array { .. }
+                | Datum::Range { .. }
+                | Datum::Multirange { .. }
+                | Datum::Record(_)
+                | Datum::Composite { .. }
+                | Datum::CompositeText { .. }
+        );
+    let literal = arena
+        .alloc(Expr::BoundLiteral {
+            value: crate::sql::ast::BoundLiteralValue::CachedDefault(encode_projected_pub(
+                &[value],
+                arena,
+            )?),
+            type_oid: value.type_oid(),
+            type_mod: -1,
+            collation: None,
+            source,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let args = arena
+        .alloc_slice_with(
+            args.len(),
+            |index| if index == 1 { &*literal } else { args[index] },
+        )
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut call = *assignment.expression;
+    if let Expr::Call { args: slot, .. } = &mut call {
+        *slot = args;
+    }
+    arena
+        .alloc(call)
+        .map(|call| (&*call, foldable))
+        .map_err(|_| super::query::arena_full_pub())
+}
+
+/// The value a PL/pgSQL assignment stores: a subscripted target's
+/// assigned element, otherwise the whole expression.
+fn assigned_value<'e, 'a>(expression: &'e Expr<'a>) -> &'e Expr<'a> {
+    match expression {
+        Expr::Call {
+            name: "__jsonb_subscript_set" | "__array_subscript_set",
+            args: [_, value, ..],
+            ..
+        } => value,
+        _ => expression,
+    }
+}
+
+fn constant_fold_error(expression: &Expr<'_>, arena: &Arena) -> Option<SqlError> {
+    if folds_to_constant(expression) {
         if matches!(
             expression,
             Expr::Unary { .. } | Expr::Binary { .. } | Expr::Cast { .. }
@@ -28298,6 +29022,7 @@ fn allocate_plpgsql_local_values<'a>(
 
 fn empty_plpgsql_local() -> TriggerLocalDecl {
     TriggerLocalDecl {
+        label: None,
         scope: PlpgsqlScope::Invocation,
         name: SqlName::EMPTY,
         ctype: ColType::Bool,
@@ -28309,16 +29034,25 @@ fn empty_plpgsql_local() -> TriggerLocalDecl {
     }
 }
 
-fn trigger_local_index(locals: &[TriggerLocalDecl], name: SqlName) -> Result<usize, SqlError> {
+fn trigger_local_index(
+    locals: &[TriggerLocalDecl],
+    name: PlpgsqlVariableName,
+) -> Result<usize, SqlError> {
     locals
         .iter()
-        .rposition(|local| local.name == name)
-        .ok_or_else(|| {
-            sql_err!(
+        .rposition(|local| name.names(local))
+        .ok_or_else(|| match name.label {
+            Some(label) => sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "\"{}.{}\" is not a known variable",
+                label.as_str(),
+                name.name.as_str()
+            ),
+            None => sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "PL/pgSQL local \"{}\" does not exist",
-                name.as_str()
-            )
+                name.name.as_str()
+            ),
         })
 }
 
@@ -28332,10 +29066,69 @@ fn coerce_plpgsql_local<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let value = match local.record_shape {
         Some(PlpgsqlRecordShape::Table(slot)) => {
+            let definition = storage.table_def(usize::from(slot), txid);
+            let mut target_oids = [0; MAX_COLUMNS];
+            for (oid, column) in target_oids.iter_mut().zip(definition.columns()) {
+                *oid = column.ctype.oid();
+            }
+            let value = fit_plpgsql_row(
+                value,
+                &target_oids[..definition.n_columns],
+                storage,
+                txid,
+                arena,
+            )?;
             coerce_plpgsql_table_rowtype(slot, value, storage, txid, arena, sequences)?
         }
+        None if let ColType::Composite(Some(creation)) = local.ctype
+            && match value {
+                Datum::Record(_) => true,
+                Datum::Composite { slot, .. } => slot != creation,
+                _ => false,
+            } =>
+        {
+            let definition = storage
+                .read_composite_definition(
+                    crate::storage::TypeDefinitionTarget::by_creation(
+                        storage,
+                        crate::storage::NamedTypeKind::Composite,
+                        creation,
+                    )?,
+                    txid,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist")
+                })?;
+            let mut target_oids = [0; MAX_COLUMNS];
+            let mut width = 0;
+            for (oid, field) in target_oids.iter_mut().zip(definition.active_fields()) {
+                *oid = storage
+                    .routine_type_oid(field.ctype, field.user_type, txid)
+                    .unwrap_or(field.ctype.oid());
+                width += 1;
+            }
+            let value = fit_plpgsql_row(value, &target_oids[..width], storage, txid, arena)?;
+            coerce_routine_argument(
+                value,
+                crate::storage::RoutineArgumentDef {
+                    name: local.name,
+                    ctype: local.ctype,
+                    user_type: local.user_type,
+                },
+                storage,
+                txid,
+                arena,
+                Some(sequences),
+            )?
+        }
         Some(PlpgsqlRecordShape::Dynamic) | None => coerce_routine_argument(
-            value,
+            plpgsql_conversion_input(
+                value,
+                storage.routine_type_oid(local.ctype, local.user_type, txid),
+                storage,
+                txid,
+                arena,
+            )?,
             crate::storage::RoutineArgumentDef {
                 name: local.name,
                 ctype: local.ctype,
@@ -28356,6 +29149,77 @@ fn coerce_plpgsql_local<'a>(
         ));
     }
     Ok(value)
+}
+
+/// PL/pgSQL moves a row into a row-typed variable by position
+/// (`exec_move_row`): missing fields become NULL, extra ones are ignored and
+/// each field converts as an assignment would. A composite value of another
+/// type is taken apart the same way; a scalar keeps its ordinary conversion.
+fn fit_plpgsql_row<'a>(
+    value: Datum<'a>,
+    target_oids: &[i32],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let (Datum::Record(fields) | Datum::Composite { fields, .. }) = value else {
+        return Ok(value);
+    };
+    let fitted = arena
+        .alloc_slice_with(target_oids.len(), |index| RecordField {
+            name: "",
+            type_oid: target_oids[index],
+            value: Datum::Null,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    for ((out, &target), source) in fitted.iter_mut().zip(target_oids).zip(fields) {
+        let converted = plpgsql_conversion_input(source.value, Some(target), storage, txid, arena)?;
+        *out = RecordField {
+            name: source.name,
+            type_oid: if matches!(converted, Datum::Text(_))
+                && !matches!(source.value, Datum::Text(_))
+            {
+                crate::sql::types::oid::TEXT
+            } else {
+                source.type_oid
+            },
+            value: converted,
+        };
+    }
+    Ok(Datum::Record(&*fitted))
+}
+
+/// PL/pgSQL converts a value to a declared type (`exec_cast_value`) with an
+/// assignment cast when one exists and otherwise through text: the value's
+/// output is read by the target type's input routine, so `true` assigned to
+/// an integer fails as `invalid input syntax for type integer: "t"`.
+pub(crate) fn plpgsql_conversion_input<'a>(
+    value: Datum<'a>,
+    target_oid: Option<i32>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let Some(target_oid) = target_oid else {
+        return Ok(value);
+    };
+    if value.is_null()
+        || crate::sql::catalog::can_coerce_assignment(storage, txid, value.type_oid(), target_oid)
+    {
+        return Ok(value);
+    }
+    let text = match value {
+        Datum::Bool(value) => {
+            if value {
+                "t"
+            } else {
+                "f"
+            }
+        }
+        Datum::Bpchar(text) => text,
+        value => crate::sql::eval::cast_to_text(value, arena)?,
+    };
+    Ok(Datum::Text(text))
 }
 
 fn coerce_plpgsql_table_rowtype<'a>(
@@ -28424,10 +29288,29 @@ fn assign_trigger_local<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl],
     values: &mut [Datum<'a>],
-    target: SqlName,
+    target: PlpgsqlVariableName,
     value: Datum<'a>,
 ) -> Result<(), SqlError> {
-    let index = trigger_local_index(locals, target)?;
+    let index = match trigger_local_index(locals, target) {
+        Ok(index) => index,
+        // `r.f := ...` names field `f` of row variable `r` when no block
+        // labelled `r` declares `f`.
+        Err(error) => {
+            let Some(record) = target.label.and_then(|label| {
+                trigger_local_index(locals, PlpgsqlVariableName::plain(label)).ok()
+            }) else {
+                return Err(error);
+            };
+            return assign_trigger_record_field(
+                context,
+                locals,
+                values,
+                record,
+                target.name,
+                value,
+            );
+        }
+    };
     if locals[index].constant {
         return Err(sql_err!(
             sqlstate::ERROR_IN_ASSIGNMENT,
@@ -28449,6 +29332,158 @@ fn assign_trigger_local<'a>(
         &sequences,
     )?;
     Ok(())
+}
+
+/// Replaces one field of a row or record variable and stores the row through
+/// the variable's ordinary conversion. A record variable's field keeps its
+/// current type, as in PostgreSQL.
+fn assign_trigger_record_field<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    locals: &[TriggerLocalDecl],
+    values: &mut [Datum<'a>],
+    record: usize,
+    field: SqlName,
+    value: Datum<'a>,
+) -> Result<(), SqlError> {
+    let local = locals[record];
+    if local.constant {
+        return Err(sql_err!(
+            sqlstate::ERROR_IN_ASSIGNMENT,
+            "variable \"{}\" is declared CONSTANT",
+            local.name.as_str()
+        ));
+    }
+    let storage = context.storage();
+    let txid = context.txn.txid;
+    let arena = context.arena;
+    let declared = |names: &mut dyn Iterator<Item = (&str, i32)>| {
+        let mut fields = [RecordField {
+            name: "",
+            type_oid: 0,
+            value: Datum::Null,
+        }; MAX_COLUMNS];
+        let mut count = 0;
+        for (slot, (name, type_oid)) in fields.iter_mut().zip(names) {
+            *slot = RecordField {
+                name: arena
+                    .alloc_str(name)
+                    .map_err(|_| super::query::arena_full_pub())?,
+                type_oid,
+                value: Datum::Null,
+            };
+            count += 1;
+        }
+        arena
+            .alloc_slice_copy(&fields[..count])
+            .map(|fields| &*fields)
+            .map_err(|_| super::query::arena_full_pub())
+    };
+    let current: &[RecordField<'a>] = match (values[record], local.record_shape, local.ctype) {
+        (Datum::Record(fields) | Datum::Composite { fields, .. }, _, _) => fields,
+        (Datum::Null, Some(PlpgsqlRecordShape::Table(slot)), _) => {
+            let definition = storage.table_def(usize::from(slot), txid);
+            declared(
+                &mut definition
+                    .columns()
+                    .iter()
+                    .map(|column| (column.name.as_str(), column.ctype.oid())),
+            )?
+        }
+        (Datum::Null, None, ColType::Composite(Some(creation))) => {
+            let definition = storage
+                .read_composite_definition(
+                    crate::storage::TypeDefinitionTarget::by_creation(
+                        storage,
+                        crate::storage::NamedTypeKind::Composite,
+                        creation,
+                    )?,
+                    txid,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist")
+                })?;
+            declared(&mut definition.active_fields().map(|field| {
+                (
+                    field.name.as_str(),
+                    storage
+                        .routine_type_oid(field.ctype, field.user_type, txid)
+                        .unwrap_or(field.ctype.oid()),
+                )
+            }))?
+        }
+        (Datum::Null, Some(PlpgsqlRecordShape::Dynamic), _) => {
+            crate::sql::eval::stash_diagnostic(
+                Some(crate::util::StackStr::from_str(
+                    "The tuple structure of a not-yet-assigned record is indeterminate.",
+                )),
+                None,
+            );
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "record \"{}\" is not assigned yet",
+                local.name.as_str()
+            ));
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "\"{}.{}\" is not a known variable",
+                local.name.as_str(),
+                field.as_str()
+            ));
+        }
+    };
+    let Some(position) = current
+        .iter()
+        .position(|candidate| candidate.name == field.as_str())
+    else {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "record \"{}\" has no field \"{}\"",
+            local.name.as_str(),
+            field.as_str()
+        ));
+    };
+    let fields = arena
+        .alloc_slice_copy(current)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let old = fields[position];
+    fields[position] = if matches!(local.record_shape, Some(PlpgsqlRecordShape::Dynamic))
+        && let Some((ctype, user_type)) = catalog_column_type(storage, txid, old.type_oid)
+    {
+        let sequences = crate::sql::sequence::SeqEval::new(storage, context.seq_session(), txid);
+        RecordField {
+            value: coerce_routine_argument(
+                plpgsql_conversion_input(value, Some(old.type_oid), storage, txid, arena)?,
+                crate::storage::RoutineArgumentDef {
+                    name: field,
+                    ctype,
+                    user_type,
+                },
+                storage,
+                txid,
+                arena,
+                Some(&sequences),
+            )?,
+            ..old
+        }
+    } else {
+        RecordField {
+            type_oid: value.type_oid(),
+            value,
+            ..old
+        }
+    };
+    assign_trigger_local(
+        context,
+        locals,
+        values,
+        PlpgsqlVariableName {
+            label: local.label,
+            name: local.name,
+        },
+        Datum::Record(&*fields),
+    )
 }
 
 /// A `RAISE` format with its `%` placeholders replaced by the arguments'
@@ -29037,7 +30072,7 @@ fn prepare_static_plpgsql_statement<'a>(
                 context.arena,
             )?,
         },
-        TriggerStatement::Dml { .. } => {
+        TriggerStatement::Dml { into, .. } => {
             let restored = restore_plpgsql_statement(
                 site.text,
                 prepared.bindings,
@@ -29059,6 +30094,7 @@ fn prepare_static_plpgsql_statement<'a>(
             TriggerStatement::Dml {
                 source: site.text,
                 statement,
+                into,
             }
         }
         statement => statement,
@@ -29224,14 +30260,24 @@ fn execute_trigger_step_in<'a>(
         }
         let (rows, output) = resume_nested_write(context, status)?;
         match statement {
-            TriggerStatement::Dml { .. } => {
-                if output.is_some() {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "static write has unexpected returned values"
-                    ));
-                }
-                status.set_rows(rows)?;
+            TriggerStatement::Dml {
+                statement, into, ..
+            } => {
+                let returns = match statement {
+                    TriggerDml::Insert(statement) => !statement.returning.is_empty(),
+                    TriggerDml::Update(statement) => !statement.returning.is_empty(),
+                    TriggerDml::Delete(statement) => !statement.returning.is_empty(),
+                };
+                finish_resumed_static_write(
+                    context,
+                    locals,
+                    local_values,
+                    into,
+                    returns,
+                    rows,
+                    output,
+                    status,
+                )?;
             }
             TriggerStatement::DynamicQuery(_) => {
                 if output.is_some() {
@@ -29249,8 +30295,12 @@ fn execute_trigger_step_in<'a>(
                         "nested write lost its returned values"
                     )
                 })?;
-                let (values, returned) = match output {
-                    write_completion::NestedWriteOutput::Rows { values, rows } => (values, rows),
+                let (values, returned, arguments) = match output {
+                    write_completion::NestedWriteOutput::Rows {
+                        values,
+                        rows,
+                        arguments,
+                    } => (values, rows, arguments),
                     write_completion::NestedWriteOutput::NoResult => {
                         status.set_row_count(rows)?;
                         return Err(sql_err!(
@@ -29266,11 +30316,13 @@ fn execute_trigger_step_in<'a>(
                     ));
                 }
                 let selected = values.decode(context.arena)?;
+                let arguments = arguments.decode(context.arena)?;
                 finish_dynamic_into(
                     context,
                     locals,
                     local_values,
                     statement,
+                    arguments,
                     selected,
                     rows,
                     status,
@@ -29413,11 +30465,7 @@ fn execute_trigger_step_in<'a>(
                                 .alloc_slice_with(status.outputs.len(), |_| Datum::Null)
                                 .map_err(|_| super::query::arena_full_pub())?;
                             for (value, output) in values.iter_mut().zip(status.outputs.iter()) {
-                                *value = if output.shadow_depth == 0 {
-                                    local_values[output.local]
-                                } else {
-                                    output.value.read(0, arena)?
-                                };
+                                *value = local_values[output.local];
                             }
                             values
                         }
@@ -29657,30 +30705,81 @@ fn execute_trigger_step_in<'a>(
                 invocation,
                 transition: &transition,
             };
+            let folded = folds_to_constant(assigned_value(assignment.expression));
+            let (expression, foldable) =
+                plpgsql_element_assignment(context, assignment, locals, &scope)?;
+            let folded = folded && foldable;
+            let assignment = TriggerLocalAssignment {
+                expression,
+                ..assignment
+            };
+            if folded
+                && let Some(statement) = crate::sql::error_context::innermost_assignment()
+                && (locals.iter().any(|local| assignment.name.names(local))
+                    || assignment.name.label.is_some_and(|label| {
+                        locals
+                            .iter()
+                            .any(|local| PlpgsqlVariableName::plain(label).names(local))
+                    }))
+            {
+                // PostgreSQL folds a constant's conversion to the target's
+                // (or a subscripted target's element) type while planning
+                // the assignment, so the failure has the assignment's
+                // context and points at a literal.
+                // A subscripted target converts its element while the
+                // expression runs; a plain one when the value is stored.
+                let value = if core::ptr::eq(
+                    assigned_value(assignment.expression),
+                    assignment.expression,
+                ) {
+                    eval_procedural_expression(
+                        context,
+                        assignment.expression,
+                        &scope,
+                        retained_parent.then_some(&mut status.pending_query),
+                    )?
+                } else {
+                    in_procedural_query(
+                        statement,
+                        crate::sql::error_context::QueryMode::Assignment,
+                        false,
+                        || {
+                            eval_procedural_expression(
+                                context,
+                                assignment.expression,
+                                &scope,
+                                retained_parent.then_some(&mut status.pending_query),
+                            )
+                        },
+                    )?
+                };
+                in_procedural_query(
+                    statement,
+                    crate::sql::error_context::QueryMode::Assignment,
+                    false,
+                    || {
+                        assign_trigger_local(context, locals, local_values, assignment.name, value)
+                            .map_err(|error| match assignment.expression {
+                                Expr::Str(literal) => {
+                                    crate::sql::error_position::at_subject(error, literal)
+                                }
+                                _ => error,
+                            })
+                    },
+                )?;
+                return Ok(None);
+            }
             let value = eval_procedural_expression(
                 context,
                 assignment.expression,
                 &scope,
                 retained_parent.then_some(&mut status.pending_query),
             )?;
-            if let Expr::Str(literal) = assignment.expression
-                && let Some(statement) = crate::sql::error_context::innermost_assignment()
-                && locals.iter().any(|local| local.name == assignment.name)
-            {
-                // PostgreSQL converts a literal to the target's type while
-                // analysing the assignment, so the failure points at it.
-                in_procedural_query(
-                    statement,
-                    crate::sql::error_context::QueryMode::Assignment,
-                    true,
-                    || {
-                        assign_trigger_local(context, locals, local_values, assignment.name, value)
-                            .map_err(|error| crate::sql::error_position::at_subject(error, literal))
-                    },
-                )?;
-            } else if locals.iter().any(|local| local.name == assignment.name) {
+            if locals.iter().any(|local| assignment.name.names(local)) {
                 assign_trigger_local(context, locals, local_values, assignment.name, value)?;
-            } else if TriggerStatusVariable::parse(assignment.name.as_str()).is_some() {
+            } else if assignment.name.label.is_none()
+                && TriggerStatusVariable::parse(assignment.name.name.as_str()).is_some()
+            {
                 status.found = match cast_to(value, ColType::Bool, context.arena)? {
                     Datum::Bool(value) => Some(value),
                     Datum::Null => None,
@@ -29693,7 +30792,10 @@ fn execute_trigger_step_in<'a>(
             Ok(None)
         }),
         TriggerStatement::CursorOpen(statement) => execute_trigger_statement(|| {
-            let changed = [trigger_local_index(locals, statement.variable)?];
+            let changed = [trigger_local_index(
+                locals,
+                PlpgsqlVariableName::plain(statement.variable),
+            )?];
             cursor_statement_effect(
                 context,
                 &invocation,
@@ -29705,7 +30807,10 @@ fn execute_trigger_step_in<'a>(
                 local_values,
                 status,
                 |context, local_values, status, completed| {
-                    let local = trigger_local_index(locals, statement.variable)?;
+                    let local = trigger_local_index(
+                        locals,
+                        PlpgsqlVariableName::plain(statement.variable),
+                    )?;
                     if locals[local].ctype != ColType::Refcursor {
                         return Err(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
@@ -29915,7 +31020,7 @@ fn execute_trigger_step_in<'a>(
                             context,
                             locals,
                             local_values,
-                            statement.variable,
+                            PlpgsqlVariableName::plain(statement.variable),
                             Datum::Text(name),
                         )?;
                     }
@@ -29944,7 +31049,10 @@ fn execute_trigger_step_in<'a>(
                 local_values,
                 status,
                 |context, local_values, status, completed| {
-                    let local = trigger_local_index(locals, statement.variable)?;
+                    let local = trigger_local_index(
+                        locals,
+                        PlpgsqlVariableName::plain(statement.variable),
+                    )?;
                     if locals[local].ctype != ColType::Refcursor {
                         return Err(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
@@ -30122,7 +31230,7 @@ fn execute_trigger_step_in<'a>(
                 local_values,
                 status,
                 |context, local_values, _status, _completed| {
-                    let local = trigger_local_index(locals, variable)?;
+                    let local = trigger_local_index(locals, PlpgsqlVariableName::plain(variable))?;
                     if locals[local].ctype != ColType::Refcursor {
                         return Err(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
@@ -30272,14 +31380,6 @@ fn execute_trigger_step_in<'a>(
                             )
                         },
                         &mut |values| {
-                            if !record_target && values.len() != statement.targets.len() {
-                                return Err(sql_err!(
-                                    sqlstate::DATATYPE_MISMATCH,
-                                    "query returned {} columns but SELECT INTO expects {}",
-                                    values.len(),
-                                    statement.targets.len()
-                                ));
-                            }
                             if record_target && values.len() != record_width {
                                 return Err(sql_err!(
                                     sqlstate::INTERNAL_ERROR,
@@ -30306,8 +31406,13 @@ fn execute_trigger_step_in<'a>(
                                         .map_err(|_| super::query::arena_full_pub())?;
                                     selected[0] = Datum::Record(&*fields);
                                 } else {
-                                    for (index, value) in values.iter().copied().enumerate() {
-                                        selected[index] = detached_trigger_datum(value, arena)?;
+                                    // Extra columns are ignored and missing
+                                    // ones leave their targets NULL.
+                                    for (slot, value) in selected[..statement.targets.len()]
+                                        .iter_mut()
+                                        .zip(values.iter().copied())
+                                    {
+                                        *slot = detached_trigger_datum(value, arena)?;
                                     }
                                 }
                                 found = true;
@@ -30334,20 +31439,14 @@ fn execute_trigger_step_in<'a>(
             // query, outside its context.
             crate::sql::error_context::outside_query(|| {
                 if statement.strict {
+                    let parameters = StrictParameters::Variables {
+                        locals,
+                        values: &local_values[..locals.len()],
+                    };
                     match row_count {
-                        0 => {
-                            return Err(sql_err!(
-                                sqlstate::NO_DATA_FOUND,
-                                "query returned no rows"
-                            ));
-                        }
+                        0 => return Err(no_rows_returned(parameters, context.arena)),
                         1 => {}
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::TOO_MANY_ROWS,
-                                "query returned more than one row"
-                            ));
-                        }
+                        _ => return Err(too_many_rows_returned(parameters, context.arena)),
                     }
                 }
                 for (index, _) in targets[..statement.targets.len()].iter().enumerate() {
@@ -30517,14 +31616,6 @@ fn execute_trigger_step_in<'a>(
                     Ok(())
                 };
                 let mut capture = |values: &[Datum]| {
-                    if !record_target && values.len() != statement.targets.len() {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "query returned {} columns but EXECUTE INTO expects {}",
-                            values.len(),
-                            statement.targets.len()
-                        ));
-                    }
                     if record_target && record_width != 0 && values.len() != record_width {
                         return Err(sql_err!(
                             sqlstate::INTERNAL_ERROR,
@@ -30552,8 +31643,13 @@ fn execute_trigger_step_in<'a>(
                                 .map_err(|_| super::query::arena_full_pub())?;
                             selected[0] = Datum::Record(&*fields);
                         } else {
-                            for (index, value) in values.iter().copied().enumerate() {
-                                selected[index] = detached_trigger_datum(value, arena)?;
+                            // Extra columns are ignored and missing ones
+                            // leave their targets NULL.
+                            for (slot, value) in selected[..statement.targets.len()]
+                                .iter_mut()
+                                .zip(values.iter().copied())
+                            {
+                                *slot = detached_trigger_datum(value, arena)?;
                             }
                         }
                         found = true;
@@ -30709,6 +31805,7 @@ fn execute_trigger_step_in<'a>(
                                     pending.save_output(
                                         values,
                                         row_count as u64,
+                                        query.arguments,
                                         &context.storage().row_work,
                                     )?;
                                 }
@@ -30748,6 +31845,7 @@ fn execute_trigger_step_in<'a>(
                     locals,
                     local_values,
                     statement,
+                    query.arguments,
                     &selected[..statement.targets.len()],
                     row_count as u64,
                     status,
@@ -30871,7 +31969,7 @@ fn execute_trigger_step_in<'a>(
                         context,
                         locals,
                         local_values,
-                        *name,
+                        PlpgsqlVariableName::plain(*name),
                         outputs.values[usize::from(output)],
                     )?;
                 }
@@ -31218,6 +32316,7 @@ fn execute_trigger_step_in<'a>(
         }
         TriggerStatement::Dml {
             statement: TriggerDml::Insert(statement),
+            into,
             ..
         } => execute_trigger_statement(|| {
             let statement = match transition_relations {
@@ -31295,6 +32394,9 @@ fn execute_trigger_step_in<'a>(
                 Some(_) => Some(snapshot_trigger_dml_scope(&scope, context.arena)?),
                 None => None,
             };
+            let returns = !statement.returning.is_empty();
+            let mut returning =
+                StaticReturning::new(context, locals, into, Stmt::Insert(statement))?;
             let arena = context.arena;
             let params = context.params;
             let boundary = context.nested_write_boundary();
@@ -31311,6 +32413,11 @@ fn execute_trigger_step_in<'a>(
                 });
             responder.clear_affected_rows();
             let outcome = responder.without_command_complete(|responder| {
+                let mut capture =
+                    |_: &Storage,
+                     _: u32,
+                     _: &dyn crate::sql::eval::SequenceAccess,
+                     values: &[Datum<'_>]| { returning.capture(values, arena) };
                 insert(
                     storage,
                     txn,
@@ -31321,7 +32428,7 @@ fn execute_trigger_step_in<'a>(
                     params,
                     seq_session,
                     responder,
-                    None,
+                    returns.then_some(&mut capture as &mut super::ReturningCapture<'_>),
                     Some(&scope),
                     transition_relations,
                     conflict_scope,
@@ -31341,23 +32448,50 @@ fn execute_trigger_step_in<'a>(
                 None
             };
             if let Some(completion) = completion {
-                status.pending_write = Some(write_completion::PendingNestedWrite::new(
-                    command.suspend(),
-                    completion,
-                ));
+                let mut pending =
+                    write_completion::PendingNestedWrite::new(command.suspend(), completion);
+                if into.is_some() && returns {
+                    let returned = returning.rows;
+                    pending.save_output(
+                        Some(returning.values(context.arena)?),
+                        returned,
+                        &[],
+                        &context.storage().row_work,
+                    )?;
+                }
+                status.pending_write = Some(pending);
                 let (rows, output) = resume_nested_write(context, status)?;
-                debug_assert!(output.is_none());
-                status.set_rows(rows)?;
+                finish_resumed_static_write(
+                    context,
+                    locals,
+                    local_values,
+                    into,
+                    returns,
+                    rows,
+                    output,
+                    status,
+                )?;
                 return Ok(None);
             }
             drop(command);
             match outcome {
-                Ok(Ok(())) => status.set_rows(
-                    context
+                Ok(Ok(())) => {
+                    let rows = context
                         .responder
                         .take_affected_rows()
-                        .expect("trigger INSERT publishes an affected-row count"),
-                )?,
+                        .expect("trigger INSERT publishes an affected-row count");
+                    let selected = returning.values(context.arena)?;
+                    finish_static_returning(
+                        context,
+                        locals,
+                        local_values,
+                        into,
+                        returns,
+                        selected,
+                        rows,
+                        status,
+                    )?;
+                }
                 Ok(Err(error)) => return Err(error),
                 Err(_) => {
                     return Err(sql_err!(
@@ -31371,6 +32505,7 @@ fn execute_trigger_step_in<'a>(
         }),
         TriggerStatement::Dml {
             statement: TriggerDml::Update(statement),
+            into,
             ..
         } => execute_trigger_statement(|| {
             let statement = match transition_relations {
@@ -31412,6 +32547,9 @@ fn execute_trigger_step_in<'a>(
                 invocation,
                 transition: &transition,
             };
+            let returns = !statement.returning.is_empty();
+            let mut returning =
+                StaticReturning::new(context, locals, into, Stmt::Update(statement))?;
             let arena = context.arena;
             let params = context.params;
             let boundary = context.nested_write_boundary();
@@ -31434,6 +32572,11 @@ fn execute_trigger_step_in<'a>(
             })?;
             responder.clear_affected_rows();
             let outcome = responder.without_command_complete(|responder| {
+                let mut capture =
+                    |_: &Storage,
+                     _: u32,
+                     _: &dyn crate::sql::eval::SequenceAccess,
+                     values: &[Datum<'_>]| { returning.capture(values, arena) };
                 update(
                     storage,
                     txn,
@@ -31445,7 +32588,7 @@ fn execute_trigger_step_in<'a>(
                     params,
                     seq_session,
                     responder,
-                    None,
+                    returns.then_some(&mut capture as &mut super::ReturningCapture<'_>),
                     Some(&scope),
                 )
             });
@@ -31457,23 +32600,50 @@ fn execute_trigger_step_in<'a>(
                 None
             };
             if let Some(completion) = completion {
-                status.pending_write = Some(write_completion::PendingNestedWrite::new(
-                    command.suspend(),
-                    completion,
-                ));
+                let mut pending =
+                    write_completion::PendingNestedWrite::new(command.suspend(), completion);
+                if into.is_some() && returns {
+                    let returned = returning.rows;
+                    pending.save_output(
+                        Some(returning.values(context.arena)?),
+                        returned,
+                        &[],
+                        &context.storage().row_work,
+                    )?;
+                }
+                status.pending_write = Some(pending);
                 let (rows, output) = resume_nested_write(context, status)?;
-                debug_assert!(output.is_none());
-                status.set_rows(rows)?;
+                finish_resumed_static_write(
+                    context,
+                    locals,
+                    local_values,
+                    into,
+                    returns,
+                    rows,
+                    output,
+                    status,
+                )?;
                 return Ok(None);
             }
             drop(command);
             match outcome {
-                Ok(Ok(())) => status.set_rows(
-                    context
+                Ok(Ok(())) => {
+                    let rows = context
                         .responder
                         .take_affected_rows()
-                        .expect("trigger UPDATE publishes an affected-row count"),
-                )?,
+                        .expect("trigger UPDATE publishes an affected-row count");
+                    let selected = returning.values(context.arena)?;
+                    finish_static_returning(
+                        context,
+                        locals,
+                        local_values,
+                        into,
+                        returns,
+                        selected,
+                        rows,
+                        status,
+                    )?;
+                }
                 Ok(Err(error)) => return Err(error),
                 Err(_) => {
                     return Err(sql_err!(
@@ -31487,6 +32657,7 @@ fn execute_trigger_step_in<'a>(
         }),
         TriggerStatement::Dml {
             statement: TriggerDml::Delete(statement),
+            into,
             ..
         } => execute_trigger_statement(|| {
             let statement = match transition_relations {
@@ -31528,6 +32699,9 @@ fn execute_trigger_step_in<'a>(
                 invocation,
                 transition: &transition,
             };
+            let returns = !statement.returning.is_empty();
+            let mut returning =
+                StaticReturning::new(context, locals, into, Stmt::Delete(statement))?;
             let arena = context.arena;
             let params = context.params;
             let boundary = context.nested_write_boundary();
@@ -31550,6 +32724,11 @@ fn execute_trigger_step_in<'a>(
             })?;
             responder.clear_affected_rows();
             let outcome = responder.without_command_complete(|responder| {
+                let mut capture =
+                    |_: &Storage,
+                     _: u32,
+                     _: &dyn crate::sql::eval::SequenceAccess,
+                     values: &[Datum<'_>]| { returning.capture(values, arena) };
                 delete(
                     storage,
                     txn,
@@ -31560,7 +32739,7 @@ fn execute_trigger_step_in<'a>(
                     params,
                     seq_session,
                     responder,
-                    None,
+                    returns.then_some(&mut capture as &mut super::ReturningCapture<'_>),
                     Some(&scope),
                 )
             });
@@ -31572,23 +32751,50 @@ fn execute_trigger_step_in<'a>(
                 None
             };
             if let Some(completion) = completion {
-                status.pending_write = Some(write_completion::PendingNestedWrite::new(
-                    command.suspend(),
-                    completion,
-                ));
+                let mut pending =
+                    write_completion::PendingNestedWrite::new(command.suspend(), completion);
+                if into.is_some() && returns {
+                    let returned = returning.rows;
+                    pending.save_output(
+                        Some(returning.values(context.arena)?),
+                        returned,
+                        &[],
+                        &context.storage().row_work,
+                    )?;
+                }
+                status.pending_write = Some(pending);
                 let (rows, output) = resume_nested_write(context, status)?;
-                debug_assert!(output.is_none());
-                status.set_rows(rows)?;
+                finish_resumed_static_write(
+                    context,
+                    locals,
+                    local_values,
+                    into,
+                    returns,
+                    rows,
+                    output,
+                    status,
+                )?;
                 return Ok(None);
             }
             drop(command);
             match outcome {
-                Ok(Ok(())) => status.set_rows(
-                    context
+                Ok(Ok(())) => {
+                    let rows = context
                         .responder
                         .take_affected_rows()
-                        .expect("trigger DELETE publishes an affected-row count"),
-                )?,
+                        .expect("trigger DELETE publishes an affected-row count");
+                    let selected = returning.values(context.arena)?;
+                    finish_static_returning(
+                        context,
+                        locals,
+                        local_values,
+                        into,
+                        returns,
+                        selected,
+                        rows,
+                        status,
+                    )?;
+                }
                 Ok(Err(error)) => return Err(error),
                 Err(_) => {
                     return Err(sql_err!(
@@ -31883,6 +33089,18 @@ fn execute_trigger_step_in<'a>(
             }
         }
         TriggerStatement::Loop(block) => Ok(control_flow::Step::plain_loop(block)),
+        TriggerStatement::Block(program) if program.declarations.is_empty() => {
+            Ok(control_flow::Step::nested_block(program))
+        }
+        TriggerStatement::Block(program) => control_flow::start_scope_block(
+            program,
+            child_scope,
+            locals,
+            local_values,
+            context.storage(),
+            context.txn.txid,
+            status,
+        ),
         TriggerStatement::If(program) => {
             let conditions = program
                 .branches
@@ -32344,11 +33562,16 @@ fn execute_trigger_statement<'a>(
     execute().map(control_flow::Step::Complete)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "INTO assignment needs the statement's variables and USING values"
+)]
 fn finish_dynamic_into<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl],
     local_values: &mut [Datum<'a>],
     statement: PlpgsqlDynamicSelectInto<'a>,
+    arguments: &[Datum<'a>],
     selected: &[Datum<'a>],
     rows: u64,
     status: &mut TriggerExecutionStatus<'a>,
@@ -32360,27 +33583,447 @@ fn finish_dynamic_into<'a>(
         ));
     }
     status.set_row_count(rows)?;
-    if statement.strict {
-        match rows {
-            0 => return Err(sql_err!(sqlstate::NO_DATA_FOUND, "query returned no rows")),
-            1 => {}
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::TOO_MANY_ROWS,
-                    "query returned more than one row"
-                ));
+    crate::sql::error_context::outside_query(|| {
+        if statement.strict {
+            match rows {
+                0 => {
+                    return Err(no_rows_returned(
+                        StrictParameters::Arguments(arguments),
+                        context.arena,
+                    ));
+                }
+                1 => {}
+                _ => {
+                    // EXECUTE's error has no hint.
+                    return Err(with_strict_parameters(
+                        sql_err!(sqlstate::TOO_MANY_ROWS, "query returned more than one row"),
+                        StrictParameters::Arguments(arguments),
+                        context.arena,
+                    ));
+                }
             }
         }
+        for (target, value) in statement
+            .targets
+            .iter()
+            .copied()
+            .zip(selected.iter().copied())
+        {
+            assign_trigger_local(context, locals, local_values, target, value)?;
+        }
+        Ok(())
+    })
+}
+
+/// The RETURNING rows of a static PL/pgSQL data change: the first row,
+/// kept for its INTO targets, and how many rows there were.
+struct StaticReturning<'a> {
+    into: Option<PlpgsqlInto<'a>>,
+    /// Field names and types when a single record variable receives the row.
+    record: Option<&'a [(&'a str, i32)]>,
+    selected: [Datum<'a>; MAX_COLUMNS],
+    rows: u64,
+}
+
+impl<'a> StaticReturning<'a> {
+    fn new(
+        context: &TriggerExecContext<'_, 'a, '_>,
+        locals: &[TriggerLocalDecl],
+        into: Option<PlpgsqlInto<'a>>,
+        statement: Stmt<'a>,
+    ) -> Result<Self, SqlError> {
+        let mut record = None;
+        if let Some(PlpgsqlInto {
+            targets: [target], ..
+        }) = into
+            && matches!(
+                locals[trigger_local_index(locals, *target)?].ctype,
+                ColType::Record | ColType::Composite(_)
+            )
+        {
+            let arena = context.arena;
+            let statement = arena
+                .alloc(statement)
+                .map_err(|_| super::query::arena_full_pub())?;
+            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let width = describe_data_modification_columns(
+                context.storage(),
+                statement,
+                arena,
+                context.txn.txid,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Sql,
+            )?;
+            let fields = arena
+                .alloc_slice_with(width, |index| ("", columns[index].type_oid))
+                .map_err(|_| super::query::arena_full_pub())?;
+            for (field, column) in fields.iter_mut().zip(&columns[..width]) {
+                field.0 = arena
+                    .alloc_str(column.name)
+                    .map_err(|_| super::query::arena_full_pub())?;
+            }
+            record = Some(&*fields);
+        }
+        Ok(Self {
+            into,
+            record,
+            selected: [Datum::Null; MAX_COLUMNS],
+            rows: 0,
+        })
     }
-    for (target, value) in statement
-        .targets
-        .iter()
-        .copied()
-        .zip(selected.iter().copied())
-    {
+
+    fn capture(&mut self, values: &[Datum<'_>], arena: &'a Arena) -> Result<(), SqlError> {
+        if self.rows == 0 && self.into.is_some() {
+            match self.record {
+                Some(fields) => {
+                    let row = arena
+                        .alloc_slice_with(fields.len(), |index| RecordField {
+                            name: fields[index].0,
+                            type_oid: fields[index].1,
+                            value: Datum::Null,
+                        })
+                        .map_err(|_| super::query::arena_full_pub())?;
+                    for (field, value) in row.iter_mut().zip(values) {
+                        field.value = detached_trigger_datum(*value, arena)?;
+                    }
+                    self.selected[0] = Datum::Record(row);
+                }
+                None => {
+                    for (slot, value) in self.selected.iter_mut().zip(values) {
+                        *slot = detached_trigger_datum(*value, arena)?;
+                    }
+                }
+            }
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// The values to assign: the first row, or NULLs (a record of NULL
+    /// fields) when there was none.
+    fn values(&mut self, arena: &'a Arena) -> Result<&[Datum<'a>], SqlError> {
+        let Some(into) = self.into else {
+            return Ok(&[]);
+        };
+        if self.rows == 0
+            && let Some(fields) = self.record
+        {
+            let row = arena
+                .alloc_slice_with(fields.len(), |index| RecordField {
+                    name: fields[index].0,
+                    type_oid: fields[index].1,
+                    value: Datum::Null,
+                })
+                .map_err(|_| super::query::arena_full_pub())?;
+            self.selected[0] = Datum::Record(row);
+        }
+        Ok(&self.selected[..into.targets.len()])
+    }
+}
+
+/// PostgreSQL's handling of a static data change's result
+/// (`exec_stmt_execsql`): RETURNING rows need INTO, INTO needs RETURNING,
+/// and INTO takes exactly one row (none is allowed without STRICT).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "INTO assignment needs the statement's variables and diagnostics"
+)]
+fn finish_static_returning<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    locals: &[TriggerLocalDecl],
+    local_values: &mut [Datum<'a>],
+    into: Option<PlpgsqlInto<'a>>,
+    returns: bool,
+    selected: &[Datum<'a>],
+    rows: u64,
+    status: &mut TriggerExecutionStatus<'a>,
+) -> Result<(), SqlError> {
+    status.set_rows(rows)?;
+    // Checking the result and storing it happen after the query, outside
+    // its context.
+    crate::sql::error_context::outside_query(|| {
+        store_static_returning(context, locals, local_values, into, returns, selected, rows)
+    })
+}
+
+fn store_static_returning<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    locals: &[TriggerLocalDecl],
+    local_values: &mut [Datum<'a>],
+    into: Option<PlpgsqlInto<'a>>,
+    returns: bool,
+    selected: &[Datum<'a>],
+    rows: u64,
+) -> Result<(), SqlError> {
+    let into = match (into, returns) {
+        (None, false) => return Ok(()),
+        (None, true) => {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "query has no destination for result data"
+            ));
+        }
+        (Some(_), false) => {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "INTO used with a command that cannot return data"
+            ));
+        }
+        (Some(into), true) => into,
+    };
+    let parameters = StrictParameters::Variables {
+        locals,
+        values: &local_values[..locals.len()],
+    };
+    match rows {
+        0 if into.strict => return Err(no_rows_returned(parameters, context.arena)),
+        0 | 1 => {}
+        _ => return Err(too_many_rows_returned(parameters, context.arena)),
+    }
+    for (target, value) in into.targets.iter().copied().zip(selected.iter().copied()) {
         assign_trigger_local(context, locals, local_values, target, value)?;
     }
     Ok(())
+}
+
+/// [`finish_static_returning`] once a waiting data change has completed,
+/// from the RETURNING values saved before it waited.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "INTO assignment needs the statement's variables and diagnostics"
+)]
+fn finish_resumed_static_write<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    locals: &[TriggerLocalDecl],
+    local_values: &mut [Datum<'a>],
+    into: Option<PlpgsqlInto<'a>>,
+    returns: bool,
+    rows: u64,
+    output: Option<write_completion::NestedWriteOutput>,
+    status: &mut TriggerExecutionStatus<'a>,
+) -> Result<(), SqlError> {
+    let selected = match output {
+        None if into.is_none() || !returns => &[][..],
+        Some(write_completion::NestedWriteOutput::Rows {
+            values,
+            rows: returned,
+            ..
+        }) if returned == rows => values.decode(context.arena)?,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "nested write lost its returned values"
+            ));
+        }
+    };
+    finish_static_returning(
+        context,
+        locals,
+        local_values,
+        into,
+        returns,
+        selected,
+        rows,
+        status,
+    )
+}
+
+/// What a `STRICT` failure lists under `#print_strict_params`: the
+/// variables its statement reads, or a dynamic query's `USING` values.
+#[derive(Clone, Copy)]
+enum StrictParameters<'s, 'a> {
+    Variables {
+        locals: &'s [TriggerLocalDecl],
+        values: &'s [Datum<'a>],
+    },
+    Arguments(&'s [Datum<'a>]),
+}
+
+/// PL/pgSQL's `STRICT` error for an empty result.
+fn no_rows_returned(parameters: StrictParameters<'_, '_>, arena: &Arena) -> SqlError {
+    with_strict_parameters(
+        sql_err!(sqlstate::NO_DATA_FOUND, "query returned no rows"),
+        parameters,
+        arena,
+    )
+}
+
+/// PL/pgSQL's error for a second row where INTO takes one.
+fn too_many_rows_returned(parameters: StrictParameters<'_, '_>, arena: &Arena) -> SqlError {
+    crate::sql::error_position::with_hint(
+        with_strict_parameters(
+            sql_err!(sqlstate::TOO_MANY_ROWS, "query returned more than one row"),
+            parameters,
+            arena,
+        ),
+        "Make sure the query returns a single row, or use LIMIT 1.",
+    )
+}
+
+/// Adds PostgreSQL's `parameters: name = 'value', ...` DETAIL to a `STRICT`
+/// failure when the running statement prints them: each variable it reads,
+/// in declaration order, or each `USING` value as `$n`.
+fn with_strict_parameters(
+    error: SqlError,
+    parameters: StrictParameters<'_, '_>,
+    arena: &Arena,
+) -> SqlError {
+    let Some(statement) = crate::sql::error_context::strict_parameters_statement() else {
+        return error;
+    };
+    match strict_parameters_detail(statement, parameters, arena) {
+        Ok(Some(detail)) => {
+            crate::sql::eval::stash_diagnostic(Some(detail), None);
+            error
+        }
+        Ok(None) => error,
+        Err(detail_error) => detail_error,
+    }
+}
+
+fn strict_parameters_detail(
+    statement: &str,
+    parameters: StrictParameters<'_, '_>,
+    arena: &Arena,
+) -> Result<Option<StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>>, SqlError> {
+    use core::fmt::Write as _;
+    arena
+        .with_remaining_region(|scratch| {
+            let mut detail = StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+            let mut listed = 0usize;
+            let mut item = |detail: &mut StackStr<_>,
+                            name: core::fmt::Arguments<'_>,
+                            value: Datum<'_>|
+             -> Result<(), SqlError> {
+                let _ = detail.write_str(if listed == 0 { "parameters: " } else { ", " });
+                listed += 1;
+                let _ = write!(detail, "{name} = ");
+                if value.is_null() {
+                    let _ = detail.write_str("NULL");
+                } else {
+                    let text = datum_to_text(value, scratch)?;
+                    let _ = detail.write_char('\'');
+                    for character in text.chars() {
+                        if character == '\'' {
+                            let _ = detail.write_char('\'');
+                        }
+                        let _ = detail.write_char(character);
+                    }
+                    let _ = detail.write_char('\'');
+                }
+                Ok(())
+            };
+            match parameters {
+                StrictParameters::Arguments(values) => {
+                    for (index, value) in values.iter().enumerate() {
+                        item(&mut detail, format_args!("${}", index + 1), *value)?;
+                    }
+                }
+                StrictParameters::Variables { locals, values } => {
+                    let referenced = scratch
+                        .alloc_slice_with(locals.len(), |_| false)
+                        .map_err(|_| super::query::arena_full_pub())?;
+                    mark_statement_variables(statement, locals, referenced, scratch)?;
+                    for (index, local) in locals.iter().enumerate() {
+                        if referenced[index] {
+                            item(
+                                &mut detail,
+                                format_args!("{}", local.name.as_str()),
+                                values[index],
+                            )?;
+                        }
+                    }
+                }
+            }
+            if detail.is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "STRICT parameter detail exceeds {} bytes",
+                    crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES
+                ));
+            }
+            Ok((listed != 0).then_some(detail))
+        })
+        .map_err(|_| super::query::arena_full_pub())?
+}
+
+/// Marks each variable a statement's text names: `x`, `label.x`, or the
+/// record `r` in `r.field`. A name after a `.` is a qualified part.
+fn mark_statement_variables(
+    statement: &str,
+    locals: &[TriggerLocalDecl],
+    referenced: &mut [bool],
+    scratch: &Arena,
+) -> Result<(), SqlError> {
+    use crate::sql::lexer::{Lexer, Tok};
+    let mut mark = |label: Option<SqlName>, name: SqlName| {
+        let index = match label {
+            Some(label) => locals
+                .iter()
+                .rposition(|local| local.name == name && local.label == Some(label))
+                .or_else(|| locals.iter().rposition(|local| local.name == label)),
+            None => locals.iter().rposition(|local| local.name == name),
+        };
+        if let Some(index) = index {
+            referenced[index] = true;
+        }
+    };
+    let mut lexer = Lexer::new(statement, scratch);
+    // The name that may start a qualified reference, and whether its `.`
+    // has been read.
+    let mut head: Option<(SqlName, bool)> = None;
+    let mut after_dot = false;
+    // An `INTO [STRICT] a, b.c` clause names targets, not values the
+    // statement reads: `Some(true)` while a target name is expected.
+    let mut into: Option<bool> = None;
+    loop {
+        let token = lexer.next_token().map_err(|error| {
+            super::parse_error_to_sql(&super::parser::ParseError::lexical(error, statement))
+        })?;
+        match (into, token) {
+            (Some(true), Tok::Ident(word)) if word.eq_ignore_ascii_case("strict") => continue,
+            (Some(true), Tok::Ident(_) | Tok::QuotedIdent(_)) => {
+                into = Some(false);
+                continue;
+            }
+            (Some(false), Tok::Op("." | ",")) => {
+                into = Some(true);
+                continue;
+            }
+            (Some(_), _) => into = None,
+            (None, _) => {}
+        }
+        if !after_dot && matches!(token, Tok::Ident(word) if word.eq_ignore_ascii_case("into")) {
+            if let Some((first, false)) = head.take() {
+                mark(None, first);
+            }
+            into = Some(true);
+            continue;
+        }
+        let name = match token {
+            Tok::Ident(name) | Tok::QuotedIdent(name) => SqlName::parse(name).ok(),
+            _ => None,
+        };
+        match head.take() {
+            Some((first, false)) if matches!(token, Tok::Op(".")) => head = Some((first, true)),
+            Some((first, true)) => match name {
+                Some(name) => mark(Some(first), name),
+                None => mark(None, first),
+            },
+            Some((first, false)) => mark(None, first),
+            None => {}
+        }
+        if head.is_none()
+            && !after_dot
+            && let Some(name) = name
+        {
+            head = Some((name, false));
+        }
+        if matches!(token, Tok::Eof) {
+            return Ok(());
+        }
+        after_dot = matches!(token, Tok::Op("."));
+    }
 }
 
 fn resume_nested_write(
@@ -34840,6 +36483,13 @@ pub(crate) fn resolve_routine_type(
         txid,
     )?;
     storage.bind_routine_result(result, txid)
+}
+
+/// Whether `written` names a table or view whose row type would resolve here
+/// ahead of any standalone composite type.
+fn relation_row_type_exists(storage: &Storage, txid: u32, written: &str) -> bool {
+    storage.resolve_composite_slot(written, txid).is_none()
+        && storage.resolve_relation_row_type(written, txid).is_some()
 }
 
 fn qualified_catalog_name(name: crate::sql::ast::QualName<'_>) -> crate::util::StackStr<130> {
@@ -39470,6 +41120,36 @@ pub(crate) fn check_called_sql_routine_result(
     )
 }
 
+/// [`check_sql_routine_result`] at `CREATE FUNCTION`, where an error that
+/// cannot point into the statement names the function in its context.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the CREATE check reads the declaration and the parsed body"
+)]
+fn check_created_sql_routine_result(
+    name: &str,
+    storage: &Storage,
+    txid: u32,
+    program: &super::query::RoutineFunctionProgram<'_>,
+    kind: crate::storage::RoutineKind,
+    record_columns: &[crate::storage::RoutineArgumentDef],
+    declared: &str,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let frame = crate::sql::error_context::SqlFunctionValidationFrame { name };
+    crate::sql::error_context::within(&frame, || {
+        check_sql_routine_result(
+            storage,
+            txid,
+            program,
+            kind,
+            record_columns,
+            declared,
+            arena,
+        )
+    })
+}
+
 /// PostgreSQL's `check_sql_stmt_retval` type checks at CREATE: a scalar
 /// result takes exactly one column that converts to it by assignment, and a
 /// row result takes one such column per field. An untyped literal output is
@@ -39809,12 +41489,13 @@ pub(crate) fn validate_routine_body(
                         .iter()
                         .any(|argument| argument.polymorphic_type().is_some())
                 {
-                    crate::sql::error_position::with_analysis(|| {
+                    crate::sql::error_position::with_analysis_in(body_text, || {
                         super::query::analyse_routine_program(&program, storage, txn.txid, arena)
                     })?;
                 }
                 if let super::query::RoutineResultContract::Returns(declared) = sql_result {
-                    check_sql_routine_result(
+                    check_created_sql_routine_result(
+                        routine.name.name,
                         storage,
                         txn.txid,
                         &program,
@@ -39905,7 +41586,8 @@ pub(crate) fn validate_routine_body(
                     |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 )?;
                 if let super::query::RoutineResultContract::Returns(declared) = sql_result {
-                    check_sql_routine_result(
+                    check_created_sql_routine_result(
+                        routine.name.name,
                         storage,
                         txn.txid,
                         &program,
@@ -39990,7 +41672,8 @@ pub(crate) fn validate_routine_body(
                     |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 )?;
                 if let super::query::RoutineResultContract::Returns(declared) = sql_result {
-                    check_sql_routine_result(
+                    check_created_sql_routine_result(
+                        routine.name.name,
                         storage,
                         txn.txid,
                         &program,
@@ -40040,6 +41723,7 @@ pub(crate) fn create_routine(
     guc: &crate::sql::guc::GucState,
     arena: &Arena,
     responder: &mut Responder,
+    created_slot: &mut Option<usize>,
 ) -> Outcome {
     let ResolvedRoutineDeclaration {
         schema,
@@ -40294,6 +41978,7 @@ pub(crate) fn create_routine(
     {
         return sql_fail(error);
     }
+    *created_slot = Some(slot);
     responder.command_complete(match kind {
         crate::storage::RoutineKind::Function { .. }
         | crate::storage::RoutineKind::SetFunction { .. }
@@ -65030,7 +66715,7 @@ fn merge_source_columns(
     }
     for item in statement.returning.items {
         match item {
-            SelectItem::Wildcard => return None,
+            SelectItem::Wildcard(_) => return None,
             SelectItem::TableWildcard(qualifier)
                 if qualifier.eq_ignore_ascii_case(source_alias) =>
             {
@@ -65058,57 +66743,118 @@ pub fn describe_merge_returning<'a>(
     out: &mut [ColDesc<'a>],
     description_target: crate::sql::exec::DescriptionTarget,
 ) -> Result<usize, SqlError> {
-    use crate::sql::ast::{FromClause, Join, JoinKind, RelationInheritance, TableRef};
+    let target = super::query::dml_target_ref(statement.target, statement.target_alias);
+    let source_star =
+        SelectItem::TableWildcard(statement.source.alias.unwrap_or(statement.source.table));
+    let target_star =
+        SelectItem::TableWildcard(statement.target_alias.unwrap_or(statement.target.name));
+    describe_joined_returning(
+        storage,
+        txid,
+        target,
+        core::slice::from_ref(&statement.source),
+        &[],
+        statement.returning,
+        Some(&[source_star, target_star]),
+        arena,
+        out,
+        description_target,
+    )
+}
 
-    let target = TableRef {
-        schema: statement.target.schema,
-        table: statement.target.name,
-        alias: statement.target_alias,
-        subquery: None,
-        func_args: None,
-        func_argument_names: &[],
-        func_variadic: false,
-        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-        rows_from: None,
-        col_alias: None,
-        inheritance: RelationInheritance::Descendants,
-        sample: None,
-        cte: None,
-        with_ordinality: false,
-        lateral: false,
-        authorization_role: None,
-        bound_table: None,
-        view_access: None,
+/// Describes `RETURNING` of `UPDATE ... FROM` and `DELETE ... USING`: the
+/// target and every FROM item, in that order for an unqualified star.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "description explicitly selects SQL identities or protocol types"
+)]
+pub(crate) fn describe_dml_from_returning<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    table: crate::sql::ast::QualName<'a>,
+    alias: Option<&'a str>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    returning: crate::sql::ast::Returning<'a>,
+    arena: &'a Arena,
+    out: &mut [ColDesc<'a>],
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
+    describe_joined_returning(
+        storage,
+        txid,
+        super::query::dml_target_ref(table, alias),
+        core::slice::from_ref(&from.base),
+        from.joins,
+        returning,
+        None,
+        arena,
+        out,
+        description_target,
+    )
+}
+
+/// Describes a `RETURNING` list whose output scope is the target followed by
+/// the FROM items `items` (each a separate FROM entry) and the joins that
+/// continue the last of them. `star` replaces an unqualified `*`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "description explicitly selects SQL identities or protocol types"
+)]
+fn describe_joined_returning<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    target: crate::sql::ast::TableRef<'a>,
+    items: &[crate::sql::ast::TableRef<'a>],
+    item_joins: &[crate::sql::ast::Join<'a>],
+    returning: crate::sql::ast::Returning<'a>,
+    star: Option<&[SelectItem<'a>]>,
+    arena: &'a Arena,
+    out: &mut [ColDesc<'a>],
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
+    use crate::sql::ast::{FromClause, Join, JoinKind, TableRef};
+
+    let item_join = |table: TableRef<'a>| Join {
+        table,
+        kind: JoinKind::Comma,
+        on: None,
+        using: None,
+        natural: false,
     };
-    let joins = arena
-        .alloc_slice_copy(&[Join {
-            table: statement.source,
-            kind: JoinKind::Cross,
-            on: None,
-            using: None,
-            natural: false,
-        }])
-        .map_err(|_| super::query::arena_full_pub())?;
-    let from = arena
-        .alloc(FromClause {
-            base: target,
-            joins,
-        })
-        .map_err(|_| super::query::arena_full_pub())?;
+    let scope_from = |extra: &[TableRef<'a>]| -> Result<&'a FromClause<'a>, SqlError> {
+        let width = items.len() + item_joins.len() + extra.len();
+        let joins = arena
+            .alloc_slice_with(width, |index| {
+                if index < items.len() {
+                    item_join(items[index])
+                } else if index < items.len() + item_joins.len() {
+                    item_joins[index - items.len()]
+                } else {
+                    item_join(extra[index - items.len() - item_joins.len()])
+                }
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        let from = arena
+            .alloc(FromClause {
+                base: target,
+                joins,
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        super::query::expand_from_schema(from, storage, txid, arena)
+    };
+    let from = scope_from(&[])?;
     let scope = super::query::QueryScope::resolve_schema(storage, from, txid, arena, None)?;
     let output_alias = |item: &SelectItem<'a>| {
         let mut alias = None;
         let mut conflicting = false;
         let mut note = |qualifier: &str| {
-            if qualifier != statement.returning.old_name()
-                && qualifier != statement.returning.new_name()
-            {
+            if qualifier != returning.old_name() && qualifier != returning.new_name() {
                 return;
             }
-            let name = if qualifier == statement.returning.old_name() {
-                statement.returning.old_name()
+            let name = if qualifier == returning.old_name() {
+                returning.old_name()
             } else {
-                statement.returning.new_name()
+                returning.new_name()
             };
             if alias.is_some_and(|known| known != name) {
                 conflicting = true;
@@ -65127,7 +66873,7 @@ pub fn describe_merge_returning<'a>(
                     }
                 });
             }
-            SelectItem::Wildcard => {}
+            SelectItem::Wildcard(_) => {}
         }
         (!conflicting).then_some(alias).flatten()
     };
@@ -65135,23 +66881,21 @@ pub fn describe_merge_returning<'a>(
         let mut found = false;
         match item {
             SelectItem::TableWildcard(qualifier) => {
-                found = *qualifier == statement.returning.old_name()
-                    || *qualifier == statement.returning.new_name();
+                found = *qualifier == returning.old_name() || *qualifier == returning.new_name();
             }
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                 expression.for_each_column_reference(&mut |qualifier, _| {
                     found |= qualifier.is_some_and(|qualifier| {
-                        qualifier == statement.returning.old_name()
-                            || qualifier == statement.returning.new_name()
+                        qualifier == returning.old_name() || qualifier == returning.new_name()
                     });
                 });
             }
-            SelectItem::Wildcard => {}
+            SelectItem::Wildcard(_) => {}
         }
         found
     };
     let mut count = 0usize;
-    for item in statement.returning.items {
+    for item in returning.items {
         if let Some(alias) = output_alias(item) {
             let saved_name = scope.names[0];
             scope.names[0] = alias;
@@ -65169,44 +66913,14 @@ pub fn describe_merge_returning<'a>(
             count += width?;
         } else if uses_output_alias(item) {
             let old_target = TableRef {
-                alias: Some(statement.returning.old_name()),
+                alias: Some(returning.old_name()),
                 ..target
             };
             let new_target = TableRef {
-                alias: Some(statement.returning.new_name()),
+                alias: Some(returning.new_name()),
                 ..target
             };
-            let joins = arena
-                .alloc_slice_copy(&[
-                    Join {
-                        table: statement.source,
-                        kind: JoinKind::Cross,
-                        on: None,
-                        using: None,
-                        natural: false,
-                    },
-                    Join {
-                        table: old_target,
-                        kind: JoinKind::Cross,
-                        on: None,
-                        using: None,
-                        natural: false,
-                    },
-                    Join {
-                        table: new_target,
-                        kind: JoinKind::Cross,
-                        on: None,
-                        using: None,
-                        natural: false,
-                    },
-                ])
-                .map_err(|_| super::query::arena_full_pub())?;
-            let output_from = arena
-                .alloc(FromClause {
-                    base: target,
-                    joins,
-                })
-                .map_err(|_| super::query::arena_full_pub())?;
+            let output_from = scope_from(&[old_target, new_target])?;
             let output_scope =
                 super::query::QueryScope::resolve_schema(storage, output_from, txid, arena, None)?;
             count += super::query::describe_scope_items(
@@ -65219,31 +66933,19 @@ pub fn describe_merge_returning<'a>(
                 &mut out[count..],
                 description_target,
             )?;
-        } else if matches!(item, SelectItem::Wildcard) {
-            let source_star =
-                SelectItem::TableWildcard(statement.source.alias.unwrap_or(statement.source.table));
-            let target_star =
-                SelectItem::TableWildcard(statement.target_alias.unwrap_or(statement.target.name));
-            count += super::query::describe_scope_items(
-                core::slice::from_ref(&source_star),
-                &scope,
-                None,
-                storage,
-                txid,
-                arena,
-                &mut out[count..],
-                description_target,
-            )?;
-            count += super::query::describe_scope_items(
-                core::slice::from_ref(&target_star),
-                &scope,
-                None,
-                storage,
-                txid,
-                arena,
-                &mut out[count..],
-                description_target,
-            )?;
+        } else if let Some(star) = star.filter(|_| matches!(item, SelectItem::Wildcard(_))) {
+            for star_item in star {
+                count += super::query::describe_scope_items(
+                    core::slice::from_ref(star_item),
+                    &scope,
+                    None,
+                    storage,
+                    txid,
+                    arena,
+                    &mut out[count..],
+                    description_target,
+                )?;
+            }
         } else {
             let width = super::query::describe_scope_items(
                 core::slice::from_ref(item),
@@ -65646,7 +67348,9 @@ pub(crate) fn merge<'a>(
         base: statement.source,
         joins: &[],
     };
-    let star = match arena.alloc_slice_copy(&[SelectItem::Wildcard]) {
+    let star = match arena.alloc_slice_copy(&[SelectItem::Wildcard(
+        crate::sql::ast::SourcePosition::UNKNOWN,
+    )]) {
         Ok(s) => &*s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
@@ -65684,7 +67388,8 @@ pub(crate) fn merge<'a>(
     };
     let source_select = match merge_source_columns(statement, source_alias, &source_all_def) {
         Some(columns) => {
-            let mut items = [SelectItem::Wildcard; MAX_COLUMNS];
+            let mut items =
+                [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_COLUMNS];
             let mut count = 0usize;
             for (index, column) in source_all_def
                 .columns()
@@ -67722,6 +69427,7 @@ where
                         statement.returning,
                         None,
                         Some(logical_values),
+                        None,
                         arena,
                         params,
                         responder,
@@ -67960,18 +69666,38 @@ pub(crate) fn instead_of_view_dml<'a>(
         Stmt::Delete(s) => s.alias,
         _ => None,
     };
+    let joined_from = match statement {
+        Stmt::Update(s) => s.from.map(|from| (s.table, from)),
+        Stmt::Delete(s) => s.using.map(|from| (s.table, from)),
+        _ => None,
+    };
     if !returning.is_empty() && !capturing {
         let mut description = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let count = match super::query::describe_catalog_items_as(
-            returning.items,
-            Some(crate::storage::RelationDefinition::from_definition(&def)),
-            alias,
-            storage,
-            txn.txid,
-            arena,
-            &mut description,
-            crate::sql::exec::DescriptionTarget::Wire,
-        ) {
+        let described = if let Some((table, from)) = joined_from {
+            describe_dml_from_returning(
+                storage,
+                txn.txid,
+                table,
+                alias,
+                from,
+                returning,
+                arena,
+                &mut description,
+                crate::sql::exec::DescriptionTarget::Wire,
+            )
+        } else {
+            super::query::describe_catalog_items_as(
+                returning.items,
+                Some(crate::storage::RelationDefinition::from_definition(&def)),
+                alias,
+                storage,
+                txn.txid,
+                arena,
+                &mut description,
+                crate::sql::exec::DescriptionTarget::Wire,
+            )
+        };
+        let count = match described {
             Ok(count) => count,
             Err(error) => return sql_fail(error),
         };
@@ -68220,6 +69946,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                 Err(error) => return sql_fail(error),
             };
             for bytes in rows.as_slice() {
+                let mut matched_from: &[Datum] = &[];
                 let mut old = [Datum::Null; MAX_COLUMNS];
                 if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
                     return sql_fail(error);
@@ -68276,6 +70003,10 @@ pub(crate) fn instead_of_view_dml<'a>(
                             seq_session,
                             txn.txid,
                         )),
+                        (!returning.is_empty()).then_some(super::query::MatchedFromRow {
+                            arena,
+                            values: &mut matched_from,
+                        }),
                     ) {
                         Ok(matched) => matched,
                         Err(error) => return sql_fail(error),
@@ -68333,7 +70064,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                 }
                 // A joined source can expose storage-backed datums. Detach the
                 // completed NEW image before the trigger body mutates storage.
-                let new = match detached_trigger_row(&new[..def.n_columns], arena) {
+                let new = match detached_values(&new[..def.n_columns], arena) {
                     Ok(values) => values,
                     Err(error) => return sql_fail(error),
                 };
@@ -68363,6 +70094,12 @@ pub(crate) fn instead_of_view_dml<'a>(
                         returning,
                         Some(&old[..def.n_columns]),
                         Some(new),
+                        update.from.map(|from| JoinedReturningValues {
+                            table: update.table,
+                            alias: update.alias,
+                            from,
+                            values: matched_from,
+                        }),
                         arena,
                         params,
                         responder,
@@ -68398,6 +70135,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                 Err(error) => return sql_fail(error),
             };
             for bytes in rows.as_slice() {
+                let mut matched_from: &[Datum] = &[];
                 let mut old = [Datum::Null; MAX_COLUMNS];
                 if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
                     return sql_fail(error);
@@ -68423,6 +70161,10 @@ pub(crate) fn instead_of_view_dml<'a>(
                             seq_session,
                             txn.txid,
                         )),
+                        (!returning.is_empty()).then_some(super::query::MatchedFromRow {
+                            arena,
+                            values: &mut matched_from,
+                        }),
                     ) {
                         Ok(matched) => matched,
                         Err(error) => return sql_fail(error),
@@ -68484,6 +70226,12 @@ pub(crate) fn instead_of_view_dml<'a>(
                         returning,
                         Some(&old[..def.n_columns]),
                         None,
+                        delete.using.map(|from| JoinedReturningValues {
+                            table: delete.table,
+                            alias: delete.alias,
+                            from,
+                            values: matched_from,
+                        }),
                         arena,
                         params,
                         responder,
@@ -68677,6 +70425,7 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
             returning,
             None,
             Some(values),
+            None,
             arena,
             params,
             responder,
@@ -68784,11 +70533,17 @@ where
         }
         statement.columns.len()
     };
-    let typed_statement =
-        match type_insert_subscript_bases(statement, def, &targets[..n_targets], arena) {
-            Ok(statement) => statement,
-            Err(error) => return sql_fail(error),
-        };
+    let typed_statement = match type_insert_subscript_bases(
+        statement,
+        def,
+        &targets[..n_targets],
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        Ok(statement) => statement,
+        Err(error) => return sql_fail(error),
+    };
     let statement = &typed_statement;
     let source_assignment_casts = match source {
         InsertSource::MaterializedSelect { .. } => None,
@@ -69522,6 +71277,7 @@ fn emit_conflict_returning<Definition0: crate::storage::DefinitionBacking>(
         returning,
         old,
         Some(&updated[..def.n_columns]),
+        None,
         arena,
         params,
         responder,
@@ -69540,6 +71296,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     returning: crate::sql::ast::Returning<'_>,
     old: Option<&[Datum]>,
     new: Option<&[Datum]>,
+    joined: Option<JoinedReturningValues<'_, '_>>,
     arena: &Arena,
     params: &[Datum],
     responder: &mut Responder,
@@ -69557,9 +71314,42 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
         new_name: returning.new_name(),
         new,
     };
+    let join = match joined
+        .map(|joined| {
+            super::query::ReturningJoin::resolve(
+                storage,
+                joined.table,
+                joined.alias,
+                joined.from,
+                txid,
+                arena,
+            )
+        })
+        .transpose()
+    {
+        Ok(join) => join,
+        Err(error) => return Ok(Err(error)),
+    };
+    let joined_row = match join
+        .as_ref()
+        .zip(joined)
+        .map(|(join, joined)| join.row(current, joined.values, arena))
+        .transpose()
+    {
+        Ok(row) => row,
+        Err(error) => return Ok(Err(error)),
+    };
+    let joined_context = joined_row.as_ref().map(|joined| JoinedReturningLookup {
+        returning: &context,
+        joined,
+    });
+    let row: &dyn ColumnLookup<'_> = match &joined_context {
+        Some(joined) => joined,
+        None => &context,
+    };
     let catalog = super::query::storage_catalog(storage, arena, txid);
     let columns = super::eval::RuntimeColumnTypes {
-        row: &context,
+        row,
         catalog: Some(&catalog),
     };
     let items = match expand_record_call_items(returning.items, &columns, storage, txid, arena) {
@@ -69586,7 +71376,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
         txid,
         arena,
         params,
-        &context,
+        row,
         Some(&crate::sql::sequence::SeqEval::new(
             storage,
             seq_session,
@@ -69607,9 +71397,32 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     let mut n = 0;
     for item in items {
         match item {
-            SelectItem::Wildcard => {
-                for v in current {
-                    projected[n] = *v;
+            SelectItem::Wildcard(_) => {
+                if let Some(joined) = &joined_row {
+                    for index in 0..joined.scope.star_columns() {
+                        projected[n] = joined.output_value(joined.scope.star_entry(index));
+                        n += 1;
+                    }
+                } else {
+                    for v in current {
+                        projected[n] = *v;
+                        n += 1;
+                    }
+                }
+            }
+            SelectItem::TableWildcard(q)
+                if context.image(q).is_none()
+                    && let Some(joined) = &joined_row =>
+            {
+                let width = match joined.scope.qualified_star_columns(q) {
+                    Ok(width) => width,
+                    Err(error) => return Ok(Err(error)),
+                };
+                for index in 0..width {
+                    projected[n] = match joined.scope.qualified_star_entry(q, index) {
+                        Ok(entry) => joined.output_value(entry),
+                        Err(error) => return Ok(Err(error)),
+                    };
                     n += 1;
                 }
             }
@@ -69636,7 +71449,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                match super::eval::record_star_expand(base, arena, params, &context, &hooks) {
+                match super::eval::record_star_expand(base, arena, params, &row, &hooks) {
                     Ok(fields) => {
                         for f in fields {
                             projected[n] = f.value;
@@ -69647,7 +71460,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
                 }
             }
             SelectItem::Expr { expression, .. } => {
-                match eval_full(expression, arena, params, &context, &hooks) {
+                match eval_full(expression, arena, params, &row, &hooks) {
                     Ok(v) => {
                         projected[n] = v;
                         n += 1;
@@ -69779,7 +71592,7 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
     let mut n = 0usize;
     for item in items {
         match item {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 for index in 0..source_def.n_columns {
                     projected[n] = source.map_or(Datum::Null, |values| values[index]);
                     n += 1;
@@ -69979,7 +71792,7 @@ fn returning_dml_target_columns<Definition0: crate::storage::DefinitionBacking>(
     let mut columns = ColumnSet::EMPTY;
     for item in returning.items {
         columns |= match item {
-            SelectItem::Wildcard => all_columns_mask(definition),
+            SelectItem::Wildcard(_) => all_columns_mask(definition),
             SelectItem::TableWildcard(qualifier) => {
                 if output_aliases.contains(qualifier)
                     || crate::sql::eval::qualifier_answers_target(
@@ -70064,16 +71877,13 @@ pub(crate) fn update<'a>(
     };
     let mut targets = [0usize; MAX_COLUMNS];
     let mut updated_columns = ColumnSet::EMPTY;
-    for (i, (name, _)) in statement.assignments.iter().enumerate() {
+    for (i, (name, assigned)) in statement.assignments.iter().enumerate() {
         let Some(column) = def.column_index(name) else {
-            return sql_fail(crate::sql::error_position::at_reference(
-                sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" of relation \"{}\" does not exist",
-                    name,
-                    statement.table.name
-                ),
+            return sql_fail(super::query::undefined_set_target(
                 name,
+                statement.table.name,
+                statement.alias,
+                assigned,
             ));
         };
         if targets[..i].contains(&column) {
@@ -70410,16 +72220,31 @@ pub(crate) fn update<'a>(
 
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_returning_items(
-            statement.returning,
-            Some(def),
-            statement.alias,
-            Some(storage),
-            txn.txid,
-            arena,
-            &mut columns,
-            crate::sql::exec::DescriptionTarget::Wire,
-        ) {
+        let described = if let Some(from) = statement.from {
+            describe_dml_from_returning(
+                storage,
+                txn.txid,
+                statement.table,
+                statement.alias,
+                from,
+                statement.returning,
+                arena,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Wire,
+            )
+        } else {
+            describe_returning_items(
+                statement.returning,
+                Some(def),
+                statement.alias,
+                Some(storage),
+                txn.txid,
+                arena,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Wire,
+            )
+        };
+        match described {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -70427,6 +72252,8 @@ pub(crate) fn update<'a>(
 
     let mut updated = 0u64;
     for i in 0..scratch.len() {
+        let mut matched_from: &[Datum<'a>] = &[];
+        let returning_from = statement.from.filter(|_| !statement.returning.is_empty());
         match dml_row_available(storage, txn, scratch[i], "updated") {
             Ok(true) => {}
             Ok(false) => continue,
@@ -70621,6 +72448,10 @@ pub(crate) fn update<'a>(
                             seq_session,
                             txn.txid,
                         )),
+                        returning_from.map(|_| super::query::MatchedFromRow {
+                            arena,
+                            values: &mut matched_from,
+                        }),
                     );
                     match r {
                         Ok(matched) => matched,
@@ -70737,12 +72568,12 @@ pub(crate) fn update<'a>(
             let mut physical_new = physical_old;
             row_layout.overlay(&logical_new, &mut physical_new);
             let old_transition =
-                match detached_trigger_row(&physical_old[..row_definition.n_columns], arena) {
+                match detached_values(&physical_old[..row_definition.n_columns], arena) {
                     Ok(values) => values,
                     Err(error) => return sql_fail(error),
                 };
             let new_physical =
-                match detached_trigger_row(&physical_new[..row_definition.n_columns], arena) {
+                match detached_values(&physical_new[..row_definition.n_columns], arena) {
                     Ok(values) => values,
                     Err(error) => return sql_fail(error),
                 };
@@ -71005,6 +72836,12 @@ pub(crate) fn update<'a>(
                     statement.returning,
                     Some(&old_transition[..def.n_columns]),
                     Some(&new_values[..def.n_columns]),
+                    returning_from.map(|from| JoinedReturningValues {
+                        table: statement.table,
+                        alias: statement.alias,
+                        from,
+                        values: matched_from,
+                    }),
                     arena,
                     params,
                     responder,
@@ -71166,6 +73003,12 @@ pub(crate) fn update<'a>(
                 statement.returning,
                 Some(&logical_old[..def.n_columns]),
                 Some(&logical_new[..def.n_columns]),
+                returning_from.map(|from| JoinedReturningValues {
+                    table: statement.table,
+                    alias: statement.alias,
+                    from,
+                    values: matched_from,
+                }),
                 arena,
                 params,
                 responder,
@@ -71205,6 +73048,69 @@ pub(crate) fn update<'a>(
             write_completion::CompletionReply::Command
         },
     )
+}
+
+/// The FROM items' values joined to a deleted row for `RETURNING` of
+/// `DELETE ... USING`, found as the row selection found them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the match repeats the row selection's explicit inputs"
+)]
+fn delete_returning_from<'r, Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txn: &TxnState,
+    statement: &Delete<'r>,
+    def: &crate::storage::TableDefinition<Definition0>,
+    old: &[Datum<'_>],
+    arena: &'r Arena,
+    params: &[Datum<'_>],
+    seq_session: &crate::sql::guc::SeqSession,
+) -> Result<Option<JoinedReturningValues<'r, 'r>>, SqlError> {
+    let Some(using) = statement.using.filter(|_| !statement.returning.is_empty()) else {
+        return Ok(None);
+    };
+    let txid = txn.txid;
+    // Read the USING items as the row selection did, before this statement's
+    // own changes.
+    let _snapshot = storage.dml_expression_snapshot(txn.command_id());
+    let mut values: &[Datum<'r>] = &[];
+    let context = RowCtx {
+        def: crate::storage::RelationDefinition::from_definition(def),
+        values: old,
+        alias: statement.alias,
+    };
+    let found = super::query::first_from_match(
+        storage,
+        using,
+        txid,
+        statement.where_clause,
+        &[],
+        arena,
+        params,
+        &context,
+        &mut |_| Ok(()),
+        Some(&crate::sql::sequence::SeqEval::new(
+            storage,
+            seq_session,
+            txid,
+        )),
+        Some(super::query::MatchedFromRow {
+            arena,
+            values: &mut values,
+        }),
+    )?;
+    if !found {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "deleted row lost its USING match before RETURNING"
+        ));
+    }
+    Ok(Some(JoinedReturningValues {
+        table: statement.table,
+        alias: statement.alias,
+        from: using,
+        values,
+    }))
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -71474,16 +73380,31 @@ pub(crate) fn delete<'a>(
     }
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match describe_returning_items(
-            statement.returning,
-            Some(def),
-            statement.alias,
-            Some(storage),
-            txn.txid,
-            arena,
-            &mut columns,
-            crate::sql::exec::DescriptionTarget::Wire,
-        ) {
+        let described = if let Some(from) = statement.using {
+            describe_dml_from_returning(
+                storage,
+                txn.txid,
+                statement.table,
+                statement.alias,
+                from,
+                statement.returning,
+                arena,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Wire,
+            )
+        } else {
+            describe_returning_items(
+                statement.returning,
+                Some(def),
+                statement.alias,
+                Some(storage),
+                txn.txid,
+                arena,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Wire,
+            )
+        };
+        match described {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -71636,6 +73557,19 @@ pub(crate) fn delete<'a>(
                     statement.returning,
                     Some(&old_transition[..def.n_columns]),
                     None,
+                    match delete_returning_from(
+                        storage,
+                        txn,
+                        statement,
+                        def,
+                        &old_transition[..def.n_columns],
+                        arena,
+                        params,
+                        seq_session,
+                    ) {
+                        Ok(joined) => joined,
+                        Err(error) => return sql_fail(error),
+                    },
                     arena,
                     params,
                     responder,
@@ -71767,6 +73701,19 @@ pub(crate) fn delete<'a>(
                 statement.returning,
                 Some(&logical_old[..def.n_columns]),
                 None,
+                match delete_returning_from(
+                    storage,
+                    txn,
+                    statement,
+                    def,
+                    &logical_old[..def.n_columns],
+                    arena,
+                    params,
+                    seq_session,
+                ) {
+                    Ok(joined) => joined,
+                    Err(error) => return sql_fail(error),
+                },
                 arena,
                 params,
                 responder,
@@ -79193,6 +81140,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                     &context,
                     &mut |_| Ok(()),
                     None,
+                    None,
                 )? {
                     scratch
                         .push(PhysicalRow::Foreign {
@@ -79260,6 +81208,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                             params,
                             &context,
                             &mut |_| Ok(()),
+                            None,
                             None,
                         )
                     })();
@@ -79362,6 +81311,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                     &scope,
                     &mut |_| Ok(()),
                     None,
+                    None,
                 )? {
                     scratch
                         .push(PhysicalRow::Foreign {
@@ -79431,6 +81381,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                             params,
                             &scope,
                             &mut |_| Ok(()),
+                            None,
                             None,
                         )
                     })();
@@ -79674,10 +81625,19 @@ fn type_insert_subscript_bases<'a>(
     statement: &Insert<'a>,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     targets: &[usize],
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<Insert<'a>, SqlError> {
     let typed = |expression: &'a Expr<'a>, target: usize| {
-        typed_subscript_base(expression, def.columns()[target].ctype, arena)
+        let column = &def.columns()[target];
+        typed_assignment_path(
+            typed_subscript_base(expression, column.ctype, arena)?,
+            column,
+            storage,
+            txid,
+            arena,
+        )
     };
     let mut typed_statement = *statement;
     if let Some(select) = statement.select
@@ -79688,6 +81648,9 @@ fn type_insert_subscript_bases<'a>(
                     expression: Expr::Call {
                         name: "__jsonb_subscript_set",
                         args: [Expr::Null, ..],
+                        ..
+                    } | Expr::Call {
+                        name: "__assign_path",
                         ..
                     },
                     ..
@@ -79778,6 +81741,75 @@ fn typed_subscript_base<'e, 'a: 'e>(
     }
 }
 
+/// Names the column's type in an assignment through a field, which a NULL
+/// base (an INSERT target) needs.
+fn typed_assignment_path<'e, 'a: 'e>(
+    expression: &'e Expr<'a>,
+    column: &ColumnMeta,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'e Expr<'a>, SqlError> {
+    let Expr::Call {
+        kind,
+        name: name @ "__assign_path",
+        bound_oid,
+        bound_strict,
+        source_position,
+        args: [base, value, Expr::Null, rest @ ..],
+        argument_names,
+        variadic,
+        star,
+        distinct,
+        order_by,
+        over,
+        filter,
+    } = expression
+    else {
+        return Ok(expression);
+    };
+    // Targets of one INSERT column merge into a chain whose first base is
+    // the NULL every link starts from.
+    let base = typed_assignment_path(base, column, storage, txid, arena)?;
+    let type_oid = storage
+        .routine_type_oid(column.ctype, column.user_type, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "column type identity is unavailable"
+            )
+        })?;
+    let typed = arena
+        .alloc(Expr::Int(i64::from(type_oid)))
+        .map_err(|_| super::query::arena_full_pub())?;
+    let args = arena
+        .alloc_slice_with(rest.len() + 3, |index| match index {
+            0 => base,
+            1 => *value,
+            2 => &*typed,
+            _ => rest[index - 3],
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    arena
+        .alloc(Expr::Call {
+            kind: *kind,
+            name,
+            bound_oid: *bound_oid,
+            bound_strict: *bound_strict,
+            source_position: *source_position,
+            args,
+            argument_names,
+            variadic: *variadic,
+            star: *star,
+            distinct: *distinct,
+            order_by,
+            over: *over,
+            filter: *filter,
+        })
+        .map(|expression| &*expression)
+        .map_err(|_| super::query::arena_full_pub())
+}
+
 /// [`super::query::check_literal_operands_typed`] for a data-changing
 /// statement's condition over its one target table.
 fn check_dml_literal_operands<'a>(
@@ -79822,7 +81854,13 @@ fn eval_prepared_assignment<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let mut cast = casts.selected(expression, column, storage, txid)?;
     cast.input_collation = super::eval::coercion_input_collation(expression, row, hooks.catalog)?;
-    let expression = typed_subscript_base(expression, column.ctype, arena)?;
+    let expression = typed_assignment_path(
+        typed_subscript_base(expression, column.ctype, arena)?,
+        column,
+        storage,
+        txid,
+        arena,
+    )?;
     let value = eval_full(expression, arena, params, row, hooks)?;
     coerce_assignment(value, column, cast, storage, txid, arena, hooks.sequences)
 }
@@ -79890,29 +81928,39 @@ fn prepare_insert_select_casts<'a>(
     } else {
         statement.columns.len()
     };
-    // Subscripted targets are assigned from the written query's columns,
-    // which must match the target list.
+    // Targets with indirection are assigned from the written query's
+    // columns, one per written target before targets of one column merge.
     if let Some(crate::sql::ast::FromClause {
         base:
             crate::sql::ast::TableRef {
                 alias: Some(crate::sql::ast::INSERT_SUBSCRIPT_SOURCE),
                 subquery: Some(written),
+                col_alias: Some(written_targets),
                 ..
             },
         ..
     }) = select.from
     {
+        let written_count = written_targets.len();
         let mut width = 0usize;
         super::query::visit_projection_types(written, storage, txid, arena, outer, &mut |_, _| {
             width += 1;
             Ok(())
         })?;
-        if width < count {
-            return Err(insert_more_targets(statement.columns, width));
+        if width < written_count {
+            return Err(insert_more_targets(
+                if written_count == count {
+                    statement.columns
+                } else {
+                    &[]
+                },
+                width,
+            ));
         }
-        if width > count {
+        if width > written_count {
             return Err(insert_more_expressions(select_output_expression(
-                written, count,
+                written,
+                written_count,
             )));
         }
     }
@@ -80007,7 +82055,10 @@ fn check_insert_values_shape(statement: &Insert<'_>, n_targets: usize) -> Result
 
 /// The written expression of output column `index` of `select`, through a
 /// set operation's first branch; None for an expanded `*`.
-fn select_output_expression<'a>(select: &'a Select<'a>, index: usize) -> Option<&'a Expr<'a>> {
+pub(crate) fn select_output_expression<'a>(
+    select: &'a Select<'a>,
+    index: usize,
+) -> Option<&'a Expr<'a>> {
     let mut select = select;
     while let Some(body) = select.set_body {
         let mut tree = body;
@@ -80049,13 +82100,14 @@ fn insert_more_expressions(expression: Option<&Expr<'_>>) -> SqlError {
 /// PostgreSQL's error for an INSERT target column without an expression,
 /// positioned at the first such column.
 fn insert_more_targets(columns: &[&str], at: usize) -> SqlError {
-    crate::sql::error_position::at_reference(
-        sql_err!(
-            sqlstate::SYNTAX_ERROR,
-            "INSERT has more target columns than expressions"
-        ),
-        columns[at],
-    )
+    let error = sql_err!(
+        sqlstate::SYNTAX_ERROR,
+        "INSERT has more target columns than expressions"
+    );
+    match columns.get(at) {
+        Some(column) => crate::sql::error_position::at_reference(error, column),
+        None => error,
+    }
 }
 
 #[expect(
@@ -80197,7 +82249,7 @@ fn coerce_column_value<'a>(
                 physical_fields: 0,
                 text,
             } if actual == slot => {
-                decode_composite_text(text, slot, storage, txid, arena, sequences)?
+                decode_retained_composite_text(text, slot, storage, txid, arena, sequences)?
             }
             value @ Datum::CompositeText { slot: actual, .. } if actual == slot => {
                 return Ok(value);
@@ -80300,7 +82352,7 @@ pub(crate) fn coerce_routine_argument<'a>(
             Datum::CompositeText {
                 slot: actual, text, ..
             } if Some(actual) == slot => {
-                decode_composite_text(text, actual, storage, txid, arena, sequences)
+                decode_retained_composite_text(text, actual, storage, txid, arena, sequences)
             }
             value => coerce_composite_value(value, slot, storage, txid, arena, sequences),
         },
@@ -80643,12 +82695,19 @@ fn coerce_composite_value_inner<'a>(
             ))
         };
     }
-    let Datum::Record(input) = value else {
-        return Err(sql_err!(
-            sqlstate::CANNOT_COERCE,
-            "cannot cast non-record value to named composite"
-        ));
-    };
+    // Text converts through the record input routine, as PostgreSQL's I/O
+    // conversion cast does.
+    if let (Datum::Text(text), CompositeEncoding::Input) = (value, encoding) {
+        return decode_composite_text_inner(
+            text,
+            slot,
+            CompositeTextSource::Client,
+            storage,
+            txid,
+            arena,
+            sequences,
+        );
+    }
     let definition = storage.require_row_type_definition(slot, txid)?;
     if !definition.visible_to(txid) {
         return Err(sql_err!(
@@ -80656,6 +82715,14 @@ fn coerce_composite_value_inner<'a>(
             "composite type does not exist"
         ));
     }
+    let Datum::Record(input) = value else {
+        return Err(sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "cannot cast type {} to {}",
+            crate::sql::eval::type_name_of_pub(&value),
+            definition.name().as_str()
+        ));
+    };
     let width = definition.active_field_count();
     if input.len() != width {
         crate::sql::eval::stash_diagnostic(
@@ -80771,6 +82838,29 @@ fn coerce_composite_value_inner<'a>(
 /// Parses PostgreSQL's composite text form stored in a row. This parser keeps
 /// quoting at the boundary: commas and parentheses inside quoted fields never
 /// leak into type coercion as separate attributes.
+/// Decodes a composite retained in its text form before the type gained
+/// fields: the text may name fewer fields than the type now has.
+fn decode_retained_composite_text<'a>(
+    text: &'a str,
+    slot: crate::storage::TypeCreation,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<Datum<'a>, SqlError> {
+    decode_composite_text_inner(
+        text,
+        slot,
+        CompositeTextSource::Retained {
+            physical_fields: None,
+        },
+        storage,
+        txid,
+        arena,
+        sequences,
+    )
+}
+
 pub(crate) fn decode_composite_text<'a>(
     text: &'a str,
     slot: crate::storage::TypeCreation,
@@ -80779,11 +82869,130 @@ pub(crate) fn decode_composite_text<'a>(
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
-    decode_composite_text_inner(text, slot, None, storage, txid, arena, sequences)
+    decode_composite_text_inner(
+        text,
+        slot,
+        CompositeTextSource::Client,
+        storage,
+        txid,
+        arena,
+        sequences,
+    )
 }
 
 /// Decodes a row-encoded composite. Its physical field count is part of the
 /// durable datum so an old layout remains unambiguous after ALTER TYPE.
+/// Splits a record literal as PostgreSQL's `record_in` does: an empty field
+/// is NULL, double quotes and backslashes protect any text, and a client
+/// literal must name exactly `expected` fields. A retained image may name
+/// fewer. Returns the number of fields read into `values`.
+fn parse_record_literal<'a>(
+    text: &'a str,
+    expected: usize,
+    retained: bool,
+    values: &mut [Option<&'a str>],
+    arena: &'a Arena,
+) -> Result<usize, SqlError> {
+    let malformed = |detail: &str| {
+        crate::sql::eval::stash_diagnostic(Some(crate::util::StackStr::from_str(detail)), None);
+        sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "malformed record literal: \"{}\"",
+            text
+        )
+    };
+    let bytes = text.as_bytes();
+    let mut at = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    if bytes.get(at) != Some(&b'(') {
+        return Err(malformed("Missing left parenthesis."));
+    }
+    at += 1;
+    let mut count = 0usize;
+    while count < expected {
+        if count > 0 {
+            match bytes.get(at) {
+                Some(b',') => at += 1,
+                Some(b')') if retained => break,
+                _ => return Err(malformed("Too few columns.")),
+            }
+        }
+        if count == values.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "composite literal has too many fields"
+            ));
+        }
+        values[count] = if matches!(bytes.get(at), Some(b',' | b')')) {
+            None
+        } else {
+            let decoded = arena
+                .alloc_slice_with(bytes.len() - at, |_| 0u8)
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "composite literal exceeds statement arena"
+                    )
+                })?;
+            let mut written = 0usize;
+            let mut quoted = false;
+            loop {
+                let Some(&byte) = bytes.get(at) else {
+                    return Err(malformed("Unexpected end of input."));
+                };
+                if !quoted && matches!(byte, b',' | b')') {
+                    break;
+                }
+                at += 1;
+                match byte {
+                    b'\\' => {
+                        let Some(&escaped) = bytes.get(at) else {
+                            return Err(malformed("Unexpected end of input."));
+                        };
+                        decoded[written] = escaped;
+                        written += 1;
+                        at += 1;
+                    }
+                    b'"' if !quoted => quoted = true,
+                    b'"' if bytes.get(at) == Some(&b'"') => {
+                        decoded[written] = b'"';
+                        written += 1;
+                        at += 1;
+                    }
+                    b'"' => quoted = false,
+                    byte => {
+                        decoded[written] = byte;
+                        written += 1;
+                    }
+                }
+            }
+            Some(core::str::from_utf8(&decoded[..written]).map_err(|_| {
+                sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "composite field is not valid UTF-8"
+                )
+            })?)
+        };
+        count += 1;
+    }
+    if retained && bytes.get(at) != Some(&b')') {
+        return Err(sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "wrong number of composite fields"
+        ));
+    }
+    if bytes.get(at) != Some(&b')') {
+        return Err(malformed("Too many columns."));
+    }
+    at += 1;
+    if bytes[at..].iter().any(|byte| !byte.is_ascii_whitespace()) {
+        return Err(malformed("Junk after right parenthesis."));
+    }
+    Ok(count)
+}
+
 pub(crate) fn decode_stored_composite_text<'a>(
     text: &'a str,
     slot: crate::storage::TypeCreation,
@@ -80795,7 +83004,9 @@ pub(crate) fn decode_stored_composite_text<'a>(
     decode_composite_text_inner(
         text,
         slot,
-        (physical_fields != 0).then_some(physical_fields as usize),
+        CompositeTextSource::Retained {
+            physical_fields: (physical_fields != 0).then_some(physical_fields as usize),
+        },
         storage,
         txid,
         arena,
@@ -80803,15 +83014,28 @@ pub(crate) fn decode_stored_composite_text<'a>(
     )
 }
 
+/// Where composite text comes from: a client literal names exactly the
+/// type's fields; retained text may predate fields added since and, with a
+/// physical field count, lists them by attribute number.
+#[derive(Clone, Copy)]
+enum CompositeTextSource {
+    Client,
+    Retained { physical_fields: Option<usize> },
+}
+
 fn decode_composite_text_inner<'a>(
     text: &'a str,
     slot: crate::storage::TypeCreation,
-    stored_physical_fields: Option<usize>,
+    source: CompositeTextSource,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
+    let (retained, stored_physical_fields) = match source {
+        CompositeTextSource::Client => (false, None),
+        CompositeTextSource::Retained { physical_fields } => (true, physical_fields),
+    };
     let encoding = match stored_physical_fields {
         None => CompositeEncoding::Input,
         Some(count) if count & usize::from(COMPOSITE_MEMBER_IDENTITIES) != 0 => {
@@ -80821,120 +83045,13 @@ fn decode_composite_text_inner<'a>(
     };
     let stored_physical_fields =
         stored_physical_fields.map(|count| count & !usize::from(COMPOSITE_MEMBER_IDENTITIES));
-    let body = text
-        .strip_prefix('(')
-        .and_then(|body| body.strip_suffix(')'))
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::INVALID_TEXT_REPRESENTATION,
-                "malformed composite literal"
-            )
-        })?;
     let definition = storage.require_row_type_definition(slot, txid)?;
-    let mut raw_values = [""; crate::storage::MAX_COMPOSITE_FIELDS];
-    let mut quoted_values = [false; crate::storage::MAX_COMPOSITE_FIELDS];
-    let mut count = 0usize;
-    let mut at = 0usize;
-    while at < body.len() {
-        if count == raw_values.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "composite literal has too many fields"
-            ));
-        }
-        let rest = &body[at..];
-        let (raw, used, quoted) = if let Some(source) = rest.strip_prefix('"') {
-            let mut read = 0;
-            let mut written = 0;
-            let decoded = arena.alloc_slice_with(source.len(), |_| 0u8).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "composite literal exceeds statement arena"
-                )
-            })?;
-            let mut closed = false;
-            while read < source.len() {
-                match source.as_bytes()[read] {
-                    b'\\' => {
-                        read += 1;
-                        let Some(&byte) = source.as_bytes().get(read) else {
-                            return Err(sql_err!(
-                                sqlstate::INVALID_TEXT_REPRESENTATION,
-                                "unterminated composite field escape"
-                            ));
-                        };
-                        decoded[written] = byte;
-                        written += 1;
-                        read += 1;
-                    }
-                    b'"' if source.as_bytes().get(read + 1) == Some(&b'"') => {
-                        decoded[written] = b'"';
-                        written += 1;
-                        read += 2;
-                    }
-                    b'"' => {
-                        read += 1;
-                        closed = true;
-                        break;
-                    }
-                    byte => {
-                        decoded[written] = byte;
-                        written += 1;
-                        read += 1;
-                    }
-                }
-            }
-            if !closed {
-                return Err(sql_err!(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                    "unterminated composite field"
-                ));
-            }
-            let raw = core::str::from_utf8(&decoded[..written]).map_err(|_| {
-                sql_err!(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                    "composite field is not valid UTF-8"
-                )
-            })?;
-            (raw, read + 1, true)
-        } else {
-            let end = rest.find(',').unwrap_or(rest.len());
-            (&rest[..end], end, false)
-        };
-        raw_values[count] = raw;
-        quoted_values[count] = quoted;
-        count += 1;
-        at += used;
-        if at == body.len() {
-            break;
-        }
-        if body.as_bytes().get(at) != Some(&b',') {
-            return Err(sql_err!(
-                sqlstate::INVALID_TEXT_REPRESENTATION,
-                "malformed composite literal"
-            ));
-        }
-        at += 1;
-        if at == body.len() {
-            raw_values[count] = "";
-            quoted_values[count] = false;
-            count += 1;
-            break;
-        }
-    }
     let physical = stored_physical_fields.is_some();
-    if physical && count > stored_physical_fields.expect("checked physical layout") {
-        return Err(sql_err!(
-            sqlstate::INVALID_TEXT_REPRESENTATION,
-            "wrong number of composite fields"
-        ));
-    }
-    if !physical && count > definition.active_field_count() {
-        return Err(sql_err!(
-            sqlstate::INVALID_TEXT_REPRESENTATION,
-            "wrong number of composite fields"
-        ));
-    }
+    // Client input names exactly the active fields; a stored image may predate
+    // fields added later and lists them by attribute number.
+    let expected = stored_physical_fields.unwrap_or(definition.active_field_count());
+    let mut raw_values = [None; crate::storage::MAX_COMPOSITE_FIELDS];
+    let count = parse_record_literal(text, expected, retained, &mut raw_values, arena)?;
     let values = arena
         .alloc_slice_with(definition.active_field_count(), |_| RecordField {
             name: "",
@@ -80957,18 +83074,13 @@ fn decode_composite_text_inner<'a>(
         } else {
             active_index
         };
-        let (raw, quoted) = if source_index < count {
-            (raw_values[source_index], quoted_values[source_index])
-        } else {
-            ("", false)
-        };
         out.name = "";
         out.type_oid = 0;
-        out.value = if raw.is_empty() && !quoted {
-            Datum::Null
-        } else {
-            Datum::Text(raw)
-        };
+        out.value = raw_values[..count]
+            .get(source_index)
+            .copied()
+            .flatten()
+            .map_or(Datum::Null, Datum::Text);
     }
     coerce_composite_value_inner(
         Datum::Record(values),
@@ -81075,7 +83187,7 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                     physical_fields: 0,
                     text,
                 } if actual == slot => {
-                    decode_composite_text(text, slot, storage, txid, arena, sequences)?
+                    decode_retained_composite_text(text, slot, storage, txid, arena, sequences)?
                 }
                 Datum::CompositeText { slot: actual, .. } if actual == slot => value,
                 Datum::Text(text) => {

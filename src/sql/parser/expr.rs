@@ -356,6 +356,8 @@ impl<'a> Parser<'a> {
                         return Ok(left);
                     }
                 }
+                // A sublink is located at its keyword, NOT included.
+                let keyword_at = self.peek_at;
                 let negated = if self.peeked == Tok::Ident("not") {
                     self.advance()?;
                     // Infix NOT must introduce one of these forms.
@@ -382,11 +384,14 @@ impl<'a> Parser<'a> {
                             .arena
                             .alloc(select)
                             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-                        left = self.arena_expr(Expr::InSubquery {
-                            operand: left,
-                            select: boxed,
-                            negated,
-                        })?;
+                        left = self.arena_expr_at(
+                            Expr::InSubquery {
+                                operand: left,
+                                select: boxed,
+                                negated,
+                            },
+                            keyword_at,
+                        )?;
                         continue;
                     }
                     let mut list = ArenaList::new(self.arena);
@@ -568,6 +573,7 @@ impl<'a> Parser<'a> {
             if operator.precedence() < min_prec {
                 return Ok(left);
             }
+            let operator_at = self.peek_at;
             self.advance()?;
             // Quantified comparison: `operand operator ANY/ALL (array)` or
             // `... (subquery)`.
@@ -589,24 +595,33 @@ impl<'a> Parser<'a> {
                     // quantify over the subquery's collected result column
                     // (same truth table as the array forms, per PostgreSQL).
                     left = if operator == BinaryOp::Eq && !all {
-                        self.arena_expr(Expr::InSubquery {
-                            operand: left,
-                            select: boxed,
-                            negated: false,
-                        })?
+                        self.arena_expr_at(
+                            Expr::InSubquery {
+                                operand: left,
+                                select: boxed,
+                                negated: false,
+                            },
+                            operator_at,
+                        )?
                     } else if operator == BinaryOp::NotEq && all {
-                        self.arena_expr(Expr::InSubquery {
-                            operand: left,
-                            select: boxed,
-                            negated: true,
-                        })?
+                        self.arena_expr_at(
+                            Expr::InSubquery {
+                                operand: left,
+                                select: boxed,
+                                negated: true,
+                            },
+                            operator_at,
+                        )?
                     } else {
-                        self.arena_expr(Expr::QuantifiedSubquery {
-                            operand: left,
-                            operator,
-                            select: boxed,
-                            all,
-                        })?
+                        self.arena_expr_at(
+                            Expr::QuantifiedSubquery {
+                                operand: left,
+                                operator,
+                                select: boxed,
+                                all,
+                            },
+                            operator_at,
+                        )?
                     };
                     continue;
                 }
@@ -715,7 +730,7 @@ impl<'a> Parser<'a> {
                         .alloc(select)
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                     self.parenthesized_primary = Some(source_position_at);
-                    return self.arena_expr(Expr::Subquery(boxed));
+                    return self.arena_expr_at(Expr::Subquery(boxed), source_position_at);
                 }
                 let inner = self.expression(0)?;
                 // A parenthesized comma list is either an OVERLAPS period pair
@@ -909,6 +924,7 @@ impl<'a> Parser<'a> {
                 })
             }
             Tok::Ident("exists") => {
+                let exists_at = self.peek_at;
                 self.advance()?;
                 self.expect_op("(")?;
                 let select = self.query_select()?;
@@ -917,7 +933,7 @@ impl<'a> Parser<'a> {
                     .arena
                     .alloc(select)
                     .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-                self.arena_expr(Expr::Exists(boxed))
+                self.arena_expr_at(Expr::Exists(boxed), exists_at)
             }
             Tok::Ident("default") => {
                 self.advance()?;
@@ -1004,6 +1020,7 @@ impl<'a> Parser<'a> {
                 }
                 // `ARRAY(SELECT ...)` array-from-subquery constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("(") {
+                    let array_at = self.previous_token.map_or(self.peek_at, |token| token.1);
                     self.advance()?;
                     let select = self.query_select()?;
                     self.expect_op(")")?;
@@ -1011,7 +1028,7 @@ impl<'a> Parser<'a> {
                         .arena
                         .alloc(select)
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-                    return self.arena_expr(Expr::ArraySubquery(boxed));
+                    return self.arena_expr_at(Expr::ArraySubquery(boxed), array_at);
                 }
                 if name.eq_ignore_ascii_case("json") && self.peeked == Tok::Op("(") {
                     return self.sql_json_constructor();
@@ -1181,6 +1198,9 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         let third = self.any_ident("column name")?;
+                        if self.peeked == Tok::Op(".") {
+                            return self.catalog_qualified_column(name_at, name, column, third);
+                        }
                         return self.arena_expr(Expr::SchemaColumn {
                             schema: name,
                             table: column,
@@ -1290,6 +1310,9 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         let third = self.any_ident("column name")?;
+                        if self.peeked == Tok::Op(".") {
+                            return self.catalog_qualified_column(name_at, name, column, third);
+                        }
                         return self.arena_expr(Expr::SchemaColumn {
                             schema: name,
                             table: column,

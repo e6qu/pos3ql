@@ -1068,11 +1068,11 @@ pub(crate) fn view_definition<'a>(
         || select.with_ties
         || plain_table(&from.base).is_none()
         || (!from.joins.is_empty()
-            && matches!(select.items, [crate::sql::ast::SelectItem::Wildcard]))
+            && matches!(select.items, [crate::sql::ast::SelectItem::Wildcard(_)]))
     {
         return Ok(None);
     }
-    let wildcard = matches!(select.items, [crate::sql::ast::SelectItem::Wildcard]);
+    let wildcard = matches!(select.items, [crate::sql::ast::SelectItem::Wildcard(_)]);
     if !wildcard && select.items.len() != column_names.len() {
         return Ok(None);
     }

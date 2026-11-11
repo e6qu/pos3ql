@@ -1045,7 +1045,7 @@ fn leaf_col_unknown<'a>(
                 }
                 idx += 1;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
                 return false;
             }
         }
@@ -1358,7 +1358,7 @@ fn register_record_shapes_inner(
     let mut slot = 0usize;
     for item in statement.items {
         match item {
-            SelectItem::Wildcard => slot += scope.map_or(0, QueryScope::star_columns),
+            SelectItem::Wildcard(_) => slot += scope.map_or(0, QueryScope::star_columns),
             SelectItem::TableWildcard(name) => {
                 slot += scope
                     .and_then(|scope| scope.qualified_star_columns(name).ok())

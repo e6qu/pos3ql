@@ -1193,12 +1193,13 @@ fn expand_grouped_stars<'a>(
     if !statement.items.iter().any(|i| {
         matches!(
             i,
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_)
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_)
         )
     }) {
         return Ok(statement);
     }
-    let mut expanded: [SelectItem<'a>; MAX_PROJ] = [SelectItem::Wildcard; MAX_PROJ];
+    let mut expanded: [SelectItem<'a>; MAX_PROJ] =
+        [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     let mut n = 0usize;
     let mut push = |item: SelectItem<'a>, n: &mut usize| -> Result<(), SqlError> {
         if *n == MAX_PROJ {
@@ -1213,7 +1214,7 @@ fn expand_grouped_stars<'a>(
     };
     for item in statement.items {
         match item {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 for i in 0..scope.star_columns() {
                     let expression = scope.star_expression(scope.star_entry(i), arena)?;
                     push(

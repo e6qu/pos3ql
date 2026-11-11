@@ -30,6 +30,15 @@ pub(crate) struct SourceCopy {
 const NODE: usize = usize::MAX;
 
 impl SourceCopy {
+    /// Records that the sublink querying `select` was written at byte `at`.
+    pub(crate) fn query(select: &crate::sql::ast::Select<'_>, at: usize) -> Self {
+        Self {
+            address: core::ptr::from_ref(select) as usize,
+            len: NODE,
+            at,
+        }
+    }
+
     /// Records that the constant `expression` was written at byte `at`.
     pub(crate) fn node(expression: &crate::sql::ast::Expr<'_>, at: usize) -> Self {
         Self {
@@ -142,6 +151,31 @@ pub(crate) fn at_reference(error: SqlError, subject: &str) -> SqlError {
 
 /// The byte offset of `subject` in the installed statement text: a token the
 /// parser copied, or a slice of the text itself.
+/// A slice inside a token the lexer copied verbatim, such as a word of a
+/// dollar-quoted function body: the copy's text appears in the statement
+/// just after the token's opening delimiter.
+fn within_copy(
+    copies: &[SourceCopy],
+    source: Source,
+    address: usize,
+    len: usize,
+) -> Option<(usize, Source)> {
+    const MAX_DELIMITER: usize = 64;
+    let text = unsafe { core::slice::from_raw_parts(source.text, source.len) };
+    copies.iter().find_map(|copy| {
+        if copy.len == NODE || address < copy.address || address + len > copy.address + copy.len {
+            return None;
+        }
+        // The copy lives in the statement arena for the statement's duration.
+        let copied = unsafe { core::slice::from_raw_parts(copy.address as *const u8, copy.len) };
+        (0..=MAX_DELIMITER)
+            .find(|delimiter| {
+                text.get(copy.at + delimiter..copy.at + delimiter + copy.len) == Some(copied)
+            })
+            .map(|delimiter| (copy.at + delimiter + (address - copy.address), source))
+    })
+}
+
 fn locate(subject: &str) -> Option<(usize, Source)> {
     let source = SOURCE.with(Cell::get);
     if source.text.is_null() {
@@ -159,7 +193,7 @@ fn locate(subject: &str) -> Option<(usize, Source)> {
     }
     let start = source.text as usize;
     if address < start || address + subject.len() > start + source.len {
-        return None;
+        return within_copy(copies, source, address, subject.len());
     }
     let at = address - start;
     // A quoted token parsed without a copy map (a routine's query) is a
@@ -187,7 +221,12 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
             .map(|at| (at, source))
     };
     match expression {
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null | Expr::Param(_) => {
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Param(_)
+        | Expr::Subquery(_) => {
             let address = core::ptr::from_ref(expression) as usize;
             // with_statement_source keeps the copy map alive with its text.
             let copies = unsafe { core::slice::from_raw_parts(source.copies, source.copies_len) };
@@ -197,7 +236,10 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
                 .map(|copy| (copy.at, source))
         }
         Expr::Str(text) | Expr::NumericLit(text) | Expr::BitLit(text) => locate(text),
-        Expr::Column { qualifier, name } => locate(qualifier.unwrap_or(name)),
+        Expr::Column { qualifier, name }
+        | Expr::RoutineParam {
+            qualifier, name, ..
+        } => locate(qualifier.unwrap_or(name)),
         Expr::Binary { left, .. } => expression_start(left),
         Expr::Cast {
             operand,
@@ -217,6 +259,15 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
         | Expr::Call {
             source_position, ..
         } => parsed(*source_position),
+        Expr::RecordFieldIndex {
+            base: Expr::RowSubquery { select, .. },
+            index,
+        } => match select.items.get(usize::from(*index)) {
+            Some(crate::sql::ast::SelectItem::Expr { expression, .. }) => {
+                expression_start(expression)
+            }
+            _ => None,
+        },
         Expr::IsNull { operand, .. }
         | Expr::Collate { operand, .. }
         | Expr::InList { operand, .. }
@@ -230,6 +281,59 @@ pub(crate) fn at_expression(error: SqlError, expression: &crate::sql::ast::Expr<
     let position = expression_start(expression).map(|(at, source)| character_position(source, at));
     record(&error, position, None);
     error
+}
+
+/// Marks `error` as being about the node `expression` at the position the
+/// parser recorded for it: a subquery at its parenthesis, an `IN` or
+/// quantified sublink at its keyword or operator.
+pub(crate) fn at_node(error: SqlError, expression: &crate::sql::ast::Expr<'_>) -> SqlError {
+    let node = core::ptr::from_ref(expression) as usize;
+    let query = sublink_query(expression).map(|select| core::ptr::from_ref(select) as usize);
+    let source = SOURCE.with(Cell::get);
+    let position = (!source.copies.is_null())
+        .then(|| {
+            // with_statement_source keeps the copy map alive with its text.
+            let copies = unsafe { core::slice::from_raw_parts(source.copies, source.copies_len) };
+            let at = |address: usize| {
+                copies
+                    .iter()
+                    .find(|copy| copy.len == NODE && copy.address == address)
+                    .map(|copy| character_position(source, copy.at))
+            };
+            at(node).or_else(|| query.and_then(at))
+        })
+        .flatten();
+    record(&error, position, None);
+    error
+}
+
+/// Marks `error` as being about a select-list item: `t.*` at its
+/// qualifier, a bare `*` where the parser read it.
+pub(crate) fn at_item(error: SqlError, item: &crate::sql::ast::SelectItem<'_>) -> SqlError {
+    use crate::sql::ast::SelectItem;
+    match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            at_expression(error, expression)
+        }
+        SelectItem::TableWildcard(qualifier) => at_reference(error, qualifier),
+        SelectItem::Wildcard(at) => at_parsed_offset(error, at.get()),
+    }
+}
+
+/// The query of a sublink expression.
+pub(crate) fn sublink_query<'e, 'a>(
+    expression: &'e crate::sql::ast::Expr<'a>,
+) -> Option<&'e crate::sql::ast::Select<'a>> {
+    use crate::sql::ast::Expr;
+    match expression {
+        Expr::Subquery(select)
+        | Expr::ArraySubquery(select)
+        | Expr::Exists(select)
+        | Expr::RowSubquery { select, .. }
+        | Expr::InSubquery { select, .. }
+        | Expr::QuantifiedSubquery { select, .. } => Some(select),
+        _ => None,
+    }
 }
 
 /// One-based character position of byte offset `at` in the source text.
@@ -450,11 +554,19 @@ pub(crate) fn with_internal_source<R>(text: &str, run: impl FnOnce() -> R) -> R 
 }
 
 /// Runs `run` positioning relation and column lookups in the installed
-/// statement text, for a query written inside a utility statement such as
-/// the body of `CREATE FUNCTION ... BEGIN ATOMIC`.
-pub(crate) fn with_analysis<R>(run: impl FnOnce() -> R) -> R {
+/// statement text, for queries parsed from `text`, a slice of it written
+/// inside a utility statement (a `CREATE FUNCTION ... BEGIN ATOMIC` body):
+/// their parsed offsets count from the slice's start.
+pub(crate) fn with_analysis_in<R>(text: &str, run: impl FnOnce() -> R) -> R {
+    let current = SOURCE.with(Cell::get);
+    let start = current.text as usize;
+    let address = text.as_ptr() as usize;
+    let mut source = current;
+    if !current.text.is_null() && address >= start && address + text.len() <= start + current.len {
+        source.offset_base = address - start;
+    }
     let _scope = SourceScope(
-        SOURCE.with(Cell::get),
+        SOURCE.with(|installed| installed.replace(source)),
         ANALYZED.with(|flag| flag.replace(true)),
     );
     run()

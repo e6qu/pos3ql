@@ -37,6 +37,18 @@ struct SqlSource {
     /// is a single plain `SELECT` of one expression into its caller, which
     /// then reports no context line for it.
     inlinable: bool,
+    /// PostgreSQL's planner runs an IMMUTABLE function called with constant
+    /// arguments instead of inlining it.
+    planned_with_constants: bool,
+}
+
+impl SqlSource {
+    fn inlining(
+        &self,
+        program: &query::RoutineFunctionProgram<'_>,
+    ) -> crate::sql::error_context::SqlFunctionInlining {
+        choose_inlining(self.planned_with_constants, self.inlinable, program)
+    }
 }
 
 struct ParsedSource<'a> {
@@ -295,6 +307,53 @@ impl SqlResult {
 /// Whether PostgreSQL's `inline_function` would replace a call of this body
 /// by its expression: one `SELECT` of one expression with no other clause,
 /// subquery or set-returning call.
+/// Whether PostgreSQL's planner may inline a call of `routine`, by its
+/// declaration alone.
+fn inlinable_declaration(routine: &crate::storage::RoutineDef) -> bool {
+    !routine.attributes.security_definer
+        && !routine.attributes.strict
+        && routine.config_count == 0
+        && !routine.kind.is_set_returning()
+        && routine.kind.function_result() != Some(ColType::Record)
+}
+
+/// How PostgreSQL's planner treats a call of a SQL-language function, which
+/// decides its error context: an IMMUTABLE function called with constant
+/// arguments runs at plan time, a body of one plain expression is inlined,
+/// and any other body runs as its own statements. A folded body's errors are
+/// raised in planning, so a call that runs is never `during inlining`.
+pub(crate) fn sql_function_inlining(
+    routine: &crate::storage::RoutineDef,
+    program: &query::RoutineFunctionProgram<'_>,
+    constant_arguments: bool,
+) -> crate::sql::error_context::SqlFunctionInlining {
+    choose_inlining(
+        planned_with_constants(routine, constant_arguments),
+        inlinable_declaration(routine),
+        program,
+    )
+}
+
+fn planned_with_constants(routine: &crate::storage::RoutineDef, constant_arguments: bool) -> bool {
+    constant_arguments
+        && routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable
+}
+
+fn choose_inlining(
+    planned_with_constants: bool,
+    inlinable: bool,
+    program: &query::RoutineFunctionProgram<'_>,
+) -> crate::sql::error_context::SqlFunctionInlining {
+    use crate::sql::error_context::SqlFunctionInlining;
+    // A body that fails while folded with constants fails in planning; one
+    // that runs here was inlined and its errors carry no frame.
+    if planned_with_constants || !inlinable || !inlined_by_postgresql(program) {
+        SqlFunctionInlining::Executed
+    } else {
+        SqlFunctionInlining::Inlined
+    }
+}
+
 fn inlined_by_postgresql(program: &query::RoutineFunctionProgram<'_>) -> bool {
     let query::RoutineFunctionResult::Query(query::RoutineQuery::Select(select)) = program.result
     else {
@@ -482,11 +541,12 @@ impl SqlExecution {
                 });
         }
         let name = self.source.name;
+        let inlining = self.source.inlining(&parsed.program);
         let frame = crate::sql::error_context::SqlFunctionFrame {
             name: name.as_str(),
             body: parsed.text,
             statement: core::cell::Cell::new(0),
-            inlined: self.source.inlinable && inlined_by_postgresql(&parsed.program),
+            inlining,
         };
         let result = crate::sql::error_context::within(&frame, || {
             crate::sql::error_position::with_internal_source(parsed.text, || {
@@ -1000,6 +1060,7 @@ pub(in crate::sql) fn execute_sql_function<'a>(
     environment: &CallEnvironment,
     policy: query::RoutineExecution,
     suspended: &mut Option<SuspendedFunction>,
+    constant_arguments: bool,
 ) -> Result<FunctionOutput<'a>, SqlError> {
     let controls = &engine.storage.execution_control;
     let rows = &engine.storage.row_work;
@@ -1123,11 +1184,8 @@ pub(in crate::sql) fn execute_sql_function<'a>(
                 owner: body_inputs.owner,
                 input_source: body_inputs.source,
                 stored,
-                inlinable: !routine.attributes.security_definer
-                    && !routine.attributes.strict
-                    && routine.config_count == 0
-                    && !routine.kind.is_set_returning()
-                    && routine.kind.function_result() != Some(ColType::Record),
+                inlinable: inlinable_declaration(routine),
+                planned_with_constants: planned_with_constants(routine, constant_arguments),
             },
             arguments,
             result,

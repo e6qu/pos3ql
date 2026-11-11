@@ -1222,7 +1222,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             if targets.is_some() {
                 let width = match item {
                     SelectItem::Expr { .. } => 1,
-                    SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                    SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                         let scope = scope.as_ref().ok_or_else(|| {
                             sql_err!(
                                 super::sqlstate::UNDEFINED_TABLE,
@@ -1573,6 +1573,24 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         if let Stmt::Merge(merge) = statement {
             self.expression(merge.on, &columns, &row)?;
         }
+        let check_sources = |assignments: &[(&str, &Expr<'_>)]| {
+            assignments.iter().try_for_each(|(_, expression)| {
+                super::dependencies::check_multiple_assignment_source(
+                    expression, &scope, storage, txid, arena,
+                )
+            })
+        };
+        match statement {
+            Stmt::Update(update) => check_sources(update.assignments)?,
+            Stmt::Merge(merge) => {
+                for when in merge.whens {
+                    if let ast::MergeActionRef::Update(assignments) = when.action() {
+                        check_sources(assignments)?;
+                    }
+                }
+            }
+            _ => {}
+        }
         super::dependencies::visit_resolved_dml_assignment_inputs(
             statement,
             storage,
@@ -1650,8 +1668,16 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             catalog: Some(&catalog),
         };
         for item in returning.items {
-            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
-                self.expression(expression, &columns, &row)?;
+            match item {
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    self.expression(expression, &columns, &row)?;
+                }
+                SelectItem::TableWildcard(qualifier) => {
+                    scope
+                        .qualified_star_columns(qualifier)
+                        .map_err(|error| crate::sql::error_position::at_item(error, item))?;
+                }
+                SelectItem::Wildcard(_) => {}
             }
         }
         Ok(())

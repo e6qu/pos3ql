@@ -736,6 +736,13 @@ pub(crate) enum ExpressionTypeIdentity {
 }
 
 impl ExpressionTypeIdentity {
+    pub(crate) const fn known_oid(self) -> Option<i32> {
+        match self {
+            Self::Known(oid) => Some(oid),
+            Self::Unresolved => None,
+        }
+    }
+
     pub(crate) const fn record_field_oid(self) -> i32 {
         match self {
             Self::Known(oid) => oid,
@@ -1624,6 +1631,7 @@ pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
             | "__json_table_value"
             | "__jsonb_subscript_set"
             | "__array_subscript_set"
+            | "__assign_path"
     )
 }
 
@@ -2792,6 +2800,71 @@ pub struct SubqueryValues<'h, 'a> {
     /// all-NULL, matching PostgreSQL (which type-checks `x IN (...)` regardless
     /// of contents).
     pub lists: &'h [SubqueryList<'a>],
+    /// Subqueries with effects, run where evaluation reaches them as
+    /// PostgreSQL runs a subplan, so their calls, sequence values and
+    /// data-modifying `WITH` reads keep PostgreSQL's order.
+    pub deferred: &'h [DeferredSubquery<'h>],
+}
+
+/// A subquery run when evaluation first reaches it. An uncorrelated one runs
+/// once per statement, like PostgreSQL's initplan, and keeps its value in
+/// retained bytes that outlive per-row memory.
+#[derive(Clone, Copy)]
+pub struct DeferredSubquery<'h> {
+    pub(crate) node: *const (),
+    pub(crate) executor: &'h dyn SubqueryExecution,
+    pub(crate) owner: &'h Arena,
+    pub(crate) cache:
+        Option<&'h core::cell::Cell<Option<crate::mem::arena::FrozenArenaSliceHandle<u8>>>>,
+}
+
+impl DeferredSubquery<'_> {
+    fn evaluate<'a>(
+        &self,
+        expression: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        row: &dyn ColumnLookup<'a>,
+        sequences: Option<&dyn SequenceAccess>,
+    ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
+        if let Some(saved) = self.cache.and_then(core::cell::Cell::get) {
+            let bytes = self.owner.retained_slice(saved).map_err(|_| arena_full())?;
+            let bytes = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+            return Ok((
+                crate::sql::exec::decode_projected_col_record(bytes, 0, arena)?,
+                crate::sql::exec::decode_projected_col_record(bytes, 1, arena)?,
+            ));
+        }
+        let SubqueryResult::Scalar { value, witness } = self
+            .executor
+            .evaluate(expression, arena, params, row, sequences)?
+        else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a deferred subquery produced a list"
+            ));
+        };
+        if let Some(cache) = self.cache {
+            let values = [value, witness];
+            let length = crate::sql::exec::projected_row_len(&values)?;
+            let handle = self
+                .owner
+                .retain_slice_with(length, |_| 0u8)
+                .map_err(|_| arena_full())?;
+            let mut bytes = self
+                .owner
+                .retained_slice_mut(handle)
+                .map_err(|_| arena_full())?;
+            crate::sql::exec::encode_projected_into(&values, &mut bytes)?;
+            drop(bytes);
+            cache.set(Some(
+                self.owner
+                    .freeze_retained_slice(handle)
+                    .map_err(|_| arena_full())?,
+            ));
+        }
+        Ok((value, witness))
+    }
 }
 
 pub enum SubqueryResult<'a> {
@@ -3453,17 +3526,24 @@ fn eval_binary_values<'a>(
     {
         let left_oid = expression_type_identity(left, row, hooks)?.routine_argument_oid();
         let right_oid = expression_type_identity(right, row, hooks)?.routine_argument_oid();
-        if let Some(value) = catalog.call_operator(
-            name,
-            [l, r],
-            [left_oid, right_oid],
-            routine_input_collation(&[left, right], row, hooks.catalog)?,
-            [
-                coercion_input_collation(left, row, hooks.catalog)?,
-                coercion_input_collation(right, row, hooks.catalog)?,
-            ],
-            nulls,
-            arena,
+        let input_collation = routine_input_collation(&[left, right], row, hooks.catalog)?;
+        let argument_collations = [
+            coercion_input_collation(left, row, hooks.catalog)?,
+            coercion_input_collation(right, row, hooks.catalog)?,
+        ];
+        if let Some(value) = crate::sql::query::with_call_arguments(
+            left.folds_to_constant() && right.folds_to_constant(),
+            || {
+                catalog.call_operator(
+                    name,
+                    [l, r],
+                    [left_oid, right_oid],
+                    input_collation,
+                    argument_collations,
+                    nulls,
+                    arena,
+                )
+            },
         )? {
             return Ok(value);
         }
@@ -4263,6 +4343,35 @@ fn eval_full_inner<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    if let Some(deferred) = hooks.subs.and_then(|subs| {
+        subs.deferred
+            .iter()
+            .find(|deferred| core::ptr::eq(deferred.node, (expression as *const Expr).cast()))
+    }) && hooks.subs.is_some_and(|subs| {
+        !subs
+            .scalars
+            .iter()
+            .any(|(node, _, _)| core::ptr::eq(*node, expression))
+    }) {
+        let (value, witness) =
+            deferred.evaluate(expression, arena, params, row, hooks.sequences)?;
+        let scalars = [(expression as *const Expr, value, witness)];
+        let values = SubqueryValues {
+            scalars: &scalars,
+            lists: &[],
+            deferred: &[],
+        };
+        return eval_full_inner(
+            expression,
+            arena,
+            params,
+            row,
+            &EvalHooks {
+                subs: Some(&values),
+                ..*hooks
+            },
+        );
+    }
     if let Some(executor) = hooks.subquery_executor
         && matches!(
             expression,
@@ -4301,6 +4410,7 @@ fn eval_full_inner<'a>(
                 SubqueryValues {
                     scalars: &scalars,
                     lists: &[],
+                    deferred: &[],
                 }
             }
             SubqueryResult::List(list) => {
@@ -4311,6 +4421,7 @@ fn eval_full_inner<'a>(
                 SubqueryValues {
                     scalars: &[],
                     lists: &lists,
+                    deferred: &[],
                 }
             }
         };
@@ -4452,8 +4563,11 @@ fn eval_full_inner<'a>(
             table,
             name,
         } => {
+            // PostgreSQL positions a three-part reference at its start.
+            let positioned =
+                |error| crate::sql::error_position::column_reference(error, Some(schema), name);
             if row.is_empty_scope() {
-                return Err(empty_scope_column_error(Some(table), name));
+                return Err(positioned(empty_scope_column_error(Some(table), name)));
             }
             // A three-part reference resolves through a composed
             // `schema.table` qualifier: only an unaliased FROM entry whose
@@ -4463,7 +4577,7 @@ fn eval_full_inner<'a>(
             let composed = arena
                 .alloc_str(crate::stack_format!(130, "{}.{}", schema, table).as_str())
                 .map_err(|_| arena_full())?;
-            let value = row.lookup(Some(composed), name)?;
+            let value = row.lookup(Some(composed), name).map_err(positioned)?;
             materialize_named_composite(value, hooks, arena)
         }
         Expr::RecursiveState {

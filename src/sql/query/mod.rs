@@ -74,6 +74,7 @@ pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;
 pub(crate) use cte::captured_type_oid;
+pub(crate) use cte::{CteReader, dml_cte_runs_after};
 mod dependencies;
 mod procedural_names;
 pub(crate) use procedural_names::{
@@ -86,6 +87,7 @@ pub(crate) use type_inputs::{
     capture_contextual_type_inputs, visit_planner_calls, visit_planner_expression,
 };
 pub(super) mod predicate_safety;
+pub(crate) use cte::expand_from_schema;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
@@ -290,8 +292,8 @@ pub(crate) use dependencies::collect_routine_signature_row_types;
 pub(crate) use dependencies::collect_runtime_expression;
 pub(crate) use dependencies::collect_runtime_statement;
 pub(crate) use dependencies::{
-    for_each_dml_assignment, validate_dml_assignment_casts, visit_dml_assignment_types,
-    visit_projection_types,
+    for_each_dml_assignment, undefined_set_target, validate_dml_assignment_casts,
+    visit_dml_assignment_types, visit_projection_types,
 };
 
 pub(crate) fn stored_routine_dependencies(
@@ -624,7 +626,7 @@ fn collect_stored_query_composite_field_rename_select<'a>(
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                 rename.collect_expression(expression, columns, nested_outer, sites, count)?;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
         }
     }
     if let Some(from_clause) = &select.from {
@@ -944,6 +946,8 @@ pub(crate) enum InvocationSite {
 #[derive(Clone, Copy)]
 pub(crate) struct PendingRoutineInvocation {
     pub target: PendingRoutineTarget,
+    /// Every argument the call site wrote folds to a constant.
+    pub constant_arguments: bool,
     arguments: crate::mem::arena::FrozenArenaSliceHandle<u8>,
     pub argument_count: usize,
     pub source_position: Option<InvocationSite>,
@@ -956,6 +960,66 @@ pub(crate) struct PendingRoutineInvocation {
 pub(crate) enum PendingRoutineTarget {
     Stored(crate::mem::arena::ArenaHandle<OwnedRoutineCallContract>),
     Intrinsic(i32),
+    WriteQuery(PendingWriteQuery),
+}
+
+/// A data-modifying `WITH` query whose rows were first read. It runs at the
+/// invocation ordinal of that read; calls it makes take the ordinals after it.
+#[derive(Clone, Copy)]
+pub(crate) struct PendingWriteQuery {
+    with: (usize, usize),
+    pub index: usize,
+    params: (usize, usize),
+    pub ordinal: usize,
+}
+
+impl PendingWriteQuery {
+    fn key(&self) -> (usize, usize) {
+        (self.with.0, self.index)
+    }
+
+    /// The statement's `WITH` list and parameters.
+    ///
+    /// # Safety
+    /// The statement that raised this read is still executing: every loop that
+    /// completes a pending call owns the statement for longer than the call.
+    pub(crate) unsafe fn statement<'x>(&self) -> (&'x [super::ast::Cte<'x>], &'x [Datum<'x>]) {
+        unsafe {
+            (
+                core::slice::from_raw_parts(self.with.0 as *const super::ast::Cte<'x>, self.with.1),
+                core::slice::from_raw_parts(self.params.0 as *const Datum<'x>, self.params.1),
+            )
+        }
+    }
+}
+
+/// A completed data-modifying `WITH` query and its rows.
+#[derive(Clone, Copy)]
+struct WriteQueryResult {
+    key: (usize, usize),
+    /// The invocation log whose read ran the query, and that read's ordinal.
+    owner: u64,
+    ordinal: usize,
+    rows: OwnedRoutineResult,
+    replay: super::sequence::StatementReplayCursor,
+}
+
+/// Reads a data-modifying `WITH` query's rows for the running statement
+/// attempt, or makes its run the attempt's pending call.
+pub(crate) fn read_write_query<'a>(
+    source: &super::ast::WriteQuerySource<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((invocations, statement_arena)) = context else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "data-modifying WITH query \"{}\" was read outside its statement",
+                source.with[source.index].name
+            ));
+        };
+        invocations.resolve_write_query(source, statement_arena, arena)
+    })
 }
 
 impl PendingRoutineInvocation {
@@ -987,7 +1051,7 @@ impl PendingRoutineInvocation {
     }
 }
 
-pub(super) fn inactive_pending_call() -> SqlError {
+pub(crate) fn inactive_pending_call() -> SqlError {
     sql_err!(
         sqlstate::INTERNAL_ERROR,
         "pending routine call storage is inactive"
@@ -1362,6 +1426,15 @@ pub(crate) struct RoutineInvocationState {
     pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
     owner: ArenaIdentity,
     results: RefCell<RoutineResults>,
+    /// Identifies this log across relocation.
+    id: u64,
+    writes: RefCell<crate::mem::arena::RetainedList<WriteQueryResult>>,
+    /// The address of the log holding `writes` for a write query's run;
+    /// zero for the statement's own log.
+    writes_root: Cell<usize>,
+    /// The statement reads data-modifying `WITH` queries, so any attempt may
+    /// still restart after its main query has produced rows.
+    reads_writes: Cell<bool>,
     inputs: input_progress::RoutineInputs,
 }
 
@@ -1384,6 +1457,8 @@ impl<'scope, 'arena> RoutineInvocationContext<'scope, 'arena> {
 }
 
 thread_local! {
+    static CALL_ARGUMENTS_CONSTANT: Cell<bool> = const { Cell::new(false) };
+    static INVOCATION_LOG_IDS: Cell<u64> = const { Cell::new(1) };
     static ACTIVE_ROUTINE_INVOCATIONS: Cell<Option<(*const (), *const ())>> = const { Cell::new(None) };
 }
 
@@ -1396,6 +1471,26 @@ impl Drop for RoutineInvocationScope {
     fn drop(&mut self) {
         ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.set(self.0));
     }
+}
+
+/// Runs a routine call whose written arguments PostgreSQL's planner folds
+/// to constants or not. An IMMUTABLE function called with constants runs at
+/// plan time, and a constant inlined body is folded while it is inlined, so
+/// the function's error context depends on it. Calls made while evaluating
+/// the arguments restore this call's value when they return.
+pub(crate) fn with_call_arguments<R>(constant: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CALL_ARGUMENTS_CONSTANT.with(|current| current.set(self.0));
+        }
+    }
+    let _restore = Restore(CALL_ARGUMENTS_CONSTANT.with(|current| current.replace(constant)));
+    run()
+}
+
+pub(crate) fn call_arguments_constant() -> bool {
+    CALL_ARGUMENTS_CONSTANT.with(Cell::get)
 }
 
 pub(crate) fn with_routine_invocation_scope<R>(
@@ -1445,13 +1540,22 @@ pub(crate) fn statement_effect_epoch() -> u64 {
     STATEMENT_EFFECT_EPOCH.with(Cell::get)
 }
 
+/// Whether the running statement reads data-modifying `WITH` queries.
+pub(crate) fn statement_reads_write_queries() -> bool {
+    with_active_routine_invocations(|context| {
+        context.is_some_and(|(invocations, _)| invocations.reads_writes.get())
+    })
+}
+
 /// Whether the running statement attempt has invoked a routine whose result
 /// a later attempt would replay. Such an attempt may still restart, so its
 /// output must not leave for the client yet.
 pub(crate) fn statement_attempt_may_restart() -> bool {
     with_active_routine_invocations(|context| {
         context.is_some_and(|(invocations, _)| {
-            invocations.next.get() != 0 || invocations.pending.get().is_some()
+            invocations.next.get() != 0
+                || invocations.pending.get().is_some()
+                || invocations.reads_writes.get()
         })
     })
 }
@@ -1517,8 +1621,162 @@ impl RoutineInvocationState {
             pending_replay: Cell::new(None),
             owner: arena.identity(),
             results: RefCell::new(RoutineResults::new()),
+            id: INVOCATION_LOG_IDS.with(|next| {
+                let id = next.get();
+                next.set(id.wrapping_add(1));
+                id
+            }),
+            writes: RefCell::new(crate::mem::arena::RetainedList::new()),
+            writes_root: Cell::new(0),
+            reads_writes: Cell::new(false),
             inputs: input_progress::RoutineInputs::new(),
         }
+    }
+
+    /// Holds the statement's output until it completes: a data-modifying
+    /// `WITH` query nothing read yet runs after the main query.
+    pub(crate) fn hold_output_for_write_queries(&self) {
+        self.reads_writes.set(true);
+    }
+
+    /// The state holding the statement's completed write queries.
+    fn write_table(&self) -> &Self {
+        let root = self.writes_root.get();
+        if root == 0 {
+            self
+        } else {
+            // A child state lives only inside the call on its root that made it.
+            unsafe { &*(root as *const Self) }
+        }
+    }
+
+    /// The invocation log of one run of a pending write query. Its calls
+    /// replay inside that run only; completed write queries stay shared.
+    pub(crate) fn write_query_child(&self, arena: &Arena) -> Self {
+        let child = Self::new(arena, self.execution);
+        child
+            .writes_root
+            .set(core::ptr::from_ref(self.write_table()) as usize);
+        child
+    }
+
+    fn write_query(
+        &self,
+        arena: &Arena,
+        key: (usize, usize),
+    ) -> Result<Option<WriteQueryResult>, SqlError> {
+        self.writes
+            .borrow()
+            .with_slice(arena, |writes| {
+                writes.iter().find(|write| write.key == key).copied()
+            })
+            .map_err(|_| inactive_pending_call())
+    }
+
+    fn resolve_write_query<'query>(
+        &self,
+        source: &super::ast::WriteQuerySource<'_>,
+        statement_arena: &Arena,
+        query_arena: &'query Arena,
+    ) -> Result<&'query [&'query [u8]], SqlError> {
+        self.require_arena(statement_arena)?;
+        let key = (source.with.as_ptr() as usize, source.index);
+        let next = self.next.get();
+        if let Some(write) = self.write_table().write_query(statement_arena, key)? {
+            // A query first read here takes its ordinal in this log, and its
+            // first read in each attempt skips the sequence values it used. A
+            // query first read inside another query's run was skipped with it.
+            if write.owner == self.id {
+                if next == write.ordinal {
+                    self.next.set(next + 1);
+                    super::sequence::restore_replay_cursor(
+                        write.replay,
+                        super::sequence::ReplayInputPosition::KeepConsumed,
+                    )?;
+                } else if next < write.ordinal {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "data-modifying WITH query replay changed order"
+                    ));
+                }
+            }
+            let OwnedRoutineResult::Rows(rows) = write.rows else {
+                return Err(inactive_pending_call());
+            };
+            // The rows stay in the statement arena's retained tail until the
+            // statement ends, after every query that reads them; only the
+            // row index is built in the reading query's memory.
+            let statement_arena: &'query Arena = unsafe { &*core::ptr::from_ref(statement_arena) };
+            return rows.rows(statement_arena, query_arena);
+        }
+        self.next.set(next + 1);
+        self.pending_replay
+            .set(super::sequence::begin_replay_cursor()?);
+        self.pending.set(Some(PendingRoutineInvocation {
+            constant_arguments: false,
+            plan_owner: super::type_input_plans::owner()?,
+            source_position: None,
+            input_collation: super::ast::Collation::None,
+            access: super::eval::RoutineCallAccess::Caller,
+            target: PendingRoutineTarget::WriteQuery(PendingWriteQuery {
+                with: (source.with.as_ptr() as usize, source.with.len()),
+                index: source.index,
+                params: source.params,
+                ordinal: next,
+            }),
+            arguments: PendingRoutineInvocation::capture_arguments(&[], statement_arena)?,
+            argument_count: 0,
+        }));
+        Err(sql_err!(
+            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+            "data-modifying WITH query is pending"
+        ))
+    }
+
+    /// The sequence position where the pending call was first reached.
+    pub(crate) fn take_pending_replay(&self) -> Option<super::sequence::StatementReplayStart> {
+        self.pending_replay.take()
+    }
+
+    /// Records a finished write query at the ordinal of the read that ran it.
+    pub(crate) fn complete_write_query(
+        &self,
+        write: PendingWriteQuery,
+        rows: crate::mem::arena::FrozenArenaSliceHandle<u8>,
+        replay: Option<super::sequence::StatementReplayStart>,
+        arena: &Arena,
+        scratch: &Arena,
+    ) -> Result<(), SqlError> {
+        self.require_arena(arena)?;
+        if self.results.borrow().len() != write.ordinal {
+            return Err(inactive_pending_call());
+        }
+        let replay = super::sequence::finish_replay_cursor(replay, scratch)?;
+        let rows = OwnedRoutineResult::from_row_image(rows);
+        self.results
+            .borrow_mut()
+            .push(
+                arena,
+                RoutineInvocationResult {
+                    value: rows,
+                    replay,
+                },
+            )
+            .map_err(invocation_results::directory_error)?;
+        self.write_table()
+            .writes
+            .borrow_mut()
+            .push(
+                arena,
+                WriteQueryResult {
+                    key: write.key(),
+                    owner: self.id,
+                    ordinal: write.ordinal,
+                    rows,
+                    replay,
+                },
+            )
+            .map_err(invocation_results::directory_error)
     }
 
     pub(crate) fn require_arena(&self, arena: &Arena) -> Result<(), SqlError> {
@@ -1579,6 +1837,7 @@ impl RoutineInvocationState {
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
         self.pending.set(Some(PendingRoutineInvocation {
+            constant_arguments: call_arguments_constant(),
             plan_owner: super::type_input_plans::owner()?,
             source_position,
             input_collation,
@@ -1630,6 +1889,7 @@ impl RoutineInvocationState {
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
         self.pending.set(Some(PendingRoutineInvocation {
+            constant_arguments: call_arguments_constant(),
             plan_owner: super::type_input_plans::owner()?,
             source_position: input_progress::invocation_site(),
             input_collation: super::ast::Collation::None,
@@ -1692,6 +1952,7 @@ impl RoutineInvocationState {
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
         self.pending.set(Some(PendingRoutineInvocation {
+            constant_arguments: call_arguments_constant(),
             plan_owner: super::type_input_plans::owner()?,
             source_position: source_position.map(InvocationSite::Expression),
             input_collation,
@@ -3611,73 +3872,54 @@ impl StorageCatalog<'_, '_, '_, '_> {
             self.storage
                 .ensure_function_statistics(crate::storage::routine_oid(routine))?;
         }
-        let output = super::sequence::with_statement_context(|context| {
-            if program_access == RoutineProgramAccess::Sequences && context.is_none() {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "SQL sequence functions require an active statement session"
-                ));
-            }
-            let live_sequences = context.map(|(_, session)| {
-                super::sequence::SeqEval::new(self.storage, session, self.txid)
-            });
-            let sequences = live_sequences
-                .as_ref()
-                .map(|sequences| sequences as &dyn SequenceAccess);
-            let mut parameters = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-            for (slot, argument) in arguments.iter().enumerate() {
-                let encoded =
-                    crate::sql::exec::encode_projected_pub(&[*argument], self.routine_workspace)?;
-                parameters[slot] = crate::sql::exec::decode_projected_col_record(
-                    encoded,
-                    0,
-                    self.routine_workspace,
-                )?;
-            }
-            for step in function_program.preceding {
-                let RoutinePrelude::Statement(statement) = step else {
-                    let RoutinePrelude::Forbidden(statement) = step else {
-                        unreachable!("routine prelude has two variants");
-                    };
-                    return Err(routine_forbidden_statement_error(statement));
-                };
-                let query = match statement {
-                    Stmt::Select(query) => RoutineQuery::Select(query),
-                    Stmt::SetQuery(query) => RoutineQuery::Set(query),
-                    _ => unreachable!("mutable routine prelude was rejected above"),
-                };
-                execute_bound_routine_query(
-                    &query,
-                    self.storage,
-                    slot,
-                    routine,
-                    self.txid,
-                    self.routine_workspace,
-                    &parameters[..arguments.len()],
-                    true,
-                    sequences,
-                    &mut |_| Ok(()),
-                )?;
-            }
-            let mut result = None;
-            let result_query = match function_program.result {
-                RoutineFunctionResult::Query(result_query) => result_query,
-                RoutineFunctionResult::DataModification(_) => {
+        let frame = crate::sql::error_context::SqlFunctionFrame {
+            name: routine.name.as_str(),
+            body: routine.body.as_str(),
+            statement: core::cell::Cell::new(0),
+            inlining: super::exec::sql_function_inlining(
+                routine,
+                &function_program,
+                call_arguments_constant(),
+            ),
+        };
+        let output = crate::sql::error_context::within(&frame, || {
+            super::sequence::with_statement_context(|context| {
+                if program_access == RoutineProgramAccess::Sequences && context.is_none() {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
-                        "data-modifying SQL function results require a resumable query executor"
+                        "SQL sequence functions require an active statement session"
                     ));
                 }
-                RoutineFunctionResult::Void(statement) => {
+                let live_sequences = context.map(|(_, session)| {
+                    super::sequence::SeqEval::new(self.storage, session, self.txid)
+                });
+                let sequences = live_sequences
+                    .as_ref()
+                    .map(|sequences| sequences as &dyn SequenceAccess);
+                let mut parameters = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                for (slot, argument) in arguments.iter().enumerate() {
+                    let encoded = crate::sql::exec::encode_projected_pub(
+                        &[*argument],
+                        self.routine_workspace,
+                    )?;
+                    parameters[slot] = crate::sql::exec::decode_projected_col_record(
+                        encoded,
+                        0,
+                        self.routine_workspace,
+                    )?;
+                }
+                for (index, step) in function_program.preceding.iter().enumerate() {
+                    frame.statement.set(index + 1);
+                    let RoutinePrelude::Statement(statement) = step else {
+                        let RoutinePrelude::Forbidden(statement) = step else {
+                            unreachable!("routine prelude has two variants");
+                        };
+                        return Err(routine_forbidden_statement_error(statement));
+                    };
                     let query = match statement {
                         Stmt::Select(query) => RoutineQuery::Select(query),
                         Stmt::SetQuery(query) => RoutineQuery::Set(query),
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "data-modifying SQL functions require a resumable query executor"
-                            ));
-                        }
+                        _ => unreachable!("mutable routine prelude was rejected above"),
                     };
                     execute_bound_routine_query(
                         &query,
@@ -3691,56 +3933,91 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         sequences,
                         &mut |_| Ok(()),
                     )?;
-                    return Ok(Some(Datum::Text("")));
                 }
-                RoutineFunctionResult::Forbidden(statement) => {
-                    return Err(routine_forbidden_statement_error(statement));
-                }
-                RoutineFunctionResult::Empty => return Ok(Some(Datum::Text(""))),
-            };
-            execute_bound_routine_query(
-                result_query,
-                self.storage,
-                slot,
-                routine,
-                self.txid,
-                self.routine_workspace,
-                &parameters[..arguments.len()],
-                true,
-                sequences,
-                &mut |values| {
-                    if result.is_none() {
-                        result = Some(result_shape.capture(
-                            values,
-                            || {
-                                RoutineResultContract::stored(
-                                    self.storage,
-                                    self.txid,
-                                    routine,
-                                    arena,
-                                )
-                                .map(RoutineResultContract::name)
-                            },
-                            arena,
-                        )?);
+                frame.statement.set(function_program.preceding.len() + 1);
+                let mut result = None;
+                let result_query = match function_program.result {
+                    RoutineFunctionResult::Query(result_query) => result_query,
+                    RoutineFunctionResult::DataModification(_) => {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "data-modifying SQL function results require a resumable query executor"
+                        ));
                     }
-                    Ok(())
-                },
-            )?;
-            let result = result.unwrap_or(Datum::Null);
-            let Some(result_contract) = result_contract else {
-                return Ok(Some(result));
-            };
-            if result_contract.polymorphic_type().is_some() {
-                Ok(Some(result))
-            } else {
-                if matches!(result_type, ColType::Composite(_)) {
-                    self.coerce_result(result, result_contract, arena, sequences)
-                        .map(Some)
+                    RoutineFunctionResult::Void(statement) => {
+                        let query = match statement {
+                            Stmt::Select(query) => RoutineQuery::Select(query),
+                            Stmt::SetQuery(query) => RoutineQuery::Set(query),
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "data-modifying SQL functions require a resumable query executor"
+                                ));
+                            }
+                        };
+                        execute_bound_routine_query(
+                            &query,
+                            self.storage,
+                            slot,
+                            routine,
+                            self.txid,
+                            self.routine_workspace,
+                            &parameters[..arguments.len()],
+                            true,
+                            sequences,
+                            &mut |_| Ok(()),
+                        )?;
+                        return Ok(Some(Datum::Text("")));
+                    }
+                    RoutineFunctionResult::Forbidden(statement) => {
+                        return Err(routine_forbidden_statement_error(statement));
+                    }
+                    RoutineFunctionResult::Empty => return Ok(Some(Datum::Text(""))),
+                };
+                execute_bound_routine_query(
+                    result_query,
+                    self.storage,
+                    slot,
+                    routine,
+                    self.txid,
+                    self.routine_workspace,
+                    &parameters[..arguments.len()],
+                    true,
+                    sequences,
+                    &mut |values| {
+                        if result.is_none() {
+                            result = Some(result_shape.capture(
+                                values,
+                                || {
+                                    RoutineResultContract::stored(
+                                        self.storage,
+                                        self.txid,
+                                        routine,
+                                        arena,
+                                    )
+                                    .map(RoutineResultContract::name)
+                                },
+                                arena,
+                            )?);
+                        }
+                        Ok(())
+                    },
+                )?;
+                let result = result.unwrap_or(Datum::Null);
+                let Some(result_contract) = result_contract else {
+                    return Ok(Some(result));
+                };
+                if result_contract.polymorphic_type().is_some() {
+                    Ok(Some(result))
                 } else {
-                    super::eval::cast_to(result, result_type, arena).map(Some)
+                    if matches!(result_type, ColType::Composite(_)) {
+                        self.coerce_result(result, result_contract, arena, sequences)
+                            .map(Some)
+                    } else {
+                        super::eval::cast_to(result, result_type, arena).map(Some)
+                    }
                 }
-            }
+            })
         });
         if let Some((total, own)) = timed.finish()
             && output.is_ok()
@@ -4869,110 +5146,118 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
-        let (oid, mapping, variadic, bound_strict) = match target {
-            super::eval::RoutineCallTarget::Builtin { .. } => {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "builtin target must execute through expression evaluation"
-                ));
-            }
-            super::eval::RoutineCallTarget::Stored {
-                oid,
-                argument_mapping,
-                variadic,
-                bound_strict,
-            } => (oid, argument_mapping, variadic, bound_strict),
-            super::eval::RoutineCallTarget::Operator { schema, name } => {
-                let collations = arena
-                    .alloc_slice_with(arguments.len(), |_| super::ast::Collation::None)
-                    .map_err(|_| arena_full())?;
-                let mut derived = None;
-                for (output, expression) in collations.iter_mut().zip(arguments) {
-                    let argument = argument_collation(expression)?;
-                    *output = argument_collation(super::eval::coercion_source(expression))?.map_or(
-                        super::ast::Collation::None,
-                        super::eval::DerivedCollation::input_collation,
-                    );
-                    derived = super::eval::merge_derived_collations(derived, argument)?;
-                }
-                let input_collation = derived.map_or(
-                    super::ast::Collation::None,
-                    super::eval::DerivedCollation::input_collation,
-                );
-                let values = arena
-                    .alloc_slice_with(arguments.len(), |_| Datum::Null)
-                    .map_err(|_| arena_full())?;
-                for (value, expression) in values.iter_mut().zip(arguments) {
-                    *value = evaluate(expression)?;
-                }
-                return self
-                    .execute_catalog_operator(
-                        schema,
-                        name,
-                        values,
-                        argument_type_oids,
-                        input_collation,
-                        collations,
-                        super::eval::OperatorNulls::RoutineStrictness,
-                        arena,
-                    )?
-                    .map(|evaluation| evaluation.value)
+        with_call_arguments(
+            arguments
+                .iter()
+                .all(|argument| argument.folds_to_constant()),
+            || {
+                let (oid, mapping, variadic, bound_strict) = match target {
+                    super::eval::RoutineCallTarget::Builtin { .. } => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "builtin target must execute through expression evaluation"
+                        ));
+                    }
+                    super::eval::RoutineCallTarget::Stored {
+                        oid,
+                        argument_mapping,
+                        variadic,
+                        bound_strict,
+                    } => (oid, argument_mapping, variadic, bound_strict),
+                    super::eval::RoutineCallTarget::Operator { schema, name } => {
+                        let collations = arena
+                            .alloc_slice_with(arguments.len(), |_| super::ast::Collation::None)
+                            .map_err(|_| arena_full())?;
+                        let mut derived = None;
+                        for (output, expression) in collations.iter_mut().zip(arguments) {
+                            let argument = argument_collation(expression)?;
+                            *output = argument_collation(super::eval::coercion_source(expression))?
+                                .map_or(
+                                    super::ast::Collation::None,
+                                    super::eval::DerivedCollation::input_collation,
+                                );
+                            derived = super::eval::merge_derived_collations(derived, argument)?;
+                        }
+                        let input_collation = derived.map_or(
+                            super::ast::Collation::None,
+                            super::eval::DerivedCollation::input_collation,
+                        );
+                        let values = arena
+                            .alloc_slice_with(arguments.len(), |_| Datum::Null)
+                            .map_err(|_| arena_full())?;
+                        for (value, expression) in values.iter_mut().zip(arguments) {
+                            *value = evaluate(expression)?;
+                        }
+                        return self
+                            .execute_catalog_operator(
+                                schema,
+                                name,
+                                values,
+                                argument_type_oids,
+                                input_collation,
+                                collations,
+                                super::eval::OperatorNulls::RoutineStrictness,
+                                arena,
+                            )?
+                            .map(|evaluation| evaluation.value)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_FUNCTION,
+                                    "operator does not exist: {}",
+                                    name
+                                )
+                            });
+                    }
+                };
+                let slot = self
+                    .storage
+                    .routine_slot_by_oid(oid, self.txid)
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_FUNCTION,
-                            "operator does not exist: {}",
-                            name
+                            "function with OID {} does not exist",
+                            oid
                         )
-                    });
-            }
-        };
-        let slot = self
-            .storage
-            .routine_slot_by_oid(oid, self.txid)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "function with OID {} does not exist",
-                    oid
-                )
-            })?;
-        let mut declared = self.storage.routine_for(slot, self.txid);
-        if let Some(strict) = bound_strict {
-            declared.attributes.strict = strict;
-        }
-        let Some(completed) = self.prepare_routine_inputs(
-            slot,
-            &mut declared,
-            RoutineCallInputs {
-                arguments,
-                argument_type_oids,
-                argument_collation,
-                mapping: &mapping,
-                variadic,
-                context: RoutineInputContext::Scalar,
+                    })?;
+                let mut declared = self.storage.routine_for(slot, self.txid);
+                if let Some(strict) = bound_strict {
+                    declared.attributes.strict = strict;
+                }
+                let Some(completed) = self.prepare_routine_inputs(
+                    slot,
+                    &mut declared,
+                    RoutineCallInputs {
+                        arguments,
+                        argument_type_oids,
+                        argument_collation,
+                        mapping: &mapping,
+                        variadic,
+                        context: RoutineInputContext::Scalar,
+                    },
+                    evaluate,
+                    arena,
+                )?
+                else {
+                    return Ok(Datum::Null);
+                };
+                let routine = &declared;
+                self.execute_routine(
+                    slot,
+                    routine,
+                    &completed.values[..declared.argument_count],
+                    completed.input_collation,
+                    super::eval::RoutineCallAccess::Caller,
+                    input_progress::invocation_site(),
+                    arena,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "resolved routine has no scalar result"
+                    )
+                })
             },
-            evaluate,
-            arena,
-        )?
-        else {
-            return Ok(Datum::Null);
-        };
-        let routine = &declared;
-        self.execute_routine(
-            slot,
-            routine,
-            &completed.values[..declared.argument_count],
-            completed.input_collation,
-            super::eval::RoutineCallAccess::Caller,
-            input_progress::invocation_site(),
-            arena,
-        )?
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "resolved routine has no scalar result"
-            )
-        })
+        )
     }
 
     fn call_routine_oid<'a>(
@@ -7268,7 +7553,7 @@ fn patch_subquery_column_types<'a>(
     let mut slot = 0usize;
     for item in items {
         match item {
-            SelectItem::Wildcard => slot += scope.map_or(0, |s| s.star_columns()),
+            SelectItem::Wildcard(_) => slot += scope.map_or(0, |s| s.star_columns()),
             SelectItem::TableWildcard(q) => {
                 slot += scope
                     .and_then(|s| s.qualified_star_columns(q).ok())
@@ -7449,7 +7734,9 @@ pub(crate) fn analyse_routine_statement<'a>(
         .resolve_relation(target.schema, target.name, txid)
         .is_some()
     {
-        return Ok(());
+        // Target columns and the values assigned to them are analysed with
+        // the statement.
+        return validate_dml_assignment_casts(statement, storage, txid, arena, None);
     }
     let error = match target.schema {
         Some(schema) => sql_err!(
@@ -7612,6 +7899,18 @@ fn check_key_types<'a>(
         if let SelectItem::Expr { expression, .. } = item {
             check_literal_operands(expression, scope, arena)?;
         }
+    }
+    for expression in statement
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .chain(statement.where_clause)
+        .chain(statement.having)
+    {
+        subquery::check_subquery_literals(expression, Some(scope), storage, txid, arena)?;
     }
     for expression in statement
         .where_clause
@@ -7793,7 +8092,7 @@ fn resolve_group_ordinals<'a>(
     let mut target_entries = 0usize;
     for item in statement.items {
         target_entries += match item {
-            SelectItem::Wildcard => scope.map_or(0, QueryScope::star_columns),
+            SelectItem::Wildcard(_) => scope.map_or(0, QueryScope::star_columns),
             SelectItem::TableWildcard(qualifier) => match scope {
                 Some(scope) => scope.qualified_star_columns(qualifier)?,
                 None => 0,
@@ -7922,7 +8221,7 @@ pub(super) fn resolve_sort_key<'a>(
                     }
                     index += 1;
                 }
-                SelectItem::Wildcard => index += scope.star_columns(),
+                SelectItem::Wildcard(_) => index += scope.star_columns(),
                 SelectItem::TableWildcard(qualifier) => {
                     index += scope.qualified_star_columns(qualifier)?;
                 }
@@ -7991,7 +8290,7 @@ fn resolve_position_target<'a>(
                 }
                 remaining -= 1;
             }
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 // A star without a FROM is invalid before any position could
                 // resolve into it, so a missing scope reports the position.
                 let Some(scope) = scope else {
@@ -8003,8 +8302,11 @@ fn resolve_position_target<'a>(
                         ResolvedColumn::Table(t, c) => {
                             column_ref(Some(scope.names[t]), scope.defs.column_name(t, c))
                         }
-                        // Unqualified: resolves back to the merged column.
-                        ResolvedColumn::Merged(m) => column_ref(None, scope.merged[m].name),
+                        // The merged column as the star produced it. Its bare
+                        // name can be ambiguous with another FROM item's column.
+                        merged @ ResolvedColumn::Merged(_) => {
+                            scope.copied_output_expression(merged, arena)
+                        }
                     };
                 }
                 remaining -= width;
@@ -8212,7 +8514,7 @@ pub fn resolve_view_for_dml<'a>(
     let mut n = 0;
     for it in sel.items {
         match it {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 for c in base_def.columns() {
                     if n == MAX_PROJ {
                         return Err(not_updatable());
@@ -8529,7 +8831,7 @@ fn describe_contextual_items<'a>(
     let catalog = storage_catalog(storage, arena, txid);
     let mut count = 0;
     for item in items {
-        if matches!(item, SelectItem::Wildcard | SelectItem::TableWildcard(_)) {
+        if matches!(item, SelectItem::Wildcard(_) | SelectItem::TableWildcard(_)) {
             let scope = scope.ok_or_else(|| {
                 sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -8619,7 +8921,7 @@ fn describe_contextual_items<'a>(
                 )?;
                 out[count - 1].collation_derivation = collation.1;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                 unreachable!("wildcards were described")
             }
         }
@@ -9274,7 +9576,7 @@ fn validate_projection_source(
     scope: &QueryScope<'_>,
 ) -> Result<(), SqlError> {
     match item {
-        SelectItem::Wildcard if scope.n == 0 => Err(sql_err!(
+        SelectItem::Wildcard(_) if scope.n == 0 => Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
             "SELECT * with no tables specified is not valid"
         )),
@@ -10414,6 +10716,21 @@ pub(crate) fn constant_select_resumable<'a>(
     }
     if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
+    }
+    for expression in statement
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .chain(statement.where_clause)
+    {
+        if let Err(error) =
+            subquery::check_subquery_literals(expression, None, storage, txid, arena)
+        {
+            return sql_fail(error);
+        }
     }
     // DISTINCT compares whole rows with each type's default equality.
     if statement.distinct
@@ -11933,7 +12250,7 @@ pub(super) fn streaming_pax_columns_ordered<'a>(
     for item in items {
         let expression = match item {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => expression,
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                 return PaxReadDemand::full_row(scan::PaxFullRowReason::WildcardProjection);
             }
         };
@@ -12038,7 +12355,7 @@ fn project_row_skipping<'a>(
                     n += 1;
                 }
             }
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 let value_of = |t: usize, c: usize| {
                     let vals = row.table_values(t).expect("bound");
                     if vals.is_empty() {
@@ -12180,7 +12497,7 @@ pub fn describe_scope_items<'q>(
                     n += 1;
                 }
             }
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 for k in 0..scope.star_columns() {
                     if n == out.len() {
                         return Err(sql_err!(
@@ -12384,7 +12701,7 @@ pub fn describe_catalog_items_as<'q>(
     let mut column = 0;
     for (item_index, item) in items.iter().enumerate() {
         match item {
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                 column += definition.map_or(0, |table| table.n_columns);
             }
             SelectItem::RecordStar(_) => {
@@ -12442,7 +12759,7 @@ pub fn describe_select_items<'q>(
     let mut column = 0;
     for item in items {
         match item {
-            SelectItem::Wildcard => column += scope.map_or(0, QueryScope::star_columns),
+            SelectItem::Wildcard(_) => column += scope.map_or(0, QueryScope::star_columns),
             SelectItem::TableWildcard(table) => {
                 if let Some(scope) = scope
                     && let Ok(table) = scope.table_index(table)
@@ -12484,7 +12801,7 @@ fn patch_array_subquery_field_types<'q>(
     let mut column = 0;
     for item in items {
         match item {
-            SelectItem::Wildcard => column += outer_scope.map_or(0, QueryScope::star_columns),
+            SelectItem::Wildcard(_) => column += outer_scope.map_or(0, QueryScope::star_columns),
             SelectItem::TableWildcard(table) => {
                 if let Some(scope) = outer_scope
                     && let Ok(table) = scope.table_index(table)
@@ -12634,7 +12951,8 @@ pub(crate) fn subquery_result_type<'a>(
     arena: &'a Arena,
 ) -> Result<Option<SubqueryResultType>, SqlError> {
     let mark = arena.mark();
-    let result = subquery_result_type_inner(expression, outer_scope, storage, txid, arena);
+    let result = subquery_result_type_inner(expression, outer_scope, storage, txid, arena)
+        .map_err(|error| subquery::subquery_shape_position(error, expression));
     unsafe {
         arena.rewind_to(mark);
     }
@@ -14188,7 +14506,7 @@ fn expr_contains_node<'a>(e: &'a Expr<'a>, target: *const Expr<'a>) -> bool {
 /// scope), and invokes `on_match` with a combined lookup for the FIRST joined
 /// row that satisfies `where_clause`. Returns whether any match was found.
 #[allow(clippy::too_many_arguments)]
-pub fn first_from_match<'a>(
+pub fn first_from_match<'a, 'r>(
     storage: &'a Storage,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -14199,6 +14517,7 @@ pub fn first_from_match<'a>(
     target: &dyn ColumnLookup<'a>,
     on_match: &mut dyn FnMut(&dyn ColumnLookup<'a>) -> Result<(), SqlError>,
     sequences: Option<&dyn SequenceAccess>,
+    matched_row: Option<MatchedFromRow<'_, 'r>>,
 ) -> Result<bool, SqlError> {
     let scope = QueryScope::resolve_exec_outer(
         storage,
@@ -14255,6 +14574,7 @@ pub fn first_from_match<'a>(
     }
     let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
     let retain_match = core::cell::Cell::new(false);
+    let mut matched_row = matched_row;
     scan_source_recycling_retaining_match_with_pax_columns(
         storage,
         &scope,
@@ -14268,6 +14588,9 @@ pub fn first_from_match<'a>(
         pax_columns,
         &retain_match,
         &mut |jr| {
+            if let Some(matched_row) = matched_row.as_mut() {
+                *matched_row.values = detached_join_values(jr, arena, matched_row.arena)?;
+            }
             let chained_row = Chained {
                 inner: jr,
                 outer: Some(target),
@@ -14279,6 +14602,132 @@ pub fn first_from_match<'a>(
         },
     )?;
     Ok(found)
+}
+
+/// Receives the FROM items' values of the row `first_from_match` selects.
+pub struct MatchedFromRow<'m, 'r> {
+    pub arena: &'r Arena,
+    pub values: &'m mut &'r [Datum<'r>],
+}
+
+/// Copies every source's visible columns of a joined row, in FROM order and
+/// with a null-extended source as NULLs, so they outlive the scan and any
+/// storage change made before the row is used.
+fn detached_join_values<'a, 'r>(
+    row: &JoinRow<'_, 'a, '_>,
+    scratch: &'a Arena,
+    arena: &'r Arena,
+) -> Result<&'r [Datum<'r>], SqlError> {
+    let values = scratch
+        .alloc_slice_with(row.scope.total_columns(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let mut offset = 0;
+    for table in 0..row.scope.n {
+        let width = row.scope.defs.get(table).expect("resolved").n_columns;
+        if let Some(source) = row.table_values(table).filter(|source| !source.is_empty()) {
+            values[offset..offset + width].copy_from_slice(&source[..width]);
+        }
+        offset += width;
+    }
+    Ok(crate::sql::exec::detached_values(values, arena)?)
+}
+
+/// The FROM item for a DML target, which includes inheritance descendants.
+pub(crate) fn dml_target_ref<'a>(target: QualName<'a>, alias: Option<&'a str>) -> TableRef<'a> {
+    TableRef {
+        schema: target.schema,
+        table: target.name,
+        alias,
+        subquery: None,
+        func_args: None,
+        func_argument_names: &[],
+        func_variadic: false,
+        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+        rows_from: None,
+        col_alias: None,
+        inheritance: crate::sql::ast::RelationInheritance::Descendants,
+        sample: None,
+        cte: None,
+        with_ordinality: false,
+        lateral: false,
+        authorization_role: None,
+        bound_table: None,
+        view_access: None,
+    }
+}
+
+/// The output namespace of `RETURNING` in `UPDATE ... FROM` and
+/// `DELETE ... USING`: the target followed by every FROM item, as
+/// PostgreSQL's range table orders them for `*`.
+pub(crate) struct ReturningJoin<'a> {
+    scope: QueryScope<'a>,
+    offsets: &'a [usize],
+    rowids: &'a [Option<u64>],
+}
+
+impl<'a> ReturningJoin<'a> {
+    pub(crate) fn resolve(
+        storage: &'a Storage,
+        target: QualName<'a>,
+        alias: Option<&'a str>,
+        from: &'a FromClause<'a>,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let scope =
+            dependencies::dml_dependency_scope(storage, target, alias, Some(from), txid, arena)?;
+        let mut offset = 0;
+        let offsets = arena
+            .alloc_slice_with(scope.n, |table| {
+                let start = offset;
+                offset += scope.defs.get(table).expect("resolved").n_columns;
+                start
+            })
+            .map_err(|_| arena_full())?;
+        let rowids = arena
+            .alloc_slice_with(scope.n, |_| None)
+            .map_err(|_| arena_full())?;
+        Ok(Self {
+            scope,
+            offsets,
+            rowids,
+        })
+    }
+
+    /// Joins the target's output image with the FROM items' matched values.
+    pub(crate) fn row<'s, 'v>(
+        &'s self,
+        target: &[Datum<'v>],
+        from: &[Datum<'v>],
+        arena: &'v Arena,
+    ) -> Result<JoinRow<'s, 'v, 'a>, SqlError> {
+        let total = self.scope.total_columns();
+        if target.len() + from.len() != total {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "RETURNING join row has {} of {} columns",
+                target.len() + from.len(),
+                total
+            ));
+        }
+        let values = arena
+            .alloc_slice_with(total, |index| {
+                if index < target.len() {
+                    target[index]
+                } else {
+                    from[index - target.len()]
+                }
+            })
+            .map_err(|_| arena_full())?;
+        Ok(JoinRow {
+            scope: &self.scope,
+            values: scan::JoinRowValues::Flat {
+                values,
+                offsets: self.offsets,
+            },
+            rowids: self.rowids,
+        })
+    }
 }
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]

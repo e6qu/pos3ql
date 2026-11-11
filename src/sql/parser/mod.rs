@@ -400,6 +400,55 @@ pub struct Parser<'a> {
     named_parameters: &'a [NamedParameter<'a>],
 }
 
+/// One step of an assignment target after its column: a field of a
+/// composite, or the subscripts of an array or other subscriptable value.
+#[derive(Clone, Copy)]
+enum Indirection<'a> {
+    Field(&'a str),
+    Subscripts(&'a [AssignmentSubscript<'a>]),
+}
+
+/// A parsed INSERT target list: the written column names, each target's
+/// indirection by position, and where each target was written.
+#[derive(Clone, Copy)]
+struct InsertTargets<'a> {
+    names: &'a [&'a str],
+    steps: &'a [(usize, &'a [Indirection<'a>])],
+    positions: &'a [usize],
+}
+
+impl<'a> InsertTargets<'a> {
+    const EMPTY: Self = Self {
+        names: &[],
+        steps: &[],
+        positions: &[],
+    };
+
+    fn path(&self, target: usize) -> Option<&'a [Indirection<'a>]> {
+        self.steps
+            .iter()
+            .find(|(at, _)| *at == target)
+            .map(|(_, path)| *path)
+    }
+
+    /// Whether several targets write `column`, all through indirection, so
+    /// they merge into one value.
+    fn merged(&self, column: &str) -> bool {
+        let mut written = self
+            .names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| **name == column);
+        written.clone().count() > 1 && written.all(|(index, _)| self.path(index).is_some())
+    }
+
+    /// Whether target `index` is a merged column's first.
+    fn kept(&self, index: usize) -> bool {
+        let name = self.names[index];
+        !(self.merged(name) && self.names[..index].contains(&name))
+    }
+}
+
 /// One subscript of an assignment target.
 #[derive(Clone, Copy)]
 enum AssignmentSubscript<'a> {
@@ -1441,16 +1490,66 @@ impl<'a> Parser<'a> {
             start: self.peek_at,
             end: self.lexer.token_end(),
         };
+        let at = self.peek_at;
         let first = self.col_ident(what)?;
         if self.eat_op(".")? {
             self.record_namespace(source)?;
+            let second = self.col_ident(what)?;
+            if self.eat_op(".")? {
+                let (schema, name) = self.catalog_qualified_name(at, first, second, what)?;
+                return Ok(QualName {
+                    schema: Some(schema),
+                    name,
+                });
+            }
             Ok(QualName {
                 schema: Some(first),
-                name: self.col_ident(what)?,
+                name: second,
             })
         } else {
             Ok(QualName::bare(first))
         }
+    }
+
+    /// The rest of a dotted name after `first.second` when another `.`
+    /// follows: `database.schema.name` must name the session's database, and
+    /// a longer name is improper, as in PostgreSQL's parse analysis.
+    pub(super) fn catalog_qualified_name(
+        &mut self,
+        at: usize,
+        first: &'a str,
+        second: &'a str,
+        what: &str,
+    ) -> Result<(&'a str, &'a str), ParseError> {
+        let third = self.col_ident(what)?;
+        let mut written = stack_format!(PARSE_MESSAGE_BYTES, "{first}.{second}.{third}");
+        let mut parts = 3;
+        while self.eat_op(".")? {
+            let part = self.col_ident(what)?;
+            let _ = core::fmt::Write::write_fmt(&mut written, format_args!(".{part}"));
+            parts += 1;
+        }
+        let error = |sqlstate: &'static str, message: core::fmt::Arguments<'_>| ParseError {
+            at,
+            message: stack_format!(PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate,
+            cursor: Some(at),
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        if parts > 3 {
+            return Err(error(
+                sqlstate::SYNTAX_ERROR,
+                format_args!("improper qualified name (too many dotted names): {written}"),
+            ));
+        } else if !crate::sql::eval::funcs::system::is_current_database(first) {
+            self.analysis_error(error(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                format_args!("cross-database references are not implemented: \"{written}\""),
+            ))?;
+        }
+        Ok((second, third))
     }
 
     fn any_qual_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
@@ -2572,8 +2671,9 @@ impl<'a> Parser<'a> {
         let mut items = ArenaList::new(self.arena);
         loop {
             let item = if self.peeked == Tok::Op("*") {
+                let at = self.peek_at;
                 self.advance()?;
-                SelectItem::Wildcard
+                SelectItem::Wildcard(crate::sql::ast::SourcePosition::new(Some(at)))
             } else if let Some(table) = self.table_wildcard()? {
                 SelectItem::TableWildcard(table)
             } else {
@@ -3566,7 +3666,9 @@ impl<'a> Parser<'a> {
                 view_access: None,
             };
             let select = Select {
-                items: self.arena_slice(&[SelectItem::Wildcard])?,
+                items: self.arena_slice(&[SelectItem::Wildcard(
+                    crate::sql::ast::SourcePosition::UNKNOWN,
+                )])?,
                 distinct: false,
                 distinct_on: &[],
                 from: Some(FromClause {
@@ -3757,10 +3859,18 @@ impl<'a> Parser<'a> {
             end: self.lexer.token_end(),
         };
         let quoted_function_name = matches!(self.peeked, Tok::QuotedIdent(_));
+        let name_at = self.peek_at;
         let first = self.col_ident("table name")?;
         let (schema, table) = if self.eat_op(".")? {
             self.record_namespace(source)?;
-            (Some(first), self.col_ident("table name")?)
+            let second = self.col_ident("table name")?;
+            if self.peeked == Tok::Op(".") && self.eat_op(".")? {
+                let (schema, table) =
+                    self.catalog_qualified_name(name_at, first, second, "table name")?;
+                (Some(schema), table)
+            } else {
+                (Some(first), second)
+            }
         } else {
             (None, first)
         };
@@ -4431,7 +4541,7 @@ impl<'a> Parser<'a> {
                     JoinKind::Inner
                 }
             } else if self.eat_op(",")? {
-                JoinKind::Cross
+                JoinKind::Comma
             } else if self.eat_ident("cross")? {
                 self.expect_ident("join")?;
                 JoinKind::Cross
@@ -4457,7 +4567,7 @@ impl<'a> Parser<'a> {
             };
             let table = self.table_ref()?;
             let mut using = None;
-            let on = if natural || kind == JoinKind::Cross {
+            let on = if natural || kind.is_cross() {
                 None
             } else if self.eat_ident("using")? {
                 // The merged-column semantics (single output column, resolved
@@ -7505,25 +7615,11 @@ impl<'a> Parser<'a> {
         self.expect_ident("insert")?;
         self.expect_ident("into")?;
         let table = self.qual_name("table name")?;
-        let mut column_names = ArenaList::new(self.arena);
-        // Subscripted targets (`INSERT INTO t (a[1]) ...`) by column position.
-        let mut column_subscripts: ArenaList<'a, (usize, &'a [AssignmentSubscript<'a>])> =
-            ArenaList::new(self.arena);
-        if self.peeked == Tok::Op("(") {
-            self.advance()?;
-            loop {
-                let column = self.col_ident("column name")?;
-                let subscripts = self.assignment_subscripts()?;
-                if !subscripts.is_empty() {
-                    self.push(&mut column_subscripts, (column_names.len(), subscripts))?;
-                }
-                self.push(&mut column_names, column)?;
-                if !self.eat_op(",")? {
-                    break;
-                }
-            }
-            self.expect_op(")")?;
-        }
+        let targets = if self.peeked == Tok::Op("(") {
+            self.insert_targets()?
+        } else {
+            InsertTargets::EMPTY
+        };
         // OVERRIDING { SYSTEM | USER } VALUE for identity columns.
         let overriding = if self.eat_ident("overriding")? {
             let mode = if self.eat_ident("system")? {
@@ -7576,123 +7672,106 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        if !column_subscripts.is_empty()
-            && let Some(query) = select
-        {
-            // PostgreSQL assigns each subscripted target from its output
-            // column into a NULL of the column's type: select the assignments
-            // from the query.
-            const SOURCE: &str = crate::sql::ast::INSERT_SUBSCRIPT_SOURCE;
-            let width = column_names.len();
-            let names = self
-                .arena
-                .alloc_slice_with(width, |_| "")
-                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-            let mut items = ArenaList::new(self.arena);
-            for (index, name) in names.iter_mut().enumerate() {
-                *name = self
+        let mut columns = targets.names;
+        if !targets.steps.is_empty() {
+            if let Some(query) = select {
+                // Select the assignments from the query's output columns.
+                const SOURCE: &str = crate::sql::ast::INSERT_SUBSCRIPT_SOURCE;
+                let names = self
                     .arena
-                    .alloc_str_display(format_args!("column{}", index + 1))
+                    .alloc_slice_with(targets.names.len(), |_| "")
                     .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-                let value = self.arena_expr(Expr::Column {
-                    qualifier: Some(SOURCE),
-                    name,
-                })?;
-                let expression = match column_subscripts
-                    .as_slice()
-                    .iter()
-                    .find(|(column, _)| *column == index)
-                {
-                    Some((_, subscripts)) => {
-                        let base = self.arena_expr(Expr::Null)?;
-                        self.subscript_assignment(base, value, subscripts)?
-                    }
-                    None => value,
-                };
-                self.push(
-                    &mut items,
-                    SelectItem::Expr {
-                        expression,
-                        alias: None,
-                    },
-                )?;
-            }
-            let wrapped = Select {
-                items: items.as_slice(),
-                distinct: false,
-                distinct_on: &[],
-                from: Some(FromClause {
-                    base: TableRef {
-                        schema: None,
-                        table: "",
-                        alias: Some(SOURCE),
-                        subquery: Some(query),
-                        func_args: None,
-                        func_argument_names: &[],
-                        func_variadic: false,
-                        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-                        rows_from: None,
-                        col_alias: Some(&*names),
-                        inheritance: crate::sql::ast::RelationInheritance::Descendants,
-                        sample: None,
-                        cte: None,
-                        with_ordinality: false,
-                        lateral: false,
-                        authorization_role: None,
-                        bound_table: None,
-                        view_access: None,
-                    },
-                    joins: &[],
-                }),
-                where_clause: None,
-                group_by: &[],
-                grouping_sets: &[],
-                having: None,
-                order_by: &[],
-                limit: None,
-                offset: None,
-                with_ties: false,
-                with: &[],
-                set_body: None,
-                locking: &[],
-                ..*query
-            };
-            select = Some(
-                self.arena
-                    .alloc(wrapped)
-                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?
-                    as &_,
-            );
-        } else if !column_subscripts.is_empty() {
-            // PostgreSQL assigns into a NULL of the column's type.
-            let rows = rows
-                .as_mut_slice()
-                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-            for row in rows.iter_mut() {
-                let mut values = ArenaList::new(self.arena);
-                for (index, value) in row.iter().enumerate() {
-                    let value = match column_subscripts
-                        .as_slice()
-                        .iter()
-                        .find(|(column, _)| *column == index)
-                    {
-                        Some((_, subscripts)) => {
-                            let base = self.arena_expr(Expr::Null)?;
-                            self.subscript_assignment(base, value, subscripts)?
-                        }
-                        None => *value,
-                    };
-                    self.push(&mut values, value)?;
+                for (index, name) in names.iter_mut().enumerate() {
+                    *name = self
+                        .arena
+                        .alloc_str_display(format_args!("column{}", index + 1))
+                        .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                 }
-                *row = values.as_slice();
+                let names = &*names;
+                let values = self.insert_target_values(&targets, &mut |parser, target| {
+                    parser.arena_expr(Expr::Column {
+                        qualifier: Some(SOURCE),
+                        name: names[target],
+                    })
+                })?;
+                let mut items = ArenaList::new(self.arena);
+                for expression in values {
+                    self.push(
+                        &mut items,
+                        SelectItem::Expr {
+                            expression,
+                            alias: None,
+                        },
+                    )?;
+                }
+                let wrapped = Select {
+                    items: items.as_slice(),
+                    distinct: false,
+                    distinct_on: &[],
+                    from: Some(FromClause {
+                        base: TableRef {
+                            schema: None,
+                            table: "",
+                            alias: Some(SOURCE),
+                            subquery: Some(query),
+                            func_args: None,
+                            func_argument_names: &[],
+                            func_variadic: false,
+                            func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                            rows_from: None,
+                            col_alias: Some(names),
+                            inheritance: crate::sql::ast::RelationInheritance::Descendants,
+                            sample: None,
+                            cte: None,
+                            with_ordinality: false,
+                            lateral: false,
+                            authorization_role: None,
+                            bound_table: None,
+                            view_access: None,
+                        },
+                        joins: &[],
+                    }),
+                    where_clause: None,
+                    group_by: &[],
+                    grouping_sets: &[],
+                    having: None,
+                    order_by: &[],
+                    limit: None,
+                    offset: None,
+                    with_ties: false,
+                    with: &[],
+                    set_body: None,
+                    locking: &[],
+                    ..*query
+                };
+                select = Some(
+                    self.arena
+                        .alloc(wrapped)
+                        .map_err(|_| self.arena_full("statement too large for SQL arena"))?
+                        as &_,
+                );
+            } else {
+                let rows = rows
+                    .as_mut_slice()
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+                for row in rows.iter_mut() {
+                    let written = *row;
+                    if written.len() != targets.names.len() {
+                        // The executor reports the count mismatch.
+                        continue;
+                    }
+                    *row =
+                        self.insert_target_values(&targets, &mut |_, target| Ok(written[target]))?;
+                }
             }
+            columns = self.insert_target_columns(&targets)?;
         }
         let on_conflict = self.on_conflict()?;
         let returning = self.returning()?;
         Ok(Stmt::Insert(Insert {
             source_position,
             table,
-            columns: column_names.as_slice(),
+            columns,
             rows: rows.as_slice(),
             select,
             on_conflict,
@@ -7701,68 +7780,173 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    /// `(column[indirection], ...)` of an INSERT, with PostgreSQL's
+    /// checkInsertTargets: a whole column appears once; several targets
+    /// through indirection may share a column.
+    fn insert_targets(&mut self) -> Result<InsertTargets<'a>, ParseError> {
+        let mut names = ArenaList::new(self.arena);
+        let mut steps: ArenaList<'a, (usize, &'a [Indirection<'a>])> = ArenaList::new(self.arena);
+        let mut positions = ArenaList::new(self.arena);
+        self.expect_op("(")?;
+        loop {
+            let column_at = self.peek_at;
+            let column = self.col_ident("column name")?;
+            let path = self.assignment_indirection()?;
+            let written = names.borrowed_slice();
+            let whole = written.iter().enumerate().any(|(index, name)| {
+                *name == column && !steps.borrowed_slice().iter().any(|(at, _)| *at == index)
+            });
+            if whole || (path.is_empty() && written.contains(&column)) {
+                self.analysis_error(ParseError {
+                    at: column_at,
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "column \"{}\" specified more than once",
+                        column
+                    ),
+                    sqlstate: sqlstate::DUPLICATE_COLUMN,
+                    cursor: Some(column_at),
+                    hint: None,
+                    near: None,
+                    detail: None,
+                })?;
+            }
+            if !path.is_empty() {
+                self.push(&mut steps, (names.len(), path))?;
+            }
+            self.push(&mut names, column)?;
+            self.push(&mut positions, column_at)?;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(InsertTargets {
+            names: names.as_slice(),
+            steps: steps.as_slice(),
+            positions: positions.as_slice(),
+        })
+    }
+
+    /// The INSERT columns after targets of one column merge.
+    fn insert_target_columns(
+        &mut self,
+        targets: &InsertTargets<'a>,
+    ) -> Result<&'a [&'a str], ParseError> {
+        let mut columns = ArenaList::new(self.arena);
+        for (index, name) in targets.names.iter().enumerate() {
+            if targets.kept(index) {
+                self.push(&mut columns, *name)?;
+            }
+        }
+        Ok(columns.as_slice())
+    }
+
+    /// One value per INSERT column from the values written to its targets.
+    /// PostgreSQL assigns a target with indirection into a NULL of its
+    /// column's type, and merged targets left to right.
+    fn insert_target_values(
+        &mut self,
+        targets: &InsertTargets<'a>,
+        value_at: &mut dyn FnMut(&mut Self, usize) -> Result<&'a Expr<'a>, ParseError>,
+    ) -> Result<&'a [&'a Expr<'a>], ParseError> {
+        let mut values = ArenaList::new(self.arena);
+        for (index, name) in targets.names.iter().enumerate() {
+            if !targets.kept(index) {
+                continue;
+            }
+            let merged = targets.merged(name);
+            let mut value = None;
+            for (target, target_name) in targets.names.iter().enumerate().skip(index) {
+                if target_name != name || (target != index && !merged) {
+                    continue;
+                }
+                let written = value_at(self, target)?;
+                value = Some(match targets.path(target) {
+                    Some(path) => {
+                        self.reject_default_through(written, path, targets.positions[target])?;
+                        let base = match value {
+                            Some(previous) => previous,
+                            None => self.arena_expr(Expr::Null)?,
+                        };
+                        self.indirection_assignment(base, written, path)?
+                    }
+                    None => written,
+                });
+            }
+            self.push(&mut values, value.expect("a kept target has a value"))?;
+        }
+        Ok(values.as_slice())
+    }
+
+    /// PostgreSQL cannot assign DEFAULT through a field or subscript.
+    fn reject_default_through(
+        &mut self,
+        value: &Expr<'a>,
+        path: &[Indirection<'a>],
+        target_at: usize,
+    ) -> Result<(), ParseError> {
+        if !matches!(value, Expr::DefaultMarker) {
+            return Ok(());
+        }
+        let field = path
+            .iter()
+            .any(|step| matches!(step, Indirection::Field(_)));
+        self.analysis_error(ParseError {
+            at: target_at,
+            message: StackStr::from_str(if field {
+                "cannot set a subfield to DEFAULT"
+            } else {
+                "cannot set an array element to DEFAULT"
+            }),
+            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            cursor: Some(target_at),
+            hint: None,
+            near: None,
+            detail: None,
+        })
+    }
+
     /// Parses a DML `SET` list into its scalar execution form. A row target is
     /// expanded here so every executor shares the same assignment semantics.
     fn assignment_list(&mut self) -> Result<&'a [(&'a str, &'a Expr<'a>)], ParseError> {
         let mut assignments: ArenaList<'a, (&'a str, &'a Expr<'a>)> = ArenaList::new(self.arena);
+        // Whether each assignment writes through indirection (a field or
+        // subscript), which lets later ones to its column build on it.
+        let mut indirect: ArenaList<'a, bool> = ArenaList::new(self.arena);
         loop {
             let mut names = ArenaList::new(self.arena);
-            let mut subscripts = ArenaList::new(self.arena);
-            if self.eat_op("(")? {
-                loop {
-                    let name = self.col_ident("column name")?;
-                    self.push(&mut names, name)?;
-                    if !self.eat_op(",")? {
-                        break;
-                    }
-                }
-                self.expect_op(")")?;
-            } else {
+            let mut paths: ArenaList<'a, &'a [Indirection<'a>]> = ArenaList::new(self.arena);
+            let mut positions = ArenaList::new(self.arena);
+            let multiple = self.eat_op("(")?;
+            loop {
+                self.push(&mut positions, self.peek_at)?;
                 let name = self.col_ident("column name")?;
                 self.push(&mut names, name)?;
-                for subscript in self.assignment_subscripts()? {
-                    self.push(&mut subscripts, *subscript)?;
+                let path = self.assignment_indirection()?;
+                self.push(&mut paths, path)?;
+                if !multiple || !self.eat_op(",")? {
+                    break;
                 }
+            }
+            if multiple {
+                self.expect_op(")")?;
             }
             self.expect_op("=")?;
 
             let name_count = names.len();
             let mut values = ArenaList::new(self.arena);
-            let value_count = if name_count == 1 {
-                let mut value = self.expression(0)?;
-                if !subscripts.is_empty() {
-                    let base = assignments
-                        .as_slice()
-                        .iter()
-                        .find_map(|(previous, assigned)| {
-                            (*previous == names.as_slice()[0]
-                                && matches!(
-                                    **assigned,
-                                    Expr::Call {
-                                        name: "__jsonb_subscript_set" | "__array_subscript_set",
-                                        ..
-                                    }
-                                ))
-                            .then_some(*assigned)
-                        })
-                        .map_or_else(
-                            || {
-                                self.arena_expr(Expr::Column {
-                                    qualifier: None,
-                                    name: names.as_slice()[0],
-                                })
-                            },
-                            Ok,
-                        )?;
-                    value = self.subscript_assignment(base, value, subscripts.as_slice())?;
-                }
+            let value_count = if !multiple {
+                let value = self.expression(0)?;
                 self.push(&mut values, value)?;
                 1
             } else if self.eat_ident("row")? {
                 self.expect_op("(")?;
                 self.assignment_row_values(&mut values)?;
                 values.len()
-            } else if self.eat_op("(")? {
+            } else if self.peeked == Tok::Op("(") {
+                let open_at = self.peek_at;
+                self.advance()?;
                 if matches!(self.peeked, Tok::Ident("select") | Tok::Ident("with")) {
                     let select = self.query_select()?;
                     self.expect_op(")")?;
@@ -7772,7 +7956,8 @@ impl<'a> Parser<'a> {
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                     let arity = u8::try_from(name_count)
                         .map_err(|_| self.err_here("assignment target is too wide"))?;
-                    let record = self.arena_expr(Expr::RowSubquery { select, arity })?;
+                    let record =
+                        self.arena_expr_at(Expr::RowSubquery { select, arity }, open_at)?;
                     for index in 0..name_count {
                         let field = self.arena_expr(Expr::RecordFieldIndex {
                             base: record,
@@ -7807,44 +7992,180 @@ impl<'a> Parser<'a> {
                     detail: None,
                 });
             }
-            for (name, value) in names.as_slice().iter().zip(values.as_slice()) {
-                if let Some(previous) = assignments
+            for (((name, value), path), at) in names
+                .as_slice()
+                .iter()
+                .zip(values.as_slice())
+                .zip(paths.as_slice())
+                .zip(positions.as_slice())
+            {
+                if !path.is_empty() {
+                    self.reject_default_through(value, path, *at)?;
+                }
+                let previous = assignments
                     .borrowed_slice()
                     .iter()
-                    .position(|(previous, _)| previous == name)
-                {
-                    if !subscripts.is_empty()
-                        && matches!(
-                            *assignments.borrowed_slice()[previous].1,
-                            Expr::Call {
-                                name: "__jsonb_subscript_set" | "__array_subscript_set",
-                                ..
-                            }
-                        )
-                    {
+                    .position(|(previous, _)| previous == name);
+                if path.is_empty() {
+                    if previous.is_some() {
+                        return Err(self.multiple_assignments(name));
+                    }
+                    self.push(&mut assignments, (*name, *value))?;
+                    self.push(&mut indirect, false)?;
+                    continue;
+                }
+                // Assignments through indirection to one column apply left to
+                // right, each to the value the earlier ones built.
+                let base = match previous {
+                    Some(previous) if indirect.borrowed_slice()[previous] => {
+                        assignments.borrowed_slice()[previous].1
+                    }
+                    Some(_) => return Err(self.multiple_assignments(name)),
+                    None => self.arena_expr(Expr::Column {
+                        qualifier: None,
+                        name,
+                    })?,
+                };
+                let assigned = self.indirection_assignment(base, value, path)?;
+                match previous {
+                    Some(previous) => {
                         assignments
                             .as_mut_slice()
                             .map_err(|_| self.arena_full("assignments exceed statement arena"))?
                             [previous]
-                            .1 = *value;
-                        continue;
+                            .1 = assigned;
                     }
-                    return Err(ParseError {
-                        message: stack_format!(
-                            PARSE_MESSAGE_BYTES,
-                            "multiple assignments to same column \"{}\"",
-                            name
-                        ),
-                        ..self.err_here("")
-                    });
+                    None => {
+                        self.push(&mut assignments, (*name, assigned))?;
+                        self.push(&mut indirect, true)?;
+                    }
                 }
-                self.push(&mut assignments, (*name, *value))?;
             }
             if !self.eat_op(",")? {
                 break;
             }
         }
         Ok(assignments.as_slice())
+    }
+
+    /// PostgreSQL's rewriter rejects this without a cursor position.
+    fn multiple_assignments(&self, name: &str) -> ParseError {
+        ParseError {
+            at: self.peek_at,
+            message: stack_format!(
+                PARSE_MESSAGE_BYTES,
+                "multiple assignments to same column \"{}\"",
+                name
+            ),
+            sqlstate: sqlstate::SYNTAX_ERROR,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        }
+    }
+
+    /// The fields (`.x`) and subscripts (`[i]`) after an assignment target's
+    /// column.
+    fn assignment_indirection(&mut self) -> Result<&'a [Indirection<'a>], ParseError> {
+        let mut steps = ArenaList::new(self.arena);
+        loop {
+            if self.eat_op(".")? {
+                let field = self.col_ident("field name")?;
+                self.push(&mut steps, Indirection::Field(field))?;
+            } else if self.peeked == Tok::Op("[") {
+                let subscripts = self.assignment_subscripts()?;
+                self.push(&mut steps, Indirection::Subscripts(subscripts))?;
+            } else {
+                break;
+            }
+        }
+        Ok(steps.as_slice())
+    }
+
+    /// `base<path> := value`. Subscripts alone use the subscript assignment
+    /// calls; a path through a field is one `__assign_path(base, value,
+    /// type, kinds, operands...)` call, `type` being the base's type OID when
+    /// the base is an untyped NULL (`f` steps carry a field name, `e` steps
+    /// an element subscript).
+    fn indirection_assignment(
+        &mut self,
+        base: &'a Expr<'a>,
+        value: &'a Expr<'a>,
+        path: &[Indirection<'a>],
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        if let [Indirection::Subscripts(subscripts)] = path {
+            return self.subscript_assignment(base, value, subscripts);
+        }
+        let mut kinds = StackStr::<32>::new();
+        let mut operands = ArenaList::new(self.arena);
+        for (at, step) in path.iter().enumerate() {
+            use core::fmt::Write as _;
+            match step {
+                Indirection::Field(name) => {
+                    let _ = kinds.write_char('f');
+                    let name = self.arena_expr(Expr::Str(name))?;
+                    self.push(&mut operands, name)?;
+                }
+                Indirection::Subscripts(subscripts) => {
+                    let sliced = subscripts
+                        .iter()
+                        .any(|subscript| matches!(subscript, AssignmentSubscript::Slice { .. }));
+                    if sliced && at + 1 != path.len() {
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(
+                                PARSE_MESSAGE_BYTES,
+                                "assignment through an array slice is not supported"
+                            ),
+                            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                            cursor: None,
+                            hint: None,
+                            near: None,
+                            detail: None,
+                        });
+                    }
+                    for subscript in *subscripts {
+                        // A list holding any slice is a slice throughout.
+                        let (kind, lower, upper) = match subscript {
+                            AssignmentSubscript::Element(index) if sliced => {
+                                ('u', None, Some(*index))
+                            }
+                            AssignmentSubscript::Element(index) => ('e', Some(*index), None),
+                            AssignmentSubscript::Slice { lower, upper } => (
+                                match (lower, upper) {
+                                    (Some(_), Some(_)) => 's',
+                                    (Some(_), None) => 'l',
+                                    (None, Some(_)) => 'u',
+                                    (None, None) => 'a',
+                                },
+                                *lower,
+                                *upper,
+                            ),
+                        };
+                        let _ = kinds.write_char(kind);
+                        for bound in [lower, upper].into_iter().flatten() {
+                            self.push(&mut operands, bound)?;
+                        }
+                    }
+                }
+            }
+        }
+        if kinds.is_truncated() {
+            return Err(self.err_here("assignment target is too deep"));
+        }
+        let mut call_args = ArenaList::new(self.arena);
+        self.push(&mut call_args, base)?;
+        self.push(&mut call_args, value)?;
+        let untyped = self.arena_expr(Expr::Null)?;
+        self.push(&mut call_args, untyped)?;
+        let kinds = self.arena_str(kinds.as_str())?;
+        let kinds = self.arena_expr(Expr::Str(kinds))?;
+        self.push(&mut call_args, kinds)?;
+        for operand in operands.as_slice() {
+            self.push(&mut call_args, *operand)?;
+        }
+        self.plain_call("__assign_path", call_args.as_slice())
     }
 
     /// The `[i]`, `[lower:upper]` subscripts after an assignment target.
@@ -8181,20 +8502,12 @@ impl<'a> Parser<'a> {
             return Ok(MergeSourceAction::DoNothing);
         }
         self.expect_ident("insert")?;
-        let mut columns: &'a [&'a str] = &[];
-        if self.peeked == Tok::Op("(") {
-            self.advance()?;
-            let mut names = ArenaList::new(self.arena);
-            loop {
-                let name = self.col_ident("column name")?;
-                self.push(&mut names, name)?;
-                if !self.eat_op(",")? {
-                    break;
-                }
-            }
-            self.expect_op(")")?;
-            columns = names.as_slice();
-        }
+        let targets = if self.peeked == Tok::Op("(") {
+            self.insert_targets()?
+        } else {
+            InsertTargets::EMPTY
+        };
+        let mut columns = targets.names;
         let overriding = if self.eat_ident("overriding")? {
             let mode = if self.eat_ident("system")? {
                 crate::sql::ast::Overriding::System
@@ -8230,9 +8543,14 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(")")?;
+        let mut values = vals.as_slice();
+        if !targets.steps.is_empty() && values.len() == targets.names.len() {
+            values = self.insert_target_values(&targets, &mut |_, target| Ok(values[target]))?;
+            columns = self.insert_target_columns(&targets)?;
+        }
         Ok(MergeSourceAction::Insert {
             columns,
-            values: vals.as_slice(),
+            values,
             default_values: false,
             overriding,
         })
@@ -9392,6 +9710,68 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A column reference of four or more names after `catalog.schema.table`:
+    /// `database.schema.table.column` must name the session's database, and a
+    /// longer reference is improper, as in PostgreSQL's parse analysis.
+    pub(super) fn catalog_qualified_column(
+        &mut self,
+        at: usize,
+        catalog: &'a str,
+        schema: &'a str,
+        table: &'a str,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let mut written = stack_format!(PARSE_MESSAGE_BYTES, "{catalog}.{schema}.{table}");
+        let mut last = None;
+        let mut parts = 3;
+        while self.eat_op(".")? {
+            let part = if self.eat_op("*")? {
+                "*"
+            } else {
+                self.any_ident("column name")?
+            };
+            let _ = core::fmt::Write::write_fmt(&mut written, format_args!(".{part}"));
+            last = Some(part);
+            parts += 1;
+            if part == "*" {
+                break;
+            }
+        }
+        let error = |sqlstate: &'static str, message: core::fmt::Arguments<'_>| ParseError {
+            at,
+            message: stack_format!(PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate,
+            cursor: Some(at),
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        if parts > 4 {
+            self.analysis_error(error(
+                sqlstate::SYNTAX_ERROR,
+                format_args!("improper qualified name (too many dotted names): {written}"),
+            ))?;
+            return self.arena_expr(Expr::Null);
+        }
+        if !crate::sql::eval::funcs::system::is_current_database(catalog) {
+            self.analysis_error(error(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                format_args!("cross-database references are not implemented: {written}"),
+            ))?;
+            return self.arena_expr(Expr::Null);
+        }
+        match last.expect("a fourth name was read") {
+            "*" => {
+                let qualifier = self.composed_qualifier(schema, table)?;
+                self.arena_expr(Expr::WholeRow(qualifier))
+            }
+            name => self.arena_expr(Expr::SchemaColumn {
+                schema,
+                table,
+                name,
+            }),
+        }
+    }
+
     /// `schema.table` composed into one arena string — the qualifier form a
     /// three-part star (`schema.table.*`) resolves through.
     pub(super) fn composed_qualifier(
@@ -9409,6 +9789,34 @@ impl<'a> Parser<'a> {
             near: None,
             detail: None,
         })
+    }
+
+    /// An expression node whose error position is `at`, the start of its
+    /// written text (a scalar subquery's opening parenthesis).
+    pub(super) fn arena_expr_at(&self, e: Expr<'a>, at: usize) -> Result<&'a Expr<'a>, ParseError> {
+        let expression = self
+            .arena
+            .alloc(e)
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        if let Some(copies) = &self.source_copies {
+            let mut copies = copies.borrow_mut();
+            if copies
+                .push(crate::sql::error_position::SourceCopy::node(expression, at))
+                .is_err()
+            {
+                return Err(self.arena_full("statement too large for SQL arena"));
+            }
+            // Rewrites copy a sublink node but share its query, which keeps
+            // the sublink's position.
+            if let Some(select) = crate::sql::error_position::sublink_query(expression)
+                && copies
+                    .push(crate::sql::error_position::SourceCopy::query(select, at))
+                    .is_err()
+            {
+                return Err(self.arena_full("statement too large for SQL arena"));
+            }
+        }
+        Ok(expression)
     }
 
     fn arena_expr(&self, e: Expr<'a>) -> Result<&'a Expr<'a>, ParseError> {

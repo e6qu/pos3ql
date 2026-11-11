@@ -54,7 +54,7 @@ fn sort_full(error: LeaseError) -> SqlError {
 /// Output values one item produces; a qualified `table.*` is not admitted.
 fn item_width(item: &SelectItem<'_>, scope: &QueryScope<'_>) -> usize {
     match item {
-        SelectItem::Wildcard => scope.star_columns(),
+        SelectItem::Wildcard(_) => scope.star_columns(),
         _ => 1,
     }
 }
@@ -133,7 +133,7 @@ pub(super) fn sort_admitted(
     for item in statement.items {
         let expression = match item {
             SelectItem::Expr { expression, .. } => expression,
-            SelectItem::Wildcard => continue,
+            SelectItem::Wildcard(_) => continue,
             SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => return Ok(false),
         };
         if volatile(expression)? {

@@ -109,9 +109,10 @@ Syntax and errors:
   PG_EXCEPTION_CONTEXT` return the same text, and `RAISE;` re-raises the
   caught error with its original context. A call PostgreSQL inlines into its
   caller's query (a SQL function whose body is one `SELECT expression`) adds
-  no line; when PostgreSQL would fail while inlining it (`SELECT f(0)` for a
-  body `SELECT 1/$1`), pos3ql reports no `SQL function "f" during inlining`
-  line. A longer context than 64 KiB is reported as a `54000` error.
+  no line when its arguments vary; with constant arguments the body is folded
+  while it is inlined, so `SELECT f(0)` for a body `SELECT 1/$1` reports
+  `SQL function "f" during inlining`, or `SQL function "f" statement 1` when
+  `f` is `IMMUTABLE` and PostgreSQL runs it while planning. A longer context than 64 KiB is reported as a `54000` error.
 - Constraint violations carry PostgreSQL's `DETAIL` and object fields:
   `Failing row contains (null, x).` with the schema, table and column of a
   not-null violation; `Key (id)=(1) already exists.` with the constraint of a
@@ -131,23 +132,98 @@ Syntax and errors:
 - Statements are analysed before they read a row, as in PostgreSQL: a `WITH`
   query nothing reads must still be valid (`WITH x AS (SELECT * FROM missing)
   SELECT 1` fails), a constant compared with or added to a column must convert
-  to its type (`WHERE id = 'abc'` fails even on an empty table), and
-  `CREATE FUNCTION` checks a SQL body's queries and target relations unless
-  `check_function_bodies` is off (always for a `BEGIN ATOMIC` body).
+  to its type (`WHERE id = 'abc'` fails even on an empty table, and so does a
+  subquery `(SELECT id FROM t WHERE id = 'abc')` of a `SELECT`, `INSERT`,
+  `UPDATE` or `DELETE`, including one in `RETURNING`), and
+  `CREATE FUNCTION` checks a SQL body's queries, target relations, target
+  columns and assigned value types unless `check_function_bodies` is off
+  (always for a `BEGIN ATOMIC` body).
+- A value written to a column must convert to the column's type with an
+  implicit or assignment cast, as PostgreSQL checks before any row is read.
+  An untyped literal (`'5'`) is read by the column type's input, and any
+  value converts to a text column, but `INSERT INTO t (id) VALUES
+  ('5'::text)` fails with `42804` (`column "id" is of type integer but
+  expression is of type text`, hint `You will need to rewrite or cast the
+  expression.`) pointing at the value. A subscripted target checks the
+  element, or the whole array for a slice: `UPDATE t SET m[1] = 'x'::text`
+  reports `subscripted assignment to "m" requires type integer but expression
+  is of type text` at `m`. `INSERT ... SELECT` checks the query's output
+  types, so a `UNION` of untyped literals is text. A `SELECT *` mismatch has
+  no cursor position.
+- PL/pgSQL converts a value to a variable's, array element's, `OUT`
+  parameter's or result's type with an assignment cast when one exists, and
+  otherwise through text, as PostgreSQL does: `x := true` for an integer `x`,
+  or `x[1] := true` for an integer array, fails with `invalid input syntax for
+  type integer: "t"`. `CREATE FUNCTION` checks that a SQL
+  function's final query returns one column of a type that converts to a
+  scalar result (`return type mismatch in function declared to return
+  integer`, detail `Actual return type is text.`), with context `SQL function
+  "f"`; an untyped literal there is text.
+- `INSERT`, `UPDATE` and `DELETE ... RETURNING ... INTO [STRICT] targets` in
+  PL/pgSQL store the returned row and set `FOUND` and `ROW_COUNT`. More than
+  one row fails with `P0003` (`query returned more than one row`) even without
+  `STRICT`; no row fails with `P0002` only under `STRICT` and otherwise stores
+  NULLs. `RETURNING` without `INTO` fails with `query has no destination for
+  result data`, and `INTO` without `RETURNING` with `INTO used with a command
+  that cannot return data`. As in PostgreSQL, extra result columns are
+  ignored and targets without a column become NULL.
+- A function's name qualifies its parameters, as in PostgreSQL: in
+  `CREATE FUNCTION f(a int)`, `f.a` is the parameter `a` in SQL and
+  PL/pgSQL bodies, even when a table in the query has a column `a`.
+- PL/pgSQL blocks nest with their own `DECLARE` sections, and a label
+  (`<<outer>>`) names a block or loop as in PostgreSQL. `outer.x` reads or
+  assigns the `x` that block declares even where an inner block or an integer
+  `FOR` counter shadows it; `EXIT outer` leaves a labelled block or loop and
+  `CONTINUE outer` resumes a labelled loop. A nested block's variables are
+  initialized in order each time it is entered, outside its own exception
+  handlers. `END outer` and `END LOOP outer` must repeat the label (`end label
+  "b" differs from block's label "a"`).
 - A name in a PL/pgSQL statement that is both a variable and a column is
   ambiguous, as in PostgreSQL: with parameter `a`, `UPDATE t SET b = 1/(a-15)`
   fails with `42702` (`column reference "a" is ambiguous`, detail `It could
   refer to either a PL/pgSQL variable or a table column.`) before any row is
   read, at any query level. `#variable_conflict use_column` at the start of
   the body, or the superuser setting `plpgsql.variable_conflict =
-  use_column`, reads the column instead. The setting is read when a backend
-  first runs the function, and a body's option overrides it. `use_variable`
-  works for names that are not columns; a name that is also a column fails
-  with `0A000` instead of reading the variable. The setting exists from
-  startup, as if PL/pgSQL were preloaded.
+  use_column`, reads the column instead. `use_variable` works for names that
+  are not columns; a name that is also a column fails with `0A000` instead of
+  reading the variable. The setting exists from startup, as if PL/pgSQL were
+  preloaded.
+- A PL/pgSQL function keeps the `plpgsql.variable_conflict` and
+  `plpgsql.print_strict_params` values it was compiled under, as PostgreSQL's
+  per-session function cache does: the creating session compiles it at
+  `CREATE FUNCTION` for calls without collatable inputs, and other calls
+  compile it at their session's first call. A body's `#variable_conflict` or
+  `#print_strict_params` option overrides the setting; `#option dump` is
+  accepted. With `print_strict_params` on, a `STRICT` failure's detail lists
+  the variables the statement reads, in declaration order (`parameters: p =
+  '1', q = NULL`), or an `EXECUTE`'s `USING` values as `$1 = '1'`.
 - Each query of a volatile PL/pgSQL function, procedure, trigger or `DO` block
   sees the rows its earlier statements changed; a stable or immutable
   function reads its caller's snapshot.
+- Data-changing `WITH` queries run exactly once and share the main query's
+  snapshot, as in PostgreSQL: in `WITH d AS (DELETE FROM t) INSERT INTO t
+  VALUES (9)`, the delete removes only the rows that existed before the
+  statement, and the main query sees a `WITH` query's changes only through
+  its `RETURNING` rows. Each runs when the statement first reads its rows,
+  so in `WITH w AS (INSERT INTO t VALUES (1) RETURNING a) SELECT f(), (SELECT
+  a FROM w), f()` the first call of a volatile `f` does not see the new row
+  and the second does. One that nothing reads runs after the main query, the
+  last written first.
+- A scalar, `EXISTS` or `ARRAY` subquery that calls a volatile function, or
+  any subquery of a statement with a data-changing `WITH`, runs where
+  evaluation reaches it, once when it is uncorrelated, so its notices,
+  sequence values and writes interleave with the rest of the expression as
+  in PostgreSQL.
+- `UPDATE` and `INSERT` assign through composite fields and array elements:
+  `UPDATE t SET pair.x = 1, pair.y = 'a'`, `SET n.inner.x = 3`, `SET
+  a[2].x = 5`, `SET bag.arr[1:2] = '{1,2}'` and `INSERT INTO t (pair.x,
+  pair.y) VALUES (1, 'a')`. A NULL composite becomes a row of NULL fields
+  first. Several targets through one column apply left to right; any other
+  repeated target fails (`multiple assignments to same column "pair"`, or
+  `column "pair" specified more than once` in an `INSERT`). Values convert
+  as assignments do, and PostgreSQL's analysis errors are reported at the
+  target (`subfield "x" is of type integer but expression is of type
+  timestamp with time zone`, `cannot set a subfield to DEFAULT`).
 - A PL/pgSQL condition of another type converts through its text form as in
   PostgreSQL: `IF 1` is true and `IF 5` fails with `invalid input syntax for
   type boolean`.

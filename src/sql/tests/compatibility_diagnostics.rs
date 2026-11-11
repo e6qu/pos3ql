@@ -6,7 +6,7 @@ use super::*;
 /// Each ErrorResponse and NoticeResponse as `SEVERITY SQLSTATE message`,
 /// followed by ` @position` when it carries a cursor and ` hint: ...` when
 /// it carries a hint, interleaved with the command tags of the response.
-fn diagnostics(bytes: &[u8]) -> Vec<String> {
+pub(super) fn diagnostics(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut offset = 0;
     while offset < bytes.len() {
@@ -48,7 +48,7 @@ fn diagnostics(bytes: &[u8]) -> Vec<String> {
     out
 }
 
-fn with_engine(name: &str, run: impl FnOnce(&mut Engine, &mut Budget)) {
+pub(super) fn with_engine(name: &str, run: impl FnOnce(&mut Engine, &mut Budget)) {
     let config = test_config(name);
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -903,6 +903,681 @@ fn function_body_syntax_errors_point_into_create_function() {
                 diagnostics(&run_with(engine, budget, sql)),
                 [expected],
                 "{sql}"
+            );
+        }
+    });
+}
+
+#[test]
+fn assignment_targets_require_postgresql_assignment_casts() {
+    with_engine("assignment-coercion", |engine, budget| {
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE TYPE mood AS ENUM ('a', 'b');
+             CREATE TABLE t (a int, m int[], d date, j jsonb, ms mood[]);",
+        );
+        assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+        const HINT: &str = " hint: You will need to rewrite or cast the expression.";
+        // Messages and positions from PostgreSQL 18.6; `^` marks the cursor.
+        for (sql, message) in [
+            (
+                "INSERT INTO t (a) VALUES (^'x'::text)",
+                "column \"a\" is of type integer but expression is of type text",
+            ),
+            (
+                "INSERT INTO t (a, d) VALUES (1, now()), (^'y'::text, now())",
+                "column \"a\" is of type integer but expression is of type text",
+            ),
+            (
+                "UPDATE t SET a = ^now()",
+                "column \"a\" is of type integer but expression is of type timestamp with time zone",
+            ),
+            (
+                "INSERT INTO t (a) VALUES (^$$1$$::varchar)",
+                "column \"a\" is of type integer but expression is of type character varying",
+            ),
+            (
+                "UPDATE t SET ^m[1] = 'x'::text",
+                "subscripted assignment to \"m\" requires type integer but expression is of type text",
+            ),
+            (
+                "UPDATE t SET ^m[1:2] = '{1}'::text[]",
+                "subscripted assignment to \"m\" requires type integer[] but expression is of type text[]",
+            ),
+            (
+                "INSERT INTO t (^m[1:2]) SELECT '{1,2}' UNION ALL SELECT '{3,4}'",
+                "subscripted assignment to \"m\" requires type integer[] but expression is of type text",
+            ),
+            (
+                "INSERT INTO t (a, ^m[1]) SELECT 1, 'x'::text",
+                "subscripted assignment to \"m\" requires type integer but expression is of type text",
+            ),
+            (
+                "UPDATE t SET ^j['k'] = 1",
+                "subscripted assignment to \"j\" requires type jsonb but expression is of type integer",
+            ),
+            (
+                "INSERT INTO t (a) SELECT ^'1' UNION SELECT '2'",
+                "column \"a\" is of type integer but expression is of type text",
+            ),
+            (
+                "UPDATE t SET (a, d) = (SELECT ^'x'::text, 1)",
+                "column \"a\" is of type integer but expression is of type text",
+            ),
+            (
+                "UPDATE t SET a = ^(SELECT '1')",
+                "column \"a\" is of type integer but expression is of type text",
+            ),
+        ] {
+            let at = sql.find('^').unwrap();
+            let written = sql.replacen('^', "", 1);
+            let output = run_with(engine, budget, &written);
+            assert_eq!(
+                diagnostics(&output),
+                [format!("ERROR 42804 {message} @{}{HINT}", at + 1)],
+                "{written}"
+            );
+        }
+        // Untyped literals and assignment casts convert, as in PostgreSQL.
+        let output = run_with(
+            engine,
+            budget,
+            "INSERT INTO t (a, m) VALUES ('1', '{2}'), (1.5, NULL), (3::bigint, NULL);
+             INSERT INTO t (a, m[1]) SELECT '4', '5';
+             INSERT INTO t (ms) VALUES ('{a}');
+             UPDATE t SET ms[1] = 'b' WHERE ms IS NOT NULL;
+             INSERT INTO t (j) SELECT jsonb_agg(g ORDER BY g) FROM generate_series(1, 2) g;
+             SELECT a, m, ms FROM t WHERE j IS NULL ORDER BY a;
+             SELECT j FROM t WHERE j IS NOT NULL;",
+        );
+        assert_eq!(
+            data_rows(&output),
+            [
+                "1|{2}|NULL",
+                "2|NULL|NULL",
+                "3|NULL|NULL",
+                "4|{5}|NULL",
+                "NULL|NULL|{b}",
+                "[1, 2]"
+            ],
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    });
+}
+
+#[test]
+fn plpgsql_conversions_read_text_output_and_sql_results_are_checked_at_create() {
+    with_engine("plpgsql-conversion", |engine, budget| {
+        // PostgreSQL 18.6 converts a value without an assignment cast
+        // through its text output, which the target's input then reads.
+        for (body, message) in [
+            (
+                "RETURNS int LANGUAGE plpgsql AS $$ DECLARE x int; BEGIN x := true; RETURN x; END $$",
+                "ERROR 22P02 invalid input syntax for type integer: \"t\"",
+            ),
+            (
+                "RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN true; END $$",
+                "ERROR 22P02 invalid input syntax for type integer: \"t\"",
+            ),
+            (
+                "RETURNS int LANGUAGE plpgsql AS $$ DECLARE x int[]; BEGIN x[1] := 'abc'::text; RETURN 1; END $$",
+                "ERROR 22P02 invalid input syntax for type integer: \"abc\"",
+            ),
+        ] {
+            let output = run_with(
+                engine,
+                budget,
+                &format!("CREATE OR REPLACE FUNCTION conv() {body}; SELECT conv();"),
+            );
+            assert_eq!(diagnostics(&output), ["CREATE FUNCTION", message], "{body}");
+        }
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE FUNCTION outconv(OUT a int) LANGUAGE plpgsql AS $$ BEGIN a := 1.6; END $$;
+             SELECT outconv();",
+        );
+        assert_eq!(data_rows(&output), ["2"]);
+        // PostgreSQL's grammar reads `RETURNS` after options as `RETURNS NULL
+        // ON NULL INPUT`, before it misses the result type.
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "CREATE FUNCTION late() LANGUAGE sql RETURNS int AS 'SELECT 1'",
+            )),
+            ["ERROR 42601 syntax error at or near \"int\" @45"]
+        );
+        // A SQL function's final query is checked against its declared
+        // result when it is created.
+        for (body, detail) in [
+            (
+                "RETURNS int AS $$SELECT 'abc'$$",
+                "Actual return type is text.",
+            ),
+            (
+                "RETURNS int AS $$SELECT 1, 2$$",
+                "Final statement must return exactly one column.",
+            ),
+            (
+                "RETURNS SETOF int AS $$SELECT now()$$",
+                "Actual return type is timestamp with time zone.",
+            ),
+            ("RETURNS int AS $$SELECT 1::bigint$$", ""),
+            ("RETURNS int AS $$SELECT 1.5 UNION SELECT 2$$", ""),
+        ] {
+            let output = run_with(
+                engine,
+                budget,
+                &format!("CREATE OR REPLACE FUNCTION sqlres() {body} LANGUAGE sql"),
+            );
+            let expected = if detail.is_empty() {
+                "CREATE FUNCTION".to_owned()
+            } else {
+                format!(
+                    "ERROR 42P13 return type mismatch in function declared to return integer detail: {detail}"
+                )
+            };
+            assert_eq!(diagnostics(&output), [expected], "{body}");
+        }
+    });
+}
+
+#[test]
+fn plpgsql_data_changes_return_rows_into_variables() {
+    with_engine("plpgsql-returning-into", |engine, budget| {
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE TABLE r (id int, v text);
+             INSERT INTO r VALUES (1, 'a'), (2, 'b');
+             CREATE FUNCTION ins() RETURNS text LANGUAGE plpgsql AS $$
+               DECLARE x int; y text;
+               BEGIN INSERT INTO r VALUES (3, 'c') RETURNING id, v INTO x, y;
+               RETURN x || y || found; END $$;
+             CREATE FUNCTION del_none() RETURNS text LANGUAGE plpgsql AS $$
+               DECLARE x int; n int;
+               BEGIN DELETE FROM r WHERE id > 100 RETURNING id INTO x;
+               GET DIAGNOSTICS n = ROW_COUNT;
+               RETURN coalesce(x::text, 'null') || found || n; END $$;
+             CREATE FUNCTION del_record() RETURNS text LANGUAGE plpgsql AS $$
+               DECLARE x record;
+               BEGIN DELETE FROM r WHERE id = 3 RETURNING * INTO x;
+               RETURN x.id || x.v; END $$;
+             CREATE FUNCTION ins_select() RETURNS int LANGUAGE plpgsql AS $$
+               DECLARE x int; y int;
+               BEGIN INSERT INTO r SELECT 7, 'g' RETURNING id INTO STRICT x, y;
+               RETURN x + coalesce(y, 0); END $$;
+             SELECT ins(); SELECT del_none(); SELECT del_record(); SELECT ins_select();",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["3ctrue", "nullfalse0", "3c", "7"],
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        // Errors from PostgreSQL 18.6.
+        for (body, expected) in [
+            (
+                "DECLARE x int; BEGIN UPDATE r SET v = 'z' RETURNING id INTO x; END",
+                "ERROR P0003 query returned more than one row hint: Make sure the query returns a single row, or use LIMIT 1.",
+            ),
+            (
+                "DECLARE x int; BEGIN UPDATE r SET v = 'z' WHERE id > 100 RETURNING id INTO STRICT x; END",
+                "ERROR P0002 query returned no rows",
+            ),
+            (
+                "BEGIN UPDATE r SET v = 'q' RETURNING id; END",
+                "ERROR 42601 query has no destination for result data",
+            ),
+            (
+                "DECLARE x int; BEGIN UPDATE r SET v = 'q' INTO x; END",
+                "ERROR 42601 INTO used with a command that cannot return data",
+            ),
+            (
+                "DECLARE x int; BEGIN SELECT id INTO STRICT x FROM r; END",
+                "ERROR P0003 query returned more than one row hint: Make sure the query returns a single row, or use LIMIT 1.",
+            ),
+            (
+                "DECLARE x int; BEGIN EXECUTE 'SELECT id FROM r' INTO STRICT x; END",
+                "ERROR P0003 query returned more than one row",
+            ),
+        ] {
+            let output = run_with(engine, budget, &format!("DO $$ {body} $$"));
+            assert_eq!(diagnostics(&output), [expected], "{body}");
+        }
+        // A query's extra columns are ignored and missing ones leave NULL.
+        let output = run_with(
+            engine,
+            budget,
+            "DO $$ DECLARE x int; y int; BEGIN
+               SELECT 1, 2 INTO x; RAISE NOTICE '%', x;
+               SELECT 5 INTO x, y; RAISE NOTICE '% %', x, y;
+               EXECUTE 'SELECT 6' INTO x, y; RAISE NOTICE '% %', x, y;
+             END $$",
+        );
+        assert_eq!(
+            diagnostics(&output),
+            [
+                "NOTICE 00000 1",
+                "NOTICE 00000 5 <NULL>",
+                "NOTICE 00000 6 <NULL>",
+                "DO"
+            ]
+        );
+    });
+}
+
+#[test]
+fn routine_name_qualifies_its_parameters() {
+    with_engine("qualified-parameters", |engine, budget| {
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE TABLE fq_rows (a int);
+             INSERT INTO fq_rows VALUES (10);
+             CREATE FUNCTION fq(a int) RETURNS int LANGUAGE sql AS $$ SELECT fq.a + 1 $$;
+             CREATE FUNCTION fp(a int) RETURNS int LANGUAGE plpgsql AS $$
+               DECLARE b int;
+               BEGIN b := fp.a * 2;
+               SELECT fp.a + b + fq_rows.a INTO b FROM fq_rows;
+               UPDATE fq_rows SET a = fp.a WHERE fq_rows.a = 10;
+               RETURN b; END $$;
+             SELECT fq(1), fp(3); SELECT a FROM fq_rows;",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["2|19", "3"],
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    });
+}
+
+#[test]
+fn create_function_analyses_data_change_targets() {
+    with_engine("create-function-dml-targets", |engine, budget| {
+        let output = run_with(engine, budget, "CREATE TABLE wt (a int, b text)");
+        assert_eq!(diagnostics(&output), ["CREATE TABLE"]);
+        const HINT: &str = " hint: You will need to rewrite or cast the expression.";
+        // Messages and positions from PostgreSQL 18.6; `^` marks the cursor.
+        for (sql, expected) in [
+            (
+                "CREATE FUNCTION w1(x int) RETURNS void LANGUAGE sql AS $$ UPDATE wt SET ^nosuch = x $$",
+                "ERROR 42703 column \"nosuch\" of relation \"wt\" does not exist".to_owned(),
+            ),
+            (
+                "CREATE FUNCTION w2(x int) RETURNS void LANGUAGE sql AS $$ INSERT INTO wt (a, ^nosuch) VALUES (x, 1) $$",
+                "ERROR 42703 column \"nosuch\" of relation \"wt\" does not exist".to_owned(),
+            ),
+            (
+                "CREATE FUNCTION w3(x text) RETURNS void LANGUAGE sql AS $$ UPDATE wt SET a = ^x $$",
+                format!(
+                    "ERROR 42804 column \"a\" is of type integer but expression is of type text{HINT}"
+                ),
+            ),
+            (
+                "CREATE FUNCTION w4(x int) RETURNS void LANGUAGE sql BEGIN ATOMIC; UPDATE wt SET ^nosuch = x; END",
+                "ERROR 42703 column \"nosuch\" of relation \"wt\" does not exist".to_owned(),
+            ),
+            (
+                "CREATE FUNCTION w5(x int) RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE wt SET a = ^'q'::text; END",
+                format!(
+                    "ERROR 42804 column \"a\" is of type integer but expression is of type text{HINT}"
+                ),
+            ),
+        ] {
+            let at = sql.find('^').unwrap();
+            let written = sql.replacen('^', "", 1);
+            let output = run_with(engine, budget, &written);
+            let (message, hint) = expected
+                .split_once(" hint:")
+                .map_or((expected.as_str(), String::new()), |(message, hint)| {
+                    (message, format!(" hint:{hint}"))
+                });
+            assert_eq!(
+                diagnostics(&output),
+                [format!("{message} @{}{hint}", at + 1)],
+                "{written}"
+            );
+        }
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE FUNCTION w6(x int) RETURNS void LANGUAGE sql BEGIN ATOMIC; ; INSERT INTO wt VALUES (x, 'z'); END;
+             SELECT w6(4); SELECT a, b FROM wt",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["NULL", "4|z"],
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    });
+}
+
+#[test]
+fn subquery_constants_convert_before_rows_are_read() {
+    with_engine("subquery-literals", |engine, budget| {
+        let output = run_with(engine, budget, "CREATE TABLE st (a int, b text)");
+        assert_eq!(diagnostics(&output), ["CREATE TABLE"]);
+        // Positions from PostgreSQL 18.6; `^` marks the cursor. The table is
+        // empty, so only analysis can find these.
+        for (sql, literal) in [
+            ("SELECT (SELECT a FROM st WHERE a = ^'q')", "q"),
+            (
+                "SELECT 1 WHERE EXISTS (SELECT 1 FROM st WHERE a = ^'q')",
+                "q",
+            ),
+            ("SELECT 1 WHERE 1 IN (SELECT a FROM st WHERE a > ^'x')", "x"),
+            (
+                "SELECT (SELECT a FROM st s2 WHERE s2.a = ^'q' UNION SELECT 1)",
+                "q",
+            ),
+            (
+                "SELECT (SELECT (SELECT a FROM st x WHERE x.a = ^'zz'))",
+                "zz",
+            ),
+            (
+                "SELECT * FROM st WHERE a IN (SELECT a FROM st t2 WHERE t2.a = ^'p')",
+                "p",
+            ),
+        ] {
+            let at = sql.find('^').unwrap();
+            let written = sql.replacen('^', "", 1);
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, &written)),
+                [format!(
+                    "ERROR 22P02 invalid input syntax for type integer: \"{literal}\" @{}",
+                    at + 1
+                )],
+                "{written}"
+            );
+        }
+        let output = run_with(
+            engine,
+            budget,
+            "SELECT (SELECT b FROM st WHERE b = 'q'), (SELECT a FROM st WHERE a = '5')",
+        );
+        assert_eq!(data_rows(&output), ["NULL|NULL"]);
+    });
+}
+
+#[test]
+fn plpgsql_labels_name_blocks_loops_and_their_variables() {
+    with_engine("plpgsql-labels", |engine, budget| {
+        // Results from PostgreSQL 18.6.
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE FUNCTION lb_nested() RETURNS text LANGUAGE plpgsql AS $$
+               <<blo>> DECLARE x int := 1;
+               BEGIN
+                 <<bli>> DECLARE x int := x + 10; y int := x;
+                 BEGIN RETURN blo.x || ',' || bli.x || ',' || x || ',' || y; END bli;
+               END blo $$;
+             CREATE FUNCTION lb_loops() RETURNS int LANGUAGE plpgsql AS $$
+               DECLARE n int := 0;
+               BEGIN
+                 <<o>> FOR i IN 1..3 LOOP
+                   <<inr>> FOR j IN 1..3 LOOP
+                     n := n + o.i * 10 + inr.j;
+                     CONTINUE o WHEN j = 2;
+                     EXIT o WHEN i = 3;
+                   END LOOP inr;
+                 END LOOP o;
+                 <<blk>> BEGIN n := n + 1000; EXIT blk; n := 0; END blk;
+                 RETURN n;
+               END $$;
+             CREATE FUNCTION lb_shadow(p int) RETURNS text LANGUAGE plpgsql AS $$
+               <<b>> DECLARE i int := 7; t text := '';
+               BEGIN
+                 <<lp>> FOR i IN 1..2 LOOP b.i := b.i + lp.i; t := t || i; END LOOP;
+                 FOR k IN 1..2 LOOP
+                   DECLARE s int := k * 2;
+                   BEGIN t := t || s; s := 0; END;
+                 END LOOP;
+                 PERFORM 1;
+                 RETURN i || ',' || t || ',' || lb_shadow.p || ',' || lb_shadow.found;
+               END $$;
+             SELECT lb_nested(), lb_loops(), lb_shadow(4);",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["1,11,11,11|1097|10,1224,4,true"],
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        for (sql, expected) in [
+            (
+                "DO $$ BEGIN <<b>> BEGIN CONTINUE b; END; END $$",
+                "42601 block label \"b\" cannot be used in CONTINUE",
+            ),
+            (
+                "DO $$ BEGIN BEGIN EXIT; END; END $$",
+                "42601 EXIT cannot be used outside a loop, unless it has a label",
+            ),
+            (
+                "DO $$ BEGIN EXIT nolabel; END $$",
+                "42601 there is no label \"nolabel\" attached to any block or loop enclosing this statement",
+            ),
+            (
+                "DO $$ <<a>> BEGIN NULL; END b $$",
+                "42601 end label \"b\" differs from block's label \"a\"",
+            ),
+            (
+                "DO $$ BEGIN <<lp>> LOOP EXIT lp; END LOOP wrong; END $$",
+                "42601 end label \"wrong\" differs from block's label \"lp\"",
+            ),
+            (
+                "DO $$ BEGIN NULL; END b $$",
+                "42601 end label \"b\" specified for unlabeled block",
+            ),
+            (
+                "DO $$ BEGIN <<x>> NULL; END $$",
+                "42601 syntax error at or near \"NULL\"",
+            ),
+            (
+                "DO $$ DECLARE <<x>> BEGIN NULL; END $$",
+                "42601 block label must be placed before DECLARE, not after",
+            ),
+            (
+                "DO $$ BEGIN DECLARE a int; a int; BEGIN NULL; END; END $$",
+                "42601 duplicate declaration at or near \"a\"",
+            ),
+            (
+                "DO $$ BEGIN DECLARE c CONSTANT int := 1; BEGIN c := 2; END; END $$",
+                "22005 variable \"c\" is declared CONSTANT",
+            ),
+            (
+                "DO $$ <<b>> DECLARE x int := 1; BEGIN b.nope := 3; END $$",
+                "42601 \"b.nope\" is not a known variable",
+            ),
+        ] {
+            let found = diagnostics(&run_with(engine, budget, sql));
+            assert!(
+                found
+                    .first()
+                    .is_some_and(|line| line.starts_with(&format!("ERROR {expected}"))),
+                "{sql}: {found:?}"
+            );
+        }
+        let output = run_with(
+            engine,
+            budget,
+            "DO $$ BEGIN DECLARE z int := 1/0; BEGIN NULL; EXCEPTION WHEN others THEN NULL; END; END $$",
+        );
+        assert_eq!(
+            diagnostics(&output)[0],
+            "ERROR 22012 division by zero",
+            "a block's declarations are initialized outside its handlers"
+        );
+    });
+}
+
+#[test]
+fn data_modifying_with_runs_once_under_one_snapshot_and_unread_last() {
+    with_engine("data-modifying-with-order", |engine, budget| {
+        // Results from PostgreSQL 18.6. A PL/pgSQL call restarts the main
+        // query without repeating the WITH query's insert.
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE TABLE dw (a int);
+             CREATE TABLE dw_log (msg text);
+             CREATE FUNCTION dw_count() RETURNS bigint LANGUAGE plpgsql VOLATILE AS $$
+               BEGIN RETURN (SELECT count(*) FROM dw); END $$;
+             CREATE FUNCTION dw_note(t text) RETURNS int LANGUAGE plpgsql VOLATILE AS $$
+               BEGIN INSERT INTO dw_log VALUES (t); RETURN 1; END $$;
+             WITH w AS (INSERT INTO dw VALUES (1)) SELECT dw_count();
+             WITH w AS (INSERT INTO dw VALUES (2) RETURNING a)
+               SELECT dw_count(), (SELECT count(*) FROM dw), (SELECT a FROM w);
+             WITH a AS (INSERT INTO dw VALUES (dw_note('first'))),
+                  b AS (INSERT INTO dw VALUES (dw_note('second')))
+               SELECT dw_note('main');
+             SELECT string_agg(msg, ',') FROM dw_log;
+             WITH d AS (DELETE FROM dw) INSERT INTO dw VALUES (99);
+             SELECT string_agg(a::text, ',') FROM dw;",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["0", "1|1|2", "1", "main,second,first", "99"],
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    });
+}
+
+#[test]
+fn plpgsql_array_elements_convert_like_variables() {
+    with_engine("plpgsql-element-assignment", |engine, budget| {
+        // PostgreSQL 18.6: assignment cast, otherwise through text.
+        let output = run_with(
+            engine,
+            budget,
+            "DO $$ DECLARE x int[] := '{1,2}'; BEGIN x[1] := true; END $$",
+        );
+        assert_eq!(
+            diagnostics(&output)[0],
+            "ERROR 22P02 invalid input syntax for type integer: \"t\""
+        );
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE FUNCTION ea() RETURNS text LANGUAGE plpgsql AS $$
+               DECLARE x int[] := '{1,2}'; t text[] := '{a}'; n numeric := 2.6;
+               BEGIN x[1] := '7'; x[2] := n; t[2] := 5; t[3] := true;
+               RETURN x::text || t::text; END $$;
+             SELECT ea();",
+        );
+        assert_eq!(data_rows(&output), ["{7,3}{a,5,true}"]);
+    });
+}
+
+#[test]
+fn strict_failures_print_the_statement_variables_when_asked() {
+    with_engine("print-strict-params", |engine, budget| {
+        // DETAIL texts from PostgreSQL 18.6.
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE TABLE sp (a int, b text);
+             INSERT INTO sp VALUES (1, 'x'), (1, 'y');
+             CREATE FUNCTION sp_on(p int, q text) RETURNS text LANGUAGE plpgsql AS $$
+               #print_strict_params on
+               DECLARE r text; z int := 3;
+               BEGIN SELECT b INTO STRICT r FROM sp WHERE a = p AND b <> q AND z = 3;
+               RETURN r; END $$;
+             CREATE FUNCTION sp_execute(p text) RETURNS text LANGUAGE plpgsql AS $$
+               #print_strict_params on
+               DECLARE r text;
+               BEGIN EXECUTE 'SELECT b FROM sp WHERE a = $1' INTO STRICT r USING length(p);
+               RETURN r; END $$;
+",
+        );
+        assert!(
+            !diagnostics(&output)
+                .iter()
+                .any(|line| line.starts_with("ERROR")),
+            "{:?}",
+            diagnostics(&output)
+        );
+        for (sql, expected) in [
+            (
+                "SELECT sp_on(2, 'it''s')",
+                "ERROR P0002 query returned no rows detail: parameters: p = '2', q = 'it''s', z = '3'",
+            ),
+            (
+                "SELECT sp_execute('x')",
+                "ERROR P0003 query returned more than one row detail: parameters: $1 = '1'",
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql))[0],
+                expected,
+                "{sql}"
+            );
+        }
+        // The creating session compiles the function with its setting.
+        let output = run_with(
+            engine,
+            budget,
+            "SET plpgsql.print_strict_params = on;
+             CREATE FUNCTION sp_session(p int) RETURNS int LANGUAGE plpgsql AS $$
+               DECLARE r int;
+               BEGIN UPDATE sp SET a = a WHERE a = p RETURNING a INTO STRICT r;
+               RETURN r; END $$;
+             RESET plpgsql.print_strict_params;
+             SELECT sp_session(5);",
+        );
+        assert!(
+            diagnostics(&output).contains(
+                &"ERROR P0002 query returned no rows detail: parameters: p = '5'".to_string()
+            ),
+            "{:?}",
+            diagnostics(&output)
+        );
+    });
+}
+
+#[test]
+fn data_change_subquery_constants_convert_before_rows_are_read() {
+    with_engine("dml-subquery-literals", |engine, budget| {
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE TABLE ds (a int); CREATE TABLE du (a int)",
+        );
+        assert_eq!(diagnostics(&output), ["CREATE TABLE", "CREATE TABLE"]);
+        // Positions from PostgreSQL 18.6; `^` marks the cursor. Both tables
+        // are empty, so only analysis can find these.
+        for (sql, literal) in [
+            (
+                "DELETE FROM ds WHERE a IN (SELECT a FROM du WHERE a = ^'q')",
+                "q",
+            ),
+            ("UPDATE ds SET a = (SELECT a FROM du WHERE a = ^'zz')", "zz"),
+            (
+                "INSERT INTO ds VALUES ((SELECT a FROM du WHERE a = ^'r'))",
+                "r",
+            ),
+            ("INSERT INTO ds SELECT a FROM du WHERE a = ^'k'", "k"),
+            (
+                "DELETE FROM ds RETURNING (SELECT a FROM du WHERE a = ^'ret')",
+                "ret",
+            ),
+        ] {
+            let at = sql.find('^').unwrap();
+            let written = sql.replacen('^', "", 1);
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, &written)),
+                [format!(
+                    "ERROR 22P02 invalid input syntax for type integer: \"{literal}\" @{}",
+                    at + 1
+                )],
+                "{written}"
             );
         }
     });

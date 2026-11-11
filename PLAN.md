@@ -333,30 +333,37 @@ and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
 constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
 `INSERT has more target columns than expressions` without its position; other
-target and expression count errors are positioned. At
-`CREATE FUNCTION`, a SQL body's queries are analysed for their relations,
-output columns, functions and types, and a data-changing statement only for
-its target relation, so an unknown column in an `UPDATE ... SET` list is
-found when the function runs. An error raised while PostgreSQL inlines a SQL function's body
-(`SQL function "f" during inlining`) has no context line. Under
+target and expression count errors are positioned. Under
 `#variable_conflict use_variable` a variable that is also a column fails with
 `0A000`: aggregate inputs and grouping keys bind names to columns before the
-variable could win. PostgreSQL fixes a function's `plpgsql.variable_conflict`
-when its creating session validates it at `CREATE FUNCTION`; pos3ql reads it
-at the backend's first call. A function-qualified parameter (`f.a` in function `f`)
-fails as a missing FROM-clause entry, and PL/pgSQL `INSERT`, `UPDATE` and
-`DELETE ... RETURNING ... INTO` fail with a syntax error at `INTO`. A constant compared
-with a column inside a subquery (`SELECT (SELECT a FROM t WHERE a = 'q')`) is
-checked only when a row is compared, so an empty table returns NULL where
-PostgreSQL rejects `'q'`; the outer query's conditions, output list and joins
-and an `UPDATE` or `DELETE` condition are checked before any row is read. Assignment
-coercion is not analysed: a value of a type without an assignment cast to its
-target converts when the row is written, so `UPDATE t SET m[1] = 'x'::text`
-on an empty table succeeds and `INSERT INTO t (m[1:2]) SELECT '{1,2}' UNION
-ALL SELECT '{3,4}'` stores the text where PostgreSQL reports `42804`
-(`subscripted assignment to "m" requires type integer[] but expression is of
-type text`); fixing it needs PostgreSQL's assignment-cast rules for every
-target type.
+variable could win. A materialized
+ordinary `WITH` query that calls a volatile function runs before the main
+query; PostgreSQL runs it when its rows are first read, as it now runs a
+data-changing one. A data-changing `WITH` inside a routine body fails
+(`WITH x AS (INSERT ...) SELECT ... INTO v` in PL/pgSQL is rejected as an
+unsupported body, `RETURN QUERY` reports the query unknown and a SQL-language
+function reports an internal error). An `IN`, `ANY` or `ALL` subquery that
+calls a volatile function runs before the expression containing it, where
+PostgreSQL runs it when evaluation reaches it. FROM-list items separated by
+commas run as one left-deep join chain, so a `RIGHT` or `FULL` join after a
+comma (`FROM a, b RIGHT JOIN c ON ...`) is rejected with `0A000`, a
+parenthesized join (`FROM a JOIN (b JOIN c ON ...) ON ...`) is a syntax error,
+and an `ON` condition can name a table from an earlier comma-separated item
+where PostgreSQL reports `invalid reference to FROM-clause entry`. A
+whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
+PostgreSQL types it as the table's row type `t`. A qualifier naming an
+aliased table (`UPDATE t x ... RETURNING t.a`) reports PostgreSQL's
+`invalid reference to FROM-clause entry` without its alias hint. A
+database-qualified name (`postgres.public.t`) works in column references,
+FROM items and `CREATE` targets but is a syntax error in `DROP` and other
+DDL name lists.
+A PL/pgSQL variable declared with a view's row type (`r v;` or
+`r v%ROWTYPE`) fails with `0A000`; a table's works. In a PL/pgSQL statement,
+`VALUES (r.*)` does not expand the row variable `r` into its fields, and a
+whole-row star in an expression (`t.* IS NULL`) is a syntax error. Reading
+a field of a row variable that was never assigned returns NULL without
+checking that the field exists. A `CONSTANT` assignment error has no cursor
+position.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,
 SQL/JSON result types) are reported when the statement would run. In a

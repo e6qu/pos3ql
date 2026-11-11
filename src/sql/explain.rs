@@ -10,8 +10,8 @@ use crate::mem::arena::Arena;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql::ast::{
-    BinaryOp, ExplainFormat, ExplainOptions, ExplainSerialize, Expr, JoinKind, Select, SelectItem,
-    SetOp, SetQuery, SetTree, Stmt,
+    BinaryOp, ExplainFormat, ExplainOptions, ExplainSerialize, Expr, Select, SelectItem, SetOp,
+    SetQuery, SetTree, Stmt,
 };
 use crate::sql::eval::{SqlError, arena_full, sqlstate};
 use crate::sql::guc::PlannerSettings;
@@ -989,9 +989,7 @@ pub(super) fn plan_select<'a>(
         .map_err(|_| arena_full())?;
     if let Some(scope) = &scope {
         let reorderable = statement.from.as_ref().is_some_and(|from| {
-            from.joins
-                .iter()
-                .all(|join| matches!(join.kind, JoinKind::Cross))
+            from.joins.iter().all(|join| join.kind.is_cross())
                 && !scope.lateral[..scope.n].iter().any(|&lateral| lateral)
         });
         if reorderable {
@@ -1528,10 +1526,7 @@ pub(super) fn plan_modification<'a>(
         let order = arena
             .alloc_slice_with(scope.n, |index| index)
             .map_err(|_| arena_full())?;
-        if from
-            .joins
-            .iter()
-            .all(|join| matches!(join.kind, JoinKind::Cross))
+        if from.joins.iter().all(|join| join.kind.is_cross())
             && !scope.lateral[..scope.n].iter().any(|&lateral| lateral)
         {
             order.copy_from_slice(query::join_order(storage, &scope, predicate, arena)?);

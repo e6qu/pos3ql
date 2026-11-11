@@ -776,7 +776,7 @@ pub(super) fn srf_in_item<'a>(item: &'a SelectItem<'a>) -> Option<&'a Expr<'a>> 
     match item {
         SelectItem::Expr { expression, .. } => srf_in_expr(expression),
         SelectItem::RecordStar(base) => srf_in_expr(base),
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => None,
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => None,
     }
 }
 
@@ -812,7 +812,7 @@ pub(super) fn has_project_set(items: &[SelectItem<'_>], storage: &Storage, txid:
         SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
             expression_has_project_set(expression, storage, txid)
         }
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
     })
 }
 
@@ -1539,7 +1539,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
     for item in items {
         let expression = match item {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => expression,
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => continue,
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => continue,
         };
         visit(
             expression,
@@ -2260,7 +2260,7 @@ pub(super) fn preserve_projection_type_identities(
     let mut output = 0usize;
     for item in items {
         match item {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 let scope = scope.ok_or_else(shape_error)?;
                 for index in 0..scope.star_columns() {
                     *type_oids.get_mut(output).ok_or_else(shape_error)? =
@@ -2365,7 +2365,7 @@ pub(crate) fn describe_derived_definition<'a>(
                 let mut slot = 0usize;
                 for item in sub.items {
                     match item {
-                        SelectItem::Wildcard => slot += ss.star_columns(),
+                        SelectItem::Wildcard(_) => slot += ss.star_columns(),
                         SelectItem::TableWildcard(q) => {
                             slot += ss.qualified_star_columns(q)?;
                         }
@@ -2424,7 +2424,7 @@ pub(crate) fn describe_derived_definition<'a>(
                 let mut slot = 0usize;
                 for item in sub.items {
                     match item {
-                        SelectItem::Wildcard => {
+                        SelectItem::Wildcard(_) => {
                             for position in 0..ss.star_columns() {
                                 output_collations[slot] =
                                     ss.output_collation(ss.star_entry(position));

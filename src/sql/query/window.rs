@@ -129,7 +129,8 @@ pub(crate) fn rewrite_grouped_windows<'a>(
     if n_keys + n_aggs > MAX_PROJ {
         return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "too many columns"));
     }
-    let mut inner_items = [SelectItem::Wildcard; MAX_PROJ];
+    let mut inner_items =
+        [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     let mut group_names: [&str; MAX_PROJ] = [""; MAX_PROJ];
     let agg_names = arena
         .alloc_slice_with(n_aggs, |_| "")
@@ -187,7 +188,8 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         agg_names,
         scope,
     };
-    let mut outer_items = [SelectItem::Wildcard; MAX_PROJ];
+    let mut outer_items =
+        [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     for (i, item) in statement.items.iter().enumerate() {
         outer_items[i] = match item {
             SelectItem::Expr { expression, alias } => SelectItem::Expr {
@@ -1899,7 +1901,7 @@ fn projected_width<'a>(
     let mut width = 0;
     for item in items {
         width += match item {
-            SelectItem::Wildcard => scope.star_columns(),
+            SelectItem::Wildcard(_) => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
             SelectItem::RecordStar(base) => {
                 record_star_width(base, Some(scope), storage, txid, arena)?

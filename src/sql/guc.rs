@@ -282,9 +282,16 @@ pub(crate) fn active_planner_settings() -> PlannerSettings {
     })
 }
 
-/// The session's `plpgsql.variable_conflict`, for a trigger function compiled
-/// while a statement runs.
-pub(crate) fn active_plpgsql_variable_conflict() -> Result<VariableConflict, SqlError> {
+/// The PL/pgSQL settings a body is compiled under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlpgsqlSettings {
+    pub(crate) variable_conflict: VariableConflict,
+    pub(crate) print_strict_params: bool,
+}
+
+/// The session's PL/pgSQL settings, for a trigger function compiled while a
+/// statement runs.
+pub(crate) fn active_plpgsql_settings() -> Result<PlpgsqlSettings, SqlError> {
     ACTIVE_GUC.with(|active| {
         let pointer = active.get();
         if pointer.is_null() {
@@ -294,7 +301,7 @@ pub(crate) fn active_plpgsql_variable_conflict() -> Result<VariableConflict, Sql
             ));
         }
         // SAFETY: `enter_eval_scope` owns the pointer's dynamic extent.
-        Ok(unsafe { &*pointer }.plpgsql_variable_conflict())
+        Ok(unsafe { &*pointer }.plpgsql_settings())
     })
 }
 
@@ -766,6 +773,7 @@ struct GucValues {
     password_encryption: PasswordEncryption,
     track_functions: TrackFunctions,
     plpgsql_variable_conflict: VariableConflict,
+    plpgsql_print_strict_params: bool,
 }
 
 /// `plpgsql.variable_conflict` and a PL/pgSQL body's `#variable_conflict`:
@@ -892,7 +900,8 @@ impl GucValues {
             default_transaction_deferrable,
             password_encryption,
             track_functions,
-            plpgsql_variable_conflict
+            plpgsql_variable_conflict,
+            plpgsql_print_strict_params
         )
     }
 
@@ -926,6 +935,7 @@ impl GucValues {
             password_encryption: PasswordEncryption::ScramSha256,
             track_functions: TrackFunctions::None,
             plpgsql_variable_conflict: VariableConflict::Error,
+            plpgsql_print_strict_params: false,
         };
         let _ = write!(values.datestyle, "ISO, MDY");
         let _ = write!(values.timezone, "UTC");
@@ -967,7 +977,8 @@ const GUC_LC_MONETARY: u32 = 1 << 26;
 const GUC_TRACK_FUNCTIONS: u32 = 1 << 27;
 const GUC_PLPGSQL_VARIABLE_CONFLICT: u32 = 1 << 28;
 const GUC_WORK_MEM: u32 = 1 << 29;
-const GUC_SETTING_COUNT: usize = 30;
+const GUC_PLPGSQL_PRINT_STRICT_PARAMS: u32 = 1 << 30;
+const GUC_SETTING_COUNT: usize = 31;
 const GUC_ALL: u32 = (1 << GUC_SETTING_COUNT) - 1;
 
 #[derive(Clone, Copy)]
@@ -1073,6 +1084,8 @@ fn guc_bit(name: &str) -> u32 {
         GUC_PLPGSQL_VARIABLE_CONFLICT
     } else if name.eq_ignore_ascii_case("work_mem") {
         GUC_WORK_MEM
+    } else if name.eq_ignore_ascii_case("plpgsql.print_strict_params") {
+        GUC_PLPGSQL_PRINT_STRICT_PARAMS
     } else {
         0
     }
@@ -1133,6 +1146,7 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
     copy!(GUC_PASSWORD_ENCRYPTION, password_encryption);
     copy!(GUC_TRACK_FUNCTIONS, track_functions);
     copy!(GUC_PLPGSQL_VARIABLE_CONFLICT, plpgsql_variable_conflict);
+    copy!(GUC_PLPGSQL_PRINT_STRICT_PARAMS, plpgsql_print_strict_params);
 }
 
 fn finish_setting_change(
@@ -1767,8 +1781,12 @@ impl GucState {
         self.store.borrow().current.track_functions
     }
 
-    pub(crate) fn plpgsql_variable_conflict(&self) -> VariableConflict {
-        self.store.borrow().current.plpgsql_variable_conflict
+    pub(crate) fn plpgsql_settings(&self) -> PlpgsqlSettings {
+        let current = self.store.borrow().current;
+        PlpgsqlSettings {
+            variable_conflict: current.plpgsql_variable_conflict,
+            print_strict_params: current.plpgsql_print_strict_params,
+        }
     }
 
     pub(crate) fn transaction_defaults(&self) -> (TransactionIsolation, bool, bool) {
@@ -2386,6 +2404,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.track_functions = defaults.track_functions;
     } else if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
         values.plpgsql_variable_conflict = defaults.plpgsql_variable_conflict;
+    } else if name.eq_ignore_ascii_case("plpgsql.print_strict_params") {
+        values.plpgsql_print_strict_params = defaults.plpgsql_print_strict_params;
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
         // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
@@ -2459,7 +2479,7 @@ fn apply_setting(
         ));
     }
     if name.eq_ignore_ascii_case("standard_conforming_strings") {
-        if parse_on_off(v).ok_or_else(|| invalid_setting_value(name, v))? {
+        if parse_boolean_setting("standard_conforming_strings", v)? {
             return Ok(());
         }
         return Err(sql_err!(
@@ -2468,8 +2488,7 @@ fn apply_setting(
         ));
     }
     if name.eq_ignore_ascii_case("check_function_bodies") {
-        values.check_function_bodies =
-            parse_on_off(v).ok_or_else(|| invalid_setting_value("check_function_bodies", v))?;
+        values.check_function_bodies = parse_boolean_setting("check_function_bodies", v)?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("xmloption") {
@@ -2528,7 +2547,7 @@ fn apply_setting(
         return store(&mut values.lc_monetary, canonical);
     }
     if name.eq_ignore_ascii_case("synchronize_seqscans") {
-        if !parse_on_off(v).ok_or_else(|| invalid_setting_value(name, v))? {
+        if !parse_boolean_setting("synchronize_seqscans", v)? {
             return Ok(());
         }
         return Err(sql_err!(
@@ -2602,12 +2621,11 @@ fn apply_setting(
         return Err(invalid_enum_value("bytea_output", v, "escape, hex"));
     }
     if name.eq_ignore_ascii_case("row_security") {
-        let on = parse_on_off(v).ok_or_else(|| invalid_setting_value("row_security", v))?;
+        let on = parse_boolean_setting("row_security", v)?;
         return store(&mut values.row_security, if on { "on" } else { "off" });
     }
     if name.eq_ignore_ascii_case("event_triggers") {
-        values.event_triggers =
-            parse_on_off(v).ok_or_else(|| invalid_setting_value("event_triggers", v))?;
+        values.event_triggers = parse_boolean_setting("event_triggers", v)?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("default_transaction_isolation") {
@@ -2621,13 +2639,13 @@ fn apply_setting(
         return Ok(());
     }
     if name.eq_ignore_ascii_case("default_transaction_read_only") {
-        values.default_transaction_read_only = parse_on_off(v)
-            .ok_or_else(|| invalid_setting_value("default_transaction_read_only", v))?;
+        values.default_transaction_read_only =
+            parse_boolean_setting("default_transaction_read_only", v)?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("default_transaction_deferrable") {
-        values.default_transaction_deferrable = parse_on_off(v)
-            .ok_or_else(|| invalid_setting_value("default_transaction_deferrable", v))?;
+        values.default_transaction_deferrable =
+            parse_boolean_setting("default_transaction_deferrable", v)?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("password_encryption") {
@@ -2654,6 +2672,11 @@ fn apply_setting(
         } else {
             return Err(invalid_enum_value("track_functions", v, "none, pl, all"));
         };
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("plpgsql.print_strict_params") {
+        values.plpgsql_print_strict_params =
+            parse_boolean_setting("plpgsql.print_strict_params", v)?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
@@ -2822,6 +2845,12 @@ fn owned_setting(values: &GucValues, name: &str) -> Option<StackStr<256>> {
         Some(StackStr::from_str(
             values.plpgsql_variable_conflict.as_str(),
         ))
+    } else if name.eq_ignore_ascii_case("plpgsql.print_strict_params") {
+        Some(StackStr::from_str(if values.plpgsql_print_strict_params {
+            "on"
+        } else {
+            "off"
+        }))
     } else if name.eq_ignore_ascii_case("seed") {
         Some(StackStr::from_str("unavailable"))
     } else {
@@ -3672,6 +3701,17 @@ fn invalid_enum_value(param: &str, v: &str, available: &str) -> SqlError {
         )),
     );
     invalid_setting_value(param, v)
+}
+
+/// A boolean setting's value, rejected as PostgreSQL's `parse_bool` does.
+fn parse_boolean_setting(param: &str, v: &str) -> Result<bool, SqlError> {
+    parse_on_off(v).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "parameter \"{}\" requires a Boolean value",
+            param
+        )
+    })
 }
 
 fn invalid_setting_value(param: &str, v: &str) -> SqlError {

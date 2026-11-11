@@ -210,7 +210,7 @@ fn run<'a>(
 impl SuspendedProcedure {
     /// Continues the saved body at its waiting statement. `invocation` builds
     /// the call's invocation from the restored program's input sites and
-    /// `#variable_conflict` option, and
+    /// compile options, and
     /// `seeded` maps the saved inputs to named locals. A failed attachment
     /// leaves the saved body in `retention` unchanged.
     pub(super) fn resume<'a>(
@@ -218,8 +218,7 @@ impl SuspendedProcedure {
         context: &mut TriggerExecContext<'_, 'a, '_>,
         identity: ProcedureIdentity,
         invocation: &dyn Fn(
-            &'a [super::super::plpgsql_inputs::Site<'a>],
-            Option<super::super::guc::VariableConflict>,
+            super::ParsedTriggerProgram<'a>,
         ) -> Result<TriggerInvocation<'a>, SqlError>,
         seeded: &dyn Fn(&'a [Datum<'a>]) -> Result<&'a [Datum<'a>], SqlError>,
         retention: &mut Option<SuspendedProcedure>,
@@ -260,7 +259,7 @@ impl SuspendedProcedure {
                     Ok(inputs) => inputs,
                     Err(error) => return Err((frame, error)),
                 };
-                let invocation = match invocation(parsed.input_sites, parsed.variable_conflict) {
+                let invocation = match invocation(parsed) {
                     Ok(invocation) => invocation,
                     Err(error) => return Err((frame, error)),
                 };

@@ -538,7 +538,7 @@ pub(crate) fn finalize_projected_row<'a>(
     let mut slot = 0usize;
     for (i, item) in statement.items.iter().enumerate() {
         match item {
-            SelectItem::Wildcard => slot += scope.star_columns(),
+            SelectItem::Wildcard(_) => slot += scope.star_columns(),
             SelectItem::TableWildcard(q) => {
                 slot += scope.qualified_star_columns(q)?;
             }
@@ -593,7 +593,7 @@ fn projected_collations<'a>(
     for item in statement.items {
         let remaining = match item {
             SelectItem::Expr { .. } => 1,
-            SelectItem::Wildcard => scope.star_columns(),
+            SelectItem::Wildcard(_) => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
             SelectItem::RecordStar(base) => {
                 record_star_width(base, Some(scope), storage, txid, arena)?
@@ -610,7 +610,7 @@ fn projected_collations<'a>(
                 collations[width] = scope.expression_collation(storage, arena, expression)?;
                 width += 1;
             }
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 for index in 0..scope.star_columns() {
                     collations[width] = scope.output_collation(scope.star_entry(index));
                     width += 1;
@@ -771,7 +771,7 @@ pub(super) fn prepare_materialization<'a>(
     let mut width = 0usize;
     for item in statement.items {
         width += match item {
-            SelectItem::Wildcard => scope.star_columns(),
+            SelectItem::Wildcard(_) => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
             SelectItem::RecordStar(base) => {
                 record_star_width(base, Some(scope), storage, txid, arena)?
@@ -893,7 +893,7 @@ fn materialization_pax_columns<'a>(
     if statement
         .items
         .iter()
-        .any(|item| matches!(item, SelectItem::Wildcard | SelectItem::TableWildcard(_)))
+        .any(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::TableWildcard(_)))
     {
         return super::scan::PaxReadDemand::full_row(
             super::scan::PaxFullRowReason::WildcardProjection,
@@ -912,7 +912,9 @@ fn materialization_pax_columns<'a>(
                 expressions[count] = expression;
                 count += 1;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => unreachable!("returned above"),
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
+                unreachable!("returned above")
+            }
         }
     }
     if let Some(predicate) = statement.where_clause {

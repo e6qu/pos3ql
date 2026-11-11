@@ -34,3 +34,5 @@ SELECT customer, grouped_label(count(*)) FROM grouped_orders GROUP BY customer
   HAVING sum(id) / (customer - 1) > 0 ORDER BY customer;
 SELECT customer, grouped_label(count(*)) FROM grouped_orders
   JOIN (VALUES (1), (2)) v(customer) USING (customer) GROUP BY customer ORDER BY customer;
+DROP FUNCTION grouped_label(bigint);
+DROP AGGREGATE grouped_total(integer);

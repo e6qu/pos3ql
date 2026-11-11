@@ -27,3 +27,4 @@ BEGIN
   RETURN x || ':' || coalesce(y::text, 'null');
 END $$;
 SELECT into_counts();
+DROP ROUTINE into_counts() CASCADE;

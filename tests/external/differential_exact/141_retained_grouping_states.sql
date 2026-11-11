@@ -45,3 +45,4 @@ SELECT k, state_tag(count(*)), sum(k) FROM generate_series(1, 2000) g,
   LATERAL (SELECT g % 7 AS k) s GROUP BY k ORDER BY k;
 SELECT g % 997 AS k, state_tag(count(*)), sum(g), max(g) FROM generate_series(1, 5000) g
   GROUP BY g % 997 ORDER BY g % 997 LIMIT 3 OFFSET 400;
+DROP ROUTINE state_tag(bigint) CASCADE;

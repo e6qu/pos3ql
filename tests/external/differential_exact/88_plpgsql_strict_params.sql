@@ -51,3 +51,4 @@ BEGIN RETURN (SELECT a::text FROM vc88); END $$;
 RESET plpgsql.variable_conflict;
 SELECT vc88_column(1);
 SELECT vc88_text('x');
+DROP ROUTINE sp88_on(integer,text), sp88_off(integer), sp88_session(integer), sp88_execute(text), sp88_none(), sp88_dump(), vc88_column(integer), vc88_text(text) CASCADE;

@@ -33,3 +33,4 @@ FETCH PRIOR scrolled;
 FETCH FIRST scrolled;
 SELECT last_value FROM retained_calls;
 COMMIT;
+DROP ROUTINE retained_label(integer) CASCADE;

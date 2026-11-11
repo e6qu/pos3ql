@@ -146,3 +146,4 @@ select k185c();
 
 DROP TABLE vt185a, vt185b, vt185c, vt185d, mt185, log185 CASCADE;
 DROP TYPE mood185;
+DROP ROUTINE f185a(), f185b(), g185a(), g185b(), g185c(), h185a(), trg185(), h185b(), k185a(), k185b(), k185c() CASCADE;

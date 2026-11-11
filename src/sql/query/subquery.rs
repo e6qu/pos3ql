@@ -3148,6 +3148,35 @@ pub(crate) fn subquery_expression_type(
         }
         _ => return Ok(None),
     };
+    if select.set_body.is_some() && !array {
+        // Each branch may read the enclosing row, as a correlated subquery does.
+        let mut type_oid = None;
+        let mut columns = 0usize;
+        super::visit_projection_types(
+            select,
+            storage,
+            txid,
+            arena,
+            Some(outer),
+            &mut |source, _| {
+                if columns == 0 {
+                    type_oid = Some(source);
+                }
+                columns += 1;
+                Ok(())
+            },
+        )?;
+        if columns != 1 {
+            return Err(subquery_shape_position(
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "subquery must return only one column"
+                ),
+                expression,
+            ));
+        }
+        return Ok(type_oid);
+    }
     if select.set_body.is_some() {
         return super::subquery_result_type(expression, None, storage, txid, arena)
             .map(|result| result.map(|result| result.type_oid));

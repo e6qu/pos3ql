@@ -14,3 +14,4 @@ BEGIN
   RETURN x::text || t::text;
 END $$;
 SELECT ea87();
+DROP ROUTINE ea87() CASCADE;

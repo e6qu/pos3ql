@@ -133,3 +133,4 @@ END $$;
 CALL cursor_loop_commit();
 SELECT * FROM cursor_loop_log ORDER BY id;
 SELECT count(*) FROM pg_cursors;
+DROP ROUTINE cursor_loop_basic(), cursor_loop_exits(), cursor_loop_return(), cursor_loop_shadow(), cursor_loop_empty(), cursor_loop_close(), cursor_loop_nested(), cursor_loop_set(), cursor_loop_commit() CASCADE;

@@ -11,4 +11,10 @@ SELECT ('a',2) IN (SELECT 'a', 2);
 RESET ROLE;
 GRANT EXECUTE ON FUNCTION int4eq(integer, integer) TO PUBLIC;
 SELECT (1,2) IN (SELECT 1, 2);
+-- A correlated set-operation subquery reads the outer row while its
+-- comparison's function is checked.
+CREATE TABLE ri_t(a int);
+INSERT INTO ri_t VALUES (1), (2);
+SELECT a FROM ri_t WHERE a IN (SELECT ri_t.a UNION SELECT 0) ORDER BY a;
+DROP TABLE ri_t;
 DROP ROLE ri_user;

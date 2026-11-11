@@ -125,7 +125,10 @@ body once, and the invocation log keeps whether the row is kept and the
 log position and takes that result, so the body's writes, notices and
 sequence values happen once and its calls see its own earlier writes. Writes
 in a body run on the engine hand their `AFTER` triggers to it, which runs
-them on the engine too.
+them on the engine too. So does a PL/pgSQL or SQL-language function called
+from a query (`SELECT f()`): its writes' `AFTER` triggers can run DDL and
+call routines; a wait inside them restarts the statement, as any wait in
+such a call does.
 
 **Example:** `UPDATE items SET total = running_total()`, where
 `running_total()` sums `items`, gives each row the sum including the rows

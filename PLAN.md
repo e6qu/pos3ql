@@ -92,7 +92,10 @@ correlated, grouped and set-operation subqueries); `BEFORE` and `INSTEAD OF`
 row trigger bodies that need the engine (DDL, view and rule writes,
 procedures with DDL, calls reading the trigger's own writes), which run once
 on it between write attempts with their result kept in the invocation log;
-`FOR` loops over a data change whose `AFTER` trigger waits; multi-step
+`FOR` loops over a data change whose `AFTER` trigger waits; `AFTER` triggers
+of writes in a PL/pgSQL or SQL-language function called from a query, which
+run on the engine (DDL and routine calls included) and restart the statement
+on a wait; multi-step
 statements nested in another's step (a rule action whose target has rules),
 which keep their own steps up to four levels deep.
 The
@@ -129,11 +132,7 @@ is owned.
   between attempts. A data-modifying `WITH` sub-statement runs to completion
   before the main statement reads it, where PostgreSQL interleaves them row
   by row, so a call in the main statement sees all of its rows. PL/pgSQL
-  rejects statements that start with `WITH` (`0A000`). A PL/pgSQL function
-  called from a query (`SELECT f()`) runs its writes' `AFTER` triggers
-  without the engine, so DDL or a routine call there fails with `0A000`;
-  handing them to the function needs its frame to own the completion
-  across waits, as `CALL` and `DO` frames do.
+  rejects statements that start with `WITH` (`0A000`).
 - **Routine variables in `WITH`:** a `WITH` query that a static PL/pgSQL
   statement materializes before its main query (`INSERT INTO t WITH c AS
   (SELECT var) SELECT * FROM c`) cannot read routine variables (`42703`):

@@ -16117,7 +16117,7 @@ impl Engine {
             }
         })();
         if continuation.is_none()
-            && txn.write_completion_boundary.is_some()
+            && txn.retains_write_frame()
             && result.as_ref().is_ok_and(|outcome| {
                 outcome.as_ref().is_err_and(|error| {
                     matches!(
@@ -16395,6 +16395,7 @@ impl Engine {
                 },
                 command: txn.command_id(),
                 depth: txn.trigger_depth(),
+                retained: true,
             });
             let prior_handoff = core::mem::replace(&mut txn.write_completion_boundary, boundary);
             let outcome = {

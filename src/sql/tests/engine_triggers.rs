@@ -419,3 +419,148 @@ fn for_loops_over_data_changes_wait_for_after_triggers() {
         }
     }
 }
+
+const QUERY_FUNCTION_SETUP: &str = "CREATE SEQUENCE q; CREATE TABLE qt(a int); \
+    CREATE TABLE qlog(m text, k bigint); \
+    CREATE FUNCTION note(x text) RETURNS int LANGUAGE plpgsql AS $$ \
+    BEGIN INSERT INTO qlog VALUES (x, nextval('q')); RETURN 1; END$$; \
+    CREATE FUNCTION aft() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+      IF current_setting('application_name') = 'wait' THEN \
+        PERFORM pg_advisory_xact_lock(7); END IF; \
+      PERFORM note('after ' || NEW.a || ' ' || (SELECT count(*) FROM qt)); \
+      EXECUTE 'CREATE TABLE IF NOT EXISTS qmade_' || NEW.a || '(x int)'; \
+      RETURN NULL; END$$; \
+    CREATE TRIGGER ta AFTER INSERT ON qt FOR EACH ROW EXECUTE FUNCTION aft(); \
+    CREATE FUNCTION w(n int) RETURNS bigint LANGUAGE plpgsql AS $$ \
+    BEGIN INSERT INTO qt VALUES (n), (n + 1); RETURN (SELECT count(*) FROM qlog); END$$; \
+    CREATE FUNCTION s(n int) RETURNS bigint LANGUAGE sql AS $$ \
+    INSERT INTO qt VALUES (n); SELECT count(*) FROM qlog $$";
+
+/// A function called from a query takes its writes' AFTER triggers, which
+/// run on the executor: their routine calls and DDL work as in PostgreSQL.
+#[test]
+fn query_function_after_triggers_run_on_the_executor() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "{QUERY_FUNCTION_SETUP}; SELECT w(1); SELECT w(10) FROM generate_series(1, 2); \
+             SELECT s(20); SELECT m, k FROM qlog ORDER BY k; \
+             SELECT relname FROM pg_class WHERE relname LIKE 'qmade_%' ORDER BY relname"
+        ),
+    );
+    assert!(
+        error_sqlstates(&output).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "2",
+            "4",
+            "6",
+            "7",
+            "after 1 2|1",
+            "after 2 2|2",
+            "after 10 4|3",
+            "after 11 4|4",
+            "after 10 6|5",
+            "after 11 6|6",
+            "after 20 7|7",
+            "qmade_1",
+            "qmade_10",
+            "qmade_11",
+            "qmade_2",
+            "qmade_20"
+        ]
+    );
+}
+
+/// A lock wait in such a trigger restarts the statement: another client
+/// runs meanwhile, and every write and sequence value happens once.
+#[test]
+fn query_function_after_trigger_lock_waits_restart_the_statement_once() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for sql in ["SELECT w(1)", "SELECT s(1)"] {
+            let mut config = test_config(&format!("query-function-after-wait-{mode:?}"));
+            config.transaction_mode = mode;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            writer.success(&mut engine, QUERY_FUNCTION_SETUP, true);
+            writer.success(&mut engine, "SET application_name = 'wait'", true);
+            holder.success(&mut engine, "SELECT pg_advisory_lock(7)", true);
+            let ExecutionStatus::Blocked {
+                completed_statements,
+                wait,
+                ..
+            } = writer.execute_status(&mut engine, sql, true)
+            else {
+                panic!(
+                    "{mode:?}: {sql}: the trigger did not wait: {}",
+                    String::from_utf8_lossy(writer.send.readable())
+                );
+            };
+            assert_eq!(wait, StatementWait::Lock);
+            assert_eq!(
+                data_rows(&holder.success(
+                    &mut engine,
+                    "SELECT count(*) FROM pg_class WHERE relname LIKE 'qmade_%'",
+                    true
+                )),
+                ["0"],
+                "{mode:?}: {sql}"
+            );
+            holder.success(&mut engine, "SELECT pg_advisory_unlock(7)", true);
+            writer.send.clear();
+            writer.arena.recycle_front();
+            let status = crate::mem::guard::forbid_alloc(|| {
+                engine.execute_simple_from(
+                    sql,
+                    completed_statements,
+                    &writer.arena,
+                    &mut writer.transaction,
+                    &mut writer.pool,
+                    &mut writer.cursors,
+                    &writer.guc,
+                    &mut Responder::new(&mut writer.send),
+                    writer.connection_id,
+                    false,
+                )
+            })
+            .unwrap();
+            assert_eq!(status, ExecutionStatus::Complete, "{mode:?}: {sql}");
+            let output = writer.send.readable().to_vec();
+            assert!(
+                error_sqlstates(&output).is_empty(),
+                "{mode:?}: {sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            let (result, log): (&[&str], &[&str]) = if sql == "SELECT w(1)" {
+                (&["2"], &["after 1 2|1", "after 2 2|2", "2"])
+            } else {
+                (&["1"], &["after 1 1|1", "1"])
+            };
+            assert_eq!(data_rows(&output), result, "{mode:?}: {sql}");
+            assert_eq!(
+                data_rows(&writer.success(
+                    &mut engine,
+                    "SELECT m, k FROM qlog ORDER BY k; \
+                     SELECT count(*) FROM pg_class WHERE relname LIKE 'qmade_%'",
+                    true
+                )),
+                log,
+                "{mode:?}: {sql}"
+            );
+            drop((holder, writer, engine));
+            std::fs::remove_dir_all(config.data_dir).unwrap();
+        }
+    }
+}

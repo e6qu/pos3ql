@@ -87,6 +87,18 @@ pub(super) struct WriteCompletionBoundary {
     pub(super) mark: StatementMark,
     pub(super) command: u32,
     pub(super) depth: u16,
+    /// The owner keeps its frame across a wait. A function called from a
+    /// statement that restarts on a wait still takes its writes' AFTER work,
+    /// so those triggers run on the engine, but nothing in it is retained.
+    pub(super) retained: bool,
+}
+
+impl TxnState {
+    /// A frame that keeps its execution across a wait owns this command.
+    pub(super) fn retains_write_frame(&self) -> bool {
+        self.write_completion_boundary
+            .is_some_and(|boundary| boundary.retained)
+    }
 }
 
 pub(crate) fn establish_savepoint(

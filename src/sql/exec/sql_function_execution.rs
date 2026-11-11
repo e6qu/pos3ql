@@ -430,15 +430,15 @@ impl SqlExecution {
         arguments: &'a [Datum<'a>],
         context: &mut TriggerExecContext<'_, 'a, '_>,
     ) -> Result<FunctionOutput<'a>, SqlError> {
+        // The body's writes hand it their AFTER work, so those triggers run
+        // on the engine whether or not this call is kept across a wait.
         let prior = context.txn.write_completion_boundary;
-        if self.policy == query::RoutineExecution::Retained {
-            context.txn.write_completion_boundary =
-                Some(super::super::txn::WriteCompletionBoundary {
-                    mark: self.boundary,
-                    command: context.txn.command_id(),
-                    depth: context.txn.trigger_depth(),
-                });
-        }
+        context.txn.write_completion_boundary = Some(super::super::txn::WriteCompletionBoundary {
+            mark: self.boundary,
+            command: context.txn.command_id(),
+            depth: context.txn.trigger_depth(),
+            retained: self.policy == query::RoutineExecution::Retained,
+        });
         let name = self.source.name;
         let frame = crate::sql::error_context::SqlFunctionFrame {
             name: name.as_str(),

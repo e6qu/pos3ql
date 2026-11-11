@@ -924,7 +924,7 @@ fn initialize_phase<'s, 'a, 'b, T>(
         Option<&mut Option<super::super::query::RoutineInvocationState>>,
     ) -> Result<T, SqlError>,
 ) -> Result<T, SqlError> {
-    let retained = context.txn.write_completion_boundary.is_some()
+    let retained = context.txn.retains_write_frame()
         && matches!(&context.host, PlpgsqlExecHost::Routine { .. });
     if !retained {
         return evaluate(context, None);

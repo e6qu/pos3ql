@@ -18807,7 +18807,7 @@ fn execute_plpgsql_call<'a>(
             values: outputs.values,
         });
     };
-    let retained = context.txn.write_completion_boundary.is_some();
+    let retained = context.txn.retains_write_frame();
     let outcome = with_bound_parameter_types(&types[..arguments.len()], || {
         engine.execute_call(
             *name,
@@ -24491,7 +24491,7 @@ impl PlpgsqlExecHost<'_> {
         }
         // A saved procedure body keeps statement boundaries in each
         // transaction it starts.
-        let retained = txn.write_completion_boundary.is_some();
+        let retained = txn.retains_write_frame();
         let prior_configuration = txn.capture_configuration();
         let next = match command {
             PlpgsqlTransactionCommand::Commit(next) => {
@@ -24539,6 +24539,7 @@ impl PlpgsqlExecHost<'_> {
                     .statement_mark(engine.wal.stage_mark(txn.txid), engine.storage.lock_mark()),
                 command: txn.command_id(),
                 depth: txn.trigger_depth(),
+                retained: true,
             });
         }
         Ok(())
@@ -24554,14 +24555,19 @@ struct TriggerExecContext<'s, 'a, 'b> {
 }
 
 impl<'s, 'a, 'b> TriggerExecContext<'s, 'a, 'b> {
-    fn nested_write_boundary(&self) -> Option<super::txn::StatementMark> {
-        self.txn.write_completion_boundary?;
+    /// Where a nested write's AFTER work starts when this frame takes it,
+    /// and whether the frame keeps it across a wait.
+    fn nested_write_boundary(&self) -> Option<(super::txn::StatementMark, bool)> {
+        let retained = self.txn.write_completion_boundary?.retained;
         let PlpgsqlExecHost::Routine { engine, .. } = &self.host else {
             return None;
         };
-        Some(self.txn.statement_mark(
-            engine.wal.stage_mark(self.txn.txid),
-            engine.storage.lock_mark(),
+        Some((
+            self.txn.statement_mark(
+                engine.wal.stage_mark(self.txn.txid),
+                engine.storage.lock_mark(),
+            ),
+            retained,
         ))
     }
     /// A trigger can use the caller's execution services, but cannot end its
@@ -25514,10 +25520,11 @@ fn execute_nested_data_modification<'a>(
             let txn = &mut *command;
             let parent_boundary = txn.write_completion_boundary;
             txn.write_completion_boundary =
-                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                     mark,
                     command: txn.command_id(),
                     depth: txn.trigger_depth(),
+                    retained,
                 });
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
@@ -25573,10 +25580,11 @@ fn execute_nested_data_modification<'a>(
             let txn = &mut *command;
             let parent_boundary = txn.write_completion_boundary;
             txn.write_completion_boundary =
-                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                     mark,
                     command: txn.command_id(),
                     depth: txn.trigger_depth(),
+                    retained,
                 });
             let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
@@ -25632,10 +25640,11 @@ fn execute_nested_data_modification<'a>(
             let txn = &mut *command;
             let parent_boundary = txn.write_completion_boundary;
             txn.write_completion_boundary =
-                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                     mark,
                     command: txn.command_id(),
                     depth: txn.trigger_depth(),
+                    retained,
                 });
             let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
@@ -25708,10 +25717,11 @@ fn execute_nested_data_modification<'a>(
             let txn = &mut *command;
             let parent_boundary = txn.write_completion_boundary;
             txn.write_completion_boundary =
-                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                     mark,
                     command: txn.command_id(),
                     depth: txn.trigger_depth(),
+                    retained,
                 });
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
@@ -27893,11 +27903,13 @@ fn execute_rewritten_nested_write<'a>(
     let mut command = enter_write_command(context.txn, &engine.storage, progress.as_deref_mut())?;
     let txn = &mut *command;
     let parent_boundary = txn.write_completion_boundary;
-    txn.write_completion_boundary = boundary.map(|mark| super::txn::WriteCompletionBoundary {
-        mark,
-        command: txn.command_id(),
-        depth: txn.trigger_depth(),
-    });
+    txn.write_completion_boundary =
+        boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
+            mark,
+            command: txn.command_id(),
+            depth: txn.trigger_depth(),
+            retained,
+        });
     let responder = &mut *context.responder;
     responder.clear_affected_rows();
     let connection_id = engine.work.connection_id();
@@ -29473,7 +29485,7 @@ fn execute_trigger_step_in<'a>(
         }
         return Ok(control_flow::Step::complete());
     }
-    let retained_parent = context.txn.write_completion_boundary.is_some()
+    let retained_parent = context.txn.retains_write_frame()
         && matches!(&context.host, PlpgsqlExecHost::Routine { .. });
     let position = match status.pending_statement.take() {
         Some(position) => {
@@ -29536,7 +29548,8 @@ fn execute_trigger_step_in<'a>(
     .then(|| {
         context
             .nested_write_boundary()
-            .map(|mark| (mark, context.responder.mark()))
+            .filter(|(_, retained)| *retained)
+            .map(|(mark, _)| (mark, context.responder.mark()))
     })
     .flatten();
     // As at top level, a write yields while it selects and locks its rows and
@@ -31576,10 +31589,11 @@ fn execute_trigger_step_in<'a>(
                 let txn = &mut *command;
                 let parent_boundary = txn.write_completion_boundary;
                 txn.write_completion_boundary =
-                    boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                         mark,
                         command: txn.command_id(),
                         depth: txn.trigger_depth(),
+                        retained,
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
@@ -31763,10 +31777,11 @@ fn execute_trigger_step_in<'a>(
                 let txn = &mut *command;
                 let parent_boundary = txn.write_completion_boundary;
                 txn.write_completion_boundary =
-                    boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                         mark,
                         command: txn.command_id(),
                         depth: txn.trigger_depth(),
+                        retained,
                     });
                 let mut scratch = storage.row_work.lease(0).map_err(|error| {
                     sql_err!(
@@ -31950,10 +31965,11 @@ fn execute_trigger_step_in<'a>(
                 let txn = &mut *command;
                 let parent_boundary = txn.write_completion_boundary;
                 txn.write_completion_boundary =
-                    boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                         mark,
                         command: txn.command_id(),
                         depth: txn.trigger_depth(),
+                        retained,
                     });
                 let mut scratch = storage.row_work.lease(0).map_err(|error| {
                     sql_err!(
@@ -32113,10 +32129,11 @@ fn execute_trigger_step_in<'a>(
                 let txn = &mut *command;
                 let parent_boundary = txn.write_completion_boundary;
                 txn.write_completion_boundary =
-                    boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                         mark,
                         command: txn.command_id(),
                         depth: txn.trigger_depth(),
+                        retained,
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {

@@ -315,6 +315,7 @@ impl PendingNestedWrite {
             mark: self.completion.boundary(),
             command: command.command_id(),
             depth: command.trigger_depth(),
+            retained: prior.is_some_and(|boundary| boundary.retained),
         });
         let result = self.completion.poll(&mut TriggerExecContext {
             host: context.host.reborrow(),
@@ -516,6 +517,7 @@ pub(in crate::sql) fn resume(
         mark: completion.boundary(),
         command: txn.command_id(),
         depth: txn.trigger_depth(),
+        retained: true,
     });
     let result = completion.poll(&mut TriggerExecContext {
         host: PlpgsqlExecHost::Routine {

@@ -577,7 +577,9 @@ impl SuspendedFunctionState {
             invocation,
             context,
             seeded,
-            Some(self.binding.boundary),
+            self.binding.boundary,
+            // Only a retained call is saved across a wait.
+            true,
         );
         if let Err(error) = admission.preserve_caller_inputs() {
             return Ok(Err(error));
@@ -648,16 +650,18 @@ fn run_body<'a>(
     invocation: TriggerInvocation<'a>,
     context: &mut TriggerExecContext<'_, 'a, '_>,
     seeded: &[Datum<'a>],
-    boundary: Option<super::super::txn::StatementMark>,
+    boundary: super::super::txn::StatementMark,
+    retained: bool,
 ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
+    // The body's writes hand it their AFTER work, so those triggers run on
+    // the engine whether or not this frame is kept across a wait.
     let prior = context.txn.write_completion_boundary;
-    if let Some(mark) = boundary {
-        context.txn.write_completion_boundary = Some(super::super::txn::WriteCompletionBoundary {
-            mark,
-            command: context.txn.command_id(),
-            depth: context.txn.trigger_depth(),
-        });
-    }
+    context.txn.write_completion_boundary = Some(super::super::txn::WriteCompletionBoundary {
+        mark: boundary,
+        command: context.txn.command_id(),
+        depth: context.txn.trigger_depth(),
+        retained,
+    });
     let definition = crate::storage::RelationDefinition::EMPTY;
     let result = (|| {
         execution.initialize(
@@ -924,15 +928,14 @@ pub(crate) fn execute<'a>(
         params: inputs,
         responder,
     };
-    let retained_boundary =
-        (policy == super::super::query::RoutineExecution::Retained).then_some(boundary);
     let result = run_body(
         &mut execution,
         &code,
         invocation,
         &mut context,
         &seeded[..seeded_count],
-        retained_boundary,
+        boundary,
+        policy == super::super::query::RoutineExecution::Retained,
     );
     drop(seeded);
     match result {

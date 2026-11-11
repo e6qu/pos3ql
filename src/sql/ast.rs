@@ -6,7 +6,7 @@ use crate::sql::types::ColType;
 use crate::util::StackStr;
 
 mod expression_copy;
-pub(crate) use expression_copy::duplicate_expression;
+pub(crate) use expression_copy::{duplicate_expression, rewrite_expression, rewrite_expressions};
 
 /// A normalized PostgreSQL configuration parameter identity.  Configuration
 /// parameters are not SQL objects: they may be dotted and their spelling is
@@ -3442,6 +3442,20 @@ impl PartialEq for MaterializedCteSource<'_> {
 }
 
 impl Expr<'_> {
+    /// A `ROW(...)` or `(a, b, ...)` constructor. PostgreSQL compares two of
+    /// these field by field with SQL-standard NULL semantics, while every
+    /// other composite comparison uses the record operators.
+    pub(crate) fn is_row_constructor(&self) -> bool {
+        matches!(
+            self,
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name,
+                ..
+            } if name.eq_ignore_ascii_case("row")
+        )
+    }
+
     /// Whether PostgreSQL's planner folds this expression to a constant, as
     /// it does a literal, a parameter of a custom plan, and operators and
     /// casts over them.
@@ -5766,7 +5780,30 @@ pub enum ParameterSource {
     /// reference is field `f` (the node's `name`) of parameter `index`, as
     /// PostgreSQL's `sql_fn_post_column_ref` resolves it.
     SqlRoutineField,
-    PlpgsqlCursor,
+    /// A PL/pgSQL variable captured by a cursor query, with the body's
+    /// `plpgsql.variable_conflict` rule for a column of the same name.
+    PlpgsqlCursor(crate::sql::guc::VariableConflict),
+}
+
+/// What a parameter reference means when a column has the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParameterCollision {
+    Column,
+    Parameter,
+    Ambiguous,
+}
+
+impl ParameterSource {
+    pub(crate) const fn collision(self) -> ParameterCollision {
+        use crate::sql::guc::VariableConflict;
+        match self {
+            Self::SqlRoutine
+            | Self::SqlRoutineField
+            | Self::PlpgsqlCursor(VariableConflict::UseColumn) => ParameterCollision::Column,
+            Self::PlpgsqlCursor(VariableConflict::UseVariable) => ParameterCollision::Parameter,
+            Self::PlpgsqlCursor(VariableConflict::Error) => ParameterCollision::Ambiguous,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

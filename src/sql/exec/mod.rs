@@ -25505,6 +25505,7 @@ impl<'a> TriggerLocalScope<'_, 'a> {
                     name: SqlName::EMPTY,
                     type_oid: 0,
                     value: Datum::Null,
+                    conflict: self.invocation.variable_conflict,
                 }
             })
             .map_err(|_| super::query::arena_full_pub())?;
@@ -26743,15 +26744,18 @@ fn eval_procedural_expression<'a>(
     };
     if expression.contains_subquery() {
         return in_procedural_query(text, mode, false, || {
-            if row.invocation.variable_conflict != super::guc::VariableConflict::UseColumn {
-                super::query::check_procedural_expression(
-                    expression,
-                    context.storage(),
-                    context.txn.txid,
-                    context.arena,
-                    row,
-                )?;
-            }
+            let expression =
+                if row.invocation.variable_conflict == super::guc::VariableConflict::UseColumn {
+                    expression
+                } else {
+                    super::query::bind_procedural_expression(
+                        expression,
+                        context.storage(),
+                        context.txn.txid,
+                        context.arena,
+                        row,
+                    )?
+                };
             eval_procedural_expression_in(context, expression, row, continuation)
         });
     }
@@ -29498,6 +29502,7 @@ fn static_write_locals<'a>(
                     name: SqlName::EMPTY,
                     type_oid: 0,
                     value: Datum::Null,
+                    conflict: scope.invocation.variable_conflict,
                 },
             }
         })
@@ -29531,6 +29536,7 @@ fn static_write_locals<'a>(
             name: SqlName::parse(name).expect("static transition name"),
             type_oid: ColType::Record.oid(),
             value: Datum::Record(fields),
+            conflict: scope.invocation.variable_conflict,
         };
     }
     Ok(captured)
@@ -31230,39 +31236,80 @@ fn prepare_static_plpgsql_statement<'a>(
     Ok((statement, Some((site, prepared))))
 }
 
-/// Reports a name in `statement` that is both a column and a variable of
-/// `row` whose `plpgsql.variable_conflict` rule is not `use_column`, before
-/// the statement reads a row, as PostgreSQL's parse analysis does.
-fn check_procedural_names<'a>(
+/// Applies the `plpgsql.variable_conflict` rule of `row` to the names in
+/// `statement` before it reads a row, as PostgreSQL's parse analysis does:
+/// a name that is both a column and a variable is an error under `error` and
+/// the variable's value under `use_variable`.
+fn bind_procedural_names<'a>(
     statement: TriggerStatement<'a>,
     row: &TriggerLocalScope<'_, 'a>,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
-) -> Result<(), SqlError> {
+) -> Result<TriggerStatement<'a>, SqlError> {
     if row.invocation.variable_conflict == super::guc::VariableConflict::UseColumn {
-        return Ok(());
+        return Ok(statement);
     }
-    let statement = match statement {
-        TriggerStatement::Perform(query)
-        | TriggerStatement::ReturnQuery(query)
-        | TriggerStatement::SelectInto(TriggerSelectInto { query, .. })
-        | TriggerStatement::For(TriggerFor {
-            source: TriggerForSource::Query(query),
-            ..
-        }) => Stmt::Select(*query),
-        TriggerStatement::Dml { statement, .. } => match statement {
-            TriggerDml::Insert(statement) => Stmt::Insert(statement),
-            TriggerDml::Update(statement) => Stmt::Update(statement),
-            TriggerDml::Delete(statement) => Stmt::Delete(statement),
-            TriggerDml::Merge(statement) => Stmt::Merge(*statement),
-        },
-        _ => return Ok(()),
+    let query = |query: &'a Select<'a>| -> Result<&'a Select<'a>, SqlError> {
+        let statement = arena
+            .alloc(Stmt::Select(*query))
+            .map_err(|_| super::query::arena_full_pub())?;
+        Ok(
+            match super::query::bind_procedural_statement(statement, storage, txid, arena, row)? {
+                bound if core::ptr::eq(bound, statement) => query,
+                Stmt::Select(bound) => bound,
+                _ => unreachable!("binding keeps the statement kind"),
+            },
+        )
     };
-    let statement = arena
-        .alloc(statement)
-        .map_err(|_| super::query::arena_full_pub())?;
-    super::query::check_procedural_statement(statement, storage, txid, arena, row)
+    Ok(match statement {
+        TriggerStatement::Perform(select) => TriggerStatement::Perform(query(select)?),
+        TriggerStatement::ReturnQuery(select) => TriggerStatement::ReturnQuery(query(select)?),
+        TriggerStatement::SelectInto(into) => TriggerStatement::SelectInto(TriggerSelectInto {
+            query: query(into.query)?,
+            ..into
+        }),
+        TriggerStatement::For(TriggerFor {
+            label,
+            target,
+            source: TriggerForSource::Query(select),
+            block,
+        }) => TriggerStatement::For(TriggerFor {
+            label,
+            target,
+            source: TriggerForSource::Query(query(select)?),
+            block,
+        }),
+        TriggerStatement::Dml {
+            source,
+            statement: dml,
+            into,
+        } => {
+            let written = arena
+                .alloc(match dml {
+                    TriggerDml::Insert(statement) => Stmt::Insert(statement),
+                    TriggerDml::Update(statement) => Stmt::Update(statement),
+                    TriggerDml::Delete(statement) => Stmt::Delete(statement),
+                    TriggerDml::Merge(statement) => Stmt::Merge(*statement),
+                })
+                .map_err(|_| super::query::arena_full_pub())?;
+            let statement = match super::query::bind_procedural_statement(
+                written, storage, txid, arena, row,
+            )? {
+                Stmt::Insert(statement) => TriggerDml::Insert(*statement),
+                Stmt::Update(statement) => TriggerDml::Update(*statement),
+                Stmt::Delete(statement) => TriggerDml::Delete(*statement),
+                Stmt::Merge(statement) => TriggerDml::Merge(statement),
+                _ => unreachable!("binding keeps the statement kind"),
+            };
+            TriggerStatement::Dml {
+                source,
+                statement,
+                into,
+            }
+        }
+        statement => statement,
+    })
 }
 
 /// The text of the static query a procedural statement runs in full, as
@@ -31504,14 +31551,14 @@ fn execute_trigger_step_in<'a>(
                 return Err(error);
             }
         };
-        check_procedural_names(
+        let bound = bind_procedural_names(
             prepared.0,
             &row,
             context.storage(),
             context.txn.txid,
             context.arena,
         )?;
-        prepared
+        (bound, prepared.1)
     };
     // A write that waits before handing off its completion runs again from
     // its own start, so its partial rows and output are withdrawn first.
@@ -32035,6 +32082,29 @@ fn execute_trigger_step_in<'a>(
                             PlpgsqlCursorQuery::Static(source) => {
                                 let parsed =
                                     super::parser::parse_stored_statement(source, context.arena)?;
+                                // The cursor's own query binds variables as
+                                // parameters; PostgreSQL's analysis reports an
+                                // ambiguous name before the cursor opens.
+                                if invocation.variable_conflict
+                                    == super::guc::VariableConflict::Error
+                                {
+                                    let statement = context
+                                        .arena
+                                        .alloc(parsed)
+                                        .map_err(|_| super::query::arena_full_pub())?;
+                                    crate::sql::error_position::with_internal_source(
+                                        source,
+                                        || {
+                                            super::query::bind_procedural_statement(
+                                                statement,
+                                                context.storage(),
+                                                context.txn.txid,
+                                                context.arena,
+                                                &scope,
+                                            )
+                                        },
+                                    )?;
+                                }
                                 match parsed {
                                     Stmt::Select(_) | Stmt::SetQuery(_) => (
                                         source,
@@ -32108,6 +32178,7 @@ fn execute_trigger_step_in<'a>(
                                         name: SqlName::EMPTY,
                                         type_oid: 0,
                                         value: Datum::Null,
+                                        conflict: invocation.variable_conflict,
                                     },
                                 )
                                 .map_err(|_| super::query::arena_full_pub())?;
@@ -32132,6 +32203,7 @@ fn execute_trigger_step_in<'a>(
                                         )
                                     })?;
                                 *slot = super::cursor::CursorLocal {
+                                    conflict: invocation.variable_conflict,
                                     name: argument.name,
                                     type_oid,
                                     value: eval_procedural_expression(

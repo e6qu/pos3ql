@@ -8,6 +8,8 @@ pub(crate) struct CursorLocal<'a> {
     pub name: SqlName,
     pub type_oid: i32,
     pub value: Datum<'a>,
+    /// The body's rule for a column that shares this variable's name.
+    pub conflict: crate::sql::guc::VariableConflict,
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +115,7 @@ pub(crate) fn bind_locals<'a>(
                 qualifier: None,
                 name: "",
                 index: 0,
+                conflict: crate::sql::guc::VariableConflict::Error,
             }
         })
         .map_err(|_| full())?;
@@ -126,6 +129,7 @@ pub(crate) fn bind_locals<'a>(
             qualifier: None,
             name,
             index: at as u32 + 1,
+            conflict: local.conflict,
         };
         at += 1;
         if let Datum::Record(fields) | Datum::Composite { fields, .. } = copied {
@@ -136,6 +140,7 @@ pub(crate) fn bind_locals<'a>(
                     qualifier: Some(name),
                     name: field.name,
                     index: at as u32 + 1,
+                    conflict: local.conflict,
                 };
                 at += 1;
             }
@@ -762,16 +767,19 @@ mod tests {
                 name: SqlName::parse("r").unwrap(),
                 type_oid: oid::RECORD,
                 value: Datum::Record(&fields),
+                conflict: crate::sql::guc::VariableConflict::Error,
             },
             CursorLocal {
                 name: SqlName::parse("d").unwrap(),
                 type_oid: oid::DATE,
                 value: Datum::Null,
+                conflict: crate::sql::guc::VariableConflict::Error,
             },
             CursorLocal {
                 name: SqlName::parse("found").unwrap(),
                 type_oid: oid::BOOL,
                 value: Datum::Bool(true),
+                conflict: crate::sql::guc::VariableConflict::Error,
             },
         ];
         crate::mem::guard::forbid_alloc(|| {
@@ -834,6 +842,7 @@ mod tests {
             name: SqlName::parse("r").unwrap(),
             type_oid: oid::RECORD,
             value: Datum::Record(&fields),
+            conflict: crate::sql::guc::VariableConflict::Error,
         };
         crate::mem::guard::forbid_alloc(|| {
             query.bind(
@@ -914,6 +923,7 @@ mod tests {
                         name: SqlName::parse("p").unwrap(),
                         type_oid: oid::DATE,
                         value: Datum::Null,
+                        conflict: crate::sql::guc::VariableConflict::Error,
                     }],
                     &[],
                     crate::sql::type_input_plans::Owner::Unlocated,

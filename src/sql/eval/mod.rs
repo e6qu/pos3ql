@@ -1545,6 +1545,15 @@ pub fn qualifier_answers_target(
 
 pub struct NoColumns;
 
+/// The column lookup a parameter reference skips when its variable wins: it
+/// reads as no column of that name, so the parameter branch answers.
+pub(crate) fn parameter_wins() -> SqlError {
+    sql_err!(
+        sqlstate::UNDEFINED_COLUMN,
+        "a PL/pgSQL variable takes precedence over the column"
+    )
+}
+
 /// Which meaning a name has when a relation in front of `outer` has a column
 /// of that name and a PL/pgSQL variable in `outer` may share it, as
 /// PostgreSQL's `plpgsql.variable_conflict` decides: Ok(true) for the column,
@@ -1754,6 +1763,7 @@ pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
             | "current_schema"
             | "similar to"
             | "overlaps periods"
+            | "rows not distinct"
             | "__is_json_scalar"
             | "__is_json_array"
             | "__is_json_object"
@@ -3024,7 +3034,7 @@ pub trait SubqueryListProbe: 'static {
     fn probe<'a>(
         &self,
         value: Datum<'a>,
-        collations: &[Collation],
+        columns: QuantifiedColumns<'_>,
         catalog: Option<&dyn CatalogAccess>,
         arena: &'a Arena,
     ) -> Result<(bool, bool), SqlError>;
@@ -3034,10 +3044,19 @@ pub trait SubqueryListProbe: 'static {
         value: Datum<'a>,
         operator: BinaryOp,
         all: bool,
-        collations: &[Collation],
+        columns: QuantifiedColumns<'_>,
         catalog: Option<&dyn CatalogAccess>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError>;
+}
+
+/// How a quantified subquery's operand meets each member: a `ROW(...)`
+/// operand compares field by field with a multi-column subquery, any other
+/// operand compares as one value.
+#[derive(Clone, Copy)]
+pub struct QuantifiedColumns<'c> {
+    pub row_constructor: bool,
+    pub collations: &'c [Collation],
 }
 
 /// One pre-evaluated `IN (subquery)` result.
@@ -3878,6 +3897,13 @@ fn eval_binary_expression<'a>(
         hooks,
         arena,
     )?;
+    if expression.left.is_row_constructor()
+        && expression.right.is_row_constructor()
+        && comparison_collation.is_some()
+        && let (Datum::Record(a), Datum::Record(b)) = (&left, &right)
+    {
+        return operators::row_constructor_compare(expression.operator, a, b);
+    }
     Ok(eval_binary_values(
         expression,
         left,
@@ -4363,6 +4389,20 @@ fn require_builtin_cast_execute(
     result
 }
 
+/// The type name a record comparison error reports for a field type.
+fn record_field_type_name(
+    type_oid: i32,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &Arena,
+) -> Result<crate::util::StackStr<260>, SqlError> {
+    if let Some(catalog) = catalog
+        && let Some(name) = catalog.type_name(type_oid, arena)?
+    {
+        return Ok(crate::util::StackStr::from_str(name));
+    }
+    operators::builtin_record_field_type_name(type_oid)
+}
+
 fn eval_binary_values<'a>(
     expression: BinaryExpression<'_, 'a>,
     mut l: Datum<'a>,
@@ -4509,6 +4549,18 @@ fn eval_binary_values<'a>(
         )?;
         return Ok(OperatorEvaluation {
             value,
+            first_argument: l,
+        });
+    }
+    if comparison.is_some()
+        && let (
+            Datum::Record(a) | Datum::Composite { fields: a, .. },
+            Datum::Record(b) | Datum::Composite { fields: b, .. },
+        ) = (&l, &r)
+    {
+        let type_name = |type_oid| record_field_type_name(type_oid, hooks.catalog, arena);
+        return Ok(OperatorEvaluation {
+            value: operators::record_compare(operator, a, b, &type_name)?,
             first_argument: l,
         });
     }
@@ -5415,14 +5467,13 @@ fn eval_full_inner<'a>(
             name,
             index,
             source,
-        } => match row.lookup(qualifier, name) {
-            Ok(_) if source == crate::sql::ast::ParameterSource::PlpgsqlCursor => Err(sql_err!(
-                sqlstate::AMBIGUOUS_COLUMN,
-                "column reference \"{}{}{}\" is ambiguous",
-                qualifier.unwrap_or(""),
-                if qualifier.is_some() { "." } else { "" },
-                name
-            )),
+        } => match match source.collision() {
+            crate::sql::ast::ParameterCollision::Parameter => Err(parameter_wins()),
+            _ => row.lookup(qualifier, name),
+        } {
+            Ok(_) if source.collision() == crate::sql::ast::ParameterCollision::Ambiguous => {
+                Err(ambiguous_procedural_reference(qualifier, name))
+            }
             Ok(value) => materialize_named_composite(value, hooks, arena),
             Err(error)
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
@@ -5952,6 +6003,17 @@ fn eval_full_inner<'a>(
                             return Ok(Datum::Bool(!negated));
                         }
                     }
+                    // `(a, b) IN ((c, d), ...)` compares each row constructor
+                    // field by field; any other member compares as a value.
+                    (Datum::Record(a), Datum::Record(b))
+                        if operand.is_row_constructor() && item.is_row_constructor() =>
+                    {
+                        match operators::row_constructor_compare(BinaryOp::Eq, a, b)? {
+                            Datum::Bool(true) => return Ok(Datum::Bool(!negated)),
+                            Datum::Bool(_) => {}
+                            _ => saw_null = true,
+                        }
+                    }
                     _ => match membership_eq(&l, &r)? {
                         Some(true) => return Ok(Datum::Bool(!negated)),
                         Some(false) => {}
@@ -6175,7 +6237,10 @@ fn eval_full_inner<'a>(
             // type-checks `x IN (...)` regardless of the set's contents, so a
             // string literal that cannot become the column type errors even
             // against an empty or all-NULL set.
-            let v = eval_full(operand, arena, params, row, hooks)?;
+            let v = single_column_row_constructor(
+                operand,
+                eval_full(operand, arena, params, row, hooks)?,
+            );
             let v = coerce_unknown(v, &witness)?;
             // A bit string is comparable only to another bit string; reject a
             // bit-vs-other membership test up front (PostgreSQL type-checks the
@@ -6211,7 +6276,15 @@ fn eval_full_inner<'a>(
                 }
                 let l = coerce_unknown(v, member)?;
                 let r = coerce_unknown(*member, &l)?;
-                match quantified_comparison(BinaryOp::Eq, l, r, collations, hooks.catalog, arena)? {
+                match quantified_comparison(
+                    BinaryOp::Eq,
+                    l,
+                    r,
+                    operand.is_row_constructor(),
+                    collations,
+                    hooks.catalog,
+                    arena,
+                )? {
                     Datum::Bool(true) => return Ok(Datum::Bool(!negated)),
                     Datum::Bool(false) => {}
                     Datum::Null => saw_null = true,
@@ -6220,8 +6293,15 @@ fn eval_full_inner<'a>(
             }
             if let Some(probe) = list.probe {
                 // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
-                let (matched, unknown) =
-                    unsafe { probe.as_ref() }.probe(v, collations, hooks.catalog, arena)?;
+                let (matched, unknown) = unsafe { probe.as_ref() }.probe(
+                    v,
+                    QuantifiedColumns {
+                        row_constructor: operand.is_row_constructor(),
+                        collations,
+                    },
+                    hooks.catalog,
+                    arena,
+                )?;
                 if matched {
                     return Ok(Datum::Bool(!negated));
                 }
@@ -6258,7 +6338,10 @@ fn eval_full_inner<'a>(
                     )
                 })?;
             let value = materialize_named_composite(
-                eval_full(operand, arena, params, row, hooks)?,
+                single_column_row_constructor(
+                    operand,
+                    eval_full(operand, arena, params, row, hooks)?,
+                ),
                 hooks,
                 arena,
             )?;
@@ -6276,6 +6359,7 @@ fn eval_full_inner<'a>(
                 operator,
                 value,
                 list.witness,
+                operand.is_row_constructor(),
                 collations,
                 hooks.catalog,
                 arena,
@@ -6288,6 +6372,7 @@ fn eval_full_inner<'a>(
                     operator,
                     left,
                     right,
+                    operand.is_row_constructor(),
                     collations,
                     hooks.catalog,
                     arena,
@@ -6310,7 +6395,10 @@ fn eval_full_inner<'a>(
                     value,
                     operator,
                     all,
-                    collations,
+                    QuantifiedColumns {
+                        row_constructor: operand.is_row_constructor(),
+                        collations,
+                    },
                     hooks.catalog,
                     arena,
                 )?;
@@ -6901,10 +6989,19 @@ fn quantified_scalar<'a>(
     }
 }
 
+/// `ROW(x) IN (SELECT y ...)` compares `x` with the single column `y`.
+fn single_column_row_constructor<'a>(operand: &Expr<'a>, value: Datum<'a>) -> Datum<'a> {
+    match value {
+        Datum::Record([field]) if operand.is_row_constructor() => field.value,
+        value => value,
+    }
+}
+
 pub(crate) fn quantified_comparison<'a>(
     operator: BinaryOp,
     left: Datum<'a>,
     right: Datum<'a>,
+    row_constructor: bool,
     collations: &[Collation],
     catalog: Option<&dyn CatalogAccess>,
     arena: &'a Arena,
@@ -6926,62 +7023,13 @@ pub(crate) fn quantified_comparison<'a>(
     };
     let left = materialize(left)?;
     let right = materialize(right)?;
-    let composite =
-        matches!(left, Datum::Composite { .. }) || matches!(right, Datum::Composite { .. });
     match (left, right) {
+        // A row constructor meets a multi-column subquery field by field; a
+        // record-valued column compares as one record value.
         (
             Datum::Record(left) | Datum::Composite { fields: left, .. },
             Datum::Record(right) | Datum::Composite { fields: right, .. },
-        ) if composite => {
-            // Composite-typed values use the record btree operators: NULL
-            // fields are equal to each other and sort after other values.
-            if left.len() != right.len() {
-                return Err(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "cannot compare record types with different numbers of columns"
-                ));
-            }
-            for (index, (left, right)) in left.iter().zip(right).enumerate() {
-                let (left, right) = (
-                    typed_field_value(left, catalog, arena)?,
-                    typed_field_value(right, catalog, arena)?,
-                );
-                let ordering = match (left.is_null(), right.is_null()) {
-                    (true, true) => core::cmp::Ordering::Equal,
-                    (true, false) => core::cmp::Ordering::Greater,
-                    (false, true) => core::cmp::Ordering::Less,
-                    (false, false) => {
-                        let collation = collations.get(index).copied().unwrap_or(Collation::None);
-                        let field = |operator| {
-                            quantified_scalar(operator, left, right, collation, catalog, arena)
-                        };
-                        if field(BinaryOp::Eq)? == Datum::Bool(true) {
-                            core::cmp::Ordering::Equal
-                        } else if field(BinaryOp::Lt)? == Datum::Bool(true) {
-                            core::cmp::Ordering::Less
-                        } else {
-                            core::cmp::Ordering::Greater
-                        }
-                    }
-                };
-                if !ordering.is_eq() {
-                    return Ok(Datum::Bool(match operator {
-                        BinaryOp::NotEq => true,
-                        BinaryOp::Lt | BinaryOp::LtEq => ordering.is_lt(),
-                        BinaryOp::Gt | BinaryOp::GtEq => ordering.is_gt(),
-                        _ => false,
-                    }));
-                }
-            }
-            Ok(Datum::Bool(matches!(
-                operator,
-                BinaryOp::Eq | BinaryOp::LtEq | BinaryOp::GtEq
-            )))
-        }
-        (
-            Datum::Record(left) | Datum::Composite { fields: left, .. },
-            Datum::Record(right) | Datum::Composite { fields: right, .. },
-        ) => {
+        ) if row_constructor => {
             if left.len() != right.len() {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -7226,14 +7274,13 @@ fn expression_collation<'a>(
             name,
             index,
             source,
-        } => match row.resolve_column_type(*qualifier, name) {
-            Ok(_) if *source == super::ast::ParameterSource::PlpgsqlCursor => Err(sql_err!(
-                sqlstate::AMBIGUOUS_COLUMN,
-                "column reference \"{}{}{}\" is ambiguous",
-                qualifier.unwrap_or(""),
-                if qualifier.is_some() { "." } else { "" },
-                name,
-            )),
+        } => match match source.collision() {
+            super::ast::ParameterCollision::Parameter => Err(parameter_wins()),
+            _ => row.resolve_column_type(*qualifier, name),
+        } {
+            Ok(_) if source.collision() == super::ast::ParameterCollision::Ambiguous => {
+                Err(ambiguous_procedural_reference(*qualifier, name))
+            }
             Ok(ctype) => Ok(DerivedCollation::implicit(
                 row.collation(*qualifier, name),
                 ctype.is_collatable(),
@@ -7264,7 +7311,7 @@ fn expression_collation<'a>(
                             collatable,
                         )
                     }
-                    super::ast::ParameterSource::PlpgsqlCursor => None,
+                    super::ast::ParameterSource::PlpgsqlCursor(_) => None,
                 })
             }
             Err(error) => Err(error),
@@ -12092,11 +12139,12 @@ fn coerce_enum_value<'a>(
         Datum::Bpchar(s) => s.trim_end_matches(' '),
         _ => return Ok(value),
     };
+    // Without catalog access the label cannot be checked; a context-free
+    // constant probe leaves this to execution.
     let catalog = hooks.catalog.ok_or_else(|| {
         sql_err!(
-            sqlstate::INVALID_TEXT_REPRESENTATION,
-            "invalid input value for enum: \"{}\"",
-            label
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "enum input requires catalog access"
         )
     })?;
     let Some(sort) = catalog.enum_label_sort(slot, label)? else {
@@ -12434,7 +12482,7 @@ mod tests {
                 qualifier: None,
                 name: "input",
                 index: 1,
-                source: ParameterSource::PlpgsqlCursor,
+                source: ParameterSource::PlpgsqlCursor(crate::sql::guc::VariableConflict::Error),
             };
             assert_eq!(
                 routine_input_collation(&[&cursor], &Columns, None)

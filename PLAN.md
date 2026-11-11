@@ -399,10 +399,7 @@ and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
 constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
 `INSERT has more target columns than expressions` without its position; other
-target and expression count errors are positioned. Under
-`#variable_conflict use_variable` a variable that is also a column fails with
-`0A000`: aggregate inputs and grouping keys bind names to columns before the
-variable could win. PL/pgSQL `SELECT ... INTO`, `PERFORM`, `RETURN QUERY` and
+target and expression count errors are positioned. PL/pgSQL `SELECT ... INTO`, `PERFORM`, `RETURN QUERY` and
 `FOR ... IN WITH ... SELECT` run a data-changing `WITH`, but other routine
 positions do not: a PL/pgSQL `WITH ... INSERT/UPDATE/DELETE` statement is
 rejected as an unsupported body and `FOR ... IN WITH ... INSERT` with
@@ -416,9 +413,12 @@ reports a missing FROM-clause entry for `a` where PostgreSQL accepts it. An
 ungrouped-column error inside an aliased parenthesized join names the alias
 (`j.x`) where PostgreSQL names the member table (`a.x`). A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
-PostgreSQL types it as the table's row type `t`, and comparing two
-whole-row values (`t.* = t.*`) is row-wise, so NULL fields give NULL where
-PostgreSQL's composite comparison treats them as equal.
+PostgreSQL types it as the table's row type `t`. `ORDER BY`, `DISTINCT` and
+`UNION` over composite or record values order and match them by their text
+form, so `(1,2)` sorts after `(1,)` where PostgreSQL puts NULL fields last
+and compares fields by type; `x = ANY (ARRAY[...])` over composite or record
+arrays and casting a row constructor to a table's row type (`ROW(1, 'a')::t`)
+fail where PostgreSQL accepts them.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. In a PL/pgSQL statement,
 `VALUES (r.*)` does not expand the row variable `r` into its fields. Reading

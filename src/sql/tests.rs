@@ -50,6 +50,7 @@ mod procedural_progress;
 mod procedural_subtransactions;
 mod procedure_progress;
 mod query_execution;
+mod record_comparisons;
 mod relation_row_types;
 mod result_streams;
 mod routine_calls;

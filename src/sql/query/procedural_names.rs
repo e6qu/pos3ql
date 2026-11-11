@@ -1,21 +1,24 @@
-//! The `plpgsql.variable_conflict` check for a statement a PL/pgSQL body runs.
+//! The `plpgsql.variable_conflict` rule for a statement a PL/pgSQL body runs.
 //!
 //! PostgreSQL's parse analysis asks PL/pgSQL about every column reference of
-//! such a statement, at every query level, and under the default rule
-//! (`error`) reports a name that is both a table column and a PL/pgSQL
-//! variable as ambiguous before any row is read. Execution here resolves
-//! names as rows arrive, so this pass walks the statement once, in
-//! PostgreSQL's analysis order, against each level's FROM schema. A level
-//! whose FROM clause does not resolve is left to the statement's own
-//! analysis, which reports that error.
+//! such a statement, at every query level. Under the default rule (`error`)
+//! a name that is both a table column and a PL/pgSQL variable is reported as
+//! ambiguous before any row is read; under `use_variable` the variable wins.
+//! Execution here resolves names as rows arrive, so this pass walks the
+//! statement once, in PostgreSQL's analysis order, against each level's FROM
+//! schema. A level whose FROM clause does not resolve is left to the
+//! statement's own analysis, which reports that error.
 //!
-//! Under `use_variable` the variable must win at every evaluation site,
-//! including aggregate inputs and grouping keys that execution binds to
-//! columns directly, so such a name is rejected rather than read as the
-//! column. `use_column` matches execution's own precedence.
+//! Under `use_variable` each colliding reference is replaced by the
+//! variable's current value as a typed constant, so aggregate inputs,
+//! grouping keys and every other site that binds names to columns see the
+//! variable. `use_column` matches execution's own precedence.
 
-use crate::mem::arena::Arena;
-use crate::sql::ast::{Expr, FromClause, Select, SelectItem, SetTree, Stmt};
+use crate::mem::arena::{Arena, ArenaFull};
+use crate::sql::ast::{
+    Cte, Delete, Expr, FromClause, Insert, Join, OnConflict, Returning, Select, SelectItem,
+    SetTree, Stmt, TableRef, Update,
+};
 use crate::sql::eval::{ColumnLookup, SqlError};
 use crate::sql::guc::VariableConflict;
 use crate::storage::Storage;
@@ -29,6 +32,14 @@ struct Level<'s, 'a> {
 }
 
 impl Level<'_, '_> {
+    /// The statement level, outside any FROM clause.
+    const fn root() -> Self {
+        Self {
+            scope: None,
+            parent: None,
+        }
+    }
+
     fn has_column(&self, qualifier: Option<&str>, name: &str) -> bool {
         let mut level = Some(self);
         while let Some(current) = level {
@@ -50,136 +61,317 @@ impl Level<'_, '_> {
     }
 }
 
-struct Check<'a, 'v> {
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-    variables: &'a dyn ColumnLookup<'v>,
-}
+/// A failure while rebuilding: an SQL error or an exhausted statement arena.
+struct Failure(SqlError);
 
-/// Reports the first reference in `statement` that names both a column and
-/// a PL/pgSQL variable whose rule is `error` (PostgreSQL's ambiguity error)
-/// or `use_variable` (unsupported).
-pub(crate) fn check_statement<'a, 'v>(
-    statement: &'a Stmt<'a>,
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-    variables: &'a dyn ColumnLookup<'v>,
-) -> Result<(), SqlError> {
-    let check = Check {
-        storage,
-        txid,
-        arena,
-        variables,
-    };
-    let root = Level {
-        scope: None,
-        parent: None,
-    };
-    match statement {
-        Stmt::Select(select) => check.select(select, &root),
-        Stmt::SetQuery(query) => {
-            for cte in query.with {
-                check.cte(cte, &root)?;
-            }
-            check.set_tree(query.body, &root)
-        }
-        Stmt::Insert(insert) => {
-            if let Some(select) = insert.select {
-                check.select(select, &root)?;
-            }
-            for row in insert.rows {
-                for value in *row {
-                    check.expression(value, &root)?;
-                }
-            }
-            let Some(scope) = check.dml_scope(insert.table, None, None) else {
-                return Ok(());
-            };
-            let target = Level {
-                scope: Some(&scope),
-                parent: None,
-            };
-            if let Some(conflict) = insert.on_conflict {
-                for (_, value) in conflict.update.unwrap_or(&[]) {
-                    check.expression(value, &target)?;
-                }
-                if let Some(predicate) = conflict.update_where {
-                    check.expression(predicate, &target)?;
-                }
-            }
-            check.items(insert.returning.items, &target)
-        }
-        Stmt::Update(update) => {
-            let Some(scope) = check.dml_scope(update.table, update.alias, update.from) else {
-                return Ok(());
-            };
-            let target = Level {
-                scope: Some(&scope),
-                parent: None,
-            };
-            if let Some(from) = update.from {
-                check.relation_sources(from, &root)?;
-            }
-            for (_, value) in update.assignments {
-                check.expression(value, &target)?;
-            }
-            if let Some(predicate) = update.where_clause {
-                check.expression(predicate, &target)?;
-            }
-            check.items(update.returning.items, &target)
-        }
-        Stmt::Delete(delete) => {
-            let Some(scope) = check.dml_scope(delete.table, delete.alias, delete.using) else {
-                return Ok(());
-            };
-            let target = Level {
-                scope: Some(&scope),
-                parent: None,
-            };
-            if let Some(using) = delete.using {
-                check.relation_sources(using, &root)?;
-            }
-            if let Some(predicate) = delete.where_clause {
-                check.expression(predicate, &target)?;
-            }
-            check.items(delete.returning.items, &target)
-        }
-        Stmt::Merge(merge) => check.merge(merge, &root),
-        _ => Ok(()),
+impl From<SqlError> for Failure {
+    fn from(error: SqlError) -> Self {
+        Self(error)
     }
 }
 
-/// [`check_statement`] for a PL/pgSQL expression, whose only query levels
-/// are the subqueries it contains.
-pub(crate) fn check_expression<'a, 'v>(
-    expression: &'a Expr<'a>,
-    storage: &'a Storage,
+impl From<ArenaFull> for Failure {
+    fn from(_: ArenaFull) -> Self {
+        Self(super::arena_full())
+    }
+}
+
+type Bound<T> = Result<T, Failure>;
+
+/// Rebuilds statements in `'a`; storage, variables and each level's FROM
+/// schema are only consulted, for the shorter `'s`.
+struct Check<'a, 's> {
+    storage: &'s Storage,
     txid: u32,
     arena: &'a Arena,
-    variables: &'a dyn ColumnLookup<'v>,
-) -> Result<(), SqlError> {
+    variables: &'s dyn ColumnLookup<'a>,
+}
+
+/// Applies `plpgsql.variable_conflict` to `statement`: reports the first
+/// reference that names both a column and a variable whose rule is `error`
+/// (PostgreSQL's ambiguity error), and returns the statement with each such
+/// reference under `use_variable` replaced by the variable's value. An
+/// unchanged statement is returned as given.
+pub(crate) fn bind_statement<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    variables: &dyn ColumnLookup<'a>,
+) -> Result<&'a Stmt<'a>, SqlError> {
     Check {
         storage,
         txid,
         arena,
         variables,
     }
-    .expression(
-        expression,
-        &Level {
-            scope: None,
-            parent: None,
-        },
-    )
+    .statement(statement)
+    .map_err(|Failure(error)| error)
 }
 
-impl<'a> Check<'a, '_> {
+/// [`bind_statement`] for a PL/pgSQL expression, whose only query levels
+/// are the subqueries it contains.
+pub(crate) fn bind_expression<'a>(
+    expression: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    variables: &dyn ColumnLookup<'a>,
+) -> Result<&'a Expr<'a>, SqlError> {
+    Check {
+        storage,
+        txid,
+        arena,
+        variables,
+    }
+    .expression(expression, &Level::root())
+    .map_err(|Failure(error)| error)
+}
+
+/// The rebuilt value, or the original when nothing inside it changed.
+fn keep<'a, T: Copy>(original: &'a T, rebuilt: T, changed: bool, arena: &'a Arena) -> Bound<&'a T> {
+    Ok(if changed {
+        arena.alloc(rebuilt)?
+    } else {
+        original
+    })
+}
+
+impl<'a: 's, 's> Check<'a, 's> {
     /// A schema whose resolution fails is left to the statement's analysis;
     /// its error and any position it recorded are discarded here.
     fn quietly<T>(&self, resolve: impl FnOnce() -> Result<T, SqlError>) -> Option<T> {
         crate::sql::error_position::preserving_pending(|| resolve().ok())
+    }
+
+    fn statement(&self, statement: &'a Stmt<'a>) -> Bound<&'a Stmt<'a>> {
+        Ok(match statement {
+            Stmt::Select(select) => {
+                let rebuilt = self.select(select, &Level::root())?;
+                if core::ptr::eq(rebuilt, select) {
+                    statement
+                } else {
+                    self.arena.alloc(Stmt::Select(*rebuilt))?
+                }
+            }
+            Stmt::Insert(insert) => {
+                let rebuilt = self.insert(insert)?;
+                if core::ptr::eq(rebuilt, insert) {
+                    statement
+                } else {
+                    self.arena.alloc(Stmt::Insert(*rebuilt))?
+                }
+            }
+            Stmt::Update(update) => {
+                let rebuilt = self.update(update)?;
+                if core::ptr::eq(rebuilt, update) {
+                    statement
+                } else {
+                    self.arena.alloc(Stmt::Update(*rebuilt))?
+                }
+            }
+            Stmt::Delete(delete) => {
+                let rebuilt = self.delete(delete)?;
+                if core::ptr::eq(rebuilt, delete) {
+                    statement
+                } else {
+                    self.arena.alloc(Stmt::Delete(*rebuilt))?
+                }
+            }
+            Stmt::Merge(merge) => {
+                let rebuilt = self.merge(merge)?;
+                if core::ptr::eq(rebuilt, merge) {
+                    statement
+                } else {
+                    self.arena.alloc(Stmt::Merge(*rebuilt))?
+                }
+            }
+            _ => statement,
+        })
+    }
+
+    fn insert(&self, insert: &'a Insert<'a>) -> Bound<&'a Insert<'a>> {
+        let mut rebuilt = *insert;
+        let mut changed = false;
+        if let Some(select) = insert.select {
+            rebuilt.select = Some(self.select(select, &Level::root())?);
+            changed |= !core::ptr::eq(rebuilt.select.unwrap(), select);
+        }
+        let mut rows: Option<&'a mut [&'a [&'a Expr<'a>]]> = None;
+        for (index, row) in insert.rows.iter().enumerate() {
+            let values = self.expressions(row, &Level::root(), &mut changed)?;
+            if !core::ptr::eq(values, *row) && rows.is_none() {
+                rows = Some(self.arena.alloc_slice_copy(insert.rows)?);
+            }
+            if let Some(copy) = rows.as_deref_mut() {
+                copy[index] = values;
+            }
+        }
+        if let Some(copy) = rows {
+            rebuilt.rows = copy;
+        }
+        if let Some(scope) = self.dml_scope(insert.table, None, None) {
+            let target = Level {
+                scope: Some(&scope),
+                parent: None,
+            };
+            if let Some(conflict) = insert.on_conflict {
+                let mut conflict_changed = false;
+                let update = conflict
+                    .update
+                    .map(|assignments| {
+                        self.assignments(assignments, &target, &mut conflict_changed)
+                    })
+                    .transpose()?;
+                let update_where =
+                    self.optional(conflict.update_where, &target, &mut conflict_changed)?;
+                if conflict_changed {
+                    changed = true;
+                    rebuilt.on_conflict = Some(OnConflict {
+                        update,
+                        update_where,
+                        ..conflict
+                    });
+                }
+            }
+            rebuilt.returning = self.returning(insert.returning, &target, &mut changed)?;
+        }
+        keep(insert, rebuilt, changed, self.arena)
+    }
+
+    fn update(&self, update: &'a Update<'a>) -> Bound<&'a Update<'a>> {
+        let Some(scope) = self.dml_scope(update.table, update.alias, update.from) else {
+            return Ok(update);
+        };
+        let target = Level {
+            scope: Some(&scope),
+            parent: None,
+        };
+        let mut rebuilt = *update;
+        let mut changed = false;
+        if let Some(from) = update.from {
+            rebuilt.from = Some(self.relation_sources(from, &Level::root(), &mut changed)?);
+        }
+        rebuilt.assignments = self.assignments(update.assignments, &target, &mut changed)?;
+        rebuilt.where_clause = self.optional(update.where_clause, &target, &mut changed)?;
+        rebuilt.returning = self.returning(update.returning, &target, &mut changed)?;
+        keep(update, rebuilt, changed, self.arena)
+    }
+
+    fn delete(&self, delete: &'a Delete<'a>) -> Bound<&'a Delete<'a>> {
+        let Some(scope) = self.dml_scope(delete.table, delete.alias, delete.using) else {
+            return Ok(delete);
+        };
+        let target = Level {
+            scope: Some(&scope),
+            parent: None,
+        };
+        let mut rebuilt = *delete;
+        let mut changed = false;
+        if let Some(using) = delete.using {
+            rebuilt.using = Some(self.relation_sources(using, &Level::root(), &mut changed)?);
+        }
+        rebuilt.where_clause = self.optional(delete.where_clause, &target, &mut changed)?;
+        rebuilt.returning = self.returning(delete.returning, &target, &mut changed)?;
+        keep(delete, rebuilt, changed, self.arena)
+    }
+
+    /// A `MERGE` as PostgreSQL's `transformMergeStmt` analyses it: the
+    /// source, the join condition over target and source, each `WHEN`
+    /// clause with the relations its kind can see (`NOT MATCHED [BY TARGET]`
+    /// sees only the source, `NOT MATCHED BY SOURCE` only the target), and
+    /// `RETURNING`.
+    fn merge(
+        &self,
+        merge: &'a crate::sql::ast::Merge<'a>,
+    ) -> Bound<&'a crate::sql::ast::Merge<'a>> {
+        use crate::sql::ast::{MergeSourceAction, MergeTargetAction, MergeWhen};
+        let mut changed = false;
+        let source = self.table(merge.source, &Level::root(), &mut changed)?;
+        let source_from: &'a FromClause<'a> = self.arena.alloc(FromClause {
+            base: source,
+            joins: &[],
+        })?;
+        let (Some(both), Some(target_only), Some(source_only)) = (
+            self.dml_scope(merge.target, merge.target_alias, Some(source_from)),
+            self.dml_scope(merge.target, merge.target_alias, None),
+            self.quietly(|| {
+                QueryScope::resolve_schema(
+                    self.storage,
+                    source_from,
+                    self.txid,
+                    self.arena,
+                    Some(self.variables),
+                )
+            }),
+        ) else {
+            return Ok(merge);
+        };
+        let level = |scope| Level {
+            scope: Some(scope),
+            parent: None,
+        };
+        let (both, target_only, source_only) =
+            (level(&both), level(&target_only), level(&source_only));
+        let mut rebuilt = *merge;
+        rebuilt.source = source;
+        rebuilt.on = self.expression(merge.on, &both)?;
+        changed |= !core::ptr::eq(rebuilt.on, merge.on);
+        let mut whens: Option<&'a mut [MergeWhen<'a>]> = None;
+        for (index, when) in merge.whens.iter().enumerate() {
+            let mut when_changed = false;
+            let target_action = |action: MergeTargetAction<'a>,
+                                 visible: &Level<'_, 's>,
+                                 changed: &mut bool|
+             -> Bound<MergeTargetAction<'a>> {
+                Ok(match action {
+                    MergeTargetAction::Update(assignments) => MergeTargetAction::Update(
+                        self.assignments(assignments, visible, changed)?,
+                    ),
+                    other => other,
+                })
+            };
+            let new = match *when {
+                MergeWhen::Matched { cond, action } => MergeWhen::Matched {
+                    cond: self.optional(cond, &both, &mut when_changed)?,
+                    action: target_action(action, &both, &mut when_changed)?,
+                },
+                MergeWhen::NotMatchedBySource { cond, action } => MergeWhen::NotMatchedBySource {
+                    cond: self.optional(cond, &target_only, &mut when_changed)?,
+                    action: target_action(action, &target_only, &mut when_changed)?,
+                },
+                MergeWhen::NotMatchedByTarget { cond, action } => MergeWhen::NotMatchedByTarget {
+                    cond: self.optional(cond, &source_only, &mut when_changed)?,
+                    action: match action {
+                        MergeSourceAction::Insert {
+                            columns,
+                            values,
+                            default_values,
+                            overriding,
+                        } => MergeSourceAction::Insert {
+                            columns,
+                            values: self.expressions(values, &source_only, &mut when_changed)?,
+                            default_values,
+                            overriding,
+                        },
+                        MergeSourceAction::DoNothing => MergeSourceAction::DoNothing,
+                    },
+                },
+            };
+            if when_changed {
+                let copy = match whens.as_deref_mut() {
+                    Some(copy) => copy,
+                    None => whens.insert(self.arena.alloc_slice_copy(merge.whens)?),
+                };
+                copy[index] = new;
+                changed = true;
+            }
+        }
+        if let Some(copy) = whens {
+            rebuilt.whens = copy;
+        }
+        rebuilt.returning = self.returning(merge.returning, &both, &mut changed)?;
+        keep(merge, rebuilt, changed, self.arena)
     }
 
     fn dml_scope(
@@ -187,7 +379,7 @@ impl<'a> Check<'a, '_> {
         target: crate::sql::ast::QualName<'a>,
         alias: Option<&'a str>,
         extra: Option<&'a FromClause<'a>>,
-    ) -> Option<QueryScope<'a>> {
+    ) -> Option<QueryScope<'s>> {
         self.quietly(|| {
             super::dependencies::dml_dependency_scope(
                 self.storage,
@@ -201,153 +393,317 @@ impl<'a> Check<'a, '_> {
         })
     }
 
-    /// A `MERGE` as PostgreSQL's `transformMergeStmt` analyses it: the
-    /// source, the join condition over target and source, each `WHEN`
-    /// clause with the relations its kind can see (`NOT MATCHED [BY TARGET]`
-    /// sees only the source, `NOT MATCHED BY SOURCE` only the target), and
-    /// `RETURNING`.
-    fn merge(
-        &self,
-        merge: &'a crate::sql::ast::Merge<'a>,
-        root: &Level<'_, 'a>,
-    ) -> Result<(), SqlError> {
-        let Ok(source) = self.arena.alloc(FromClause {
-            base: merge.source,
-            joins: &[],
-        }) else {
-            return Err(super::arena_full_pub());
-        };
-        let source: &'a FromClause<'a> = source;
-        self.relation_sources(source, root)?;
-        let (Some(both), Some(target_only), Some(source_only)) = (
-            self.dml_scope(merge.target, merge.target_alias, Some(source)),
-            self.dml_scope(merge.target, merge.target_alias, None),
-            self.quietly(|| {
-                QueryScope::resolve_schema(
-                    self.storage,
-                    source,
-                    self.txid,
-                    self.arena,
-                    Some(self.variables),
-                )
-            }),
-        ) else {
-            return Ok(());
-        };
-        let level = |scope| Level {
-            scope: Some(scope),
-            parent: None,
-        };
-        let (both, target_only, source_only) =
-            (level(&both), level(&target_only), level(&source_only));
-        self.expression(merge.on, &both)?;
-        for when in merge.whens {
-            let visible = match when.kind() {
-                crate::sql::ast::MergeMatchKind::Matched => &both,
-                crate::sql::ast::MergeMatchKind::NotMatchedBySource => &target_only,
-                crate::sql::ast::MergeMatchKind::NotMatchedByTarget => &source_only,
-            };
-            if let Some(condition) = when.condition() {
-                self.expression(condition, visible)?;
-            }
-            match when.action() {
-                crate::sql::ast::MergeActionRef::Update(assignments) => {
-                    for (_, value) in assignments {
-                        self.expression(value, visible)?;
-                    }
-                }
-                crate::sql::ast::MergeActionRef::Insert { values, .. } => {
-                    for value in values {
-                        self.expression(value, visible)?;
-                    }
-                }
-                crate::sql::ast::MergeActionRef::Delete
-                | crate::sql::ast::MergeActionRef::DoNothing => {}
-            }
-        }
-        self.items(merge.returning.items, &both)
-    }
-
+    /// The replacement for a reference: PostgreSQL's ambiguity error under
+    /// `error`, the variable's value under `use_variable`.
     fn reference(
         &self,
-        qualifier: Option<&str>,
-        name: &str,
-        level: &Level<'_, 'a>,
-    ) -> Result<(), SqlError> {
+        reference: &'a Expr<'a>,
+        qualifier: Option<&'a str>,
+        name: &'a str,
+        level: &Level<'_, 's>,
+    ) -> Bound<Option<&'a Expr<'a>>> {
         match self.variables.procedural_variable(qualifier, name) {
-            Some(VariableConflict::Error) if level.has_column(qualifier, name) => Err(
+            Some(VariableConflict::Error) if level.has_column(qualifier, name) => Err(Failure(
                 crate::sql::eval::ambiguous_procedural_reference(qualifier, name),
-            ),
+            )),
             Some(VariableConflict::UseVariable) if level.has_column(qualifier, name) => {
-                Err(crate::sql::error_position::at_reference(
-                    crate::sql_err!(
-                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                        "#variable_conflict use_variable is not supported for \"{}{}{}\", which is also a column",
-                        qualifier.unwrap_or(""),
-                        if qualifier.is_some() { "." } else { "" },
-                        name
-                    ),
-                    qualifier.unwrap_or(name),
-                ))
+                self.variable_value(reference, qualifier, name).map(Some)
             }
-            _ => Ok(()),
+            _ => Ok(None),
         }
     }
 
-    fn expression(&self, expression: &'a Expr<'a>, level: &Level<'_, 'a>) -> Result<(), SqlError> {
-        match expression {
-            Expr::Column { qualifier, name } => self.reference(*qualifier, name, level),
-            Expr::Subquery(select)
-            | Expr::Exists(select)
-            | Expr::ArraySubquery(select)
-            | Expr::RowSubquery { select, .. } => self.select(select, level),
-            Expr::InSubquery {
-                operand, select, ..
-            }
-            | Expr::QuantifiedSubquery {
-                operand, select, ..
-            } => {
-                self.expression(operand, level)?;
-                self.select(select, level)
-            }
-            _ => super::walk_children(expression, &mut |child| self.expression(child, level)),
-        }
-    }
-
-    fn items(&self, items: &'a [SelectItem<'a>], level: &Level<'_, 'a>) -> Result<(), SqlError> {
-        for item in items {
-            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
-                self.expression(expression, level)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn cte(
+    /// The variable's current value as a constant of its declared type,
+    /// typmod and collation; the reference stays its source.
+    fn variable_value(
         &self,
-        cte: &'a crate::sql::ast::Cte<'a>,
-        parent: &Level<'_, 'a>,
-    ) -> Result<(), SqlError> {
-        match cte.dml {
-            Some(statement) => check_statement(
-                statement,
-                self.storage,
-                self.txid,
-                self.arena,
-                self.variables,
+        reference: &'a Expr<'a>,
+        qualifier: Option<&'a str>,
+        name: &'a str,
+    ) -> Bound<&'a Expr<'a>> {
+        let value = self.variables.lookup(qualifier, name)?;
+        let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
+        let hooks = crate::sql::eval::EvalHooks {
+            catalog: Some(&catalog),
+            ..crate::sql::eval::NO_HOOKS
+        };
+        let type_oid =
+            crate::sql::eval::expression_type_identity(reference, self.variables, &hooks)?
+                .record_field_oid();
+        let collation = self.variables.collation(qualifier, name);
+        Ok(self.arena.alloc(Expr::BoundLiteral {
+            value: crate::sql::ast::BoundLiteralValue::CachedDefault(
+                crate::sql::exec::encode_projected_pub(&[value], self.arena)?,
             ),
-            None => self.select(cte.query, parent),
+            type_oid,
+            type_mod: self.variables.column_type_mod(qualifier, name),
+            collation: (collation != crate::sql::ast::Collation::None).then_some(collation),
+            source: reference,
+        })?)
+    }
+
+    fn expression(&self, expression: &'a Expr<'a>, level: &Level<'_, 's>) -> Bound<&'a Expr<'a>> {
+        crate::sql::ast::rewrite_expression(expression, self.arena, &mut |node| match node {
+            Expr::Column { qualifier, name } => self.reference(node, *qualifier, name, level),
+            Expr::Subquery(select) => self.subquery(select, level, Expr::Subquery),
+            Expr::Exists(select) => self.subquery(select, level, Expr::Exists),
+            Expr::ArraySubquery(select) => self.subquery(select, level, Expr::ArraySubquery),
+            Expr::RowSubquery { select, arity } => {
+                let arity = *arity;
+                self.subquery(select, level, |select| Expr::RowSubquery { select, arity })
+            }
+            Expr::InSubquery {
+                operand,
+                select,
+                negated,
+            } => {
+                let new_operand = self.expression(operand, level)?;
+                let new_select = self.select(select, level)?;
+                Ok(
+                    (!core::ptr::eq(new_operand, *operand) || !core::ptr::eq(new_select, *select))
+                        .then(|| {
+                            self.arena.alloc(Expr::InSubquery {
+                                operand: new_operand,
+                                select: new_select,
+                                negated: *negated,
+                            })
+                        })
+                        .transpose()?
+                        .map(|node| &*node),
+                )
+            }
+            Expr::QuantifiedSubquery {
+                operand,
+                operator,
+                select,
+                all,
+            } => {
+                let new_operand = self.expression(operand, level)?;
+                let new_select = self.select(select, level)?;
+                Ok(
+                    (!core::ptr::eq(new_operand, *operand) || !core::ptr::eq(new_select, *select))
+                        .then(|| {
+                            self.arena.alloc(Expr::QuantifiedSubquery {
+                                operand: new_operand,
+                                operator: *operator,
+                                select: new_select,
+                                all: *all,
+                            })
+                        })
+                        .transpose()?
+                        .map(|node| &*node),
+                )
+            }
+            _ => Ok(None),
+        })
+    }
+
+    fn subquery(
+        &self,
+        select: &'a Select<'a>,
+        level: &Level<'_, 's>,
+        node: impl FnOnce(&'a Select<'a>) -> Expr<'a>,
+    ) -> Bound<Option<&'a Expr<'a>>> {
+        let rebuilt = self.select(select, level)?;
+        if core::ptr::eq(rebuilt, select) {
+            return Ok(None);
+        }
+        Ok(Some(self.arena.alloc(node(rebuilt))?))
+    }
+
+    fn expressions(
+        &self,
+        expressions: &'a [&'a Expr<'a>],
+        level: &Level<'_, 's>,
+        changed: &mut bool,
+    ) -> Bound<&'a [&'a Expr<'a>]> {
+        crate::sql::ast::rewrite_expressions(
+            expressions,
+            self.arena,
+            &mut |node| {
+                let rebuilt = self.expression(node, level)?;
+                Ok((!core::ptr::eq(rebuilt, node)).then_some(rebuilt))
+            },
+            changed,
+        )
+    }
+
+    fn optional(
+        &self,
+        expression: Option<&'a Expr<'a>>,
+        level: &Level<'_, 's>,
+        changed: &mut bool,
+    ) -> Bound<Option<&'a Expr<'a>>> {
+        let Some(expression) = expression else {
+            return Ok(None);
+        };
+        let rebuilt = self.expression(expression, level)?;
+        *changed |= !core::ptr::eq(rebuilt, expression);
+        Ok(Some(rebuilt))
+    }
+
+    fn assignments(
+        &self,
+        assignments: &'a [(&'a str, &'a Expr<'a>)],
+        level: &Level<'_, 's>,
+        changed: &mut bool,
+    ) -> Bound<&'a [(&'a str, &'a Expr<'a>)]> {
+        let mut rebuilt: Option<&'a mut [(&'a str, &'a Expr<'a>)]> = None;
+        for (index, (_, value)) in assignments.iter().enumerate() {
+            let new = self.expression(value, level)?;
+            if !core::ptr::eq(new, *value) && rebuilt.is_none() {
+                rebuilt = Some(self.arena.alloc_slice_copy(assignments)?);
+            }
+            if let Some(copy) = rebuilt.as_deref_mut() {
+                copy[index].1 = new;
+            }
+        }
+        Ok(match rebuilt {
+            Some(copy) => {
+                *changed = true;
+                copy
+            }
+            None => assignments,
+        })
+    }
+
+    fn items(
+        &self,
+        items: &'a [SelectItem<'a>],
+        level: &Level<'_, 's>,
+        changed: &mut bool,
+    ) -> Bound<&'a [SelectItem<'a>]> {
+        let mut rebuilt: Option<&'a mut [SelectItem<'a>]> = None;
+        for (index, item) in items.iter().enumerate() {
+            let new = match item {
+                SelectItem::Expr { expression, alias } => {
+                    let new = self.expression(expression, level)?;
+                    (!core::ptr::eq(new, *expression)).then_some(SelectItem::Expr {
+                        expression: new,
+                        alias: *alias,
+                    })
+                }
+                SelectItem::RecordStar(expression) => {
+                    let new = self.expression(expression, level)?;
+                    (!core::ptr::eq(new, *expression)).then_some(SelectItem::RecordStar(new))
+                }
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => None,
+            };
+            if let Some(new) = new {
+                let copy = match rebuilt.as_deref_mut() {
+                    Some(copy) => copy,
+                    None => rebuilt.insert(self.arena.alloc_slice_copy(items)?),
+                };
+                copy[index] = new;
+            }
+        }
+        Ok(match rebuilt {
+            Some(copy) => {
+                *changed = true;
+                copy
+            }
+            None => items,
+        })
+    }
+
+    fn returning(
+        &self,
+        returning: Returning<'a>,
+        level: &Level<'_, 's>,
+        changed: &mut bool,
+    ) -> Bound<Returning<'a>> {
+        Ok(Returning {
+            items: self.items(returning.items, level, changed)?,
+            ..returning
+        })
+    }
+
+    fn ctes(
+        &self,
+        ctes: &'a [Cte<'a>],
+        parent: &Level<'_, 's>,
+        changed: &mut bool,
+    ) -> Bound<&'a [Cte<'a>]> {
+        let mut rebuilt: Option<&'a mut [Cte<'a>]> = None;
+        for (index, cte) in ctes.iter().enumerate() {
+            let new = match cte.dml {
+                Some(statement) => {
+                    let new = self.statement(statement)?;
+                    (!core::ptr::eq(new, statement)).then_some(Cte {
+                        dml: Some(new),
+                        ..*cte
+                    })
+                }
+                None => {
+                    let new = self.select(cte.query, parent)?;
+                    (!core::ptr::eq(new, cte.query)).then_some(Cte { query: new, ..*cte })
+                }
+            };
+            if let Some(new) = new {
+                let copy = match rebuilt.as_deref_mut() {
+                    Some(copy) => copy,
+                    None => rebuilt.insert(self.arena.alloc_slice_copy(ctes)?),
+                };
+                copy[index] = new;
+            }
+        }
+        Ok(match rebuilt {
+            Some(copy) => {
+                *changed = true;
+                copy
+            }
+            None => ctes,
+        })
+    }
+
+    fn set_tree(&self, tree: &'a SetTree<'a>, parent: &Level<'_, 's>) -> Bound<&'a SetTree<'a>> {
+        match tree {
+            SetTree::Select(select) => {
+                let new = self.select(select, parent)?;
+                if core::ptr::eq(new, *select) {
+                    return Ok(tree);
+                }
+                Ok(self.arena.alloc(SetTree::Select(new))?)
+            }
+            SetTree::Op {
+                syntax,
+                operator,
+                all,
+                left,
+                right,
+            } => {
+                let new_left = self.set_tree(left, parent)?;
+                let new_right = self.set_tree(right, parent)?;
+                if core::ptr::eq(new_left, *left) && core::ptr::eq(new_right, *right) {
+                    return Ok(tree);
+                }
+                Ok(self.arena.alloc(SetTree::Op {
+                    syntax: *syntax,
+                    operator: *operator,
+                    all: *all,
+                    left: new_left,
+                    right: new_right,
+                })?)
+            }
         }
     }
 
-    fn set_tree(&self, tree: &'a SetTree<'a>, parent: &Level<'_, 'a>) -> Result<(), SqlError> {
-        match tree {
-            SetTree::Select(select) => self.select(select, parent),
-            SetTree::Op { left, right, .. } => {
-                self.set_tree(left, parent)?;
-                self.set_tree(right, parent)
-            }
+    fn table(
+        &self,
+        table: TableRef<'a>,
+        parent: &Level<'_, 's>,
+        changed: &mut bool,
+    ) -> Bound<TableRef<'a>> {
+        let mut rebuilt = table;
+        if let Some(subquery) = table.subquery {
+            let new = self.select(subquery, parent)?;
+            *changed |= !core::ptr::eq(new, subquery);
+            rebuilt.subquery = Some(new);
         }
+        if let Some(arguments) = table.func_args {
+            rebuilt.func_args = Some(self.expressions(arguments, parent, changed)?);
+        }
+        Ok(rebuilt)
     }
 
     /// The subqueries and function arguments of FROM items, which see only
@@ -355,33 +711,61 @@ impl<'a> Check<'a, '_> {
     fn relation_sources(
         &self,
         from: &'a FromClause<'a>,
-        parent: &Level<'_, 'a>,
-    ) -> Result<(), SqlError> {
-        for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
-            if let Some(subquery) = table.subquery {
-                self.select(subquery, parent)?;
-            }
-            for argument in table.func_args.unwrap_or(&[]) {
-                self.expression(argument, parent)?;
+        parent: &Level<'_, 's>,
+        changed: &mut bool,
+    ) -> Bound<&'a FromClause<'a>> {
+        let mut from_changed = false;
+        let rebuilt = self.join_sources(*from, parent, &mut from_changed)?;
+        *changed |= from_changed;
+        keep(from, rebuilt, from_changed, self.arena)
+    }
+
+    fn join_sources(
+        &self,
+        from: FromClause<'a>,
+        parent: &Level<'_, 's>,
+        changed: &mut bool,
+    ) -> Bound<FromClause<'a>> {
+        let base = self.table(from.base, parent, changed)?;
+        let mut joins: Option<&'a mut [Join<'a>]> = None;
+        for (index, join) in from.joins.iter().enumerate() {
+            let mut join_changed = false;
+            let table = self.table(join.table, parent, &mut join_changed)?;
+            if join_changed {
+                let copy = match joins.as_deref_mut() {
+                    Some(copy) => copy,
+                    None => joins.insert(self.arena.alloc_slice_copy(from.joins)?),
+                };
+                copy[index].table = table;
+                *changed = true;
             }
         }
-        Ok(())
+        Ok(FromClause {
+            base,
+            joins: match joins {
+                Some(copy) => copy,
+                None => from.joins,
+            },
+        })
     }
 
     /// One query level, in PostgreSQL's analysis order: WITH, FROM, the
     /// output list, WHERE, HAVING, ORDER BY, GROUP BY, DISTINCT ON, LIMIT
     /// and OFFSET.
-    fn select(&self, select: &'a Select<'a>, parent: &Level<'_, 'a>) -> Result<(), SqlError> {
-        for cte in select.with {
-            self.cte(cte, parent)?;
-        }
+    fn select(&self, select: &'a Select<'a>, parent: &Level<'_, 's>) -> Bound<&'a Select<'a>> {
+        let mut rebuilt = *select;
+        let mut changed = false;
+        rebuilt.with = self.ctes(select.with, parent, &mut changed)?;
         if let Some(body) = select.set_body {
             // A set operation's ORDER BY names its output columns.
-            return self.set_tree(body, parent);
+            let new = self.set_tree(body, parent)?;
+            changed |= !core::ptr::eq(new, body);
+            rebuilt.set_body = Some(new);
+            return keep(select, rebuilt, changed, self.arena);
         }
         let scope = match &select.from {
             Some(from) => {
-                self.relation_sources(from, parent)?;
+                rebuilt.from = Some(self.join_sources(*from, parent, &mut changed)?);
                 let expanded = self.quietly(|| {
                     let select = super::expand_ctes(select, self.storage, self.txid, self.arena)?;
                     let from = select.from.as_ref().expect("expansion keeps FROM");
@@ -398,7 +782,7 @@ impl<'a> Check<'a, '_> {
                 match expanded {
                     Some(scope) => Some(scope),
                     // The statement's own analysis reports this level.
-                    None => return Ok(()),
+                    None => return keep(select, rebuilt, changed, self.arena),
                 }
             }
             None => None,
@@ -407,41 +791,62 @@ impl<'a> Check<'a, '_> {
             scope: scope.as_ref(),
             parent: Some(parent),
         };
-        if let Some(from) = &select.from {
-            for join in from.joins {
-                if let Some(on) = join.on {
-                    self.expression(on, &level)?;
+        if let Some(from) = rebuilt.from {
+            let mut joins: Option<&'a mut [Join<'a>]> = None;
+            for (index, join) in from.joins.iter().enumerate() {
+                let Some(on) = join.on else {
+                    continue;
+                };
+                let new = self.expression(on, &level)?;
+                if !core::ptr::eq(new, on) {
+                    let copy = match joins.as_deref_mut() {
+                        Some(copy) => copy,
+                        None => joins.insert(self.arena.alloc_slice_copy(from.joins)?),
+                    };
+                    copy[index].on = Some(new);
                 }
             }
+            if let Some(copy) = joins {
+                changed = true;
+                rebuilt.from = Some(FromClause {
+                    joins: copy,
+                    ..from
+                });
+            }
         }
-        self.items(select.items, &level)?;
-        for expression in select.where_clause.into_iter().chain(select.having) {
-            self.expression(expression, &level)?;
-        }
-        for order in select.order_by {
+        rebuilt.items = self.items(select.items, &level, &mut changed)?;
+        rebuilt.where_clause = self.optional(select.where_clause, &level, &mut changed)?;
+        rebuilt.having = self.optional(select.having, &level, &mut changed)?;
+        let mut order: Option<&'a mut [crate::sql::ast::OrderBy<'a>]> = None;
+        for (index, key) in select.order_by.iter().enumerate() {
             // A bare name that is an output column sorts by that column.
             if let Expr::Column {
                 qualifier: None,
                 name,
-            } = order.expression
+            } = key.expression
                 && select.items.iter().any(|item| {
                     matches!(item, SelectItem::Expr { alias: Some(alias), .. } if alias == name)
                 })
             {
                 continue;
             }
-            self.expression(order.expression, &level)?;
+            let new = self.expression(key.expression, &level)?;
+            if !core::ptr::eq(new, key.expression) {
+                let copy = match order.as_deref_mut() {
+                    Some(copy) => copy,
+                    None => order.insert(self.arena.alloc_slice_copy(select.order_by)?),
+                };
+                copy[index].expression = new;
+            }
         }
-        for expression in select
-            .group_by
-            .iter()
-            .chain(select.distinct_on)
-            .copied()
-            .chain(select.limit)
-            .chain(select.offset)
-        {
-            self.expression(expression, &level)?;
+        if let Some(copy) = order {
+            changed = true;
+            rebuilt.order_by = copy;
         }
-        Ok(())
+        rebuilt.group_by = self.expressions(select.group_by, &level, &mut changed)?;
+        rebuilt.distinct_on = self.expressions(select.distinct_on, &level, &mut changed)?;
+        rebuilt.limit = self.optional(select.limit, &level, &mut changed)?;
+        rebuilt.offset = self.optional(select.offset, &level, &mut changed)?;
+        keep(select, rebuilt, changed, self.arena)
     }
 }

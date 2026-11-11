@@ -1500,7 +1500,7 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         // column is anonymous, while PostgreSQL does label OVERLAPS.
         Expr::Call {
             kind: crate::sql::ast::CallKind::SqlSyntax,
-            name: crate::sql::parser::SIMILAR_TO,
+            name: crate::sql::parser::SIMILAR_TO | crate::sql::parser::ROWS_NOT_DISTINCT,
             ..
         } => None,
         Expr::Call {
@@ -4555,7 +4555,7 @@ pub(crate) fn infer_routine_argument_oid(
     if matches!(
         expression,
         Expr::RoutineParam {
-            source: crate::sql::ast::ParameterSource::PlpgsqlCursor,
+            source: crate::sql::ast::ParameterSource::PlpgsqlCursor(_),
             ..
         }
     ) {
@@ -5199,14 +5199,15 @@ fn infer_type_unpositioned(
             name,
             index,
             source,
-        } => match columns.resolve(*qualifier, name) {
-            Ok(_) if *source == crate::sql::ast::ParameterSource::PlpgsqlCursor => {
-                return Err(sql_err!(
-                    sqlstate::AMBIGUOUS_COLUMN,
-                    "column reference \"{}{}{}\" is ambiguous",
-                    qualifier.unwrap_or(""),
-                    if qualifier.is_some() { "." } else { "" },
-                    name
+        } => match match source.collision() {
+            crate::sql::ast::ParameterCollision::Parameter => {
+                Err(crate::sql::eval::parameter_wins())
+            }
+            _ => columns.resolve(*qualifier, name),
+        } {
+            Ok(_) if source.collision() == crate::sql::ast::ParameterCollision::Ambiguous => {
+                return Err(crate::sql::eval::ambiguous_procedural_reference(
+                    *qualifier, name,
                 ));
             }
             Ok(column) => of(column),
@@ -5223,7 +5224,7 @@ fn infer_type_unpositioned(
                             .map_err(|_| error)?;
                         Some((meta.type_oid, meta.ctype.typlen()))
                     }
-                    crate::sql::ast::ParameterSource::PlpgsqlCursor => {
+                    crate::sql::ast::ParameterSource::PlpgsqlCursor(_) => {
                         bound_parameter_type_oid(*index)
                             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))
                     }
@@ -6792,6 +6793,7 @@ fn infer_type_unpositioned(
                 crate::sql::types::RangeKind::from_multirange_name(name).expect("multirange name"),
             )),
             crate::sql::parser::SIMILAR_TO
+            | crate::sql::parser::ROWS_NOT_DISTINCT
             | "isempty"
             | "lower_inc"
             | "upper_inc"

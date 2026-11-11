@@ -91,7 +91,7 @@ pub(crate) fn compare_text_collated<'a>(
         Collation::Default | Collation::Catalog(_) => catalog
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::INTERNAL_ERROR,
+                    sqlstate::FEATURE_NOT_SUPPORTED,
                     "database collation comparator is unavailable"
                 )
             })?
@@ -646,7 +646,7 @@ pub fn compare_datums_with_catalog(
         Collation::Default | Collation::Catalog(_) => catalog
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::INTERNAL_ERROR,
+                    sqlstate::FEATURE_NOT_SUPPORTED,
                     "database collation comparator is unavailable"
                 )
             })?
@@ -2235,13 +2235,13 @@ pub(crate) fn unary<'a>(
     }
 }
 
-/// PostgreSQL row comparison (`(a,b) = (c,d)`, `<`, …): three-valued and
-/// short-circuiting, distinct from the total order `compare_datums` gives
-/// ORDER BY. Equality scans every pair — a definite inequality is `false`, an
+/// PostgreSQL's comparison between two row constructors (`(a,b) = (c,d)`,
+/// `<`, …): three-valued and short-circuiting, unlike a record value
+/// comparison ([`record_compare`]). Equality scans every pair — a definite inequality is `false`, an
 /// all-equal row is `true`, and an otherwise-equal row with a NULL pair is
 /// NULL. Ordering walks left to right — the first non-equal pair decides, and a
 /// NULL pair reached before then yields NULL. The rows must have equal arity.
-fn row_compare<'a>(
+pub(crate) fn row_constructor_compare<'a>(
     operator: BinaryOp,
     a: &[RecordField<'a>],
     b: &[RecordField<'a>],
@@ -2259,7 +2259,14 @@ fn row_compare<'a>(
             for (x, y) in a.iter().zip(b) {
                 if x.value.is_null() || y.value.is_null() {
                     saw_null = true;
-                } else if !compare_datums(&x.value, &y.value)?.is_eq() {
+                } else if !record_field_ordering(
+                    &x.value,
+                    &y.value,
+                    true,
+                    &builtin_record_field_type_name,
+                )?
+                .is_eq()
+                {
                     return Ok(Datum::Bool(operator == NotEq));
                 }
             }
@@ -2274,7 +2281,12 @@ fn row_compare<'a>(
                 if x.value.is_null() || y.value.is_null() {
                     return Ok(Datum::Null);
                 }
-                let ordering = compare_datums(&x.value, &y.value)?;
+                let ordering = record_field_ordering(
+                    &x.value,
+                    &y.value,
+                    false,
+                    &builtin_record_field_type_name,
+                )?;
                 if !ordering.is_eq() {
                     return Ok(Datum::Bool(match operator {
                         Lt | LtEq => ordering.is_lt(),
@@ -2287,34 +2299,108 @@ fn row_compare<'a>(
     }
 }
 
-/// PostgreSQL's `record_eq`/`record_lt` family for composite-typed values.
-fn record_compare<'a>(
+/// PostgreSQL's comparison of two record values (`record_eq`, `record_lt`, …)
+/// as opposed to a comparison between two row constructors: two NULL fields
+/// are equal and a NULL field sorts after any value, so the result is never
+/// NULL. Fields must have identical types, and records of different widths
+/// are comparable only when an earlier field already decided the result.
+pub(crate) fn record_compare<'a>(
     operator: BinaryOp,
     a: &[RecordField<'a>],
     b: &[RecordField<'a>],
+    type_name: &dyn Fn(i32) -> Result<crate::util::StackStr<260>, SqlError>,
 ) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::*;
-    if a.len() != b.len() {
-        return Err(sql_err!(
-            sqlstate::DATATYPE_MISMATCH,
-            "cannot compare record types with different numbers of columns"
-        ));
-    }
-    let ordering = compare_datums(&Datum::Record(a), &Datum::Record(b))?;
+    let ordering = record_ordering(a, b, matches!(operator, Eq | NotEq), type_name)?;
     Ok(Datum::Bool(match operator {
         Eq => ordering.is_eq(),
         NotEq => !ordering.is_eq(),
         Lt => ordering.is_lt(),
         LtEq => ordering.is_le(),
         Gt => ordering.is_gt(),
-        _ => ordering.is_ge(),
+        GtEq => ordering.is_ge(),
+        _ => unreachable!("record comparison received a non-comparison operator"),
     }))
 }
 
-/// SQL equality as the membership tests (`IN`, `NOT IN`) need it: three-valued,
-/// returning `None` for unknown. Rows go through [`row_compare`], so a NULL
-/// *inside* a row makes the membership unknown; `compare_datums` alone gives
-/// the total order ORDER BY wants, where a NULL field is just another value.
+/// The `record_cmp` order behind [`record_compare`]; `equality` selects the
+/// error PostgreSQL reports for a field type without the needed operator.
+fn record_ordering(
+    a: &[RecordField<'_>],
+    b: &[RecordField<'_>],
+    equality: bool,
+    type_name: &dyn Fn(i32) -> Result<crate::util::StackStr<260>, SqlError>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    let mut ordering = core::cmp::Ordering::Equal;
+    for (column, (x, y)) in a.iter().zip(b).enumerate() {
+        if x.type_oid != y.type_oid && x.type_oid != 0 && y.type_oid != 0 {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "cannot compare dissimilar column types {} and {} at record column {}",
+                type_name(x.type_oid)?.as_str(),
+                type_name(y.type_oid)?.as_str(),
+                column + 1
+            ));
+        }
+        if x.type_oid == crate::sql::types::oid::UNKNOWN {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "could not identify {} for type unknown",
+                if equality {
+                    "an equality operator"
+                } else {
+                    "a comparison function"
+                }
+            ));
+        }
+        ordering = match (x.value.is_null(), y.value.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) => core::cmp::Ordering::Greater,
+            (false, true) => core::cmp::Ordering::Less,
+            (false, false) => record_field_ordering(&x.value, &y.value, equality, type_name)?,
+        };
+        if !ordering.is_eq() {
+            break;
+        }
+    }
+    if ordering.is_eq() && a.len() != b.len() {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "cannot compare record types with different numbers of columns"
+        ));
+    }
+    Ok(ordering)
+}
+
+/// Orders two non-NULL field values; nested records use the record operators.
+fn record_field_ordering(
+    x: &Datum<'_>,
+    y: &Datum<'_>,
+    equality: bool,
+    type_name: &dyn Fn(i32) -> Result<crate::util::StackStr<260>, SqlError>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    match (x, y) {
+        (
+            Datum::Record(a) | Datum::Composite { fields: a, .. },
+            Datum::Record(b) | Datum::Composite { fields: b, .. },
+        ) => record_ordering(a, b, equality, type_name),
+        _ => compare_datums(x, y),
+    }
+}
+
+/// Names a built-in record field type for an error raised without catalog
+/// access.
+pub(crate) fn builtin_record_field_type_name(
+    type_oid: i32,
+) -> Result<crate::util::StackStr<260>, SqlError> {
+    crate::sql::exec::builtin_type_name_fixed(type_oid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type identity is unavailable"))
+}
+
+/// SQL equality as the membership tests need it: three-valued, returning
+/// `None` for unknown. Record members compare as record values, so their NULL
+/// fields equal each other; row-constructor lists compare field by field
+/// before reaching here.
 pub(crate) fn membership_eq<'a>(l: &Datum<'a>, r: &Datum<'a>) -> Result<Option<bool>, SqlError> {
     if l.is_null() || r.is_null() {
         return Ok(None);
@@ -2325,16 +2411,12 @@ pub(crate) fn membership_eq<'a>(l: &Datum<'a>, r: &Datum<'a>) -> Result<Option<b
     )
     | (Datum::Record(a), Datum::Composite { fields: b, .. }) = (l, r)
     {
-        return Ok(match record_compare(BinaryOp::Eq, a, b)? {
-            Datum::Bool(equal) => Some(equal),
-            _ => None,
-        });
-    }
-    if let (Datum::Record(a), Datum::Record(b)) = (l, r) {
-        return Ok(match row_compare(BinaryOp::Eq, a, b)? {
-            Datum::Bool(equal) => Some(equal),
-            _ => None,
-        });
+        return Ok(
+            match record_compare(BinaryOp::Eq, a, b, &builtin_record_field_type_name)? {
+                Datum::Bool(equal) => Some(equal),
+                _ => None,
+            },
+        );
     }
     Ok(Some(compare_datums(l, r)?.is_eq()))
 }
@@ -2873,20 +2955,12 @@ pub(crate) fn binary<'a>(
         Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(operator, l, r),
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => compare_bits(operator, l, r),
-            // Row comparison uses PostgreSQL's three-valued, short-circuiting
-            // semantics (NULL-propagating), distinct from the total order that
-            // `compare_datums` gives ORDER BY / DISTINCT.
-            // A composite-typed operand compares with the record btree
-            // operators: NULL fields are equal to each other and sort last,
-            // so the result is never unknown.
+            // Record values compare with record_eq/record_cmp; comparisons
+            // between two row constructors use `row_constructor_compare`.
             (
                 Datum::Composite { fields: a, .. },
                 Datum::Record(b) | Datum::Composite { fields: b, .. },
-            )
-            | (Datum::Record(a), Datum::Composite { fields: b, .. }) => {
-                record_compare(operator, a, b)
-            }
-            (Datum::Record(a), Datum::Record(b)) => row_compare(operator, a, b),
+            ) => record_compare(operator, a, b, &builtin_record_field_type_name),
             _ => compare(operator, l, r, l_unknown, r_unknown),
         },
         Add | Sub

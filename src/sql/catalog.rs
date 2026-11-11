@@ -31838,6 +31838,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "synchronize_seqscans" => "on",
             "track_functions" => "none",
             "plpgsql.variable_conflict" => "error",
+            "plpgsql.print_strict_params" => "off",
             "TimeZone" => "UTC",
             "transaction_isolation" => "read committed",
             "transaction_deferrable" | "transaction_read_only" => "off",
@@ -31849,6 +31850,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "check_function_bodies"
                 | "event_triggers"
                 | "integer_datetimes"
+                | "plpgsql.print_strict_params"
                 | "is_superuser"
                 | "row_security"
                 | "standard_conforming_strings"
@@ -31973,16 +31975,22 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 text(
                     match name {
                         "track_functions" => "Statistics / Monitoring",
-                        "plpgsql.variable_conflict" => "Customized Options",
+                        "plpgsql.variable_conflict" | "plpgsql.print_strict_params" => {
+                            "Customized Options"
+                        }
                         _ => "Client Connection Defaults",
                     },
                     arena,
                 )?,
                 text(
-                    if name == "plpgsql.variable_conflict" {
-                        "Sets handling of conflicts between PL/pgSQL variable names and table column names."
-                    } else {
-                        ""
+                    match name {
+                        "plpgsql.variable_conflict" => {
+                            "Sets handling of conflicts between PL/pgSQL variable names and table column names."
+                        }
+                        "plpgsql.print_strict_params" => {
+                            "Print information about parameters in the DETAIL part of the error messages generated on INTO ... STRICT failures."
+                        }
+                        _ => "",
                     },
                     arena,
                 )?,

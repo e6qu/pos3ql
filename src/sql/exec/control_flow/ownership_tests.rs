@@ -322,6 +322,7 @@ fn output_binding_admission_returns_control_leases_after_failure_and_owner_drop(
     )
     .unwrap();
     let locals = [TriggerLocalDecl {
+        label: None,
         name: SqlName::parse("value").unwrap(),
         ctype: ColType::Text,
         ..empty_plpgsql_local()
@@ -461,101 +462,6 @@ fn lexical_frame_capacity_covers_every_branch_and_fails_before_execution() {
 }
 
 #[test]
-fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
-    let mut control_budget = Budget::new(32 << 10);
-    let pool = LeasePool::new(
-        &mut control_budget,
-        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
-        16 << 10,
-        32,
-    )
-    .unwrap();
-    let mut budget = Budget::new(128 << 10);
-    let source = Arena::new(&mut budget, "output binding source", 16 << 10).unwrap();
-    let parsing = Arena::new(&mut budget, "output binding syntax", 16 << 10).unwrap();
-    let workspace = Arena::new(&mut budget, "output binding state", 16 << 10).unwrap();
-    let mut temporary = Arena::new(&mut budget, "output binding value", 16 << 10).unwrap();
-    let output = Arena::new(&mut budget, "output binding copies", 16 << 10).unwrap();
-    let (_, code) = parse_owned_program(
-        "BEGIN NULL; END",
-        &parsing,
-        &pool,
-        PlpgsqlProgramKind::Anonymous,
-    )
-    .unwrap();
-    let locals = [TriggerLocalDecl {
-        name: SqlName::parse("value").unwrap(),
-        ctype: ColType::Text,
-        ..empty_plpgsql_local()
-    }];
-    let mut status =
-        TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool, &pool).unwrap();
-    status.set_output_locals(&[0], locals.len());
-    crate::mem::guard::forbid_alloc(|| {
-        let text = temporary.alloc_str("original output").unwrap();
-        status.shadow_output_local(0, Datum::Text(text)).unwrap();
-        let used = workspace.used();
-        status.shadow_output_local(0, Datum::Int4(7)).unwrap();
-        assert_eq!(workspace.used(), used);
-        assert_eq!(status.outputs[0].shadow_depth, 2);
-        assert_eq!(
-            status
-                .control_frames
-                .as_mut()
-                .unwrap()
-                .execution(&source, &code)
-                .err()
-                .unwrap()
-                .sqlstate,
-            "40001"
-        );
-        assert_eq!(status.outputs[0].shadow_depth, 2);
-    });
-    temporary.reset();
-    crate::mem::guard::forbid_alloc(|| {
-        temporary.alloc_slice_with(2048, |_| 0xffu8).unwrap();
-        let first = status.outputs[0].value.read(0, &output).unwrap();
-        assert_eq!(first, Datum::Text("original output"));
-        status.unshadow_output_local(0);
-        assert_eq!(status.outputs[0].shadow_depth, 1);
-        assert_eq!(status.outputs[0].value.read(0, &output).unwrap(), first);
-        status.unshadow_output_local(0);
-        source
-            .with_remaining_region(|scratch| {
-                status
-                    .shadow_output_local(0, Datum::Text(scratch.alloc_str("new output").unwrap()))
-                    .unwrap();
-                status.unshadow_output_local(0);
-            })
-            .unwrap();
-        assert_eq!(status.outputs[0].shadow_depth, 0);
-        assert_eq!(
-            status.outputs[0].value.read(0, &output).unwrap(),
-            Datum::Text("new output")
-        );
-        let used = workspace.used();
-        for _ in 0..u8::MAX {
-            status.shadow_output_local(0, Datum::Null).unwrap();
-        }
-        assert_eq!(
-            status
-                .shadow_output_local(0, Datum::Int4(9))
-                .unwrap_err()
-                .sqlstate,
-            "54000"
-        );
-        assert_eq!(status.outputs[0].shadow_depth, u8::MAX);
-        assert!(status.outputs[0].value.read(0, &output).unwrap().is_null());
-        assert_eq!(workspace.used(), used);
-        assert_eq!(first, Datum::Text("original output"));
-        for _ in 0..u8::MAX {
-            status.unshadow_output_local(0);
-        }
-        assert_eq!(status.outputs[0].shadow_depth, 0);
-    });
-}
-
-#[test]
 fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
     let mut control_budget = Budget::new(32 << 10);
     let pool = LeasePool::new(
@@ -577,11 +483,13 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
     .unwrap();
     let locals = [
         TriggerLocalDecl {
+            label: None,
             name: SqlName::parse("x").unwrap(),
             ctype: ColType::Text,
             ..empty_plpgsql_local()
         },
         TriggerLocalDecl {
+            label: None,
             name: SqlName::parse("n").unwrap(),
             ctype: ColType::Int4,
             ..empty_plpgsql_local()
@@ -619,10 +527,13 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
                 panic!("numeric frame")
             };
             frames.enter(frame);
+            // The counter shadows `x` in a new slot after the variables.
             let (scope, current, _) = frames.scope(&locals, &mut values);
-            assert_eq!(current[0], Datum::Int4(1));
+            assert_eq!(current[0], Datum::Text("outside"));
+            assert_eq!(current[2], Datum::Int4(1));
             assert_eq!(scope[1].name.as_str(), "n");
-            assert_eq!(scope[0].scope, PlpgsqlScope::frame(2));
+            assert_eq!(scope[2].name.as_str(), "x");
+            assert_eq!(scope[2].scope, PlpgsqlScope::frame(2));
             let Step::Enter(frame) = start_numeric_loop(
                 inner,
                 1,
@@ -639,15 +550,15 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             };
             frames.enter(frame);
             let (scope, current, _) = frames.scope(&locals, &mut values);
-            assert_eq!(scope.len(), 3);
-            assert_eq!(scope[2].name.as_str(), "j");
-            assert_eq!(scope[2].scope, PlpgsqlScope::frame(3));
+            assert_eq!(scope.len(), 4);
+            assert_eq!(scope[3].name.as_str(), "j");
+            assert_eq!(scope[3].scope, PlpgsqlScope::frame(3));
             current[1] = Datum::Int4(41);
             status.set_found(false);
             let inner = frames.pop();
             frames.finish(inner, &locals, &mut values, &mut status, success);
             let (_, current, _) = frames.scope(&locals, &mut values);
-            assert_eq!(current[0], Datum::Int4(1));
+            assert_eq!(current[2], Datum::Int4(1));
             assert_eq!(current[1], Datum::Int4(41));
             let outer = frames.pop();
             frames.finish(outer, &locals, &mut values, &mut status, success);
@@ -686,11 +597,13 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
     let foreign = Arena::new(&mut budget, "foreign procedural positions", 64 << 10).unwrap();
     let locals = [
         TriggerLocalDecl {
+            label: None,
             name: SqlName::parse("x").unwrap(),
             ctype: ColType::Text,
             ..empty_plpgsql_local()
         },
         TriggerLocalDecl {
+            label: None,
             name: SqlName::parse("n").unwrap(),
             ctype: ColType::Text,
             ..empty_plpgsql_local()
@@ -766,7 +679,11 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
         let (_, current, _) = frames.scope(&locals, &mut values);
         assert_eq!(
             current,
-            &[Datum::Int4(1), Datum::Text("changed once before waiting")]
+            &[
+                Datum::Text("outside counter"),
+                Datum::Text("changed once before waiting"),
+                Datum::Int4(1)
+            ]
         );
         let child = frames.pop();
         frames.finish(child, &locals, &mut values, &mut status, true);
@@ -914,7 +831,7 @@ fn row_loop_resources_release_once_on_pop_and_owner_drop() {
                 frames.enter(FrameEntry::new(
                     block,
                     EntryState::Rows {
-                        target: SqlName::parse("x").unwrap(),
+                        target: PlpgsqlVariableName::plain(SqlName::parse("x").unwrap()),
                         index: 0,
                         values: rows,
                     },
@@ -1264,7 +1181,12 @@ fn lowered_assignment_inputs_bind_handler_variables_from_the_original_source() {
                 generation: 1,
                 statement: 0,
             },
-            || TriggerInvocation::anonymous(crate::sql::guc::VariableConflict::Error),
+            || {
+                TriggerInvocation::anonymous(crate::sql::guc::PlpgsqlSettings {
+                    variable_conflict: crate::sql::guc::VariableConflict::Error,
+                    print_strict_params: false,
+                })
+            },
         )
         .unwrap()
         .with_input_sites(program.input_sites);
@@ -1354,7 +1276,7 @@ fn quoted_cursor_names_use_tokens_in_open_fetch_move_and_close() {
                             .unwrap();
                         assert_eq!(motion.variable, open.variable);
                         if !motion.move_only {
-                            assert_eq!(motion.targets[0].as_str(), "output value");
+                            assert_eq!(motion.targets[0].name.as_str(), "output value");
                         }
                     }
                     assert_eq!(
@@ -1375,12 +1297,16 @@ fn lexical_variable_values_types_and_domains_select_one_binding() {
         statement: 0,
     };
     let mut invocation = super::super::super::type_input_plans::with_owner(owner, || {
-        TriggerInvocation::anonymous(crate::sql::guc::VariableConflict::Error)
+        TriggerInvocation::anonymous(crate::sql::guc::PlpgsqlSettings {
+            variable_conflict: crate::sql::guc::VariableConflict::Error,
+            print_strict_params: false,
+        })
     })
     .unwrap();
     invocation.program_kind = PlpgsqlProgramKind::Trigger;
     invocation.name = "actual trigger";
     let mut locals = ["tg_name", "found", "sqlstate", "sqlerrm"].map(|name| TriggerLocalDecl {
+        label: None,
         name: SqlName::parse(name).unwrap(),
         ctype: ColType::Int4,
         ..empty_plpgsql_local()
@@ -1448,11 +1374,13 @@ fn lexical_variable_values_types_and_domains_select_one_binding() {
         let same_name = SqlName::parse("value").unwrap();
         let declarations = [
             TriggerLocalDecl {
+                label: None,
                 name: same_name,
                 ctype: ColType::Int4,
                 ..empty_plpgsql_local()
             },
             TriggerLocalDecl {
+                label: None,
                 name: same_name,
                 ctype: ColType::Text,
                 ..empty_plpgsql_local()
@@ -1468,7 +1396,10 @@ fn lexical_variable_values_types_and_domains_select_one_binding() {
         .unwrap();
         assert_eq!(selected.value, Datum::Text("body local"));
         assert_eq!(selected.ctype, ColType::Text);
-        assert_eq!(trigger_local_index(&declarations, same_name).unwrap(), 1);
+        assert_eq!(
+            trigger_local_index(&declarations, PlpgsqlVariableName::plain(same_name)).unwrap(),
+            1
+        );
     });
 }
 
@@ -1519,6 +1450,7 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                     // This pass uses names and mutability, independently of catalog types.
                     let locals = scratch
                         .alloc_slice_with(parsed.locals.len(), |index| TriggerLocalDecl {
+                            label: None,
                             name: parsed.locals[index].name,
                             constant: parsed.locals[index].constant,
                             ..empty_plpgsql_local()
@@ -1529,6 +1461,7 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                         body: parsed.body,
                         input_sites: parsed.input_sites,
                         variable_conflict: parsed.variable_conflict,
+                        print_strict_params: parsed.print_strict_params,
                     };
                     let result = validate_plpgsql_constant_assignments(&program, &|_| false);
                     match expected {
@@ -1623,12 +1556,14 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
                 .unwrap();
         let locals = [
             TriggerLocalDecl {
+                label: None,
                 name: SqlName::parse("x").unwrap(),
                 ctype: ColType::Text,
                 constant: true,
                 ..empty_plpgsql_local()
             },
             TriggerLocalDecl {
+                label: None,
                 name: SqlName::parse("marker").unwrap(),
                 ctype: ColType::Text,
                 not_null: true,
@@ -1755,11 +1690,6 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
         );
         assert_eq!(execution.status.found, Some(true));
         assert_eq!(execution.status.row_count, 37);
-        assert_eq!(execution.status.outputs[0].shadow_depth, 1);
-        assert_eq!(
-            execution.status.outputs[0].value.read(0, &output).unwrap(),
-            Datum::Text("outside counter")
-        );
         // Restored values borrow the destination, not the released saved images.
         let mut overwritten = rows.lease::<u8>(64 << 10).unwrap();
         overwritten.extend_from_slice(&[0xff; 4096]).unwrap();
@@ -1769,8 +1699,9 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
         assert_eq!(frames.state.active, 3);
         assert_eq!(frames.last().next, 1);
         let (_, current, _) = frames.scope(&execution.locals, &mut execution.values);
-        assert_eq!(current[0], Datum::Int4(1));
+        assert_eq!(current[0], Datum::Text("outside counter"));
         assert_eq!(current[2], Datum::Int4(1));
+        assert_eq!(current[3], Datum::Int4(1));
         assert!(
             matches!(current[1], Datum::Text(value) if value.len() == 256 && value.bytes().all(|byte| byte == b'b'))
         );
@@ -1839,11 +1770,13 @@ fn failed_frame_capture_preserves_live_scopes_and_drop_returns_paused_capacity()
         .unwrap();
         let locals = [
             TriggerLocalDecl {
+                label: None,
                 name: SqlName::parse("x").unwrap(),
                 ctype: ColType::Text,
                 ..empty_plpgsql_local()
             },
             TriggerLocalDecl {
+                label: None,
                 name: SqlName::parse("marker").unwrap(),
                 ctype: ColType::Text,
                 ..empty_plpgsql_local()
@@ -1893,7 +1826,8 @@ fn failed_frame_capture_preserves_live_scopes_and_drop_returns_paused_capacity()
             let mut frames = retained.execution(&workspace, &code).unwrap();
             assert_eq!(frames.state.active, 2);
             let (_, values, _) = frames.scope(&execution.locals, &mut execution.values);
-            assert_eq!(values[0], Datum::Int4(1));
+            assert_eq!(values[0], Datum::Text("outside counter"));
+            assert_eq!(values[2], Datum::Int4(1));
             assert!(
                 matches!(values[1], Datum::Text(value) if value.len() == 512 && value.bytes().all(|byte| byte == b'q'))
             );
@@ -1938,6 +1872,7 @@ fn declaration_capture_is_failure_preserving_and_repeated_pauses_share_metadata(
         )
         .unwrap();
         let declarations = [TriggerLocalDecl {
+            label: None,
             name: SqlName::parse("selected").unwrap(),
             ctype: ColType::Text,
             constant: true,

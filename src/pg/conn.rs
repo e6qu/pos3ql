@@ -685,6 +685,9 @@ impl Conn {
         self.arena.reset();
         self.txn.clear();
         self.sqlprep.clear();
+        // Routine instances are the backend's function cache: a new client
+        // compiles each function again under its own settings.
+        self.sqlprep.routine_inputs.clear();
         self.cursors.clear();
         for p in &mut self.prepared {
             p.active = false;

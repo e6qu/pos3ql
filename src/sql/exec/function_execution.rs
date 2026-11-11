@@ -189,6 +189,7 @@ struct FunctionBinding {
     input_owner: super::super::type_input_plans::Owner,
     input_collation: crate::sql::ast::Collation,
     variable_conflict: super::super::guc::VariableConflict,
+    print_strict_params: bool,
     fresh_snapshots: bool,
     parameters: SharedSlice<RoutineArgumentDef>,
     inputs: local_values::SavedValues,
@@ -292,6 +293,7 @@ impl FunctionBinding {
             input_collation: self.input_collation,
             input_sites,
             variable_conflict: self.variable_conflict,
+            print_strict_params: self.print_strict_params,
             fresh_snapshots: self.fresh_snapshots,
             materialized_relations: None,
             nargs: i32::try_from(self.parameters.len()).expect("bounded routine argument count"),
@@ -571,7 +573,7 @@ pub(crate) fn execute<'a>(
     environment: &CallEnvironment,
     policy: super::super::query::RoutineExecution,
     suspended: &mut Option<SuspendedFunction>,
-    compiled_conflict: super::super::guc::VariableConflict,
+    compiled_conflict: super::super::guc::PlpgsqlSettings,
 ) -> Result<FunctionOutput<'a>, SqlError> {
     let inputs = arena
         .alloc_slice_copy(inputs)
@@ -628,6 +630,7 @@ pub(crate) fn execute<'a>(
             continue;
         }
         declarations[count] = TriggerLocalDecl {
+            label: Some(routine.name),
             scope: PlpgsqlScope::Invocation,
             name: argument.name,
             ctype: argument.ctype,
@@ -650,6 +653,7 @@ pub(crate) fn execute<'a>(
             return;
         }
         declarations[count] = TriggerLocalDecl {
+            label: Some(routine.name),
             scope: PlpgsqlScope::Invocation,
             name: output.name,
             ctype: output.ctype,
@@ -712,7 +716,7 @@ pub(crate) fn execute<'a>(
         routine,
         kind,
         collation,
-        program.variable_conflict(compiled_conflict),
+        program.settings(compiled_conflict),
         arena,
     )?
     .with_input_sites(program.input_sites);
@@ -820,6 +824,7 @@ pub(crate) fn execute<'a>(
                         input_owner: invocation.input_owner,
                         input_collation: collation,
                         variable_conflict: invocation.variable_conflict,
+                        print_strict_params: invocation.print_strict_params,
                         fresh_snapshots: invocation.fresh_snapshots,
                         parameters,
                         inputs: saved_inputs,

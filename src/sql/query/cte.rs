@@ -2609,20 +2609,23 @@ fn with_exec_context<'a, 's, 'e, R>(
             ));
         }
         if cte.dml.is_some() {
-            let materialized_cte = dml_mats
-                .iter()
-                .find(|(name, _)| *name == cte.name)
-                .map(|(_, materialized_cte)| *materialized_cte)
-                .ok_or_else(|| {
-                    sql_err!(
+            match dml_mats.iter().find(|(name, _)| *name == cte.name) {
+                Some(&(_, materialized_cte)) => materialized
+                    .push((cte.name, materialized_cte))
+                    .map_err(|_| arena_full())?,
+                // A query nothing reads runs after the main query.
+                None if root_references(cte.name) == 0
+                    && with
+                        .iter()
+                        .all(|other| cte_references(other, cte.name) == 0) => {}
+                None => {
+                    return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "data-modifying CTE \"{}\" was not materialized",
                         cte.name
-                    )
-                })?;
-            materialized
-                .push((cte.name, materialized_cte))
-                .map_err(|_| arena_full())?;
+                    ));
+                }
+            }
         } else if cte.recursive && self_references > 0 {
             let recursive =
                 materialize_recursive(cte, context, storage, txid, arena, params, sequences)?;
@@ -3044,6 +3047,28 @@ fn select_references(s: &Select, name: &str) -> usize {
         .map(|cte| cte_references(cte, name))
         .sum::<usize>();
     count
+}
+
+/// The query a `WITH` list belongs to.
+#[derive(Clone, Copy)]
+pub(crate) enum CteReader<'a> {
+    Select(&'a Select<'a>),
+    Statement(&'a Stmt<'a>),
+}
+
+/// PostgreSQL runs a data-modifying `WITH` query when its rows are first read,
+/// and one that nothing reads after the main query has finished.
+pub(crate) fn dml_cte_runs_after(with: &[Cte<'_>], index: usize, main: CteReader<'_>) -> bool {
+    let name = with[index].name;
+    let read_by_main = match main {
+        CteReader::Select(select) => select_references(select, name),
+        CteReader::Statement(statement) => statement_references(statement, name),
+    };
+    read_by_main == 0
+        && with
+            .iter()
+            .enumerate()
+            .all(|(other, cte)| other == index || cte_references(cte, name) == 0)
 }
 
 fn cte_references(cte: &Cte<'_>, name: &str) -> usize {

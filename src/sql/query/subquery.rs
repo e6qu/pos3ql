@@ -737,7 +737,7 @@ pub(super) fn check_subquery_literals<'a>(
     Ok(())
 }
 
-fn check_select_literals<'a>(
+pub(super) fn check_select_literals<'a>(
     select: &'a Select<'a>,
     outer: Option<&QueryScope<'a>>,
     storage: &Storage,

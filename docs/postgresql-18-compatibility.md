@@ -123,7 +123,8 @@ Syntax and errors:
   query nothing reads must still be valid (`WITH x AS (SELECT * FROM missing)
   SELECT 1` fails), a constant compared with or added to a column must convert
   to its type (`WHERE id = 'abc'` fails even on an empty table, and so does a
-  `SELECT`'s subquery `(SELECT id FROM t WHERE id = 'abc')`), and
+  subquery `(SELECT id FROM t WHERE id = 'abc')` of a `SELECT`, `INSERT`,
+  `UPDATE` or `DELETE`, including one in `RETURNING`), and
   `CREATE FUNCTION` checks a SQL body's queries, target relations, target
   columns and assigned value types unless `check_function_bodies` is off
   (always for a `BEGIN ATOMIC` body).
@@ -139,10 +140,11 @@ Syntax and errors:
   is of type text` at `m`. `INSERT ... SELECT` checks the query's output
   types, so a `UNION` of untyped literals is text. A `SELECT *` mismatch has
   no cursor position.
-- PL/pgSQL converts a value to a variable's, `OUT` parameter's or result's
-  type with an assignment cast when one exists, and otherwise through text, as
-  PostgreSQL does: `x := true` for an integer `x` fails with `invalid input
-  syntax for type integer: "t"`. `CREATE FUNCTION` checks that a SQL
+- PL/pgSQL converts a value to a variable's, array element's, `OUT`
+  parameter's or result's type with an assignment cast when one exists, and
+  otherwise through text, as PostgreSQL does: `x := true` for an integer `x`,
+  or `x[1] := true` for an integer array, fails with `invalid input syntax for
+  type integer: "t"`. `CREATE FUNCTION` checks that a SQL
   function's final query returns one column of a type that converts to a
   scalar result (`return type mismatch in function declared to return
   integer`, detail `Actual return type is text.`), with context `SQL function
@@ -158,20 +160,43 @@ Syntax and errors:
 - A function's name qualifies its parameters, as in PostgreSQL: in
   `CREATE FUNCTION f(a int)`, `f.a` is the parameter `a` in SQL and
   PL/pgSQL bodies, even when a table in the query has a column `a`.
+- PL/pgSQL blocks nest with their own `DECLARE` sections, and a label
+  (`<<outer>>`) names a block or loop as in PostgreSQL. `outer.x` reads or
+  assigns the `x` that block declares even where an inner block or an integer
+  `FOR` counter shadows it; `EXIT outer` leaves a labelled block or loop and
+  `CONTINUE outer` resumes a labelled loop. A nested block's variables are
+  initialized in order each time it is entered, outside its own exception
+  handlers. `END outer` and `END LOOP outer` must repeat the label (`end label
+  "b" differs from block's label "a"`).
 - A name in a PL/pgSQL statement that is both a variable and a column is
   ambiguous, as in PostgreSQL: with parameter `a`, `UPDATE t SET b = 1/(a-15)`
   fails with `42702` (`column reference "a" is ambiguous`, detail `It could
   refer to either a PL/pgSQL variable or a table column.`) before any row is
   read, at any query level. `#variable_conflict use_column` at the start of
   the body, or the superuser setting `plpgsql.variable_conflict =
-  use_column`, reads the column instead. The setting is read when a backend
-  first runs the function, and a body's option overrides it. `use_variable`
-  works for names that are not columns; a name that is also a column fails
-  with `0A000` instead of reading the variable. The setting exists from
-  startup, as if PL/pgSQL were preloaded.
+  use_column`, reads the column instead. `use_variable` works for names that
+  are not columns; a name that is also a column fails with `0A000` instead of
+  reading the variable. The setting exists from startup, as if PL/pgSQL were
+  preloaded.
+- A PL/pgSQL function keeps the `plpgsql.variable_conflict` and
+  `plpgsql.print_strict_params` values it was compiled under, as PostgreSQL's
+  per-session function cache does: the creating session compiles it at
+  `CREATE FUNCTION` for calls without collatable inputs, and other calls
+  compile it at their session's first call. A body's `#variable_conflict` or
+  `#print_strict_params` option overrides the setting; `#option dump` is
+  accepted. With `print_strict_params` on, a `STRICT` failure's detail lists
+  the variables the statement reads, in declaration order (`parameters: p =
+  '1', q = NULL`), or an `EXECUTE`'s `USING` values as `$1 = '1'`.
 - Each query of a volatile PL/pgSQL function, procedure, trigger or `DO` block
   sees the rows its earlier statements changed; a stable or immutable
   function reads its caller's snapshot.
+- Data-changing `WITH` queries run exactly once and share the main query's
+  snapshot, as in PostgreSQL: in `WITH d AS (DELETE FROM t) INSERT INTO t
+  VALUES (9)`, the delete removes only the rows that existed before the
+  statement, and the main query sees a `WITH` query's changes only through
+  its `RETURNING` rows. One that nothing reads runs after the main query, the
+  last written first. One the main query reads runs before it, in written
+  order, where PostgreSQL runs it when its rows are first read.
 - A PL/pgSQL condition of another type converts through its text form as in
   PostgreSQL: `IF 1` is true and `IF 5` fails with `invalid input syntax for
   type boolean`.

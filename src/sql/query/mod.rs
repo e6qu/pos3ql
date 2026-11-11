@@ -72,6 +72,7 @@ pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;
 pub(crate) use cte::captured_type_oid;
+pub(crate) use cte::{CteReader, dml_cte_runs_after};
 mod dependencies;
 mod procedural_names;
 pub(crate) use procedural_names::{

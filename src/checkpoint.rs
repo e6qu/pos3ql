@@ -20280,6 +20280,8 @@ mod stored_dependency_tests {
                         }
                         Err(error) => panic!("accept saved-row read: {error}"),
                     };
+                    // BSD sockets inherit the listener's nonblocking mode.
+                    socket.set_nonblocking(false).unwrap();
                     socket
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();

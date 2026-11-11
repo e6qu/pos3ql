@@ -1227,6 +1227,7 @@ pub(crate) fn validate_dml_assignment_casts(
         let target = match statement {
             Stmt::Insert(insert) => insert.table,
             Stmt::Update(update) => update.table,
+            Stmt::Delete(delete) => delete.table,
             Stmt::Merge(merge) => merge.target,
             _ => return Ok(()),
         };
@@ -1241,6 +1242,7 @@ pub(crate) fn validate_dml_assignment_casts(
         let (alias, extra) = match statement {
             Stmt::Insert(_) => (None, None),
             Stmt::Update(update) => (update.alias, update.from),
+            Stmt::Delete(delete) => (delete.alias, delete.using),
             Stmt::Merge(merge) => {
                 let source = arena
                     .alloc(FromClause {
@@ -1254,6 +1256,10 @@ pub(crate) fn validate_dml_assignment_casts(
         };
         let target_name = target.name;
         let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena)?;
+        // Each subquery level converts a constant compared with its columns
+        // before any row is read, as PostgreSQL's analysis does: the WHERE
+        // clause first, then the assignments or inserted values.
+        use super::subquery::check_subquery_literals as subquery_literals;
         let target = scope.defs.get(0).expect("assignment target resolved");
         let catalog = super::storage_catalog(storage, arena, txid);
         let transition = transition.map(|row| crate::sql::eval::RuntimeColumnTypes {
@@ -1331,9 +1337,13 @@ pub(crate) fn validate_dml_assignment_casts(
                     }
                 }
                 for row in insert.rows {
+                    for expression in row.iter() {
+                        subquery_literals(expression, None, storage, txid, arena)?;
+                    }
                     insert_values(insert.columns, row)?;
                 }
                 if let Some(select) = insert.select {
+                    super::subquery::check_select_literals(select, None, storage, txid, arena)?;
                     validate_insert_projection(
                         select,
                         insert.columns,
@@ -1354,8 +1364,17 @@ pub(crate) fn validate_dml_assignment_casts(
                 }
             }
             Stmt::Update(update) => {
+                if let Some(predicate) = update.where_clause {
+                    subquery_literals(predicate, Some(&scope), storage, txid, arena)?;
+                }
                 for (name, expression) in update.assignments {
+                    subquery_literals(expression, Some(&scope), storage, txid, arena)?;
                     assign(name, expression)?;
+                }
+            }
+            Stmt::Delete(delete) => {
+                if let Some(predicate) = delete.where_clause {
+                    subquery_literals(predicate, Some(&scope), storage, txid, arena)?;
                 }
             }
             Stmt::Merge(merge) => {
@@ -1374,6 +1393,17 @@ pub(crate) fn validate_dml_assignment_casts(
                 }
             }
             _ => unreachable!(),
+        }
+        let returning = match statement {
+            Stmt::Insert(insert) => insert.returning.items,
+            Stmt::Update(update) => update.returning.items,
+            Stmt::Delete(delete) => delete.returning.items,
+            _ => &[],
+        };
+        for item in returning {
+            if let SelectItem::Expr { expression, .. } = item {
+                subquery_literals(expression, Some(&scope), storage, txid, arena)?;
+            }
         }
         Ok(())
     })();

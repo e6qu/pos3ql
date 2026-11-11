@@ -125,10 +125,10 @@ struct Slot {
     // again when its caller later restores the former search path.
     invalidated: bool,
     input_attempt: Option<super::sequence::StatementInputAttempt>,
-    /// A PL/pgSQL instance keeps the `plpgsql.variable_conflict` value in
-    /// effect when this backend first compiled it, as PostgreSQL's function
-    /// cache does.
-    variable_conflict: Option<super::guc::VariableConflict>,
+    /// A PL/pgSQL instance keeps the `plpgsql.variable_conflict` and
+    /// `plpgsql.print_strict_params` values in effect when this backend first
+    /// compiled it, as PostgreSQL's function cache does.
+    compile_settings: Option<super::guc::PlpgsqlSettings>,
 }
 
 impl Slot {
@@ -138,7 +138,7 @@ impl Slot {
         self.validity = None;
         self.invalidated = false;
         self.input_attempt = None;
-        self.variable_conflict = None;
+        self.compile_settings = None;
     }
 }
 
@@ -165,7 +165,7 @@ impl RoutineInputPlans {
                     validity: None,
                     invalidated: false,
                     input_attempt: None,
-                    variable_conflict: None,
+                    compile_settings: None,
                 })
                 .expect("startup reserved every routine-input control");
         }
@@ -321,6 +321,10 @@ impl RoutineInputPlans {
             });
         }
         let mut current = None;
+        // A replaced instance of the same definition keeps the settings it
+        // was compiled under, as PostgreSQL's function cache does until the
+        // function itself changes.
+        let mut compiled = None;
         for index in 0..self.slots.len() {
             let slot = &self.slots[index];
             let key = match &slot.state {
@@ -358,6 +362,7 @@ impl RoutineInputPlans {
                 if reusable {
                     current = Some(key);
                 } else {
+                    compiled = compiled.or(self.slots[index].compile_settings);
                     self.slots[index].invalidated = true;
                     if !self.is_retained(plan) {
                         self.abandon(plan)?;
@@ -389,6 +394,7 @@ impl RoutineInputPlans {
             },
         };
         let reserved = self.install(index, generation, key, specialization);
+        self.slots[index].compile_settings = compiled;
         Ok(BodyAdmission {
             key,
             reserved: Some(reserved),
@@ -481,7 +487,7 @@ impl RoutineInputPlans {
             validity: None,
             invalidated: false,
             input_attempt: None,
-            variable_conflict: None,
+            compile_settings: None,
         };
         PlanId {
             slot: index,
@@ -888,15 +894,15 @@ impl RoutineInputPlans {
         }
     }
 
-    /// Records the conflict rule a PL/pgSQL instance compiled with; the first
+    /// Records the settings a PL/pgSQL instance compiled with; the first
     /// recording wins for the instance's lifetime.
-    pub(crate) fn compiled_variable_conflict(
+    pub(crate) fn compiled_settings(
         &mut self,
         plan: PlanId,
-        current: super::guc::VariableConflict,
-    ) -> Result<super::guc::VariableConflict, SqlError> {
+        current: super::guc::PlpgsqlSettings,
+    ) -> Result<super::guc::PlpgsqlSettings, SqlError> {
         let slot = self.slot_mut(plan)?;
-        Ok(*slot.variable_conflict.get_or_insert(current))
+        Ok(*slot.compile_settings.get_or_insert(current))
     }
 
     fn slot(&self, id: PlanId) -> Result<&Slot, SqlError> {

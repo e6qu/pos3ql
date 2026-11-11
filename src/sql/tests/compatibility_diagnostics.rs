@@ -1304,3 +1304,281 @@ fn subquery_constants_convert_before_rows_are_read() {
         assert_eq!(data_rows(&output), ["NULL|NULL"]);
     });
 }
+
+#[test]
+fn plpgsql_labels_name_blocks_loops_and_their_variables() {
+    with_engine("plpgsql-labels", |engine, budget| {
+        // Results from PostgreSQL 18.6.
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE FUNCTION lb_nested() RETURNS text LANGUAGE plpgsql AS $$
+               <<blo>> DECLARE x int := 1;
+               BEGIN
+                 <<bli>> DECLARE x int := x + 10; y int := x;
+                 BEGIN RETURN blo.x || ',' || bli.x || ',' || x || ',' || y; END bli;
+               END blo $$;
+             CREATE FUNCTION lb_loops() RETURNS int LANGUAGE plpgsql AS $$
+               DECLARE n int := 0;
+               BEGIN
+                 <<o>> FOR i IN 1..3 LOOP
+                   <<inr>> FOR j IN 1..3 LOOP
+                     n := n + o.i * 10 + inr.j;
+                     CONTINUE o WHEN j = 2;
+                     EXIT o WHEN i = 3;
+                   END LOOP inr;
+                 END LOOP o;
+                 <<blk>> BEGIN n := n + 1000; EXIT blk; n := 0; END blk;
+                 RETURN n;
+               END $$;
+             CREATE FUNCTION lb_shadow(p int) RETURNS text LANGUAGE plpgsql AS $$
+               <<b>> DECLARE i int := 7; t text := '';
+               BEGIN
+                 <<lp>> FOR i IN 1..2 LOOP b.i := b.i + lp.i; t := t || i; END LOOP;
+                 FOR k IN 1..2 LOOP
+                   DECLARE s int := k * 2;
+                   BEGIN t := t || s; s := 0; END;
+                 END LOOP;
+                 PERFORM 1;
+                 RETURN i || ',' || t || ',' || lb_shadow.p || ',' || lb_shadow.found;
+               END $$;
+             SELECT lb_nested(), lb_loops(), lb_shadow(4);",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["1,11,11,11|1097|10,1224,4,true"],
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        for (sql, expected) in [
+            (
+                "DO $$ BEGIN <<b>> BEGIN CONTINUE b; END; END $$",
+                "42601 block label \"b\" cannot be used in CONTINUE",
+            ),
+            (
+                "DO $$ BEGIN BEGIN EXIT; END; END $$",
+                "42601 EXIT cannot be used outside a loop, unless it has a label",
+            ),
+            (
+                "DO $$ BEGIN EXIT nolabel; END $$",
+                "42601 there is no label \"nolabel\" attached to any block or loop enclosing this statement",
+            ),
+            (
+                "DO $$ <<a>> BEGIN NULL; END b $$",
+                "42601 end label \"b\" differs from block's label \"a\"",
+            ),
+            (
+                "DO $$ BEGIN <<lp>> LOOP EXIT lp; END LOOP wrong; END $$",
+                "42601 end label \"wrong\" differs from block's label \"lp\"",
+            ),
+            (
+                "DO $$ BEGIN NULL; END b $$",
+                "42601 end label \"b\" specified for unlabeled block",
+            ),
+            (
+                "DO $$ BEGIN <<x>> NULL; END $$",
+                "42601 syntax error at or near \"NULL\"",
+            ),
+            (
+                "DO $$ DECLARE <<x>> BEGIN NULL; END $$",
+                "42601 block label must be placed before DECLARE, not after",
+            ),
+            (
+                "DO $$ BEGIN DECLARE a int; a int; BEGIN NULL; END; END $$",
+                "42601 duplicate declaration at or near \"a\"",
+            ),
+            (
+                "DO $$ BEGIN DECLARE c CONSTANT int := 1; BEGIN c := 2; END; END $$",
+                "22005 variable \"c\" is declared CONSTANT",
+            ),
+            (
+                "DO $$ <<b>> DECLARE x int := 1; BEGIN b.nope := 3; END $$",
+                "42601 \"b.nope\" is not a known variable",
+            ),
+        ] {
+            let found = diagnostics(&run_with(engine, budget, sql));
+            assert!(
+                found
+                    .first()
+                    .is_some_and(|line| line.starts_with(&format!("ERROR {expected}"))),
+                "{sql}: {found:?}"
+            );
+        }
+        let output = run_with(
+            engine,
+            budget,
+            "DO $$ BEGIN DECLARE z int := 1/0; BEGIN NULL; EXCEPTION WHEN others THEN NULL; END; END $$",
+        );
+        assert_eq!(
+            diagnostics(&output)[0],
+            "ERROR 22012 division by zero",
+            "a block's declarations are initialized outside its handlers"
+        );
+    });
+}
+
+#[test]
+fn data_modifying_with_runs_once_under_one_snapshot_and_unread_last() {
+    with_engine("data-modifying-with-order", |engine, budget| {
+        // Results from PostgreSQL 18.6. A PL/pgSQL call restarts the main
+        // query without repeating the WITH query's insert.
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE TABLE dw (a int);
+             CREATE TABLE dw_log (msg text);
+             CREATE FUNCTION dw_count() RETURNS bigint LANGUAGE plpgsql VOLATILE AS $$
+               BEGIN RETURN (SELECT count(*) FROM dw); END $$;
+             CREATE FUNCTION dw_note(t text) RETURNS int LANGUAGE plpgsql VOLATILE AS $$
+               BEGIN INSERT INTO dw_log VALUES (t); RETURN 1; END $$;
+             WITH w AS (INSERT INTO dw VALUES (1)) SELECT dw_count();
+             WITH w AS (INSERT INTO dw VALUES (2) RETURNING a)
+               SELECT dw_count(), (SELECT count(*) FROM dw), (SELECT a FROM w);
+             WITH a AS (INSERT INTO dw VALUES (dw_note('first'))),
+                  b AS (INSERT INTO dw VALUES (dw_note('second')))
+               SELECT dw_note('main');
+             SELECT string_agg(msg, ',') FROM dw_log;
+             WITH d AS (DELETE FROM dw) INSERT INTO dw VALUES (99);
+             SELECT string_agg(a::text, ',') FROM dw;",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["0", "1|1|2", "1", "main,second,first", "99"],
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    });
+}
+
+#[test]
+fn plpgsql_array_elements_convert_like_variables() {
+    with_engine("plpgsql-element-assignment", |engine, budget| {
+        // PostgreSQL 18.6: assignment cast, otherwise through text.
+        let output = run_with(
+            engine,
+            budget,
+            "DO $$ DECLARE x int[] := '{1,2}'; BEGIN x[1] := true; END $$",
+        );
+        assert_eq!(
+            diagnostics(&output)[0],
+            "ERROR 22P02 invalid input syntax for type integer: \"t\""
+        );
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE FUNCTION ea() RETURNS text LANGUAGE plpgsql AS $$
+               DECLARE x int[] := '{1,2}'; t text[] := '{a}'; n numeric := 2.6;
+               BEGIN x[1] := '7'; x[2] := n; t[2] := 5; t[3] := true;
+               RETURN x::text || t::text; END $$;
+             SELECT ea();",
+        );
+        assert_eq!(data_rows(&output), ["{7,3}{a,5,true}"]);
+    });
+}
+
+#[test]
+fn strict_failures_print_the_statement_variables_when_asked() {
+    with_engine("print-strict-params", |engine, budget| {
+        // DETAIL texts from PostgreSQL 18.6.
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE TABLE sp (a int, b text);
+             INSERT INTO sp VALUES (1, 'x'), (1, 'y');
+             CREATE FUNCTION sp_on(p int, q text) RETURNS text LANGUAGE plpgsql AS $$
+               #print_strict_params on
+               DECLARE r text; z int := 3;
+               BEGIN SELECT b INTO STRICT r FROM sp WHERE a = p AND b <> q AND z = 3;
+               RETURN r; END $$;
+             CREATE FUNCTION sp_execute(p text) RETURNS text LANGUAGE plpgsql AS $$
+               #print_strict_params on
+               DECLARE r text;
+               BEGIN EXECUTE 'SELECT b FROM sp WHERE a = $1' INTO STRICT r USING length(p);
+               RETURN r; END $$;
+",
+        );
+        assert!(
+            !diagnostics(&output)
+                .iter()
+                .any(|line| line.starts_with("ERROR")),
+            "{:?}",
+            diagnostics(&output)
+        );
+        for (sql, expected) in [
+            (
+                "SELECT sp_on(2, 'it''s')",
+                "ERROR P0002 query returned no rows detail: parameters: p = '2', q = 'it''s', z = '3'",
+            ),
+            (
+                "SELECT sp_execute('x')",
+                "ERROR P0003 query returned more than one row detail: parameters: $1 = '1'",
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql))[0],
+                expected,
+                "{sql}"
+            );
+        }
+        // The creating session compiles the function with its setting.
+        let output = run_with(
+            engine,
+            budget,
+            "SET plpgsql.print_strict_params = on;
+             CREATE FUNCTION sp_session(p int) RETURNS int LANGUAGE plpgsql AS $$
+               DECLARE r int;
+               BEGIN UPDATE sp SET a = a WHERE a = p RETURNING a INTO STRICT r;
+               RETURN r; END $$;
+             RESET plpgsql.print_strict_params;
+             SELECT sp_session(5);",
+        );
+        assert!(
+            diagnostics(&output).contains(
+                &"ERROR P0002 query returned no rows detail: parameters: p = '5'".to_string()
+            ),
+            "{:?}",
+            diagnostics(&output)
+        );
+    });
+}
+
+#[test]
+fn data_change_subquery_constants_convert_before_rows_are_read() {
+    with_engine("dml-subquery-literals", |engine, budget| {
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE TABLE ds (a int); CREATE TABLE du (a int)",
+        );
+        assert_eq!(diagnostics(&output), ["CREATE TABLE", "CREATE TABLE"]);
+        // Positions from PostgreSQL 18.6; `^` marks the cursor. Both tables
+        // are empty, so only analysis can find these.
+        for (sql, literal) in [
+            (
+                "DELETE FROM ds WHERE a IN (SELECT a FROM du WHERE a = ^'q')",
+                "q",
+            ),
+            ("UPDATE ds SET a = (SELECT a FROM du WHERE a = ^'zz')", "zz"),
+            (
+                "INSERT INTO ds VALUES ((SELECT a FROM du WHERE a = ^'r'))",
+                "r",
+            ),
+            ("INSERT INTO ds SELECT a FROM du WHERE a = ^'k'", "k"),
+            (
+                "DELETE FROM ds RETURNING (SELECT a FROM du WHERE a = ^'ret')",
+                "ret",
+            ),
+        ] {
+            let at = sql.find('^').unwrap();
+            let written = sql.replacen('^', "", 1);
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, &written)),
+                [format!(
+                    "ERROR 22P02 invalid input syntax for type integer: \"{literal}\" @{}",
+                    at + 1
+                )],
+                "{written}"
+            );
+        }
+    });
+}

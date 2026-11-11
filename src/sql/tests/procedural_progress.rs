@@ -217,12 +217,15 @@ fn output_control_admission_precedes_initializers_and_releases_failed_calls() {
 }
 
 #[test]
-fn saved_output_payload_exhaustion_rolls_back_and_returns_control_capacity() {
+fn shadowing_counter_keeps_a_large_output_without_saving_it() {
+    // An integer FOR counter is a new variable; the OUT parameter it shadows
+    // keeps its own slot, so RETURN NEXT needs no saved copy of the payload
+    // and a 4096-byte value fits a 4096-byte execution control pool.
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
     ] {
-        let mut config = test_config(&format!("saved-output-payload-admission-{mode:?}"));
+        let mut config = test_config(&format!("shadowed-output-payload-{mode:?}"));
         config.transaction_mode = mode;
         config.execution_control_bytes = 4096;
         config.execution_control_leases = 16;
@@ -238,40 +241,34 @@ fn saved_output_payload_exhaustion_rolls_back_and_returns_control_capacity() {
         );
         session.success(&mut engine, "CREATE FUNCTION saved_payload(p text) RETURNS TABLE(payload text) LANGUAGE plpgsql AS $$BEGIN payload := p; INSERT INTO saved_payload_audit VALUES (1); FOR payload IN 1..1 LOOP PERFORM nextval('saved_payload_calls'); RETURN NEXT; END LOOP; END$$", true);
         for expected in 1..=2 {
-            let error = session.execute(
-                &mut engine,
-                "SELECT * FROM saved_payload(repeat('x',4096))",
-                true,
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT length(payload), left(payload, 3) FROM saved_payload(repeat('x',4096))",
+                    true,
+                )),
+                ["4096|xxx"],
+                "{mode:?}"
             );
-            assert_eq!(error_sqlstates(&error), ["54000"], "{mode:?}");
-            assert!(String::from_utf8_lossy(&error).contains("execution_control_bytes"));
             assert_eq!(
                 data_rows(&session.success(
                     &mut engine,
                     "SELECT count(*) FROM saved_payload_audit",
                     true
                 )),
-                [(expected - 1).to_string()],
-                "{mode:?}: failed capture must roll back its earlier insert"
-            );
-            assert_eq!(
-                data_rows(&session.success(&mut engine, "SELECT * FROM saved_payload('ok')", true)),
-                ["ok"],
-                "{mode:?}: failed capture must release its owned ranges"
+                [expected.to_string()],
+                "{mode:?}"
             );
         }
         assert_eq!(
-            data_rows(&session.success(
-                &mut engine,
-                "SELECT count(*) FROM saved_payload_audit",
-                true
-            )),
-            ["2"]
+            data_rows(&session.success(&mut engine, "SELECT * FROM saved_payload('ok')", true)),
+            ["ok"],
+            "{mode:?}"
         );
         assert_eq!(
             data_rows(&session.success(&mut engine, "SELECT nextval('saved_payload_calls')", true)),
-            ["3"],
-            "{mode:?}: denied capture must not enter the loop body"
+            ["4"],
+            "{mode:?}: each call runs the loop body once"
         );
     }
 }

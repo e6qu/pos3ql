@@ -289,22 +289,15 @@ PostgreSQL inlines a SQL function's body
 (`SQL function "f" during inlining`) has no context line. Under
 `#variable_conflict use_variable` a variable that is also a column fails with
 `0A000`: aggregate inputs and grouping keys bind names to columns before the
-variable could win. PostgreSQL fixes a function's `plpgsql.variable_conflict`
-when its creating session validates it at `CREATE FUNCTION`; pos3ql reads it
-at the backend's first call. PL/pgSQL `#print_strict_params` and `#option
-dump` fail with `0A000`, so `STRICT` errors carry no `parameters:` detail, and
-a block label (`<<outer>>`) is rejected, so `outer.x` cannot name a block's
-variable. A constant compared with a column inside a subquery of an `INSERT`, `UPDATE` or `DELETE`
-(`DELETE FROM t WHERE a IN (SELECT a FROM u WHERE a = 'q')`) is checked only
-when a row is compared, so an empty table succeeds where PostgreSQL rejects
-`'q'`; a `SELECT`'s subqueries are checked at every level. Assigning a composite
+variable could win. A `STRICT` failure of a dynamic `EXECUTE` that waited
+for storage omits its `parameters:` detail. PL/pgSQL errors found while compiling a body (an unknown label, a duplicate
+declaration) have no cursor position. Assigning a composite
 column's field (`UPDATE t SET pair.x = 1`) is a syntax error; PostgreSQL
-assigns the field. A PL/pgSQL subscripted assignment converts its element
-with an explicit cast, so `x[1] := true` for an integer array stores 1 where
-PostgreSQL rejects the boolean while analysing the assignment. A
-data-changing `WITH` query that the main query does not read runs before it,
-so a volatile function the main query calls sees its rows; PostgreSQL runs it
-after the main query. `pg_sleep` and its
+assigns the field. A
+data-changing `WITH` query that the main query reads runs before the main
+query, in written order; PostgreSQL runs it when the main query first reads
+its rows, so a volatile function called after that point sees them and
+side effects interleave in reading order. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,

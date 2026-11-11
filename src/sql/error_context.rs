@@ -43,6 +43,13 @@ pub(crate) trait Frame {
         None
     }
 
+    /// For a PL/pgSQL invocation: the statement it runs when a `STRICT`
+    /// failure there reports its parameters, else `Some(None)`. Other frames
+    /// answer `None`.
+    fn strict_parameters(&self) -> Option<Option<&str>> {
+        None
+    }
+
     /// Names the dynamic query this frame runs; false if it runs none.
     fn begin_dynamic(&self, _text: *const str) -> bool {
         false
@@ -102,7 +109,7 @@ pub(crate) fn begin_dynamic_query(text: &str) {
 pub(crate) enum QueryMode {
     /// `SQL statement "..."`.
     Statement,
-    /// `SQL expression "..."`.
+    /// `PL/pgSQL expression "..."`.
     Expression,
     /// `PL/pgSQL assignment "..."`.
     Assignment,
@@ -149,7 +156,7 @@ impl Frame for QueryFrame<'_> {
         }
         let what = match self.mode {
             QueryMode::Statement => "SQL statement",
-            QueryMode::Expression => "SQL expression",
+            QueryMode::Expression => "PL/pgSQL expression",
             QueryMode::Assignment => "PL/pgSQL assignment",
         };
         write!(out, "{what} \"{}\"", self.text)
@@ -497,6 +504,21 @@ pub(crate) fn innermost_assignment<'s>() -> Option<&'s str> {
     frame
         .assignment()
         .map(|text| unsafe { &*(text as *const str) })
+}
+
+/// The statement whose `STRICT` failure reports its parameters: the
+/// innermost PL/pgSQL invocation's, when `#print_strict_params` is on.
+pub(crate) fn strict_parameters_statement<'s>() -> Option<&'s str> {
+    let mut node = HEAD.with(Cell::get);
+    while !node.is_null() {
+        // Active frames outlive the statement asking for them.
+        let frame = unsafe { &*(*node).frame };
+        if let Some(statement) = frame.strict_parameters() {
+            return statement.map(|text| unsafe { &*(text as *const str) });
+        }
+        node = unsafe { (*node).previous };
+    }
+    None
 }
 
 /// Whether any frame is active, so a notice has a context.

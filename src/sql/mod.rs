@@ -14006,10 +14006,17 @@ impl Engine {
     /// visible to sibling CTEs or the main query except through these relations
     /// (matching PostgreSQL's single-snapshot rule). Returns `None` when the
     /// statement has no data-modifying CTE, so the ordinary path is unchanged.
+    ///
+    /// PostgreSQL runs a data-modifying query that nothing reads after the
+    /// main query: `after` selects those, with `prior` holding the outputs of
+    /// the ones that ran first.
     #[allow(clippy::too_many_arguments)]
     fn run_dml_ctes<'a>(
         &mut self,
         with: &'a [ast::Cte<'a>],
+        main: query::CteReader<'_>,
+        after: bool,
+        prior: &'a [(&'a str, &'a ast::MaterializedCte<'a>)],
         txn: &mut TxnState,
         arena: &'a Arena,
         params: &[Datum<'a>],
@@ -14036,8 +14043,18 @@ impl Engine {
         // All of this statement's sub-parts share one command snapshot.
         self.storage.set_read_snapshot(txn.command_id());
         let mut mats = ArenaList::new(arena);
-        for (cte_index, cte) in with.iter().enumerate() {
+        for materialized in prior {
+            mats.push(*materialized)
+                .map_err(|_| query::arena_full_pub())?;
+        }
+        // PostgreSQL finishes unread queries last first.
+        let order = (0..with.len()).map(|index| if after { with.len() - 1 - index } else { index });
+        for cte_index in order {
+            let cte = &with[cte_index];
             let Some(dml) = cte.dml else { continue };
+            if query::dml_cte_runs_after(with, cte_index, main) != after {
+                continue;
+            }
             // Earlier ordinary, recursive, and data-modifying CTEs are in
             // scope inside this CTE body. Expansion finishes its immutable
             // catalog work before the statement takes a mutable storage borrow.
@@ -15546,6 +15563,7 @@ impl Engine {
             Ok(replay) => replay,
             Err(error) => return Ok(Err(error)),
         };
+        let modifies = statement.with.iter().any(|cte| cte.dml.is_some());
         loop {
             if let Err(error) = sequence::rewind_replay_cursor(replay) {
                 return Ok(Err(error));
@@ -15554,6 +15572,9 @@ impl Engine {
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
             let output_mark = responder.mark();
+            let attempt_arena_mark = arena.mark();
+            let statement_mark =
+                txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
             let outcome = self.execute_select_once(
                 statement,
                 arena,
@@ -15568,6 +15589,13 @@ impl Engine {
             };
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                 return Ok(Err(error));
+            }
+            if modifies {
+                // A data-modifying WITH query's changes are repeated by the
+                // next attempt, so this attempt's are undone first.
+                self.rollback_waiting_statement(txn, statement_mark);
+                self.dml_scratch.clear();
+                unsafe { arena.rewind_to(attempt_arena_mark) };
             }
             if let Err(error) = responder.truncate_to(output_mark) {
                 // Rows already sent cannot be withdrawn for another attempt.
@@ -16404,6 +16432,8 @@ impl Engine {
         }
     }
 
+    /// Runs a `SELECT` with its data-modifying `WITH` queries: those the
+    /// statement reads first, then the main query, then the rest.
     #[allow(clippy::too_many_arguments)]
     fn execute_select_once<'statement>(
         &mut self,
@@ -16418,56 +16448,104 @@ impl Engine {
         query::with_routine_invocation_scope(
             invocations.map(|invocations| query::RoutineInvocationContext::new(invocations, arena)),
             || {
-                let dml_mats =
-                    match self.run_dml_ctes(statement.with, txn, arena, params, guc, responder) {
-                        Ok(materialized) => materialized.unwrap_or(&[]),
-                        Err(error) => return Ok(Err(error)),
-                    };
-                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
-                let statement = match query::expand_ctes_exec(
-                    statement,
-                    &self.storage,
-                    txn.txid,
-                    &self.work,
+                let main = query::CteReader::Select(statement);
+                let dml_mats = match self.run_dml_ctes(
+                    statement.with,
+                    main,
+                    false,
+                    &[],
+                    txn,
+                    arena,
                     params,
-                    dml_mats,
-                    Some(&sequence),
+                    guc,
+                    responder,
                 ) {
-                    Ok(expanded) => expanded,
+                    Ok(materialized) => materialized.unwrap_or(&[]),
                     Err(error) => return Ok(Err(error)),
                 };
-                if let Err(error) =
-                    query::validate_locking(statement, &self.storage, txn.txid, &self.work)
-                {
-                    return Ok(Err(error));
+                let output_mark = responder.mark();
+                let outcome = self.execute_select_main(
+                    statement,
+                    dml_mats,
+                    arena,
+                    params,
+                    txn,
+                    guc,
+                    invocations,
+                    responder,
+                )?;
+                if outcome.is_err() {
+                    return Ok(outcome);
                 }
-                if statement.from.is_none() {
-                    query::constant_select_resumable(
-                        &self.storage,
-                        txn.txid,
-                        statement,
-                        &self.work,
-                        params,
-                        Some(&sequence),
-                        invocations,
-                        invocations.map(|_| arena),
-                        responder,
-                    )
-                } else {
-                    query::select_query_resumable(
-                        &self.storage,
-                        txn.txid,
-                        statement,
-                        &self.work,
-                        params,
-                        Some(&sequence),
-                        invocations,
-                        invocations.map(|_| arena),
-                        responder,
-                    )
-                }
+                Ok(self.finish_dml_ctes(
+                    statement.with,
+                    main,
+                    dml_mats,
+                    output_mark,
+                    txn,
+                    arena,
+                    params,
+                    guc,
+                    responder,
+                ))
             },
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_select_main<'statement>(
+        &mut self,
+        statement: &ast::Select<'_>,
+        dml_mats: &[(&str, &ast::MaterializedCte<'_>)],
+        arena: &'statement Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        guc: &GucState,
+        invocations: Option<&'statement query::RoutineInvocationState>,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+        let statement = match query::expand_ctes_exec(
+            statement,
+            &self.storage,
+            txn.txid,
+            &self.work,
+            params,
+            dml_mats,
+            Some(&sequence),
+        ) {
+            Ok(expanded) => expanded,
+            Err(error) => return Ok(Err(error)),
+        };
+        if let Err(error) = query::validate_locking(statement, &self.storage, txn.txid, &self.work)
+        {
+            return Ok(Err(error));
+        }
+        if statement.from.is_none() {
+            query::constant_select_resumable(
+                &self.storage,
+                txn.txid,
+                statement,
+                &self.work,
+                params,
+                Some(&sequence),
+                invocations,
+                invocations.map(|_| arena),
+                responder,
+            )
+        } else {
+            query::select_query_resumable(
+                &self.storage,
+                txn.txid,
+                statement,
+                &self.work,
+                params,
+                Some(&sequence),
+                invocations,
+                invocations.map(|_| arena),
+                responder,
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -16624,7 +16702,9 @@ impl Engine {
                 bindings
             }
         };
-        exec::create_routine(
+        let output_mark = responder.mark();
+        let mut created = None;
+        let outcome = exec::create_routine(
             &mut self.storage,
             &mut self.wal,
             txn,
@@ -16634,7 +16714,40 @@ impl Engine {
             guc,
             arena,
             responder,
-        )
+            &mut created,
+        )?;
+        // PostgreSQL's validator compiles a PL/pgSQL function in the creating
+        // session, whose function cache keeps the settings it compiled under
+        // for calls whose input collation it shares (non-collatable inputs).
+        if outcome.is_ok()
+            && check_body
+            && routine.language == ast::RoutineLanguage::PlPgSql
+            && let Some(slot) = created
+        {
+            let definition = self.storage.routine_for(slot, txn.txid);
+            if matches!(
+                definition.kind,
+                crate::storage::RoutineKind::Function { .. }
+                    | crate::storage::RoutineKind::SetFunction { .. }
+                    | crate::storage::RoutineKind::RecordFunction { .. }
+                    | crate::storage::RoutineKind::TableFunction
+                    | crate::storage::RoutineKind::Procedure
+            ) && let Err(error) = self.plpgsql_instance_owner(
+                &definition,
+                ast::Collation::None,
+                txn,
+                sqlprep,
+                guc,
+                arena,
+            ) {
+                // The command's tag is still unsent; the error replaces it.
+                return Ok(Err(match responder.truncate_to(output_mark) {
+                    Ok(()) => error,
+                    Err(truncation) => truncation,
+                }));
+            }
+        }
+        Ok(outcome)
     }
 
     /// The backend's instance of a PL/pgSQL routine, and the
@@ -16647,7 +16760,7 @@ impl Engine {
         sqlprep: &mut SqlPreparedPool,
         guc: &GucState,
         arena: &Arena,
-    ) -> Result<(type_input_plans::Owner, guc::VariableConflict), SqlError> {
+    ) -> Result<(type_input_plans::Owner, guc::PlpgsqlSettings), SqlError> {
         use type_input_plans::{InputImage, Lookup, Owner};
         use type_inputs::RoutineInputKind;
         arena
@@ -16695,7 +16808,7 @@ impl Engine {
                     Some(Lookup::Ready(plan, InputImage::Runtime(bytes))) if bytes.is_empty() => {
                         let conflict = sqlprep
                             .routine_inputs
-                            .compiled_variable_conflict(plan, guc.plpgsql_variable_conflict())?;
+                            .compiled_settings(plan, guc.plpgsql_settings())?;
                         Ok((Owner::Nested(plan), conflict))
                     }
                     _ => Err(sql_err!(
@@ -17564,10 +17677,74 @@ impl Engine {
         ) {
             return Ok(Err(error));
         }
-        let dml_mats = match self.run_dml_ctes(ctes, txn, arena, params, guc, responder) {
-            Ok(materialized) => materialized.unwrap_or(&[]),
-            Err(error) => return Ok(Err(error)),
+        let main = query::CteReader::Statement(statement);
+        let dml_mats =
+            match self.run_dml_ctes(ctes, main, false, &[], txn, arena, params, guc, responder) {
+                Ok(materialized) => materialized.unwrap_or(&[]),
+                Err(error) => return Ok(Err(error)),
+            };
+        let output_mark = responder.mark();
+        let outcome = self.execute_with_main_statement(
+            ctes, statement, dml_mats, params, txn, guc, responder, capture,
+        )?;
+        if outcome.is_err() {
+            return Ok(outcome);
+        }
+        Ok(self.finish_dml_ctes(
+            ctes,
+            main,
+            dml_mats,
+            output_mark,
+            txn,
+            arena,
+            params,
+            guc,
+            responder,
+        ))
+    }
+
+    /// Runs the data-modifying `WITH` queries nothing read, after the main
+    /// query and under the same snapshot. A failure replaces the main query's
+    /// result while it has not reached the client, as PostgreSQL reports it
+    /// before completing the command.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_dml_ctes<'a>(
+        &mut self,
+        with: &'a [ast::Cte<'a>],
+        main: query::CteReader<'_>,
+        dml_mats: &'a [(&'a str, &'a ast::MaterializedCte<'a>)],
+        output_mark: crate::pg::overflow::OutputMark,
+        txn: &mut TxnState,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<(), SqlError> {
+        let error = match self.run_dml_ctes(
+            with, main, true, dml_mats, txn, arena, params, guc, responder,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
         };
+        if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+            // Rows that reached the client stay sent; the error follows them.
+            let _sent = responder.truncate_to(output_mark);
+        }
+        Err(error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_with_main_statement<'a, 'capture>(
+        &mut self,
+        ctes: &'a [ast::Cte<'a>],
+        statement: &'a Stmt<'a>,
+        dml_mats: &'a [(&'a str, &'a ast::MaterializedCte<'a>)],
+        params: &[Datum<'a>],
+        txn: &mut TxnState,
+        guc: &GucState,
+        responder: &mut Responder,
+        capture: Option<&'capture mut ReturningCapture<'capture>>,
+    ) -> Result<Result<(), SqlError>, WireFull> {
         let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
         let statement = match query::expand_dml_ctes(
             statement,
@@ -24054,6 +24231,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "max_locks_per_transaction",
     "max_prepared_transactions",
     "password_encryption",
+    "plpgsql.print_strict_params",
     "plpgsql.variable_conflict",
     "row_security",
     "search_path",

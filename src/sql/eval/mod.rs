@@ -2058,6 +2058,14 @@ pub trait CatalogAccess {
         Ok(None)
     }
     /// The canonical SQL definition for a function OID, if this catalog owns it.
+    /// `pg_get_function_sqlbody` of a routine's SQL-standard body.
+    fn function_sqlbody<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
     fn function_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }

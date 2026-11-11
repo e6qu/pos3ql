@@ -5568,6 +5568,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::serial_sequence_name(self.storage, self.txid, table, column, arena)
     }
 
+    fn function_sqlbody<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::function_sqlbody_text(self.storage, self.txid, oid, arena)
+    }
+
     fn function_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         super::catalog::function_def_text(self.storage, self.txid, oid, arena)
     }

@@ -135,7 +135,11 @@ Functions and expressions:
   call that reaches it fails with `0A000`, as in PostgreSQL. A `BEGIN ATOMIC`
   body accepts only queries, data changes and `CALL`; anything else fails at
   `CREATE` (`0A000`, `COMMIT is not yet supported in unquoted SQL function
-  body`).
+  body`). `pg_get_function_sqlbody` returns a `RETURN` or `BEGIN ATOMIC` body
+  (`RETURN (x * 2)`; `BEGIN ATOMIC` then one statement per line) and NULL for
+  a quoted body; a `SELECT` of expressions without `FROM` is printed in
+  PostgreSQL's analyzed form (`SELECT (x + 1);`), other statements as
+  written.
 - PL/pgSQL `CALL` assigns output parameters to the variables written as
   their arguments: `CALL doubled(x, y)` updates `x` and `y`, and a constant in
   an output position fails with `42601` (`procedure parameter "b" is an output

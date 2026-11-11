@@ -305,9 +305,10 @@ because its validation types the reference as `record`. `pg_get_viewdef` uses Po
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their
-query text. A `BEGIN ATOMIC` body is printed as written rather than one
-deparsed statement per line, and `pg_get_function_sqlbody` returns NULL for
-it; rule actions (`DO INSERT ...`) are printed as written, and their pretty
+query text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions without `FROM` is
+deparsed (`SELECT (x + 1);`); other statements are printed one per line as
+written, where PostgreSQL prints its analyzed form (`INSERT INTO t (a, b)
+VALUES (f.x, 'q'::text);`); rule actions (`DO INSERT ...`) are printed as written, and their pretty
 form fails with `0A000`; policy expressions are not deparsed. Syntax and scanner errors in a client's
 query report PostgreSQL's wording and cursor position (the `P` field that psql shows as `LINE 1:` and a caret), but
 other errors do not yet: PostgreSQL also points at the unknown relation, column,

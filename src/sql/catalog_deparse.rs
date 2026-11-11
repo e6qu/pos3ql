@@ -25,6 +25,8 @@ pub(crate) enum Destination {
     Assignment(i32),
     /// A boolean condition (CHECK, policy and trigger qualifications).
     Condition,
+    /// A value of its own type, such as a select-list item.
+    Value,
 }
 
 pub(crate) struct Context<'s> {
@@ -70,6 +72,7 @@ pub(crate) fn deparse<'a>(
     match destination {
         Destination::Assignment(target) => context.assigned(expression, target, &mut output)?,
         Destination::Condition => context.write(expression, Some(oid::BOOL), &mut output)?,
+        Destination::Value => context.write(expression, None, &mut output)?,
     }
     Ok(output.supported.then(|| output.text.as_str()))
 }

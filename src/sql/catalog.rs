@@ -14740,15 +14740,42 @@ pub fn function_def_text<'a>(
             }
             let _ = write!(definition, "AS {0}{body}{0}", delimiter.as_str());
         }
+        crate::storage::RoutineBodyKind::Return | crate::storage::RoutineBodyKind::Atomic => {
+            write_sql_body(&mut definition, storage, txid, &routine, arena)?;
+        }
+    }
+    let _ = definition.write_char('\n');
+    if definition.is_truncated() {
+        return Err(routine_definition_too_large());
+    }
+    Ok(Some(
+        arena
+            .alloc_str(definition.as_str())
+            .map_err(|_| super::eval::arena_full())?,
+    ))
+}
+
+/// PostgreSQL's `pg_get_function_sqlbody` of a SQL-standard body:
+/// `RETURN expression`, or `BEGIN ATOMIC` with one statement per line. A
+/// `RETURN` expression and a `SELECT` of expressions without `FROM` are
+/// printed in analyzed form (`SELECT (x + 1);`); other statements as written.
+fn write_sql_body(
+    output: &mut impl core::fmt::Write,
+    storage: &Storage,
+    txid: u32,
+    routine: &crate::storage::RoutineDef,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let context = deparse::Context {
+        storage,
+        txid,
+        table: None,
+        parameters: routine.parameters(),
+        joined: &[],
+        pretty: false,
+    };
+    match routine.body_kind {
         crate::storage::RoutineBodyKind::Return => {
-            let context = deparse::Context {
-                storage,
-                txid,
-                table: None,
-                parameters: routine.parameters(),
-                joined: &[],
-                pretty: false,
-            };
             let deparsed = match routine
                 .function_result_contract()
                 .and_then(|result| storage.routine_type_oid(result.ctype, result.user_type, txid))
@@ -14763,28 +14790,163 @@ pub fn function_def_text<'a>(
                 None => None,
             };
             let _ = write!(
-                definition,
+                output,
                 "RETURN {}",
                 deparsed.unwrap_or(routine.body.as_str())
             );
         }
         crate::storage::RoutineBodyKind::Atomic => {
-            let _ = definition.write_str("BEGIN ATOMIC\n");
-            if !routine.body.as_str().trim().is_empty() {
-                let _ = writeln!(definition, " {};", routine.body.as_str());
+            let _ = output.write_str("BEGIN ATOMIC\n");
+            for statement in split_sql_statements(routine.body.as_str()) {
+                let _ = output.write_char(' ');
+                write_atomic_statement(output, &context, statement, arena)?;
+                let _ = output.write_str(";\n");
             }
-            let _ = definition.write_str("END");
+            let _ = output.write_str("END");
+        }
+        crate::storage::RoutineBodyKind::String => {}
+    }
+    Ok(())
+}
+
+/// One `BEGIN ATOMIC` statement: a `SELECT` of expressions without `FROM`
+/// in analyzed form, any other statement as written.
+fn write_atomic_statement(
+    output: &mut impl core::fmt::Write,
+    context: &deparse::Context<'_>,
+    statement: &str,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let items = statement
+        .get(..7)
+        .filter(|keyword| keyword.eq_ignore_ascii_case("select "))
+        .map(|_| statement[7..].trim());
+    if let Some(items) = items.filter(|items| !items.is_empty()) {
+        let mark = arena.mark();
+        let mut printed = StackStr::<{ crate::storage::ROUTINE_SQL_MAX }>::from_str("SELECT ");
+        let mut complete = true;
+        for (index, item) in split_top_level_commas(items).enumerate() {
+            match deparse::deparse(context, item, deparse::Destination::Value, arena)? {
+                Some(deparsed) => {
+                    // PostgreSQL wraps each later item onto its own line and
+                    // names a bare parameter, whose column is not `?column?`.
+                    let _ = write!(
+                        printed,
+                        "{}{deparsed}",
+                        if index == 0 { "" } else { ",\n     " }
+                    );
+                    if let Ok(crate::sql::ast::Expr::Column {
+                        qualifier: None,
+                        name,
+                    }) = crate::sql::parser::parse_expr(item, arena)
+                    {
+                        let _ = printed.write_str(" AS ");
+                        write_identifier(&mut printed, name);
+                    }
+                }
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        // The printed items were copied out of the workspace.
+        unsafe { arena.rewind_to(mark) };
+        if complete && !printed.is_truncated() {
+            let _ = output.write_str(printed.as_str());
+            return Ok(());
         }
     }
-    let _ = definition.write_char('\n');
-    if definition.is_truncated() {
+    let _ = output.write_str(statement);
+    Ok(())
+}
+
+/// The `;`-separated statements of a `BEGIN ATOMIC` body, outside quotes,
+/// dollar quotes, parentheses and comments.
+fn split_sql_statements(body: &str) -> impl Iterator<Item = &str> {
+    let mut rest = body;
+    core::iter::from_fn(move || {
+        loop {
+            if rest.trim().is_empty() {
+                return None;
+            }
+            let bytes = rest.as_bytes();
+            let mut depth = 0usize;
+            let mut offset = 0;
+            let mut end = rest.len();
+            while offset < bytes.len() {
+                match bytes[offset] {
+                    quote @ (b'\'' | b'"') => {
+                        offset += 1;
+                        while offset < bytes.len() && bytes[offset] != quote {
+                            offset += 1;
+                        }
+                    }
+                    b'-' if bytes.get(offset + 1) == Some(&b'-') => {
+                        while offset < bytes.len() && bytes[offset] != b'\n' {
+                            offset += 1;
+                        }
+                    }
+                    b'$' => {
+                        let tag_end = rest[offset + 1..]
+                            .find(|character: char| {
+                                !(character.is_ascii_alphanumeric() || character == '_')
+                            })
+                            .map(|length| offset + 1 + length);
+                        if let Some(tag_end) = tag_end.filter(|end| bytes[*end] == b'$') {
+                            let tag = &rest[offset..=tag_end];
+                            match rest[tag_end + 1..].find(tag) {
+                                Some(close) => offset = tag_end + close + tag.len(),
+                                None => offset = bytes.len(),
+                            }
+                        }
+                    }
+                    b'(' => depth += 1,
+                    b')' => depth = depth.saturating_sub(1),
+                    b';' if depth == 0 => {
+                        end = offset;
+                        break;
+                    }
+                    _ => {}
+                }
+                offset += 1;
+            }
+            let statement = rest[..end].trim();
+            rest = rest.get(end + 1..).unwrap_or("");
+            if !statement.is_empty() {
+                return Some(statement);
+            }
+        }
+    })
+}
+
+/// `pg_get_function_sqlbody`: the SQL-standard body of a user-defined
+/// routine, or `None` for a body written as a string constant.
+pub fn function_sqlbody_text<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+        return Ok(None);
+    };
+    let routine = storage.routine_for(slot, txid);
+    if !matches!(
+        routine.body_kind,
+        crate::storage::RoutineBodyKind::Return | crate::storage::RoutineBodyKind::Atomic
+    ) {
+        return Ok(None);
+    }
+    let mut body = crate::util::StackStr::<{ crate::storage::ROUTINE_SQL_MAX * 2 }>::new();
+    write_sql_body(&mut body, storage, txid, &routine, arena)?;
+    if body.is_truncated() {
         return Err(routine_definition_too_large());
     }
-    Ok(Some(
-        arena
-            .alloc_str(definition.as_str())
-            .map_err(|_| super::eval::arena_full())?,
-    ))
+    arena
+        .alloc_str(body.as_str())
+        .map(Some)
+        .map_err(|_| super::eval::arena_full())
 }
 
 fn routine_definition_too_large() -> SqlError {

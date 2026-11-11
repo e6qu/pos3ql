@@ -2227,9 +2227,16 @@ pub(crate) fn dispatch<'a>(
             }
             "pg_get_function_sqlbody" => {
                 arity(1)?;
-                // Supported bodies are stored as prosrc; pg_dump selects it
-                // whenever this SQL-standard parse-tree representation is NULL.
-                Ok(Datum::Null)
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
+                };
+                Ok(cat
+                    .function_sqlbody(oid, arena)?
+                    .map_or(Datum::Null, Datum::Text))
             }
             "obj_description" => {
                 if !(1..=2).contains(&args.len()) || star {

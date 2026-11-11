@@ -104,8 +104,9 @@ ORDINALITY`), or a **retained join** of up to eight such items or literal
 `VALUES` lists (a nested loop, or a hash join built in `plan_build_bytes`
 where the general executor would hash), optionally with an `ORDER BY` the
 stream sorts itself (local mode), or a **retained grouping** of such a
-source (`GROUP BY`, `HAVING`, aggregates and plain `DISTINCT`, below);
-without grouping sets, `DISTINCT ON`, set operations, subqueries, CTEs, row locking or row security, whose read position (one
+source (`GROUP BY`, `HAVING`, aggregates and plain `DISTINCT`, below), or
+`DISTINCT ON` the stream sorts (local mode);
+without grouping sets, set operations, subqueries, CTEs, row locking or row security, whose read position (one
 record per resident row of each table plus the query text) fits
 `result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins
 whose `ON`/`USING` conditions are scalar, non-volatile and call no
@@ -310,7 +311,7 @@ delivered, as streams do now.
 | Hash join (built: two tables, inner, cross and `LEFT`) | Build-side rows, entries and bucket heads | `plan_build_bytes` / `plan_build_leases`; exhaustion is `54000` naming them |
 | Grouping (built: `GROUP BY`, `HAVING`, aggregates) | Each group's key, states and held values; or every input row's keys and aggregated columns, then each group's keys and results | `plan_build_bytes` |
 | `DISTINCT` (built: plain, as a grouping by the output list) | Each distinct output row | `plan_build_bytes` |
-| Sort (built: local mode) | Sort keys, saved output and input columns of every row | `plan_build_bytes`; object-store mode: the external sorter's runs on the block grid (not built) |
+| Sort (built: local mode, also for `DISTINCT ON`) | Sort keys, saved output and input columns of every row | `plan_build_bytes`; object-store mode: the external sorter's runs on the block grid (not built) |
 | Set operations | `UNION ALL`: child cursor; others: sorted runs of both inputs with counts | External runs |
 | Scalar, `IN`/`EXISTS` subquery | Per-outer-row child tree, rewound per row, or a cached sorted run when uncorrelated | Node record or external run |
 | Derived table, CTE read once | Child tree in place | Its nodes |
@@ -344,7 +345,10 @@ leases: the sort keys, the output items that run before the sort, and, when a
 volatile item runs after it, the row's input columns. It orders the rows with
 an in-place heap sort (equal keys keep input order) and then returns them one
 by one; a volatile item runs as its row is returned, so `nextval` numbers
-rows in output order. The choice depends only on the storage mode, never on
+rows in output order. `DISTINCT ON` sorts by `ORDER BY`, then by its
+expressions missing from it, ascending, and returns only the first row of
+each run of equal expressions; as in the general executor, its output items
+all run before the sort. The choice depends only on the storage mode, never on
 the input size: in object-store mode the general executor sorts in external
 runs on the block grid, and such a result spools. Streaming those runs needs
 a run reader per stream, sized at startup with `result_stream_slots`, since

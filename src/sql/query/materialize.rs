@@ -735,7 +735,7 @@ pub(super) fn prepare_materialization<'a>(
         order_exprs[key] = Some(resolved);
     }
     for (index, on) in statement.distinct_on.iter().enumerate() {
-        let resolved = super::resolve_sort_key(
+        let resolved = super::resolve_distinct_on_key(
             on,
             statement.items,
             scope,
@@ -744,20 +744,20 @@ pub(super) fn prepare_materialization<'a>(
             txid,
             &order_exprs[..n_order + index],
         )?;
-        if n_order > 0
-            && (index >= n_order
-                || *order_exprs[index].expect("resolved").expression != *resolved.expression)
-        {
-            return Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
-            ));
-        }
         key_collations[n_order + index] =
             scope.expression_collation(storage, arena, resolved.expression)?;
         order_exprs[n_order + index] = Some(resolved);
     }
     let n_keys = n_order + n_on;
+    let mut order_targets = [&Expr::Null; MAX_PROJ];
+    for (target, key) in order_targets.iter_mut().zip(&order_exprs[..n_keys]) {
+        *target = key.expect("resolved").expression;
+    }
+    check_distinct_on_order(
+        &order_targets[..n_order],
+        &order_targets[n_order..n_keys],
+        statement.distinct_on,
+    )?;
     if statement.distinct && n_on == 0 {
         for expression in order_exprs.iter().take(n_order) {
             let target = expression.expect("resolved").expression;
@@ -1371,6 +1371,46 @@ fn compare_materialized_rows(
     } else {
         core::cmp::Ordering::Equal
     })
+}
+
+/// PostgreSQL's rule for `DISTINCT ON` with `ORDER BY`: the leading
+/// `ORDER BY` items are the `DISTINCT ON` expressions, in any order, and
+/// those missing from `ORDER BY` are allowed only when every item is one.
+/// The sort then uses `ORDER BY`, followed by the `DISTINCT ON` expressions
+/// ascending. `on` are the resolved `DISTINCT ON` expressions, `written`
+/// their text, which a mismatch points at.
+pub(super) fn check_distinct_on_order(
+    order: &[&Expr<'_>],
+    on: &[&Expr<'_>],
+    written: &[&Expr<'_>],
+) -> Result<(), SqlError> {
+    let mismatch = |index: usize| {
+        crate::sql::error_position::at_expression(
+            sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+            ),
+            written[index],
+        )
+    };
+    let mut skipped = false;
+    for key in order {
+        if let Some(index) = on.iter().position(|expression| **expression == **key) {
+            if skipped {
+                return Err(mismatch(index));
+            }
+        } else {
+            skipped = true;
+        }
+    }
+    if skipped
+        && let Some(index) = on
+            .iter()
+            .position(|expression| !order.iter().any(|key| **key == **expression))
+    {
+        return Err(mismatch(index));
+    }
+    Ok(())
 }
 
 #[expect(

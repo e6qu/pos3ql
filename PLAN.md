@@ -103,13 +103,13 @@ is owned.
 - **Results and cursors:** large results resume row by row for `SELECT`
   from one table or builtin set-returning functions with constant arguments,
   or a nested-loop or hash join of up to eight such items and `VALUES` lists,
-  with an `ORDER BY` sorted in `plan_build_bytes` in local mode or a
+  with an `ORDER BY` or `DISTINCT ON` sorted in `plan_build_bytes` in local mode or a
   `GROUP BY`, `HAVING`, aggregates and plain `DISTINCT` computed there, including
   paged portals, forward `FETCH` from `NO SCROLL` cursors and
   `COPY ... TO STDOUT` of such a query or one table. Remaining:
   - More retained shapes, by the
     [retained plan tree design](docs/architecture.md#retained-plan-tree-partly-built):
-    index-probed joins, RIGHT and FULL joins, `DISTINCT ON`, grouping sets,
+    index-probed joins, RIGHT and FULL joins, grouping sets,
     subqueries, set operations, sorts in object-store mode (external runs
     with a run reader per stream; a large ordered `SELECT` there still
     spools, and a paged portal of one buffers in `portal_result_bytes`),

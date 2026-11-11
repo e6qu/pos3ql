@@ -134,7 +134,8 @@ pub(super) fn admit_grouping<'a>(
     }
     let plain =
         aggregates.is_empty() && statement.group_by.is_empty() && statement.having.is_none();
-    if plain && !statement.distinct {
+    // DISTINCT ON keeps each first row of a retained sort.
+    if plain && (!statement.distinct || !statement.distinct_on.is_empty()) {
         return Ok(Some(Grouping::Plain));
     }
     // Plain DISTINCT groups by its output list, as the general executor

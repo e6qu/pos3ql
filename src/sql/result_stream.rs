@@ -188,7 +188,7 @@ impl Engine {
     pub(crate) fn continue_result_stream(
         &mut self,
         stream: &mut ResultStream,
-        arena: &Arena,
+        arena: &mut Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
@@ -346,7 +346,7 @@ impl Engine {
         &mut self,
         stream: &mut ResultStream,
         state: &mut StreamState,
-        arena: &Arena,
+        arena: &mut Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
@@ -364,6 +364,14 @@ impl Engine {
             if responder.output_backlogged() {
                 return Ok(Ok(Some(StatementWait::ClientOutput)));
             }
+            // A delivered row's receipts are never replayed: each new row
+            // starts with empty statement memory, so a long stream cannot
+            // accumulate them. Resetting also invalidates every handle into
+            // the finished row.
+            if !row_attempted {
+                arena.reset();
+            }
+            let arena = &*arena;
             // Effects end with their row: a later row's reads yield again.
             let row_mark =
                 txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());

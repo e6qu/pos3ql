@@ -444,9 +444,9 @@ fn notifications_wait_for_the_result_in_progress() {
     assert_eq!(&kinds[kinds.len() - 3..], b"CZA");
 }
 
-#[test]
-fn tls_backpressure_keeps_ciphertext_queued_instead_of_closing() {
-    use crate::mem::lease_pool::{LeasePool, Purpose};
+/// Completes a TLS handshake between `conn` and a rustls client on `socket`
+/// and installs the server session on the connection.
+fn tls_client(conn: &mut Conn, socket: &mut TcpStream) -> rustls::ClientConnection {
     let server_config = crate::pg::tls::build_server_config(
         "tests/data/tls-test-cert.pem",
         "tests/data/tls-test-key.pem",
@@ -464,11 +464,6 @@ fn tls_backpressure_keeps_ciphertext_queued_instead_of_closing() {
             .with_root_certificates(roots)
             .with_no_client_auth(),
     );
-    let (mut socket, server) = socket_pair();
-    let config = Config::default_dev();
-    let mut budget = Budget::new(256 << 20);
-    let mut conn = Conn::new(&config, &mut budget).unwrap();
-    conn.open(server, 5);
     let mut session = crate::pg::tls::ServerSession::new(&server_config).unwrap();
     let mut client = rustls::ClientConnection::new(
         client_config,
@@ -479,7 +474,7 @@ fn tls_backpressure_keeps_ciphertext_queued_instead_of_closing() {
     while client.is_handshaking() || session.is_handshaking() {
         assert!(Instant::now() < deadline, "handshake stalled");
         while client.wants_write() {
-            match client.write_tls(&mut socket) {
+            match client.write_tls(socket) {
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) => panic!("client write: {error}"),
@@ -490,7 +485,7 @@ fn tls_backpressure_keeps_ciphertext_queued_instead_of_closing() {
         session
             .flush_nonblocking(conn.stream.as_mut().unwrap())
             .unwrap();
-        match client.read_tls(&mut socket) {
+        match client.read_tls(socket) {
             Ok(_) => {
                 client.process_new_packets().unwrap();
             }
@@ -499,6 +494,45 @@ fn tls_backpressure_keeps_ciphertext_queued_instead_of_closing() {
         }
     }
     conn.tls = Some(session);
+    client
+}
+
+/// Reads whatever plaintext the TLS client can decrypt right now.
+fn read_tls_available(
+    client: &mut rustls::ClientConnection,
+    socket: &mut TcpStream,
+    into: &mut Vec<u8>,
+) {
+    loop {
+        match client.read_tls(socket) {
+            Ok(0) => panic!("server closed the TLS connection"),
+            Ok(_) => {
+                client.process_new_packets().unwrap();
+                let mut chunk = [0u8; 16384];
+                loop {
+                    match client.reader().read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => into.extend_from_slice(&chunk[..n]),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("client plaintext: {error}"),
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(error) => panic!("client TLS read: {error}"),
+        }
+    }
+}
+
+#[test]
+fn tls_backpressure_keeps_ciphertext_queued_instead_of_closing() {
+    use crate::mem::lease_pool::{LeasePool, Purpose};
+    let (mut socket, server) = socket_pair();
+    let config = Config::default_dev();
+    let mut budget = Budget::new(256 << 20);
+    let mut conn = Conn::new(&config, &mut budget).unwrap();
+    conn.open(server, 5);
+    let mut client = tls_client(&mut conn, &mut socket);
     // Queue far more than the kernel and the 64 KiB rustls record buffer
     // hold while the client reads nothing.
     let spool = LeasePool::new(&mut budget, Purpose::RESULT_SPOOL, 1 << 20, 1).unwrap();
@@ -523,23 +557,7 @@ fn tls_backpressure_keeps_ciphertext_queued_instead_of_closing() {
     while plaintext.len() < rows * 43 {
         assert!(Instant::now() < deadline, "TLS output did not drain");
         assert_eq!(conn.on_writable(), After::Continue);
-        match client.read_tls(&mut socket) {
-            Ok(0) => panic!("server closed the TLS connection"),
-            Ok(_) => {
-                client.process_new_packets().unwrap();
-                let mut chunk = [0u8; 16384];
-                loop {
-                    match client.reader().read(&mut chunk) {
-                        Ok(0) => break,
-                        Ok(n) => plaintext.extend_from_slice(&chunk[..n]),
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(error) => panic!("client plaintext: {error}"),
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => panic!("client TLS read: {error}"),
-        }
+        read_tls_available(&mut client, &mut socket, &mut plaintext);
     }
     assert_eq!(plaintext.len(), rows * 43);
     assert!(messages(&plaintext).iter().all(|message| message.0 == b'D'));
@@ -1185,4 +1203,178 @@ fn routine_replays_never_repeat_or_panic_after_rows_reach_the_client() {
         .collect();
     assert_rows(&rows, rows.len());
     assert_eq!(count(&mut conn, &mut fixture.engine, &mut client), "302");
+}
+
+#[test]
+fn long_streams_release_each_rows_effect_receipts() {
+    let mut config = fixture_config(
+        crate::config::TransactionMode::Mvcc,
+        "stream-receipts",
+        16 << 20,
+    );
+    config.result_stream_bytes = 4 << 20;
+    // Far less statement memory than one receipt per delivered row needs.
+    config.sql_arena_bytes = 512 << 10;
+    config.row_overlay_slots = 65536;
+    let mut fixture = Fixture::with_config(config);
+    let (mut conn, mut client) = connection(&mut fixture, 1);
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "CREATE TABLE long_rows(id int, payload text); CREATE SEQUENCE numbers",
+    );
+    assert!(messages(&response).iter().all(|message| message.0 != b'E'));
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "INSERT INTO long_rows SELECT g, repeat('x', 200) FROM generate_series(1, 6000) g",
+    );
+    assert!(
+        messages(&response).iter().all(|message| message.0 != b'E'),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    client
+        .write_all(&query(
+            "SELECT id, CASE WHEN id > 1000 THEN nextval('numbers') + nextval('numbers') END, \
+             payload FROM long_rows",
+        ))
+        .unwrap();
+    assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+    assert!(conn.result_stream.is_active());
+    let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert_eq!(
+        &kinds[kinds.len() - 2..],
+        b"CZ",
+        "{}",
+        String::from_utf8_lossy(response[kinds.len() - 2].1)
+    );
+    let rows: Vec<_> = response
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .collect();
+    assert_rows(&rows, 6000);
+}
+
+#[test]
+fn tls_result_streams_resume_while_the_client_reads_ciphertext() {
+    let (mut fixture, _, _, mut other, mut other_client) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "stream-tls");
+    let (mut socket, server) = socket_pair();
+    let mut conn = Conn::new(&fixture.config, &mut fixture.budget).unwrap();
+    conn.open(server, 3);
+    conn.auth_database = fixture.engine.database_login("postgres");
+    conn.phase = Phase::Ready;
+    let mut client = tls_client(&mut conn, &mut socket);
+    let mut input = query("SELECT id, payload FROM big");
+    input.extend_from_slice(&query("SELECT 2"));
+    client.writer().write_all(&input).unwrap();
+    while client.wants_write() {
+        client.write_tls(&mut socket).unwrap();
+    }
+    assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+    assert!(conn.result_stream.is_active());
+    assert_eq!(
+        conn.parked_wait(),
+        Some(crate::sql::StatementWait::ClientOutput)
+    );
+    // The stream keeps at most one row beyond the send buffer and the
+    // session's ciphertext; other sessions keep running meanwhile.
+    assert!(conn.overflow_bytes() < 1024);
+    let response = run(
+        &mut other,
+        &mut fixture.engine,
+        &mut other_client,
+        "SELECT count(*) FROM big",
+    );
+    assert!(messages(&response).iter().all(|message| message.0 != b'E'));
+    assert!(conn.result_stream.is_active());
+    let mut plaintext = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while messages(&plaintext)
+        .iter()
+        .filter(|message| message.0 == b'Z')
+        .count()
+        < 2
+    {
+        assert!(Instant::now() < deadline, "TLS stream did not drain");
+        read_tls_available(&mut client, &mut socket, &mut plaintext);
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| conn.on_writable()),
+            After::Continue
+        );
+        let generation = fixture.engine.lock_generation();
+        if let Some(pending) = crate::mem::guard::forbid_alloc(|| {
+            conn.retry_parked(&mut fixture.engine, KEY, generation, false)
+        }) {
+            assert_eq!(
+                crate::mem::guard::forbid_alloc(|| conn.finish_response(pending, None)),
+                After::Continue
+            );
+        }
+    }
+    let response = messages(&plaintext);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    let first_ready = kinds.iter().position(|kind| *kind == b'Z').unwrap();
+    let rows: Vec<_> = response[..first_ready]
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .collect();
+    assert_rows(&rows, 5000);
+    assert_eq!(response[first_ready - 1].1, b"SELECT 5000\0");
+    assert_eq!(&kinds[first_ready + 1..], b"TDCZ");
+    assert!(!conn.result_stream.is_active());
+}
+
+#[test]
+fn a_stream_whose_open_outgrows_its_estimate_fails_by_name() {
+    let mut config = fixture_config(
+        crate::config::TransactionMode::Mvcc,
+        "stream-open-full",
+        16 << 20,
+    );
+    config.result_stream_bytes = Config::MIN_RESULT_STREAM_BYTES * 3;
+    let mut fixture = Fixture::with_config(config);
+    let (mut conn, mut client) = connection(&mut fixture, 1);
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "CREATE TABLE narrow(id int, payload text); \
+         INSERT INTO narrow SELECT g, repeat('x', 2000) FROM generate_series(1, 400) g",
+    );
+    assert!(messages(&response).iter().all(|message| message.0 != b'E'));
+    // Each short column reference parses into far more than the per-byte
+    // allowance the estimate makes for query text, so the estimate admits
+    // the stream and binding its plan then outgrows the allocation.
+    let mut sql = String::from("SELECT payload");
+    for _ in 0..1500 {
+        sql.push_str(",id");
+    }
+    sql.push_str(" FROM narrow");
+    let before = fixture.engine.result_stream_metrics();
+    let response = run(&mut conn, &mut fixture.engine, &mut client, &sql);
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert_eq!(
+        fixture.engine.result_stream_metrics().spooled_capacity,
+        before.spooled_capacity
+    );
+    // Promotion discarded the first attempt before any byte left, so the
+    // client sees only the named error.
+    assert_eq!(kinds, b"EZ", "{kinds:?}");
+    assert_eq!(sqlstate_of(response[0].1), "54000");
+    let message = String::from_utf8_lossy(response[0].1);
+    assert!(message.contains("result_stream_bytes"), "{message}");
+    assert!(!conn.result_stream.is_active());
+    let response = run(&mut conn, &mut fixture.engine, &mut client, "SELECT 5");
+    assert!(
+        messages(&response)
+            .iter()
+            .any(|message| message.0 == b'D' && first_text(message.1) == "5")
+    );
 }

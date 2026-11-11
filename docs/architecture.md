@@ -105,7 +105,9 @@ client reads and yields when the client is behind (`Client`/`ClientWrite` in
 `pg_stat_activity`), when a row waits for an object download, and when a row
 waits for a lock. Delivered rows are final: a wait inside a row rolls back and
 re-evaluates only that row, and an effect makes only the rest of that row read
-synchronously. Every other large result uses the spool above, decided before
+synchronously. A delivered row's receipts (sequence values, routine results)
+are released before the next row starts, so statement memory holds one row's
+receipts however long the stream runs. Every other large result uses the spool above, decided before
 any of its rows reach the client; `pos3ql_result_stream_spooled_total` counts
 those by reason (`shape`, `capacity`, `effects`).
 

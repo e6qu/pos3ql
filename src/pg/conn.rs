@@ -4613,7 +4613,7 @@ impl Conn {
             );
             let step = engine.continue_result_stream(
                 &mut self.result_stream,
-                &self.arena,
+                &mut self.arena,
                 &mut self.txn,
                 &mut self.sqlprep,
                 &mut self.cursors,
@@ -4747,7 +4747,7 @@ impl Conn {
             );
             let step = engine.continue_result_stream(
                 &mut self.result_stream,
-                &self.arena,
+                &mut self.arena,
                 &mut self.txn,
                 &mut self.sqlprep,
                 &mut self.cursors,

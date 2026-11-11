@@ -29,10 +29,9 @@ pub(super) enum ItemShape<'a> {
 pub(super) struct JoinLevel<'a> {
     /// The scope index this level reads.
     table: usize,
-    source: RetainedSource<'a>,
-    /// The level's current row; [`RetainedRow::Null`] is a LEFT JOIN's
-    /// NULL-extended row.
-    pending: Option<PendingRow<'a>>,
+    /// The level's source and current row; [`RetainedRow::Null`] is a LEFT
+    /// JOIN's NULL-extended row.
+    scan: ScanNode<'a>,
     /// A LEFT JOIN keeps an unmatched row of the levels above it.
     left: bool,
     /// The bound ON condition, including USING/NATURAL equalities.
@@ -45,7 +44,6 @@ pub(super) struct JoinLevel<'a> {
     checked: bool,
     /// The source has not been read since the levels above moved.
     restart: bool,
-    decoded_columns: Option<&'a [bool; MAX_COLUMNS]>,
     /// A hash join's build side: this level's source is read once into the
     /// table, which each row above probes.
     hash: Option<HashTable>,
@@ -583,15 +581,17 @@ pub(super) fn open_levels<'a>(
             };
             JoinLevel {
                 table,
-                source,
-                pending: None,
+                scan: ScanNode {
+                    source,
+                    pending: None,
+                    decoded_columns: masks[depth],
+                },
                 left: table > 0 && from.joins[table - 1].kind == JoinKind::Left,
                 on: on[depth],
                 pushdown: pushdown[depth],
                 matched: false,
                 checked: false,
                 restart: true,
-                decoded_columns: masks[depth],
                 hash: if depth == 1 { hash.take() } else { None },
             }
         })
@@ -608,7 +608,7 @@ pub(super) fn open_levels<'a>(
 
 impl<'a> JoinState<'a> {
     pub(super) fn has_pending(&self) -> bool {
-        self.levels.iter().any(|level| level.pending.is_some())
+        self.levels.iter().any(|level| level.scan.pending.is_some())
     }
 
     /// Whether every level holds a checked row: a joined row is ready.
@@ -617,16 +617,18 @@ impl<'a> JoinState<'a> {
             && self
                 .levels
                 .last()
-                .is_some_and(|level| level.pending.is_some() && level.checked)
+                .is_some_and(|level| level.scan.pending.is_some() && level.checked)
     }
 
     pub(super) fn tables(&self) -> impl Iterator<Item = (usize, &RetainedSource<'a>)> {
-        self.levels.iter().map(|level| (level.table, &level.source))
+        self.levels
+            .iter()
+            .map(|level| (level.table, &level.scan.source))
     }
 
     pub(super) fn close(&mut self) {
         for level in self.levels.iter_mut() {
-            level.source.close();
+            level.scan.source.close();
         }
     }
 
@@ -635,7 +637,7 @@ impl<'a> JoinState<'a> {
     pub(super) fn rewind(&mut self, state_arena: &Arena) -> Result<(), SqlError> {
         for level in self.levels.iter_mut() {
             if level.hash.is_none() {
-                level.source.rewind(state_arena)?;
+                level.scan.source.rewind(state_arena)?;
             }
             level.matched = false;
             level.checked = false;
@@ -655,7 +657,7 @@ impl<'a> JoinState<'a> {
         params: &[Datum<'a>],
     ) -> Result<(), SqlError> {
         for level in self.levels.iter_mut() {
-            start_generator_source(&mut level.source, storage, txid, state_arena, params)?;
+            start_generator_source(&mut level.scan.source, storage, txid, state_arena, params)?;
         }
         Ok(())
     }
@@ -664,11 +666,9 @@ impl<'a> JoinState<'a> {
     /// call reads that level's next row.
     pub(super) fn finish_row(&mut self, state_arena: &Arena) {
         let level = &mut self.levels[self.depth];
-        if let Some(pending) = level.pending.take() {
-            // SAFETY: deeper levels hold no row; the caller dropped every
-            // evaluation value of the finished row.
-            unsafe { state_arena.rewind_to(pending.mark) };
-        }
+        // Deeper levels hold no row; the caller dropped every evaluation
+        // value of the finished row.
+        level.scan.release(state_arena);
         level.checked = false;
     }
 
@@ -709,9 +709,9 @@ impl<'a> JoinState<'a> {
                 } else {
                     let level = &mut self.levels[depth];
                     if depth > 0 {
-                        level.source.rewind(state_arena)?;
+                        level.scan.source.rewind(state_arena)?;
                     }
-                    if matches!(level.source, RetainedSource::Physical(_)) {
+                    if matches!(level.scan.source, RetainedSource::Physical(_)) {
                         storage.record_relation_scan(
                             txid,
                             scope.slots[level.table],
@@ -726,7 +726,7 @@ impl<'a> JoinState<'a> {
                 level.matched = false;
             }
             let level = &mut self.levels[depth];
-            if level.pending.is_none() {
+            if level.scan.pending.is_none() {
                 let mark = state_arena.mark();
                 let next = match &mut level.hash {
                     Some(table) => table
@@ -743,10 +743,10 @@ impl<'a> JoinState<'a> {
                         })
                         .transpose(),
                     None => next_source_row(
-                        &mut level.source,
+                        &mut level.scan.source,
                         state_arena,
                         buffers,
-                        level.decoded_columns,
+                        level.scan.decoded_columns,
                     ),
                 };
                 let row = match next {
@@ -766,7 +766,7 @@ impl<'a> JoinState<'a> {
                                 None,
                             )?;
                         }
-                        level.pending = Some(PendingRow {
+                        level.scan.pending = Some(PendingRow {
                             row,
                             mark,
                             counted: true,
@@ -777,7 +777,7 @@ impl<'a> JoinState<'a> {
                     None if level.left && !level.matched => {
                         // No partner: the levels above join a NULL row here.
                         level.matched = true;
-                        level.pending = Some(PendingRow {
+                        level.scan.pending = Some(PendingRow {
                             row: RetainedRow::Null,
                             mark,
                             counted: true,
@@ -802,7 +802,7 @@ impl<'a> JoinState<'a> {
                 let passes = self.row_passes(scope, storage, txid, work, params)?;
                 let level = &mut self.levels[depth];
                 if !passes {
-                    let pending = level.pending.take().expect("checked join row");
+                    let pending = level.scan.pending.take().expect("checked join row");
                     unsafe { state_arena.rewind_to(pending.mark) };
                     continue;
                 }
@@ -875,17 +875,17 @@ impl<'a> JoinState<'a> {
             check_timeout()?;
             let mark = state_arena.mark();
             let row = next_source_row(
-                &mut level.source,
+                &mut level.scan.source,
                 state_arena,
                 buffers,
-                level.decoded_columns,
+                level.scan.decoded_columns,
             );
             let row = match row {
                 Ok(Some(row)) => row,
                 Ok(None) => {
                     unsafe { state_arena.rewind_to(mark) };
                     table.built = true;
-                    level.source.close();
+                    level.scan.source.close();
                     return Ok(());
                 }
                 Err(error) => {
@@ -1042,7 +1042,7 @@ impl<'a> JoinState<'a> {
             .alloc_slice_with(scope.n, |_| None::<u64>)
             .map_err(|_| arena_full())?;
         for level in &self.levels[..count] {
-            let pending = level.pending.as_ref().ok_or_else(|| {
+            let pending = level.scan.pending.as_ref().ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "retained join level has no current row"

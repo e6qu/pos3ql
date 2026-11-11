@@ -104,6 +104,9 @@ enum ColdRequest {
     Grouped,
     /// A paged portal of a plain DISTINCT, grouped by its output list.
     Distinct,
+    /// A paged portal of a UNION ALL whose second query reads the table
+    /// again from cold storage after the first query's rows were delivered.
+    Union,
 }
 
 #[test]
@@ -127,6 +130,11 @@ fn grouped_paged_portals_yield_on_cold_reads_and_read_each_object_once() {
 }
 
 #[test]
+fn union_all_streams_yield_on_cold_reads_in_each_query() {
+    cold_result_stream("result-stream-cold-union", ColdRequest::Union);
+}
+
+#[test]
 fn distinct_paged_portals_yield_on_cold_reads_and_read_each_object_once() {
     cold_result_stream("result-stream-cold-distinct", ColdRequest::Distinct);
 }
@@ -134,7 +142,7 @@ fn distinct_paged_portals_yield_on_cold_reads_and_read_each_object_once() {
 fn cold_result_stream(name: &str, request: ColdRequest) {
     let paged = matches!(
         request,
-        ColdRequest::Paged | ColdRequest::Grouped | ColdRequest::Distinct
+        ColdRequest::Paged | ColdRequest::Grouped | ColdRequest::Distinct | ColdRequest::Union
     );
     let mut config = test_config(name);
     config.object_store_on = true;
@@ -207,6 +215,11 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
     client
         .write_all(&match request {
             ColdRequest::Select => query(sql),
+            ColdRequest::Union => paged_request(
+                "SELECT id, code FROM cold_orders WHERE id <= 160 UNION ALL \
+                 SELECT id, code FROM cold_orders WHERE id > 160",
+                50,
+            ),
             ColdRequest::Paged => paged_request(sql, 50),
             ColdRequest::Copy => query("COPY cold_orders TO STDOUT"),
             ColdRequest::Distinct => paged_request("SELECT DISTINCT id, code FROM cold_orders", 50),
@@ -229,6 +242,8 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
 
     let mut received = Vec::new();
     let mut yielded_after_rows = false;
+    // The second query of a UNION ALL starts its own cold scan.
+    let mut second_query_yielded = false;
     let mut fetched = std::collections::HashSet::new();
     let mut gets = 0usize;
     let mut deadline = Instant::now() + Duration::from_secs(10);
@@ -263,6 +278,12 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
                 ["42"]
             );
             engine.bind_query_connection(conn.id());
+        }
+        if conn.parked_wait() == Some(StatementWait::ObjectIo)
+            && conn.result_stream_active()
+            && delivered >= 160
+        {
+            second_query_yielded = true;
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -322,7 +343,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
                 fetched.len()
             );
         }
-        ColdRequest::Paged => {
+        ColdRequest::Paged | ColdRequest::Union => {
             // Each full page suspends; the unlimited Execute returns the rest.
             assert_eq!(kinds.iter().filter(|kind| **kind == b's').count(), 3);
             assert_eq!(response[kinds.len() - 2].1, b"SELECT 170\0");
@@ -368,6 +389,9 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         "a cold read after delivered rows, or a grouping's input read, must yield instead of blocking"
     );
     assert!(engine.result_stream_metrics().opened >= 1);
+    if request == ColdRequest::Union {
+        assert!(second_query_yielded, "the second query's cold scan yields");
+    }
     drop(conn.close());
     drop((other, engine));
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

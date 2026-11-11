@@ -448,7 +448,7 @@ pub(super) struct GroupState<'a> {
     pointers: &'a [*const Expr<'a>],
     having: Option<&'a Expr<'a>>,
     /// The input columns the aggregates read; other columns save as NULL.
-    demand: PaxReadDemand,
+    demand: &'a PaxReadDemand,
     /// Saved input: with fixed states, one key record per group; otherwise
     /// one record per input row: its keys, then per source a presence flag
     /// and its row's columns.
@@ -614,7 +614,9 @@ impl<'a> GroupState<'a> {
         let expressions = arena
             .alloc_slice_with(aggregates.len(), |index| aggregates[index].1)
             .map_err(|_| arena_full())?;
-        let demand = pax_column_demand(scope, from, expressions);
+        let demand = &*arena
+            .alloc(pax_column_demand(scope, from, expressions))
+            .map_err(|_| arena_full())?;
         let templates = arena
             .alloc_slice_with(aggregates.len(), |_| AggState::default())
             .map_err(|_| arena_full())?;

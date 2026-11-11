@@ -6,7 +6,9 @@ use crate::mem::arena::ArenaMark;
 mod grouping;
 mod join;
 mod sort;
+mod tree;
 pub(crate) use join::MAX_RETAINED_SOURCES;
+use tree::{PlanNode, PlanTree, Pull, ReaderState, ScanNode};
 
 /// What a cursor-mode reader serves: a result stream returns its rows once,
 /// in order, so it may sort them itself; a declared cursor keeps its own
@@ -24,6 +26,9 @@ use crate::storage::{
 enum RetainedMode {
     Cursor,
     Statement,
+    /// One query of a `UNION ALL` a stream appends: read in place, with
+    /// its bounds evaluated at open and no description of its own.
+    Branch,
 }
 
 struct PendingRow<'a> {
@@ -115,6 +120,13 @@ enum RetainedSource<'a> {
         kinds: &'a [super::generator::GeneratorKind],
         generator: Option<super::generator::FunctionRows<'a>>,
     },
+    /// The queries of a `UNION ALL`, read one after another as PostgreSQL's
+    /// Append node does; each row is coerced to the combined column types.
+    Append {
+        branches: crate::mem::arena::OwnedArenaSlice<'a, RetainedSelect<'a>>,
+        next: usize,
+        targets: &'a [ColType],
+    },
 }
 
 impl<'a> RetainedSource<'a> {
@@ -130,6 +142,12 @@ impl<'a> RetainedSource<'a> {
                     generator.rewind();
                 }
             }
+            Self::Append { .. } => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "an appended result cannot be rewound"
+                ));
+            }
         }
         Ok(())
     }
@@ -142,6 +160,7 @@ impl<'a> RetainedSource<'a> {
             Self::Generated { generator, .. } => {
                 *generator = Some(super::generator::FunctionRows::finished());
             }
+            Self::Append { branches, next, .. } => *next = branches.len(),
         }
     }
 }
@@ -210,13 +229,6 @@ enum InputBytes<'a> {
     Values(&'a [Datum<'a>]),
 }
 
-enum ReaderState {
-    Unstarted,
-    Reading,
-    Complete,
-    Eliminated,
-}
-
 #[derive(Clone, Copy)]
 enum RowBounds<'a> {
     Unstarted {
@@ -230,37 +242,19 @@ enum RowBounds<'a> {
 }
 
 pub(crate) struct RetainedSelect<'a> {
-    items: &'a [SelectItem<'a>],
-    predicate: Option<&'a Expr<'a>>,
-    bounds: RowBounds<'a>,
-    /// The bounds before the first row, for a rescan.
-    initial_bounds: RowBounds<'a>,
-    /// A scrollable cursor keeps its finished input open to read it again.
-    keep_finished: bool,
     scope: QueryScope<'a>,
-    source: RetainedSource<'a>,
-    decoded_columns: Option<[bool; MAX_COLUMNS]>,
-    pending: Option<PendingRow<'a>>,
-    state: ReaderState,
+    /// The nodes that produce the rows: see [`tree`].
+    plan: PlanTree<'a>,
     revisit: crate::sql::cursor::Revisit,
     /// Row locks each fetched row takes, as PostgreSQL's LockRows node does.
     locking: &'a [crate::sql::ast::LockClause<'a>],
     /// A locking cursor's ORDER BY: every qualifying row is saved and sorted
     /// before the first row is locked.
     order: &'a [RetainedOrderKey],
-    /// The FROM items of a join, read as nested-loop levels; `source` and
-    /// `pending` are unused then.
-    joins: Option<join::JoinState<'a>>,
     /// A scrollable cursor returns saved output rows on revisit instead of
     /// reading its input again: PostgreSQL materializes a join under a
     /// scrollable cursor, so a volatile output list is not evaluated again.
     saves_scroll_output: bool,
-    /// An ORDER BY the reader sorts itself in `plan_build_bytes`.
-    sort: Option<sort::SortState<'a>>,
-    /// Grouping and aggregates the reader computes itself in
-    /// `plan_build_bytes`; `predicate` is then the WHERE run as input is
-    /// read.
-    grouping: Option<grouping::GroupState<'a>>,
     /// A statement's RowDescription, sent once its first row is prepared:
     /// a sort or hash table that does not fit leaves nothing queued, and the
     /// statement runs in the general executor instead.
@@ -270,7 +264,7 @@ pub(crate) struct RetainedSelect<'a> {
 fn description_too_large(mode: RetainedMode) -> SqlError {
     match mode {
         RetainedMode::Cursor => super::super::cursor_description_too_large(),
-        RetainedMode::Statement => sql_err!(
+        RetainedMode::Statement | RetainedMode::Branch => sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "retained statement row description exceeds output capacity"
         ),
@@ -296,6 +290,8 @@ fn describe<'a>(
             .alloc_slice_copy(columns)
             .map(|columns| Some(&*columns))
             .map_err(|_| arena_full()),
+        // The appending reader describes the combined result.
+        RetainedMode::Branch => Ok(None),
     }
 }
 
@@ -1510,7 +1506,306 @@ fn next_source_row<'a>(
             .expect("generator starts with the cursor's first fetch")
             .next_encoded(state_arena)
             .map(|row| row.map(RetainedRow::Literal)),
+        RetainedSource::Append { .. } => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "appended rows are read through their plan"
+        )),
     }
+}
+
+/// Collects the queries of a set tree that is only explicit `UNION ALL`.
+fn union_all_leaves<'a>(
+    tree: &'a crate::sql::ast::SetTree<'a>,
+    leaves: &mut crate::mem::arena::ArenaList<'a, &'a Select<'a>>,
+) -> Result<bool, SqlError> {
+    use crate::sql::ast::{SetOp, SetOperationSyntax, SetTree};
+    match tree {
+        SetTree::Select(select) => {
+            leaves.push(*select).map_err(|_| arena_full())?;
+            Ok(true)
+        }
+        SetTree::Op {
+            syntax: SetOperationSyntax::Explicit,
+            operator: SetOp::Union,
+            all: true,
+            left,
+            right,
+        } => Ok(union_all_leaves(left, leaves)? && union_all_leaves(right, leaves)?),
+        SetTree::Op { .. } => Ok(false),
+    }
+}
+
+/// The queries a stream appends for `statement`, a `SELECT * FROM (...)`
+/// over an explicit `UNION ALL`; `None` for any other statement.
+fn appended_leaves<'a>(
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<Option<&'a [&'a Select<'a>]>, SqlError> {
+    let Some(from) = statement.from.as_ref() else {
+        return Ok(None);
+    };
+    let Some(body) = from
+        .base
+        .subquery
+        .filter(|_| from.joins.is_empty() && !from.base.lateral)
+        .filter(|query| {
+            query.with.is_empty()
+                && query.order_by.is_empty()
+                && query.limit.is_none()
+                && query.offset.is_none()
+                && query.locking.is_empty()
+        })
+        .and_then(|query| query.set_body)
+    else {
+        return Ok(None);
+    };
+    let mut leaves = crate::mem::arena::ArenaList::new(arena);
+    if !union_all_leaves(body, &mut leaves)? {
+        return Ok(None);
+    }
+    leaves
+        .into_mut_slice()
+        .map(|leaves| Some(&*leaves))
+        .map_err(|_| arena_full())
+}
+
+/// Whether one appended query runs in place: its expressions are
+/// non-volatile and call no routine body, since they run below the
+/// statement driver, where no call can hand off.
+fn branch_admitted<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    leaf: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    let scope = match leaf.from.as_ref() {
+        Some(from) => QueryScope::resolve_schema(storage, from, txid, arena, None)?,
+        None => QueryScope::singleton(storage, txid, arena)?,
+    };
+    let columns = CatalogScopeCols {
+        scope: &scope,
+        outer_scope: None,
+        storage,
+        txid,
+        arena,
+    };
+    let catalog = storage_catalog(storage, arena, txid);
+    let mut expressions = crate::mem::arena::ArenaList::new(arena);
+    for item in leaf.items {
+        match item {
+            SelectItem::Expr { expression, .. } => {
+                expressions.push(*expression).map_err(|_| arena_full())?;
+            }
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
+            SelectItem::RecordStar(_) => return Ok(false),
+        }
+    }
+    for expression in leaf
+        .where_clause
+        .into_iter()
+        .chain(leaf.having)
+        .chain(leaf.group_by.iter().copied())
+        .chain(leaf.distinct_on.iter().copied())
+        .chain(leaf.order_by.iter().map(|order| order.expression))
+    {
+        expressions.push(expression).map_err(|_| arena_full())?;
+    }
+    for expression in expressions.as_slice() {
+        // Binding proves which casts and operators are builtins.
+        let bound = bind_expression(expression, arena, Some(&columns), None)?;
+        if super::super::eval::routine_input_handoff(bound, Some(&catalog))
+            || super::predicate_safety::expression_properties(
+                expression,
+                &columns,
+                storage,
+                txid,
+                super::predicate_safety::AnalysisStage::RuntimeProjection,
+            )?
+            .volatile
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `SELECT * FROM (query)` for a set query a stream may append, with the
+/// query's LIMIT and OFFSET moved to the outer reader; `None` when `query`
+/// is not an explicit `UNION ALL` without ORDER BY, WITH or row locks.
+fn appended_select<'a>(
+    query: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<Option<&'a Select<'a>>, SqlError> {
+    if query.set_body.is_none()
+        || !query.with.is_empty()
+        || !query.order_by.is_empty()
+        || query.with_ties
+        || !query.locking.is_empty()
+    {
+        return Ok(None);
+    }
+    let inner = arena
+        .alloc(Select {
+            limit: None,
+            offset: None,
+            ..*query
+        })
+        .map_err(|_| arena_full())?;
+    let items = arena
+        .alloc_slice_copy(&[SelectItem::Wildcard])
+        .map_err(|_| arena_full())?;
+    let wrapper = arena
+        .alloc(Select {
+            items,
+            distinct: false,
+            distinct_on: &[],
+            from: Some(FromClause {
+                base: TableRef {
+                    schema: None,
+                    table: "",
+                    alias: None,
+                    subquery: Some(inner),
+                    func_args: None,
+                    func_argument_names: &[],
+                    func_variadic: false,
+                    func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                    rows_from: None,
+                    col_alias: None,
+                    inheritance: crate::sql::ast::RelationInheritance::Descendants,
+                    sample: None,
+                    cte: None,
+                    with_ordinality: false,
+                    lateral: false,
+                    authorization_role: None,
+                    bound_table: None,
+                    view_access: None,
+                },
+                joins: &[],
+            }),
+            where_clause: None,
+            group_by: &[],
+            grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
+            grouping_sets: &[],
+            having: None,
+            order_by: &[],
+            limit: query.limit,
+            offset: query.offset,
+            with_ties: false,
+            with: &[],
+            set_body: None,
+            locking: &[],
+        })
+        .map_err(|_| arena_full())?;
+    Ok(Some(&*wrapper))
+}
+
+/// The query a stream reads for `select`: the appending form of a
+/// `UNION ALL`, else `select` itself.
+pub(crate) fn stream_query<'a>(
+    select: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    Ok(appended_select(select, arena)?.unwrap_or(select))
+}
+
+/// The Select form of a top-level set query, as subqueries carry one.
+pub(crate) fn set_query_select<'a>(
+    query: &'a crate::sql::ast::SetQuery<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    arena
+        .alloc(Select {
+            items: &[],
+            distinct: false,
+            distinct_on: &[],
+            from: None,
+            where_clause: None,
+            group_by: &[],
+            grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
+            grouping_sets: &[],
+            having: None,
+            order_by: query.order_by,
+            limit: query.limit,
+            offset: query.offset,
+            with_ties: query.with_ties,
+            with: query.with,
+            set_body: Some(query.body),
+            locking: query.locking,
+        })
+        .map(|select| &*select)
+        .map_err(|_| arena_full())
+}
+
+/// Reads the next row of an appended `UNION ALL`: the current query's
+/// filter, bounds and output run here, its values are coerced to the
+/// combined column types and encoded into `work`. Each query keeps its own
+/// row in `state_arena` until its output is encoded, so a wait leaves that
+/// row pending and the same call resumes it.
+fn next_appended_row<'a, 'w>(
+    branches: &mut [RetainedSelect<'a>],
+    next: &mut usize,
+    targets: &[ColType],
+    pull: &mut Pull<'_, 'a>,
+    work: &'w Arena,
+) -> Result<Option<&'w [u8]>, SqlError> {
+    while let Some(branch) = branches.get_mut(*next) {
+        let state_arena = pull.state_arena;
+        if !branch.prepare_branch_row(pull)? {
+            *next += 1;
+            continue;
+        }
+        let passes = branch.evaluate_statement_predicate(
+            pull.storage,
+            pull.txid,
+            work,
+            pull.params,
+            None,
+            None,
+            work,
+        )?;
+        if !passes || branch.skip_statement_row() {
+            branch.finish_statement_row(state_arena, false);
+            continue;
+        }
+        let mut values = crate::mem::arena::ArenaList::new(work);
+        for index in 0..branch.statement_items_len() {
+            let item = branch.evaluate_statement_item(
+                index,
+                pull.storage,
+                pull.txid,
+                work,
+                pull.params,
+                None,
+                None,
+                work,
+            )?;
+            for value in item {
+                let target = targets.get(values.len()).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "each UNION query must have the same number of columns"
+                    )
+                })?;
+                let value = super::setops::coerce_set_value(*value, *target, work)?;
+                values.push(value).map_err(|_| arena_full())?;
+            }
+        }
+        if values.len() != targets.len() {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "each UNION query must have the same number of columns"
+            ));
+        }
+        let values = values.as_slice();
+        let length = crate::sql::exec::projected_row_len(values)?;
+        let bytes = work
+            .alloc_slice_with(length, |_| 0u8)
+            .map_err(|_| arena_full())?;
+        crate::sql::exec::encode_projected_into(values, bytes)?;
+        branch.finish_statement_row(state_arena, true);
+        return Ok(Some(&*bytes));
+    }
+    Ok(None)
 }
 
 fn literal_source_tree(tree: &crate::sql::ast::SetTree<'_>) -> Option<usize> {
@@ -1663,10 +1958,7 @@ impl<'a> RetainedSelect<'a> {
         state_arena: &'a Arena,
         params: &[Datum<'a>],
     ) -> Result<(), SqlError> {
-        if let Some(joins) = &mut self.joins {
-            return joins.start_generators(storage, txid, state_arena, params);
-        }
-        start_generator_source(&mut self.source, storage, txid, state_arena, params)
+        self.plan.start(storage, txid, state_arena, params)
     }
 
     pub(crate) fn revisit(&self) -> crate::sql::cursor::Revisit {
@@ -1684,7 +1976,7 @@ impl<'a> RetainedSelect<'a> {
     where
         'a: 'work,
     {
-        let RowBounds::Unstarted { limit, offset } = self.bounds else {
+        let RowBounds::Unstarted { limit, offset } = self.plan.bounds() else {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "cursor bounds were evaluated before its plan started"
@@ -1694,7 +1986,7 @@ impl<'a> RetainedSelect<'a> {
             super::super::exec::eval_offset_pub(offset, work, params, &crate::sql::eval::NO_HOOKS)?;
         let count =
             super::super::exec::eval_limit_pub(limit, work, params, &crate::sql::eval::NO_HOOKS)?;
-        self.bounds = RowBounds::Active {
+        *self.plan.bounds_mut() = RowBounds::Active {
             skip: 0,
             remaining: u64::MAX,
         };
@@ -1702,23 +1994,12 @@ impl<'a> RetainedSelect<'a> {
     }
 
     pub(crate) fn has_pending(&self) -> bool {
-        if self.sort.as_ref().is_some_and(sort::SortState::has_current)
-            || self
-                .grouping
-                .as_ref()
-                .is_some_and(grouping::GroupState::has_current)
-        {
-            return true;
-        }
-        match &self.joins {
-            Some(joins) => joins.has_pending(),
-            None => self.pending.is_some(),
-        }
+        self.plan.has_current()
     }
 
     /// LIMIT has returned all its rows; PostgreSQL reads no further input.
     pub(crate) fn limit_reached(&self) -> bool {
-        matches!(self.bounds, RowBounds::Active { remaining: 0, .. })
+        matches!(self.plan.bounds(), RowBounds::Active { remaining: 0, .. })
     }
 
     pub(crate) fn locks_rows(&self) -> bool {
@@ -1736,13 +2017,14 @@ impl<'a> RetainedSelect<'a> {
         self.order.is_empty()
             && self.locking.is_empty()
             && !self.saves_scroll_output
-            && self.grouping.is_none()
+            && self.plan.group().is_none()
+            && self.branches().is_empty()
     }
 
     /// Keeps the input readable after its last row, so a scrollable cursor
     /// can [`Self::rewind`] it.
     pub(crate) fn keep_finished_input(&mut self) {
-        self.keep_finished = true;
+        self.plan.keep_finished = true;
     }
 
     /// Returns to the first input row, as PostgreSQL's executor rewind does
@@ -1755,24 +2037,10 @@ impl<'a> RetainedSelect<'a> {
                 "retained cursor input cannot be rewound here"
             ));
         }
-        if matches!(self.state, ReaderState::Eliminated) {
+        if matches!(self.plan.state, ReaderState::Eliminated) {
             return Ok(());
         }
-        if let Some(sort) = &mut self.sort {
-            // The sorted rows stay; only output positions return.
-            sort.rewind();
-            self.bounds = self.initial_bounds;
-            return Ok(());
-        }
-        match &mut self.joins {
-            Some(joins) => joins.rewind(state_arena)?,
-            None => self.source.rewind(state_arena)?,
-        }
-        self.bounds = self.initial_bounds;
-        // PostgreSQL counts a scrollable scan once, however it moves; the
-        // rows read again are counted as read.
-        self.state = ReaderState::Reading;
-        Ok(())
+        self.plan.rewind(state_arena)
     }
 
     /// Orders saved inputs, stored last first, so input 0 sorts first.
@@ -1825,7 +2093,7 @@ impl<'a> RetainedSelect<'a> {
     }
 
     fn pending_identity(&self) -> Result<(u64, crate::storage::RowVersion), SqlError> {
-        let pending = self.pending.as_ref().ok_or_else(|| {
+        let pending = self.pending().ok_or_else(|| {
             sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "cursor has no pending row to lock"
@@ -1872,7 +2140,11 @@ impl<'a> RetainedSelect<'a> {
                 crate::storage::LockedRowRecheck::Updated(home) => {
                     let version = home.snapshot().row_version();
                     let bytes = storage.row_bytes(table, rowid, home, state_arena)?;
-                    let pending = self.pending.as_mut().expect("identified pending row");
+                    let pending = self
+                        .plan
+                        .scan_mut()
+                        .and_then(|scan| scan.pending.as_mut())
+                        .expect("identified pending row");
                     pending.row = RetainedRow::Current {
                         rowid,
                         version,
@@ -1894,7 +2166,7 @@ impl<'a> RetainedSelect<'a> {
     ) -> Result<(), SqlError> {
         // Long walks over saved rows stay cancelable and time-limited.
         check_timeout()?;
-        if let Some(pending) = &self.pending {
+        if let Some(pending) = self.pending() {
             if pending.saved == Some(index) {
                 return Ok(());
             }
@@ -1915,7 +2187,10 @@ impl<'a> RetainedSelect<'a> {
         }
         let (header, values) = copied.split_at(INPUT_HEADER);
         let rowid = u64::from_le_bytes(header[..8].try_into().expect("eight-byte identity"));
-        self.pending = Some(PendingRow {
+        self.plan
+            .scan_mut()
+            .expect("saved inputs are scanned")
+            .pending = Some(PendingRow {
             row: RetainedRow::Saved {
                 rowid: (rowid != NO_ROWID).then_some(rowid),
                 version: crate::storage::RowVersion::decode(&header[8..]),
@@ -1936,7 +2211,7 @@ impl<'a> RetainedSelect<'a> {
             InputBytes<'_>,
         ) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let pending = self.pending.as_ref().ok_or_else(|| {
+        let pending = self.pending().ok_or_else(|| {
             sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "cursor has no pending input to save"
@@ -2008,46 +2283,74 @@ impl<'a> RetainedSelect<'a> {
     pub(crate) fn default_scrollable(&self) -> bool {
         // PostgreSQL never makes a row-locking cursor scrollable by default;
         // a sort can scan backward.
-        if self.sort.is_some() {
-            return self.locking.is_empty() && !matches!(self.state, ReaderState::Eliminated);
+        if self.plan.sort().is_some() {
+            return self.locking.is_empty() && !matches!(self.plan.state, ReaderState::Eliminated);
         }
         self.locking.is_empty()
             && matches!(
-                self.source,
-                RetainedSource::Physical(_)
-                    | RetainedSource::Generated { .. }
-                    | RetainedSource::Literals {
-                        scrollable: true,
-                        ..
-                    }
+                self.plan.scan().map(|scan| &scan.source),
+                Some(
+                    RetainedSource::Physical(_)
+                        | RetainedSource::Generated { .. }
+                        | RetainedSource::Literals {
+                            scrollable: true,
+                            ..
+                        }
+                )
             )
-            && !matches!(self.state, ReaderState::Eliminated)
+            && !matches!(self.plan.state, ReaderState::Eliminated)
     }
 
     /// The physical tables this reader scans.
     pub(crate) fn source_tables(&self) -> [Option<usize>; MAX_RETAINED_SOURCES] {
         let mut tables = [None; MAX_RETAINED_SOURCES];
-        if matches!(self.state, ReaderState::Eliminated) {
+        if matches!(self.plan.state, ReaderState::Eliminated) {
             return tables;
         }
-        match &self.joins {
+        match self.plan.join() {
             Some(joins) => {
                 for (target, (table, source)) in tables.iter_mut().zip(joins.tables()) {
                     *target = matches!(source, RetainedSource::Physical(_))
                         .then(|| self.scope.slots[table]);
                 }
             }
+            None if !self.branches().is_empty() => {
+                let mut held = self
+                    .branches()
+                    .iter()
+                    .flat_map(|branch| branch.source_tables())
+                    .flatten();
+                for target in &mut tables {
+                    *target = held.next();
+                }
+                debug_assert!(held.next().is_none(), "admission bounds appended tables");
+            }
             None => {
-                tables[0] =
-                    matches!(self.source, RetainedSource::Physical(_)).then(|| self.scope.slots[0]);
+                tables[0] = matches!(
+                    self.plan.scan().map(|scan| &scan.source),
+                    Some(RetainedSource::Physical(_))
+                )
+                .then(|| self.scope.slots[0]);
             }
         }
         tables
     }
 
     pub(crate) fn uses_table(&self, table: usize) -> bool {
-        !matches!(self.state, ReaderState::Eliminated)
-            && self.scope.slots[..self.scope.n].contains(&table)
+        !matches!(self.plan.state, ReaderState::Eliminated)
+            && (self.scope.slots[..self.scope.n].contains(&table)
+                || self
+                    .branches()
+                    .iter()
+                    .any(|branch| branch.uses_table(table)))
+    }
+
+    /// The queries an appending reader reads, in order.
+    fn branches(&self) -> &[RetainedSelect<'a>] {
+        match self.plan.scan().map(|scan| &scan.source) {
+            Some(RetainedSource::Append { branches, .. }) => branches,
+            _ => &[],
+        }
     }
 
     /// The source a top-level `SELECT` reads when a cursor-mode open would
@@ -2065,6 +2368,9 @@ impl<'a> RetainedSelect<'a> {
         let Some(from) = statement.from.as_ref() else {
             return Ok(None);
         };
+        if let Some(leaves) = appended_leaves(statement, arena)? {
+            return Self::appended_source(storage, txid, statement, leaves, arena);
+        }
         if !from.joins.is_empty() {
             let Some((scope, shape, ..)) =
                 retained_join_scope(storage, txid, statement, from, None, true, true, arena)?
@@ -2189,6 +2495,80 @@ impl<'a> RetainedSelect<'a> {
         Ok(Some(StreamSource::Table(table)))
     }
 
+    /// [`Self::stream_source`] of a `UNION ALL` read as one appended
+    /// stream: every query streams on its own and runs in place, and their
+    /// physical tables together fit one retained join's.
+    fn appended_source(
+        storage: &'a Storage,
+        txid: u32,
+        statement: &'a Select<'a>,
+        leaves: &'a [&'a Select<'a>],
+        arena: &'a Arena,
+    ) -> Result<Option<StreamSource>, SqlError> {
+        if leaves.len() > MAX_RETAINED_SOURCES {
+            return Ok(None);
+        }
+        let catalog = storage_catalog(storage, arena, txid);
+        if [statement.limit, statement.offset]
+            .into_iter()
+            .flatten()
+            .any(|bound| !retained_bound(bound, &catalog))
+        {
+            return Ok(None);
+        }
+        let mut tables = [None; MAX_RETAINED_SOURCES];
+        let mut count = 0;
+        for leaf in leaves {
+            if !branch_admitted(storage, txid, leaf, arena)? {
+                return Ok(None);
+            }
+            let leaf_tables = match Self::stream_source(storage, txid, leaf, arena)? {
+                Some(StreamSource::Table(table)) => {
+                    [Some(table), None, None, None, None, None, None, None]
+                }
+                Some(StreamSource::Generated) => [None; MAX_RETAINED_SOURCES],
+                Some(StreamSource::Join(tables)) => tables,
+                None => return Ok(None),
+            };
+            for table in leaf_tables.into_iter().flatten() {
+                let Some(target) = tables.get_mut(count) else {
+                    return Ok(None);
+                };
+                *target = Some(table);
+                count += 1;
+            }
+        }
+        // The combined description and bounds resolve as the reader's will.
+        let scope = QueryScope::resolve_schema(
+            storage,
+            statement.from.as_ref().expect("appended source"),
+            txid,
+            arena,
+            None,
+        )?;
+        let columns = CatalogScopeCols {
+            scope: &scope,
+            outer_scope: None,
+            storage,
+            txid,
+            arena,
+        };
+        for bound in [statement.limit, statement.offset].into_iter().flatten() {
+            let (oid, _) = super::super::exec::infer_type_res(bound, &columns)?;
+            if oid != super::super::types::oid::UNKNOWN
+                && !matches!(
+                    catalog
+                        .domain_base_type(oid)
+                        .or_else(|| ColType::from_oid(oid)),
+                    Some(ColType::Int2 | ColType::Int4 | ColType::Int8)
+                )
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(StreamSource::Join(tables)))
+    }
+
     pub(crate) fn open(
         storage: &'a Storage,
         txid: u32,
@@ -2281,6 +2661,12 @@ impl<'a> RetainedSelect<'a> {
             .and_then(|from| from.base.subquery)
             .and_then(literal_source);
         let literals = literal_count.is_some();
+        // A stream appends the queries of a UNION ALL itself.
+        let appended = if mode == RetainedMode::Cursor && reader_use == RetainedUse::Stream {
+            appended_leaves(statement, arena)?
+        } else {
+            None
+        };
         if from.is_none() && mode == RetainedMode::Statement {
             return Ok(None);
         }
@@ -2290,7 +2676,7 @@ impl<'a> RetainedSelect<'a> {
         if from.is_some_and(|from| {
             !from.joins.is_empty()
                 || from.base.is_function_source() && generated.is_none()
-                || from.base.subquery.is_some() && !literals
+                || from.base.subquery.is_some() && !literals && appended.is_none()
                 || from.base.cte.is_some()
                 || from.base.sample.is_some()
                 || matches!(
@@ -2364,6 +2750,7 @@ impl<'a> RetainedSelect<'a> {
                 if scope.n != 1
                     || !literals
                         && generated.is_none()
+                        && appended.is_none()
                         && (scope.derived[0].is_some() || scope.slots[0] == usize::MAX)
                 {
                     return Ok(None);
@@ -2433,7 +2820,9 @@ impl<'a> RetainedSelect<'a> {
             }
         }
         let binding_columns = Some(&columns);
-        let table = if let Some(from) = from.filter(|_| !literals && generated.is_none()) {
+        let table = if let Some(from) =
+            from.filter(|_| !literals && generated.is_none() && appended.is_none())
+        {
             let table = scope.slots[0];
             let definition = scope.defs.stored(0).expect("resolved physical source");
             if definition.kind != crate::storage::TableKind::Local
@@ -2571,7 +2960,7 @@ impl<'a> RetainedSelect<'a> {
             .transpose()?;
         let (predicate, eliminated) = match predicate {
             Some(predicate)
-                if mode == RetainedMode::Cursor && row_independent(predicate, &scope) =>
+                if mode != RetainedMode::Statement && row_independent(predicate, &scope) =>
             {
                 let hooks = EvalHooks {
                     catalog: Some(&catalog),
@@ -2625,7 +3014,7 @@ impl<'a> RetainedSelect<'a> {
                 .map(|bound| bind_expression(bound, arena, binding_columns, None))
                 .transpose()?,
         };
-        let bounds = if mode == RetainedMode::Statement {
+        let bounds = if mode != RetainedMode::Cursor {
             RowBounds::Active {
                 skip: super::super::exec::eval_offset_pub(
                     statement.offset,
@@ -2657,7 +3046,42 @@ impl<'a> RetainedSelect<'a> {
                 false,
             )?;
         }
-        let source = if let Some(table) = table {
+        let source = if let Some(leaves) = appended {
+            let definition = scope.defs.get(0).expect("appended result definition");
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            definition.schema(&mut schema);
+            let targets = arena
+                .alloc_slice_copy(&schema[..definition.n_columns])
+                .map_err(|_| arena_full())?;
+            let mut opened: [Option<RetainedSelect<'a>>; MAX_RETAINED_SOURCES] = Default::default();
+            for (slot, leaf) in opened.iter_mut().zip(leaves) {
+                let Some(mut branch) = Self::open_mode(
+                    storage,
+                    txid,
+                    leaf,
+                    params,
+                    arena,
+                    responder,
+                    RetainedMode::Branch,
+                    RetainedUse::Stream,
+                )?
+                else {
+                    return Ok(None);
+                };
+                branch.start_generator(storage, txid, arena, params)?;
+                *slot = Some(branch);
+            }
+            let branches = arena
+                .alloc_owned_slice_with(leaves.len(), |index| {
+                    opened[index].take().expect("opened appended query")
+                })
+                .map_err(|_| arena_full())?;
+            RetainedSource::Append {
+                branches,
+                next: 0,
+                targets,
+            }
+        } else if let Some(table) = table {
             let mut source = RowCursor::closed();
             if !eliminated {
                 scan::validate_materialized_view_reads(storage, &scope, None, arena, txid)?;
@@ -2732,29 +3156,25 @@ impl<'a> RetainedSelect<'a> {
             txid,
         )?;
         let description = describe(&columns[..width], mode, arena, responder)?;
-        Ok(Some(Self {
-            items,
-            predicate,
-            bounds,
-            initial_bounds: bounds,
-            keep_finished: false,
-            scope,
+        let decoded_columns = decoded_columns
+            .map(|mask| arena.alloc(mask).map(|mask| &*mask))
+            .transpose()
+            .map_err(|_| arena_full())?;
+        let leaf = PlanNode::Scan(ScanNode {
             source,
-            decoded_columns,
             pending: None,
+            decoded_columns,
+        });
+        let above = sort.map(PlanNode::Sort).or(grouping.map(PlanNode::Group));
+        let plan = PlanTree::new(leaf, predicate, above, items, bounds, eliminated)?;
+        Ok(Some(Self {
+            scope,
+            plan,
             revisit,
             locking,
             order,
-            joins: None,
             saves_scroll_output: false,
-            sort,
-            grouping,
             description,
-            state: if eliminated {
-                ReaderState::Eliminated
-            } else {
-                ReaderState::Unstarted
-            },
         }))
     }
 
@@ -2881,7 +3301,7 @@ impl<'a> RetainedSelect<'a> {
             .transpose()?;
         let (predicate, eliminated) = match predicate {
             Some(predicate)
-                if mode == RetainedMode::Cursor && row_independent(predicate, &scope) =>
+                if mode != RetainedMode::Statement && row_independent(predicate, &scope) =>
             {
                 let hooks = EvalHooks {
                     catalog: Some(&catalog),
@@ -2956,7 +3376,7 @@ impl<'a> RetainedSelect<'a> {
                 .map(|bound| bind_expression(bound, arena, binding_columns, None))
                 .transpose()?,
         };
-        let bounds = if mode == RetainedMode::Statement {
+        let bounds = if mode != RetainedMode::Cursor {
             RowBounds::Active {
                 skip: super::super::exec::eval_offset_pub(
                     statement.offset,
@@ -3008,29 +3428,23 @@ impl<'a> RetainedSelect<'a> {
             txid,
         )?;
         let description = describe(&description[..width], mode, arena, responder)?;
-        Ok(Some(Self {
-            items,
+        let above = sort.map(PlanNode::Sort).or(grouping.map(PlanNode::Group));
+        let plan = PlanTree::new(
+            PlanNode::Join(joins),
             predicate,
+            above,
+            items,
             bounds,
-            initial_bounds: bounds,
-            keep_finished: false,
+            eliminated,
+        )?;
+        Ok(Some(Self {
             scope,
-            source: RetainedSource::Singleton { available: false },
-            decoded_columns: None,
-            pending: None,
+            plan,
             revisit: crate::sql::cursor::Revisit::SavedOutput,
             locking: &[],
             order: &[],
-            joins: Some(joins),
             saves_scroll_output,
-            sort,
-            grouping,
             description,
-            state: if eliminated {
-                ReaderState::Eliminated
-            } else {
-                ReaderState::Unstarted
-            },
         }))
     }
 
@@ -3049,46 +3463,11 @@ impl<'a> RetainedSelect<'a> {
         params: &[Datum<'_>],
     ) -> Result<bool, SqlError> {
         assert!(
-            matches!(self.bounds, RowBounds::Active { .. }),
+            matches!(self.plan.bounds(), RowBounds::Active { .. }),
             "statement bounds must be prepared"
         );
-        if matches!(self.bounds, RowBounds::Active { remaining: 0, .. }) {
-            if !self.keep_finished {
-                self.source.close();
-                if let Some(joins) = &mut self.joins {
-                    joins.close();
-                }
-            }
-            if !matches!(self.state, ReaderState::Eliminated) {
-                self.state = ReaderState::Complete;
-            }
-            if self.sort.is_some() || self.grouping.is_some() {
-                return Ok(false);
-            }
-        }
-        if self.grouping.is_some() {
-            return self.prepare_grouped_row(
-                storage,
-                txid,
-                observed_at,
-                state_arena,
-                buffers,
-                work,
-                params,
-            );
-        }
-        if self.sort.is_some() {
-            return self.prepare_sorted_row(
-                storage,
-                txid,
-                observed_at,
-                state_arena,
-                buffers,
-                work,
-                params,
-            );
-        }
-        self.prepare_input_row(
+        self.plan.advance(&mut Pull {
+            scope: &self.scope,
             storage,
             txid,
             observed_at,
@@ -3096,359 +3475,26 @@ impl<'a> RetainedSelect<'a> {
             buffers,
             work,
             params,
-        )
-    }
-
-    /// Reads the sort's whole input at its first row, then returns the
-    /// sorted rows one by one.
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_sorted_row(
-        &mut self,
-        storage: &Storage,
-        txid: u32,
-        observed_at: i64,
-        state_arena: &'a Arena,
-        buffers: &mut RowCursorBuffers,
-        work: &Arena,
-        params: &[Datum<'_>],
-    ) -> Result<bool, SqlError> {
-        while !self.sort.as_ref().expect("sorted reader").filled() {
-            if !self.prepare_input_row(
-                storage,
-                txid,
-                observed_at,
-                state_arena,
-                buffers,
-                work,
-                params,
-            )? {
-                self.sort
-                    .as_mut()
-                    .expect("sorted reader")
-                    .finish_fill(storage, txid)?;
-                break;
-            }
-            let mark = work.mark();
-            let mut sort = self.sort.take().expect("sorted reader");
-            let pushed = self
-                .encode_sort_input(&sort, storage, txid, work, params)
-                .and_then(|encoded| encoded.map_or(Ok(()), |row| sort.push_encoded(row)));
-            self.sort = Some(sort);
-            // SAFETY: the encoded row was copied into the sort's lease.
-            unsafe { work.rewind_to(mark) };
-            pushed?;
-            self.finish_input_row(state_arena);
-        }
-        self.sort
-            .as_mut()
-            .expect("sorted reader")
-            .advance(storage, txid)
-    }
-
-    /// Reads and saves the grouping's whole input at its first row, folds
-    /// its groups, then returns them one by one.
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_grouped_row(
-        &mut self,
-        storage: &Storage,
-        txid: u32,
-        observed_at: i64,
-        state_arena: &'a Arena,
-        buffers: &mut RowCursorBuffers,
-        work: &Arena,
-        params: &[Datum<'_>],
-    ) -> Result<bool, SqlError> {
-        while self.grouping.as_ref().expect("grouped reader").filling() {
-            if !self.prepare_input_row(
-                storage,
-                txid,
-                observed_at,
-                state_arena,
-                buffers,
-                work,
-                params,
-            )? {
-                self.grouping
-                    .as_mut()
-                    .expect("grouped reader")
-                    .finish_input(storage, txid, work)?;
-                break;
-            }
-            let mark = work.mark();
-            let mut grouping = self.grouping.take().expect("grouped reader");
-            let pushed = self.accept_group_input(&mut grouping, storage, txid, work, params);
-            self.grouping = Some(grouping);
-            // SAFETY: the row's keys, states or saved columns were copied
-            // into the grouping's leases.
-            unsafe { work.rewind_to(mark) };
-            pushed?;
-            self.finish_input_row(state_arena);
-        }
-        let scope = &self.scope;
-        let grouping = self.grouping.as_mut().expect("grouped reader");
-        grouping.fold(scope, storage, txid, work, params)?;
-        Ok(grouping.advance())
-    }
-
-    /// Filters the pending input row and hands it to the grouping.
-    fn accept_group_input<'work>(
-        &'work self,
-        grouping: &mut grouping::GroupState<'a>,
-        storage: &'work Storage,
-        txid: u32,
-        work: &'work Arena,
-        params: &[Datum<'work>],
-    ) -> Result<(), SqlError> {
-        self.with_input_row(work, |row| {
-            let catalog = StorageCatalog {
-                storage,
-                routine_workspace: work,
-                txid,
-                invocations: None,
-                statement_arena: None,
-            };
-            let hooks = EvalHooks {
-                catalog: Some(&catalog),
-                ..super::super::eval::NO_HOOKS
-            };
-            if let Some(predicate) = self.predicate
-                && !where_passes(predicate, work, params, row, &hooks)?
-            {
-                return Ok(());
-            }
-            grouping.accept(&self.scope, storage, txid, row, work, params, &hooks)
         })
     }
 
-    /// Filters the pending input row and encodes its sort keys, saved
-    /// output values and, for postponed items, its input columns.
-    fn encode_sort_input<'work>(
-        &'work self,
-        sort: &sort::SortState<'a>,
-        storage: &'work Storage,
-        txid: u32,
-        work: &'work Arena,
-        params: &[Datum<'_>],
-    ) -> Result<Option<&'work [u8]>, SqlError> {
-        self.with_input_row(work, |row| {
-            let catalog = StorageCatalog {
-                storage,
-                routine_workspace: work,
-                txid,
-                invocations: None,
-                statement_arena: None,
-            };
-            let hooks = EvalHooks {
-                catalog: Some(&catalog),
-                ..super::super::eval::NO_HOOKS
-            };
-            if let Some(predicate) = self.predicate
-                && !where_passes(predicate, work, params, row, &hooks)?
-            {
-                return Ok(None);
-            }
-            let mut values = crate::mem::arena::ArenaList::new(work);
-            for key in sort.key_expressions() {
-                let value = eval_full(key, work, params, row, &hooks)?;
-                values.push(value).map_err(|_| arena_full())?;
-            }
-            for index in 0..self.items.len() {
-                if sort.postponed(index) {
-                    continue;
-                }
-                let mut projected = [Datum::Null; MAX_PROJ];
-                let width = project_row(
-                    &self.items[index..index + 1],
-                    &self.scope,
-                    row,
-                    work,
-                    params,
-                    &hooks,
-                    &mut projected,
-                    None,
-                )?;
-                if width != sort.saved_width(index) {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "retained sort item width changed"
-                    ));
-                }
-                for value in &projected[..width] {
-                    values.push(*value).map_err(|_| arena_full())?;
-                }
-            }
-            if sort.keeps_inputs() {
-                for table in 0..self.scope.n {
-                    let width = self.scope.defs.get(table).expect("resolved").n_columns;
-                    match row
-                        .table_values(table)
-                        .filter(|_| row.table_present(table) == Some(true))
-                    {
-                        Some(columns) if !columns.is_empty() || width == 0 => {
-                            values.push(Datum::Bool(true)).map_err(|_| arena_full())?;
-                            for column in 0..width {
-                                values
-                                    .push(columns.get(column).copied().unwrap_or(Datum::Null))
-                                    .map_err(|_| arena_full())?;
-                            }
-                        }
-                        _ => {
-                            values.push(Datum::Bool(false)).map_err(|_| arena_full())?;
-                            for _ in 0..width {
-                                values.push(Datum::Null).map_err(|_| arena_full())?;
-                            }
-                        }
-                    }
-                }
-            }
-            let values = values.as_slice();
-            let length = crate::sql::exec::projected_row_len(values)?;
-            let bytes = work
-                .alloc_slice_with(length, |_| 0u8)
-                .map_err(|_| arena_full())?;
-            crate::sql::exec::encode_projected_into(values, bytes)?;
-            Ok(Some(&*bytes))
-        })
-    }
-
-    /// Reads the next input row of the source or join.
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_input_row(
-        &mut self,
-        storage: &Storage,
-        txid: u32,
-        observed_at: i64,
-        state_arena: &'a Arena,
-        buffers: &mut RowCursorBuffers,
-        work: &Arena,
-        params: &[Datum<'_>],
-    ) -> Result<bool, SqlError> {
-        match self.state {
-            ReaderState::Complete | ReaderState::Eliminated => return Ok(false),
-            ReaderState::Unstarted => {
-                if matches!(self.source, RetainedSource::Physical(_)) {
-                    storage.record_relation_scan(
-                        txid,
-                        self.scope.slots[0],
-                        None,
-                        0,
-                        observed_at,
-                    )?;
-                }
-                self.state = ReaderState::Reading;
-            }
-            ReaderState::Reading => {}
-        }
-        if let Some(joins) = &mut self.joins {
-            let ready = joins.prepare_row(
-                &self.scope,
-                storage,
-                txid,
-                observed_at,
-                state_arena,
-                buffers,
-                work,
-                params,
-            )?;
-            if !ready {
-                self.state = ReaderState::Complete;
-                if !self.keep_finished {
-                    joins.close();
-                }
-            }
-            return Ok(ready);
-        }
-        check_timeout()?;
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.saved.is_some())
-        {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "cursor read its source while a saved input was pending"
-            ));
-        }
-        if self.pending.is_none() {
-            let mark = state_arena.mark();
-            let next = next_source_row(
-                &mut self.source,
-                state_arena,
-                buffers,
-                self.decoded_columns.as_ref(),
-            );
-            let row = match next {
-                Ok(row) => row,
-                Err(error) => {
-                    // Failed reads retain navigation state, not front scratch.
-                    unsafe { state_arena.rewind_to(mark) };
-                    return Err(error);
-                }
-            };
-            let Some(row) = row else {
-                unsafe { state_arena.rewind_to(mark) };
-                self.state = ReaderState::Complete;
-                if !self.keep_finished {
-                    self.source.close();
-                }
-                return Ok(false);
-            };
-            self.pending = Some(PendingRow {
-                row,
-                mark,
-                counted: false,
-                saved: None,
-            });
-        }
-        let pending = self.pending.as_mut().expect("captured statement row");
-        if !pending.counted {
-            if matches!(pending.row, RetainedRow::Physical(_)) {
-                storage.record_relation_tuple_read(txid, self.scope.slots[0], None)?;
-            }
-            pending.counted = true;
-        }
-        Ok(true)
-    }
-
-    fn with_statement_row<'work, R>(
-        &'work self,
-        work: &'work Arena,
-        each: impl FnOnce(&scan::JoinRow<'_, 'work, '_>) -> Result<R, SqlError>,
-    ) -> Result<R, SqlError> {
-        if let Some(sort) = &self.sort
-            && sort.has_current()
-        {
-            return sort.with_input_row(&self.scope, work, each);
-        }
-        self.with_input_row(work, each)
-    }
-
-    /// The pending input row, before any sort.
-    fn with_input_row<'work, R>(
-        &'work self,
-        work: &'work Arena,
-        each: impl FnOnce(&scan::JoinRow<'_, 'work, '_>) -> Result<R, SqlError>,
-    ) -> Result<R, SqlError> {
-        if let Some(joins) = &self.joins {
-            return joins.with_row(&self.scope, work, self.scope.n, each);
-        }
-        let pending = self.pending.as_ref().expect("prepared statement row");
-        let mut values = [Datum::Null; MAX_COLUMNS];
-        pending.decode(&self.scope, &mut values)?;
-        let rowids = [match &pending.row {
-            RetainedRow::Physical(row) => Some(row.rowid),
-            RetainedRow::Saved { rowid, .. } => *rowid,
-            RetainedRow::Current { rowid, .. } => Some(*rowid),
-            RetainedRow::Singleton | RetainedRow::Literal(_) | RetainedRow::Null => None,
-        }];
-        each(&scan::JoinRow {
+    /// Moves an appended query to its next row.
+    fn prepare_branch_row(&mut self, pull: &mut Pull<'_, 'a>) -> Result<bool, SqlError> {
+        self.plan.advance(&mut Pull {
             scope: &self.scope,
-            values: scan::JoinRowValues::Flat {
-                values: &values,
-                offsets: &[0],
-            },
-            rowids: &rowids,
+            storage: pull.storage,
+            txid: pull.txid,
+            observed_at: pull.observed_at,
+            state_arena: pull.state_arena,
+            buffers: pull.buffers,
+            work: pull.work,
+            params: pull.params,
         })
+    }
+
+    /// The single source's current row.
+    fn pending(&self) -> Option<&PendingRow<'a>> {
+        self.plan.scan().and_then(|scan| scan.pending.as_ref())
     }
 
     #[expect(
@@ -3465,7 +3511,7 @@ impl<'a> RetainedSelect<'a> {
         invocations: Option<&RoutineInvocationState>,
         frame_arena: &Arena,
     ) -> Result<bool, SqlError> {
-        if let Some(grouping) = &self.grouping {
+        if let Some(grouping) = self.plan.group() {
             let catalog = StorageCatalog {
                 storage,
                 routine_workspace: work,
@@ -3480,13 +3526,10 @@ impl<'a> RetainedSelect<'a> {
             };
             return grouping.having_passes(&self.scope, work, params, &hooks);
         }
-        let Some(predicate) = self.predicate else {
+        // A sorted row passed its filter before the sort.
+        let Some(predicate) = self.plan.driver_filter() else {
             return Ok(true);
         };
-        // A sorted row passed the filter before the sort.
-        if self.sort.as_ref().is_some_and(sort::SortState::has_current) {
-            return Ok(true);
-        }
         let catalog = StorageCatalog {
             storage,
             routine_workspace: work,
@@ -3499,13 +3542,13 @@ impl<'a> RetainedSelect<'a> {
             sequences: sequence,
             ..super::super::eval::NO_HOOKS
         };
-        self.with_statement_row(work, |row| {
+        self.plan.with_row(&self.scope, work, |row| {
             where_passes(predicate, work, params, row, &hooks)
         })
     }
 
     pub(crate) fn statement_items_len(&self) -> usize {
-        self.items.len()
+        self.plan.items().len()
     }
 
     #[expect(
@@ -3523,14 +3566,15 @@ impl<'a> RetainedSelect<'a> {
         invocations: Option<&RoutineInvocationState>,
         frame_arena: &'frame Arena,
     ) -> Result<&'frame [Datum<'frame>], SqlError> {
-        if let Some(sort) = &self.sort
+        let items = self.plan.items();
+        if let Some(sort) = self.plan.sort()
             && sort.has_current()
             && !sort.postponed(index)
         {
             return sort.saved_item(index, frame_arena);
         }
-        if let Some(grouping) = &self.grouping {
-            let SelectItem::Expr { expression, .. } = self.items[index] else {
+        if let Some(grouping) = self.plan.group() {
+            let SelectItem::Expr { expression, .. } = items[index] else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "grouped output item is not an expression"
@@ -3569,10 +3613,10 @@ impl<'a> RetainedSelect<'a> {
             sequences: sequence,
             ..super::super::eval::NO_HOOKS
         };
-        self.with_statement_row(work, |row| {
+        self.plan.with_row(&self.scope, work, |row| {
             let mut projected = [Datum::Null; MAX_PROJ];
             let width = project_row(
-                &self.items[index..index + 1],
+                &items[index..index + 1],
                 &self.scope,
                 row,
                 work,
@@ -3593,7 +3637,7 @@ impl<'a> RetainedSelect<'a> {
 
     /// OFFSET consumes projected rows while the caller suppresses emission.
     pub(crate) fn skip_statement_row(&mut self) -> bool {
-        let RowBounds::Active { skip, .. } = &mut self.bounds else {
+        let RowBounds::Active { skip, .. } = self.plan.bounds_mut() else {
             unreachable!("statement bounds must be prepared")
         };
         if *skip == 0 {
@@ -3605,36 +3649,14 @@ impl<'a> RetainedSelect<'a> {
 
     pub(crate) fn finish_statement_row(&mut self, state_arena: &Arena, emitted: bool) {
         if emitted {
-            let RowBounds::Active { remaining, .. } = &mut self.bounds else {
+            let RowBounds::Active { remaining, .. } = self.plan.bounds_mut() else {
                 unreachable!("statement bounds must be prepared")
             };
             *remaining = remaining.checked_sub(1).expect("prepared remaining row");
         }
-        if let Some(sort) = &mut self.sort {
-            sort.finish_row();
-            return;
-        }
-        if let Some(grouping) = &mut self.grouping {
-            grouping.finish_row();
-            return;
-        }
-        self.finish_input_row(state_arena);
-    }
-
-    /// Releases the pending input row and its bytes.
-    fn finish_input_row(&mut self, state_arena: &Arena) {
-        if let Some(joins) = &mut self.joins {
-            joins.finish_row(state_arena);
-            return;
-        }
-        let mark = self
-            .pending
-            .take()
-            .expect("finished statement input row")
-            .mark;
-        // The caller has emitted/dropped all scoped evaluation values. Taking
-        // pending first releases its owned bytes before reclaiming row scratch.
-        unsafe { state_arena.rewind_to(mark) };
+        // The caller has emitted or dropped every evaluation value of the
+        // row.
+        self.plan.release(state_arena);
     }
 
     /// Whether the statement's RowDescription still waits for its first
@@ -3670,18 +3692,16 @@ impl<'a> RetainedSelect<'a> {
         buffers: &mut RowCursorBuffers,
         work: &Arena,
     ) -> Result<(), SqlError> {
-        match &mut self.joins {
-            Some(joins) if !matches!(self.state, ReaderState::Eliminated) => joins.build_hashes(
-                &self.scope,
-                storage,
-                txid,
-                observed_at,
-                state_arena,
-                buffers,
-                work,
-            ),
-            _ => Ok(()),
-        }
+        self.plan.build(&mut Pull {
+            scope: &self.scope,
+            storage,
+            txid,
+            observed_at,
+            state_arena,
+            buffers,
+            work,
+            params: &[],
+        })
     }
 
     #[expect(
@@ -3702,8 +3722,8 @@ impl<'a> RetainedSelect<'a> {
         'a: 'work,
     {
         self.start_generator(storage, txid, state_arena, params)?;
-        if let RowBounds::Unstarted { limit, offset } = self.bounds {
-            self.bounds = RowBounds::Active {
+        if let RowBounds::Unstarted { limit, offset } = self.plan.bounds() {
+            *self.plan.bounds_mut() = RowBounds::Active {
                 skip: super::super::exec::eval_offset_pub(
                     offset,
                     work,

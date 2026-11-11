@@ -1081,6 +1081,13 @@ fn leaf_col_unknown<'a>(
                     if matches!(expression, Expr::Cast { .. }) {
                         return false;
                     }
+                    // An untyped literal stays unknown whatever the FROM.
+                    if matches!(
+                        exec::infer_type_pub(expression, None).map(|t| t.0),
+                        Ok(crate::sql::types::oid::UNKNOWN)
+                    ) {
+                        return true;
+                    }
                     let scratch_mark = arena.mark();
                     let raw = match &s.from {
                         None => exec::infer_type_pub(expression, None).map(|t| t.0),
@@ -1481,6 +1488,23 @@ pub(crate) fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
     if numeric(a) && numeric(b) {
         return Some(exec::unify_numeric_tower(a, b));
     }
+    // The string category: PostgreSQL's select_common_type keeps the
+    // running type unless it is not the preferred `text` and only it casts
+    // implicitly to the next one, so `varchar UNION text` stays varchar.
+    let string = |t| {
+        matches!(
+            t,
+            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name
+        )
+    };
+    if string(a) && string(b) {
+        let implicit = |from, to| from != ColType::Name || to == ColType::Text;
+        return Some(if a != ColType::Text && implicit(a, b) && !implicit(b, a) {
+            b
+        } else {
+            a
+        });
+    }
     None
 }
 
@@ -1556,6 +1580,9 @@ pub(crate) fn describe_set_body<'a>(
     // type of the other branches, as PostgreSQL resolves an unknown literal).
     let mut target: [Option<ColType>; MAX_PROJ] = [None; MAX_PROJ];
     let mut identical_types: [Option<i32>; MAX_PROJ] = [None; MAX_PROJ];
+    // PostgreSQL keeps a column's type modifier only when every input has
+    // the same type and modifier (select_common_typmod).
+    let mut identical_mods: [bool; MAX_PROJ] = [true; MAX_PROJ];
     for (c, col) in columns[..n_cols].iter().enumerate() {
         let unknown = leaf_col_unknown(storage, leaf0, c, txid, arena);
         identical_types[c] = Some(if unknown {
@@ -1605,6 +1632,9 @@ pub(crate) fn describe_set_body<'a>(
             };
             if identical_types[c] != Some(input_oid) {
                 identical_types[c] = None;
+            }
+            if lc[c].type_mod != columns[c].type_mod {
+                identical_mods[c] = false;
             }
             if unknown {
                 continue; // an untyped NULL column adopts the running type
@@ -1657,6 +1687,9 @@ pub(crate) fn describe_set_body<'a>(
             .filter(|oid| *oid != crate::sql::types::oid::UNKNOWN)
             .unwrap_or_else(|| target[c].oid());
         col.typlen = target[c].typlen();
+        if identical_types[c].is_none() || !identical_mods[c] {
+            col.type_mod = -1;
+        }
     }
     // Set operations retain a domain only when every input has that declared type.
     if let Some(type_oids) = type_oids {

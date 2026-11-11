@@ -359,6 +359,15 @@ impl CursorQuery {
         })
     }
 
+    /// Returns the retained source to its first row; see
+    /// [`crate::sql::query::RetainedSelect::rewind`].
+    pub(crate) fn rewind_source(&mut self) -> Result<(), SqlError> {
+        let source = self.retained.as_mut().expect("retained cursor input");
+        // Retention stores bytes in this allocation, never the movable Arena object.
+        let arena: &'static Arena = unsafe { &*(&self.arena as *const Arena) };
+        source.rewind(arena)
+    }
+
     pub(crate) fn source(&self) -> Option<&crate::sql::query::RetainedSelect<'static>> {
         self.retained.as_ref()
     }

@@ -96,9 +96,10 @@ is owned.
   from one table or builtin set-returning functions with constant arguments,
   including paged portals, forward `FETCH` from `NO SCROLL` cursors and
   `COPY ... TO STDOUT` of such a query or one table. Remaining:
-  - More retained shapes: joins, grouping, subqueries, set operations, sorts
-    of results (a large ordered `SELECT` still spools, because its sort input
-    has no size estimate to choose a stream before it runs), and more
+  - More retained shapes, by the
+    [retained plan tree design](docs/architecture.md#retained-plan-tree-design-not-yet-built):
+    joins, grouping, subqueries, set operations, sorts of results (a large
+    ordered `SELECT` still spools), and more
     set-returning functions than the generator builtins (series, subscripts,
     one-array `unnest`, regex, and the `json`/`jsonb` `_each`,
     `_array_elements` and `_object_keys` families, alone or in `ROWS FROM`):
@@ -109,9 +110,11 @@ is owned.
     an expression that is not a source column returns saved values where
     PostgreSQL evaluates a volatile output list again, and a row-locking cursor
     over a join, or ordered by such an expression, locks its rows at `DECLARE`.
-  - `FETCH` from scrollable cursors, including PostgreSQL's default for table
-    scans, saves every visited row in `cursor_bytes`: the retained read
-    position cannot move backward over saved generations.
+  - Scrollable cursors whose revisited rows are evaluated again (volatile
+    output or filter), ordered scrollable cursors and held cursors still save
+    their history in `cursor_bytes`. A scrollable cursor moving back rereads
+    its input from the first row; retained position checkpoints would bound
+    that reread.
   - PL/pgSQL `FOR rec IN c LOOP` over a bound cursor is rejected with
     `0A000`; it needs a loop frame that opens, fetches and closes the cursor
     across waits in every procedural executor.

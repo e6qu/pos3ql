@@ -274,8 +274,15 @@ FETCH 1 FROM parts;  -- produces only the "a" row
 - Selecting `id` from a row with a 128 KiB text column does not copy that text
   into cursor memory.
 
-`SCROLL` cursors save visited rows so `FETCH PRIOR` and jumps backward need no
-new reads; `FETCH LAST` reads the rest. When the output list calls a volatile
+A `SCROLL` cursor (and a table scan's or function's cursor declared without a
+scroll option) whose output list and filter call no volatile function keeps
+only the rows of its current `FETCH`: a forward fetch from the client streams
+like a `NO SCROLL` cursor's, and a motion back to rows it no longer holds reads
+the input again from its first row with the cursor's snapshot, so rows
+inserted since `DECLARE` stay invisible. `FETCH PRIOR` right after a fetch
+reuses that fetch's rows; otherwise moving back costs a read of the input up
+to the target row, and `pg_stat_*_tables.seq_tup_read` counts the rows read
+again. When the output list calls a volatile
 function such as `nextval`, a row reached again by `FETCH PRIOR`, `ABSOLUTE`,
 `RELATIVE` or a later forward fetch is evaluated again, as PostgreSQL scans
 backward: with `SELECT id, nextval('s') FROM t`, `FETCH NEXT` twice then
@@ -284,7 +291,8 @@ input columns of each row instead of its output, and a volatile filter also
 saves the rows it rejected, because the filter runs again too. `LIMIT` returns
 the row at the edge of its window again without evaluating it, and `MOVE` and
 `FETCH ABSOLUTE` take PostgreSQL's steps (an absolute target less than halfway
-back rewinds and reads forward). History must fit `cursor_bytes`; exhaustion
+back rewinds and reads forward). Such a cursor's history, and an ordered
+scrollable cursor's, must fit `cursor_bytes`; exhaustion
 returns `54000` and leaves the cursor failed until closed. Without a scroll
 option, a table scan, a retained set-returning function and a list of two or
 more `VALUES` rows allow scrolling; one row, `UNION ALL` and a provably empty

@@ -120,17 +120,23 @@ cold storage only until its first byte reaches the client, then reads
 synchronously until it ends. Today that covers joins, grouping, sorted
 results, subqueries, set operations, `VALUES` lists, other function sources,
 row locking, row security, a result that started an effect before it
-overflowed, and a `FETCH` from a scrollable cursor. A buffered paged portal
+overflowed, and a `FETCH` from a scrollable cursor that saves its history. A buffered paged portal
 sends nothing before its first page, so its reads yield throughout.
 
 A forward `FETCH n` or `FETCH ALL` (simple Query or unpaged `Execute`) from
-a cursor that reads as it fetches and saves no history (`NO SCROLL`, or a
-forward-only shape) opens such a stream over the cursor's own retained query
-before its first row: rows are evaluated as the client reads them, none is
-saved in `cursor_bytes`, and the cursor's position advances with each
-delivered row. A failure after delivered rows marks the cursor failed, as
-PostgreSQL does. Scrollable cursors still buffer a `FETCH` in `cursor_bytes`,
-because they save every visited row for backward motion.
+a cursor that reads as it fetches and saves no history opens such a stream
+over the cursor's own retained query before its first row: rows are evaluated
+as the client reads them, none is saved in `cursor_bytes`, and the cursor's
+position advances with each delivered row. A failure after delivered rows
+marks the cursor failed, as PostgreSQL does. A cursor saves no history when it
+is `NO SCROLL` or forward-only, and also when it is scrollable but unordered,
+not locking, and free of volatile functions: such a cursor keeps only its
+current fetch's rows, and backward motion beyond them rewinds its retained
+input (table position, literal list or function arguments) to the first row
+under the same snapshot and reads forward to the target, so memory stays
+fixed however far the cursor has moved. Scrollable cursors that evaluate
+revisited rows again, or that sort or lock, still save every visited row in
+`cursor_bytes`.
 
 **Paged portals evaluate rows per `Execute`.** An `Execute` with a row limit
 opens such a statement's stream before its first row. Each `Execute`
@@ -173,6 +179,66 @@ runs other connections. Converting the blocking paths is tracked in
 connection's cached lookup and a third connection's commit can finish. If the
 first connection's statement had already called `nextval('order_ids')`, its
 remaining reads would instead block the worker.
+
+### Retained plan tree (design, not yet built)
+
+Today a result stream or retained cursor holds one source: a table position,
+a literal list, or generator calls, with a filter, projection and LIMIT above
+it. Every other shape runs in the general executor, which materializes in the
+statement arena and cannot pause after its first byte. The retained plan tree
+generalizes the one-source reader into a tree of nodes that pull one row at a
+time, each owning a fixed control record and fixed buffers reserved at
+startup. It is the planned route for joins, grouping, subqueries, set
+operations and sorts of results, for removing the per-call restart of a
+top-level `SELECT` (each routine call then hands off on its row, as single
+sources already do), and for removing synchronous cold reads from spooled
+results after their first byte.
+
+**Nodes.** Each node implements one step: `next(row slot) -> Row | End |
+Wait(kind)`. A wait returns up the tree without discarding state; the
+connection parks and the same call resumes. A node never repeats an effect:
+row receipts stay with the row being built and are released when it is
+delivered, as streams do now.
+
+| Node | State it retains | Memory owner |
+|---|---|---|
+| Scan, literal list, generator calls | Today's retained positions | Stream or cursor allocation |
+| Filter, projection, `LIMIT`/`OFFSET` | Remaining counts | Node record |
+| Nested-loop join (all join kinds) | Outer row bytes, inner position, outer-matched flag | Node record; the inner source rewinds as scrollable cursors do |
+| Hash join | Build-side rows and bucket heads | A new startup pool, `plan_build_bytes` / `plan_build_leases`; exhaustion is `54000` naming them |
+| Sorted aggregation and `DISTINCT` | Current group key and transition values | Node record |
+| Hash aggregation | Groups and transition values | `plan_build_bytes` |
+| Sort | Sorted runs and merge cursors | The existing external sorter's runs on the block grid, so input size is bounded by storage, not memory |
+| Set operations | `UNION ALL`: child cursor; others: sorted runs of both inputs with counts | External runs |
+| Scalar, `IN`/`EXISTS` subquery | Per-outer-row child tree, rewound per row, or a cached sorted run when uncorrelated | Node record or external run |
+| Derived table, CTE read once | Child tree in place | Its nodes |
+
+**Choosing a stream before execution.** Eligibility is decided from the
+query's shape before it runs, never after a failure: a statement either opens
+as a tree (all its nodes supported, every build side and sort with an owner) or
+takes today's path. Shapes with no size estimate (a sort over a join, for
+example) do not depend on one: sorts use external runs, so they need run
+blocks rather than memory, and a hash build side that exceeds
+`plan_build_bytes` fails with `54000` naming it. Because that failure would be
+new for a query that succeeds today in the statement arena, a hash node is
+chosen only when the planner already knows the build side fits (for example a
+table whose resident row count is known); otherwise the tree uses a nested
+loop or a sorted merge, whose memory does not depend on input size.
+
+**Sorting.** A sort node pulls its whole input first (yielding on storage
+waits like any reader before its first byte), writes sorted runs through the
+external sorter, then streams the merged run. A merge reader keeps its
+position as a block cursor in the stream's allocation, so reads of run blocks
+after the first byte yield instead of blocking. The external sorter today is
+a shared pool of eight statement-scoped producers; a tree that keeps a run
+across client waits needs its own run reader per stream, sized at startup with
+`result_stream_slots`.
+
+**Cursors.** A scrollable cursor over a tree moves back by rewinding: scans,
+literal lists and generator calls rewind as now, sort nodes reread their
+finished run, and joins rewind their outer source. A tree containing a
+volatile function under a node that cannot evaluate rows again saves its
+outputs, as scrollable cursors over such shapes do now.
 
 ### How saved state is owned
 

@@ -23626,7 +23626,11 @@ impl Engine {
                 self.run_scroll_command(at, arena, txn, sqlprep, cursors, guc, responder)?;
                 cursors.finish_scroll_hold(at);
             } else {
-                cursors.begin_fetch(at, cursor::FetchMotion::All, false)?;
+                // PostgreSQL stores a scrollable held cursor's whole result.
+                if cursors.windowed(at) && cursors.refill(at).is_none() {
+                    cursors.restart_window(at, 1, usize::MAX)?;
+                }
+                cursors.begin_fetch(at, cursor::FetchMotion::All, false, usize::MAX)?;
                 while self.advance_cursor_resumable(
                     at, true, arena, txn, sqlprep, cursors, guc, responder,
                 )? {
@@ -23668,23 +23672,40 @@ impl Engine {
                 });
             }
             if let Some((at, needed)) = cursors.read_request(name, motion, move_only)? {
-                cursors.begin_fetch(at, motion, move_only)?;
-                while cursors.produced_rows(at) < needed {
-                    let saved = cursors.saves_history(at)
-                        || (!move_only
-                            && match motion {
-                                cursor::FetchMotion::Absolute(_)
-                                | cursor::FetchMotion::Relative(_) => {
-                                    cursors.produced_rows(at) + 1 == needed
-                                }
-                                _ => true,
-                            });
-                    if !self.advance_cursor_resumable(
-                        at, saved, arena, txn, sqlprep, cursors, guc, responder,
-                    )? {
-                        break;
+                cursors.begin_fetch(at, motion, move_only, needed)?;
+                loop {
+                    let refill = cursors.refill(at);
+                    let target = refill.map_or(needed, |(_, last)| last);
+                    while cursors.produced_rows(at) < target {
+                        let next = cursors.produced_rows(at) + 1;
+                        let saved = match refill {
+                            Some((first, _)) => next >= first,
+                            None => {
+                                cursors.saves_history(at)
+                                    || (!move_only
+                                        && match motion {
+                                            cursor::FetchMotion::Absolute(_)
+                                            | cursor::FetchMotion::Relative(_) => next == needed,
+                                            _ => true,
+                                        })
+                            }
+                        };
+                        if !self.advance_cursor_resumable(
+                            at, saved, arena, txn, sqlprep, cursors, guc, responder,
+                        )? {
+                            cursors.finish_input(at);
+                            break;
+                        }
+                        cursors.record_row(at, saved)?;
                     }
-                    cursors.record_row(at, saved)?;
+                    // A windowed scroll cursor returning to rows outside its
+                    // window reads its input again from the first row.
+                    match cursors.window_miss(at, motion, move_only) {
+                        Some((first, last)) if refill.is_none() => {
+                            cursors.restart_window(at, first, last)?;
+                        }
+                        _ => break,
+                    }
                 }
             }
             cursors.fetch(name, motion, move_only)

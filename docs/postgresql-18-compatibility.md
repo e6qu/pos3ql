@@ -323,8 +323,11 @@ rows fit; raising `cursor_bytes` does not help there.
   client without saving them, so any count works; other fetches, such as a
   `FETCH` inside a routine, `RELATIVE`/`ABSOLUTE` or one over a row-locking
   cursor, buffer one batch in `cursor_bytes`, which is reused.
-- `SCROLL`: every visited row stays in `cursor_bytes`, so history can exhaust it.
-  When revisited rows are evaluated again, the history holds each row's input
+- `SCROLL` without volatile functions, unordered and not locking: only the
+  current fetch's rows stay in `cursor_bytes`; a top-level forward fetch
+  streams, and moving back reads the input again from its first row.
+- Other `SCROLL` cursors keep every visited row in `cursor_bytes`, so history
+  can exhaust it. When revisited rows are evaluated again, the history holds each row's input
   columns plus 17 bytes of row identity, and a volatile filter adds the rows it
   rejected; the current fetch's output shares the same bytes.
 - Ordered cursors save every qualifying row's input columns (plus 17 bytes)

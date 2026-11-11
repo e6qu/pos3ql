@@ -647,6 +647,8 @@ fn canonical_jsonb<'a>(text: &str, arena: &'a Arena) -> Result<&'a str, SqlError
 /// `WITH ORDINALITY` row number after their columns.
 pub(crate) struct FunctionRows<'a> {
     calls: &'a mut [RowGenerator<'a>],
+    /// Each call's first position, for a rescan.
+    initial: &'a [RowGenerator<'a>],
     live: &'a mut [bool],
     /// The next row number when the source has `WITH ORDINALITY`.
     ordinality: Option<i64>,
@@ -661,17 +663,32 @@ impl<'a> FunctionRows<'a> {
         let live = arena
             .alloc_slice_with(calls.len(), |_| true)
             .map_err(|_| arena_full())?;
+        let initial = arena
+            .alloc_slice_with(calls.len(), |index| calls[index])
+            .map_err(|_| arena_full())?;
         Ok(Self {
             calls,
+            initial,
             live,
             ordinality: ordinality.then_some(1),
         })
+    }
+
+    /// Starts the calls again from their first rows, as PostgreSQL rescans
+    /// a function scan's stored result.
+    pub(crate) fn rewind(&mut self) {
+        self.calls.copy_from_slice(self.initial);
+        self.live.fill(true);
+        if let Some(ordinal) = self.ordinality.as_mut() {
+            *ordinal = 1;
+        }
     }
 
     /// A source that yields no rows, for an eliminated or closed reader.
     pub(crate) fn finished() -> Self {
         Self {
             calls: &mut [],
+            initial: &[],
             live: &mut [],
             ordinality: None,
         }

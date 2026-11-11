@@ -153,7 +153,8 @@ impl RowCursor {
         Ok(())
     }
 
-    #[cfg(test)]
+    /// Returns to the first row of the same snapshot: the captured resident
+    /// rows and saved generations are read again in the same order.
     pub(crate) fn rewind(&mut self, arena: &Arena) -> Result<(), SqlError> {
         let source = self.source.as_mut().ok_or_else(|| {
             sql_err!(

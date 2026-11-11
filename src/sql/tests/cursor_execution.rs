@@ -2017,7 +2017,7 @@ fn cursor_trigger_functions_validate_return_when_the_execution_path_finishes() {
 }
 
 #[test]
-fn cursor_retained_scroll_reuses_history_and_extends_only_when_needed() {
+fn cursor_retained_scroll_keeps_one_fetch_and_rereads_with_its_snapshot() {
     use crate::sql::cursor::FetchMotion;
     let config = test_config("cursor-retained-scroll");
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -2038,18 +2038,20 @@ fn cursor_retained_scroll_reuses_history_and_extends_only_when_needed() {
         ["FETCH 0"]
     );
     assert_eq!(session.cursors.produced_rows(slot), 0);
+    // The cursor keeps one fetch's rows; returning to an earlier row reads
+    // the input again from the first row with the cursor's snapshot.
     for (sql, expected, produced) in [
         ("FETCH NEXT FROM scrolling", "20", 1),
         ("FETCH 0 FROM scrolling", "20", 1),
         ("FETCH NEXT FROM scrolling", "40", 2),
-        ("FETCH PRIOR FROM scrolling", "20", 2),
+        ("FETCH PRIOR FROM scrolling", "20", 1),
     ] {
         assert_eq!(
             data_rows(&session.success(&mut engine, sql, true)),
             [expected]
         );
         assert_eq!(session.cursors.produced_rows(slot), produced);
-        assert_eq!(session.cursors.buffered_rows(slot), produced);
+        assert_eq!(session.cursors.buffered_rows(slot), 1);
     }
     assert_eq!(
         command_tags(&session.success(&mut engine, "MOVE FORWARD 2 FROM scrolling", true)),
@@ -2064,7 +2066,7 @@ fn cursor_retained_scroll_reuses_history_and_extends_only_when_needed() {
         data_rows(&session.success(&mut engine, "FETCH LAST FROM scrolling", true)),
         ["80"]
     );
-    assert_eq!(session.cursors.buffered_rows(slot), 4);
+    assert_eq!(session.cursors.buffered_rows(slot), 1);
     assert_eq!(
         data_rows(&session.success(&mut engine, "FETCH BACKWARD ALL FROM scrolling", true)),
         ["60", "40", "20"]
@@ -3212,4 +3214,39 @@ fn rows_from_and_ordinality_cursors_advance_their_calls_in_lockstep() {
         assert_eq!(error_sqlstates(&reply), [code], "{query}");
         session.success(&mut engine, "ROLLBACK", true);
     }
+}
+
+#[test]
+fn scroll_cursors_keep_one_fetch_of_rows_and_reread_their_input_to_move_back() {
+    // Every visited row of these cursors exceeds cursor_bytes; each FETCH's
+    // own rows fit it. Expected rows come from PostgreSQL 18.6.
+    let mut config = test_config("windowed-scroll-cursor");
+    config.cursor_bytes = 1024;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE TABLE win(id integer, payload text); INSERT INTO win SELECT g, \
+             repeat('x', 40) FROM generate_series(1,400) g; BEGIN; DECLARE c CURSOR FOR \
+             SELECT id, length(payload) FROM win WHERE id % 2 = 0; FETCH 3 FROM c; FETCH 3 \
+             FROM c; FETCH PRIOR FROM c; FETCH BACKWARD 2 FROM c; MOVE 150 FROM c; FETCH \
+             RELATIVE -3 FROM c; FETCH ABSOLUTE -1 FROM c; FETCH ABSOLUTE 2 FROM c; FETCH \
+             LAST FROM c; FETCH NEXT FROM c; FETCH PRIOR FROM c; FETCH FIRST FROM c; FETCH \
+             0 FROM c; MOVE ABSOLUTE 120 FROM c; FETCH BACKWARD 3 FROM c; FETCH 2 FROM c; \
+             SELECT is_scrollable FROM pg_cursors WHERE name = 'c'; DECLARE g CURSOR FOR \
+             SELECT * FROM generate_series(1, 400) WITH ORDINALITY; MOVE 300 FROM g; FETCH \
+             BACKWARD 2 FROM g; FETCH ABSOLUTE 5 FROM g; FETCH RELATIVE 390 FROM g; DECLARE \
+             h CURSOR WITH HOLD FOR SELECT id FROM win WHERE id > 390; MOVE 7 FROM h; \
+             COMMIT; FETCH PRIOR FROM h; FETCH FIRST FROM h; FETCH ALL FROM h; CLOSE h;",
+            true
+        )),
+        [
+            "2|40", "4|40", "6|40", "8|40", "10|40", "12|40", "10|40", "8|40", "6|40", "300|40",
+            "400|40", "4|40", "400|40", "400|40", "2|40", "2|40", "238|40", "236|40", "234|40",
+            "236|40", "238|40", "t", "299|299", "298|298", "5|5", "395|395", "396", "391", "392",
+            "393", "394", "395", "396", "397", "398", "399", "400",
+        ]
+    );
 }

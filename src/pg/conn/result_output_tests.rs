@@ -688,7 +688,13 @@ fn function_sources_stream_rows_as_the_client_reads() {
     ] {
         let opened = fixture.engine.result_stream_metrics().opened;
         send_large(&mut conn, &mut fixture.engine, &mut client, &query(&sql));
-        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        // Loopback may still be delivering the request's tail.
+        for _ in 0..50 {
+            assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+            if conn.result_streams.is_active() {
+                break;
+            }
+        }
         assert!(conn.result_streams.is_active(), "{sql:.80}");
         // The stream holds the call's position, not its rows.
         assert!(conn.overflow_bytes() < 1024);
@@ -1731,6 +1737,56 @@ fn forward_fetches_stream_cursor_rows_as_the_client_reads() {
         assert!(fixture.engine.result_stream_metrics().opened >= opened + 2);
         assert!(!conn.result_streams.is_held());
     }
+}
+
+#[test]
+fn scrollable_fetches_stream_forward_and_reread_input_to_move_back() {
+    let (mut fixture, mut conn, mut client, _, _) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "scroll-fetch-stream");
+    let opened = fixture.engine.result_stream_metrics().opened;
+    // A table scan's cursor is scrollable by default. FETCH ALL streams
+    // without saving its rows; moving back reads the input again with the
+    // cursor's snapshot, so a later insert is not seen.
+    let mut input =
+        query("BEGIN; DECLARE c CURSOR FOR SELECT id, payload FROM big; FETCH 10 c; FETCH ALL c");
+    input.extend_from_slice(&query(
+        "INSERT INTO big VALUES (9001, 'late'); FETCH PRIOR c; FETCH ABSOLUTE 3 c; \
+         FETCH BACKWARD 2 c; FETCH LAST c; COMMIT",
+    ));
+    client.write_all(&input).unwrap();
+    assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+    assert!(conn.result_streams.is_active());
+    assert!(conn.overflow_bytes() < 1024);
+    let response = drain(&mut conn, &mut fixture.engine, &mut client, 2);
+    let response = messages(&response);
+    let tags: Vec<&[u8]> = response
+        .iter()
+        .filter(|message| message.0 == b'C')
+        .map(|message| message.1)
+        .collect();
+    assert_eq!(
+        tags,
+        [
+            &b"BEGIN\0"[..],
+            b"DECLARE CURSOR\0",
+            b"FETCH 10\0",
+            b"FETCH 4990\0",
+            b"INSERT 0 1\0",
+            b"FETCH 1\0",
+            b"FETCH 1\0",
+            b"FETCH 2\0",
+            b"FETCH 1\0",
+            b"COMMIT\0"
+        ]
+    );
+    let rows: Vec<&str> = response
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .map(|message| first_text(message.1))
+        .collect();
+    assert_eq!(rows.len(), 5005);
+    assert_eq!(&rows[5000..], ["5000", "3", "2", "1", "5000"]);
+    assert!(fixture.engine.result_stream_metrics().opened > opened);
 }
 
 #[test]

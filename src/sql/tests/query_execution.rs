@@ -269,10 +269,7 @@ fn cold_cursor_fetch(
                     count += 1;
                 }
                 assert_eq!(session.cursors.produced_rows(slot), count as usize);
-                assert_eq!(
-                    session.cursors.buffered_rows(slot),
-                    if scrollable { count } else { rows } as usize
-                );
+                assert_eq!(session.cursors.buffered_rows(slot), rows as usize);
                 session.send.clear();
                 session.arena.reset();
                 deadline = Instant::now() + Duration::from_secs(2);
@@ -345,10 +342,17 @@ fn cold_cursor_fetch(
         "SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='cold_orders'",
         true,
     );
-    assert_eq!(
-        data_rows(&statistics),
-        [format!("1|{}", (skip + take) * stride)]
-    );
+    // One scan; a scrollable cursor moving back reads rows again from the
+    // first row, and those reads count too.
+    let statistics = data_rows(&statistics);
+    let (scans, read) = statistics[0].split_once('|').unwrap();
+    assert_eq!(scans, "1");
+    let read: i32 = read.parse().unwrap();
+    if scrollable {
+        assert!(read > (skip + take) * stride, "{read}");
+    } else {
+        assert_eq!(read, (skip + take) * stride);
+    }
     session.success(&mut engine, "CLOSE cold; ROLLBACK", true);
 }
 

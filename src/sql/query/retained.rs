@@ -166,6 +166,7 @@ enum ReaderState {
     Eliminated,
 }
 
+#[derive(Clone, Copy)]
 enum RowBounds<'a> {
     Unstarted {
         limit: Option<&'a Expr<'a>>,
@@ -181,6 +182,10 @@ pub(crate) struct RetainedSelect<'a> {
     items: &'a [SelectItem<'a>],
     predicate: Option<&'a Expr<'a>>,
     bounds: RowBounds<'a>,
+    /// The bounds before the first row, for a rescan.
+    initial_bounds: RowBounds<'a>,
+    /// A scrollable cursor keeps its finished input open to read it again.
+    keep_finished: bool,
     scope: QueryScope<'a>,
     source: RetainedSource<'a>,
     decoded_columns: Option<[bool; MAX_COLUMNS]>,
@@ -1287,6 +1292,49 @@ impl<'a> RetainedSelect<'a> {
         !self.order.is_empty()
     }
 
+    /// Whether [`Self::rewind`] can return to the first row: an unsorted,
+    /// non-locking source of one table, literal rows, generated rows or a
+    /// single row. The same snapshot then yields the same rows in order.
+    pub(crate) fn rewindable(&self) -> bool {
+        self.order.is_empty() && self.locking.is_empty()
+    }
+
+    /// Keeps the input readable after its last row, so a scrollable cursor
+    /// can [`Self::rewind`] it.
+    pub(crate) fn keep_finished_input(&mut self) {
+        self.keep_finished = true;
+    }
+
+    /// Returns to the first input row, as PostgreSQL's executor rewind does
+    /// for a scrollable portal. LIMIT and OFFSET apply again. No row may be
+    /// pending; nothing is allocated.
+    pub(crate) fn rewind(&mut self, state_arena: &Arena) -> Result<(), SqlError> {
+        if !self.rewindable() || self.pending.is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "retained cursor input cannot be rewound here"
+            ));
+        }
+        if matches!(self.state, ReaderState::Eliminated) {
+            return Ok(());
+        }
+        match &mut self.source {
+            RetainedSource::Physical(cursor) => cursor.rewind(state_arena)?,
+            RetainedSource::Literals { next, .. } => *next = 0,
+            RetainedSource::Singleton { available } => *available = true,
+            RetainedSource::Generated { generator, .. } => {
+                if let Some(generator) = generator {
+                    generator.rewind();
+                }
+            }
+        }
+        self.bounds = self.initial_bounds;
+        // PostgreSQL counts a scrollable scan once, however it moves; the
+        // rows read again are counted as read.
+        self.state = ReaderState::Reading;
+        Ok(())
+    }
+
     /// Orders saved inputs, stored last first, so input 0 sorts first.
     pub(crate) fn sort_saved_inputs(
         &self,
@@ -2147,6 +2195,8 @@ impl<'a> RetainedSelect<'a> {
             items,
             predicate,
             bounds,
+            initial_bounds: bounds,
+            keep_finished: false,
             scope,
             source,
             decoded_columns,
@@ -2178,7 +2228,9 @@ impl<'a> RetainedSelect<'a> {
             "statement bounds must be prepared"
         );
         if matches!(self.bounds, RowBounds::Active { remaining: 0, .. }) {
-            self.source.close();
+            if !self.keep_finished {
+                self.source.close();
+            }
             if !matches!(self.state, ReaderState::Eliminated) {
                 self.state = ReaderState::Complete;
             }
@@ -2248,7 +2300,9 @@ impl<'a> RetainedSelect<'a> {
             let Some(row) = row else {
                 unsafe { state_arena.rewind_to(mark) };
                 self.state = ReaderState::Complete;
-                self.source.close();
+                if !self.keep_finished {
+                    self.source.close();
+                }
                 return Ok(false);
             };
             self.pending = Some(PendingRow {

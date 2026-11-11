@@ -161,6 +161,22 @@ def probe(args, trace):
             rows(owner, "large.projected_once", "SELECT last_value,is_called FROM calls", [(3999, True)])
             owner.execute("COMMIT")
 
+            # A function scan's cursor is scrollable by default. Its FETCH ALL
+            # exceeds pos3ql's cursor_bytes; it streams, and moving back
+            # reads the series again from its start.
+            owner.execute("BEGIN")
+            owner.execute("DECLARE wide CURSOR FOR SELECT g, repeat('x', 900) FROM generate_series(1,5000) g")
+            with owner.cursor() as cursor:
+                cursor.execute("FETCH ALL FROM wide")
+                fetched = cursor.fetchall()
+                entry = {"case": "scroll.fetch_all_streams", "count": len(fetched), "tag": cursor.statusmessage}
+                trace.append(entry)
+                assert fetched == [(g, "x" * 900) for g in range(1, 5001)], json.dumps(entry)
+            rows(owner, "scroll.prior_after_all", "FETCH PRIOR FROM wide", [(5000, "x" * 900)])
+            rows(owner, "scroll.absolute_back", "FETCH ABSOLUTE 2 FROM wide", [(2, "x" * 900)])
+            rows(owner, "scroll.backward_to_start", "FETCH BACKWARD 2 FROM wide", [(1, "x" * 900)])
+            owner.execute("COMMIT")
+
             owner.execute("BEGIN")
             owner.execute("DECLARE locked NO SCROLL CURSOR FOR SELECT id FROM source_rows ORDER BY id FOR UPDATE")
             observer.execute("BEGIN")

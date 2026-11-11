@@ -387,6 +387,7 @@ enum EventObjectRef {
     ViewRowType(u16),
     ViewArrayType(u16),
     ViewRule(u16),
+    MatviewRule(u16),
     DomainArray(u16),
     DomainConstraint {
         domain: u16,
@@ -546,6 +547,31 @@ impl EventObjectRef {
                 );
                 rule.address_names[0] = StackStr::from_str(view.schema.as_str());
                 rule.address_names[1] = StackStr::from_str(view.name.as_str());
+                rule.address_names[2] = StackStr::from_str("_RETURN");
+                rule.address_name_count = 3;
+                rule
+            }
+            Self::MatviewRule(slot) => {
+                let matview = storage.matview(usize::from(slot));
+                let relation = storage.table_def(usize::from(matview.backing_table), txid);
+                let mut identity = EventIdentity::new();
+                write!(
+                    identity,
+                    "\"_RETURN\" on {}",
+                    qualified(relation.schema.as_str(), relation.name.as_str())?.as_str()
+                )
+                .map_err(|_| graph_full())?;
+                let mut rule = base_object(
+                    catalog::PG_REWRITE_OID,
+                    matview.rule_oid(),
+                    "rule",
+                    None,
+                    None,
+                    identity,
+                    false,
+                );
+                rule.address_names[0] = StackStr::from_str(relation.schema.as_str());
+                rule.address_names[1] = StackStr::from_str(relation.name.as_str());
                 rule.address_names[2] = StackStr::from_str("_RETURN");
                 rule.address_name_count = 3;
                 rule
@@ -2949,12 +2975,18 @@ fn existing_catalog_object(
                 })
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
-        catalog::PG_REWRITE_OID => EventObjectRef::Primary(ObjectRef::Rule(
-            storage
-                .rules_visible_to(txid)
-                .find_map(|(slot, rule)| (rule.oid() == object_id).then_some(slot))
-                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-        )),
+        catalog::PG_REWRITE_OID => {
+            if let Some(slot) = storage.matview_slot_by_rule_oid(object_id, txid) {
+                EventObjectRef::MatviewRule(u16::try_from(slot).map_err(|_| graph_full())?)
+            } else {
+                EventObjectRef::Primary(ObjectRef::Rule(
+                    storage
+                        .rules_visible_to(txid)
+                        .find_map(|(slot, rule)| (rule.oid() == object_id).then_some(slot))
+                        .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+                ))
+            }
+        }
         catalog::PG_CAST_OID => {
             if let Some(slot) = storage
                 .casts_visible_to(txid)
@@ -3950,10 +3982,14 @@ fn push_table_indexes(
     Ok(())
 }
 
+/// A table's dependents, or a materialized view's (`matview` names it, and
+/// its `_RETURN` rule follows its row types; `parent_is_normal` is the
+/// rule's `normal` flag).
 fn push_table_drop_dependents(
     storage: &Storage,
     txid: u32,
     slot: usize,
+    matview: Option<(usize, bool)>,
     indexes: &[(usize, crate::storage::RelationIdentity)],
     output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
@@ -3991,6 +4027,15 @@ fn push_table_drop_dependents(
         false,
         false,
     )?;
+    if let Some((matview, parent_is_normal)) = matview {
+        push_drop(
+            output,
+            count,
+            EventObjectRef::MatviewRule(u16::try_from(matview).map_err(|_| graph_full())?),
+            false,
+            parent_is_normal,
+        )?;
+    }
 
     for check in table.checks() {
         push_drop(
@@ -4268,12 +4313,13 @@ fn push_drop_dependents(
 ) -> Result<(), SqlError> {
     match reference {
         ObjectRef::Table(slot) => {
-            push_table_drop_dependents(storage, txid, slot, before.indexes, output, count)
+            push_table_drop_dependents(storage, txid, slot, None, before.indexes, output, count)
         }
         ObjectRef::MaterializedView(slot) => push_table_drop_dependents(
             storage,
             txid,
             storage.matview_table(slot),
+            Some((slot, parent_is_normal)),
             before.indexes,
             output,
             count,

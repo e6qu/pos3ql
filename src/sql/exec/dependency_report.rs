@@ -407,25 +407,38 @@ impl Walker<'_> {
     }
 
     fn required_by(&self, object: ObjectAddress, owner: ObjectAddress, arena: &Arena) -> SqlError {
-        let object = match describe(self.storage, self.txid, object, arena) {
-            Ok(description) => description,
-            Err(error) => return error,
-        };
-        let owner = match describe(self.storage, self.txid, owner, arena) {
-            Ok(description) => description,
-            Err(error) => return error,
-        };
+        required_by(self.storage, self.txid, object, owner, arena)
+    }
+}
+
+/// PostgreSQL's refusal to drop `object` on its own while `owner` owns it
+/// internally (a view's `_RETURN` rule).
+pub(crate) fn required_by(
+    storage: &Storage,
+    txid: u32,
+    object: ObjectAddress,
+    owner: ObjectAddress,
+    arena: &Arena,
+) -> SqlError {
+    let mark = arena.mark();
+    let error = (|| {
+        let object = describe(storage, txid, object, arena)?;
+        let owner = describe(storage, txid, owner, arena)?;
         crate::sql::eval::stash_diagnostic(
             None,
             Some(stack_format!(128, "You can drop {} instead.", owner)),
         );
-        sql_err!(
+        Ok::<_, SqlError>(sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             "cannot drop {} because {} requires it",
             object,
             owner
-        )
-    }
+        ))
+    })()
+    .unwrap_or_else(|error| error);
+    // SAFETY: the error copied both descriptions.
+    unsafe { arena.rewind_to(mark) };
+    error
 }
 
 /// PostgreSQL's `getObjectDescription` of one reached object.

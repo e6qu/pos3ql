@@ -285,7 +285,7 @@ rather than collections that grow with catalog churn.
 | Casts / operators / operator families / operator classes | 720,000,000 / 740,000,000 / 760,000,000 / 780,000,000 + stamp |
 | Access methods / event triggers | 800,000,000 / 820,000,000 + stamp |
 | Default privileges / role memberships | 840,000,000 / 860,000,000 + stamp |
-| Rewrite rules | 880,000,000 + stamp |
+| Rewrite rules | 880,000,000 + stamp; a materialized view's `_RETURN` rule uses the view's own stamp |
 | Large objects | Any OID; `lo_create(oid)` accepts the client's choice, as PostgreSQL does |
 
 **User example:** an application saves the OID of `orders`, drops the table and

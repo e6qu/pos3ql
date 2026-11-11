@@ -7497,6 +7497,17 @@ impl MatviewDef {
         self.ddl_state.visible_to(txid)
     }
 
+    /// The OID of the view's `_RETURN` rule in `pg_rewrite`. Rules and
+    /// materialized views draw creation stamps from one sequence, so the
+    /// view's own stamp names its rule within the rewrite-rule band.
+    pub(crate) fn rule_oid(&self) -> i32 {
+        OidBand::RewriteRule.oid(
+            CatalogIdentity::parse(self.created_at)
+                .expect("admitted materialized view has a checked identity")
+                .created_at(),
+        )
+    }
+
     pub(crate) fn populated_for(&self, transaction: u32) -> bool {
         self.pending_population
             .filter(|pending| pending.transaction == transaction)
@@ -43539,6 +43550,12 @@ impl Storage {
                 })
                 .then_some(slot)
             })
+    }
+
+    /// The materialized view whose `_RETURN` rule has `oid`.
+    pub(crate) fn matview_slot_by_rule_oid(&self, oid: i32, txid: u32) -> Option<usize> {
+        self.matviews_visible_to(txid)
+            .find_map(|(slot, matview)| (matview.rule_oid() == oid).then_some(slot))
     }
 
     pub(crate) fn matview_table(&self, slot: usize) -> usize {

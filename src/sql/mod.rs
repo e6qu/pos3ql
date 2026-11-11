@@ -19591,9 +19591,14 @@ impl Engine {
                 new_name,
                 responder,
             ),
-            Stmt::DropRule(rule) => {
-                exec::drop_rule(&mut self.storage, &mut self.wal, txn, *rule, responder)
-            }
+            Stmt::DropRule(rule) => exec::drop_rule(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *rule,
+                arena,
+                responder,
+            ),
             Stmt::CreateRoutine(routine) => {
                 self.execute_create_routine(routine, arena, txn, sqlprep, cursors, guc, responder)
             }

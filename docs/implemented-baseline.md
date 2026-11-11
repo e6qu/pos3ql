@@ -493,13 +493,20 @@ output names.
 A materialized view created `WITH NO DATA` fails ordinary reads with `55000`,
 including `LIMIT 0`. REFRESH requires MAINTAIN, runs as the owner and holds an
 exclusive lock until the transaction ends. Rollback restores both rows and
-populated status.
+populated status. Like a view, a materialized view owns a `_RETURN` rule in
+`pg_rewrite` whose `pg_depend` rows name each column it reads, so
+`ALTER TABLE orders ALTER COLUMN total TYPE numeric` fails with `0A000` while
+a materialized view reads `orders.total`. Rule commands on a materialized view
+fail as in PostgreSQL (`0A000` for `CREATE RULE`, `2BP01` for dropping
+`_RETURN`); only `COMMENT ON RULE "_RETURN"` is accepted.
 
 Rewrite rules take the target table's exclusive lock, so a rule that redirects
 an insert conflicts with ordinary reads of that table. `_RETURN` cannot be
-renamed. `pg_get_ruledef` supports both formatting modes for unconditional
-`DO NOTHING` rules; other rules return their saved SQL, and pretty formatting
-of a condition or action returns `0A000`. A missing rule returns NULL.
+renamed or dropped apart from its view. `pg_get_ruledef` supports both
+formatting modes for unconditional `DO NOTHING` rules and for `_RETURN` rules,
+whose action is printed as `pg_get_viewdef` prints the view; other rules
+return their saved SQL, and pretty formatting of a condition or action returns
+`0A000`. A missing rule returns NULL.
 
 ## Catalog listings and current lookups
 

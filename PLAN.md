@@ -342,7 +342,7 @@ SCHEMA`, `DROP MATERIALIZED VIEW`, `DROP FOREIGN TABLE ... CASCADE` or another
 object's cascade while another table's column or a domain uses its row type
 fails with `0A000`. `ALTER COLUMN ... TYPE` is refused for columns that a
 view, rule, trigger `WHEN` condition, policy or SQL-standard routine body
-reads, but not yet for a materialized view's columns or the target columns of
+reads (including a materialized view), but not yet for the target columns of
 a stored `INSERT` or `UPDATE`, whose `pg_depend` column rows are missing.
 `DROP` of casts, operator
 classes and families, extensions, policies, triggers, rules, indexes and
@@ -353,12 +353,15 @@ the `pg_depend` walk that `DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`,
 `pg_event_trigger_dropped_objects` is built by each statement rather than from
 that walk; `pg_depend` still lacks PostgreSQL's rows for TOAST tables, types
 named only inside
-expressions (a cast in a default or routine body), a materialized view's
-`_RETURN` rule and its column rows, the target columns of a rule's or
+expressions (a cast in a default or routine body), the target columns of a rule's or
 SQL-standard routine body's `INSERT` or `UPDATE` (`INSERT INTO t (e)` depends
 on `t.e`; the stored column set also drives read-privilege checks, so it needs
 a separate written-column set), and the column-level rows of views that read a
-sequence. A partition key that is an
+sequence. `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
+`_RETURN` rules, at OID `reltype + 1`, and `pg_settings_u`/`pg_settings_n`),
+and `ALTER VIEW` and `ALTER MATERIALIZED VIEW` accept only their own actions,
+so `ALTER VIEW v DISABLE RULE r` fails with `42601` where PostgreSQL reports
+`42809` `ALTER action DISABLE RULE cannot be performed on relation "v"`. A partition key that is an
 expression (`PARTITION BY LIST ((k + v))`, `PARTITION BY RANGE (lower(a))`)
 fails with `0A000`; PostgreSQL routes rows by the evaluated key and lists it
 in `pg_partitioned_table.partexprs`. The

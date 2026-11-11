@@ -15852,6 +15852,25 @@ pub(crate) fn view_def_text_pretty<'a>(
         let Some(view) = storage.find_matview(schema.as_str(), name.as_str(), txid) else {
             return Ok(None);
         };
+        let definition = storage.table_def(slot, txid);
+        let names = arena
+            .alloc_slice_with(definition.columns().len(), |_| "")
+            .map_err(|_| arena_full())?;
+        for (target, column) in names.iter_mut().zip(definition.columns()) {
+            *target = arena
+                .alloc_str(column.name.as_str())
+                .map_err(|_| arena_full())?;
+        }
+        if let Some(deparsed) = deparse::view_definition(
+            storage,
+            txid,
+            view.sql.as_str().trim().trim_end_matches(';'),
+            names,
+            layout,
+            arena,
+        )? {
+            return Ok(Some(deparsed));
+        }
         return arena
             .alloc_str_display(format_args!("{};", view.sql.as_str()))
             .map(Some)
@@ -15947,6 +15966,26 @@ fn table_size(storage: &Storage, txid: u32, slot: usize) -> Result<i64, SqlError
         Ok(core::ops::ControlFlow::Continue(()))
     })?;
     Ok(bytes)
+}
+
+/// The `pg_rewrite` OID of a rule comment's object: a rule `name` on the
+/// relation `subid` encodes, or a materialized view's `_RETURN` rule.
+fn rule_comment_oid(storage: &Storage, txid: u32, name: &str, subid: u32) -> Option<i32> {
+    storage
+        .rules_visible_to(txid)
+        .find_map(|(_, rule)| {
+            let definition = rule.definition_for(txid);
+            (definition.name.as_str() == name && definition.target.comment_subid() == subid)
+                .then(|| rule.oid())
+        })
+        .or_else(|| {
+            storage.matviews_visible_to(txid).find_map(|(_, matview)| {
+                (name == "_RETURN"
+                    && crate::storage::RuleTarget::Table(matview.backing_table).comment_subid()
+                        == subid)
+                    .then(|| matview.rule_oid())
+            })
+        })
 }
 
 /// `pg_description`: one row per committed object comment, resolving each to
@@ -16221,16 +16260,10 @@ fn pg_description<'a>(
                 (subscription.oid(), PG_SUBSCRIPTION_OID)
             }
             crate::storage::CommentClass::Rule => {
-                let rule = storage
-                    .rules_visible_to(txid)
-                    .map(|(_, rule)| rule)
-                    .find(|rule| {
-                        let definition = rule.definition_for(txid);
-                        definition.name.as_str() == name
-                            && definition.target.comment_subid() == subid
-                    });
-                let Some(rule) = rule else { continue };
-                (rule.oid(), PG_REWRITE_OID)
+                let Some(oid) = rule_comment_oid(storage, txid, name, subid) else {
+                    continue;
+                };
+                (oid, PG_REWRITE_OID)
             }
             crate::storage::CommentClass::TextSearchParser
             | crate::storage::CommentClass::TextSearchTemplate
@@ -17082,12 +17115,8 @@ fn visit_comments_for_object(
             "pg_rewrite" => {
                 class == crate::storage::CommentClass::Rule
                     && subid == 0
-                    && storage.rules_visible_to(txid).any(|(_, rule)| {
-                        let definition = rule.definition_for(txid);
-                        definition.name.as_str() == name
-                            && definition.target.comment_subid() == csub
-                            && Some(rule.oid()) == signed_oid
-                    })
+                    && signed_oid.is_some()
+                    && rule_comment_oid(storage, txid, name, csub) == signed_oid
             }
             "pg_proc" => {
                 class == crate::storage::CommentClass::Routine

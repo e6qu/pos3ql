@@ -25906,6 +25906,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.wal,
                     txn,
                     *rule,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateCast(cast) => super::exec::create_cast(
@@ -43297,6 +43298,39 @@ fn rule_target(
     }
 }
 
+/// The materialized view a rule DDL target names. Its only rule is the
+/// `_RETURN` rule it owns, which rule DDL cannot change.
+fn rule_target_matview(
+    storage: &Storage,
+    target: crate::storage::RuleTarget,
+    txid: u32,
+) -> Option<usize> {
+    match target {
+        crate::storage::RuleTarget::Table(table) => {
+            storage.matview_slot_for_table(usize::from(table), txid)
+        }
+        crate::storage::RuleTarget::View(_) => None,
+    }
+}
+
+/// PostgreSQL's refusal to drop a view's `_RETURN` rule apart from the view.
+fn return_rule_required(
+    storage: &Storage,
+    txid: u32,
+    rule_oid: i32,
+    relation_oid: i32,
+    arena: &Arena,
+) -> SqlError {
+    use crate::sql::catalog::dependencies::ObjectAddress;
+    dependency_report::required_by(
+        storage,
+        txid,
+        ObjectAddress::new(crate::sql::catalog::PG_REWRITE_OID, rule_oid, 0),
+        ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, relation_oid, 0),
+        arena,
+    )
+}
+
 struct RuleConditionColumns<'a> {
     names: [&'a str; crate::storage::MAX_COLUMNS],
     metadata: [StaticTypeMeta; crate::storage::MAX_COLUMNS],
@@ -43931,6 +43965,12 @@ pub fn create_rule(
     ) {
         return sql_fail(error);
     }
+    if rule_target_matview(storage, target, txn.txid).is_some() {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "rules on materialized views are not supported"
+        ));
+    }
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
     }
@@ -43997,6 +44037,16 @@ pub fn alter_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
+    if rule_target_matview(storage, target, txn.txid).is_some() {
+        return sql_fail(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "relation \"{}\" cannot have rules",
+                table.name
+            ),
+            format_args!("This operation is not supported for materialized views."),
+        ));
+    }
     if let Err(error) = storage.lock_object(
         txn.txid,
         target.into(),
@@ -44111,6 +44161,7 @@ pub fn drop_rule(
     wal: &mut Wal,
     txn: &mut TxnState,
     rule: crate::sql::ast::DropRule<'_>,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     let crate::sql::ast::DropRule {
@@ -44133,6 +44184,18 @@ pub fn drop_rule(
     }
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
+    }
+    if name == "_RETURN"
+        && let Some(matview) = rule_target_matview(storage, target, txn.txid)
+    {
+        let matview = storage.matview_for(matview, txn.txid);
+        return sql_fail(return_rule_required(
+            storage,
+            txn.txid,
+            matview.rule_oid(),
+            crate::sql::catalog::user_table_oid(storage, usize::from(matview.backing_table)),
+            arena,
+        ));
     }
     let Some(slot) = storage.rule_slot(target, name, txn.txid) else {
         if if_exists {
@@ -44157,10 +44220,18 @@ pub fn drop_rule(
         ));
     };
     if storage.rule(slot).definition_for(txn.txid).event == crate::storage::RewriteEvent::Select {
-        return sql_fail(sql_err!(
-            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-            "cannot drop rule _RETURN on view \"{}\"",
-            table.name
+        let crate::storage::RuleTarget::View(view) = target else {
+            return sql_fail(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "an ON SELECT rule belongs to a table"
+            ));
+        };
+        return sql_fail(return_rule_required(
+            storage,
+            txn.txid,
+            storage.rule(slot).oid(),
+            crate::sql::catalog::view_oid(storage, usize::from(view)),
+            arena,
         ));
     }
     let selected = match storage.prepare_rule_edit(slot, txn.txid) {
@@ -44632,7 +44703,10 @@ pub fn comment(
             if let Err(error) = storage.require_owner(target.access_object(), txid, "relation") {
                 return sql_fail(error);
             }
-            if storage.rule_slot(target, identity.name, txid).is_none() {
+            if storage.rule_slot(target, identity.name, txid).is_none()
+                && !(identity.name == "_RETURN"
+                    && rule_target_matview(storage, target, txid).is_some())
+            {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "rule \"{}\" for relation \"{}\" does not exist",
@@ -72868,6 +72942,42 @@ enum ColSource<'a> {
     FillDefault(usize),
 }
 
+/// PostgreSQL's `ATSimplePermissions` refusal of an `ALTER TABLE` action
+/// that a relation kind (`kind`, plural) does not support.
+fn unsupported_alter_action(action: &AlterAction<'_>, relation: &str, kind: &str) -> SqlError {
+    use crate::sql::ast::{TriggerEnableMode, TriggerEnableTarget};
+    let (mode, object, target) = match action {
+        AlterAction::SetTriggerEnabled { target, enabled } => (
+            *enabled,
+            "TRIGGER",
+            match target {
+                TriggerEnableTarget::Name(_) => "",
+                TriggerEnableTarget::All => " ALL",
+                TriggerEnableTarget::User => " USER",
+            },
+        ),
+        AlterAction::SetRuleEnabled { enabled, .. } => (*enabled, "RULE", ""),
+        _ => unreachable!("only trigger and rule modes are refused by relation kind"),
+    };
+    let mode = match mode {
+        TriggerEnableMode::Origin => "ENABLE",
+        TriggerEnableMode::Replica => "ENABLE REPLICA",
+        TriggerEnableMode::Always => "ENABLE ALWAYS",
+        TriggerEnableMode::Disabled => "DISABLE",
+    };
+    crate::sql::eval::with_detail(
+        sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "ALTER action {} {}{} cannot be performed on relation \"{}\"",
+            mode,
+            object,
+            target,
+            relation
+        ),
+        format_args!("This operation is not supported for {kind}."),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn alter_table(
     storage: &mut Storage,
@@ -74786,10 +74896,10 @@ fn alter_table_relation(
                 ) {
                     return sql_fail(error);
                 }
-                return sql_fail(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "\"{}\" is not a table",
-                    statement.table.name
+                return sql_fail(unsupported_alter_action(
+                    &statement.actions[0],
+                    statement.table.name,
+                    "views",
                 ));
             }
             None if statement.if_exists => {
@@ -74865,17 +74975,24 @@ fn alter_table_relation(
     }
     let changes_rule_mode = matches!(statement.actions, [AlterAction::SetRuleEnabled { .. }]);
     let changes_trigger_mode = matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]);
-    if (changes_rule_mode || changes_trigger_mode)
-        && (storage
+    if changes_rule_mode || changes_trigger_mode {
+        let unsupported = if storage
             .matview_slot_for_table(table_index, txn.txid)
             .is_some()
-            || changes_rule_mode && def.kind == crate::storage::TableKind::Foreign)
-    {
-        return sql_fail(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "\"{}\" is not a table",
-            statement.table.name
-        ));
+        {
+            Some("materialized views")
+        } else if changes_rule_mode && def.kind == crate::storage::TableKind::Foreign {
+            Some("foreign tables")
+        } else {
+            None
+        };
+        if let Some(kind) = unsupported {
+            return sql_fail(unsupported_alter_action(
+                &statement.actions[0],
+                statement.table.name,
+                kind,
+            ));
+        }
     }
 
     let identity_mode_restriction = if def.partition.attachment.is_some() {

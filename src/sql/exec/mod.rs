@@ -40123,26 +40123,12 @@ fn alter_builtin_routine(
             "aggregate routine attributes cannot be altered with this command"
         ));
     }
-    // Built-in rows carry no per-call settings (see the PLAN.md gap).
-    if actions.iter().any(|action| {
-        matches!(
-            action,
-            AlterRoutineAction::SetConfig { .. } | AlterRoutineAction::ResetConfig(_)
-        )
-    }) {
-        return sql_fail(routine_lookup::signature_error(
-            storage,
-            txn.txid,
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "SET and RESET of built-in function ",
-            identity,
-            " are not supported",
-        ));
-    }
     let state = storage.builtin_routine_state(routine, txn.txid);
     let mut attributes = state.attributes.attributes;
-    let mut configs = [crate::storage::RoutineConfig::EMPTY; 0];
-    let mut config_count = 0;
+    let mut configs =
+        [crate::storage::RoutineConfig::EMPTY; crate::storage::MAX_BUILTIN_ROUTINE_CONFIGS];
+    let mut config_count = state.attributes.configs().len();
+    configs[..config_count].copy_from_slice(state.attributes.configs());
     if let Err(error) = apply_routine_definition_actions(
         storage,
         txn.txid,
@@ -40156,7 +40142,11 @@ fn alter_builtin_routine(
     ) {
         return sql_fail(error);
     }
-    let image = match crate::storage::BuiltinRoutineAttributes::new(routine, attributes) {
+    let image = match crate::storage::BuiltinRoutineAttributes::new(
+        routine,
+        attributes,
+        &configs[..config_count],
+    ) {
         Ok(image) => image,
         Err(error) => return sql_fail(error),
     };

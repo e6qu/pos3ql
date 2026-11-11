@@ -5828,11 +5828,28 @@ impl Checkpointer {
                         cost_bits: Some(parse_field(words.next(), "brtn cost")?),
                         rows_bits: Some(parse_field(words.next(), "brtn rows")?),
                     };
+                    // The settings use the journal image's encoding.
+                    let configs = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("brtn settings missing"))?,
+                    )?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("invalid brtn record"));
                     }
-                    let image = crate::storage::BuiltinRoutineAttributes::new(routine, attributes)
-                        .map_err(|_| CheckpointSetupError::Corrupt("invalid brtn image"))?;
+                    let mut encoded = Vec::with_capacity(21 + configs.len());
+                    encoded.extend_from_slice(&[
+                        u8::from(attributes.strict),
+                        attributes.volatility.code(),
+                        attributes.parallel.code(),
+                        u8::from(attributes.security_definer),
+                        u8::from(attributes.leakproof),
+                    ]);
+                    encoded.extend_from_slice(&attributes.cost_bits.unwrap_or(0).to_le_bytes());
+                    encoded.extend_from_slice(&attributes.rows_bits.unwrap_or(0).to_le_bytes());
+                    encoded.extend_from_slice(&configs);
+                    let image = crate::wal::decode_builtin_routine_image(routine, &encoded)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid brtn image"))?;
                     storage
                         .replay_builtin_routine_attributes(
                             storage.current_database_oid(),
@@ -13540,10 +13557,25 @@ impl Checkpointer {
                 &mut database_context,
                 entry.database,
             )?;
+            struct ConfigsHex<'a>(&'a [crate::storage::RoutineConfig]);
+            impl core::fmt::Display for ConfigsHex<'_> {
+                fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    write!(out, "{:02x}", self.0.len())?;
+                    for config in self.0 {
+                        for text in [config.name.as_str(), config.value.as_str()] {
+                            write!(out, "{:02x}", text.len())?;
+                            for byte in text.as_bytes() {
+                                write!(out, "{byte:02x}")?;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            }
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "brtn {} {} {} {} {} {} {} {}",
+                    "brtn {} {} {} {} {} {} {} {} {}",
                     routine.get(),
                     u8::from(attributes.strict),
                     attributes.volatility.code(),
@@ -13552,6 +13584,7 @@ impl Checkpointer {
                     u8::from(attributes.leakproof),
                     image.cost().to_bits(),
                     image.rows().to_bits(),
+                    ConfigsHex(image.configs()),
                 ),
             )?;
         }

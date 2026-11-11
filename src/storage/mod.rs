@@ -24,7 +24,7 @@ pub(crate) use catalog_identities::{CatalogCreation, CatalogIdentity};
 mod builtin_routines;
 pub(crate) use builtin_routines::{
     BuiltinRoutineAttributes, BuiltinRoutineEntry, BuiltinRoutineOid,
-    MAX_BUILTIN_ROUTINE_CATALOG_SLOTS, PendingBuiltinRoutine,
+    MAX_BUILTIN_ROUTINE_CATALOG_SLOTS, MAX_BUILTIN_ROUTINE_CONFIGS, PendingBuiltinRoutine,
 };
 mod default_acls;
 mod partition_triggers;

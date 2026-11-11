@@ -28375,7 +28375,7 @@ fn builtin_proc_row<'a>(
             Datum::Null,
             Datum::Bool(attributes.strict),
             Datum::Bool(attributes.leakproof),
-            Datum::Null,
+            builtin_proconfig(state.attributes.configs(), arena)?,
             Datum::Float8(state.attributes.cost()),
             Datum::Float8(state.attributes.rows()),
             Datum::Null,
@@ -28394,6 +28394,32 @@ fn builtin_proc_row<'a>(
         ],
         arena,
     )
+}
+
+/// `proconfig`: each setting as `name=value`, or NULL without settings.
+fn builtin_proconfig<'a>(
+    configs: &[crate::storage::RoutineConfig],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if configs.is_empty() {
+        return Ok(Datum::Null);
+    }
+    let mut rendered = [Datum::Null; crate::storage::MAX_BUILTIN_ROUTINE_CONFIGS];
+    for (output, config) in rendered.iter_mut().zip(configs) {
+        *output = Datum::Text(
+            arena
+                .alloc_str_display(format_args!(
+                    "{}={}",
+                    config.name.as_str(),
+                    config.value.as_str()
+                ))
+                .map_err(|_| catalog_capacity_exceeded("pg_proc.proconfig"))?,
+        );
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Text,
+        raw: super::array::build(&rendered[..configs.len()], arena)?,
+    })
 }
 
 fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {

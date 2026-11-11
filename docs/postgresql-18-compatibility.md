@@ -157,14 +157,16 @@ Functions and expressions:
   `function f(integer) does not exist`.
 - Each database has its own copy of a built-in function's catalog row, as in
   PostgreSQL. `ALTER FUNCTION lower(text) STABLE` changes volatility,
-  `PARALLEL`, `LEAKPROOF`, `COST`, `ROWS`, `STRICT`, `SECURITY` and `OWNER
-  TO` in the current database only; `pg_proc` shows the change, and a
+  `PARALLEL`, `LEAKPROOF`, `COST`, `ROWS`, `STRICT`, `SECURITY`, `SET`/`RESET`
+  settings (`proconfig`, at most 16 per routine, then `54000`) and `OWNER TO`
+  in the current database only; `pg_proc` shows the change, and a
   generated column or publication row filter then rejects a function marked
   stable or volatile. As in PostgreSQL, a built-in still runs with its own
   null handling and as the caller: `STRICT` only makes a constant NULL input
   fold to NULL (`array_append(ARRAY[1], NULL)` is NULL, but a NULL column
-  value is still appended), and `SECURITY DEFINER` changes nothing at run
-  time. `REVOKE EXECUTE ON FUNCTION md5(text) FROM PUBLIC` makes a later
+  value is still appended), and `SECURITY DEFINER` and `SET` settings change
+  nothing at run time, as PostgreSQL calls built-ins without consulting
+  `pg_proc`. `REVOKE EXECUTE ON FUNCTION md5(text) FROM PUBLIC` makes a later
   `SELECT md5('a')` fail with `42501` for roles without a grant. The check
   also covers the function behind an operator, cast, `IN`, `ANY`, `LIKE`,
   regular-expression match, simple `CASE`, `IS DISTINCT FROM`, `NULLIF`,
@@ -194,8 +196,7 @@ Functions and expressions:
   the current database. Changes survive restart and
   are copied by `CREATE DATABASE ... TEMPLATE`. Each changed routine uses one
   of the `max_builtin_routine_entries` rows (default 64); running out fails
-  with `54000`. Limits: `SET`/`RESET` settings of a built-in, and renaming or
-  moving one, fail with `0A000`; a signature naming `cstring` or `"any"`
+  with `54000`. Limits: renaming or moving a built-in fails with `0A000`; a signature naming `cstring` or `"any"`
   (`'int4in(cstring)'::regprocedure`, `GRANT ... ON FUNCTION
   int4in(cstring)`) is not recognized (`42883`). Dropping a built-in fails
   with `2BP01`, as in PostgreSQL.

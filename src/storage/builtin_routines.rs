@@ -31,12 +31,17 @@ impl BuiltinRoutineOid {
     }
 }
 
+/// The most `SET` settings (`proconfig` entries) one built-in routine row
+/// holds; another fails with `54000`.
+pub(crate) const MAX_BUILTIN_ROUTINE_CONFIGS: usize = 16;
+
 /// The `pg_proc` attributes of a built-in routine that `ALTER FUNCTION` may
-/// change. Per-call settings are not stored: `SET` and `RESET` of a built-in
-/// are rejected.
+/// change, including the settings applied while it runs (`proconfig`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BuiltinRoutineAttributes {
     pub attributes: RoutineAttributes,
+    configs: [RoutineConfig; MAX_BUILTIN_ROUTINE_CONFIGS],
+    config_count: u8,
 }
 
 impl BuiltinRoutineAttributes {
@@ -61,21 +66,51 @@ impl BuiltinRoutineAttributes {
                 cost_bits: Some(metadata.cost.to_bits()),
                 rows_bits: Some(metadata.rows.to_bits()),
             },
+            configs: [RoutineConfig::EMPTY; MAX_BUILTIN_ROUTINE_CONFIGS],
+            config_count: 0,
         }
     }
 
-    /// Accepts an image of `routine` whose estimates are present.
+    /// Accepts an image of `routine` whose estimates are present, with its
+    /// distinct, named settings.
     pub(crate) fn new(
         _routine: BuiltinRoutineOid,
         attributes: RoutineAttributes,
+        configs: &[RoutineConfig],
     ) -> Result<Self, SqlError> {
-        if attributes.cost_bits.is_none() || attributes.rows_bits.is_none() {
+        if attributes.cost_bits.is_none()
+            || attributes.rows_bits.is_none()
+            || configs.iter().enumerate().any(|(index, config)| {
+                config.name.as_str().is_empty()
+                    || configs[..index]
+                        .iter()
+                        .any(|prior| prior.name == config.name)
+            })
+        {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "built-in routine attribute image is invalid"
             ));
         }
-        Ok(Self { attributes })
+        if configs.len() > MAX_BUILTIN_ROUTINE_CONFIGS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many routine configuration settings (limit {})",
+                MAX_BUILTIN_ROUTINE_CONFIGS
+            ));
+        }
+        let mut stored = [RoutineConfig::EMPTY; MAX_BUILTIN_ROUTINE_CONFIGS];
+        stored[..configs.len()].copy_from_slice(configs);
+        Ok(Self {
+            attributes,
+            configs: stored,
+            config_count: configs.len() as u8,
+        })
+    }
+
+    /// The settings applied while the routine runs, in `proconfig` order.
+    pub(crate) fn configs(&self) -> &[RoutineConfig] {
+        &self.configs[..usize::from(self.config_count)]
     }
 
     pub(crate) fn cost(&self) -> f64 {
@@ -514,11 +549,19 @@ mod tests {
         assert_eq!(catalog.cost(), 1.0);
         let mut changed = catalog.attributes;
         changed.volatility = RoutineVolatility::Stable;
-        assert!(BuiltinRoutineAttributes::new(lower, changed).is_ok());
+        assert!(BuiltinRoutineAttributes::new(lower, changed, &[]).is_ok());
         changed.strict = false;
         changed.security_definer = true;
-        assert!(BuiltinRoutineAttributes::new(lower, changed).is_ok());
+        let config = RoutineConfig {
+            name: SqlName::parse("work_mem").unwrap(),
+            value: crate::util::StackStr::from_str("1MB"),
+        };
+        let image = BuiltinRoutineAttributes::new(lower, changed, &[config]).unwrap();
+        assert_eq!(image.configs(), [config]);
+        assert!(BuiltinRoutineAttributes::new(lower, changed, &[config, config]).is_err());
+        let too_many = [config; MAX_BUILTIN_ROUTINE_CONFIGS + 1];
+        assert!(BuiltinRoutineAttributes::new(lower, changed, &too_many).is_err());
         changed.cost_bits = None;
-        assert!(BuiltinRoutineAttributes::new(lower, changed).is_err());
+        assert!(BuiltinRoutineAttributes::new(lower, changed, &[]).is_err());
     }
 }

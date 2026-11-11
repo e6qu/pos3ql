@@ -266,11 +266,9 @@ order and startup limits hold throughout. The
 **Work:** audit PostgreSQL 18 built-in functions by signature and executed
 behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
-unsupported case into an explicit error. Known gaps: `SET`/`RESET` of a
-built-in function, or renaming or moving one, fails with `0A000` where
-PostgreSQL changes the catalog entry (built-in rows need storage for
-`proconfig`, and every built-in name lookup must consult a renamed or moved
-row); a routine signature naming `cstring` or `"any"` cannot be written
+unsupported case into an explicit error. Known gaps: renaming or moving a
+built-in function fails with `0A000` where PostgreSQL changes the catalog
+entry (every built-in name lookup must consult a renamed or moved row); a routine signature naming `cstring` or `"any"` cannot be written
 (`GRANT ... ON FUNCTION int4in(cstring)` fails with `42883`) because those
 pseudo-types are not pos3ql column types, and `pg_type` lists 182 of
 PostgreSQL's 621 built-in types; PostgreSQL's predefined roles

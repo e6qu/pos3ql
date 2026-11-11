@@ -8,7 +8,7 @@ const MD5: &str = "SELECT proacl FROM pg_proc WHERE oid = 'md5(text)'::regproced
 fn assert_changed(engine: &mut Engine, budget: &mut Budget) {
     assert_eq!(
         data_rows(&run_with(engine, budget, LOWER)),
-        ["s|t|5|0|r|t|f|NULL|changer"]
+        ["s|t|5|0|r|t|f|{\"search_path=pg_catalog, public\",statement_timeout=5s}|changer"]
     );
     assert_eq!(
         data_rows(&run_with(engine, budget, MD5)),
@@ -55,6 +55,9 @@ fn builtin_routine_changes_are_per_database_enforced_and_recovered() {
              ALTER FUNCTION lower(text) STABLE STRICT COST 5 PARALLEL RESTRICTED LEAKPROOF \
                SECURITY INVOKER; \
              ALTER FUNCTION generate_series(integer, integer) ROWS 10; \
+             ALTER FUNCTION lower(text) SET search_path = pg_catalog, public \
+               SET statement_timeout = '5s' SET datestyle = 'ISO, MDY'; \
+             ALTER FUNCTION lower(text) RESET datestyle; \
              ALTER FUNCTION lower(text) OWNER TO changer; \
              REVOKE EXECUTE ON FUNCTION md5(text) FROM PUBLIC; \
              GRANT EXECUTE ON FUNCTION md5(text) TO grantee WITH GRANT OPTION",
@@ -67,10 +70,13 @@ fn builtin_routine_changes_are_per_database_enforced_and_recovered() {
         for (sql, state) in [
             ("ALTER FUNCTION lower(text) ROWS 10", "22023"),
             (
-                "ALTER FUNCTION lower(text) SET search_path = public",
-                "0A000",
+                "ALTER FUNCTION lower(text) SET no_such_setting = 1",
+                "42704",
             ),
-            ("ALTER FUNCTION lower(text) RESET ALL", "0A000"),
+            (
+                "BEGIN; ALTER FUNCTION lower(text) RESET ALL; SELECT 1/0",
+                "22012",
+            ),
             (
                 "CREATE TABLE generated_lower (a text, b text GENERATED ALWAYS AS (lower(a)) STORED)",
                 "42P17",

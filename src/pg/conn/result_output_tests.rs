@@ -45,11 +45,7 @@ fn set_buffer(socket: &impl AsRawFd, option: libc::c_int, bytes: libc::c_int) {
 /// backed-off retransmission timeouts, stalling the transfer for seconds.
 fn socket_pair() -> (TcpStream, TcpStream) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let probe_rcvbuf = std::env::var("POS3QL_PROBE_RCVBUF")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(4096);
-    set_buffer(&listener, libc::SO_RCVBUF, probe_rcvbuf);
+    set_buffer(&listener, libc::SO_RCVBUF, 4096);
     let server = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (client, _) = listener.accept().unwrap();
     set_buffer(&server, libc::SO_SNDBUF, 4096);
@@ -170,25 +166,8 @@ fn drain_after(
     mut received: Vec<u8>,
 ) -> Vec<u8> {
     let deadline = Instant::now() + Duration::from_secs(20);
-    let probe = std::env::var("POS3QL_PROBE_TRACE").is_ok();
-    let started = Instant::now();
-    let mut last_trace = Instant::now();
-    let mut iterations = 0u64;
     loop {
         read_available(client, &mut received);
-        iterations += 1;
-        if probe && last_trace.elapsed() > Duration::from_millis(250) {
-            last_trace = Instant::now();
-            eprintln!(
-                "PROBE {:?} it {iterations} recv {} send {} overflow {} parked {:?} streams {}",
-                started.elapsed(),
-                received.len(),
-                conn.send.len(),
-                conn.overflow_bytes(),
-                conn.parked_wait(),
-                conn.result_streams.is_active()
-            );
-        }
         if messages(&received).iter().filter(|m| m.0 == b'Z').count() >= ready_count {
             return received;
         }

@@ -397,12 +397,15 @@ Evaluation order follows PostgreSQL:
   [PostgreSQL reference results](https://github.com/e6qu/pos3ql/tree/854feb372391d1c87f3d5b261e85a78430d96449/tests/external/reference/2026-11-05-procedural-subtransactions).
 - `CALL` works inside `DO` blocks, procedures, functions and trigger
   functions, assigning output parameters to the argument variables. A
-  procedure called from a `DO` block may `COMMIT`. When a called procedure
-  waits for a lock, storage or `pg_sleep`, the statement resumes without
-  repeating finished inserts, sequence values or `pg_stat_user_functions`
-  calls; the procedure runs again from its start and replays those finished
-  effects. A wait after the procedure's own `COMMIT` or `ROLLBACK` fails with
-  `0A000` (`a non-atomic routine cannot suspend after transaction control`).
+  procedure called from a `DO` block may `COMMIT`. A PL/pgSQL procedure or
+  `DO` block that waits for a lock, storage or `pg_sleep` resumes at the
+  waiting statement, also after its own `COMMIT` or `ROLLBACK`: finished
+  statements, inserts, sequence values and `pg_stat_user_functions` calls are
+  not repeated, and a write that was waiting runs again from its own start.
+  For example, `CALL import_batches()` that commits each batch keeps the
+  committed batches when a later batch waits for a row lock, and continues
+  with that batch once the lock is free. A lock timeout or cancel while it
+  waits ends only the current transaction; earlier commits stay.
 - `pg_sleep(1)` releases the SQL worker while it waits, so other connections
   keep running; `statement_timeout` and cancel requests end the sleep.
 - DDL succeeds only after its end-of-command event triggers. A failing hook for

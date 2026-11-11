@@ -7058,13 +7058,17 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
     let states = arena
         .alloc_slice_with(agg_nodes.len(), |_| AggState::default())
         .map_err(|_| arena_full())?;
-    let columns = super::exec::CatalogCols {
-        definition: None,
-        alias: None,
-        output_aliases: &[],
-        storage,
-        txid,
-        arena,
+    let columns = subquery::SubqueryColumns {
+        scope: None,
+        outer: Some(row),
+        catalog: super::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
     };
     for (i, (_, node)) in agg_nodes.iter().enumerate() {
         states[i].init(node, storage, txid, &columns, arena)?;
@@ -8708,15 +8712,13 @@ fn rewrite_grouped_expr<'a>(
             Ok(e)
         }
         Expr::Column { qualifier, name } => {
-            // An unknown column errors as such; a known one is ungrouped.
+            // A name outside the query's sources is an outer reference, such as
+            // a PL/pgSQL variable, and stays constant in every group; evaluation
+            // reports it if nothing defines it. A known one is ungrouped.
             if let Some(scope) = context.scope
                 && scope.find_column(*qualifier, name).is_err()
             {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
-                ));
+                return Ok(e);
             }
             Err(sql_err!(
                 sqlstate::GROUPING_ERROR,
@@ -10902,6 +10904,11 @@ fn select_into_rows_mode<'a>(
                 project_sets: None,
                 merge_action: None,
             };
+            // PL/pgSQL variables are outer references of the virtual row.
+            let row = Chained {
+                inner: &super::eval::NoColumns,
+                outer,
+            };
             let Some((ptrs, values)) = fromless_aggregate_hooks(
                 statement,
                 agg_nodes.as_slice(),
@@ -10909,7 +10916,7 @@ fn select_into_rows_mode<'a>(
                 txid,
                 arena,
                 params,
-                &super::eval::NoColumns,
+                &row,
                 &hooks,
             )?
             else {
@@ -10930,23 +10937,13 @@ fn select_into_rows_mode<'a>(
             for item in statement.items {
                 match item {
                     SelectItem::Expr { expression, .. } => {
-                        vals[n] = eval_full(
-                            expression,
-                            arena,
-                            params,
-                            &super::eval::NoColumns,
-                            &agg_hooks,
-                        )?;
+                        vals[n] = eval_full(expression, arena, params, &row, &agg_hooks)?;
                         n += 1;
                     }
                     SelectItem::RecordStar(base) => {
-                        for field in super::eval::record_star_expand(
-                            base,
-                            arena,
-                            params,
-                            &super::eval::NoColumns,
-                            &agg_hooks,
-                        )? {
+                        for field in
+                            super::eval::record_star_expand(base, arena, params, &row, &agg_hooks)?
+                        {
                             vals[n] = field.value;
                             n += 1;
                         }
@@ -13065,6 +13062,30 @@ fn describe_scope_record_star<'q>(
 }
 
 /// Resolves column types across all tables in a join scope.
+/// Aggregate argument types inside a query that has outer references, such
+/// as PL/pgSQL variables: the query's own columns first, then the outer ones.
+/// Without outer references the query's columns alone resolve them.
+fn aggregate_outer_columns<'s, 'd, 'o, 'r, 'c>(
+    scope: Option<&'s QueryScope<'d>>,
+    outer: Option<&'o dyn ColumnLookup<'r>>,
+    storage: &'c Storage,
+    txid: u32,
+    arena: &'c Arena,
+) -> Option<subquery::SubqueryColumns<'s, 'd, 'o, 'r, 'c>> {
+    outer.map(|outer| subquery::SubqueryColumns {
+        scope,
+        outer: Some(outer),
+        catalog: super::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+    })
+}
+
 pub(super) struct ScopeCols<'s, 'd>(pub(super) &'s QueryScope<'d>);
 impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     fn is_empty_scope(&self) -> bool {

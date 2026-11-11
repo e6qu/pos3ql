@@ -47,7 +47,9 @@ pub(crate) struct FunctionTiming {
 }
 
 /// A waiting call owns timestamps, without keeping a worker's timing slot.
+/// The default is an untimed call.
 #[must_use = "retain a paused timer with its unfinished call"]
+#[derive(Default)]
 pub(crate) struct PausedFunctionTiming(Option<FunctionTimingFrame>);
 
 impl FunctionTiming {

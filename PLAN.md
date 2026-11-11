@@ -64,9 +64,14 @@ run. On resumption the same order keeps the same local values, audit row and
 number.
 
 **Done today:** ordered AFTER-trigger work; nested INSERT/UPDATE/DELETE;
-trigger frames; PL/pgSQL calls inside `PERFORM`, `SELECT ... INTO` and
-declaration initializers; SQL-language function bodies, child calls and return
-checks; SQL cursors executing from retained query state, including row locks
+trigger frames; PL/pgSQL calls inside `PERFORM`, `SELECT ... INTO`,
+declaration initializers and every PL/pgSQL statement's expressions,
+including statements with several (`FOR` bounds, `CASE`, `RAISE` arguments
+and options, `IF ... ELSIF`, `ASSERT`, `CALL` arguments, dynamic `EXECUTE`
+values), which keep finished values across a wait; SQL-language function
+bodies, child calls and return checks; PL/pgSQL procedures and `DO` blocks,
+including nested `CALL`, resuming at the waiting statement after their own
+`COMMIT` or `ROLLBACK`, with queries yielding on storage reads; SQL cursors executing from retained query state, including row locks
 taken per `FETCH` and scrollable cursors that evaluate revisited rows again;
 client output that never blocks the worker on a slow reader; large
 single-table results resuming row by row across client, storage and lock
@@ -76,8 +81,8 @@ is owned.
 
 **Remaining:**
 
-- **Functions:** callers and expression positions that have no owning query;
-  PL/pgSQL return conversion that can wait. A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
+- **Functions:** PL/pgSQL return conversion that can wait.
+  Writes inside a procedure body still read storage synchronously. A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
   grouping, subqueries) restarts once for each first call of a SQL-language
   routine, so its work grows with the square of those calls; single-table,
   `VALUES` and `generate_series` sources hand each call off on its row.
@@ -300,14 +305,8 @@ reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
 A SQL-language procedure called from a trigger fired inside a write (a BEFORE
 row trigger, a deferred constraint trigger at `COMMIT`) runs queries, data
 changes and nested `CALL`, but rejects DDL and other utility statements with
-`0A000` because that trigger runs without the engine's utility executor. A procedure that waits for storage or a lock, at the
-top level or called from PL/pgSQL, runs again from its start when its
-statement resumes (finished effects replay from the statement journal)
-instead of resuming at a saved position, so a wait after the procedure's own
-`COMMIT` or `ROLLBACK` fails with `0A000` where PostgreSQL waits. Fixing it
-needs a statement-owned saved procedure frame (like the saved write completion
-a trigger frame uses) whose rollback boundary moves to each transaction the
-procedure starts. A table's or view's row type cannot
+`0A000` because that trigger runs without the engine's utility executor. A
+table's or view's row type cannot
 appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
 where PostgreSQL accepts it. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current

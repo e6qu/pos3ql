@@ -42211,7 +42211,7 @@ fn plpgsql_call_and_do_own_real_non_atomic_transaction_boundaries() {
 }
 
 #[test]
-fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
+fn plpgsql_non_atomic_call_resumes_after_a_committed_boundary() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
         &mut engine,
@@ -42247,12 +42247,12 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
 
     let mut caller = TxnState::new(&mut budget, 256).unwrap();
     let mut send = crate::mem::FixedBuf::new(&mut budget, "procedure wait send", 1 << 18).unwrap();
-    let arena = Arena::new(&mut budget, "procedure wait SQL", 1 << 18).unwrap();
+    let mut arena = Arena::new(&mut budget, "procedure wait SQL", 1 << 18).unwrap();
     let mut pool = test_pool(&mut budget);
     let guc = GucState::new();
     let mut cursors = test_cursors(&mut budget);
     let call = "CALL procedure_wait()";
-    let rejected = engine
+    let status = engine
         .execute_simple(
             call,
             &arena,
@@ -42264,15 +42264,49 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
             2,
         )
         .unwrap();
-    assert_eq!(rejected, ExecutionStatus::Complete);
-    let error = String::from_utf8_lossy(send.readable());
-    assert!(error.contains("0A000"), "{error}");
-    assert!(
-        error.contains("cannot suspend after transaction control"),
-        "{error}"
+    let ExecutionStatus::Blocked {
+        completed_statements,
+        output_mark,
+        wait: StatementWait::Lock,
+    } = status
+    else {
+        panic!(
+            "procedure did not wait after COMMIT: {status:?}: {}",
+            String::from_utf8_lossy(send.readable())
+        );
+    };
+    // The committed first transaction is visible while the call waits.
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT phase FROM procedure_wait_log",
+        )),
+        ["before"]
     );
-
     assert!(run_txn(&mut engine, &mut budget, &mut blocker, "COMMIT").contains("COMMIT"));
+    output_mark.truncate_unsent(&mut send);
+    arena.recycle_front();
+    let status = engine
+        .execute_simple_from(
+            call,
+            completed_statements,
+            &arena,
+            &mut caller,
+            &mut pool,
+            &mut cursors,
+            &guc,
+            &mut Responder::new(&mut send),
+            2,
+            false,
+        )
+        .unwrap();
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert!(
+        error_sqlstates(send.readable()).is_empty(),
+        "{}",
+        String::from_utf8_lossy(send.readable())
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -42280,7 +42314,7 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
             "SELECT phase, count(*) FROM procedure_wait_log GROUP BY phase ORDER BY phase; \
              SELECT value FROM procedure_wait_target",
         )),
-        ["before|1", "20"]
+        ["after|1", "before|1", "21"]
     );
 }
 

@@ -814,9 +814,11 @@ mod set_rows;
 mod transition_rows;
 pub(super) use call_environment::CallEnvironment;
 mod function_execution;
+mod procedure_execution;
 mod sql_function_execution;
 pub(super) use function_execution::execute as execute_plpgsql_function;
 pub(super) use function_execution::{FunctionOutput, SuspendedFunction};
+pub(super) use procedure_execution::SuspendedProcedure;
 pub(super) use sql_function_execution::execute_sql_function;
 mod trigger_firing;
 mod write_completion;
@@ -17907,6 +17909,10 @@ struct TriggerExecutionStatus<'a> {
     pending_write: Option<write_completion::PendingNestedWrite>,
     pending_statement: Option<super::sequence::SavedStatementPosition>,
     pending_query: Option<super::query::RoutineInvocationState>,
+    /// Finished expressions of a waiting statement that evaluates several.
+    expressions: local_values::ExpressionProgress,
+    /// A procedure this frame's `CALL` started that is waiting.
+    pending_call: Option<SuspendedProcedure>,
 }
 
 impl<'a> TriggerExecutionStatus<'a> {
@@ -17941,6 +17947,8 @@ impl<'a> TriggerExecutionStatus<'a> {
             pending_write: None,
             pending_statement: None,
             pending_query: None,
+            expressions: local_values::ExpressionProgress::new(rows)?,
+            pending_call: None,
         })
     }
     fn collect_set_rows(&mut self, result: PlpgsqlSetResult) {
@@ -18493,6 +18501,7 @@ fn execute_plpgsql_dynamic_call<'a>(
                     *transaction_context,
                     context.responder,
                     Some(&mut outputs),
+                    None,
                 )
             })
         })
@@ -18518,6 +18527,8 @@ fn execute_plpgsql_call<'a>(
     statement: &'a Stmt<'a>,
     locals: &[TriggerLocalDecl],
     scope: &TriggerLocalScope<'_, 'a>,
+    expressions: &mut StatementExpressions<'_>,
+    pending_call: &mut Option<SuspendedProcedure>,
 ) -> Result<PlpgsqlCallOutputs<'a>, SqlError> {
     let Stmt::Call {
         name,
@@ -18553,8 +18564,10 @@ fn execute_plpgsql_call<'a>(
     let mut targets = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
     // Arguments are PL/pgSQL expressions: record fields, subqueries and
     // function calls evaluate as in any other statement of the block.
+    // A resumed call reads its finished arguments back instead of running
+    // their routine calls again.
     for (value, argument) in values.iter_mut().zip(arguments.iter()) {
-        *value = eval_procedural_expression(context, argument, scope, None)?;
+        *value = expressions.eval(context, argument, scope)?;
     }
     {
         let catalog = super::query::storage_catalog(context.storage(), arena, context.txn.txid);
@@ -18615,6 +18628,7 @@ fn execute_plpgsql_call<'a>(
             values: outputs.values,
         });
     };
+    let retained = context.txn.write_completion_boundary.is_some();
     let outcome = with_bound_parameter_types(&types[..arguments.len()], || {
         engine.execute_call(
             *name,
@@ -18630,6 +18644,8 @@ fn execute_plpgsql_call<'a>(
             *transaction_context,
             context.responder,
             Some(&mut outputs),
+            // A retained caller keeps the callee's waiting body with its own.
+            retained.then_some(&mut *pending_call),
         )
     });
     routine_utility_outcome(outcome)?;
@@ -19135,6 +19151,89 @@ fn run_atomic_sql_procedure_call<'a>(
         &types[..arguments.len()],
         &mut outputs,
     )
+}
+
+/// PostgreSQL's `check_sql_fn_statements`: a SQL routine body cannot `CALL`
+/// a procedure that has output parameters. It runs before the result check.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the check parses the body exactly as the routine validator does"
+)]
+fn reject_sql_body_output_calls(
+    body_kind: crate::storage::RoutineBodyKind,
+    body: &str,
+    routine_name: &str,
+    arguments: &[crate::storage::RoutineArgumentDef],
+    inputs: &[super::type_inputs::Binding<'_>],
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    // A `BEGIN ATOMIC` body rejects `CALL` itself, before this check.
+    if body_kind != crate::storage::RoutineBodyKind::String {
+        return Ok(());
+    }
+    let body = arena
+        .alloc_str(body)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let routine_name = arena
+        .alloc_str(routine_name)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let inputs = arena
+        .alloc_slice_copy(inputs)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut parser = super::parser::Parser::new(body, arena)
+        .and_then(|parser| parser.with_routine_parameters(routine_name, arguments))
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.set_type_inputs(inputs);
+    while let Some(statement) = parser
+        .next_stmt()
+        .map_err(|error| super::parse_error_to_sql(&error))?
+    {
+        let Stmt::Call {
+            name,
+            arguments,
+            argument_names,
+            variadic,
+        } = statement
+        else {
+            continue;
+        };
+        if arguments.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+            continue;
+        }
+        let mut types = [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (target, argument) in types.iter_mut().zip(arguments) {
+            *target = infer_type_catalog(argument, None, storage, txid, arena)?.0;
+        }
+        let qualified = match name.schema {
+            Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
+            None => stack_format!(260, "{}", name.name),
+        };
+        // Resolution failures are reported where the statement runs.
+        let crate::storage::RoutineCallSelection::Stored(slot) = storage.select_routine_call(
+            qualified.as_str(),
+            argument_names,
+            &types[..arguments.len()],
+            variadic,
+            txid,
+            crate::storage::RoutineCallKind::Procedure,
+        ) else {
+            continue;
+        };
+        if storage
+            .routine_for(slot, txid)
+            .parameters()
+            .iter()
+            .any(|parameter| parameter.mode.is_output())
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "calling procedures with output arguments is not supported in SQL functions"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Output parameters of a procedure called from PL/pgSQL. Static `CALL`
@@ -22263,12 +22362,15 @@ pub(crate) fn execute_event_trigger<'a>(
 
 /// Executes a stored PL/pgSQL procedure with one typed namespace for formal
 /// parameters and declarations. Named OUT and INOUT values cross back through
-/// the same declared types after the block completes.
+/// the same declared types after the block completes. With `retention`, a
+/// waiting body is saved there and a saved body resumes instead of starting;
+/// `timing` is `None` exactly when resuming. Returns the output count and the
+/// call's timer.
 #[expect(
     clippy::too_many_arguments,
     reason = "stored procedure execution owns its complete typed call context"
 )]
-pub(crate) fn execute_plpgsql_procedure<'a>(
+pub(in crate::sql) fn execute_plpgsql_procedure<'a>(
     engine: &mut super::Engine,
     txn: &mut TxnState,
     sqlprep: &mut super::prep::SqlPreparedPool,
@@ -22281,25 +22383,318 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     arena: &'a Arena,
     responder: &mut Responder<'_>,
     outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
-) -> Result<usize, SqlError> {
-    run_plpgsql_procedure(
-        &mut TriggerExecContext {
-            host: PlpgsqlExecHost::Routine {
-                engine,
-                guc,
-                sqlprep,
-                cursors,
-                transaction_context,
-            },
-            txn,
-            arena,
-            params: inputs,
-            responder,
+    environment: &CallEnvironment,
+    timing: Option<super::statistics::FunctionTiming>,
+    retention: Option<&mut Option<SuspendedProcedure>>,
+) -> Result<(usize, super::statistics::FunctionTiming), SqlError> {
+    let mut context = TriggerExecContext {
+        host: PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            sqlprep,
+            cursors,
+            transaction_context,
         },
-        routine,
+        txn,
+        arena,
+        params: inputs,
+        responder,
+    };
+    let Some(retention) = retention else {
+        let timing = timing.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "an unsaved procedure call has no timer"
+            )
+        })?;
+        let count = run_plpgsql_procedure(&mut context, routine, input_collation, outputs)?;
+        return Ok((count, timing));
+    };
+    let identity = procedure_execution::ProcedureIdentity::routine(routine);
+    let mut finished = None;
+    let mut finish = |execution: &execution_frame::ExecutionFrame<'_, 'a>,
+                      timing: super::statistics::FunctionTiming| {
+        finished = Some((procedure_output_values(routine, execution, outputs), timing));
+        Ok(())
+    };
+    let _formal_scope = enter_routine_parameter_types(
+        routine.arguments(),
+        Some(&super::query::storage_catalog(
+            context.storage(),
+            arena,
+            context.txn.txid,
+        )),
         input_collation,
-        outputs,
+    )?;
+    match (retention.take(), timing) {
+        (Some(saved), None) => saved.resume(
+            &mut context,
+            identity,
+            &|sites| {
+                Ok(
+                    TriggerInvocation::procedure(routine, input_collation, arena)?
+                        .with_input_sites(sites),
+                )
+            },
+            &|inputs| procedure_seeded_values(routine, inputs, arena),
+            retention,
+            &mut finish,
+        )?,
+        (None, Some(timing)) => {
+            let (program, code) = compile_plpgsql_procedure(&context, routine, arena)?;
+            let locals = procedure_declarations(routine, program.locals, arena)?;
+            let seeded = procedure_seeded_values(routine, inputs, arena)?;
+            let invocation = TriggerInvocation::procedure(routine, input_collation, arena)?
+                .with_input_sites(program.input_sites);
+            let execution = execution_frame::ExecutionFrame::new(
+                arena,
+                &code,
+                locals,
+                0,
+                &context.storage().execution_control,
+                &context.storage().row_work,
+            )?;
+            procedure_execution::execute(
+                &mut context,
+                execution,
+                procedure_execution::ProcedureBody {
+                    identity,
+                    code: &code,
+                    invocation,
+                    seeded,
+                },
+                inputs,
+                environment,
+                timing,
+                retention,
+                &mut finish,
+            )?
+        }
+        (saved, _) => {
+            *retention = saved;
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a procedure call's timer does not match its saved state"
+            ));
+        }
+    }
+    finished.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a finished procedure lost its outputs"
+        )
+    })
+}
+
+/// Executes a `DO` block. With `retention` it keeps a waiting block there
+/// and resumes a saved one instead of starting again.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a retained block carries its complete transaction-capable call context"
+)]
+pub(in crate::sql) fn execute_retained_anonymous_plpgsql<'a>(
+    engine: &mut super::Engine,
+    txn: &mut TxnState,
+    sqlprep: &mut super::prep::SqlPreparedPool,
+    cursors: &mut super::cursor::CursorPool,
+    guc: &super::guc::GucState,
+    transaction_context: PlpgsqlTransactionContext,
+    source: &'a str,
+    arena: &'a Arena,
+    responder: &mut Responder<'_>,
+    retention: &mut Option<SuspendedProcedure>,
+) -> Result<(), SqlError> {
+    let mut context = TriggerExecContext {
+        host: PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            sqlprep,
+            cursors,
+            transaction_context,
+        },
+        txn,
+        arena,
+        params: crate::sql::eval::NO_PARAMS,
+        responder,
+    };
+    let environment = CallEnvironment::new(None, None);
+    let identity = procedure_execution::ProcedureIdentity::ANONYMOUS;
+    let mut finish =
+        |_: &execution_frame::ExecutionFrame<'_, 'a>, _: super::statistics::FunctionTiming| Ok(());
+    if let Some(saved) = retention.take() {
+        return saved.resume(
+            &mut context,
+            identity,
+            &|sites| Ok(TriggerInvocation::anonymous()?.with_input_sites(sites)),
+            &|_| Ok(&[]),
+            retention,
+            &mut finish,
+        );
+    }
+    let (program, code) = compile_plpgsql_execution(
+        source,
+        PlpgsqlProgramKind::Anonymous,
+        context.storage(),
+        context.txn.txid,
+        arena,
+        &|_| false,
+    )?;
+    let invocation = TriggerInvocation::anonymous()?.with_input_sites(program.input_sites);
+    let execution = execution_frame::ExecutionFrame::new(
+        arena,
+        &code,
+        program.locals,
+        0,
+        &context.storage().execution_control,
+        &context.storage().row_work,
+    )?;
+    procedure_execution::execute(
+        &mut context,
+        execution,
+        procedure_execution::ProcedureBody {
+            identity,
+            code: &code,
+            invocation,
+            seeded: &[],
+        },
+        &[],
+        &environment,
+        super::statistics::begin_function_timing(false)?,
+        retention,
+        &mut finish,
     )
+}
+
+fn compile_plpgsql_procedure<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    routine: &crate::storage::RoutineDef,
+    arena: &'a Arena,
+) -> Result<(TriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
+    compile_plpgsql_execution(
+        routine.body.as_str(),
+        PlpgsqlProgramKind::Procedure,
+        context.storage(),
+        context.txn.txid,
+        arena,
+        &|name| {
+            routine
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.name == name)
+                || routine.result_columns[..routine.result_column_count]
+                    .iter()
+                    .any(|column| column.name == name)
+        },
+    )
+}
+
+/// Named formal parameters first, then the body's declarations, as one
+/// typed namespace.
+fn procedure_declarations<'a>(
+    routine: &crate::storage::RoutineDef,
+    program_locals: &[TriggerLocalDecl],
+    arena: &'a Arena,
+) -> Result<&'a [TriggerLocalDecl], SqlError> {
+    let named = routine
+        .parameters()
+        .iter()
+        .filter(|parameter| !parameter.name.as_str().is_empty())
+        .count();
+    let declarations = arena
+        .alloc_slice_with(named.saturating_add(program_locals.len()), |_| {
+            empty_plpgsql_local()
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut count = 0usize;
+    for parameter in routine.parameters() {
+        if parameter.name.as_str().is_empty() {
+            continue;
+        }
+        if declarations[..count]
+            .iter()
+            .any(|prior: &TriggerLocalDecl| prior.name == parameter.name)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "procedure parameter \"{}\" conflicts with a PL/pgSQL variable",
+                parameter.name.as_str()
+            ));
+        }
+        declarations[count] = TriggerLocalDecl {
+            scope: PlpgsqlScope::Invocation,
+            name: parameter.name,
+            ctype: parameter.ctype,
+            user_type: parameter.user_type,
+            type_mod: -1,
+            record_shape: None,
+            constant: false,
+            not_null: false,
+        };
+        count += 1;
+    }
+    declarations[count..].copy_from_slice(program_locals);
+    Ok(declarations)
+}
+
+/// Initial values of the named formal parameters: inputs in order, NULL for
+/// output-only parameters.
+fn procedure_seeded_values<'a>(
+    routine: &crate::storage::RoutineDef,
+    inputs: &'a [Datum<'a>],
+    arena: &'a Arena,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    let named = routine
+        .parameters()
+        .iter()
+        .filter(|parameter| !parameter.name.as_str().is_empty())
+        .count();
+    let seeded = arena
+        .alloc_slice_with(named, |_| Datum::Null)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut input_index = 0usize;
+    let mut count = 0usize;
+    for parameter in routine.parameters() {
+        let input = if parameter.mode.is_input() {
+            let value = inputs.get(input_index).copied().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "procedure inputs do not match its parameters"
+                )
+            })?;
+            input_index += 1;
+            Some(value)
+        } else {
+            None
+        };
+        if parameter.name.as_str().is_empty() {
+            continue;
+        }
+        seeded[count] = input.unwrap_or(Datum::Null);
+        count += 1;
+    }
+    Ok(seeded)
+}
+
+/// Copies each OUT and INOUT parameter's final value, by name.
+fn procedure_output_values<'a>(
+    routine: &crate::storage::RoutineDef,
+    execution: &execution_frame::ExecutionFrame<'_, 'a>,
+    outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+) -> usize {
+    let mut output_count = 0usize;
+    for parameter in routine.parameters() {
+        if !parameter.mode.is_output() {
+            continue;
+        }
+        outputs[output_count] = execution
+            .locals
+            .iter()
+            .position(|local| local.name == parameter.name)
+            .filter(|_| !parameter.name.as_str().is_empty())
+            .map_or(Datum::Null, |index| execution.values[index]);
+        output_count += 1;
+    }
+    output_count
 }
 
 /// Runs a PL/pgSQL procedure body on `context`'s host with `context.params`
@@ -23620,6 +24015,9 @@ impl PlpgsqlExecHost<'_> {
                 "invalid transaction termination"
             ));
         }
+        // A saved procedure body keeps statement boundaries in each
+        // transaction it starts.
+        let retained = txn.write_completion_boundary.is_some();
         let prior_configuration = txn.capture_configuration();
         let next = match command {
             PlpgsqlTransactionCommand::Commit(next) => {
@@ -23649,7 +24047,7 @@ impl PlpgsqlExecHost<'_> {
                 next
             }
             PlpgsqlTransactionCommand::Rollback(next) => {
-                engine.rollback_txn(txn, guc);
+                engine.rollback_txn_within_statement(txn, guc);
                 cursors.on_rollback();
                 next
             }
@@ -23657,6 +24055,17 @@ impl PlpgsqlExecHost<'_> {
         engine.ensure_txn(txn, TxnMode::Implicit, guc)?;
         if next == PlpgsqlNextTransaction::Chained {
             txn.restore_configuration(prior_configuration);
+        }
+        // The new transaction sees what the earlier ones committed, as each
+        // statement after PostgreSQL's procedure COMMIT takes a new snapshot.
+        drop(engine.begin_command_snapshot(txn, true, false, false, false)?);
+        if retained {
+            txn.write_completion_boundary = Some(super::txn::WriteCompletionBoundary {
+                mark: txn
+                    .statement_mark(engine.wal.stage_mark(txn.txid), engine.storage.lock_mark()),
+                command: txn.command_id(),
+                depth: txn.trigger_depth(),
+            });
         }
         Ok(())
     }
@@ -23852,6 +24261,69 @@ fn execute_procedural_query<T>(
     }
 }
 
+/// Evaluates a statement's expressions in order. In a frame that is kept
+/// across waits, the expression that waits owns its routine calls in
+/// `pending`; when the statement has several expressions, each finished value
+/// is also saved, so a resumed statement reads it back and continues at the
+/// expression that waited.
+struct StatementExpressions<'s> {
+    saved: Option<(
+        &'s mut local_values::ExpressionProgress,
+        &'s mut Option<super::query::RoutineInvocationState>,
+    )>,
+    several: bool,
+    next: usize,
+}
+
+impl<'s> StatementExpressions<'s> {
+    fn new(
+        retained: bool,
+        several: bool,
+        progress: &'s mut local_values::ExpressionProgress,
+        pending: &'s mut Option<super::query::RoutineInvocationState>,
+    ) -> Self {
+        Self {
+            saved: retained.then_some((progress, pending)),
+            several,
+            next: 0,
+        }
+    }
+
+    fn eval<'a>(
+        &mut self,
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+        expression: &'a Expr<'a>,
+        row: &TriggerLocalScope<'_, 'a>,
+    ) -> Result<Datum<'a>, SqlError> {
+        let index = self.next;
+        self.next += 1;
+        let Some((progress, pending)) = self.saved.as_mut() else {
+            return eval_procedural_expression(context, expression, row, None);
+        };
+        if !self.several {
+            if index != 0 {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "PL/pgSQL statement has more expressions than counted"
+                ));
+            }
+            return eval_procedural_expression(context, expression, row, Some(&mut **pending));
+        }
+        if index < progress.finished() {
+            return progress.read(index, context.arena);
+        }
+        if index != progress.finished() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "PL/pgSQL statement resumed out of expression order"
+            ));
+        }
+        let value = eval_procedural_expression(context, expression, row, Some(&mut **pending))?;
+        progress.push(value, context.arena)?;
+        Ok(value)
+    }
+}
+
 fn eval_procedural_expression<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     expression: &'a Expr<'a>,
@@ -24009,8 +24481,9 @@ fn bind_plpgsql_dynamic_query<'a>(
     query: PlpgsqlDynamicQuery<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
     kind: DynamicCommandKind,
+    expressions: &mut StatementExpressions<'_>,
 ) -> Result<BoundPlpgsqlCommand<'a>, SqlError> {
-    let command = eval_procedural_expression(context, query.command, scope, None)?;
+    let command = expressions.eval(context, query.command, scope)?;
     if command.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -24043,10 +24516,8 @@ fn bind_plpgsql_dynamic_query<'a>(
         }
     }
     for (index, expression) in query.arguments.iter().copied().enumerate() {
-        arguments[index] = detached_trigger_datum(
-            eval_procedural_expression(context, expression, scope, None)?,
-            context.arena,
-        )?;
+        arguments[index] =
+            detached_trigger_datum(expressions.eval(context, expression, scope)?, context.arena)?;
     }
     if matches!(kind, DynamicCommandKind::Cursor) {
         let mark = context.arena.mark();
@@ -26885,11 +27356,14 @@ fn assign_trigger_local<'a>(
     Ok(())
 }
 
+/// Formats `RAISE` arguments, evaluated in order as part of the statement's
+/// `expressions`.
 fn trigger_format_message<'a>(
     format: &str,
     arguments: &[&'a Expr<'a>],
     context: &mut TriggerExecContext<'_, 'a, '_>,
     scope: &TriggerLocalScope<'_, 'a>,
+    expressions: &mut StatementExpressions<'_>,
 ) -> Result<StackStr<192>, SqlError> {
     use core::fmt::Write as _;
 
@@ -26905,7 +27379,7 @@ fn trigger_format_message<'a>(
             let _ = message.write_char('%');
             continue;
         }
-        let value = eval_procedural_expression(context, arguments[argument], scope, None)?;
+        let value = expressions.eval(context, arguments[argument], scope)?;
         argument += 1;
         if value.is_null() {
             let _ = message.write_str("<NULL>");
@@ -26926,8 +27400,9 @@ fn trigger_diagnostic_text<'a, const N: usize>(
     expression: &'a Expr<'a>,
     context: &mut TriggerExecContext<'_, 'a, '_>,
     scope: &TriggerLocalScope<'_, 'a>,
+    expressions: &mut StatementExpressions<'_>,
 ) -> Result<StackStr<N>, SqlError> {
-    let value = eval_procedural_expression(context, expression, scope, None)?;
+    let value = expressions.eval(context, expression, scope)?;
     if value.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -26948,11 +27423,12 @@ fn trigger_raise_sqlstate<'a>(
     state: TriggerRaiseSqlState<'a>,
     context: &mut TriggerExecContext<'_, 'a, '_>,
     scope: &TriggerLocalScope<'_, 'a>,
+    expressions: &mut StatementExpressions<'_>,
 ) -> Result<crate::sql::eval::SqlState, SqlError> {
     match state {
         TriggerRaiseSqlState::Parsed(state) => Ok(state),
         TriggerRaiseSqlState::Expression(expression) => {
-            let code = trigger_diagnostic_text::<6>(expression, context, scope)?;
+            let code = trigger_diagnostic_text::<6>(expression, context, scope, expressions)?;
             parse_trigger_raised_sqlstate(code.as_str())
                 .ok_or_else(|| invalid_trigger_sqlstate(code.as_str()))
         }
@@ -26980,8 +27456,9 @@ fn trigger_condition<'a>(
     locals: &[TriggerLocalDecl],
     values: &[Datum<'a>],
     found: Option<bool>,
+    continuation: Option<&mut Option<super::query::RoutineInvocationState>>,
 ) -> Result<bool, SqlError> {
-    match eval_procedural_expression(
+    trigger_condition_value(eval_procedural_expression(
         context,
         expression,
         &TriggerLocalScope {
@@ -26995,8 +27472,12 @@ fn trigger_condition<'a>(
                 new,
             },
         },
-        None,
-    )? {
+        continuation,
+    )?)
+}
+
+fn trigger_condition_value(value: Datum<'_>) -> Result<bool, SqlError> {
+    match value {
         Datum::Bool(value) => Ok(value),
         Datum::Null => Ok(false),
         _ => Err(sql_err!(
@@ -27071,9 +27552,16 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
     query: PlpgsqlDynamicQuery<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
     record_target: bool,
+    expressions: &mut StatementExpressions<'_>,
 ) -> Result<TriggerForRows<'a>, SqlError> {
     let arena = context.arena;
-    let query = bind_plpgsql_dynamic_query(context, query, scope, DynamicCommandKind::Statement)?;
+    let query = bind_plpgsql_dynamic_query(
+        context,
+        query,
+        scope,
+        DynamicCommandKind::Statement,
+        expressions,
+    )?;
     let query = resolve_plpgsql_dynamic_prepared(context, query)?;
     with_bound_parameter_types(query.parameter_types, || {
         let mut fields = [("", 0); MAX_PROJ];
@@ -27574,6 +28062,28 @@ fn execute_trigger_step<'a>(
             }
         }
     };
+    // A write that waits before handing off its completion runs again from
+    // its own start, so its partial rows and output are withdrawn first.
+    let write_start = (retained_parent
+        && matches!(
+            statement,
+            TriggerStatement::Dml { .. }
+                | TriggerStatement::DynamicQuery(_)
+                | TriggerStatement::DynamicSelectInto(_)
+        ))
+    .then(|| {
+        context
+            .nested_write_boundary()
+            .map(|mark| (mark, context.responder.mark()))
+    })
+    .flatten();
+    // Writes read storage synchronously, as top-level writing statements do.
+    let atomic_reads = match &context.host {
+        PlpgsqlExecHost::Routine { engine, .. } if write_start.is_some() => {
+            engine.atomic_block_read_scope()
+        }
+        _ => None,
+    };
     let mut execute = || match statement {
         TriggerStatement::Null => execute_trigger_statement(|| Ok(None)),
         TriggerStatement::TransactionControl(command) => execute_trigger_statement(|| {
@@ -27615,7 +28125,7 @@ fn execute_trigger_step<'a>(
                                 &mut context,
                                 expression,
                                 &scope,
-                                None,
+                                retained_parent.then_some(&mut status.pending_query),
                             )? {
                                 Datum::Record(fields) => {
                                     if fields.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
@@ -27725,8 +28235,18 @@ fn execute_trigger_step<'a>(
                 invocation,
                 transition: &transition,
             };
-            let query =
-                bind_plpgsql_dynamic_query(context, query, &scope, DynamicCommandKind::Statement)?;
+            let query = bind_plpgsql_dynamic_query(
+                context,
+                query,
+                &scope,
+                DynamicCommandKind::Statement,
+                &mut StatementExpressions::new(
+                    retained_parent,
+                    true,
+                    &mut status.expressions,
+                    &mut status.pending_query,
+                ),
+            )?;
             let arena = context.arena;
             execute_bound_plpgsql_dynamic_query(context, query, &mut |values| {
                 if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
@@ -27764,7 +28284,10 @@ fn execute_trigger_step<'a>(
                         transition: &transition,
                     };
                     TriggerReturnValue::Value(eval_procedural_expression(
-                        context, expression, &scope, None,
+                        context,
+                        expression,
+                        &scope,
+                        retained_parent.then_some(&mut status.pending_query),
                     )?)
                 }
             };
@@ -27824,7 +28347,12 @@ fn execute_trigger_step<'a>(
                 &scope,
                 hooks.catalog,
             )?;
-            let value = eval_procedural_expression(context, assignment.expression, &scope, None)?;
+            let value = eval_procedural_expression(
+                context,
+                assignment.expression,
+                &scope,
+                retained_parent.then_some(&mut status.pending_query),
+            )?;
             let value = coerce_assignment(
                 value,
                 &definition.columns()[column],
@@ -27859,7 +28387,12 @@ fn execute_trigger_step<'a>(
                 invocation,
                 transition: &transition,
             };
-            let value = eval_procedural_expression(context, assignment.expression, &scope, None)?;
+            let value = eval_procedural_expression(
+                context,
+                assignment.expression,
+                &scope,
+                retained_parent.then_some(&mut status.pending_query),
+            )?;
             if locals.iter().any(|local| local.name == assignment.name) {
                 assign_trigger_local(context, locals, local_values, assignment.name, value)?;
             } else if TriggerStatusVariable::parse(assignment.name.as_str()).is_some() {
@@ -27971,6 +28504,12 @@ fn execute_trigger_step<'a>(
                                     query,
                                     &scope,
                                     DynamicCommandKind::Cursor,
+                                    &mut StatementExpressions::new(
+                                        retained_parent,
+                                        true,
+                                        &mut status.expressions,
+                                        &mut status.pending_query,
+                                    ),
                                 )?;
                                 let bound = resolve_plpgsql_dynamic_prepared(context, bound)?;
                                 if !matches!(bound.statement, Stmt::Select(_) | Stmt::SetQuery(_)) {
@@ -28298,6 +28837,7 @@ fn execute_trigger_step<'a>(
                     locals,
                     &local_values[..locals.len()],
                     status.found,
+                    retained_parent.then_some(&mut status.pending_query),
                 )?,
                 None => true,
             };
@@ -28503,6 +29043,12 @@ fn execute_trigger_step<'a>(
                 statement.query,
                 &scope,
                 DynamicCommandKind::Statement,
+                &mut StatementExpressions::new(
+                    retained_parent,
+                    true,
+                    &mut status.expressions,
+                    &mut status.pending_query,
+                ),
             )?;
             let query = resolve_plpgsql_dynamic_prepared(context, query)?;
             let has_result = match query.statement {
@@ -28877,8 +29423,18 @@ fn execute_trigger_step<'a>(
                 invocation,
                 transition: &transition,
             };
-            let query =
-                bind_plpgsql_dynamic_query(context, query, &scope, DynamicCommandKind::Statement)?;
+            let query = bind_plpgsql_dynamic_query(
+                context,
+                query,
+                &scope,
+                DynamicCommandKind::Statement,
+                &mut StatementExpressions::new(
+                    retained_parent,
+                    true,
+                    &mut status.expressions,
+                    &mut status.pending_query,
+                ),
+            )?;
             let query = resolve_plpgsql_dynamic_prepared(context, query)?;
             with_bound_parameter_types(query.parameter_types, || {
                 let row_count = match query.statement {
@@ -28948,7 +29504,21 @@ fn execute_trigger_step<'a>(
                 invocation,
                 transition: &transition,
             };
-            let outputs = execute_plpgsql_call(context, statement, locals, &scope)?;
+            // Even one argument is saved: the called procedure can wait after it.
+            let mut expressions = StatementExpressions::new(
+                retained_parent,
+                true,
+                &mut status.expressions,
+                &mut status.pending_query,
+            );
+            let outputs = execute_plpgsql_call(
+                context,
+                statement,
+                locals,
+                &scope,
+                &mut expressions,
+                &mut status.pending_call,
+            )?;
             for (argument, output) in outputs.arguments.iter().zip(outputs.assigned) {
                 if let (Some(name), Some(output)) = (argument, output) {
                     assign_trigger_local(
@@ -29049,19 +29619,6 @@ fn execute_trigger_step<'a>(
             Ok(None)
         }),
         TriggerStatement::Assert(assertion) => execute_trigger_statement(|| {
-            if trigger_condition(
-                context,
-                assertion.condition,
-                definition,
-                invocation,
-                old,
-                new.as_deref(),
-                locals,
-                &local_values[..locals.len()],
-                status.found,
-            )? {
-                return Ok(None);
-            }
             let transition = TriggerTransition {
                 definition,
                 old,
@@ -29074,9 +29631,18 @@ fn execute_trigger_step<'a>(
                 invocation,
                 transition: &transition,
             };
+            let mut expressions = StatementExpressions::new(
+                retained_parent,
+                assertion.message.is_some(),
+                &mut status.expressions,
+                &mut status.pending_query,
+            );
+            if trigger_condition_value(expressions.eval(context, assertion.condition, &scope)?)? {
+                return Ok(None);
+            }
             let message = match assertion.message {
                 Some(message) => {
-                    let value = eval_procedural_expression(context, message, &scope, None)?;
+                    let value = expressions.eval(context, message, &scope)?;
                     if value.is_null() {
                         stack_format!(192, "assertion failed")
                     } else {
@@ -29115,16 +29681,38 @@ fn execute_trigger_step<'a>(
                 invocation,
                 transition: &transition,
             };
-            let sqlstate = trigger_raise_sqlstate(raise.sqlstate, context, &scope)?;
+            let count = usize::from(matches!(
+                raise.sqlstate,
+                TriggerRaiseSqlState::Expression(_)
+            )) + match (raise.message, raise.default_message, raise.format) {
+                (Some(_), _, _) => 1,
+                (None, Some(_), _) | (None, None, None) => 0,
+                (None, None, Some(_)) => raise.arguments.len(),
+            } + usize::from(raise.detail.is_some())
+                + usize::from(raise.hint.is_some());
+            let mut expressions = StatementExpressions::new(
+                retained_parent,
+                count > 1,
+                &mut status.expressions,
+                &mut status.pending_query,
+            );
+            let sqlstate =
+                trigger_raise_sqlstate(raise.sqlstate, context, &scope, &mut expressions)?;
             let message = match raise.message {
-                Some(message) => trigger_diagnostic_text::<192>(message, context, &scope)?,
+                Some(message) => {
+                    trigger_diagnostic_text::<192>(message, context, &scope, &mut expressions)?
+                }
                 None if raise.default_message.is_some() => {
                     stack_format!(192, "{}", raise.default_message.expect("default message"))
                 }
                 None => match raise.format {
-                    Some(format) => {
-                        trigger_format_message(format, raise.arguments, context, &scope)?
-                    }
+                    Some(format) => trigger_format_message(
+                        format,
+                        raise.arguments,
+                        context,
+                        &scope,
+                        &mut expressions,
+                    )?,
                     None => stack_format!(192, "{}", sqlstate.as_str()),
                 },
             };
@@ -29132,13 +29720,16 @@ fn execute_trigger_step<'a>(
                 .detail
                 .map(|detail| {
                     trigger_diagnostic_text::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>(
-                        detail, context, &scope,
+                        detail,
+                        context,
+                        &scope,
+                        &mut expressions,
                     )
                 })
                 .transpose()?;
             let hint = raise
                 .hint
-                .map(|hint| trigger_diagnostic_text::<128>(hint, context, &scope))
+                .map(|hint| trigger_diagnostic_text::<128>(hint, context, &scope, &mut expressions))
                 .transpose()?;
             if detail.is_some() || hint.is_some() {
                 crate::sql::eval::stash_diagnostic(detail, hint);
@@ -29634,18 +30225,24 @@ fn execute_trigger_step<'a>(
                     invocation,
                     transition: &transition,
                 };
+                let mut expressions = StatementExpressions::new(
+                    retained_parent,
+                    true,
+                    &mut status.expressions,
+                    &mut status.pending_query,
+                );
                 let lower = trigger_loop_integer(
-                    eval_procedural_expression(context, lower, &scope, None)?,
+                    expressions.eval(context, lower, &scope)?,
                     context.arena,
                     "lower bound",
                 )?;
                 let upper = trigger_loop_integer(
-                    eval_procedural_expression(context, upper, &scope, None)?,
+                    expressions.eval(context, upper, &scope)?,
                     context.arena,
                     "upper bound",
                 )?;
                 let step = trigger_loop_integer(
-                    eval_procedural_expression(context, step, &scope, None)?,
+                    expressions.eval(context, step, &scope)?,
                     context.arena,
                     "BY value",
                 )?;
@@ -29747,6 +30344,12 @@ fn execute_trigger_step<'a>(
                                     query,
                                     &scope,
                                     locals[target].ctype == ColType::Record,
+                                    &mut StatementExpressions::new(
+                                        retained_parent,
+                                        true,
+                                        &mut status.expressions,
+                                        &mut status.pending_query,
+                                    ),
                                 )?
                             }
                             TriggerForSource::Array { expression, slice } => {
@@ -29766,7 +30369,7 @@ fn execute_trigger_step<'a>(
                                     &mut context,
                                     expression,
                                     &scope,
-                                    None,
+                                    retained_parent.then_some(&mut status.pending_query),
                                 )?;
                                 let Datum::Array { element, raw } = array else {
                                     if array.is_null() {
@@ -29874,6 +30477,7 @@ fn execute_trigger_step<'a>(
                 locals,
                 &local_values[..locals.len()],
                 status.found,
+                retained_parent.then_some(&mut status.pending_query),
             )? {
                 Ok(control_flow::Step::while_loop(program))
             } else {
@@ -29882,25 +30486,33 @@ fn execute_trigger_step<'a>(
         }
         TriggerStatement::Loop(block) => Ok(control_flow::Step::plain_loop(block)),
         TriggerStatement::If(program) => {
+            let conditions = program
+                .branches
+                .iter()
+                .filter(|branch| branch.condition.is_some())
+                .count();
+            let transition = TriggerTransition {
+                definition,
+                old,
+                new: new.as_deref(),
+            };
+            let scope = TriggerLocalScope {
+                locals,
+                values: &local_values[..locals.len()],
+                found: status.found,
+                invocation,
+                transition: &transition,
+            };
+            let mut expressions = StatementExpressions::new(
+                retained_parent,
+                conditions > 1,
+                &mut status.expressions,
+                &mut status.pending_query,
+            );
             for branch in program.branches {
                 let selected = match branch.condition {
                     None => true,
-                    Some(condition) => match eval_procedural_expression(
-                        context,
-                        condition,
-                        &TriggerLocalScope {
-                            locals,
-                            values: &local_values[..locals.len()],
-                            found: status.found,
-                            invocation,
-                            transition: &TriggerTransition {
-                                definition,
-                                old,
-                                new: new.as_deref(),
-                            },
-                        },
-                        None,
-                    )? {
+                    Some(condition) => match expressions.eval(context, condition, &scope)? {
                         Datum::Bool(value) => value,
                         Datum::Null => false,
                         _ => {
@@ -29931,13 +30543,19 @@ fn execute_trigger_step<'a>(
                 invocation,
                 transition: &transition,
             };
+            let mut expressions = StatementExpressions::new(
+                retained_parent,
+                program.branches.len() + usize::from(program.operand.is_some()) > 1,
+                &mut status.expressions,
+                &mut status.pending_query,
+            );
             let operand = program
                 .operand
-                .map(|expression| eval_procedural_expression(context, expression, &scope, None))
+                .map(|expression| expressions.eval(context, expression, &scope))
                 .transpose()?;
             let mut selected = None;
             for branch in program.branches {
-                let value = eval_procedural_expression(context, branch.when, &scope, None)?;
+                let value = expressions.eval(context, branch.when, &scope)?;
                 let matches = match operand {
                     Some(operand) => {
                         let catalog = crate::sql::query::storage_catalog(
@@ -29998,14 +30616,36 @@ fn execute_trigger_step<'a>(
         }),
         None => execute(),
     };
-    if retained_parent
+    drop(atomic_reads);
+    if let Some((mark, output)) = write_start
         && status.pending_write.is_none()
-        && matches!(
-            statement,
-            TriggerStatement::Dml { .. }
-                | TriggerStatement::DynamicQuery(_)
-                | TriggerStatement::DynamicSelectInto(_)
-        )
+        && result.as_ref().is_err_and(|error| {
+            matches!(
+                error.sqlstate.internal_control(),
+                Some(
+                    crate::sql::eval::InternalControl::LockWait
+                        | crate::sql::eval::InternalControl::IoWait
+                )
+            )
+        })
+    {
+        let PlpgsqlExecHost::Routine { engine, .. } = &mut context.host else {
+            unreachable!("a retained parent runs on the statement executor")
+        };
+        if !context.txn.owns_statement_mark(mark) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a non-atomic routine cannot suspend after transaction control"
+            ));
+        }
+        engine.rollback_waiting_statement(context.txn, mark);
+        context.responder.truncate_to(output)?;
+        // The rollback undid the effects of the statement's routine calls,
+        // so its expressions run again instead of reading saved results.
+        status.expressions.clear();
+        status.pending_query = None;
+    } else if write_start.is_some()
+        && status.pending_write.is_none()
         && result.as_ref().is_err_and(control_flow::is_execution_wait)
     {
         return Err(sql_err!(
@@ -30013,9 +30653,13 @@ fn execute_trigger_step<'a>(
             "nested write cannot wait without retaining its unfinished operation"
         ));
     }
-    if status.pending_write.is_none() && result.as_ref().is_err_and(control_flow::is_execution_wait)
-    {
-        status.pending_statement = Some(position);
+    let waiting = result.as_ref().is_err_and(control_flow::is_execution_wait);
+    if status.pending_write.is_none() && waiting {
+        // Expressions that finished before the wait are not run again.
+        status.pending_statement = Some(status.expressions.take_position().unwrap_or(position));
+    }
+    if !waiting {
+        status.expressions.clear();
     }
     result
 }
@@ -37753,6 +38397,16 @@ pub(crate) fn validate_routine_body(
                 resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
                 validate_plpgsql_parameter_names(&parameters[..routine.arguments.len()])?;
             } else {
+                reject_sql_body_output_calls(
+                    body_kind,
+                    body_text,
+                    routine.name.name,
+                    &arguments[..argument_count],
+                    body_inputs,
+                    storage,
+                    txn.txid,
+                    arena,
+                )?;
                 let program = super::query::parse_stored_routine_function_program(
                     body_kind,
                     body_text,
@@ -37834,6 +38488,16 @@ pub(crate) fn validate_routine_body(
                 // The parsed PL/pgSQL program is the persisted contract. SQL
                 // routine dependency analysis applies only to LANGUAGE SQL.
             } else {
+                reject_sql_body_output_calls(
+                    body_kind,
+                    body_text,
+                    routine.name.name,
+                    &arguments[..argument_count],
+                    body_inputs,
+                    storage,
+                    txn.txid,
+                    arena,
+                )?;
                 let program = super::query::parse_stored_routine_function_program(
                     body_kind,
                     body_text,
@@ -37909,6 +38573,16 @@ pub(crate) fn validate_routine_body(
                 resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
                 validate_plpgsql_parameter_names(&parameters[..routine.arguments.len()])?;
             } else {
+                reject_sql_body_output_calls(
+                    body_kind,
+                    body_text,
+                    routine.name.name,
+                    &arguments[..argument_count],
+                    body_inputs,
+                    storage,
+                    txn.txid,
+                    arena,
+                )?;
                 let program = super::query::parse_stored_routine_function_program(
                     body_kind,
                     body_text,

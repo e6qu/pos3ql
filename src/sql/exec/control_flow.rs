@@ -1061,17 +1061,22 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             context.arena,
                         )?;
                         let (scope, scope_values, _) = frames.scope(locals, values);
-                        if trigger_condition(
-                            context,
-                            condition,
-                            definition,
-                            invocation,
-                            old,
-                            new.as_deref(),
-                            scope,
-                            scope_values,
-                            status.found,
-                        )? {
+                        let found = status.found;
+                        // The repeated check is its own statement boundary.
+                        if initialize_phase(status, context, |context, continuation| {
+                            trigger_condition(
+                                context,
+                                condition,
+                                definition,
+                                invocation,
+                                old,
+                                new.as_deref(),
+                                scope,
+                                scope_values,
+                                found,
+                                continuation,
+                            )
+                        })? {
                             frames.last_mut().next = 0;
                         } else {
                             let frame = frames.pop();

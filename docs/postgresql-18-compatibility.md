@@ -95,9 +95,11 @@ Functions and expressions:
   Procedure output parameters take the final statement's first row.
   Transaction control in a quoted SQL body (`AS 'COMMIT'`) is stored, and a
   call that reaches it fails with `0A000`, as in PostgreSQL. A `BEGIN ATOMIC`
-  body accepts only queries, data changes and `CALL`; anything else fails at
-  `CREATE` (`0A000`, `COMMIT is not yet supported in unquoted SQL function
-  body`).
+  body accepts only queries and data changes; anything else, `CALL` included,
+  fails at `CREATE` (`0A000`, `COMMIT is not yet supported in unquoted SQL
+  function body`). A quoted SQL body cannot `CALL` a procedure with output
+  parameters (`0A000`, `calling procedures with output arguments is not
+  supported in SQL functions`).
 - PL/pgSQL `CALL` assigns output parameters to the variables written as
   their arguments: `CALL doubled(x, y)` updates `x` and `y`, and a constant in
   an output position fails with `42601` (`procedure parameter "b" is an output
@@ -114,6 +116,16 @@ Functions and expressions:
   statements; any other statement in its body, such as `CREATE TABLE`, fails
   with `0A000` (`a SQL procedure called during a write cannot run CREATE
   TABLE`) where PostgreSQL runs it.
+- A procedure or `DO` block that waits for a lock or storage, before or after
+  its own `COMMIT`, continues at the waiting statement as in PostgreSQL. A
+  PL/pgSQL statement whose function call waits continues at that call,
+  including statements with several expressions (`FOR` bounds, `CASE`,
+  `RAISE` arguments and `USING` options, `IF ... ELSIF`, `ASSERT`, `CALL`
+  arguments, `EXECUTE` command and `USING` values): expressions that finished
+  before the wait are not evaluated again. For example, in
+  `FOR i IN next_batch()..last_batch() LOOP`, `next_batch()` runs once even
+  when `last_batch()` waits for a lock. A dynamic `EXECUTE` that writes rolls
+  back to its own start and evaluates its expressions again.
 - A built-in function cannot implement `CREATE CAST` or `CREATE OPERATOR`
   (`0A000`). Aggregate support functions can name supported built-ins.
 - A missing-function message that does not fit the fixed 192-byte error
@@ -224,7 +236,7 @@ PostgreSQL). Current `0A000` messages:
 
 | Message | Example cause |
 |---|---|
-| `expression wait requires an owned invocation log` | A wait inside an assignment, `RETURN`, loop bound, or message expression of a PL/pgSQL function running in retained AFTER-trigger work |
+| `expression wait requires an owned invocation log` | A routine call that waits inside an expression that no saved statement owns, such as a SQL-language function body replayed by its caller in retained AFTER-trigger work |
 | `SQL row expression requires retained write progress` | A multirow UPDATE that changes one row, then calls a function for the next row that must wait |
 | `expression restart requires owned volatile values` | Restarting would repeat an unsaved `random()` or clock value |
 

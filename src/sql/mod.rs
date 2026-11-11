@@ -1392,7 +1392,8 @@ fn statement_tag(statement: &Stmt<'_>) -> &'static str {
 }
 
 /// PostgreSQL's command tag for a statement that a `BEGIN ATOMIC` body cannot
-/// hold; `None` for the queries, data changes and `CALL` it accepts.
+/// hold; `None` for the queries and data changes it accepts. `CALL` is a
+/// utility there too.
 pub(crate) fn unquoted_body_unsupported_tag(statement: &Stmt<'_>) -> Option<&'static str> {
     use ast::DiscardTarget;
     Some(match statement {
@@ -1401,8 +1402,8 @@ pub(crate) fn unquoted_body_unsupported_tag(statement: &Stmt<'_>) -> Option<&'st
         | Stmt::Insert(_)
         | Stmt::Update(_)
         | Stmt::Delete(_)
-        | Stmt::Merge(_)
-        | Stmt::Call { .. } => return None,
+        | Stmt::Merge(_) => return None,
+        Stmt::Call { .. } => "CALL",
         Stmt::With { statement, .. } => return unquoted_body_unsupported_tag(statement),
         Stmt::Begin(_, start) => start.command_name(),
         Stmt::Commit => "COMMIT",
@@ -8657,6 +8658,12 @@ impl Engine {
 
     pub fn rollback_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
         sequence::finish_statement(guc.seq_session());
+        self.rollback_txn_within_statement(txn, guc);
+    }
+
+    /// Rolls back the transaction a procedure's `ROLLBACK` ends. The calling
+    /// statement continues, so its effect journal stays for later waits.
+    pub(crate) fn rollback_txn_within_statement(&mut self, txn: &mut TxnState, guc: &GucState) {
         if txn.staged_commit().is_some() || self.transaction_publication.owns(txn.txid) {
             crate::logging::error_args(
                 "rollback_after_commit_boundary",
@@ -12003,6 +12010,7 @@ impl Engine {
                         && txn.staged_commit().is_none()
                         && txn.commit_admission().is_none()
                         && txn.pending_write_completion.is_none()
+                        && txn.pending_procedure.is_none()
                         && let Err(error) = sequence::ensure_statement_effects_replayable()
                     {
                         e = error;
@@ -12017,7 +12025,34 @@ impl Engine {
                     if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                         || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                     {
-                        if txn.pending_write_completion.is_some() && !lock_timeout_expired {
+                        let mut procedure_timed_out = false;
+                        if txn.pending_procedure.is_some() {
+                            // The saved body keeps its finished statements and
+                            // their output; only the waiting one runs again.
+                            if !lock_timeout_expired {
+                                if txn.suspended_statement_context().is_none() {
+                                    txn.suspend_statement(
+                                        None,
+                                        datetime::statement_clock(),
+                                        query::statement_deadline(),
+                                        routine_transaction_context,
+                                    );
+                                }
+                                self.storage.preserve_advisory_statement();
+                                return Ok(ExecutionStatus::Blocked {
+                                    completed_statements: statement_index,
+                                    output_mark: responder.mark(),
+                                    wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                        StatementWait::ObjectIo
+                                    } else {
+                                        StatementWait::Lock
+                                    },
+                                });
+                            }
+                            txn.pending_procedure = None;
+                            txn.release_suspended_statement();
+                            procedure_timed_out = true;
+                        } else if txn.pending_write_completion.is_some() && !lock_timeout_expired {
                             self.storage.preserve_advisory_statement();
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
@@ -12059,12 +12094,15 @@ impl Engine {
                                 },
                             });
                         }
-                        if txn.concurrent_index.is_some() {
+                        if procedure_timed_out || txn.concurrent_index.is_some() {
+                            // A procedure's earlier transactions stay committed;
+                            // the error path ends only the current one.
                             e = sql_err!(
                                 sqlstate::LOCK_NOT_AVAILABLE,
                                 "canceling statement due to lock timeout"
                             );
                         } else if txn.owns_statement_mark(statement_mark) {
+                            txn.procedure_restart = false;
                             if txn.suspended_statement_context().is_none() {
                                 txn.suspend_statement(
                                     None,
@@ -12093,6 +12131,7 @@ impl Engine {
                                 "canceling statement due to lock timeout"
                             );
                         } else {
+                            txn.procedure_restart = false;
                             e = sql_err!(
                                 sqlstate::FEATURE_NOT_SUPPORTED,
                                 "a non-atomic routine cannot suspend after transaction control"
@@ -12707,6 +12746,7 @@ impl Engine {
                                     && txn.staged_commit().is_none()
                                     && txn.commit_admission().is_none()
                                     && txn.pending_write_completion.is_none()
+                                    && txn.pending_procedure.is_none()
                                     && let Err(error) =
                                         sequence::ensure_statement_effects_replayable()
                                 {
@@ -12723,7 +12763,30 @@ impl Engine {
                                 if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                                 {
-                                    if txn.pending_write_completion.is_some()
+                                    let mut procedure_timed_out = false;
+                                    if txn.pending_procedure.is_some() {
+                                        if !lock_timeout_expired {
+                                            if txn.suspended_statement_context().is_none() {
+                                                txn.suspend_statement(
+                                                    None,
+                                                    datetime::statement_clock(),
+                                                    query::statement_deadline(),
+                                                    routine_transaction_context,
+                                                );
+                                            }
+                                            self.storage.preserve_advisory_statement();
+                                            return Ok(ExtendedExecutionStatus::Blocked {
+                                                wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                                    StatementWait::ObjectIo
+                                                } else {
+                                                    StatementWait::Lock
+                                                },
+                                            });
+                                        }
+                                        txn.pending_procedure = None;
+                                        txn.release_suspended_statement();
+                                        procedure_timed_out = true;
+                                    } else if txn.pending_write_completion.is_some()
                                         && !lock_timeout_expired
                                     {
                                         self.storage.preserve_advisory_statement();
@@ -12763,12 +12826,13 @@ impl Engine {
                                             },
                                         });
                                     }
-                                    if txn.concurrent_index.is_some() {
+                                    if procedure_timed_out || txn.concurrent_index.is_some() {
                                         e = sql_err!(
                                             sqlstate::LOCK_NOT_AVAILABLE,
                                             "canceling statement due to lock timeout"
                                         );
                                     } else if txn.owns_statement_mark(statement_mark) {
+                                        txn.procedure_restart = false;
                                         if txn.suspended_statement_context().is_none() {
                                             txn.suspend_statement(
                                                 None,
@@ -12795,6 +12859,7 @@ impl Engine {
                                             "canceling statement due to lock timeout"
                                         );
                                     } else {
+                                        txn.procedure_restart = false;
                                         e = sql_err!(
                                             sqlstate::FEATURE_NOT_SUPPORTED,
                                             "a non-atomic routine cannot suspend after transaction control"
@@ -15675,10 +15740,16 @@ impl Engine {
                 })
             })
         {
-            return Ok(Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "expression wait requires an owned invocation log"
-            )));
+            if txn.running_procedures == 0 {
+                return Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "expression wait requires an owned invocation log"
+                )));
+            }
+            // A procedure statement whose calls no saved frame owns makes the
+            // whole statement roll back and run again, which is possible
+            // only before the procedure's first transaction control.
+            txn.procedure_restart = true;
         }
         if result.as_ref().is_ok_and(|outcome| {
             outcome.as_ref().is_err_and(|error| {
@@ -17619,21 +17690,37 @@ impl Engine {
         guc: &GucState,
         transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
+        retention: Option<&mut Option<exec::SuspendedProcedure>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) = self.storage.require_language_usage("plpgsql", txn.txid) {
             return Ok(Err(error));
         }
-        match exec::execute_anonymous_plpgsql(
-            self,
-            txn,
-            sqlprep,
-            cursors,
-            guc,
-            transaction_context,
-            body,
-            arena,
-            responder,
-        ) {
+        let executed = match retention {
+            Some(retention) => exec::execute_retained_anonymous_plpgsql(
+                self,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                transaction_context,
+                body,
+                arena,
+                responder,
+                retention,
+            ),
+            None => exec::execute_anonymous_plpgsql(
+                self,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                transaction_context,
+                body,
+                arena,
+                responder,
+            ),
+        };
+        match executed {
             Ok(()) => responder.command_complete("DO").map(|_| Ok(())),
             Err(error) => Ok(Err(error)),
         }
@@ -17720,7 +17807,11 @@ impl Engine {
         transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
         mut capture: Option<&mut exec::ProcedureOutputs<'a>>,
+        mut retention: Option<&mut Option<exec::SuspendedProcedure>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        // A saved body resumes in place of a new call: its settings, timer and
+        // statistics entry already belong to the first attempt.
+        let resuming = retention.as_ref().is_some_and(|saved| saved.is_some());
         let outcome = (|| {
             if arguments.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
                 return Ok(Err(sql_err!(
@@ -17805,14 +17896,19 @@ impl Engine {
                 Ok(role) => crate::storage::SessionIdentity::bound(role),
                 Err(error) => return Ok(Err(error)),
             };
-            let _security = routine
+            let security = routine
                 .attributes
                 .security_definer
                 .then(|| eval::funcs::system::enter_current_user(owner));
-            let _config = match guc.enter_routine_configs(routine.configs()) {
-                Ok(scope) => scope,
-                Err(error) => return Ok(Err(error)),
+            let config = if resuming {
+                None
+            } else {
+                match guc.enter_routine_configs(routine.configs()) {
+                    Ok(scope) => Some(scope),
+                    Err(error) => return Ok(Err(error)),
+                }
             };
+            let environment = exec::CallEnvironment::new(config, security);
             let role = eval::funcs::system::current_user_owned();
             if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
                 return Ok(Err(error));
@@ -17827,11 +17923,18 @@ impl Engine {
                 guc::TrackFunctions::All => true,
             };
             let procedure_oid = crate::storage::routine_oid(routine);
-            let timed = match statistics::begin_function_timing(track) {
-                Ok(timed) => timed,
-                Err(error) => return Ok(Err(error)),
+            let mut timed = if resuming {
+                None
+            } else {
+                match statistics::begin_function_timing(track) {
+                    Ok(timed) => Some(timed),
+                    Err(error) => return Ok(Err(error)),
+                }
             };
-            if track && let Err(error) = self.storage.ensure_function_statistics(procedure_oid) {
+            if track
+                && !resuming
+                && let Err(error) = self.storage.ensure_function_statistics(procedure_oid)
+            {
                 return Ok(Err(error));
             }
             let executed = (|| {
@@ -17847,7 +17950,7 @@ impl Engine {
                         Ok(owner) => owner,
                         Err(error) => return Ok(Err(error)),
                     };
-                    let output_count = match type_input_plans::with_owner(instance, || {
+                    let executed = type_input_plans::with_owner(instance, || {
                         exec::execute_plpgsql_procedure(
                             self,
                             txn,
@@ -17868,9 +17971,16 @@ impl Engine {
                             arena,
                             responder,
                             &mut output_values,
+                            &environment,
+                            timed.take(),
+                            retention.as_deref_mut(),
                         )
-                    }) {
-                        Ok(count) => count,
+                    });
+                    let output_count = match executed {
+                        Ok((count, timing)) => {
+                            timed = Some(timing);
+                            count
+                        }
                         Err(error) => return Ok(Err(error)),
                     };
                     if let Some(capture) = capture.as_deref_mut() {
@@ -18222,7 +18332,7 @@ impl Engine {
                     })
                 })
             })();
-            if let Some((total, own)) = timed.finish()
+            if let Some((total, own)) = timed.and_then(statistics::FunctionTiming::finish)
                 && matches!(executed, Ok(Ok(())))
                 && let Err(error) = statistics::record_completed_call(
                     &self.storage,
@@ -18900,7 +19010,11 @@ impl Engine {
         {
             return Ok(Err(error));
         }
-        let _atomic_reads = if statement_writes(statement) {
+        // A top-level procedure body owns its waits: its queries may yield on
+        // storage reads before an effect, while its writes block.
+        let retained_body =
+            reset_workspace && matches!(statement, Stmt::Call { .. } | Stmt::Do { .. });
+        let _atomic_reads = if statement_writes(statement) && !retained_body {
             self.ckpt
                 .as_ref()
                 .map(Checkpointer::atomic_block_read_scope)
@@ -19062,8 +19176,11 @@ impl Engine {
         {
             // Transfer ownership before returning to the reactor. The next
             // attempt resumes this command and view; it is not a new statement.
+            // A saved procedure body resumes at a later statement, possibly in
+            // a transaction it started, so it takes a new snapshot instead.
+            let lease = txn.pending_procedure.is_none().then_some(lease);
             txn.suspend_statement(
-                Some(lease),
+                lease,
                 statement_clock,
                 query::statement_deadline(),
                 routine_transaction_context,
@@ -19624,31 +19741,52 @@ impl Engine {
                 arguments,
                 argument_names,
                 variadic,
-            } => self.execute_call(
-                *name,
-                arguments,
-                argument_names,
-                *variadic,
-                arena,
-                params,
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                routine_transaction_context,
-                responder,
-                None,
-            ),
-            Stmt::Do { body } => self.execute_do(
-                body,
-                arena,
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                routine_transaction_context,
-                responder,
-            ),
+            } => {
+                // A top-level statement owns its waiting procedure body.
+                let mut saved = if reset_workspace {
+                    txn.pending_procedure.take()
+                } else {
+                    None
+                };
+                let outcome = self.execute_call(
+                    *name,
+                    arguments,
+                    argument_names,
+                    *variadic,
+                    arena,
+                    params,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    routine_transaction_context,
+                    responder,
+                    None,
+                    reset_workspace.then_some(&mut saved),
+                );
+                txn.pending_procedure = saved;
+                outcome
+            }
+            Stmt::Do { body } => {
+                let mut saved = if reset_workspace {
+                    txn.pending_procedure.take()
+                } else {
+                    None
+                };
+                let outcome = self.execute_do(
+                    body,
+                    arena,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    routine_transaction_context,
+                    responder,
+                    reset_workspace.then_some(&mut saved),
+                );
+                txn.pending_procedure = saved;
+                outcome
+            }
             Stmt::CreateLanguage(language) => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "{}",

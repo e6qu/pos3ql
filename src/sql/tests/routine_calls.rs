@@ -4302,9 +4302,9 @@ fn relation_row_types_in_routine_signatures_are_rejected_explicitly() {
     ]);
 }
 
-/// PostgreSQL's parse analysis accepts only queries, data changes and CALL in
-/// a `BEGIN ATOMIC` body, naming any other statement by its command tag before
-/// checking the declared result.
+/// PostgreSQL's parse analysis accepts only queries and data changes in a
+/// `BEGIN ATOMIC` body, naming any other statement (`CALL` included) by its
+/// command tag before checking the declared result.
 #[test]
 fn unquoted_bodies_reject_utility_statements_at_creation() {
     use super::routine_identity_diagnostics::diagnostics;
@@ -4312,6 +4312,11 @@ fn unquoted_bodies_reject_utility_statements_at_creation() {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE PROCEDURE atomic_target() LANGUAGE sql AS 'SELECT 1'",
+        true,
+    );
     for (body, tag) in [
         ("COMMIT", "COMMIT"),
         ("VACUUM", "VACUUM"),
@@ -4323,6 +4328,7 @@ fn unquoted_bodies_reject_utility_statements_at_creation() {
         ("START TRANSACTION", "START TRANSACTION"),
         ("ROLLBACK TO a", "ROLLBACK"),
         ("RELEASE a", "RELEASE"),
+        ("CALL atomic_target()", "CALL"),
     ] {
         let sql = format!(
             "CREATE FUNCTION atomic_utility() RETURNS integer LANGUAGE sql \
@@ -4502,6 +4508,24 @@ fn trigger_functions_call_sql_procedures_atomically() {
             ],
         ),
         (
+            "CREATE PROCEDURE sql_call_bad(x integer, INOUT r integer) LANGUAGE sql AS \
+                 $$CALL sql_call_ret(x, NULL)$$",
+            &[(
+                'E',
+                "0A000",
+                "calling procedures with output arguments is not supported in SQL functions",
+            )],
+        ),
+        (
+            "CREATE FUNCTION sql_call_bad_function(x integer) RETURNS integer LANGUAGE sql \
+                 BEGIN ATOMIC CALL sql_call_ret(x, NULL); SELECT 1; END",
+            &[(
+                'E',
+                "0A000",
+                "CALL is not yet supported in unquoted SQL function body",
+            )],
+        ),
+        (
             "CREATE TABLE sql_call_deferred(a integer); \
              CREATE FUNCTION sql_call_constraint() RETURNS trigger LANGUAGE plpgsql AS \
                  $$DECLARE v integer; BEGIN CALL sql_call_out(NEW.a * 7, v); \
@@ -4519,6 +4543,98 @@ fn trigger_functions_call_sql_procedures_atomically() {
              SELECT string_agg(msg || n, ',' ORDER BY msg, n) INTO logged FROM sql_call_log; \
              RAISE NOTICE '% %', rows, logged; END$$",
             &[('N', "00000", "7:21,8:24 in7,in8,in21,ret7,ret8")],
+        ),
+    ]);
+}
+
+/// Statements after a procedure's own `COMMIT` or `ROLLBACK` see what its
+/// earlier transactions committed. Expected notices are PostgreSQL 18.6's.
+#[test]
+fn procedure_statements_after_transaction_control_see_committed_rows() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    let call = "DO $$DECLARE t bigint; BEGIN CALL seen_sum(t); RAISE NOTICE '%', t; END$$";
+    check(&[
+        (
+            "CREATE TABLE seen_rows(n bigint); \
+             CREATE PROCEDURE seen_sum(INOUT total bigint) LANGUAGE plpgsql AS $$BEGIN \
+             INSERT INTO seen_rows VALUES (10); COMMIT; INSERT INTO seen_rows VALUES (20); \
+             SELECT sum(n) INTO total FROM seen_rows; INSERT INTO seen_rows VALUES (400); \
+             ROLLBACK; SELECT total + sum(n) INTO total FROM seen_rows; END$$",
+            NONE,
+        ),
+        (call, &[('N', "00000", "40")]),
+        (call, &[('N', "00000", "60")]),
+    ]);
+}
+
+/// A PL/pgSQL variable in a grouped `SELECT ... INTO` is a constant within
+/// every group, in the select list, `HAVING`, aggregate and window function
+/// arguments, over tables, derived tables and no `FROM` at all, as in
+/// PostgreSQL 18.6.
+#[test]
+fn plpgsql_variables_in_grouped_queries_are_constants() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    check(&[
+        (
+            "CREATE TABLE grouped_values(n integer); \
+             INSERT INTO grouped_values VALUES (1), (2), (2)",
+            NONE,
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u bigint; BEGIN \
+             SELECT t + sum(n) INTO u FROM grouped_values; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "10")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u text; BEGIN \
+             SELECT t * n || ':' || count(*) INTO u FROM grouped_values GROUP BY n \
+             HAVING count(*) > t - 4; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "10:2")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u text; BEGIN \
+             SELECT string_agg(t + n || '', ',' ORDER BY n) INTO u \
+             FROM (SELECT n FROM grouped_values) s; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "6,7,7")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u bigint; BEGIN \
+             SELECT t + count(*) INTO u; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "6")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u bigint; BEGIN \
+             SELECT sum(t) INTO u FROM (SELECT n FROM grouped_values) s; \
+             RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "15")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u bigint; BEGIN \
+             SELECT sum(t) INTO u; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "5")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u bigint; BEGIN \
+             SELECT sum(t + n) INTO u FROM grouped_values GROUP BY n \
+             ORDER BY n DESC LIMIT 1; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "14")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u bigint; BEGIN \
+             SELECT sum(t) OVER () INTO u FROM grouped_values; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "15")],
+        ),
+        (
+            "SELECT nope + sum(n) FROM grouped_values",
+            &[('E', "42703", "column \"nope\" does not exist")],
+        ),
+        (
+            "SELECT n, sum(n) FROM grouped_values",
+            &[(
+                'E',
+                "42803",
+                "column \"grouped_values.n\" must appear in the GROUP BY clause or be used in an aggregate function",
+            )],
         ),
     ]);
 }

@@ -1194,28 +1194,111 @@ fn paused_initializers_and_domain_checks_retain_their_child_calls_and_values() {
     }
 }
 
+/// A PL/pgSQL statement whose expression calls a waiting function owns that
+/// call across the wait, so the child's insert and sequence value happen once.
+/// A statement with several expressions (`ELSIF`, `CASE`, `FOR` bounds,
+/// `RAISE` arguments and options, `ASSERT`, `CALL` arguments) also keeps the
+/// values of the expressions that finished before the wait: `expression_first`
+/// runs once although the statement resumes.
 #[test]
-fn unowned_expression_waits_roll_back_instead_of_repeating_completed_child_writes() {
+fn expression_waits_resume_procedural_statements() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
     ] {
-        for (site, language, body) in [
+        for (site, body, notices, calls) in [
             (
                 "assignment",
-                "plpgsql",
                 "DECLARE n bigint; BEGIN n:=expression_child(); RETURN n; END",
+                &[][..],
+                1,
             ),
-            ("return", "plpgsql", "BEGIN RETURN expression_child(); END"),
-            (
-                "bounds",
-                "plpgsql",
-                "BEGIN FOR i IN 1..expression_child() LOOP NULL; END LOOP; RETURN 1; END",
-            ),
+            ("return", "BEGIN RETURN expression_child(); END", &[], 1),
             (
                 "message",
-                "plpgsql",
                 "BEGIN RAISE NOTICE '%',expression_child(); RETURN 1; END",
+                &["1"],
+                1,
+            ),
+            (
+                "condition",
+                "BEGIN IF expression_child() > 0 THEN RETURN 1; END IF; RETURN 0; END",
+                &[],
+                1,
+            ),
+            (
+                "while",
+                "BEGIN WHILE expression_child() < 0 LOOP END LOOP; RETURN 1; END",
+                &[],
+                1,
+            ),
+            (
+                "while-again",
+                "DECLARE k int:=0; BEGIN WHILE CASE WHEN k=0 THEN true \
+                 ELSE expression_child() < 0 END LOOP k:=k+1; END LOOP; RETURN 1; END",
+                &[],
+                1,
+            ),
+            (
+                "exit-when",
+                "BEGIN LOOP EXIT WHEN expression_child() > 0; END LOOP; RETURN 1; END",
+                &[],
+                1,
+            ),
+            (
+                "foreach",
+                "DECLARE v bigint; BEGIN FOREACH v IN ARRAY ARRAY[expression_child()] \
+                 LOOP RAISE NOTICE '%',v; END LOOP; RETURN 1; END",
+                &["1"],
+                1,
+            ),
+            (
+                "elsif",
+                "BEGIN IF expression_first() < 0 THEN RETURN 0; \
+                 ELSIF expression_child() > 0 THEN RETURN 1; END IF; RETURN 2; END",
+                &[],
+                2,
+            ),
+            (
+                "case",
+                "BEGIN CASE expression_first() WHEN expression_child() THEN RETURN 0; \
+                 ELSE RETURN 1; END CASE; END",
+                &[],
+                2,
+            ),
+            (
+                "bounds",
+                "BEGIN FOR i IN expression_first()..expression_child() LOOP \
+                 RAISE NOTICE '%',i; END LOOP; RETURN 1; END",
+                &["1", "2"],
+                2,
+            ),
+            (
+                "arguments",
+                "BEGIN RAISE NOTICE '% %',expression_first(),expression_child(); RETURN 1; END",
+                &["1 2"],
+                2,
+            ),
+            (
+                "options",
+                "BEGIN RAISE NOTICE '%',expression_first() \
+                 USING HINT = expression_child()::text; RETURN 1; END",
+                &["1"],
+                2,
+            ),
+            (
+                "assert",
+                "BEGIN ASSERT expression_first() < expression_child(), 'unreached'; \
+                 RETURN 1; END",
+                &[],
+                2,
+            ),
+            (
+                "call",
+                "BEGIN CALL expression_procedure(expression_first(),expression_child()); \
+                 RETURN 1; END",
+                &["1 2"],
+                2,
             ),
         ] {
             let mut config = test_config(&format!("function-expression-wait-{mode:?}-{site}"));
@@ -1232,10 +1315,15 @@ fn unowned_expression_waits_roll_back_instead_of_repeating_completed_child_write
                 ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
             writer.success(&mut engine,&format!("CREATE SEQUENCE expression_numbers; \
                 CREATE TABLE expression_root(id integer); CREATE TABLE expression_audit(n bigint); \
+                CREATE FUNCTION expression_first() RETURNS bigint LANGUAGE plpgsql AS $$ \
+                    DECLARE n bigint:=nextval('expression_numbers'); BEGIN INSERT INTO expression_audit VALUES(n); \
+                    RETURN n; END$$; \
                 CREATE FUNCTION expression_child() RETURNS bigint LANGUAGE plpgsql AS $$ \
                     DECLARE n bigint:=nextval('expression_numbers'); BEGIN INSERT INTO expression_audit VALUES(n); \
                     PERFORM pg_advisory_xact_lock(125); RETURN n; END$$; \
-                CREATE FUNCTION expression_parent() RETURNS bigint LANGUAGE {language} AS $${body}$$; \
+                CREATE PROCEDURE expression_procedure(a bigint, b bigint) LANGUAGE plpgsql AS $$ \
+                    BEGIN RAISE NOTICE '% %',a,b; END$$; \
+                CREATE FUNCTION expression_parent() RETURNS bigint LANGUAGE plpgsql AS $${body}$$; \
                 CREATE FUNCTION expression_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
                     BEGIN PERFORM expression_parent(); RETURN NEW; END$$; \
                 CREATE TRIGGER expression_trigger AFTER INSERT ON expression_root FOR EACH ROW EXECUTE FUNCTION expression_trigger()"),true);
@@ -1244,26 +1332,77 @@ fn unowned_expression_waits_roll_back_instead_of_repeating_completed_child_write
                 "BEGIN; SELECT pg_advisory_xact_lock(125)",
                 true,
             );
-            let error = writer.execute(&mut engine, "INSERT INTO expression_root VALUES(1)", true);
-            assert_eq!(
-                error_sqlstates(&error),
-                ["0A000"],
-                "{mode:?} {site}: {}",
-                String::from_utf8_lossy(&error)
-            );
-            assert!(
-                String::from_utf8_lossy(&error)
-                    .contains("expression wait requires an owned invocation log")
-            );
+            let sql = "INSERT INTO expression_root VALUES(1)";
+            let status = writer.execute_status(&mut engine, sql, true);
+            let ExecutionStatus::Blocked {
+                completed_statements,
+                output_mark,
+                wait,
+            } = status
+            else {
+                panic!(
+                    "{mode:?} {site}: the expression did not wait: {status:?}: {}",
+                    String::from_utf8_lossy(writer.send.readable())
+                );
+            };
+            assert_eq!(wait, StatementWait::Lock, "{mode:?} {site}");
             holder.success(&mut engine, "COMMIT", true);
-            assert_eq!(data_rows(&writer.success(&mut engine,"SELECT count(*) FROM expression_root; SELECT count(*) FROM expression_audit; SELECT last_value FROM expression_numbers",true)),["0","0","1"]);
-            writer.success(&mut engine, "INSERT INTO expression_root VALUES(2)", true);
-            let expected = ["2", "2", "2"];
-            assert_eq!(data_rows(&writer.success(&mut engine,"SELECT id FROM expression_root; SELECT n FROM expression_audit ORDER BY n; SELECT last_value FROM expression_numbers",true)), expected);
+            output_mark.truncate_unsent(&mut writer.send);
+            writer.arena.recycle_front();
+            let status = crate::mem::guard::forbid_alloc(|| {
+                engine.execute_simple_from(
+                    sql,
+                    completed_statements,
+                    &writer.arena,
+                    &mut writer.transaction,
+                    &mut writer.pool,
+                    &mut writer.cursors,
+                    &writer.guc,
+                    &mut Responder::new(&mut writer.send),
+                    writer.connection_id,
+                    false,
+                )
+            })
+            .unwrap();
+            assert_eq!(status, ExecutionStatus::Complete, "{mode:?} {site}");
+            assert!(
+                error_sqlstates(writer.send.readable()).is_empty(),
+                "{mode:?} {site}: {}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            assert_eq!(
+                notice_messages(writer.send.readable()),
+                notices,
+                "{mode:?} {site}"
+            );
+            let expected = std::iter::once("1".to_string())
+                .chain((1..=calls).map(|n| n.to_string()))
+                .chain(std::iter::once(calls.to_string()))
+                .collect::<Vec<_>>();
+            assert_eq!(data_rows(&writer.success(&mut engine,"SELECT count(*) FROM expression_root; SELECT n FROM expression_audit ORDER BY n; SELECT last_value FROM expression_numbers",true)),expected, "{mode:?} {site}");
             drop((holder, writer, engine));
             std::fs::remove_dir_all(config.data_dir).unwrap();
         }
     }
+}
+
+fn notice_messages(bytes: &[u8]) -> Vec<String> {
+    let mut messages = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let length = u32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        if bytes[offset] == b'N' {
+            let payload = &bytes[offset + 5..offset + 1 + length];
+            if let Some(message) = payload
+                .split(|byte| *byte == 0)
+                .find(|field| field.first() == Some(&b'M'))
+            {
+                messages.push(String::from_utf8(message[1..].to_vec()).unwrap());
+            }
+        }
+        offset += 1 + length;
+    }
+    messages
 }
 
 /// A SQL function that waits, called once per row, counts each completed call

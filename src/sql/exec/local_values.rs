@@ -126,6 +126,79 @@ impl SavedValues {
     }
 }
 
+/// The finished expressions of one PL/pgSQL statement that evaluates several
+/// (`IF ... ELSIF`, `CASE`, `FOR` bounds, `RAISE` arguments and options,
+/// `CALL` arguments). When a later expression waits, the statement resumes at
+/// that expression: finished values are read back, so their routine calls and
+/// sequence values are not repeated, and the waiting expression keeps its own
+/// invocation log.
+pub(super) struct ExpressionProgress {
+    values: SavedValues,
+    finished: usize,
+    /// The statement journal position after the last finished expression.
+    position: Option<super::super::sequence::SavedStatementPosition>,
+}
+
+impl ExpressionProgress {
+    pub(super) fn new(pool: &std::sync::Arc<LeasePool>) -> Result<Self, SqlError> {
+        Ok(Self {
+            values: SavedValues::new(pool)?,
+            finished: 0,
+            position: None,
+        })
+    }
+
+    pub(super) fn finished(&self) -> usize {
+        self.finished
+    }
+
+    pub(super) fn read<'out>(
+        &self,
+        index: usize,
+        output: &'out Arena,
+    ) -> Result<Datum<'out>, SqlError> {
+        if index >= self.finished {
+            return Err(layout_changed());
+        }
+        self.values.read(index, output)
+    }
+
+    /// Records the next finished value and the journal position after it.
+    pub(super) fn push(&mut self, value: Datum<'_>, scratch: &Arena) -> Result<(), SqlError> {
+        let position = super::super::sequence::SavedStatementPosition::capture()?;
+        if self.finished == 0 {
+            self.values.replace(&[value])?;
+        } else {
+            let earlier = self.values.decode(scratch)?;
+            let finished = self.finished;
+            self.values.replace_indexed(finished + 1, |index| {
+                if index < finished {
+                    earlier[index]
+                } else {
+                    value
+                }
+            })?;
+        }
+        self.finished += 1;
+        self.position = Some(position);
+        Ok(())
+    }
+
+    /// The position a waiting statement resumes from, when an expression
+    /// finished since the statement last started or resumed.
+    pub(super) fn take_position(
+        &mut self,
+    ) -> Option<super::super::sequence::SavedStatementPosition> {
+        self.position.take()
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.values.clear();
+        self.finished = 0;
+        self.position = None;
+    }
+}
+
 /// Active slots may borrow workspace payloads; suspension saves those bytes and
 /// clears every reference while keeping the original slot reservation.
 pub(super) struct LocalValues<'a> {

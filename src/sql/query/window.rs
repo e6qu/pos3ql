@@ -239,6 +239,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             authorization_role: None,
             bound_table: None,
             view_access: None,
+            join_members: None,
         },
         joins: &[],
     };
@@ -1635,7 +1636,7 @@ pub(crate) fn project_window_rows<'a>(
     let mut total = 0usize;
     for t in 0..scope.n {
         offs[t] = total;
-        total += scope.defs.get(t).expect("resolved").n_columns;
+        total += scope.stored_width(t);
     }
 
     // Pass 1: count source rows.
@@ -1967,7 +1968,7 @@ pub(crate) fn external_window_into<'a>(
     let mut total = 0usize;
     for (t, offset) in offs.iter_mut().enumerate().take(scope.n) {
         *offset = total;
-        total += scope.defs.get(t).expect("resolved").n_columns;
+        total += scope.stored_width(t);
     }
     // Resolve ORDER BY (ordinals → select items).
     let n_order = statement.order_by.len();
@@ -2105,7 +2106,7 @@ pub(crate) fn external_window_into<'a>(
                                 } else if index < n_keys + total {
                                     let flat = index - n_keys;
                                     for (t, offset) in offs.iter().enumerate().take(scope.n) {
-                                        let nc = scope.defs.get(t).expect("resolved").n_columns;
+                                        let nc = scope.stored_width(t);
                                         if flat < offset + nc {
                                             let vals = row.table_values(t).expect("bound");
                                             return if vals.is_empty() {

@@ -63,10 +63,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         let flat_of = |t: usize, c: usize| -> usize {
-            (0..t)
-                .map(|i| self.scope.defs.get(i).expect("resolved").n_columns)
-                .sum::<usize>()
-                + c
+            (0..t).map(|i| self.scope.stored_width(i)).sum::<usize>() + c
         };
         match self.scope.find_column(qualifier, name)? {
             ResolvedColumn::Table(t, c) => crate::sql::exec::decode_projected_col_record(
@@ -99,7 +96,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                     && qualifier.is_none()
                     && (self.scope.using_alias(name).is_some()
-                        || self.scope.table_index(name).is_ok()) =>
+                        || self.scope.source(name).is_ok()) =>
             {
                 self.scope.whole_row_type(name)
             }
@@ -152,19 +149,33 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
         if self.scope.using_alias(table).is_some() {
             return Ok(true);
         }
-        let source = self.scope.table_index(table)?;
+        let source = self.scope.source(table)?;
         let value = crate::sql::exec::decode_projected_col_record(
             self.bytes,
-            self.raw_at + self.scope.total_columns() + source,
+            self.raw_at + self.scope.stored_columns() + source.table,
             self.arena,
         )?;
-        match value {
-            Datum::Bool(present) => Ok(present),
-            _ => Err(sql_err!(
-                sqlstate::DATA_EXCEPTION,
-                "saved projection source-presence flag is not boolean"
-            )),
-        }
+        let present = match value {
+            Datum::Bool(present) => present,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "saved projection source-presence flag is not boolean"
+                ));
+            }
+        };
+        let Some(column) = source.presence.filter(|_| present) else {
+            return Ok(present);
+        };
+        let offset = (0..source.table)
+            .map(|table| self.scope.stored_width(table))
+            .sum::<usize>()
+            + column;
+        super::scope::member_present(crate::sql::exec::decode_projected_col_record(
+            self.bytes,
+            self.raw_at + offset,
+            self.arena,
+        )?)
     }
 
     fn whole_row_fields(
@@ -353,7 +364,7 @@ fn materialized_value_at<'a>(
             .unwrap_or(Datum::Null);
     }
     let mut raw_index = index - width - n_keys;
-    let source_columns = scope.total_columns();
+    let source_columns = scope.stored_columns();
     if raw_index >= source_columns {
         let table = raw_index - source_columns;
         let present = row
@@ -362,7 +373,7 @@ fn materialized_value_at<'a>(
         return Datum::Bool(present);
     }
     for table in 0..scope.n {
-        let column_count = scope.defs.get(table).expect("resolved").n_columns;
+        let column_count = scope.stored_width(table);
         if raw_index < column_count {
             if !raw_columns
                 .is_some_and(|columns| columns.references_column(table, raw_index, column_count))
@@ -451,7 +462,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
             Err(error)
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                     && qualifier.is_none()
-                    && (self.0.using_alias(name).is_some() || self.0.table_index(name).is_ok()) =>
+                    && (self.0.using_alias(name).is_some() || self.0.source(name).is_ok()) =>
             {
                 self.0.whole_row_type(name)
             }
@@ -852,7 +863,7 @@ pub(super) fn prepare_materialization<'a>(
     };
     // Presence is independent of field NULLs, including zero-column rows.
     let n_raw = if raw_needed {
-        scope.total_columns() + scope.n
+        scope.stored_columns() + scope.n
     } else {
         0
     };

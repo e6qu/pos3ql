@@ -8034,21 +8034,99 @@ impl<'a> Parser<'a> {
             if n == names.len() {
                 return Err(self.limit("relations", names.len()));
             }
-            let first = self.any_ident(what)?;
-            names[n] = if self.eat_op(".")? {
-                QualName {
-                    schema: Some(first),
-                    name: self.any_ident(what)?,
-                }
-            } else {
-                QualName::bare(first)
-            };
+            names[n] = self.drop_target_name(what)?;
             n += 1;
             if !self.eat_op(",")? {
                 break;
             }
         }
         Ok((self.arena_slice(&names[..n])?, if_exists))
+    }
+
+    /// One dotted name of a DROP list. PostgreSQL resolves the list when the
+    /// command runs, so a database other than the session's, or too many
+    /// parts, is an analysis error without a cursor position.
+    fn drop_target_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
+        let at = self.peek_at;
+        let mut parts = [""; 4];
+        let mut n = 0usize;
+        loop {
+            let part = self.any_ident(what)?;
+            if n < parts.len() {
+                parts[n] = part;
+            }
+            n += 1;
+            if !self.eat_op(".")? {
+                break;
+            }
+        }
+        let written = || {
+            let mut written = crate::stack_format!(super::PARSE_MESSAGE_BYTES, "{}", parts[0]);
+            for part in &parts[1..n.min(parts.len())] {
+                let _ = core::fmt::Write::write_fmt(&mut written, format_args!(".{part}"));
+            }
+            written
+        };
+        let failure = |sqlstate: &'static str, message| ParseError {
+            at,
+            message,
+            sqlstate,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        match n {
+            1 => Ok(QualName::bare(parts[0])),
+            2 => Ok(QualName {
+                schema: Some(parts[0]),
+                name: parts[1],
+            }),
+            3 => {
+                if !crate::sql::eval::funcs::system::is_current_database(parts[0]) {
+                    self.analysis_error(failure(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        crate::stack_format!(
+                            super::PARSE_MESSAGE_BYTES,
+                            "cross-database references are not implemented: \"{}\"",
+                            written()
+                        ),
+                    ))?;
+                }
+                Ok(QualName {
+                    schema: Some(parts[1]),
+                    name: parts[2],
+                })
+            }
+            _ => {
+                let kind = if matches!(
+                    what,
+                    "table name"
+                        | "view name"
+                        | "materialized view name"
+                        | "index name"
+                        | "sequence name"
+                        | "foreign table name"
+                ) {
+                    "relation"
+                } else {
+                    "qualified"
+                };
+                self.analysis_error(failure(
+                    sqlstate::SYNTAX_ERROR,
+                    crate::stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "improper {} name (too many dotted names): {}",
+                        kind,
+                        written()
+                    ),
+                ))?;
+                Ok(QualName {
+                    schema: Some(parts[n.min(parts.len()) - 2]),
+                    name: parts[n.min(parts.len()) - 1],
+                })
+            }
+        }
     }
 
     fn drop_bare_targets(

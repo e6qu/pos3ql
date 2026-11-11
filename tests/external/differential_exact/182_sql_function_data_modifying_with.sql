@@ -1,0 +1,14 @@
+-- A SQL-language function runs its query's data-modifying WITH queries once,
+-- with the function's arguments, under the statement's snapshot.
+CREATE TABLE m182(a int);
+CREATE FUNCTION m182s() RETURNS bigint LANGUAGE sql AS $$ WITH q AS (INSERT INTO m182 VALUES (1) RETURNING a) SELECT count(*) FROM q $$;
+SELECT m182s();
+CREATE FUNCTION m182t(x int) RETURNS SETOF int LANGUAGE sql AS $$ WITH q AS (INSERT INTO m182 VALUES (x), (x + 1) RETURNING a) SELECT a * 10 FROM q ORDER BY 1 $$;
+SELECT * FROM m182t(5);
+CREATE FUNCTION m182u(x int) RETURNS int LANGUAGE sql AS $$ WITH q AS (DELETE FROM m182 WHERE a = x RETURNING a) SELECT 7 $$;
+SELECT m182u(1);
+CREATE FUNCTION m182v() RETURNS bigint LANGUAGE sql AS $$ WITH q AS (INSERT INTO m182 VALUES (9) RETURNING a) SELECT count(*) FROM m182 $$;
+SELECT m182v();
+SELECT * FROM m182 ORDER BY a;
+DROP FUNCTION m182s(); DROP FUNCTION m182t(int); DROP FUNCTION m182u(int); DROP FUNCTION m182v();
+DROP TABLE m182;

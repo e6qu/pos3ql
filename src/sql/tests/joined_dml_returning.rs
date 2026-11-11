@@ -1,5 +1,6 @@
-//! `RETURNING` of `UPDATE ... FROM` and `DELETE ... USING`, and the scope of
-//! comma-separated FROM items, compared with PostgreSQL 18.6.
+//! `RETURNING` of `UPDATE ... FROM` and `DELETE ... USING`, the scope of
+//! comma-separated FROM items, and parenthesized joins, compared with
+//! PostgreSQL 18.6.
 
 use super::compatibility_diagnostics::{diagnostics, with_engine};
 use super::*;
@@ -183,14 +184,89 @@ fn comma_separated_from_items_scope_their_joins() {
                 "2|y|2|q|20.00|y",
             ]
         );
-        // A RIGHT or FULL join after a comma would need its own join tree.
+        // A RIGHT or FULL join after a comma joins only its own FROM item:
+        // each unmatched row still pairs with every earlier item's row.
+        let output = run_with(
+            engine,
+            budget,
+            "SELECT t.a, s.a, t2.a FROM t, s RIGHT JOIN t t2 ON s.a = t2.a + 1 ORDER BY 1, 3",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["1|2|1", "1|NULL|2", "2|2|1", "2|NULL|2"]
+        );
+        let output = run_with(
+            engine,
+            budget,
+            "SELECT count(*) FROM t, s FULL JOIN t t2 ON s.a = t2.a + 5",
+        );
+        assert_eq!(data_rows(&output), ["8"]);
+        // A join condition cannot see an earlier comma-separated item.
         assert_eq!(
             error_sqlstates(&run_with(
                 engine,
                 budget,
-                "SELECT * FROM t, s RIGHT JOIN t t2 ON s.a = t2.a",
+                "SELECT * FROM t, s JOIN t t2 ON t.a = t2.a",
             )),
-            ["0A000"]
+            ["42P01"]
+        );
+    });
+}
+
+#[test]
+fn parenthesized_joins_keep_unaliased_members_addressable() {
+    with_engine("parenthesized-joins", |engine, budget| {
+        setup(engine, budget);
+        // The right side of an outer join is the whole parenthesized join:
+        // a row matching `s` but not `t2` drops out of it, so `t` stays
+        // unmatched and every member is null-extended.
+        let output = run_with(
+            engine,
+            budget,
+            "SELECT t.a, s.c, t2.b, s IS NULL FROM t LEFT JOIN (s JOIN t t2 ON s.a = t2.a + 1) \
+             ON t.a = s.a ORDER BY 1",
+        );
+        assert_eq!(row_description_names(&output), ["a", "c", "b", "?column?"]);
+        assert_eq!(data_rows(&output), ["1|NULL|NULL|t", "2|q|x|f"]);
+        let output = run_with(
+            engine,
+            budget,
+            "SELECT * FROM (t JOIN s USING (a)) JOIN t t2 USING (a) ORDER BY 1",
+        );
+        assert_eq!(row_description_names(&output), ["a", "b", "c", "d", "b"]);
+        assert_eq!(data_rows(&output), ["1|x|p|10.00|x", "2|y|q|20.00|y"]);
+        // An alias hides the members; duplicate join columns stay ambiguous.
+        let output = run_with(
+            engine,
+            budget,
+            "SELECT j.* FROM (t JOIN s USING (a)) AS j(k) ORDER BY 1",
+        );
+        assert_eq!(row_description_names(&output), ["k", "b", "c", "d"]);
+        for (sql, sqlstate) in [
+            ("SELECT t.a FROM (t JOIN s USING (a)) AS j", "42P01"),
+            ("SELECT j.a FROM (t JOIN s ON t.a = s.a) AS j", "42702"),
+            (
+                "SELECT * FROM t JOIN (s JOIN t t2 ON t2.a = t.a) ON true",
+                "42P01",
+            ),
+            ("SELECT * FROM t JOIN (t JOIN s ON true) ON true", "42712"),
+            ("SELECT * FROM (t)", "42601"),
+        ] {
+            assert_eq!(
+                error_sqlstates(&run_with(engine, budget, sql)),
+                [sqlstate],
+                "{sql}"
+            );
+        }
+        // Ordering by a star position names the member column it copies.
+        let output = run_with(
+            engine,
+            budget,
+            "SELECT * FROM t JOIN (s JOIN t t2 ON s.a = t2.a) ON t.a = s.a ORDER BY 5 DESC",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["2|y|2|q|20.00|2|y", "1|x|1|p|10.00|1|x"]
         );
     });
 }

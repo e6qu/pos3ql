@@ -132,11 +132,17 @@ is owned.
   `WITH ... INSERT/UPDATE/DELETE` statement fails with `0A000`. A `FOR` loop over a
   data change fails with `0A000` when an `AFTER` trigger of that change
   waits, since the loop has no owner for its returned rows.
-- **Routine variables in `WITH`:** a `WITH` query that a static PL/pgSQL
-  statement materializes before its main query (`INSERT INTO t WITH c AS
-  (SELECT var) SELECT * FROM c`) cannot read routine variables (`42703`):
-  `WITH` materialization takes no enclosing row. A `WITH` inside a derived
-  table reads them.
+- **Routine variables in `WITH`:** the `WITH` queries of a PL/pgSQL
+  `RETURN QUERY`, `SELECT ... INTO`, `PERFORM` or `FOR` query read the
+  routine's variables, materialized or not, but three other `WITH` positions
+  cannot (`42703`): a static `INSERT`, `UPDATE` or `DELETE` that starts with
+  `WITH` (`INSERT INTO t WITH c AS MATERIALIZED (SELECT var) SELECT * FROM
+  c`), a materialized `WITH` inside a derived table (`FROM (WITH c AS
+  MATERIALIZED (SELECT var) SELECT * FROM c) s`), and an ordinary `WITH`
+  query that a data-modifying one reads (`WITH c AS (SELECT var), w AS
+  (INSERT ... SELECT * FROM c RETURNING ...)`): their expansion or run takes
+  no enclosing row. Passing the routine's row to those expansions, as
+  `expand_plpgsql_with` does, fixes them.
 - **Triggers fired inside a write** run without the engine's utility
   executor, so DDL there (PL/pgSQL `CREATE TABLE`, `EXECUTE 'CREATE ...'`,
   or a SQL procedure that a BEFORE trigger calls) and writes to views or
@@ -394,34 +400,26 @@ constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` repor
 target and expression count errors are positioned. Under
 `#variable_conflict use_variable` a variable that is also a column fails with
 `0A000`: aggregate inputs and grouping keys bind names to columns before the
-variable could win. A materialized
-ordinary `WITH` query that calls a volatile function runs before the main
-query; PostgreSQL runs it when its rows are first read, as it now runs a
-data-changing one. PL/pgSQL `SELECT ... INTO`, `PERFORM`, `RETURN QUERY` and
+variable could win. PL/pgSQL `SELECT ... INTO`, `PERFORM`, `RETURN QUERY` and
 `FOR ... IN WITH ... SELECT` run a data-changing `WITH`, but other routine
 positions do not: a PL/pgSQL `WITH ... INSERT/UPDATE/DELETE` statement is
-rejected as an unsupported body and `FOR ... IN WITH ... INSERT` with `0A000`, `EXECUTE` and a cursor's query report the
-`WITH` name unknown, a SQL-language function fails, and
-a trigger function rejects it with `0A000`. These need the routine's write
-path to run the `WITH` writes under the main statement's snapshot. An `IN`, `ANY` or `ALL` subquery that
-calls a volatile function runs before the expression containing it, where
-PostgreSQL runs it when evaluation reaches it. FROM-list items separated by
-commas run as one left-deep join chain, so a `RIGHT` or `FULL` join after a
-comma (`FROM a, b RIGHT JOIN c ON ...`) is rejected with `0A000`, a
-parenthesized join (`FROM a JOIN (b JOIN c ON ...) ON ...`) is a syntax error,
-and an `ON` condition can name a table from an earlier comma-separated item
-where PostgreSQL reports `invalid reference to FROM-clause entry`. A
+rejected as an unsupported body and `FOR ... IN WITH ... INSERT` with
+`0A000`, `EXECUTE` and a cursor's query report the `WITH` name unknown, and a
+trigger function rejects it with `0A000`. A SQL-language function's query runs
+them before reading, as a top-level query does. These need the routine's write
+path to run the `WITH` writes under the main statement's snapshot. A `LATERAL` item inside a
+parenthesized join or a derived table can reference only the FROM items
+beside it, so `a JOIN (b JOIN LATERAL (SELECT a.x) s ON true) ON true`
+reports a missing FROM-clause entry for `a` where PostgreSQL accepts it. An
+ungrouped-column error inside an aliased parenthesized join names the alias
+(`j.x`) where PostgreSQL names the member table (`a.x`). A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
-PostgreSQL types it as the table's row type `t`. A qualifier naming an
-aliased table (`UPDATE t x ... RETURNING t.a`) reports PostgreSQL's
-`invalid reference to FROM-clause entry` without its alias hint. A
-database-qualified name (`postgres.public.t`) works in column references,
-FROM items and `CREATE` targets but is a syntax error in `DROP` and other
-DDL name lists.
+PostgreSQL types it as the table's row type `t`, and comparing two
+whole-row values (`t.* = t.*`) is row-wise, so NULL fields give NULL where
+PostgreSQL's composite comparison treats them as equal.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. In a PL/pgSQL statement,
-`VALUES (r.*)` does not expand the row variable `r` into its fields, and a
-whole-row star in an expression (`t.* IS NULL`) is a syntax error. Reading
+`VALUES (r.*)` does not expand the row variable `r` into its fields. Reading
 a field of a row variable that was never assigned returns NULL without
 checking that the field exists. A `CONSTANT` assignment error has no cursor
 position.

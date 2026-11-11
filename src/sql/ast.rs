@@ -3388,6 +3388,21 @@ pub(crate) enum MaterializedCteSource<'a> {
     RecursiveExternal(&'a core::sync::atomic::AtomicUsize),
     /// A data-modifying `WITH` query that runs when its rows are first read.
     Write(WriteQuerySource<'a>),
+    /// An ordinary `WITH` query evaluated once, when a scan first reads it,
+    /// as PostgreSQL's CTE scan runs it: a query that is never read never
+    /// runs, and its calls happen after the main query's earlier ones.
+    Deferred(DeferredCteQuery<'a>),
+}
+
+/// The query of a [`MaterializedCteSource::Deferred`] source and its rows
+/// once read. The rows live in the statement arena's persistent tail, which
+/// per-row rewinds cannot reclaim.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeferredCteQuery<'a> {
+    pub tree: &'a SetTree<'a>,
+    /// Zero until read, then the address of the persistent
+    /// [`MaterializedCteInlineSource`] naming the rows.
+    pub rows: &'a core::sync::atomic::AtomicUsize,
 }
 
 /// A data-modifying `WITH` query bound into one statement attempt. The
@@ -3420,6 +3435,7 @@ impl PartialEq for MaterializedCteSource<'_> {
             (Self::Write(left), Self::Write(right)) => {
                 core::ptr::eq(left.with, right.with) && left.index == right.index
             }
+            (Self::Deferred(left), Self::Deferred(right)) => core::ptr::eq(left.rows, right.rows),
             _ => false,
         }
     }
@@ -3457,6 +3473,7 @@ impl<'a> MaterializedCte<'a> {
             MaterializedCteSource::RecursiveInline(source) => inline_rows(source),
             // Only a read runs the query; see `read_rows`.
             MaterializedCteSource::Write(_)
+            | MaterializedCteSource::Deferred(_)
             | MaterializedCteSource::External(_)
             | MaterializedCteSource::RecursiveExternal(_) => &[],
         }
@@ -3467,10 +3484,14 @@ impl<'a> MaterializedCte<'a> {
     pub(crate) fn read_rows(
         &self,
         arena: &'a crate::mem::arena::Arena,
+        query: Option<crate::sql::query::DeferredCteRead<'_, 'a>>,
     ) -> Result<&'a [&'a [u8]], crate::sql::SqlError> {
         match self.source {
             MaterializedCteSource::Write(source) => {
                 crate::sql::query::read_write_query(&source, arena)
+            }
+            MaterializedCteSource::Deferred(deferred) => {
+                crate::sql::query::read_deferred_cte(deferred, arena, query)
             }
             _ => Ok(self.rows()),
         }
@@ -3490,7 +3511,8 @@ impl<'a> MaterializedCte<'a> {
             }
             MaterializedCteSource::Inline(_)
             | MaterializedCteSource::RecursiveInline(_)
-            | MaterializedCteSource::Write(_) => None,
+            | MaterializedCteSource::Write(_)
+            | MaterializedCteSource::Deferred(_) => None,
         }
     }
 }
@@ -3608,6 +3630,24 @@ pub struct TableRef<'a> {
     /// Source view retained across expansion so projected column privileges
     /// remain enforceable after its body becomes a derived table.
     pub view_access: Option<u16>,
+    /// A parenthesized join, `(a JOIN b ON ...)`, runs as the derived table
+    /// in `subquery`. Unaliased, its member tables (and `USING` aliases)
+    /// stay addressable by these names outside it: the subquery's output is
+    /// the join's own columns, then each member's columns (`m.*`), then one
+    /// `num_nulls(m)` per table member marking whether that member was
+    /// null-extended. An alias hides the members, which then only name
+    /// what an error reports as out of reach, and the output is the join's
+    /// own columns.
+    pub join_members: Option<&'a [JoinMember<'a>]>,
+}
+
+/// A name a parenthesized join exposes to its enclosing FROM clause.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JoinMember<'a> {
+    pub name: &'a str,
+    /// A `USING (...) AS alias` name qualifies merged columns only; it has
+    /// no row presence of its own.
+    pub using_alias: bool,
 }
 
 impl TableRef<'_> {

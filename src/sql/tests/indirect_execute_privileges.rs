@@ -168,3 +168,24 @@ fn plans_check_every_called_routine_before_running() {
         assert!(text.contains(expected), "{expected}: {text}");
     }
 }
+
+/// An empty `ARRAY[]` cast to a type takes that type without calling a cast
+/// function, so changed built-in privileges never look for one.
+#[test]
+fn empty_array_casts_need_no_cast_function_after_privilege_changes() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE EXECUTE ON FUNCTION texteq(text, text) FROM PUBLIC; \
+         GRANT EXECUTE ON FUNCTION texteq(text, text) TO PUBLIC",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ARRAY[]::integer[], ARRAY[ARRAY[]::integer[], NULL::integer[]]"
+        )),
+        ["{}|{}"]
+    );
+}

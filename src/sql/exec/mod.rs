@@ -21184,9 +21184,10 @@ type MaterializedWithQueries<'a> = &'a [(&'a str, &'a crate::sql::ast::Materiali
 fn bind_plpgsql_dml_ctes<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     query: &'a Select<'a>,
+    scope: &dyn ColumnLookup<'a>,
 ) -> Result<(&'a Select<'a>, MaterializedWithQueries<'a>), SqlError> {
     if !query.with.iter().any(|cte| cte.dml.is_some()) {
-        return Ok((query, &[]));
+        return Ok((expand_plpgsql_with(context, query, scope)?, &[]));
     }
     let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
         return Err(sql_err!(
@@ -21224,7 +21225,34 @@ fn bind_plpgsql_dml_ctes<'a>(
         context.txn.txid,
         arena,
     )?;
-    Ok((bound, materialized))
+    Ok((expand_plpgsql_with(context, bound, scope)?, materialized))
+}
+
+/// Binds a query's ordinary `WITH` queries. A materialized one only
+/// describes its rows here and runs when the query first reads them.
+fn expand_plpgsql_with<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    query: &'a Select<'a>,
+    scope: &dyn ColumnLookup<'a>,
+) -> Result<&'a Select<'a>, SqlError> {
+    if query.with.is_empty() {
+        return Ok(query);
+    }
+    let sequences = crate::sql::sequence::SeqEval::new(
+        context.storage(),
+        context.seq_session(),
+        context.txn.txid,
+    );
+    super::query::expand_enclosed_ctes_exec(
+        query,
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+        context.params,
+        &[],
+        Some(&sequences),
+        Some(scope),
+    )
 }
 
 /// Runs the data-modifying `WITH` queries of `query` that nothing read.
@@ -31595,18 +31623,6 @@ fn execute_trigger_step_in<'a>(
                     .map_err(|_| super::query::arena_full_pub())?
             }),
             TriggerStatement::ReturnQuery(query) => execute_trigger_statement(|| {
-                let written = query;
-                let (query, dml_ctes) = bind_plpgsql_dml_ctes(context, query)?;
-                let query = match transition_relations {
-                    Some(relations) => super::query::bind_materialized_relations(
-                        query,
-                        relations,
-                        context.storage(),
-                        context.txn.txid,
-                        context.arena,
-                    )?,
-                    None => query,
-                };
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -31618,6 +31634,18 @@ fn execute_trigger_step_in<'a>(
                     found: status.found,
                     invocation,
                     transition: &transition,
+                };
+                let written = query;
+                let (query, dml_ctes) = bind_plpgsql_dml_ctes(context, query, &scope)?;
+                let query = match transition_relations {
+                    Some(relations) => super::query::bind_materialized_relations(
+                        query,
+                        relations,
+                        context.storage(),
+                        context.txn.txid,
+                        context.arena,
+                    )?,
+                    None => query,
                 };
                 let arena = context.arena;
                 let params = context.params;
@@ -32446,18 +32474,6 @@ fn execute_trigger_step_in<'a>(
                 for (index, target) in statement.targets.iter().enumerate() {
                     targets[index] = trigger_local_index(locals, *target)?;
                 }
-                let written = statement.query;
-                let (query, dml_ctes) = bind_plpgsql_dml_ctes(context, statement.query)?;
-                let query = match transition_relations {
-                    Some(relations) => super::query::bind_materialized_relations(
-                        query,
-                        relations,
-                        context.storage(),
-                        context.txn.txid,
-                        context.arena,
-                    )?,
-                    None => query,
-                };
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -32469,6 +32485,18 @@ fn execute_trigger_step_in<'a>(
                     found: status.found,
                     invocation,
                     transition: &transition,
+                };
+                let written = statement.query;
+                let (query, dml_ctes) = bind_plpgsql_dml_ctes(context, statement.query, &scope)?;
+                let query = match transition_relations {
+                    Some(relations) => super::query::bind_materialized_relations(
+                        query,
+                        relations,
+                        context.storage(),
+                        context.txn.txid,
+                        context.arena,
+                    )?,
+                    None => query,
                 };
                 let record_target = statement.targets.len() == 1
                     && matches!(
@@ -33190,18 +33218,6 @@ fn execute_trigger_step_in<'a>(
                         params: context.params,
                         responder: context.responder,
                     };
-                    let written = query;
-                    let (query, dml_ctes) = bind_plpgsql_dml_ctes(&mut context, query)?;
-                    let query = match transition_relations {
-                        Some(relations) => super::query::bind_materialized_relations(
-                            query,
-                            relations,
-                            context.storage(),
-                            context.txn.txid,
-                            context.arena,
-                        )?,
-                        None => query,
-                    };
                     let transition = TriggerTransition {
                         definition,
                         old,
@@ -33213,6 +33229,18 @@ fn execute_trigger_step_in<'a>(
                         found: status.found,
                         invocation,
                         transition: &transition,
+                    };
+                    let written = query;
+                    let (query, dml_ctes) = bind_plpgsql_dml_ctes(&mut context, query, &scope)?;
+                    let query = match transition_relations {
+                        Some(relations) => super::query::bind_materialized_relations(
+                            query,
+                            relations,
+                            context.storage(),
+                            context.txn.txid,
+                            context.arena,
+                        )?,
+                        None => query,
                     };
                     let arena = context.arena;
                     let params = context.params;
@@ -34446,21 +34474,6 @@ fn execute_trigger_step_in<'a>(
                             };
                             let values = match program.source {
                                 TriggerForSource::Query(query) => {
-                                    let written = query;
-                                    let (query, dml_ctes) =
-                                        bind_plpgsql_dml_ctes(&mut context, query)?;
-                                    let query = match transition_relations {
-                                        Some(relations) => {
-                                            super::query::bind_materialized_relations(
-                                                query,
-                                                relations,
-                                                context.storage(),
-                                                context.txn.txid,
-                                                context.arena,
-                                            )?
-                                        }
-                                        None => query,
-                                    };
                                     let transition = TriggerTransition {
                                         definition,
                                         old,
@@ -34472,6 +34485,21 @@ fn execute_trigger_step_in<'a>(
                                         found: status.found,
                                         invocation,
                                         transition: &transition,
+                                    };
+                                    let written = query;
+                                    let (query, dml_ctes) =
+                                        bind_plpgsql_dml_ctes(&mut context, query, &scope)?;
+                                    let query = match transition_relations {
+                                        Some(relations) => {
+                                            super::query::bind_materialized_relations(
+                                                query,
+                                                relations,
+                                                context.storage(),
+                                                context.txn.txid,
+                                                context.arena,
+                                            )?
+                                        }
+                                        None => query,
                                     };
                                     let arena = context.arena;
                                     let params = context.params;

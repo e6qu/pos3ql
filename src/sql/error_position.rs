@@ -78,6 +78,7 @@ struct Pending {
     /// One-based character position, as the `P` field counts.
     position: Option<usize>,
     hint: Option<&'static str>,
+    note: Option<AnalysisNote>,
 }
 
 /// What PostgreSQL adds to an analysis error: its cursor and hint.
@@ -85,6 +86,57 @@ struct Pending {
 pub(crate) struct Annotation {
     pub(crate) position: Option<usize>,
     pub(crate) hint: Option<&'static str>,
+    pub(crate) note: Option<AnalysisNote>,
+}
+
+/// A computed DETAIL or HINT of a name-resolution error, kept beside the
+/// error it explains: it reaches the client only with that error (same
+/// SQLSTATE and message), so a probe that discards its error cannot attach
+/// text to an unrelated later one.
+#[derive(Clone, Copy)]
+pub(crate) enum AnalysisNote {
+    Detail(crate::util::StackStr<NOTE_BYTES>),
+    Hint(crate::util::StackStr<NOTE_BYTES>),
+}
+
+/// Two quoted identifiers of `NAMEDATALEN - 1` bytes plus the wording.
+const NOTE_BYTES: usize = 2 * crate::sql::lexer::MAX_IDENTIFIER_BYTES + 128;
+
+/// Attaches a computed DETAIL to `error`.
+pub(crate) fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> SqlError {
+    note(error, AnalysisNote::Detail(note_text(detail)))
+}
+
+/// Attaches a computed HINT to `error`.
+pub(crate) fn with_computed_hint(error: SqlError, hint: core::fmt::Arguments<'_>) -> SqlError {
+    note(error, AnalysisNote::Hint(note_text(hint)))
+}
+
+fn note_text(text: core::fmt::Arguments<'_>) -> crate::util::StackStr<NOTE_BYTES> {
+    use core::fmt::Write as _;
+    let mut out = crate::util::StackStr::new();
+    let _ = out.write_fmt(text);
+    out
+}
+
+fn note(error: SqlError, note: AnalysisNote) -> SqlError {
+    if error.sqlstate.internal_control().is_some() {
+        return error;
+    }
+    let message_hash = message_hash(&error.message);
+    PENDING.with(|pending| {
+        let known = pending
+            .get()
+            .filter(|known| known.sqlstate == error.sqlstate && known.message_hash == message_hash);
+        pending.set(Some(Pending {
+            sqlstate: error.sqlstate,
+            message_hash,
+            position: known.and_then(|known| known.position),
+            hint: known.and_then(|known| known.hint),
+            note: Some(note),
+        }))
+    });
+    error
 }
 
 const FUNCTION_HINT: &str = "No function matches the given name and argument types. You might need to add explicit type casts.";
@@ -280,6 +332,17 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
 pub(crate) fn at_expression(error: SqlError, expression: &crate::sql::ast::Expr<'_>) -> SqlError {
     let position = expression_start(expression).map(|(at, source)| character_position(source, at));
     record(&error, position, None);
+    error
+}
+
+/// [`at_expression`] with PostgreSQL's hint.
+pub(crate) fn at_expression_with_hint(
+    error: SqlError,
+    expression: &crate::sql::ast::Expr<'_>,
+    hint: &'static str,
+) -> SqlError {
+    let position = expression_start(expression).map(|(at, source)| character_position(source, at));
+    record(&error, position, Some(hint));
     error
 }
 
@@ -487,6 +550,7 @@ fn record(error: &SqlError, position: Option<usize>, hint: Option<&'static str>)
             message_hash,
             position: known.and_then(|known| known.position).or(position),
             hint: known.and_then(|known| known.hint).or(hint),
+            note: known.and_then(|known| known.note),
         }))
     });
 }
@@ -595,6 +659,7 @@ pub(crate) fn take_annotation(sqlstate: &str, message: &dyn core::fmt::Display) 
         Annotation {
             position: pending.position,
             hint: pending.hint,
+            note: pending.note,
         }
     } else {
         Annotation::default()

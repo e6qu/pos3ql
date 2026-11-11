@@ -96,6 +96,7 @@ pub(crate) fn expand_stored_query_exec<'a>(
         Some(path),
         Some(dependencies),
         None,
+        None,
         |name| select_references(select, name),
         |context| subst_select_body(select, context, arena),
     )
@@ -472,10 +473,27 @@ pub fn expand_ctes_exec<'a>(
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Select<'a>, SqlError> {
+    expand_enclosed_ctes_exec(sel, storage, txid, arena, params, dml_mats, sequences, None)
+}
+
+/// [`expand_ctes_exec`] for a query a routine runs: its `WITH` queries read
+/// the routine's variables from `enclosing`, as PostgreSQL's parser hook
+/// binds them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expand_enclosed_ctes_exec<'a>(
+    sel: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
+    sequences: Option<&dyn SequenceAccess>,
+    enclosing: Option<&dyn crate::sql::eval::ColumnLookup<'a>>,
+) -> Result<&'a Select<'a>, SqlError> {
     if !select_contains_with(sel) && !storage.has_any_view() {
         return Ok(sel);
     }
-    analyze_unreferenced_ctes(sel, storage, txid, arena)?;
+    analyze_unreferenced_ctes(sel, storage, txid, arena, enclosing)?;
     with_exec_context(
         sel.with,
         storage,
@@ -491,6 +509,7 @@ pub fn expand_ctes_exec<'a>(
         None,
         None,
         None,
+        enclosing,
         |name| select_references(sel, name),
         |context| subst_select_body(sel, context, arena),
     )
@@ -505,7 +524,9 @@ fn analyze_unreferenced_ctes<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    enclosing: Option<&dyn crate::sql::eval::ColumnLookup<'a>>,
 ) -> Result<(), SqlError> {
+    let variables = enclosing.map(crate::sql::eval::RoutineVariables);
     for (index, cte) in sel.with.iter().enumerate() {
         if cte.dml.is_some() || select_references(sel, cte.name) != 0 {
             continue;
@@ -537,6 +558,7 @@ fn analyze_unreferenced_ctes<'a>(
                         authorization_role: None,
                         bound_table: None,
                         view_access: None,
+                        join_members: None,
                     },
                     joins: &[],
                 }),
@@ -564,7 +586,9 @@ fn analyze_unreferenced_ctes<'a>(
                 arena,
                 &mut columns,
                 crate::sql::exec::DescriptionTarget::Sql,
-                None,
+                variables
+                    .as_ref()
+                    .map(|row| row as &dyn crate::sql::eval::ColumnLookup<'_>),
             )
         });
         // Only the verdict leaves; the description is discarded.
@@ -861,6 +885,7 @@ pub(crate) fn expand_stored_rule_expression_exec<'a>(
         Some(path),
         Some(dependencies),
         Some(authorization_role),
+        None,
         |_| 0,
         |context| {
             subst_expr(
@@ -961,6 +986,7 @@ fn rule_relation_ref<'a>(
         authorization_role: None,
         bound_table: None,
         view_access: None,
+        join_members: None,
     }
 }
 
@@ -1349,6 +1375,7 @@ pub(crate) fn rule_transition_source<'a>(
                 authorization_role: None,
                 bound_table: None,
                 view_access: None,
+                join_members: None,
             };
             for (column, name) in columns.iter().copied().enumerate() {
                 let expression = input_columns
@@ -1417,6 +1444,7 @@ pub(crate) fn rule_transition_source<'a>(
         authorization_role: None,
         bound_table: None,
         view_access: None,
+        join_members: None,
     };
     Ok(RuleTransitionSource {
         source,
@@ -1621,6 +1649,7 @@ fn expand_stored_statement_with_transition<'a>(
         Some(path),
         Some(dependencies),
         authorization_role,
+        None,
         |name| statement_references(body, name),
         |context| {
             let context = Subst {
@@ -1719,6 +1748,7 @@ fn expand_dml_ctes_with_relations<'a>(
         &[],
         sequences,
         0,
+        None,
         None,
         None,
         None,
@@ -2588,6 +2618,7 @@ fn with_exec_context<'a, 's, 'e, R>(
     path: Option<crate::storage::PathContext>,
     dependencies: Option<crate::storage::StoredQueryDependencyView<'s>>,
     authorization_role: Option<u16>,
+    enclosing: Option<&dyn crate::sql::eval::ColumnLookup<'a>>,
     root_references: impl Fn(&str) -> usize,
     build: impl for<'c> FnOnce(Subst<'c, 'a, 's, 'e>) -> Result<R, SqlError>,
 ) -> Result<R, SqlError> {
@@ -2697,8 +2728,7 @@ fn with_exec_context<'a, 's, 'e, R>(
                     storage,
                     txid,
                     arena,
-                    params,
-                    sequences,
+                    enclosing,
                 )?;
                 materialized
                     .push((cte.name, relation))
@@ -2776,13 +2806,13 @@ fn materialize_query_cte<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
-    params: &[Datum<'a>],
-    sequences: Option<&dyn SequenceAccess>,
+    enclosing: Option<&dyn crate::sql::eval::ColumnLookup<'a>>,
 ) -> Result<&'a MaterializedCte<'a>, SqlError> {
     let tree = arena
         .alloc(SetTree::Select(query))
         .map_err(|_| arena_full())?;
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let variables = enclosing.map(crate::sql::eval::RoutineVariables);
     let ncols = describe_set_body(
         storage,
         tree,
@@ -2791,7 +2821,9 @@ fn materialize_query_cte<'a>(
         arena,
         None,
         crate::sql::exec::DescriptionTarget::Sql,
-        None,
+        variables
+            .as_ref()
+            .map(|row| row as &dyn crate::sql::eval::ColumnLookup<'_>),
     )?;
     if aliases.len() > ncols {
         return Err(sql_err!(
@@ -2825,16 +2857,17 @@ fn materialize_query_cte<'a>(
     let column_collations = arena
         .alloc_slice_with(ncols, |index| described[index].collation)
         .map_err(|_| arena_full())?;
-    let (rows, _, materialized_columns) =
-        materialize_set_body(storage, txid, tree, arena, params, sequences)?;
-    debug_assert_eq!(materialized_columns, ncols);
+    let deferred = crate::sql::ast::DeferredCteQuery {
+        tree,
+        rows: arena.alloc_atomic_usize(0).map_err(|_| arena_full())?,
+    };
     arena
         .alloc(MaterializedCte {
             column_names,
             column_types,
             column_collations,
             definition: None,
-            source: crate::sql::ast::MaterializedCteSource::Inline(rows),
+            source: crate::sql::ast::MaterializedCteSource::Deferred(deferred),
         })
         .map(|relation| &*relation)
         .map_err(|_| arena_full())
@@ -3608,6 +3641,15 @@ pub(super) fn select_contains_function(
             table
                 .subquery
                 .is_some_and(|query| select_contains_function(query, matches))
+                // A WITH query not yet read runs, with its calls, where this
+                // query first reads it.
+                || table.cte.is_some_and(|cte| match cte.source {
+                    crate::sql::ast::MaterializedCteSource::Deferred(deferred) => {
+                        deferred.rows.load(core::sync::atomic::Ordering::Relaxed) == 0
+                            && set_tree_contains_function(deferred.tree, matches)
+                    }
+                    _ => false,
+                })
                 || table.func_args.is_some_and(|arguments| {
                     matches(table.table, arguments.len())
                         || arguments.iter().any(|argument| expression_has_it(argument))
@@ -5217,6 +5259,7 @@ fn subst_select<'a>(
             context.path,
             context.dependencies,
             context.authorization_role,
+            None,
             |name| select_references(select, name),
             |inner| subst_select_body(select, inner, arena),
         );
@@ -5846,6 +5889,7 @@ fn subst_tableref<'a>(
             authorization_role: None,
             bound_table: None,
             view_access: None,
+            join_members: None,
         });
     }
     // An unqualified name matching a CTE becomes a derived table over the
@@ -5879,6 +5923,7 @@ fn subst_tableref<'a>(
             authorization_role: None,
             bound_table: None,
             view_access: None,
+            join_members: None,
         });
     }
     // A name resolving to a view (not shadowed by a CTE, and not out-resolved
@@ -6020,6 +6065,7 @@ fn subst_tableref<'a>(
                 Some(view_path),
                 Some(dependencies.view()),
                 authorization_role,
+                None,
                 |name| select_references(vsel, name),
                 |inner| subst_select_body(vsel, inner, arena),
             )?
@@ -6056,6 +6102,7 @@ fn subst_tableref<'a>(
                 authorization_role: None,
                 bound_table: None,
                 view_access: Some(slot as u16),
+                join_members: None,
             });
         }
         let aliases = if view_columns.has_aliases() {
@@ -6090,6 +6137,7 @@ fn subst_tableref<'a>(
             authorization_role: None,
             bound_table: None,
             view_access: Some(slot as u16),
+            join_members: None,
         });
     }
     // Inside a view body, pin a table reference to the schema it resolved to

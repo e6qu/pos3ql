@@ -25952,13 +25952,16 @@ where
                 name
             ),
             // A qualifier names a record variable or nothing in scope.
+            // PostgreSQL reports a record's missing field without a position.
             Some(qualifier) => match self.record_index(Some(qualifier), name) {
-                Some(_) => sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "record \"{}\" has no field \"{}\"",
-                    qualifier,
-                    name
-                ),
+                Some(_) => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "record \"{}\" has no field \"{}\"",
+                        qualifier,
+                        name
+                    ));
+                }
                 None => super::eval::empty_scope_column_error(Some(qualifier), name),
             },
             None => super::eval::empty_scope_column_error(None, name),
@@ -26948,7 +26951,13 @@ fn in_simple_expression<T>(
     let frame = crate::sql::error_context::QueryFrame::new(text, mode, true);
     crate::sql::error_context::with_frame(&frame, || {
         crate::sql::error_position::with_internal_source(text, run).map_err(|error| {
-            if error.sqlstate.internal_control().is_none() {
+            // Names resolve while PostgreSQL analyzes the expression.
+            if matches!(
+                error.sqlstate.as_str(),
+                sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+            ) {
+                frame.planned();
+            } else if error.sqlstate.internal_control().is_none() {
                 let mark = arena.mark();
                 let folded = crate::sql::error_position::preserving_pending(|| {
                     constant_fold_error(expression, arena)

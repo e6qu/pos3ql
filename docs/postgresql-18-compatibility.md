@@ -164,21 +164,37 @@ Functions and expressions:
   `SELECT md5('a')` fail with `42501` for roles without a grant. The check
   also covers the function behind an operator, cast, `IN`, `ANY`, `LIKE`,
   regular-expression match, simple `CASE`, `IS DISTINCT FROM`, `NULLIF`,
-  `DISTINCT`, `GROUP BY` and `UNION`/`INTERSECT`/`EXCEPT`: after
+  `DISTINCT`, `GROUP BY`, window `PARTITION BY` and `ORDER BY` keys, `ROW(a,
+  b) = ROW(c, d)` field comparisons and `UNION`/`INTERSECT`/`EXCEPT`: after
   `REVOKE EXECUTE ON FUNCTION int4pl(integer, integer) FROM PUBLIC`,
   `SELECT a + 1 FROM t` fails even when `t` is empty, as PostgreSQL checks
-  every function when a plan starts. `GRANT`, `has_function_privilege`,
-  `proacl` and psql's `\df+` follow PostgreSQL, including the description
-  PostgreSQL ships for each listed built-in routine
+  every function when a plan starts. User-defined functions are checked the
+  same way, in select lists, filters, ordering, `LIMIT`, subqueries, `INSERT`
+  values and `ON CONFLICT DO UPDATE`, `MERGE` conditions and actions and
+  `RETURNING`; branches the planner folds away (`WHERE false AND f(x)`,
+  `CASE WHEN false THEN f(x) END`) are not checked. Every PostgreSQL 18.6
+  `pg_proc` row is listed, so operator, cast and support functions such as
+  `texteq`, `int4um` and `int4in` can be granted, revoked and altered; called
+  by name, an operator, cast or type-input function runs as that operator or
+  cast (`texteq('a', 'b')` is `'a' = 'b'`), and another listed routine
+  pos3ql does not run fails with `0A000`. Server administration functions
+  keep initdb's ACL: `pg_reload_conf()` and `pg_read_file(text)` are
+  executable only by superusers and roles granted `EXECUTE`. pos3ql has no
+  predefined roles (`pg_monitor`, `pg_read_all_stats`), so their initdb
+  grants are not listed in `proacl`. `GRANT`, `has_function_privilege`,
+  `proacl`, `pg_get_function_arguments`, `pg_get_function_result` and psql's
+  `\df+` follow PostgreSQL, including the description PostgreSQL ships for
+  each built-in routine
   (`obj_description('lower(text)'::regprocedure)` is `lowercase`);
   `COMMENT ON FUNCTION` replaces it and `COMMENT ... IS NULL` removes it in
   the current database. Changes survive restart and
   are copied by `CREATE DATABASE ... TEMPLATE`. Each changed routine uses one
   of the `max_builtin_routine_entries` rows (default 64); running out fails
   with `54000`. Limits: `SET`/`RESET` settings of a built-in, and renaming or
-  moving one, fail with `0A000`; operator functions that pos3ql does not list
-  in `pg_proc` (`texteq`, `int4um`) cannot be granted or revoked (`42883`).
-  Dropping a built-in fails with `2BP01`, as in PostgreSQL.
+  moving one, fail with `0A000`; a signature naming `cstring` or `"any"`
+  (`'int4in(cstring)'::regprocedure`, `GRANT ... ON FUNCTION
+  int4in(cstring)`) is not recognized (`42883`). Dropping a built-in fails
+  with `2BP01`, as in PostgreSQL.
 - Array and `CASE` result types follow declarations, including subqueries and
   nulls: `ARRAY[(SELECT NULL::date)]` is `date[]`; mixing integer and bigint
   gives `bigint[]`; an empty constructor needs a type (`ARRAY[]::integer[]`).

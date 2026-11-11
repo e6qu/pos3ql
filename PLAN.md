@@ -270,12 +270,13 @@ unsupported case into an explicit error. Known gaps: `SET`/`RESET` of a
 built-in function, or renaming or moving one, fails with `0A000` where
 PostgreSQL changes the catalog entry (built-in rows need storage for
 `proconfig`, and every built-in name lookup must consult a renamed or moved
-row); about half of PostgreSQL's 3,413 `pg_proc` rows, mostly operator and
-type support functions such as `texteq`, are not listed, so they cannot be
-granted, revoked or called by name; a revoked user-defined function is
-checked when it is called rather than when a plan starts, and window
-`PARTITION BY` keys and row comparisons do not check the `=` function of
-each key; `DROP ROLE` reports dependent objects without PostgreSQL's `DETAIL` list
+row); a routine signature naming `cstring` or `"any"` cannot be written
+(`GRANT ... ON FUNCTION int4in(cstring)` fails with `42883`) because those
+pseudo-types are not pos3ql column types, and `pg_type` lists 182 of
+PostgreSQL's 621 built-in types; PostgreSQL's predefined roles
+(`pg_monitor`) do not exist, so their initdb `EXECUTE` grants are absent; a
+listed built-in that is neither implemented nor an operator, cast or input
+function fails with `0A000` when called; `DROP ROLE` reports dependent objects without PostgreSQL's `DETAIL` list
 (`owner of function lower(text)`), `pg_shdepend` lacks privilege rows and
 the owners of schemas, types and built-in routines, and `pg_describe_object`
 schema-qualifies names that PostgreSQL prints unqualified when they are

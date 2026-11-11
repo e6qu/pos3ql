@@ -3816,16 +3816,55 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         )
     }
 
+    fn routine_privileges_present(&self) -> bool {
+        self.txid != 0
+            && (self.storage.builtin_routine_count() != 0 || self.storage.routine_count() != 0)
+    }
+
+    fn require_stored_routine_execute(&self, oid: i32) -> Result<(), SqlError> {
+        match self.storage.routine_slot_by_oid(oid, self.txid) {
+            Some(slot) => self.storage.require_routine_execute(slot, self.txid),
+            None => Ok(()),
+        }
+    }
+
+    fn require_subquery_routine_execute<'a>(
+        &self,
+        select: &Select<'a>,
+        outer: &dyn super::eval::ColumnLookup<'a>,
+        exists: bool,
+    ) -> Result<(), SqlError> {
+        if select.set_body.is_some() || !select.with.is_empty() {
+            return Ok(());
+        }
+        let arena = self.routine_workspace;
+        let mark = arena.mark();
+        let result = (|| {
+            let scope = select
+                .from
+                .as_ref()
+                .map(|from| {
+                    QueryScope::resolve_schema(self.storage, from, self.txid, arena, Some(outer))
+                })
+                .transpose()?;
+            let schema = scope.as_ref().map(ScopeSchema);
+            let row = scan::Chained {
+                inner: schema.as_ref().map_or(
+                    &super::eval::NoColumns as &dyn super::eval::ColumnLookup<'_>,
+                    |schema| schema,
+                ),
+                outer: Some(outer),
+            };
+            require_select_expressions_execute(select, &row, self, exists)
+        })();
+        // The check returns no workspace-backed values.
+        unsafe { arena.rewind_to(mark) };
+        result
+    }
+
     fn require_builtin_routine_execute(&self, oid: i32) -> Result<(), SqlError> {
         let Some(routine) = crate::storage::BuiltinRoutineOid::parse(oid) else {
             return Ok(());
-        };
-        let Some(slot) = self.storage.builtin_routine_slot(routine) else {
-            return Ok(());
-        };
-        let object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::BuiltinRoutine,
-            slot: slot as u16,
         };
         if self.txid != 0 {
             let role = self.storage.current_role_slot(self.txid).ok_or_else(|| {
@@ -3834,12 +3873,28 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     "current role is not present in the role catalog"
                 )
             })?;
-            if !self.storage.has_object_privilege(
-                object,
-                role,
-                crate::storage::PrivilegeSet::EXECUTE,
-                self.txid,
-            ) {
+            let allowed = match self.storage.builtin_routine_slot(routine) {
+                Some(slot) => self.storage.has_object_privilege(
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::BuiltinRoutine,
+                        slot: slot as u16,
+                    },
+                    role,
+                    crate::storage::PrivilegeSet::EXECUTE,
+                    self.txid,
+                ),
+                // Without a row the routine keeps its initdb ACL: `PUBLIC`
+                // or only its bootstrap-superuser owner may execute it.
+                None => {
+                    super::catalog::intrinsic_routine_public_execute(oid) != Some(false)
+                        || self.storage.role_has_privileges_of(
+                            role,
+                            usize::from(crate::storage::BOOTSTRAP_ROLE),
+                            self.txid,
+                        )
+                }
+            };
+            if !allowed {
                 return Err(sql_err!(
                     sqlstate::INSUFFICIENT_PRIVILEGE,
                     "permission denied for function {}",
@@ -7408,6 +7463,64 @@ fn correlated_row_hooks<'scratch, 'a>(
     }
 }
 
+/// PostgreSQL checks `EXECUTE` on every function a plan calls when the
+/// executor starts, so a revoked function fails even when no row reaches it.
+pub(super) fn require_select_routine_execute<'a>(
+    statement: &Select<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let catalog = storage_catalog(storage, arena, txid);
+    if !super::eval::CatalogAccess::routine_privileges_present(&catalog) {
+        return Ok(());
+    }
+    require_select_expressions_execute(statement, &ScopeSchema(scope), &catalog, false)
+}
+
+/// Checks `EXECUTE` behind each expression of one `SELECT` level; `exists`
+/// skips the select list an `EXISTS` test discards.
+fn require_select_expressions_execute<'a>(
+    statement: &Select<'a>,
+    row: &dyn ColumnLookup<'a>,
+    catalog: &dyn super::eval::CatalogAccess,
+    exists: bool,
+) -> Result<(), SqlError> {
+    let hooks = super::eval::EvalHooks {
+        catalog: Some(catalog),
+        ..super::eval::NO_HOOKS
+    };
+    let items = statement
+        .items
+        .iter()
+        .filter(|_| !exists)
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                Some(*expression)
+            }
+            _ => None,
+        });
+    let joins = statement
+        .from
+        .iter()
+        .flat_map(|from| from.joins.iter().filter_map(|join| join.on));
+    let orders = statement.order_by.iter().map(|order| order.expression);
+    for expression in items
+        .chain(statement.where_clause)
+        .chain(statement.group_by.iter().copied())
+        .chain(statement.having)
+        .chain(statement.distinct_on.iter().copied())
+        .chain(joins)
+        .chain(orders)
+        .chain(statement.limit)
+        .chain(statement.offset)
+    {
+        super::eval::require_expression_builtin_execute(expression, row, &hooks)?;
+    }
+    Ok(())
+}
+
 /// PostgreSQL has no equality or ordering for `json` — two documents differing
 /// only in whitespace or key order are the same value but not the same text, so
 /// it declines rather than answer by a rule it does not hold to, and offers
@@ -7442,35 +7555,8 @@ fn check_key_types<'a>(
             SelectItem::Expr { expression, .. } => Some(*expression),
             _ => None,
         });
+    require_select_routine_execute(statement, scope, arena, storage, txid)?;
     let catalog = storage_catalog(storage, arena, txid);
-    if super::eval::CatalogAccess::builtin_routine_privileges_present(&catalog) {
-        // PostgreSQL checks every function a plan calls when the executor
-        // starts, so a revoked function fails even when no row reaches it.
-        let hooks = super::eval::EvalHooks {
-            catalog: Some(&catalog),
-            ..super::eval::NO_HOOKS
-        };
-        let row = ScopeSchema(scope);
-        let items = statement.items.iter().filter_map(|item| match item {
-            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                Some(*expression)
-            }
-            _ => None,
-        });
-        let joins = statement
-            .from
-            .iter()
-            .flat_map(|from| from.joins.iter().filter_map(|join| join.on));
-        for expression in items
-            .chain(statement.where_clause)
-            .chain(statement.group_by.iter().copied())
-            .chain(statement.having)
-            .chain(statement.distinct_on.iter().copied())
-            .chain(joins)
-        {
-            super::eval::require_expression_builtin_execute(expression, &row, &hooks)?;
-        }
-    }
     for key in statement
         .group_by
         .iter()
@@ -10156,6 +10242,16 @@ fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
     row: &R,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<srf::ProjectSet<'a>, SqlError> {
+    // PostgreSQL checks the plan's functions before its filter runs.
+    let items = statement.items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            Some(*expression)
+        }
+        _ => None,
+    });
+    for expression in items.chain(statement.where_clause) {
+        super::eval::require_expression_builtin_execute(expression, row, hooks)?;
+    }
     if let Some(predicate) = statement.where_clause
         && !where_passes(predicate, arena, params, row, hooks)?
     {
@@ -11361,6 +11457,7 @@ fn select_into_rows_mode<'a>(
         seq,
         outer,
     )?;
+    require_select_routine_execute(statement, &scope, arena, storage, txid)?;
     let resolved_columns = subquery::SubqueryColumns {
         scope: Some(&scope),
         outer,

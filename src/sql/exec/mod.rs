@@ -63504,6 +63504,14 @@ pub(crate) fn merge<'a>(
     {
         return sql_fail(error);
     }
+    if let Err(error) = super::query::require_dml_builtin_execute(
+        &Stmt::Merge(*statement),
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.lock_table(
         txn.txid,
         table_index,
@@ -66819,6 +66827,14 @@ where
         insert_columns,
         authorization_role,
         txn.txid,
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = super::query::require_dml_builtin_execute(
+        &Stmt::Insert(*statement),
+        storage,
+        txn.txid,
+        arena,
     ) {
         return sql_fail(error);
     }

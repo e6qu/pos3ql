@@ -456,6 +456,15 @@ impl UserTypeName {
                 created_at: key.created_at,
             }),
             TypeBinding::Stored(key) => Some(key),
+            TypeBinding::Relation(creation) => {
+                write!(output, "t:{}:{}", creation.created_at(), self.name.as_str())
+                    .expect("bounded stored type name");
+                return output;
+            }
+            TypeBinding::InformationSchema(domain) => {
+                write!(output, "i:{}", domain.name()).expect("bounded stored type name");
+                return output;
+            }
             TypeBinding::Declaration | TypeBinding::Polymorphic(_) => None,
         };
         if let Some(key) = stored {
@@ -494,6 +503,30 @@ impl UserTypeName {
             return PolymorphicType::from_name(name)
                 .map(Self::polymorphic)
                 .ok_or_else(invalid);
+        }
+        if let Some(name) = encoded.strip_prefix("i:") {
+            if schema.as_str() != "information_schema" {
+                return Err(invalid());
+            }
+            return crate::sql::information_schema_domains::InformationSchemaDomain::ALL
+                .into_iter()
+                .find(|domain| domain.name() == name)
+                .map(Self::information_schema_domain)
+                .ok_or_else(invalid);
+        }
+        if let Some(relation) = encoded.strip_prefix("t:") {
+            let (created_at, name) = relation.split_once(':').ok_or_else(invalid)?;
+            let creation = created_at
+                .parse()
+                .ok()
+                .filter(|_| !created_at.starts_with('0'))
+                .and_then(TypeCreation::parse)
+                .ok_or_else(invalid)?;
+            return Ok(Self::relation_row_type(
+                schema,
+                SqlName::parse(name)?,
+                creation,
+            ));
         }
         let mut fields = encoded
             .strip_prefix("r:")
@@ -636,9 +669,54 @@ pub(super) enum TypeBinding {
     Captured(TypeIdentity),
     Stored(StoredTypeIdentity),
     Polymorphic(PolymorphicType),
+    /// The row type of the relation created at this stamp. The relation owns
+    /// the type's lifetime, so no type-catalog slot is captured.
+    Relation(TypeCreation),
+    /// One of PostgreSQL's built-in `information_schema` domains.
+    InformationSchema(crate::sql::information_schema_domains::InformationSchemaDomain),
 }
 
 impl UserTypeName {
+    pub(crate) fn relation_row_type(
+        schema: SqlName,
+        name: SqlName,
+        creation: TypeCreation,
+    ) -> Self {
+        Self {
+            schema,
+            name,
+            binding: TypeBinding::Relation(creation),
+        }
+    }
+
+    pub(crate) fn information_schema_domain(
+        domain: crate::sql::information_schema_domains::InformationSchemaDomain,
+    ) -> Self {
+        Self {
+            schema: SqlName::parse("information_schema").expect("static schema name"),
+            name: SqlName::parse(domain.name()).expect("static domain name"),
+            binding: TypeBinding::InformationSchema(domain),
+        }
+    }
+
+    /// The built-in domain this names, if it is an `information_schema` domain.
+    pub(crate) fn information_schema_domain_binding(
+        self,
+    ) -> Option<crate::sql::information_schema_domains::InformationSchemaDomain> {
+        match self.binding {
+            TypeBinding::InformationSchema(domain) => Some(domain),
+            _ => None,
+        }
+    }
+
+    /// The relation creation stamp when this names a relation's row type.
+    pub(crate) fn relation_row_type_creation(self) -> Option<TypeCreation> {
+        match self.binding {
+            TypeBinding::Relation(creation) => Some(creation),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_named(self, schema: SqlName, name: SqlName) -> bool {
         self.schema == schema && self.name == name
     }
@@ -666,6 +744,10 @@ impl PartialEq for UserTypeName {
             (TypeBinding::Captured(left), TypeBinding::Captured(right)) => left == right,
             (TypeBinding::Polymorphic(left), TypeBinding::Polymorphic(right)) => left == right,
             (TypeBinding::Stored(left), TypeBinding::Stored(right)) => left == right,
+            (TypeBinding::Relation(left), TypeBinding::Relation(right)) => left == right,
+            (TypeBinding::InformationSchema(left), TypeBinding::InformationSchema(right)) => {
+                left == right
+            }
             (TypeBinding::Declaration, TypeBinding::Declaration) => {
                 self.schema == other.schema && self.name == other.name
             }
@@ -980,7 +1062,9 @@ impl TypeCatalog {
                 transaction,
             ),
             TypeBinding::Declaration => self.lookup_reference_name(identity, database, transaction),
-            TypeBinding::Polymorphic(_) => Ok(None),
+            TypeBinding::Polymorphic(_)
+            | TypeBinding::Relation(_)
+            | TypeBinding::InformationSchema(_) => Ok(None),
         }
     }
     pub(super) fn type_snapshot(
@@ -1127,6 +1211,38 @@ impl TypeCatalog {
                 sqlstate::DATATYPE_MISMATCH,
                 "polymorphic type reference has an invalid representation"
             ));
+        }
+        if let TypeBinding::InformationSchema(domain) = identity.binding {
+            let ctype = match result.ctype {
+                ColType::Array(_) => ColType::Array(
+                    ArrElem::from_coltype(domain.base()).expect("domain base has an array type"),
+                ),
+                _ => domain.base(),
+            };
+            return Ok(RoutineResult {
+                ctype,
+                user_type: Some(identity),
+            });
+        }
+        // The relation, not the type catalog, owns a row type's lifetime; the
+        // binding alone restores its representation.
+        if let TypeBinding::Relation(creation) = identity.binding {
+            let ctype = match result.ctype {
+                ColType::Composite(_) => ColType::Composite(Some(creation)),
+                ColType::Array(ArrElem::Composite(_)) => {
+                    ColType::Array(ArrElem::Composite(Some(creation)))
+                }
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "relation row type reference has an invalid representation"
+                    ));
+                }
+            };
+            return Ok(RoutineResult {
+                ctype,
+                user_type: Some(identity),
+            });
         }
         let snapshot = self
             .resolve_type_reference(identity, database, transaction)?

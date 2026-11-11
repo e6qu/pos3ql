@@ -714,6 +714,19 @@ pub trait ColumnLookup<'a> {
     }
 }
 
+/// A whole-row reference to a relation has the relation's row type; any other
+/// FROM item yields an anonymous record.
+fn whole_row_value<'a>(
+    row: &dyn ColumnLookup<'a>,
+    table: &str,
+    fields: &'a [RecordField<'a>],
+) -> Datum<'a> {
+    match row.whole_row_type(table) {
+        Some(ColType::Composite(Some(slot))) => Datum::Composite { slot, fields },
+        _ => Datum::Record(fields),
+    }
+}
+
 /// Static type identity retained until a context decides how PostgreSQL
 /// resolves an unconstrained expression.
 #[derive(Clone, Copy)]
@@ -788,6 +801,15 @@ pub(crate) fn expression_type_identity<'a>(
                     "evaluated user-type cast has no catalog identity"
                 )
             });
+    }
+    // An element of an `information_schema` domain array keeps the domain,
+    // which its base-typed array representation does not record.
+    if let Expr::Subscript { base, .. } = expression
+        && let ExpressionTypeIdentity::Known(array) = expression_type_identity(base, row, hooks)?
+        && let Some((domain, true)) =
+            super::information_schema_domains::InformationSchemaDomain::from_oid(array)
+    {
+        return Ok(ExpressionTypeIdentity::Known(domain.oid()));
     }
     if let Expr::Array(elements) = expression {
         let plan = array_constructor_type(
@@ -2219,7 +2241,12 @@ pub trait CatalogAccess {
     fn function_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
-    fn trigger_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+    fn trigger_def<'a>(
+        &self,
+        _oid: i32,
+        _pretty: bool,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
     fn function_arguments<'a>(
@@ -2300,6 +2327,26 @@ pub trait CatalogAccess {
     /// The `FOREIGN KEY (...) REFERENCES ...` definition of the constraint with
     /// this OID, or `None` if no such foreign-key constraint is known.
     fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
+    /// `pg_get_constraintdef` with PostgreSQL's pretty-printing flag.
+    fn constraint_def_pretty<'a>(
+        &self,
+        oid: i32,
+        _pretty: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        self.constraint_def(oid, arena)
+    }
+    /// A relation and its partition ancestors as regclass values, nearest first.
+    fn partition_ancestors<'a>(
+        &self,
+        _relation: i32,
+        _arena: &'a Arena,
+    ) -> Result<&'a [Datum<'a>], SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "partition ancestry requires catalog access"
+        ))
+    }
     /// The executable `RANGE|LIST|HASH (...)` clause for a partitioned table.
     fn partition_key_def<'a>(
         &self,
@@ -2438,6 +2485,11 @@ pub trait CatalogAccess {
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
+    /// Checks the current role's `EXECUTE` privilege on a selected built-in
+    /// routine in the current database.
+    fn require_builtin_routine_execute(&self, _oid: i32) -> Result<(), SqlError> {
+        Ok(())
+    }
     fn has_database_privilege(
         &self,
         _role: Option<&str>,
@@ -2511,6 +2563,16 @@ pub trait CatalogAccess {
     /// Stored SELECT text of a view or materialized view OID.
     fn view_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
+    }
+    /// `pg_get_viewdef` with PostgreSQL's pretty-printing flag and wrap column.
+    fn view_def_pretty<'a>(
+        &self,
+        oid: i32,
+        _pretty: bool,
+        _wrap_column: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        self.view_def(oid, arena)
     }
     fn rule_def<'a>(
         &self,
@@ -4321,7 +4383,7 @@ fn eval_full_inner<'a>(
             Some(fields) if row.whole_row_is_scalar(table) => {
                 Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
             }
-            Some(fields) => Ok(Datum::Record(fields)),
+            Some(fields) => Ok(whole_row_value(row, table, fields)),
             None => Ok(Datum::Null), // outer-join null row
         },
         Expr::Bool(b) => Ok(Datum::Bool(b)),
@@ -4346,7 +4408,7 @@ fn eval_full_inner<'a>(
                     Ok(Some(fields)) if row.whole_row_is_scalar(name) => {
                         Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
                     }
-                    Ok(Some(fields)) => Ok(Datum::Record(fields)),
+                    Ok(Some(fields)) => Ok(whole_row_value(row, name, fields)),
                     Ok(None) => Ok(Datum::Null),
                     Err(_) => Err(crate::sql::error_position::column_reference(
                         e, qualifier, name,
@@ -5849,7 +5911,58 @@ pub(crate) fn quantified_comparison<'a>(
     };
     let left = materialize(left)?;
     let right = materialize(right)?;
+    let composite =
+        matches!(left, Datum::Composite { .. }) || matches!(right, Datum::Composite { .. });
     match (left, right) {
+        (
+            Datum::Record(left) | Datum::Composite { fields: left, .. },
+            Datum::Record(right) | Datum::Composite { fields: right, .. },
+        ) if composite => {
+            // Composite-typed values use the record btree operators: NULL
+            // fields are equal to each other and sort after other values.
+            if left.len() != right.len() {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "cannot compare record types with different numbers of columns"
+                ));
+            }
+            for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                let (left, right) = (
+                    typed_field_value(left, catalog, arena)?,
+                    typed_field_value(right, catalog, arena)?,
+                );
+                let ordering = match (left.is_null(), right.is_null()) {
+                    (true, true) => core::cmp::Ordering::Equal,
+                    (true, false) => core::cmp::Ordering::Greater,
+                    (false, true) => core::cmp::Ordering::Less,
+                    (false, false) => {
+                        let collation = collations.get(index).copied().unwrap_or(Collation::None);
+                        let field = |operator| {
+                            quantified_scalar(operator, left, right, collation, catalog, arena)
+                        };
+                        if field(BinaryOp::Eq)? == Datum::Bool(true) {
+                            core::cmp::Ordering::Equal
+                        } else if field(BinaryOp::Lt)? == Datum::Bool(true) {
+                            core::cmp::Ordering::Less
+                        } else {
+                            core::cmp::Ordering::Greater
+                        }
+                    }
+                };
+                if !ordering.is_eq() {
+                    return Ok(Datum::Bool(match operator {
+                        BinaryOp::NotEq => true,
+                        BinaryOp::Lt | BinaryOp::LtEq => ordering.is_lt(),
+                        BinaryOp::Gt | BinaryOp::GtEq => ordering.is_gt(),
+                        _ => false,
+                    }));
+                }
+            }
+            Ok(Datum::Bool(matches!(
+                operator,
+                BinaryOp::Eq | BinaryOp::LtEq | BinaryOp::GtEq
+            )))
+        }
         (
             Datum::Record(left) | Datum::Composite { fields: left, .. },
             Datum::Record(right) | Datum::Composite { fields: right, .. },
@@ -7385,6 +7498,9 @@ fn call<'a>(
         kind,
     } = syntax;
     let args = if let Some((oid, _)) = builtin {
+        if let Some(catalog) = hooks.catalog {
+            catalog.require_builtin_routine_execute(oid)?;
+        }
         bind_builtin_arguments(oid, args, argument_names, variadic, arena)?
     } else {
         args

@@ -38,6 +38,7 @@ pub(crate) mod identifiers;
 pub mod identity;
 pub(crate) mod index_interval;
 pub(crate) mod index_signature;
+pub(crate) mod information_schema_domains;
 pub mod json;
 pub mod jsonpath;
 pub(crate) mod large_object;
@@ -6596,9 +6597,11 @@ impl Engine {
                 &WalOp::SetObjectOwner {
                     class: object.class as u8,
                     object_oid: match object.class {
-                        crate::storage::AccessClass::Routine => {
-                            crate::storage::routine_oid(&self.storage.routine(object.slot as usize))
-                        }
+                        crate::storage::AccessClass::Routine
+                        | crate::storage::AccessClass::BuiltinRoutine => self
+                            .storage
+                            .access_object_routine_oid(object)
+                            .expect("journaled routine object has an OID"),
                         crate::storage::AccessClass::LargeObject => {
                             self.storage.large_object(object.slot as usize).oid.get() as i32
                         }
@@ -6661,9 +6664,11 @@ impl Engine {
                 &WalOp::SetObjectAcl {
                     class: object.class as u8,
                     object_oid: match object.class {
-                        crate::storage::AccessClass::Routine => {
-                            crate::storage::routine_oid(&self.storage.routine(object.slot as usize))
-                        }
+                        crate::storage::AccessClass::Routine
+                        | crate::storage::AccessClass::BuiltinRoutine => self
+                            .storage
+                            .access_object_routine_oid(object)
+                            .expect("journaled routine object has an OID"),
                         crate::storage::AccessClass::LargeObject => {
                             self.storage.large_object(object.slot as usize).oid.get() as i32
                         }
@@ -6779,6 +6784,37 @@ impl Engine {
         if let Err(error) = parameter_acl_staging {
             self.rollback_txn(txn, guc);
             return Err(error);
+        }
+        for (position, undo) in txn.ddl().iter().enumerate() {
+            let DdlUndo::BuiltinRoutineChanged { slot, .. } = *undo else {
+                continue;
+            };
+            if txn.ddl()[position + 1..].iter().any(|later| {
+                matches!(later, DdlUndo::BuiltinRoutineChanged { slot: later, .. } if *later == slot)
+            }) {
+                continue;
+            }
+            let entry = self.storage.builtin_routine_entry(usize::from(slot));
+            let image = entry.attributes_to(txn.txid);
+            let Some(routine) = entry.routine else {
+                continue;
+            };
+            if image == entry.committed {
+                continue;
+            }
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::SetBuiltinRoutine {
+                    database: entry.database.get(),
+                    routine,
+                    image: crate::wal::WalBuiltinRoutineImage::Captured(&image),
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::DefaultAclChanged { slot, .. } = *undo else {
@@ -7875,6 +7911,9 @@ impl Engine {
                 }
                 DdlUndo::ParameterAclChanged { .. } => {
                     self.storage.commit_parameter_acls(txn.txid);
+                }
+                DdlUndo::BuiltinRoutineChanged { slot, .. } => {
+                    self.storage.commit_builtin_routine(*slot, txn.txid);
                 }
                 // Promote the uncommitted comment overlay to committed; its WAL
                 // record was journaled at exec time (like other DDL).
@@ -19611,9 +19650,16 @@ impl Engine {
             Stmt::CreateTable(c) => {
                 exec::create_table(&mut self.storage, &mut self.wal, txn, c, arena, responder)
             }
-            Stmt::DropTable(d) => {
-                exec::drop_table(&mut self.storage, &mut self.wal, txn, d, arena, responder)
-            }
+            Stmt::DropTable(d) => exec::drop_table(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                &mut self.dml_scratch,
+                d,
+                arena,
+                guc.seq_session(),
+                responder,
+            ),
             Stmt::CreateView {
                 name,
                 persistence,
@@ -22756,7 +22802,8 @@ impl Engine {
             | crate::storage::AccessClass::Extension
             | crate::storage::AccessClass::Database
             | crate::storage::AccessClass::LargeObject
-            | crate::storage::AccessClass::Language => {
+            | crate::storage::AccessClass::Language
+            | crate::storage::AccessClass::BuiltinRoutine => {
                 return Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "unsupported extension member class"
@@ -25259,6 +25306,9 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
                 .restore_parameter_acl_pending(prior)
                 .expect("transaction owns its parameter ACL undo");
         }
+        DdlUndo::BuiltinRoutineChanged { slot, prior } => {
+            storage.restore_builtin_routine_pending(slot, prior);
+        }
         DdlUndo::CommentSet { slot, prior } => {
             storage.restore_comment_pending(slot as usize, prior);
         }
@@ -26541,6 +26591,25 @@ fn apply_wal_op(
             let database = crate::storage::DatabaseOid::parse(oid)
                 .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL database scope"))?;
             storage.select_database(database)?;
+        }
+        WalOp::SetBuiltinRoutine {
+            database,
+            routine,
+            image,
+        } => {
+            let database = crate::storage::DatabaseOid::parse(database).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "corrupt WAL built-in routine database"
+                )
+            })?;
+            let attributes = image.materialize(routine).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "corrupt WAL built-in routine image"
+                )
+            })?;
+            storage.replay_builtin_routine_attributes(database, routine, attributes)?;
         }
         WalOp::SetPartitionTrigger { expected, image } => {
             storage.install_partition_trigger_image(expected, image, 0)?;
@@ -28696,25 +28765,17 @@ fn apply_wal_op(
                     "journal extension does not exist"
                 )
             })?;
-            let object = if class == crate::storage::AccessClass::Routine {
-                storage.routine_slot_by_oid(object_oid, 0).map(|slot| {
-                    crate::storage::AccessObject {
-                        class,
-                        slot: slot as u16,
-                    }
-                })
-            } else {
-                storage.resolve_access_object(class, schema, name, 0)
-            }
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "journal extension dependency target {}.{} (class {}) does not exist",
-                    schema,
-                    name,
-                    class as u8
-                )
-            })?;
+            let object = storage
+                .resolve_recorded_access_object(class, object_oid, schema, name, 0)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "journal extension dependency target {}.{} (class {}) does not exist",
+                        schema,
+                        name,
+                        class as u8
+                    )
+                })?;
             let (slot, _) =
                 storage.change_extension_dependency(extension, object, kind, exists, 0)?;
             storage.commit_extension_dependency(slot, 0);
@@ -29012,20 +29073,15 @@ fn apply_wal_op(
                     class
                 )
             })?;
-            let object = (if class == crate::storage::AccessClass::Routine {
-                storage
-                    .routine_slot_by_oid(object_oid, 0)
-                    .map(Storage::routine_access_object)
-            } else {
-                storage.resolve_access_object(class, schema, name, 0)
-            })
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "WAL ownership target \"{}\" does not exist",
-                    name
-                )
-            })?;
+            let object = storage
+                .resolve_recorded_access_object(class, object_oid, schema, name, 0)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "WAL ownership target \"{}\" does not exist",
+                        name
+                    )
+                })?;
             let owner = storage.find_role(owner).ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -29110,13 +29166,8 @@ fn apply_wal_op(
                     class
                 )
             })?;
-            let object = if class == crate::storage::AccessClass::Routine {
-                storage
-                    .routine_slot_by_oid(object_oid, 0)
-                    .map(Storage::routine_access_object)
-            } else {
-                storage.resolve_access_object(class, schema, name, 0)
-            };
+            let object =
+                storage.resolve_recorded_access_object(class, object_oid, schema, name, 0)?;
             let Some(object) = object else {
                 if privileges.0 == 0 {
                     storage.set_lsn(lsn);

@@ -101,7 +101,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
                     && (self.scope.using_alias(name).is_some()
                         || self.scope.table_index(name).is_ok()) =>
             {
-                Some(self.scope.func_scalar_type(name).unwrap_or(ColType::Record))
+                self.scope.whole_row_type(name)
             }
             Err(_) => None,
         }
@@ -145,12 +145,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     }
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
-        self.scope.qualified_star_columns(table).ok()?;
-        Some(
-            self.scope
-                .func_scalar_type(table)
-                .unwrap_or(ColType::Record),
-        )
+        self.scope.whole_row_type(table)
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
@@ -456,7 +451,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
                     && qualifier.is_none()
                     && (self.0.using_alias(name).is_some() || self.0.table_index(name).is_ok()) =>
             {
-                Some(self.0.func_scalar_type(name).unwrap_or(ColType::Record))
+                self.0.whole_row_type(name)
             }
             Err(_) => None,
         }
@@ -495,8 +490,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
     }
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
-        self.0.qualified_star_columns(table).ok()?;
-        Some(self.0.func_scalar_type(table).unwrap_or(ColType::Record))
+        self.0.whole_row_type(table)
     }
 }
 

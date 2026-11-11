@@ -1,0 +1,16 @@
+CREATE TABLE pa_plain(a integer);
+CREATE TABLE pa_tree(a integer) PARTITION BY RANGE (a);
+CREATE TABLE pa_branch PARTITION OF pa_tree FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (a);
+CREATE TABLE pa_leaf PARTITION OF pa_branch FOR VALUES FROM (0) TO (5);
+SELECT pg_partition_ancestors('pa_plain');
+SELECT pg_partition_root('pa_plain') IS NULL;
+SELECT pg_partition_ancestors('pa_leaf'), pg_partition_root('pa_leaf');
+SELECT relid, pg_typeof(relid) FROM pg_partition_ancestors('pa_branch'::regclass);
+SELECT conname FROM pg_constraint WHERE confrelid IN (SELECT pg_catalog.pg_partition_ancestors('pa_leaf') UNION ALL VALUES ('pa_leaf'::pg_catalog.regclass));
+SELECT * FROM pg_partition_ancestors(0);
+CREATE TABLE pa_twig PARTITION OF pa_tree FOR VALUES FROM (10) TO (20);
+SELECT relid, parentrelid, isleaf, level FROM pg_partition_tree('pa_tree');
+SELECT pg_partition_tree('pa_branch');
+SELECT count(*) FROM pg_partition_tree('pa_plain');
+SELECT * FROM pg_partition_tree(0);
+DROP TABLE pa_tree, pa_plain;

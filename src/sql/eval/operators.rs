@@ -2287,6 +2287,30 @@ fn row_compare<'a>(
     }
 }
 
+/// PostgreSQL's `record_eq`/`record_lt` family for composite-typed values.
+fn record_compare<'a>(
+    operator: BinaryOp,
+    a: &[RecordField<'a>],
+    b: &[RecordField<'a>],
+) -> Result<Datum<'a>, SqlError> {
+    use BinaryOp::*;
+    if a.len() != b.len() {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "cannot compare record types with different numbers of columns"
+        ));
+    }
+    let ordering = compare_datums(&Datum::Record(a), &Datum::Record(b))?;
+    Ok(Datum::Bool(match operator {
+        Eq => ordering.is_eq(),
+        NotEq => !ordering.is_eq(),
+        Lt => ordering.is_lt(),
+        LtEq => ordering.is_le(),
+        Gt => ordering.is_gt(),
+        _ => ordering.is_ge(),
+    }))
+}
+
 /// SQL equality as the membership tests (`IN`, `NOT IN`) need it: three-valued,
 /// returning `None` for unknown. Rows go through [`row_compare`], so a NULL
 /// *inside* a row makes the membership unknown; `compare_datums` alone gives
@@ -2296,10 +2320,17 @@ pub(crate) fn membership_eq<'a>(l: &Datum<'a>, r: &Datum<'a>) -> Result<Option<b
         return Ok(None);
     }
     if let (
-        Datum::Record(a) | Datum::Composite { fields: a, .. },
+        Datum::Composite { fields: a, .. },
         Datum::Record(b) | Datum::Composite { fields: b, .. },
-    ) = (l, r)
+    )
+    | (Datum::Record(a), Datum::Composite { fields: b, .. }) = (l, r)
     {
+        return Ok(match record_compare(BinaryOp::Eq, a, b)? {
+            Datum::Bool(equal) => Some(equal),
+            _ => None,
+        });
+    }
+    if let (Datum::Record(a), Datum::Record(b)) = (l, r) {
         return Ok(match row_compare(BinaryOp::Eq, a, b)? {
             Datum::Bool(equal) => Some(equal),
             _ => None,
@@ -2845,10 +2876,17 @@ pub(crate) fn binary<'a>(
             // Row comparison uses PostgreSQL's three-valued, short-circuiting
             // semantics (NULL-propagating), distinct from the total order that
             // `compare_datums` gives ORDER BY / DISTINCT.
+            // A composite-typed operand compares with the record btree
+            // operators: NULL fields are equal to each other and sort last,
+            // so the result is never unknown.
             (
-                Datum::Record(a) | Datum::Composite { fields: a, .. },
+                Datum::Composite { fields: a, .. },
                 Datum::Record(b) | Datum::Composite { fields: b, .. },
-            ) => row_compare(operator, a, b),
+            )
+            | (Datum::Record(a), Datum::Composite { fields: b, .. }) => {
+                record_compare(operator, a, b)
+            }
+            (Datum::Record(a), Datum::Record(b)) => row_compare(operator, a, b),
             _ => compare(operator, l, r, l_unknown, r_unknown),
         },
         Add | Sub

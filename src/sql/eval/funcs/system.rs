@@ -1674,10 +1674,33 @@ pub(crate) fn dispatch<'a>(
                     cat, oid, arena,
                 )?))
             }
-            "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => {
+            "pg_partition_root" => {
                 arity(1)?;
-                eval_full(args[0], arena, params, row, hooks)
+                let Some(cat) = hooks.catalog else {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "pg_partition_root requires catalog access"
+                    ));
+                };
+                let relation = super::super::regobject_cast(
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    ColType::Regclass,
+                    Some(cat),
+                    arena,
+                )?;
+                let Some(oid) = relation.catalog_oid() else {
+                    return Ok(Datum::Null);
+                };
+                Ok(cat
+                    .partition_ancestors(oid as i32, arena)?
+                    .last()
+                    .copied()
+                    .unwrap_or(Datum::Null))
             }
+            "pg_partition_ancestors" | "pg_partition_tree" => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "set-valued function called in context that cannot accept a set"
+            )),
             _ if predicate == Some(CatalogPredicateKind::Privilege) => {
                 let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
                 let Some(cat) = hooks.catalog else {
@@ -2066,8 +2089,16 @@ pub(crate) fn dispatch<'a>(
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                let pretty = match args.get(1) {
+                    Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Bool(pretty) => pretty,
+                        _ => false,
+                    },
+                    None => false,
+                };
                 Ok(cat
-                    .constraint_def(oid, arena)?
+                    .constraint_def_pretty(oid, pretty, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2116,8 +2147,21 @@ pub(crate) fn dispatch<'a>(
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                let pretty = match args.get(1) {
+                    Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
+                        Datum::Bool(pretty) => pretty,
+                        Datum::Null => return Ok(Datum::Null),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(
+                                "pg_get_triggerdef",
+                                &other,
+                            ));
+                        }
+                    },
+                    None => false,
+                };
                 Ok(cat
-                    .trigger_def(oid, arena)?
+                    .trigger_def(oid, pretty, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2313,8 +2357,25 @@ pub(crate) fn dispatch<'a>(
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                // `pretty` is a boolean, or a wrap column that implies it.
+                let (pretty, wrap_column) = match args.get(1) {
+                    Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Bool(pretty) => (pretty, 0),
+                        value => match super::super::cast_to(value, ColType::Int4, arena)? {
+                            Datum::Int4(wrap_column) => (true, wrap_column),
+                            other => {
+                                return Err(crate::sql::eval::function_argument_mismatch(
+                                    "pg_get_viewdef",
+                                    &other,
+                                ));
+                            }
+                        },
+                    },
+                    None => (false, 0),
+                };
                 Ok(cat
-                    .view_def(oid, arena)?
+                    .view_def_pretty(oid, pretty, wrap_column, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2477,10 +2538,14 @@ pub(crate) fn dispatch<'a>(
                         None => -1,
                     },
                 };
-                let type_mod = match eval_full(args[1], arena, params, row, hooks)? {
+                let modifier = eval_full(args[1], arena, params, row, hooks)?;
+                // A NULL modifier means "no modifier", not a NULL result. An
+                // explicit -1 still marks the modifier as given, which makes
+                // PostgreSQL spell unconstrained `character` as `bpchar`.
+                let modifier_given = !modifier.is_null();
+                let type_mod = match modifier {
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
-                    // A NULL modifier means "no modifier", not a NULL result.
                     _ => -1,
                 };
                 if let Some(cat) = hooks.catalog
@@ -2498,7 +2563,11 @@ pub(crate) fn dispatch<'a>(
                     ColType::Array(element) => (element.to_coltype(), true),
                     scalar => (scalar, false),
                 };
-                let name = base.name();
+                let name = if base == ColType::Bpchar && modifier_given && type_mod < 0 {
+                    "bpchar"
+                } else {
+                    base.name()
+                };
                 // Array typmods describe their elements. Render the base under
                 // that modifier, then attach [] as PostgreSQL does.
                 let mut text = match TypeMod::decode(base, type_mod) {

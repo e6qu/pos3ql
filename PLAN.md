@@ -299,18 +299,33 @@ order and startup limits hold throughout. The
 **Work:** audit PostgreSQL 18 built-in functions by signature and executed
 behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
-unsupported case into an explicit error. Known gaps: `ALTER`, `COMMENT ON`
-and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
-with `0A000` where PostgreSQL changes the catalog entry; `information_schema`
-domains such as `cardinal_number` do not exist. A SQL function whose earlier
+unsupported case into an explicit error. Known gaps: changing `STRICT`,
+`SECURITY` or `SET` of a built-in function, or renaming or moving one, fails
+with `0A000` where PostgreSQL changes the catalog entry; a revoked built-in
+`EXECUTE` is not checked for the function behind an operator (`1 + 1` after
+`REVOKE EXECUTE ON FUNCTION int4pl(integer, integer) FROM PUBLIC`);
+`DROP ROLE` reports dependent objects without PostgreSQL's `DETAIL` list
+(`owner of function lower(text)`); built-in functions have no
+`pg_description` text of their own (`obj_description('lower(text)'::regprocedure)`
+is NULL where PostgreSQL returns `lowercase`). A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final
-statement runs. Expressions are shown as stored, not deparsed: `pg_get_expr`,
-`pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
-`text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
-the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
-than one deparsed statement per line. Errors in a client's query report
+statement runs. Column defaults, CHECK constraints, routine parameter defaults
+`RETURN` bodies, index predicates, trigger `WHEN` conditions and rule
+conditions are printed in PostgreSQL's analyzed form (`'x'::text`,
+`((k >= 1) AND (k <= 5))`), but only for literals, columns, parameters,
+operators, `IN`, `LIKE`, `IS NULL`, `CASE`, casts, SQL value functions and
+built-in function calls; other expressions (subqueries, user-defined function
+calls, `$n` parameters, array constructors, whole-row references and `IS
+DISTINCT FROM`) are still printed as stored. `pg_get_viewdef` uses PostgreSQL's
+layout, including its wrap column, only for a view
+over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
+comma or `USING` joins, subqueries or set operations; other views return their
+query text. A `BEGIN ATOMIC` body is printed as written rather than one
+deparsed statement per line, and `pg_get_function_sqlbody` returns NULL for
+it; rule actions (`DO INSERT ...`) are printed as written, and their pretty
+form fails with `0A000`; policy expressions are not deparsed. Errors in a client's query report
 PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
 caret) for syntax errors and for unknown relations, columns, types, functions
 and operators, failed constant input and non-boolean conditions, except a
@@ -353,10 +368,19 @@ RETURNING` a non-JSON, non-string type are rejected with `0A000`.
 A SQL-language procedure called from a trigger fired inside a write (a BEFORE
 row trigger, a deferred constraint trigger at `COMMIT`) runs queries, data
 changes and nested `CALL`, but rejects DDL and other utility statements with
-`0A000` because that trigger runs without the engine's utility executor. A
-table's or view's row type cannot
-appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
-where PostgreSQL accepts it. The
+`0A000` because that trigger runs without the engine's utility executor.
+Relation row types: values and columns of a
+view's row type, and dropping a relation through `DROP SCHEMA`, `DROP
+MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
+column uses its row type, fail with `0A000`; a `DROP TABLE ... CASCADE` that
+reaches both columns and routines, or names several tables, reports one notice
+per table or dependency kind where PostgreSQL reports one for the statement, and a routine's dependency on a row type is described as depending on the
+table. Values and columns of a view's row type need the view's column types,
+which pos3ql derives from the view's query on each use instead of storing them
+as PostgreSQL's `pg_attribute` rows do. In a SQL-language function, `o.note`
+for a composite parameter `o` fails with `42P01` (`(o).note` works): the
+reference must fall back from a column to the parameter's field in every typing
+pass, as PostgreSQL's `sql_fn_post_column_ref` does. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

@@ -10,23 +10,28 @@ use crate::mem::mutex::Mutex;
 mod array_element_comparisons;
 mod builtin_aggregate_resolution;
 mod builtin_argument_binding;
+mod builtin_routine_changes;
+mod builtin_routine_comments;
 mod canonical_sequences;
 mod catalog_identity_lookup;
 mod client_catalog;
 mod compatibility_diagnostics;
 mod constraint_index_identity;
 mod cursor_execution;
+mod deparsed_expressions;
 mod error_report_fields;
 mod foreign_parent_admission;
 mod function_progress;
 mod geometric_casts;
 mod geometry_assignments;
 mod index_parent_ownership;
+mod information_schema_domains;
 mod key_preparation;
 mod nested_planner_inputs;
 pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
+mod partition_ancestry;
 mod polymorphic_resolution;
 mod prepared_object_capacity;
 mod prepared_parameter_types;
@@ -35,6 +40,7 @@ mod procedural_progress;
 mod procedural_subtransactions;
 mod procedure_progress;
 mod query_execution;
+mod relation_row_types;
 mod result_streams;
 mod routine_calls;
 mod routine_identity_diagnostics;
@@ -47,6 +53,7 @@ mod sequence_inheritance;
 mod shared_row_capacity;
 mod shared_row_work;
 mod shared_statistics;
+mod special_datetime_inputs;
 mod sql_function_results;
 mod stored_relation_sources;
 mod table_metadata_capacity;
@@ -76406,7 +76413,16 @@ fn publication_row_filters_reject_nonimmutable_functions_at_ddl_time() {
          CREATE PUBLICATION publication_filter_volatile_pub \
            FOR TABLE publication_filter_volatile WHERE (random() > 0)",
     );
-    assert!(String::from_utf8_lossy(&output).contains("42P17"));
+    assert_eq!(error_sqlstates(&output), ["0A000"]);
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("invalid publication WHERE expression"),
+        "{text}"
+    );
+    assert!(
+        text.contains("User-defined or built-in mutable functions are not allowed."),
+        "{text}"
+    );
 }
 
 #[test]
@@ -79863,7 +79879,7 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
              FROM pg_index WHERE indexrelid = 'lifecycle_value_idx'::regclass",
         )),
         [
-            "CREATE INDEX lifecycle_value_idx ON ONLY public.lifecycle_root USING btree (id, value COLLATE \"C\" DESC NULLS LAST) INCLUDE (payload) WITH (fillfactor='80', deduplicate_items=off) WHERE id >= 0",
+            "CREATE INDEX lifecycle_value_idx ON ONLY public.lifecycle_root USING btree (id, value COLLATE \"C\" DESC NULLS LAST) INCLUDE (payload) WITH (fillfactor='80', deduplicate_items=off) WHERE (id >= 0)",
             "t|t|t|0 950|1978 3126|0 1",
         ]
     );

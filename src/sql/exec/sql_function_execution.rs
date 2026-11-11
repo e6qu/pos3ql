@@ -208,12 +208,54 @@ impl SqlResult {
                 Ok(())
             }
             Self::Rows(rows) => {
-                let width =
-                    if matches!(source.kind, crate::storage::RoutineKind::SetFunction { .. }) {
-                        1
-                    } else {
-                        source.columns.len()
-                    };
+                let set_function =
+                    matches!(source.kind, crate::storage::RoutineKind::SetFunction { .. });
+                // A set of composite values takes each row's columns as the
+                // fields unless the row is one value of that composite type.
+                if set_function
+                    && let ColType::Composite(Some(creation)) = source.return_type.ctype
+                    && !matches!(values, [Datum::Composite { slot, .. } | Datum::CompositeText { slot, .. }] if *slot == creation)
+                    && !matches!(values, [Datum::Null])
+                {
+                    let width = storage
+                        .require_row_type_definition(creation, txid)?
+                        .active_field_count();
+                    if values.len() != width {
+                        return Err(query::routine_result_width_mismatch(
+                            source.declared_result(storage, txid, arena)?,
+                            false,
+                            values.len(),
+                            width,
+                        ));
+                    }
+                    let fields = arena
+                        .alloc_slice_with(values.len(), |index| crate::sql::types::RecordField {
+                            name: "",
+                            type_oid: values[index].type_oid(),
+                            value: values[index],
+                        })
+                        .map_err(|_| query::arena_full_pub())?;
+                    for field in fields.iter_mut() {
+                        field.value = detach_routine_datum(field.value, arena)?;
+                    }
+                    let converted = arena
+                        .alloc_slice_with(1, |_| Datum::Null)
+                        .map_err(|_| query::arena_full_pub())?;
+                    converted[0] = coerce_routine_argument(
+                        Datum::Record(fields),
+                        source.return_type,
+                        storage,
+                        txid,
+                        arena,
+                        Some(sequences),
+                    )?;
+                    return rows.append(converted);
+                }
+                let width = if set_function {
+                    1
+                } else {
+                    source.columns.len()
+                };
                 if values.len() != width {
                     return Err(query::routine_result_width_mismatch(
                         source.declared_result(storage, txid, arena)?,

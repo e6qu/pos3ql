@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 26;
+pub(crate) const RECORD_VERSION: u8 = 27;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -119,6 +119,7 @@ wal_record_kinds! {
 /// create-and-remove sequences that leave no live catalog row.
     KIND_CATALOG_RESERVATION = 157;
     KIND_SET_PARTITION_TRIGGER = 158;
+    KIND_SET_BUILTIN_ROUTINE = 159;
 // Publication records carry the typed ordinary-descendant selection added
 // after the original record layout. New kinds make older bytes fail recovery
 // loudly instead of being reinterpreted as a different catalog contract.
@@ -264,6 +265,7 @@ const NO_DOMAIN_BASE_CREATION: u32 = 0;
 fn access_class_has_oid(class: u8) -> bool {
     class == crate::storage::AccessClass::Routine as u8
         || class == crate::storage::AccessClass::LargeObject as u8
+        || class == crate::storage::AccessClass::BuiltinRoutine as u8
 }
 
 fn table_needs_typed_journal<B: DefinitionBacking>(def: &TableDefinition<B>) -> bool {
@@ -675,6 +677,67 @@ pub(crate) enum WalExtendedStatisticsKey<'a> {
 
 impl WalExtendedStatisticsKey<'_> {
     pub(crate) const EMPTY: Self = Self::Column("");
+}
+
+/// A built-in routine's changeable `pg_proc` attributes: five attribute
+/// bytes, then cost and rows as IEEE-754 bits.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WalBuiltinRoutineImage<'a> {
+    Captured(&'a crate::storage::BuiltinRoutineAttributes),
+    Encoded(&'a [u8]),
+}
+
+const BUILTIN_ROUTINE_IMAGE_BYTES: usize = 5 + 8 + 8;
+
+impl WalBuiltinRoutineImage<'_> {
+    fn encoded_len(self) -> usize {
+        BUILTIN_ROUTINE_IMAGE_BYTES
+    }
+
+    fn append(self, buffer: &mut FixedBuf) -> bool {
+        match self {
+            Self::Captured(image) => {
+                let attributes = image.attributes;
+                buffer.append(&[
+                    u8::from(attributes.strict),
+                    attributes.volatility.code(),
+                    attributes.parallel.code(),
+                    u8::from(attributes.security_definer),
+                    u8::from(attributes.leakproof),
+                ]) && buffer.append(&image.cost().to_bits().to_le_bytes())
+                    && buffer.append(&image.rows().to_bits().to_le_bytes())
+            }
+            Self::Encoded(bytes) => buffer.append(bytes),
+        }
+    }
+
+    /// Parses and validates the image for `routine`; `None` for any malformed
+    /// byte.
+    pub(crate) fn materialize(
+        self,
+        routine: crate::storage::BuiltinRoutineOid,
+    ) -> Option<crate::storage::BuiltinRoutineAttributes> {
+        let bytes = match self {
+            Self::Captured(image) => return Some(*image),
+            Self::Encoded(bytes) => bytes,
+        };
+        let flag = |byte: u8| match byte {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        };
+        let fixed: &[u8; BUILTIN_ROUTINE_IMAGE_BYTES] = bytes.try_into().ok()?;
+        let attributes = crate::storage::RoutineAttributes {
+            strict: flag(fixed[0])?,
+            volatility: crate::storage::RoutineVolatility::from_code(fixed[1])?,
+            parallel: crate::storage::RoutineParallel::from_code(fixed[2])?,
+            security_definer: flag(fixed[3])?,
+            leakproof: flag(fixed[4])?,
+            cost_bits: Some(u64::from_le_bytes(fixed[5..13].try_into().ok()?)),
+            rows_bits: Some(u64::from_le_bytes(fixed[13..21].try_into().ok()?)),
+        };
+        crate::storage::BuiltinRoutineAttributes::new(routine, attributes).ok()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2223,6 +2286,13 @@ pub(crate) enum WalOp<'a> {
         expected: Option<crate::storage::ParameterAclOid>,
         image: Option<crate::storage::ParameterAclImage<'a>>,
     },
+    /// The complete committed attribute image of a built-in routine's row in
+    /// one database. Owner and privileges use the object owner and ACL kinds.
+    SetBuiltinRoutine {
+        database: i32,
+        routine: crate::storage::BuiltinRoutineOid,
+        image: WalBuiltinRoutineImage<'a>,
+    },
     PreparedCatalogRow {
         relation: crate::storage::CatalogRelationIdentity,
         row: crate::storage::HistoricalCatalogRow<'a>,
@@ -3266,6 +3336,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::ReserveCatalogSequence(_) => KIND_CATALOG_RESERVATION,
         WalOp::SetPartitionTrigger { .. } => KIND_SET_PARTITION_TRIGGER,
         WalOp::SetParameterAcl { .. } => KIND_SET_PARAMETER_ACL,
+        WalOp::SetBuiltinRoutine { .. } => KIND_SET_BUILTIN_ROUTINE,
         WalOp::PreparedCatalogRow { .. } => KIND_PREPARED_CATALOG_ROW,
         WalOp::SetRelationIndexHint { .. } => KIND_SET_RELATION_INDEX_HINT,
     }
@@ -4540,6 +4611,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             .saturating_add(row.key.len())
             .saturating_add(row.before.map_or(0, |image| image.bytes.len())),
         WalOp::SetRelationIndexHint { .. } => crate::storage::CatalogPosition::ENCODED_BYTES + 1,
+        WalOp::SetBuiltinRoutine { image, .. } => 4 + 4 + image.encoded_len(),
     }
 }
 
@@ -6766,6 +6838,15 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             position,
             has_index,
         } => buffer.append(&position.encode()) && buffer.append(&[u8::from(*has_index)]),
+        WalOp::SetBuiltinRoutine {
+            database,
+            routine,
+            image,
+        } => {
+            buffer.append(&database.to_le_bytes())
+                && buffer.append(&routine.get().to_le_bytes())
+                && image.append(buffer)
+        }
         WalOp::PreparedCatalogRow { relation, row } => {
             let Ok(key_length) = u32::try_from(row.key.len()) else {
                 return false;
@@ -12171,6 +12252,20 @@ fn decode_op_inner<'a>(
                 image,
             })
         }),
+        KIND_SET_BUILTIN_ROUTINE => decode_large_op(|| {
+            let database = i32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+            crate::storage::DatabaseOid::parse(database)?;
+            let routine = crate::storage::BuiltinRoutineOid::parse(i32::from_le_bytes(
+                payload.get(4..8)?.try_into().ok()?,
+            ))?;
+            let image = WalBuiltinRoutineImage::Encoded(payload.get(8..)?);
+            image.materialize(routine)?;
+            Some(WalOp::SetBuiltinRoutine {
+                database,
+                routine,
+                image,
+            })
+        }),
         KIND_SET_RELATION_INDEX_HINT => decode_large_op(|| {
             let position = crate::storage::CatalogPosition::decode(payload.get(..10)?)?;
             if payload.len() != 11 {
@@ -14636,6 +14731,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn builtin_routine_codec_keeps_database_routine_and_fixed_attributes() {
+        use crate::storage::{BuiltinRoutineAttributes, BuiltinRoutineOid, RoutineVolatility};
+        let lower = BuiltinRoutineOid::parse(870).unwrap();
+        let mut attributes = BuiltinRoutineAttributes::catalog(lower).attributes;
+        attributes.volatility = RoutineVolatility::Stable;
+        attributes.cost_bits = Some(5.0f64.to_bits());
+        let image = BuiltinRoutineAttributes::new(lower, attributes).unwrap();
+        let operation = WalOp::SetBuiltinRoutine {
+            database: 5,
+            routine: lower,
+            image: WalBuiltinRoutineImage::Captured(&image),
+        };
+        let mut bytes = [0; 256];
+        let payload = encode_catalog_operation(&operation, &mut bytes);
+        let Some(WalOp::SetBuiltinRoutine {
+            database,
+            routine,
+            image: decoded,
+        }) = decode_op(KIND_SET_BUILTIN_ROUTINE, payload)
+        else {
+            panic!("built-in routine row did not round trip");
+        };
+        assert_eq!((database, routine), (5, lower));
+        assert_eq!(decoded.materialize(lower), Some(image));
+        let mut invalid = [0; 256];
+        invalid[..payload.len()].copy_from_slice(payload);
+        // Strictness is fixed for built-ins; a flipped flag is corruption.
+        invalid[8] = 0;
+        assert!(decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len()]).is_none());
+        invalid[..payload.len()].copy_from_slice(payload);
+        invalid[4..8].copy_from_slice(&16_384i32.to_le_bytes());
+        assert!(decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len()]).is_none());
+        assert!(decode_op(KIND_SET_BUILTIN_ROUTINE, &payload[..payload.len() - 1]).is_none());
     }
 
     #[test]

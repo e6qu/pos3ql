@@ -45,6 +45,15 @@ Schemas and catalogs:
   `0A000` and is never redirected to `public`. Tables, views, sequences, and
   composite types in `pg_catalog` or `pg_toast` keep PostgreSQL's `42501`;
   missing CREATE permission is also `42501`.
+- `information_schema`'s domains (`cardinal_number`, `character_data`,
+  `sql_identifier`, `time_stamp`, `yes_or_no`) exist as in PostgreSQL: its view
+  columns have those types (`pg_typeof(table_name)` is
+  `information_schema.sql_identifier`; the wire type is the base type), casts
+  and table columns check them (`(-1)::information_schema.cardinal_number`
+  fails with `23514`), and `pg_type`, `pg_constraint` and the domain views list
+  them. Arrays of these domains work the same way:
+  `'{-1}'::information_schema.cardinal_number[]` fails with `23514`, and an
+  element of such an array has the domain's type.
 - `information_schema` views can be queried, but their relation OIDs cannot:
   `'information_schema.columns'::regclass` and `to_regclass(...)` fail with
   `0A000` (`relation OIDs for information_schema views are not supported`).
@@ -152,7 +161,36 @@ Syntax and errors:
   from a jsonb NULL (`INSERT INTO t (j['x']) VALUES ('1')` stores
   `{"x": 1}`).
 
+Row types:
+
+- Every table, partitioned table, foreign table, materialized view and view has
+  a row type named like the relation. `ROW(1, 'a')::orders`, `'(1,a)'::orders`,
+  `orders[]`, whole-row references (`SELECT o FROM orders o` has type
+  `orders`), routine parameters and results (`RETURNS SETOF orders`) and table
+  columns (`CREATE TABLE archive(o orders)`) behave as in PostgreSQL. A routine
+  or column using the row type blocks `DROP TABLE orders`; `CASCADE` drops the
+  routine or column. Comparing two composite values uses PostgreSQL's record
+  ordering, so `ROW(1, NULL)::orders = ROW(1, NULL)::orders` is true.
+- While a column uses the row type, `ALTER TABLE orders ADD COLUMN ... DEFAULT`
+  and `ALTER COLUMN ... TYPE` fail with `0A000` as in PostgreSQL. Dropping the
+  relation through `DROP SCHEMA ... CASCADE` or `DROP MATERIALIZED VIEW`, or a
+  `DROP FOREIGN TABLE ... CASCADE`, while another schema's column uses its row
+  type fails with `0A000` instead of dropping that column.
+- Values and columns of a view's row type are rejected with `0A000`; routine
+  signatures may name it.
+
 Functions and expressions:
+
+- `pg_get_expr`, `pg_get_constraintdef`, `pg_get_function_arguments` and
+  `pg_get_functiondef` print column defaults, CHECK constraints, parameter
+  defaults and `RETURN` bodies as PostgreSQL does: `DEFAULT 'x'` on a `text`
+  column is shown as `'x'::text`, and `CHECK (v <> '')` on a `varchar` column as
+  `CHECK (((v)::text <> ''::text))`. `pg_get_viewdef` uses PostgreSQL's
+  indented layout for views over plain tables joined with `ON`. Pretty output
+  (`pg_get_constraintdef(oid, true)`, as psql's `\d` uses) drops redundant
+  parentheses as PostgreSQL does. Expressions outside the deparser's typed
+  coverage and other views keep their stored spelling
+  (see [PLAN](../PLAN.md#close-application-compatibility-gaps)).
 
 - Named arguments and omitted defaults run in declared input order and share
   the caller's session, so a default calling `nextval('order_numbers')` updates
@@ -213,10 +251,22 @@ Functions and expressions:
   `COMMENT ON` and `GRANT` quote for a routine they cannot find, such as
   `function f(integer) does not exist`. Messages up to 100 arguments of
   schema-qualified type names fit; a longer one fails with `54000`.
-- Built-in functions cannot be changed: `ALTER FUNCTION lower(text) STABLE`,
-  `COMMENT ON FUNCTION lower(text)` and `GRANT EXECUTE ON FUNCTION
-  lower(text)` fail with `0A000`. Dropping one fails with `2BP01`, as in
-  PostgreSQL.
+- Each database has its own copy of a built-in function's catalog row, as in
+  PostgreSQL. `ALTER FUNCTION lower(text) STABLE` changes volatility,
+  `PARALLEL`, `LEAKPROOF`, `COST`, `ROWS` and `OWNER TO` in the current
+  database only; `pg_proc` shows the change, and a generated column or
+  publication row filter then rejects a function marked stable or volatile. `REVOKE EXECUTE ON FUNCTION md5(text) FROM PUBLIC` makes a
+  later `SELECT md5('a')` fail with `42501` for roles without a grant, and
+  `GRANT`, `has_function_privilege`, `proacl` and psql's `\df+` follow
+  PostgreSQL. Changes survive restart and are copied by `CREATE DATABASE ...
+  TEMPLATE`. Each changed routine uses one of the `max_builtin_routine_entries`
+  rows (default 64); running out fails with `54000`. Limits: changing
+  `STRICT`, `SECURITY` or `SET`/`RESET` settings of a built-in, and renaming
+  or moving one, fail with `0A000`, because pos3ql runs built-ins through
+  fixed implementations; a revoked `EXECUTE` is checked for function calls
+  but not for the function behind an operator (`1 + 1` still runs after
+  `REVOKE EXECUTE ON FUNCTION int4pl(integer, integer) FROM PUBLIC`).
+  Dropping a built-in fails with `2BP01`, as in PostgreSQL.
 - Array and `CASE` result types follow declarations, including subqueries and
   nulls: `ARRAY[(SELECT NULL::date)]` is `date[]`; mixing integer and bigint
   gives `bigint[]`; an empty constructor needs a type (`ARRAY[]::integer[]`).

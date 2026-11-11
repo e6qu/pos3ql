@@ -6373,15 +6373,24 @@ impl Expr<'_> {
     /// (PostgreSQL requires immutability, 42P17). Every other function is treated
     /// as immutable.
     pub fn contains_nonimmutable_function(&self) -> Option<&str> {
-        self.find_function(is_nonimmutable_function)
+        self.find_function(&is_nonimmutable_function)
+    }
+
+    /// As [`Self::contains_nonimmutable_function`], also treating a function
+    /// as non-immutable when `changed` reports that the database altered it.
+    pub fn contains_nonimmutable_function_with(
+        &self,
+        changed: &dyn Fn(&str) -> bool,
+    ) -> Option<&str> {
+        self.find_function(&|name| is_nonimmutable_function(name) || changed(name))
     }
 
     /// The volatile subset relevant to PostgreSQL's CTE inlining rule.
     pub fn contains_volatile_function(&self) -> Option<&str> {
-        self.find_function(is_volatile_function)
+        self.find_function(&is_volatile_function)
     }
 
-    fn find_function(&self, matches: fn(&str) -> bool) -> Option<&str> {
+    fn find_function(&self, matches: &dyn Fn(&str) -> bool) -> Option<&str> {
         match self {
             Expr::Call { name, args, .. } => {
                 if matches(name) {

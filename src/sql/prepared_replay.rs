@@ -780,6 +780,31 @@ pub(super) fn stage_catalog_record(
             })?;
             transaction.record_catalog_change(storage, DdlUndo::LargeObjectDropped(slot as u32))?;
         }
+        WalOp::SetBuiltinRoutine {
+            database,
+            routine,
+            image,
+        } => {
+            let database = crate::storage::DatabaseOid::parse(database)
+                .filter(|database| *database == storage.current_database_oid())
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "prepared built-in routine belongs to another database"
+                    )
+                })?;
+            let attributes = image.materialize(routine).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "prepared built-in routine image is invalid"
+                )
+            })?;
+            debug_assert_eq!(database, storage.current_database_oid());
+            let slot = storage.ensure_builtin_routine(routine)?;
+            let prior = storage.set_builtin_routine_attributes(slot, attributes, txid)?;
+            transaction
+                .record_catalog_change(storage, DdlUndo::BuiltinRoutineChanged { slot, prior })?;
+        }
         // These records belong to independent maintenance transactions or SQL
         // commands that cannot enter a prepared transaction.
         WalOp::CreateReplicationSlot { .. }
@@ -822,13 +847,7 @@ fn access_object(
 ) -> Result<AccessObject, SqlError> {
     let class = AccessClass::from_u8(class)
         .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "prepared object class is invalid"))?;
-    let object = if class == AccessClass::Routine {
-        storage
-            .routine_slot_by_oid(oid, transaction)
-            .map(Storage::routine_access_object)
-    } else {
-        storage.resolve_access_object(class, schema, name, transaction)
-    };
+    let object = storage.resolve_recorded_access_object(class, oid, schema, name, transaction)?;
     object.ok_or_else(|| {
         sql_err!(
             sqlstate::DATA_EXCEPTION,

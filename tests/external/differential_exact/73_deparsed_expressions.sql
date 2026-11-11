@@ -20,3 +20,6 @@ DROP TABLE dpx_more;
 DROP SEQUENCE dpx_sequence;
 DROP FUNCTION dpx_concat, dpx_test, dpx_math;
 DROP TABLE dpx_defaults, dpx_checks;
+CREATE TABLE dpx_pretty(id integer, b integer, v varchar(5), n numeric, d boolean, k integer CHECK (k BETWEEN 1 AND 5), m text CHECK (m IN ('a', 'b')), o integer CHECK (o IS NOT NULL AND o <> 7), p text CHECK (p LIKE 'x%' OR NOT d), q integer CHECK ((q + 1) * 2 > 3 - (4 - b)), c2 integer CHECK (c2::text <> '1' AND n > 1));
+SELECT conname, pg_get_constraintdef(oid, true), pg_get_expr(conbin, conrelid, true) FROM pg_constraint WHERE conrelid = 'dpx_pretty'::regclass ORDER BY conname;
+DROP TABLE dpx_pretty;

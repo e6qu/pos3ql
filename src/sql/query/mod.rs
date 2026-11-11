@@ -5513,7 +5513,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::index_def_text(self.storage, self.txid, oid, col, pretty, arena)
     }
     fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::constraint_def_text(self.storage, self.txid, oid, arena)
+        super::catalog::constraint_def_text(self.storage, self.txid, oid, false, arena)
+    }
+    fn constraint_def_pretty<'a>(
+        &self,
+        oid: i32,
+        pretty: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::constraint_def_text(self.storage, self.txid, oid, pretty, arena)
     }
     fn partition_ancestors<'a>(
         &self,
@@ -6290,6 +6298,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn view_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         super::catalog::view_def_text(self.storage, self.txid, oid, arena)
+    }
+
+    fn view_def_pretty<'a>(
+        &self,
+        oid: i32,
+        pretty: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::view_def_text_pretty(self.storage, self.txid, oid, pretty, arena)
     }
 
     fn rule_def<'a>(

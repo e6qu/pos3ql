@@ -545,6 +545,8 @@ pub(super) fn deparse<'a>(
                             txid: transaction,
                             table: None,
                             parameters: &[],
+                            joined: &[],
+                            pretty: false,
                         },
                         element,
                         super::deparse::Destination::Assignment(type_oid),
@@ -568,13 +570,15 @@ pub(super) fn deparse<'a>(
         }
         return Ok(Some(display.as_str()));
     }
-    if !pretty {
+    {
         let table = slot.map(|slot| storage.table_def(slot, transaction));
         let context = super::deparse::Context {
             storage,
             txid: transaction,
             table: table.as_deref(),
             parameters: &[],
+            joined: &[],
+            pretty,
         };
         let destination = match destination {
             Some(type_oid) => super::deparse::Destination::Assignment(type_oid),

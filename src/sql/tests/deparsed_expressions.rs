@@ -88,3 +88,61 @@ fn catalog_expressions_print_postgresql_analyzed_forms() {
         ["bpchar|character"]
     );
 }
+
+#[test]
+fn single_table_view_definitions_use_postgresql_layout() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE listed(id integer, a text, b integer); \
+         CREATE VIEW listed_view AS SELECT id, a || 'z' AS az, count(*) AS c FROM listed \
+         WHERE b > 0 GROUP BY id, a ORDER BY id DESC LIMIT 5",
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_viewdef('listed_view'::regclass)"
+        ),
+        [
+            " SELECT id,\n    (a || 'z'::text) AS az,\n    count(*) AS c\n   FROM listed\n  WHERE (b > 0)\n  GROUP BY id, a\n  ORDER BY id DESC\n LIMIT 5;"
+        ]
+    );
+}
+
+#[test]
+fn pretty_definitions_drop_only_redundant_parentheses() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE tidy(b integer, n numeric, v varchar(5), q integer \
+         CHECK ((q + 1) * 2 > 3 - (4 - b)), c integer CHECK (c::text <> '1' AND n > 1)); \
+         CREATE TABLE tidy_notes(id integer, note text); \
+         CREATE VIEW tidy_view AS SELECT t.b, j.note FROM tidy t \
+         JOIN tidy_notes j ON j.id = t.b AND j.note IS NOT NULL WHERE t.b > 0 AND (t.n > 1 OR t.v <> 'x')",
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_constraintdef(oid, true) FROM pg_constraint \
+             WHERE conrelid = 'tidy'::regclass ORDER BY conname"
+        ),
+        [
+            "CHECK (((q + 1) * 2) > (3 - (4 - b)))",
+            "CHECK (c::text <> '1'::text AND n > 1::numeric)",
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_viewdef('tidy_view'::regclass, true)"
+        ),
+        [
+            " SELECT t.b,\n    j.note\n   FROM tidy t\n     JOIN tidy_notes j ON j.id = t.b AND j.note IS NOT NULL\n  WHERE t.b > 0 AND (t.n > 1::numeric OR t.v::text <> 'x'::text);"
+        ]
+    );
+}

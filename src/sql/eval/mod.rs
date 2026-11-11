@@ -2133,6 +2133,15 @@ pub trait CatalogAccess {
     /// The `FOREIGN KEY (...) REFERENCES ...` definition of the constraint with
     /// this OID, or `None` if no such foreign-key constraint is known.
     fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
+    /// `pg_get_constraintdef` with PostgreSQL's pretty-printing flag.
+    fn constraint_def_pretty<'a>(
+        &self,
+        oid: i32,
+        _pretty: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        self.constraint_def(oid, arena)
+    }
     /// A relation and its partition ancestors as regclass values, nearest first.
     fn partition_ancestors<'a>(
         &self,
@@ -2355,6 +2364,15 @@ pub trait CatalogAccess {
     /// Stored SELECT text of a view or materialized view OID.
     fn view_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
+    }
+    /// `pg_get_viewdef` with PostgreSQL's pretty-printing flag.
+    fn view_def_pretty<'a>(
+        &self,
+        oid: i32,
+        _pretty: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        self.view_def(oid, arena)
     }
     fn rule_def<'a>(
         &self,

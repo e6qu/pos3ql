@@ -103,8 +103,11 @@ Functions and expressions:
   `pg_get_functiondef` print column defaults, CHECK constraints, parameter
   defaults and `RETURN` bodies as PostgreSQL does: `DEFAULT 'x'` on a `text`
   column is shown as `'x'::text`, and `CHECK (v <> '')` on a `varchar` column as
-  `CHECK (((v)::text <> ''::text))`. Expressions outside the deparser's typed
-  coverage, `pretty` output and `pg_get_viewdef` keep their stored spelling
+  `CHECK (((v)::text <> ''::text))`. `pg_get_viewdef` uses PostgreSQL's
+  indented layout for views over plain tables joined with `ON`. Pretty output
+  (`pg_get_constraintdef(oid, true)`, as psql's `\d` uses) drops redundant
+  parentheses as PostgreSQL does. Expressions outside the deparser's typed
+  coverage and other views keep their stored spelling
   (see [PLAN](../PLAN.md#close-application-compatibility-gaps)).
 
 - Named arguments and omitted defaults run in declared input order and share

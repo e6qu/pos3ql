@@ -287,10 +287,11 @@ and `RETURN` bodies are printed in PostgreSQL's analyzed form (`'x'::text`,
 operators, `IN`, `LIKE`, `IS NULL`, `CASE`, casts, SQL value functions and
 built-in function calls; other expressions (subqueries, user-defined function
 calls, `$n` parameters, array constructors) are still printed as stored, and
-pretty requests are not honored: `pg_get_expr(..., true)` prints the stored
-text and `pg_get_constraintdef(oid, true)` (used by psql's `\d`) prints the
-fully parenthesized form where PostgreSQL drops redundant parentheses. `pg_get_viewdef` returns the view's query text, a `BEGIN
-ATOMIC` body is printed as written rather than one deparsed statement per line,
+`pg_get_viewdef(view, wrap_column)` ignores the wrap column. `pg_get_viewdef` uses PostgreSQL's layout only for a view
+over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
+comma or `USING` joins, subqueries or set operations; other views return their
+query text. A `BEGIN ATOMIC` body is printed as
+written rather than one deparsed statement per line,
 and index, trigger, rule and policy expressions are not deparsed. Syntax and scanner errors in a client's
 query report PostgreSQL's wording and cursor position (the `P` field that psql shows as `LINE 1:` and a caret), but
 other errors do not yet: PostgreSQL also points at the unknown relation, column,
@@ -321,8 +322,8 @@ journal) instead of resuming at a saved position inside the procedure. Relation 
 view's row type, and dropping a relation through `DROP SCHEMA`, `DROP
 MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
 column uses its row type, fail with `0A000`; a `DROP TABLE ... CASCADE` that
-reaches both columns and routines reports two notices where PostgreSQL reports
-one, and a routine's dependency on a row type is described as depending on the
+reaches both columns and routines, or names several tables, reports one notice
+per table or dependency kind where PostgreSQL reports one for the statement, and a routine's dependency on a row type is described as depending on the
 table. `pg_partition_tree` is rejected (`0A000` in `FROM`, `42883` in a select
 list). In a SQL-language function, `o.note` for a composite parameter `o` fails
 with `42P01` (`(o).note` works). The

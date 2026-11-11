@@ -1,0 +1,16 @@
+CREATE TABLE vdx(id integer PRIMARY KEY, a text, b integer, v varchar(5), n numeric, d boolean);
+CREATE VIEW vdx1 AS SELECT id, a || 'z' AS az, b + 1 AS b1 FROM vdx WHERE b > 0 ORDER BY id;
+CREATE VIEW vdx2 AS SELECT id, a, upper(v) AS uv FROM vdx WHERE v <> 'x' AND n > 1 ORDER BY b DESC, id LIMIT 10 OFFSET 2;
+CREATE VIEW vdx3 AS SELECT b, count(*) AS c FROM vdx GROUP BY b;
+CREATE VIEW vdx4 AS SELECT id AS ident, lower(a) FROM vdx WHERE a LIKE 'x%' OR a IS NULL;
+CREATE VIEW vdx5 AS SELECT * FROM vdx;
+CREATE VIEW vdx6 AS SELECT CASE WHEN d THEN 'yes' WHEN b > 1 THEN 'big' ELSE 'no' END AS dd, id FROM vdx;
+CREATE TABLE vdx_customers(id integer PRIMARY KEY, name text);
+CREATE TABLE vdx_notes(oid integer, note varchar(5));
+CREATE VIEW vdx7 AS SELECT o.id, c.name, o.n * 2 AS dbl FROM vdx o JOIN vdx_customers c ON c.id = o.b WHERE o.n > 0;
+CREATE VIEW vdx8 AS SELECT vdx.id, vdx_customers.name FROM vdx LEFT JOIN vdx_customers ON vdx_customers.id = vdx.b;
+CREATE VIEW vdx9 AS SELECT o.id, x.note FROM vdx o JOIN vdx_customers c ON c.id = o.b LEFT JOIN vdx_notes x ON x.oid = o.id AND x.note <> 'z' ORDER BY o.id;
+CREATE VIEW vdx0 AS SELECT x.oid AS id FROM vdx_notes x WHERE x.note IS NOT NULL;
+SELECT viewname, pg_get_viewdef(viewname::regclass), pg_get_viewdef(viewname::regclass, true), definition FROM pg_views WHERE viewname LIKE 'vdx_' ORDER BY viewname;
+DROP VIEW vdx0, vdx1, vdx2, vdx3, vdx4, vdx5, vdx6, vdx7, vdx8, vdx9;
+DROP TABLE vdx, vdx_customers, vdx_notes;

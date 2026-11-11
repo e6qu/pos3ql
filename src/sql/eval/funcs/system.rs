@@ -2066,8 +2066,16 @@ pub(crate) fn dispatch<'a>(
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                let pretty = match args.get(1) {
+                    Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Bool(pretty) => pretty,
+                        _ => false,
+                    },
+                    None => false,
+                };
                 Ok(cat
-                    .constraint_def(oid, arena)?
+                    .constraint_def_pretty(oid, pretty, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2313,8 +2321,17 @@ pub(crate) fn dispatch<'a>(
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                // `pretty` is a boolean, or a wrap column that implies it.
+                let pretty = match args.get(1) {
+                    Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Bool(pretty) => pretty,
+                        _ => true,
+                    },
+                    None => false,
+                };
                 Ok(cat
-                    .view_def(oid, arena)?
+                    .view_def_pretty(oid, pretty, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }

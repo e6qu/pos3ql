@@ -33,6 +33,22 @@ pub(crate) struct Context<'s> {
     pub table: Option<&'s TableDef>,
     /// Named parameters of the routine whose body or default is printed.
     pub parameters: &'s [crate::storage::RoutineParameterDef],
+    /// The FROM items of a view, by exposed name. Column references are
+    /// qualified when there is more than one, as PostgreSQL prints them.
+    pub joined: &'s [(&'s str, &'s TableDef)],
+    /// `PRETTYFLAG_PAREN`: parentheses only where precedence requires them.
+    pub pretty: bool,
+}
+
+/// The node a pretty-printed child expression appears under.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Parent {
+    Operator(&'static str),
+    Connective(BinaryOp),
+    Not,
+    Cast,
+    NullTest,
+    ArrayComparison,
 }
 
 /// Deparses `source`, or returns `None` when its shape is outside this
@@ -108,6 +124,14 @@ impl Context<'_> {
                 self.txid,
             ));
         }
+        if let Some((_, table)) = self.joined_source(qualifier, name) {
+            let column = table
+                .columns()
+                .iter()
+                .find(|column| column.name.as_str() == name)
+                .expect("joined source has the column");
+            return super::catalog_column_type_oid(self.storage, column, self.txid).map(Some);
+        }
         let Some(table) = self.table else {
             return Ok(None);
         };
@@ -122,6 +146,26 @@ impl Context<'_> {
             return Ok(None);
         };
         super::catalog_column_type_oid(self.storage, column, self.txid).map(Some)
+    }
+
+    /// The one joined FROM item a column reference names.
+    fn joined_source(&self, qualifier: Option<&str>, name: &str) -> Option<(&str, &TableDef)> {
+        let mut found = None;
+        for (exposed, table) in self.joined {
+            if qualifier.is_some_and(|qualifier| qualifier != *exposed)
+                || !table
+                    .columns()
+                    .iter()
+                    .any(|column| column.name.as_str() == name)
+            {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some((*exposed, *table));
+        }
+        found
     }
 
     fn named_type(&self, type_name: &str) -> Option<i32> {
@@ -193,6 +237,11 @@ impl Context<'_> {
                 }
                 None => None,
             },
+            Expr::Call {
+                name: "count",
+                star: true,
+                ..
+            } => Some(oid::INT8),
             Expr::Call { .. } => self
                 .selected_builtin(expression)?
                 .map(|routine| routine.result_oid),
@@ -323,13 +372,57 @@ impl Context<'_> {
                     && !(numeric_rank(natural) == Some(1) && numeric_rank(expected) == Some(1))
                     && !(numeric_rank(natural) == Some(3) && numeric_rank(expected) == Some(3)) =>
             {
-                output.push("(")?;
-                self.bare(expression, output)?;
-                output.push(")::")?;
+                self.wrapped(expression, None, Parent::Cast, true, output)?;
+                output.push("::")?;
                 self.type_name(expected, output)
             }
             _ => self.bare(expression, output),
         }
+    }
+
+    fn open(&self, output: &mut Output<'_>) -> Result<(), SqlError> {
+        if self.pretty {
+            Ok(())
+        } else {
+            output.push("(")
+        }
+    }
+
+    fn close(&self, output: &mut Output<'_>) -> Result<(), SqlError> {
+        if self.pretty {
+            Ok(())
+        } else {
+            output.push(")")
+        }
+    }
+
+    /// A child expression: a cast operand is always parenthesized, and pretty
+    /// printing parenthesizes where precedence requires (`isSimpleNode`).
+    /// `expected` of `None` prints the child itself, without a coercion.
+    fn wrapped(
+        &self,
+        expression: &Expr<'_>,
+        expected: Option<Option<i32>>,
+        parent: Parent,
+        first: bool,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        let parenthesize = if self.pretty {
+            !simple(expression, parent, first)
+        } else {
+            parent == Parent::Cast
+        };
+        if parenthesize {
+            output.push("(")?;
+        }
+        match expected {
+            Some(expected) => self.write(expression, expected, output)?,
+            None => self.bare(expression, output)?,
+        }
+        if parenthesize {
+            output.push(")")?;
+        }
+        Ok(())
     }
 
     fn literal(
@@ -436,7 +529,14 @@ impl Context<'_> {
                 if self.column_type(*qualifier, name)?.is_none() {
                     return output.unsupported();
                 }
-                let mut identifier = crate::util::StackStr::<130>::new();
+                let mut identifier = crate::util::StackStr::<260>::new();
+                if self.joined.len() > 1 {
+                    let Some((exposed, _)) = self.joined_source(*qualifier, name) else {
+                        return output.unsupported();
+                    };
+                    write_identifier(&mut identifier, exposed);
+                    let _ = identifier.write_char('.');
+                }
                 write_identifier(&mut identifier, name);
                 output.push(identifier.as_str())
             }
@@ -458,6 +558,7 @@ impl Context<'_> {
                     let negated = crate::stack_format!(160, "-{}", text);
                     self.constant(negated.as_str(), oid::NUMERIC, output)
                 }
+                _ if self.pretty => output.unsupported(),
                 _ => {
                     output.push("(- ")?;
                     self.write(operand, None, output)?;
@@ -469,17 +570,18 @@ impl Context<'_> {
                 operand,
                 ..
             } => {
-                output.push("(NOT ")?;
-                self.write(operand, Some(oid::BOOL), output)?;
-                output.push(")")
+                self.open(output)?;
+                output.push("NOT ")?;
+                self.wrapped(operand, Some(Some(oid::BOOL)), Parent::Not, true, output)?;
+                self.close(output)
             }
             Expr::Binary {
                 operator: operator @ (BinaryOp::And | BinaryOp::Or),
                 ..
             } => {
-                output.push("(")?;
+                self.open(output)?;
                 self.connective(expression, *operator, true, output)?;
-                output.push(")")
+                self.close(output)
             }
             Expr::Binary {
                 operator,
@@ -501,22 +603,20 @@ impl Context<'_> {
                 } else {
                     self.operand_types(left, right)?
                 };
-                output.push("(")?;
-                self.write(left, left_type, output)?;
+                self.open(output)?;
+                let parent = Parent::Operator(symbol);
+                self.wrapped(left, Some(left_type), parent, true, output)?;
                 output.push(" ")?;
                 output.push(symbol)?;
                 output.push(" ")?;
-                self.write(right, right_type, output)?;
-                output.push(")")
+                self.wrapped(right, Some(right_type), parent, false, output)?;
+                self.close(output)
             }
             Expr::IsNull { operand, negated } => {
-                output.push("(")?;
-                self.write(operand, None, output)?;
-                output.push(if *negated {
-                    " IS NOT NULL)"
-                } else {
-                    " IS NULL)"
-                })
+                self.open(output)?;
+                self.wrapped(operand, Some(None), Parent::NullTest, true, output)?;
+                output.push(if *negated { " IS NOT NULL" } else { " IS NULL" })?;
+                self.close(output)
             }
             Expr::InList {
                 operand,
@@ -527,8 +627,14 @@ impl Context<'_> {
                     Some(found) => Some(operator_type(found)),
                     None => Some(oid::TEXT),
                 };
-                output.push("(")?;
-                self.write(operand, element, output)?;
+                self.open(output)?;
+                self.wrapped(
+                    operand,
+                    Some(element),
+                    Parent::ArrayComparison,
+                    true,
+                    output,
+                )?;
                 output.push(if *negated {
                     " <> ALL (ARRAY["
                 } else {
@@ -540,7 +646,8 @@ impl Context<'_> {
                     }
                     self.write(item, element, output)?;
                 }
-                output.push("]))")
+                output.push("])")?;
+                self.close(output)
             }
             Expr::Like {
                 operand,
@@ -549,16 +656,13 @@ impl Context<'_> {
                 case_insensitive,
                 escape: None,
             } => {
-                output.push("(")?;
-                self.write(operand, Some(oid::TEXT), output)?;
-                output.push(match (*negated, *case_insensitive) {
-                    (false, false) => " ~~ ",
-                    (false, true) => " ~~* ",
-                    (true, false) => " !~~ ",
-                    (true, true) => " !~~* ",
-                })?;
-                self.write(pattern, Some(oid::TEXT), output)?;
-                output.push(")")
+                let symbol = match (*negated, *case_insensitive) {
+                    (false, false) => "~~",
+                    (false, true) => "~~*",
+                    (true, false) => "!~~",
+                    (true, true) => "!~~*",
+                };
+                self.operator_pair(operand, pattern, symbol, output)
             }
             Expr::Match {
                 operand,
@@ -566,16 +670,13 @@ impl Context<'_> {
                 negated,
                 case_insensitive,
             } => {
-                output.push("(")?;
-                self.write(operand, Some(oid::TEXT), output)?;
-                output.push(match (*negated, *case_insensitive) {
-                    (false, false) => " ~ ",
-                    (false, true) => " ~* ",
-                    (true, false) => " !~ ",
-                    (true, true) => " !~* ",
-                })?;
-                self.write(pattern, Some(oid::TEXT), output)?;
-                output.push(")")
+                let symbol = match (*negated, *case_insensitive) {
+                    (false, false) => "~",
+                    (false, true) => "~*",
+                    (true, false) => "!~",
+                    (true, true) => "!~*",
+                };
+                self.operator_pair(operand, pattern, symbol, output)
             }
             Expr::Cast {
                 operand, type_name, ..
@@ -587,9 +688,8 @@ impl Context<'_> {
                     // A cast literal is converted while parsing.
                     Expr::Str(_) | Expr::Null => self.literal(operand, target, output),
                     _ => {
-                        output.push("(")?;
-                        self.write(operand, None, output)?;
-                        output.push(")::")?;
+                        self.wrapped(operand, Some(None), Parent::Cast, true, output)?;
+                        output.push("::")?;
                         self.type_name(target, output)
                     }
                 }
@@ -627,6 +727,15 @@ impl Context<'_> {
                     output.unsupported()
                 }
             }
+            Expr::Call {
+                name: "count",
+                star: true,
+                args: [],
+                distinct: false,
+                filter: None,
+                over: None,
+                ..
+            } => output.push("count(*)"),
             Expr::Call { name, args, .. } => {
                 let Some(routine) = self.selected_builtin(expression)? else {
                     return output.unsupported();
@@ -680,6 +789,44 @@ impl Context<'_> {
         }
     }
 
+    /// A searched CASE in PostgreSQL's indented layout.
+    fn case_block(
+        &self,
+        whens: &[(&Expr<'_>, &Expr<'_>)],
+        otherwise: Option<&Expr<'_>>,
+        indent: usize,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        const SPACES: &str = "                                ";
+        let (Some(outer), Some(inner)) = (SPACES.get(..indent), SPACES.get(..indent + 4)) else {
+            return output.unsupported();
+        };
+        let Some((_, first)) = whens.first() else {
+            return output.unsupported();
+        };
+        let result = Some(self.type_of(first)?.unwrap_or(oid::TEXT));
+        output.push("\n")?;
+        output.push(outer)?;
+        output.push("CASE")?;
+        for (condition, value) in whens {
+            output.push("\n")?;
+            output.push(inner)?;
+            output.push("WHEN ")?;
+            self.write(condition, Some(oid::BOOL), output)?;
+            output.push(" THEN ")?;
+            self.write(value, result, output)?;
+        }
+        if let Some(otherwise) = otherwise {
+            output.push("\n")?;
+            output.push(inner)?;
+            output.push("ELSE ")?;
+            self.write(otherwise, result, output)?;
+        }
+        output.push("\n")?;
+        output.push(outer)?;
+        output.push("END")
+    }
+
     /// PostgreSQL's grammar flattens a left-nested `AND`/`OR` chain into one
     /// list; a right operand of the same connective stays a nested list.
     fn connective(
@@ -703,7 +850,13 @@ impl Context<'_> {
             } else {
                 " OR "
             })?;
-            self.write(right, Some(oid::BOOL), output)?;
+            self.wrapped(
+                right,
+                Some(Some(oid::BOOL)),
+                Parent::Connective(operator),
+                false,
+                output,
+            )?;
             return Ok(first);
         }
         if !first {
@@ -713,8 +866,90 @@ impl Context<'_> {
                 " OR "
             })?;
         }
-        self.write(expression, Some(oid::BOOL), output)?;
+        self.wrapped(
+            expression,
+            Some(Some(oid::BOOL)),
+            Parent::Connective(operator),
+            first,
+            output,
+        )?;
         Ok(false)
+    }
+
+    /// A text pattern operator (`~~`, `~`, and their variants).
+    fn operator_pair(
+        &self,
+        left: &Expr<'_>,
+        right: &Expr<'_>,
+        symbol: &'static str,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        self.open(output)?;
+        let parent = Parent::Operator(symbol);
+        self.wrapped(left, Some(Some(oid::TEXT)), parent, true, output)?;
+        output.push(" ")?;
+        output.push(symbol)?;
+        output.push(" ")?;
+        self.wrapped(right, Some(Some(oid::TEXT)), parent, false, output)?;
+        self.close(output)
+    }
+}
+
+/// `isSimpleNode` with `PRETTYFLAG_PAREN`: whether a child needs no
+/// parentheses under its parent.
+fn simple(expression: &Expr<'_>, parent: Parent, first: bool) -> bool {
+    let connective = |kind: Option<BinaryOp>| match parent {
+        Parent::Connective(outer) => match kind {
+            None | Some(BinaryOp::And) => matches!(outer, BinaryOp::And | BinaryOp::Or),
+            Some(_) => outer == BinaryOp::Or,
+        },
+        Parent::Not => matches!(kind, None | Some(BinaryOp::And)),
+        _ => false,
+    };
+    let operator = |symbol: &str| match parent {
+        Parent::Operator(outer) => {
+            let low = |symbol: &str| matches!(symbol, "+" | "-");
+            let high = |symbol: &str| matches!(symbol, "*" | "/" | "%");
+            if !(low(symbol) || high(symbol)) || !(low(outer) || high(outer)) {
+                false
+            } else if high(symbol) && low(outer) {
+                true
+            } else if low(symbol) && high(outer) {
+                false
+            } else {
+                first
+            }
+        }
+        Parent::Connective(_) | Parent::Not => true,
+        _ => false,
+    };
+    match expression {
+        Expr::Column { .. }
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Bool(_)
+        | Expr::Str(_)
+        | Expr::Null
+        | Expr::Call { .. }
+        | Expr::Cast { .. } => true,
+        Expr::Unary {
+            operator: UnaryOp::Neg,
+            operand,
+            ..
+        } => matches!(operand, Expr::Int(_) | Expr::NumericLit(_)),
+        Expr::Unary {
+            operator: UnaryOp::Not,
+            ..
+        } => connective(None),
+        Expr::Binary {
+            operator: kind @ (BinaryOp::And | BinaryOp::Or),
+            ..
+        } => connective(Some(*kind)),
+        Expr::Binary { operator: kind, .. } => operator_symbol(*kind).is_some_and(operator),
+        Expr::Like { .. } | Expr::Match { .. } => operator("~~"),
+        Expr::IsNull { .. } => matches!(parent, Parent::Connective(_) | Parent::Not),
+        _ => false,
     }
 }
 
@@ -764,4 +999,220 @@ fn upper_ascii(name: &str) -> crate::util::StackStr<16> {
         let _ = upper.write_char(character.to_ascii_uppercase());
     }
     upper
+}
+
+/// The most FROM items a deparsed view may join.
+const MAX_JOINED: usize = 8;
+
+/// A plain table reference, with no function, subquery or sample.
+fn plain_table<'r>(
+    source: &'r crate::sql::ast::TableRef<'_>,
+) -> Option<&'r crate::sql::ast::TableRef<'r>> {
+    (source.subquery.is_none()
+        && source.func_args.is_none()
+        && source.rows_from.is_none()
+        && source.col_alias.is_none())
+    .then_some(source)
+}
+
+/// `pg_get_viewdef(view)` for a view over one table: PostgreSQL's indented
+/// layout, one target per line, with analyzed expressions. Other query shapes
+/// are reported as unsupported.
+pub(crate) fn view_definition<'a>(
+    storage: &Storage,
+    txid: u32,
+    query: &str,
+    column_names: &[&str],
+    pretty: bool,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let Ok(select) = crate::sql::parser::parse_query(query, arena) else {
+        return Ok(None);
+    };
+    let Some(from) = select.from else {
+        return Ok(None);
+    };
+    if select.distinct
+        || !select.distinct_on.is_empty()
+        || from.joins.len() >= MAX_JOINED
+        || from.joins.iter().any(|join| {
+            join.on.is_none()
+                || join.using.is_some()
+                || join.natural
+                || join.kind == crate::sql::ast::JoinKind::Cross
+                || plain_table(&join.table).is_none()
+        })
+        || !select.with.is_empty()
+        || select.set_body.is_some()
+        || !select.locking.is_empty()
+        || !select.grouping_sets.is_empty()
+        || select.having.is_some()
+        || select.with_ties
+        || plain_table(&from.base).is_none()
+        || (!from.joins.is_empty()
+            && matches!(select.items, [crate::sql::ast::SelectItem::Wildcard]))
+    {
+        return Ok(None);
+    }
+    let wildcard = matches!(select.items, [crate::sql::ast::SelectItem::Wildcard]);
+    if !wildcard && select.items.len() != column_names.len() {
+        return Ok(None);
+    }
+    let sources = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+    let mut reads: [Option<crate::storage::TableDefinitionRead<'_>>; MAX_JOINED] =
+        core::array::from_fn(|_| None);
+    for (read, source) in reads.iter_mut().zip(sources.clone()) {
+        let Some(crate::storage::ResolvedRelation::Table(slot)) =
+            storage.resolve_relation(source.schema, source.table, txid)
+        else {
+            return Ok(None);
+        };
+        *read = Some(storage.table_def(slot, txid));
+    }
+    let table = reads[0].as_deref().expect("resolved base relation");
+    let mut joined: [(&str, &TableDef); MAX_JOINED] = [("", table); MAX_JOINED];
+    let count = from.joins.len() + 1;
+    for ((target, read), source) in joined.iter_mut().zip(&reads).zip(sources) {
+        *target = (
+            source.alias.unwrap_or(source.table),
+            read.as_deref().expect("resolved source"),
+        );
+    }
+    let context = Context {
+        storage,
+        txid,
+        table: Some(table),
+        parameters: &[],
+        joined: &joined[..count],
+        pretty,
+    };
+    let mut output = Output {
+        arena,
+        text: ArenaString::new(arena),
+        supported: true,
+    };
+    if wildcard && table.columns().len() < column_names.len() {
+        return Ok(None);
+    }
+    for (index, name) in column_names.iter().enumerate() {
+        // `*` was expanded to the table's columns when the view was created.
+        let expanded;
+        let expression = if wildcard {
+            expanded = Expr::Column {
+                qualifier: None,
+                name: table.columns()[index].name.as_str(),
+            };
+            &expanded
+        } else {
+            let crate::sql::ast::SelectItem::Expr { expression, .. } = &select.items[index] else {
+                return Ok(None);
+            };
+            *expression
+        };
+        if let Expr::Case {
+            operand: None,
+            whens,
+            otherwise,
+            synthetic: false,
+        } = expression
+        {
+            // The indented layout starts a searched CASE on its own line,
+            // dropping the trailing space of the line it leaves.
+            output.push(if index == 0 { " SELECT" } else { "," })?;
+            context.case_block(whens, *otherwise, 8, &mut output)?;
+        } else {
+            output.push(if index == 0 { " SELECT " } else { ",\n    " })?;
+            let natural = context.type_of(expression)?;
+            context.write(expression, natural, &mut output)?;
+        }
+        let bare_column = matches!(expression, Expr::Column { name: column, .. } if column == name);
+        if !bare_column {
+            output.push(" AS ")?;
+            let mut identifier = crate::util::StackStr::<130>::new();
+            write_identifier(&mut identifier, name);
+            output.push(identifier.as_str())?;
+        }
+    }
+    output.push("\n   FROM ")?;
+    if !pretty {
+        for _ in from.joins {
+            output.push("(")?;
+        }
+    }
+    let relation = |table: &TableDef, source: &crate::sql::ast::TableRef<'_>| {
+        let mut relation = crate::util::StackStr::<400>::new();
+        if !storage.schema_is_on_path(table.schema, txid) {
+            write_identifier(&mut relation, table.schema.as_str());
+            let _ = relation.write_char('.');
+        }
+        write_identifier(&mut relation, table.name.as_str());
+        if let Some(alias) = source.alias.filter(|alias| *alias != table.name.as_str()) {
+            let _ = relation.write_char(' ');
+            write_identifier(&mut relation, alias);
+        }
+        relation
+    };
+    output.push(relation(table, &from.base).as_str())?;
+    for (join, (_, joined_table)) in from.joins.iter().zip(&joined[1..]) {
+        output.push(match join.kind {
+            crate::sql::ast::JoinKind::Left => "\n     LEFT JOIN ",
+            crate::sql::ast::JoinKind::Right => "\n     RIGHT JOIN ",
+            crate::sql::ast::JoinKind::Full => "\n     FULL JOIN ",
+            _ => "\n     JOIN ",
+        })?;
+        output.push(relation(joined_table, &join.table).as_str())?;
+        output.push(if pretty { " ON " } else { " ON (" })?;
+        context.write(
+            join.on.expect("checked join condition"),
+            Some(oid::BOOL),
+            &mut output,
+        )?;
+        if !pretty {
+            output.push("))")?;
+        }
+    }
+    if let Some(condition) = select.where_clause {
+        output.push("\n  WHERE ")?;
+        context.write(condition, Some(oid::BOOL), &mut output)?;
+    }
+    if !select.group_by.is_empty() {
+        output.push("\n  GROUP BY ")?;
+        for (index, expression) in select.group_by.iter().enumerate() {
+            if index != 0 {
+                output.push(", ")?;
+            }
+            let natural = context.type_of(expression)?;
+            context.write(expression, natural, &mut output)?;
+        }
+    }
+    if !select.order_by.is_empty() {
+        output.push("\n  ORDER BY ")?;
+        for (index, order) in select.order_by.iter().enumerate() {
+            if index != 0 {
+                output.push(", ")?;
+            }
+            let natural = context.type_of(order.expression)?;
+            context.write(order.expression, natural, &mut output)?;
+            if order.descending {
+                output.push(" DESC")?;
+            }
+            if order.nulls_first != order.descending {
+                output.push(if order.nulls_first {
+                    " NULLS FIRST"
+                } else {
+                    " NULLS LAST"
+                })?;
+            }
+        }
+    }
+    for (keyword, value) in [(" OFFSET ", select.offset), (" LIMIT ", select.limit)] {
+        if let Some(value) = value {
+            output.push("\n")?;
+            output.push(keyword)?;
+            let natural = context.type_of(value)?;
+            context.write(value, natural, &mut output)?;
+        }
+    }
+    output.push(";")?;
+    Ok(output.supported.then(|| output.text.as_str()))
 }

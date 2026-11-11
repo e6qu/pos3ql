@@ -14715,6 +14715,8 @@ pub fn function_def_text<'a>(
                 txid,
                 table: None,
                 parameters: routine.parameters(),
+                joined: &[],
+                pretty: false,
             };
             let deparsed = match routine
                 .function_result_contract()
@@ -15221,6 +15223,8 @@ fn write_routine_arguments(
                 txid,
                 table: None,
                 parameters: &[],
+                joined: &[],
+                pretty: false,
             };
             let deparsed = match storage
                 .routine_type_oid(parameter.ctype, parameter.user_type, txid)
@@ -15482,6 +15486,17 @@ pub fn view_def_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    view_def_text_pretty(storage, txid, oid, false, arena)
+}
+
+/// `pg_get_viewdef(view, pretty)`.
+pub fn view_def_text_pretty<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    pretty: bool,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
     if let Some(name) = catalog_relation_name(oid) {
         return Ok(view_definitions::DEFINITIONS
             .iter()
@@ -15506,7 +15521,26 @@ pub fn view_def_text<'a>(
             .map(Some)
             .map_err(|_| arena_full());
     }
-    rewrite::view_definition(storage, txid, oid, arena)
+    let stored = rewrite::view_definition(storage, txid, oid, arena)?;
+    if let Some(text) = stored
+        && let Some(slot) = view_slot_by_oid(storage, txid, oid)
+    {
+        let view = storage.view(slot);
+        let columns = view.columns_for(txid);
+        let names = arena
+            .alloc_slice_with(columns.names().len(), |_| "")
+            .map_err(|_| arena_full())?;
+        for (target, name) in names.iter_mut().zip(columns.names()) {
+            *target = arena.alloc_str(name.as_str()).map_err(|_| arena_full())?;
+        }
+        let query = text.trim().trim_end_matches(';');
+        if let Some(deparsed) =
+            deparse::view_definition(storage, txid, query, names, pretty, arena)?
+        {
+            return Ok(Some(deparsed));
+        }
+    }
+    Ok(stored)
 }
 
 pub fn rule_def_text<'a>(
@@ -16973,6 +17007,7 @@ pub fn constraint_def_text<'a>(
     storage: &Storage,
     txid: u32,
     oid: i32,
+    pretty: bool,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     if let Some(check) = super::information_schema_domains::InformationSchemaDomain::ALL
@@ -17062,6 +17097,8 @@ pub fn constraint_def_text<'a>(
                 txid,
                 table: Some(&table),
                 parameters: &[],
+                joined: &[],
+                pretty,
             };
             match deparse::deparse(
                 &context,

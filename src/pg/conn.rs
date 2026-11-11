@@ -681,7 +681,14 @@ impl Conn {
     }
 
     /// Binds this slot to a fresh socket, resetting all protocol state.
-    pub fn open(&mut self, stream: TcpStream, id: i32) {
+    /// Takes over a client socket. Like PostgreSQL, the connection sends
+    /// every protocol message without Nagle delay: a small response written
+    /// behind an unacknowledged one would otherwise wait for the client's
+    /// delayed acknowledgement. A socket that cannot be configured is not
+    /// served.
+    pub fn open(&mut self, stream: TcpStream, id: i32) -> std::io::Result<()> {
+        stream.set_nonblocking(true)?;
+        stream.set_nodelay(true)?;
         self.stream = Some(stream);
         self.recv.clear();
         self.send.clear();
@@ -736,6 +743,7 @@ impl Conn {
         self.pending_tls = None;
         self.cancel_request = None;
         self.termination = TerminationState::Open;
+        Ok(())
     }
 
     pub fn close(&mut self) -> Option<TcpStream> {
@@ -8385,7 +8393,7 @@ mod tests {
             for (connection, id) in [(&mut conn, 73), (&mut other, 74)] {
                 let (server, _) = listener.accept().unwrap();
                 server.set_nonblocking(true).unwrap();
-                connection.open(server, id);
+                connection.open(server, id).unwrap();
                 connection.phase = Phase::Ready;
                 engine
                     .register_backend(
@@ -8594,7 +8602,7 @@ mod tests {
             for (connection, id) in [(&mut conn, 73), (&mut other, 74)] {
                 let (server, _) = listener.accept().unwrap();
                 server.set_nonblocking(true).unwrap();
-                connection.open(server, id);
+                connection.open(server, id).unwrap();
                 connection.phase = Phase::Ready;
                 engine
                     .register_backend(
@@ -8857,7 +8865,7 @@ mod tests {
             let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (server, _) = listener.accept().unwrap();
             server.set_nonblocking(true).unwrap();
-            conn.open(server, 72);
+            conn.open(server, 72).unwrap();
             conn.phase = Phase::Ready;
             let role = engine.role_login("postgres").unwrap().identity;
             engine
@@ -10439,7 +10447,7 @@ mod tests {
             let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (server, _) = listener.accept().unwrap();
             server.set_nonblocking(true).unwrap();
-            connection.open(server, 73);
+            connection.open(server, 73).unwrap();
             let auth = AuthContext {
                 mode: AuthMode::Trust,
                 password: String::new(),
@@ -10859,7 +10867,7 @@ mod tests {
         let config = Config::default_dev();
         let mut budget = Budget::new(256 << 20);
         let mut connection = Conn::new(&config, &mut budget).unwrap();
-        connection.open(server, 72);
+        connection.open(server, 72).unwrap();
         let padding = [0u8; 4096];
         let mut prefix = 0usize;
         let mut stream = connection.stream();
@@ -10949,7 +10957,7 @@ mod tests {
         let config = Config::default_dev();
         let mut budget = Budget::new(256 << 20);
         let mut connection = Conn::new(&config, &mut budget).expect("connection budget");
-        connection.open(server, 71);
+        connection.open(server, 71).unwrap();
         assert!(connection.terminate_by_administrator());
 
         // Model the coverage-CI race: a query reaches the kernel after the
@@ -11823,7 +11831,7 @@ mod tests {
                 for (connection, id) in [(&mut conn, 73), (&mut blocker, 74)] {
                     let (socket, _) = listener.accept().unwrap();
                     socket.set_nonblocking(true).unwrap();
-                    connection.open(socket, id);
+                    connection.open(socket, id).unwrap();
                     connection.phase = Phase::Ready;
                     engine
                         .register_backend(

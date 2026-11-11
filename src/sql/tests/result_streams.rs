@@ -179,7 +179,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
 
     let mut conn = Conn::new(&config, &mut budget).unwrap();
     let (mut client, server) = socket_pair();
-    conn.open(server, 1);
+    conn.open(server, 1).unwrap();
     conn.enter_ready_for_tests(&engine);
     let auth = AuthContext {
         mode: crate::pg::auth::AuthMode::Trust,

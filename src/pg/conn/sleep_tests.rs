@@ -43,10 +43,9 @@ fn connection(fixture: &mut Fixture, id: i32) -> (Conn, TcpStream) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let server = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (client, _) = listener.accept().unwrap();
-    server.set_nonblocking(true).unwrap();
     client.set_nonblocking(true).unwrap();
     let mut conn = Conn::new(&fixture.config, &mut fixture.budget).unwrap();
-    conn.open(server, id);
+    conn.open(server, id).unwrap();
     conn.auth_database = fixture.engine.database_login("postgres");
     conn.phase = Phase::Ready;
     (conn, client)
@@ -82,24 +81,49 @@ fn retry(conn: &mut Conn, engine: &mut Engine) -> bool {
     }
 }
 
-/// Every complete backend message the client has received so far.
+/// The backend messages of one complete response, through its
+/// ReadyForQuery. Waits for the client socket rather than for a fixed time:
+/// a loaded host may deliver the response at any point before the hang bound.
 fn received(conn: &mut Conn, client: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
     assert_eq!(conn.on_writable(), After::Continue);
-    std::thread::sleep(Duration::from_millis(20));
+    let deadline = crate::test_wait::deadline();
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
+        let messages = complete_messages(&bytes);
+        if messages.last().is_some_and(|(kind, _)| *kind == b'Z') {
+            return messages;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "no ReadyForQuery: {}",
+            describe(&messages)
+        );
+        let mut poll = libc::pollfd {
+            fd: client.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let wait = remaining.as_millis().min(i32::MAX as u128) as i32;
+        assert!(unsafe { libc::poll(&mut poll, 1, wait) } >= 0);
         match client.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => panic!("server closed the connection: {}", describe(&messages)),
             Ok(n) => bytes.extend_from_slice(&chunk[..n]),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => panic!("client read: {error}"),
         }
     }
+}
+
+/// The complete backend messages at the front of `bytes`.
+fn complete_messages(mut rest: &[u8]) -> Vec<(u8, Vec<u8>)> {
     let mut messages = Vec::new();
-    let mut rest = &bytes[..];
     while rest.len() >= 5 {
         let total = 1 + u32::from_be_bytes(rest[1..5].try_into().unwrap()) as usize;
+        if total > rest.len() {
+            break;
+        }
         messages.push((rest[0], rest[5..total].to_vec()));
         rest = &rest[total..];
     }
@@ -229,25 +253,15 @@ fn statement_timeout_and_cancellation_end_a_sleep() {
         &mut sleeper_client,
         "SELECT pg_sleep(30)",
     );
-    let parked_after_send = sleeper.parked_wait();
-    let mut retries = Vec::new();
     while sleeper.parked_wait().is_some() {
         let remaining = sleeper.parked_wait_remaining().unwrap();
         assert!(remaining <= Duration::from_millis(100));
         std::thread::sleep(remaining);
-        retries.push(retry(&mut sleeper, &mut fixture.engine));
+        retry(&mut sleeper, &mut fixture.engine);
     }
     assert!(started.elapsed() < Duration::from_secs(10));
-    let queued = (sleeper.send.len(), sleeper.overflow_bytes());
     let response = received(&mut sleeper, &mut sleeper_client);
-    assert_eq!(
-        sqlstates(&response),
-        ["57014"],
-        "response [{}]; parked after send {parked_after_send:?}; retries {retries:?}; \
-         queued {queued:?}; later [{}]",
-        describe(&response),
-        describe(&received(&mut sleeper, &mut sleeper_client))
-    );
+    assert_eq!(sqlstates(&response), ["57014"], "{}", describe(&response));
     send(
         &mut sleeper,
         &mut fixture.engine,
@@ -258,23 +272,10 @@ fn statement_timeout_and_cancellation_end_a_sleep() {
         sleeper.parked_wait(),
         Some(crate::sql::StatementWait::Timer)
     );
-    let before_cancel = (sleeper.send.len(), sleeper.recv.len());
     assert!(sleeper.cancel_parked(&mut fixture.engine));
-    let after_cancel = (
-        sleeper.send.len(),
-        sleeper.recv.len(),
-        sleeper.parked_wait(),
-    );
+    // The rest of the Query is skipped: RESET's completion, then the error.
     let response = received(&mut sleeper, &mut sleeper_client);
-    assert_eq!(
-        sqlstates(&response),
-        ["57014"],
-        "response [{}]; send/recv before cancel {before_cancel:?}; after {after_cancel:?}; \
-         queued after read {:?}; later [{}]",
-        describe(&response),
-        (sleeper.send.len(), sleeper.overflow_bytes()),
-        describe(&received(&mut sleeper, &mut sleeper_client))
-    );
+    assert_eq!(sqlstates(&response), ["57014"], "{}", describe(&response));
     send(
         &mut sleeper,
         &mut fixture.engine,

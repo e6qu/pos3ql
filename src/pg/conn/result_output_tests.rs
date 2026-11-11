@@ -53,7 +53,6 @@ fn socket_pair() -> (TcpStream, TcpStream) {
     let server = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (client, _) = listener.accept().unwrap();
     set_buffer(&server, libc::SO_SNDBUF, 4096);
-    server.set_nonblocking(true).unwrap();
     client.set_nonblocking(true).unwrap();
     (client, server)
 }
@@ -105,7 +104,7 @@ fn fixture(mode: crate::config::TransactionMode, name: &str, spool_bytes: usize)
 fn connection(fixture: &mut Fixture, id: i32) -> (Conn, TcpStream) {
     let (client, server) = socket_pair();
     let mut conn = Conn::new(&fixture.config, &mut fixture.budget).unwrap();
-    conn.open(server, id);
+    conn.open(server, id).unwrap();
     conn.auth_database = fixture.engine.database_login("postgres");
     conn.phase = Phase::Ready;
     (conn, client)
@@ -554,7 +553,7 @@ fn tls_backpressure_keeps_ciphertext_queued_instead_of_closing() {
     let config = Config::default_dev();
     let mut budget = Budget::new(256 << 20);
     let mut conn = Conn::new(&config, &mut budget).unwrap();
-    conn.open(server, 5);
+    conn.open(server, 5).unwrap();
     let mut client = tls_client(&mut conn, &mut socket);
     // Queue far more than the kernel and the 64 KiB rustls record buffer
     // hold while the client reads nothing.
@@ -1724,7 +1723,7 @@ fn tls_result_streams_resume_while_the_client_reads_ciphertext() {
         stream_fixture(crate::config::TransactionMode::Mvcc, "stream-tls");
     let (mut socket, server) = socket_pair();
     let mut conn = Conn::new(&fixture.config, &mut fixture.budget).unwrap();
-    conn.open(server, 3);
+    conn.open(server, 3).unwrap();
     conn.auth_database = fixture.engine.database_login("postgres");
     conn.phase = Phase::Ready;
     let mut client = tls_client(&mut conn, &mut socket);

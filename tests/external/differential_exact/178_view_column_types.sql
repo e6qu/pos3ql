@@ -57,3 +57,23 @@ DROP VIEW u1, u2;
 ALTER TABLE u ALTER COLUMN a TYPE bigint;
 RESET search_path;
 DROP SCHEMA vct CASCADE;
+-- Trigger WHEN conditions and rules record the columns NEW and OLD read.
+CREATE SCHEMA vct2;
+SET search_path = vct2;
+CREATE TABLE t (a int, b int, c int, d int, e int);
+CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+CREATE TRIGGER tr BEFORE UPDATE ON t FOR EACH ROW WHEN (NEW.b > 0 AND OLD.a < 1) EXECUTE FUNCTION tf();
+ALTER TABLE t ALTER COLUMN b TYPE bigint;
+CREATE TABLE r (x int, y int);
+CREATE RULE ru AS ON INSERT TO r DO ALSO DELETE FROM t WHERE e = NEW.x;
+CREATE RULE ru2 AS ON UPDATE TO r WHERE OLD.y > 0 DO INSTEAD DELETE FROM t WHERE c = OLD.x;
+ALTER TABLE t ALTER COLUMN e TYPE bigint;
+ALTER TABLE r ALTER COLUMN x TYPE bigint;
+SELECT pg_describe_object(classid, objid, objsubid) AS dependent,
+       pg_describe_object(refclassid, refobjid, refobjsubid) AS referenced, deptype
+  FROM pg_depend
+ WHERE classid IN ('pg_rewrite'::regclass, 'pg_trigger'::regclass)
+   AND objid >= 16384 AND refobjid >= 16384
+ ORDER BY 1, 2;
+RESET search_path;
+DROP SCHEMA vct2 CASCADE;

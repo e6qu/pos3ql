@@ -5837,6 +5837,18 @@ impl RuleDefinition {
         let start = usize::from(span.start);
         &self.source.as_str()[start..start + usize::from(span.len)]
     }
+
+    /// The rule's condition and action texts.
+    pub(crate) fn fragments(&self) -> impl Iterator<Item = &str> {
+        self.condition
+            .into_iter()
+            .chain(
+                self.actions[..usize::from(self.action_count)]
+                    .iter()
+                    .copied(),
+            )
+            .map(|span| self.text(span))
+    }
 }
 
 #[derive(Clone)]

@@ -340,9 +340,10 @@ PL/pgSQL variable of one with `0A000`; dropping a relation through `DROP
 SCHEMA`, `DROP MATERIALIZED VIEW`, `DROP FOREIGN TABLE ... CASCADE` or another
 object's cascade while another table's column or a domain uses its row type
 fails with `0A000`. `ALTER COLUMN ... TYPE` is refused for columns that a
-view, policy or SQL-standard routine body reads, but not yet for columns read
-by a trigger's `WHEN` condition, a rule action or a materialized view, whose
-`pg_depend` column rows are missing. `DROP` of casts, operator
+view, rule, trigger `WHEN` condition, policy or SQL-standard routine body
+reads, but not yet for a materialized view's columns or the target columns of
+a stored `INSERT` or `UPDATE`, whose `pg_depend` column rows are missing.
+`DROP` of casts, operator
 classes and families, collations, extensions, servers, policies, triggers,
 rules, indexes and `DROP OWNED` still describe their dependents with their own
 code instead of the `pg_depend` walk that `DROP TABLE`, `VIEW`, `MATERIALIZED
@@ -352,10 +353,12 @@ dependents); `pg_depend` has no rows
 for foreign servers, foreign tables and user mappings, and still lacks
 PostgreSQL's rows for
 columns using a user-defined collation, TOAST tables, types named only inside
-expressions (a cast in a default or routine body), the columns a trigger's
-`WHEN` condition reads, a materialized view's `_RETURN` rule and its column
-rows, and the column-level rows of rules (`NEW.x`, `INSERT INTO t (e)`) and of
-views that read a sequence. A partition key that is an
+expressions (a cast in a default or routine body), a materialized view's
+`_RETURN` rule and its column rows, the target columns of a rule's or
+SQL-standard routine body's `INSERT` or `UPDATE` (`INSERT INTO t (e)` depends
+on `t.e`; the stored column set also drives read-privilege checks, so it needs
+a separate written-column set), and the column-level rows of views that read a
+sequence. A partition key that is an
 expression (`PARTITION BY LIST ((k + v))`) fails with `42601`. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.

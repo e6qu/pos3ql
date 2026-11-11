@@ -573,6 +573,31 @@ pub(crate) fn for_each_dependency(
             crate::storage::RuleTarget::View(slot) => view_oid(storage, usize::from(slot)),
         };
         push!(2618, rule.oid(), PG_CLASS_OID, relation_oid, 0, "a")?;
+        // `NEW.x` and `OLD.x` read columns of the rule's own relation.
+        let own = transition_columns(
+            storage,
+            txid,
+            match definition.target {
+                crate::storage::RuleTarget::Table(slot) => {
+                    crate::storage::RowTypeRelation::Table(usize::from(slot))
+                }
+                crate::storage::RuleTarget::View(slot) => {
+                    crate::storage::RowTypeRelation::View(usize::from(slot))
+                }
+            },
+            definition.fragments(),
+            arena,
+        )?;
+        for attribute in own.iter().copied() {
+            push!(
+                2618,
+                rule.oid(),
+                PG_CLASS_OID,
+                relation_oid,
+                i32::from(attribute),
+                "n"
+            )?;
+        }
         for dependency in storage
             .snapshot_rule_dependencies(slot, txid, arena)?
             .entries()
@@ -641,6 +666,30 @@ pub(crate) fn for_each_dependency(
             "n",
         )?;
         push!(2620, trigger_oid, PG_CLASS_OID, relation_oid, 0, "a")?;
+        // The columns a `WHEN` condition reads through `NEW` and `OLD`.
+        if let (Some(when), crate::storage::TriggerTarget::Table(table)) =
+            (trigger.when.as_ref(), trigger.target)
+        {
+            for attribute in transition_columns(
+                storage,
+                txid,
+                crate::storage::RowTypeRelation::Table(usize::from(table)),
+                core::iter::once(when.as_str()),
+                arena,
+            )?
+            .iter()
+            .copied()
+            {
+                push!(
+                    2620,
+                    trigger_oid,
+                    PG_CLASS_OID,
+                    relation_oid,
+                    i32::from(attribute),
+                    "n"
+                )?;
+            }
+        }
         if let crate::storage::TriggerKind::Constraint {
             referenced_table, ..
         } = trigger.kind
@@ -1390,4 +1439,77 @@ fn policy_dependencies(
         }
     }
     Ok(())
+}
+
+/// Attribute numbers of `relation` that `NEW.column` or `OLD.column` names in
+/// `fragments`, each once, in attribute order.
+fn transition_columns<'a, 'f>(
+    storage: &Storage,
+    txid: u32,
+    relation: crate::storage::RowTypeRelation,
+    fragments: impl Iterator<Item = &'f str>,
+    arena: &'a Arena,
+) -> Result<&'a [u16], SqlError> {
+    let attribute = |name: &str| -> Option<u16> {
+        match relation {
+            crate::storage::RowTypeRelation::Table(slot) => {
+                let definition = storage.table_def(slot, txid);
+                definition
+                    .column_index(name)
+                    .map(|column| definition.attribute_number(column))
+            }
+            crate::storage::RowTypeRelation::View(slot) => {
+                let (_, count) = storage.view_column_shape(slot, txid);
+                (0..count)
+                    .find(|index| {
+                        storage
+                            .view_column(slot, txid, *index)
+                            .is_some_and(|(column, _)| column.as_str() == name)
+                    })
+                    .and_then(|index| u16::try_from(index + 1).ok())
+            }
+        }
+    };
+    let mut found = ColumnSet::EMPTY;
+    for fragment in fragments {
+        let mut lexer = crate::sql::lexer::Lexer::new(fragment, arena);
+        let mut previous = [crate::sql::lexer::Tok::Eof; 2];
+        loop {
+            let token = lexer.next_token().map_err(|_| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "stored trigger or rule text does not scan"
+                )
+            })?;
+            if token == crate::sql::lexer::Tok::Eof {
+                break;
+            }
+            if let (
+                [
+                    crate::sql::lexer::Tok::Ident(pseudo),
+                    crate::sql::lexer::Tok::Op("."),
+                ],
+                crate::sql::lexer::Tok::Ident(column) | crate::sql::lexer::Tok::QuotedIdent(column),
+            ) = (previous, token)
+                && matches!(pseudo, "new" | "old")
+                && let Some(number) = attribute(column)
+            {
+                found.insert(usize::from(number) - 1);
+            }
+            previous = [previous[1], token];
+        }
+    }
+    let count = (0..MAX_COLUMNS)
+        .filter(|column| found.contains(*column))
+        .count();
+    let attributes = arena
+        .alloc_slice_with(count, |_| 0u16)
+        .map_err(|_| arena_full())?;
+    for (slot, column) in attributes
+        .iter_mut()
+        .zip((0..MAX_COLUMNS).filter(|column| found.contains(*column)))
+    {
+        *slot = u16::try_from(column + 1).expect("attribute number fits");
+    }
+    Ok(attributes)
 }

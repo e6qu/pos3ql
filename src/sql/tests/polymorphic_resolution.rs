@@ -305,3 +305,16 @@ fn first_dimension_array_reorderings_match_postgresql() {
         ),
     ]);
 }
+
+/// An untyped parameter takes its type from the built-in overload PostgreSQL
+/// selects, so `abs($1)` is callable without parameter types.
+#[test]
+fn untyped_parameters_take_builtin_argument_types() {
+    assert_eq!(
+        rows(&[
+            "PREPARE typed_from_call AS SELECT abs($1), sqrt($2), upper($3), length($4); \
+             EXECUTE typed_from_call(-1, 4, 'ab', 'abc')",
+        ]),
+        [vec!["1|2|AB|3"]]
+    );
+}

@@ -46174,19 +46174,39 @@ impl Storage {
             }
             found.map(|(_, expected)| expected)
         };
-        if let Some((schema, routine_name)) = name.split_once('.') {
-            return resolve(schema, routine_name);
+        let stored = if let Some((schema, routine_name)) = name.split_once('.') {
+            resolve(schema, routine_name)
+        } else {
+            self.path().entries().iter().find_map(|entry| {
+                let PathEntry::Schema(schema_slot) = entry else {
+                    return None;
+                };
+                let schema = self.schema_def_for(*schema_slot as usize, txid).name;
+                resolve(schema.as_str(), name)
+            })
+        };
+        if stored.is_some() {
+            return stored;
         }
-        for entry in self.path().entries() {
-            let PathEntry::Schema(schema_slot) = entry else {
-                continue;
-            };
-            let schema = self.schema_def_for(*schema_slot as usize, txid).name;
-            if let Some(expected) = resolve(schema.as_str(), name) {
-                return Some(expected);
-            }
+        // A built-in call types its parameters from the overload PostgreSQL
+        // selects for the known inputs (`abs($1)` takes double precision).
+        match self.select_routine_call(
+            name,
+            argument_names,
+            actual_oids,
+            explicit_variadic,
+            txid,
+            RoutineCallKind::Function,
+        ) {
+            RoutineCallSelection::Builtin { oid, .. } => self.builtin_call_input_oids(
+                oid,
+                argument_names,
+                actual_oids,
+                explicit_variadic,
+                txid,
+            ),
+            _ => None,
         }
-        None
     }
 
     pub(crate) fn routine_for_bound_call(

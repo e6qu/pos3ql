@@ -2864,7 +2864,7 @@ sql_arena_bytes = 4096
 
     #[test]
     fn write_step_levels_are_bounded() {
-        const REQUIRED: &str = "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\n";
+        const REQUIRED: &str = "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\n";
         assert_eq!(Config::parse(REQUIRED).unwrap().write_step_levels, 4);
         assert_eq!(
             Config::parse(&format!("write_step_levels = 8\n{REQUIRED}"))

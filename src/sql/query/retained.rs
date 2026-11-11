@@ -1596,7 +1596,7 @@ fn branch_admitted<'a>(
             SelectItem::Expr { expression, .. } => {
                 expressions.push(*expression).map_err(|_| arena_full())?;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
             SelectItem::RecordStar(_) => return Ok(false),
         }
     }
@@ -1652,7 +1652,9 @@ fn appended_select<'a>(
         })
         .map_err(|_| arena_full())?;
     let items = arena
-        .alloc_slice_copy(&[SelectItem::Wildcard])
+        .alloc_slice_copy(&[SelectItem::Wildcard(
+            crate::sql::ast::SourcePosition::UNKNOWN,
+        )])
         .map_err(|_| arena_full())?;
     let wrapper = arena
         .alloc(Select {
@@ -1679,6 +1681,7 @@ fn appended_select<'a>(
                     authorization_role: None,
                     bound_table: None,
                     view_access: None,
+                    join_members: None,
                 },
                 joins: &[],
             }),
@@ -1694,6 +1697,7 @@ fn appended_select<'a>(
             with: &[],
             set_body: None,
             locking: &[],
+            windows: &[],
         })
         .map_err(|_| arena_full())?;
     Ok(Some(&*wrapper))
@@ -1731,6 +1735,7 @@ pub(crate) fn set_query_select<'a>(
             with: query.with,
             set_body: Some(query.body),
             locking: query.locking,
+            windows: &[],
         })
         .map(|select| &*select)
         .map_err(|_| arena_full())

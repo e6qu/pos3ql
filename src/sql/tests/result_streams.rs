@@ -95,17 +95,30 @@ fn paged_request(sql: &str, page: i32) -> Vec<u8> {
     request
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColdRequest {
+    Select,
+    Paged,
+    Copy,
+}
+
 #[test]
 fn result_streams_yield_on_cold_reads_after_delivered_rows() {
-    cold_result_stream("result-stream-cold", false);
+    cold_result_stream("result-stream-cold", ColdRequest::Select);
 }
 
 #[test]
 fn paged_portals_yield_on_cold_reads_between_and_within_pages() {
-    cold_result_stream("result-stream-cold-paged", true);
+    cold_result_stream("result-stream-cold-paged", ColdRequest::Paged);
 }
 
-fn cold_result_stream(name: &str, paged: bool) {
+#[test]
+fn copy_to_stdout_yields_on_cold_reads_after_delivered_rows() {
+    cold_result_stream("result-stream-cold-copy", ColdRequest::Copy);
+}
+
+fn cold_result_stream(name: &str, request: ColdRequest) {
+    let paged = request == ColdRequest::Paged;
     let mut config = test_config(name);
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -175,10 +188,10 @@ fn cold_result_stream(name: &str, paged: bool) {
     };
     let sql = "SELECT id, code FROM cold_orders";
     client
-        .write_all(&if paged {
-            paged_request(sql, 50)
-        } else {
-            query(sql)
+        .write_all(&match request {
+            ColdRequest::Select => query(sql),
+            ColdRequest::Paged => paged_request(sql, 50),
+            ColdRequest::Copy => query("COPY cold_orders TO STDOUT"),
         })
         .unwrap();
     let mut poll = libc::pollfd {
@@ -199,7 +212,7 @@ fn cold_result_stream(name: &str, paged: bool) {
         read_available(&mut client, &mut received);
         let delivered = messages(&received)
             .iter()
-            .filter(|message| message.0 == b'D')
+            .filter(|message| matches!(message.0, b'D' | b'd'))
             .count();
         if messages(&received).iter().any(|message| message.0 == b'Z') {
             break;
@@ -266,19 +279,40 @@ fn cold_result_stream(name: &str, paged: bool) {
         "{:?}",
         String::from_utf8_lossy(response[kinds.len() - 2].1)
     );
-    if paged {
-        // Each full page suspends; the unlimited Execute returns the rest.
-        assert_eq!(kinds.iter().filter(|kind| **kind == b's').count(), 3);
-        assert_eq!(response[kinds.len() - 2].1, b"SELECT 170\0");
-    } else {
-        assert_eq!(kinds.iter().filter(|kind| **kind == b'T').count(), 1);
-        assert_eq!(response[kinds.len() - 2].1, b"SELECT 320\0");
+    match request {
+        ColdRequest::Paged => {
+            // Each full page suspends; the unlimited Execute returns the rest.
+            assert_eq!(kinds.iter().filter(|kind| **kind == b's').count(), 3);
+            assert_eq!(response[kinds.len() - 2].1, b"SELECT 170\0");
+        }
+        ColdRequest::Select => {
+            assert_eq!(kinds.iter().filter(|kind| **kind == b'T').count(), 1);
+            assert_eq!(response[kinds.len() - 2].1, b"SELECT 320\0");
+        }
+        ColdRequest::Copy => {
+            assert_eq!(kinds[0], b'H');
+            assert_eq!(response[kinds.len() - 2].1, b"COPY 320\0");
+            let lines: Vec<_> = response
+                .iter()
+                .filter(|message| message.0 == b'd')
+                .collect();
+            assert_eq!(lines.len(), 320);
+            for (index, line) in lines.iter().enumerate() {
+                let text = core::str::from_utf8(line.1).unwrap().trim_end_matches('\n');
+                let (id, code) = text.split_once('\t').unwrap();
+                assert_eq!(id, (index + 1).to_string());
+                assert_eq!(checksum(code.as_bytes()), expected[index]);
+            }
+        }
     }
     let rows: Vec<_> = response
         .iter()
         .filter(|message| message.0 == b'D')
         .collect();
-    assert_eq!(rows.len(), 320);
+    assert_eq!(
+        rows.len(),
+        if request == ColdRequest::Copy { 0 } else { 320 }
+    );
     for (index, row) in rows.iter().enumerate() {
         let values = fields(row.1);
         assert_eq!(values[0], (index + 1).to_string().as_bytes());

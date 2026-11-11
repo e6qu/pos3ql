@@ -325,7 +325,11 @@ COPY (SELECT id, status FROM orders ORDER BY id) TO STDOUT (FORMAT csv);
 
 Table-form `COPY TO` returns `42809` for a partitioned parent without an
 applicable row-security rewrite and `0A000` for an unpopulated materialized
-view. Views, foreign tables and catalog tables require query form.
+view. Views, foreign tables and catalog tables require query form. Otherwise
+it sends the rows of `SELECT columns FROM ONLY table`, in the same order a
+`SELECT` without `ORDER BY` returns them. A large `COPY ... TO STDOUT` from
+one table or a streamable query resumes row by row like a large `SELECT`:
+it waits for a slow client and for cold storage without holding the worker.
 
 `COPY FROM` statement triggers declared with
 `REFERENCING NEW TABLE AS inserted_rows` see the values saved after BEFORE

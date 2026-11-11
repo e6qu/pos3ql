@@ -92,9 +92,10 @@ stay queued until it finishes; if such a routine is first called after rows
 already reached the client, the statement fails with `0A000` instead of
 repeating them.
 
-**Large results resume row by row.** Before a top-level `SELECT` runs (simple
-Query or extended `Execute`), the engine decides whether it can become a
-**result stream**: one ordinary table, or one builtin set-returning function
+**Large results resume row by row.** Before a top-level `SELECT` or
+`COPY ... TO STDOUT` runs (simple Query or extended `Execute`), the engine
+decides whether it (or the query a COPY reads: its own, or `SELECT columns
+FROM ONLY table` for a table) can become a **result stream**: one ordinary table, or one builtin set-returning function
 with constant arguments (`generate_series`, a one-array `unnest`), without
 joins, grouping, sorting, `DISTINCT`, set operations, subqueries, CTEs, row
 locking or row security, whose read position (one record per resident row
@@ -145,10 +146,10 @@ BY id` sorts first, so its output queues in the spool instead.
 | Maintenance: checkpoint capture, merges, index builds, journal and saved-file cleanup | Yields, using a separate maintenance read owner and fixed clients |
 | A statement after its first effect (volatile function, routine body, sequence change, first output byte reaching the client) | Blocks until the statement ends |
 | Output queued for a slow client | Never blocks; the connection waits for the client between messages |
-| Result streams (see above): each row before its first effect | Yields; delivered rows are kept |
+| Result streams (see above), including `COPY ... TO STDOUT` and a streamed `FETCH`: each row before its first effect | Yields; delivered rows are kept |
 | Writing statements: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, DDL, `CALL`, `DO`, `COPY FROM` | Blocks for the whole statement |
 | Commit processing, deferred constraint triggers, `SET CONSTRAINTS`, `PREPARE TRANSACTION`, `COMMIT PREPARED`/`ROLLBACK PREPARED` | Blocks |
-| `COPY` rows and completion; logical-replication apply and initial copy | Blocks |
+| `COPY FROM` rows and completion; a `COPY TO` that cannot stream once its first byte reaches the client; logical-replication apply and initial copy | Blocks |
 | Large-object fast-path calls, login event triggers, manual `CHECKPOINT` | Blocks |
 
 Lock waits are separate: a command waiting for a row, table or advisory lock

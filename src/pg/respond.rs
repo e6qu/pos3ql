@@ -2182,6 +2182,19 @@ impl<'b> Responder<'b> {
         result
     }
 
+    /// Runs `operation` with RowDescription suppressed, as for a COPY whose
+    /// query describes its columns in CopyOutResponse instead.
+    pub(crate) fn without_row_description<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let prior = self.suppress_row_description;
+        self.suppress_row_description = true;
+        let result = operation(self);
+        self.suppress_row_description = prior;
+        result
+    }
+
     /// Runs an internal statement without exposing its row description, rows,
     /// or command tag. Diagnostic messages and errors still use the ordinary
     /// wire path.

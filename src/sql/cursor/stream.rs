@@ -49,6 +49,8 @@ pub(crate) struct StreamState {
     pub(crate) suspended: bool,
     /// Rows come from this cursor instead of the stream's own query.
     pub(crate) fetch: Option<FetchStream>,
+    /// A `COPY ... TO STDOUT` sends its query's rows as COPY data.
+    pub(crate) copy: Option<crate::sql::exec::CopyFmt>,
     /// Whether a previous turn already entered the statement's effect scope.
     pub(crate) resumed: bool,
 }

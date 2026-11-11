@@ -1690,3 +1690,114 @@ fn streamed_fetches_fail_their_cursor_after_delivered_rows() {
     let response = run(&mut conn, &mut fixture.engine, &mut client, "ROLLBACK");
     assert!(messages(&response).iter().all(|message| message.0 != b'E'));
 }
+
+/// The data lines of CopyData messages.
+fn copy_lines<'a>(messages: &[(u8, &'a [u8])]) -> Vec<&'a str> {
+    messages
+        .iter()
+        .filter(|message| message.0 == b'd')
+        .map(|message| {
+            core::str::from_utf8(message.1)
+                .unwrap()
+                .trim_end_matches('\n')
+        })
+        .collect()
+}
+
+#[test]
+fn copy_to_stdout_streams_rows_as_the_client_reads() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let (mut fixture, mut conn, mut client, mut other, mut other_client) =
+            stream_fixture(mode, "copy-stream");
+        let opened = fixture.engine.result_stream_metrics().opened;
+        let mut input = query("COPY big TO STDOUT");
+        input.extend_from_slice(&query(
+            "COPY (SELECT id, payload FROM big WHERE id > 4000) TO STDOUT (FORMAT csv, HEADER)",
+        ));
+        client.write_all(&input).unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        assert_eq!(
+            conn.parked_wait(),
+            Some(crate::sql::StatementWait::ClientOutput)
+        );
+        assert!(conn.result_stream.is_active());
+        assert!(conn.overflow_bytes() < 1024);
+        let progress = if mode == crate::config::TransactionMode::Mvcc {
+            "SELECT count(*) FROM big"
+        } else {
+            "SELECT 1"
+        };
+        let response = run(&mut other, &mut fixture.engine, &mut other_client, progress);
+        assert!(messages(&response).iter().all(|message| message.0 != b'E'));
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 2);
+        let response = messages(&response);
+        let first_ready = response
+            .iter()
+            .position(|message| message.0 == b'Z')
+            .unwrap();
+        let (table, select) = response.split_at(first_ready + 1);
+        let kinds: Vec<u8> = table.iter().map(|message| message.0).collect();
+        assert_eq!(kinds[0], b'H');
+        assert_eq!(&kinds[kinds.len() - 3..], b"cCZ");
+        assert_eq!(table[kinds.len() - 2].1, b"COPY 5000\0");
+        let lines = copy_lines(table);
+        assert_eq!(lines.len(), 5000);
+        for (index, line) in lines.iter().enumerate() {
+            assert_eq!(*line, format!("{}\t{}", index + 1, "x".repeat(200)));
+        }
+        let lines = copy_lines(select);
+        assert_eq!(lines.len(), 1001);
+        assert_eq!(lines[0], "id,payload");
+        assert_eq!(lines[1], format!("4001,{}", "x".repeat(200)));
+        assert_eq!(select[select.len() - 2].1, b"COPY 1000\0");
+        assert_eq!(fixture.engine.result_stream_metrics().opened, opened + 2);
+        assert!(!conn.result_stream.is_held());
+    }
+}
+
+#[test]
+fn streamed_copy_fails_after_delivered_rows_and_matches_unstreamed_output() {
+    let (mut fixture, mut conn, mut client, _, _) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "copy-stream-error");
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "COPY (SELECT id, 1 / (id - 3001), payload FROM big) TO STDOUT",
+    );
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert_eq!(&kinds[kinds.len() - 2..], b"EZ");
+    assert_eq!(sqlstate_of(response[kinds.len() - 2].1), "22012");
+    assert_eq!(copy_lines(&response).len(), 3000);
+    // Binary output streamed from the table equals the same rows spooled.
+    let spooled = fixture.engine.result_stream_metrics().spooled_shape;
+    let streamed = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "COPY big (payload, id) TO STDOUT (FORMAT binary)",
+    );
+    let small = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "COPY (SELECT payload, id FROM big ORDER BY id) TO STDOUT (FORMAT binary)",
+    );
+    assert_eq!(
+        fixture.engine.result_stream_metrics().spooled_shape,
+        spooled + 1
+    );
+    let data = |response: &[u8]| -> Vec<u8> {
+        messages(response)
+            .iter()
+            .filter(|message| message.0 == b'd')
+            .flat_map(|message| message.1.iter().copied())
+            .collect()
+    };
+    assert_eq!(data(&streamed), data(&small));
+    assert!(data(&streamed).starts_with(b"PGCOPY\n\xff\r\n\0"));
+}

@@ -934,6 +934,8 @@ pub(crate) struct PendingResultStream {
     pub(crate) source_end: usize,
     /// A FETCH that streams its cursor's rows instead of a reopened query.
     pub(crate) fetch: Option<cursor::FetchStream>,
+    /// A `COPY ... TO STDOUT` that reopens its query as COPY data.
+    pub(crate) copy: bool,
     pub(crate) owner: type_input_plans::Owner,
     /// The statement's original deadline; the stream keeps it across waits.
     pub(crate) deadline: i64,
@@ -11919,6 +11921,7 @@ impl Engine {
                         source_start: *source_start,
                         source_end: *source_end,
                         fetch: fetch_stream,
+                        copy: matches!(statement, Stmt::Copy(_)),
                         owner,
                         deadline: query::statement_deadline(),
                         output_mark: promoted,
@@ -12564,6 +12567,7 @@ impl Engine {
                                             source_start: 0,
                                             source_end: text.len(),
                                             fetch: fetch_stream,
+                                            copy: matches!(statement, Stmt::Copy(_)),
                                             owner,
                                             deadline: query::statement_deadline(),
                                             output_mark: promoted,
@@ -21164,7 +21168,7 @@ impl Engine {
                             arena,
                             params,
                             responder,
-                        ) {
+                        )? {
                             Ok(count) => {
                                 responder.command_complete(
                                     crate::stack_format!(32, "COPY {count}").as_str(),
@@ -21191,18 +21195,25 @@ impl Engine {
                     return Ok(Err(error));
                 }
                 if c.to {
-                    match exec::copy_out(
+                    // A table's rows are its query's rows, in scan order.
+                    let sql = match exec::copy_select_text(&self.storage, &setup, txn.txid, arena) {
+                        Ok(sql) => sql,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    match exec::copy_out_query(
                         &self.storage,
                         txn.txid,
-                        &setup,
-                        arena,
-                        responder,
+                        sql,
+                        &c.options,
                         Some(&sequence::SeqEval::new(
                             &self.storage,
                             guc.seq_session(),
                             txn.txid,
                         )),
-                    ) {
+                        arena,
+                        params,
+                        responder,
+                    )? {
                         Ok(count) => {
                             responder.command_complete(
                                 crate::stack_format!(32, "COPY {count}").as_str(),

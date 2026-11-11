@@ -91,12 +91,13 @@ is owned.
   keeps its own transition table and firing order.
 - **Results and cursors:** resume more large results row by row; `SELECT`
   from one table or one generated series does today, including paged
-  portals and forward `FETCH` from `NO SCROLL` cursors. Remaining: a second
+  portals, forward `FETCH` from `NO SCROLL` cursors and `COPY ... TO STDOUT`
+  of such queries or one table. Remaining: a second
   paged portal while one holds the connection's stream (it buffers into
   `portal_result_bytes`); `FETCH` from scrollable cursors, including
   PostgreSQL's default for table scans, which saves every visited row in
   `cursor_bytes` because the retained read position cannot move backward over
-  spilled generations; `COPY TO`; and more retained shapes (joins, sorting, grouping, subqueries, set
+  spilled generations; and more retained shapes (joins, sorting, grouping, subqueries, set
   operations, and more set-returning functions than `generate_series` and
   one-array `unnest`).
   Cursors over those shapes still run at `DECLARE`, so a scrollable sorted

@@ -104,9 +104,6 @@ impl Engine {
             };
             return Ok(StreamChoice::Fetch(FetchStream { slot, limit }));
         }
-        let Stmt::Select(select) = statement else {
-            return Err(SpoolReason::Shape);
-        };
         if typed_inputs {
             return Err(SpoolReason::Shape);
         }
@@ -114,7 +111,31 @@ impl Engine {
             return Err(SpoolReason::Capacity);
         }
         let mark = self.work.mark();
-        let source = query::RetainedSelect::stream_source(&self.storage, txid, select, &self.work);
+        let (source, source_len) = match statement {
+            Stmt::Select(select) => (
+                query::RetainedSelect::stream_source(&self.storage, txid, select, &self.work),
+                source_len,
+            ),
+            // COPY TO STDOUT streams the query it reads.
+            Stmt::Copy(copy) if copy.to => {
+                match self
+                    .copy_query_text(copy, txid, &self.work)
+                    .and_then(|text| {
+                        let select = crate::sql::parser::parse_query(text, &self.work)?;
+                        query::RetainedSelect::stream_source(
+                            &self.storage,
+                            txid,
+                            select,
+                            &self.work,
+                        )
+                        .map(|source| (source, text.len()))
+                    }) {
+                    Ok((source, len)) => (Ok(source), source_len.max(len)),
+                    Err(error) => (Err(error), source_len),
+                }
+            }
+            _ => (Ok(None), source_len),
+        };
         // The probe resolved names in scratch memory only.
         unsafe { self.work.rewind_to(mark) };
         let positions = match source {
@@ -137,6 +158,21 @@ impl Engine {
             Some(bytes) if bytes <= self.result_stream_bytes => Ok(StreamChoice::Promote),
             _ => Err(SpoolReason::Capacity),
         }
+    }
+
+    /// The query a `COPY ... TO STDOUT` reads: its own, or its table's
+    /// target columns from only that table. Table checks run first.
+    fn copy_query_text<'a>(
+        &self,
+        copy: &ast::CopyStmt<'a>,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<&'a str, SqlError> {
+        if let Some(sql) = copy.query {
+            return Ok(sql);
+        }
+        let setup = exec::copy_begin(&self.storage, copy, txid)?;
+        exec::copy_select_text(&self.storage, &setup, txid, arena)
     }
 
     pub(super) fn record_result_spool(&mut self, reason: SpoolReason) {
@@ -169,6 +205,7 @@ impl Engine {
         protocol: StreamProtocol,
         page_limit: Option<u64>,
         fetch: Option<FetchStream>,
+        copy: bool,
         sql: &str,
         params: &[Datum],
         parameter_types: &[i32],
@@ -189,23 +226,70 @@ impl Engine {
         let txid = txn.txid;
         let source_snapshot = txn.command_id().saturating_add(1);
         let _guc_eval_scope = guc::enter_eval_scope(guc, txn);
+        let work_mark = self.work.mark();
         let opened = exec::with_bound_parameter_types(parameter_types, || {
+            // A COPY streams the query it reads, formatted as COPY data.
+            let mut copy_format = None;
+            let query_text = if copy {
+                let mut parser = crate::sql::parser::Parser::new(sql, &self.work)
+                    .map_err(|error| parse_error_to_sql(&error))?;
+                let Some(Stmt::Copy(statement)) = parser
+                    .next_stmt()
+                    .map_err(|error| parse_error_to_sql(&error))?
+                else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "result stream COPY statement changed"
+                    ));
+                };
+                self.storage.set_read_snapshot(source_snapshot);
+                let text = self.copy_query_text(&statement, txid, &self.work)?;
+                let mut columns = [types::ColDesc::new("", 0, 0); MAX_PROJ];
+                let count =
+                    query::describe_query(text, &self.storage, txid, &self.work, &mut columns)?;
+                let mut names = [""; MAX_PROJ];
+                for (name, column) in names.iter_mut().zip(&columns[..count]) {
+                    *name = column.name;
+                }
+                let format = exec::copy_fmt_for_columns(&names[..count], &statement.options)?;
+                copy_format = Some((format, names, count));
+                text
+            } else {
+                sql
+            };
             stream
                 .query
-                .bind(sql, params, &[], &[], owner, |parser| {
+                .bind(query_text, params, &[], &[], owner, |parser| {
                     type_inputs::validate_restored(parser, &self.storage, txid)
                 })
                 .map_err(stream_capacity)?;
             self.storage.set_read_snapshot(source_snapshot);
             responder.set_render(guc.render());
-            stream
-                .query
-                .prepare_source(&self.storage, txid, responder)
-                .map_err(stream_capacity)
+            let Some((format, names, count)) = copy_format else {
+                return stream
+                    .query
+                    .prepare_source(&self.storage, txid, responder)
+                    .map(|ready| (ready, None))
+                    .map_err(stream_capacity);
+            };
+            let ready = responder
+                .without_row_description(|responder| {
+                    stream.query.prepare_source(&self.storage, txid, responder)
+                })
+                .map_err(stream_capacity)?;
+            exec::begin_copy_out(&format, &names[..count], responder).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "a result message exceeds conn_send_buffer_bytes"
+                )
+            })?;
+            Ok((ready, Some(format)))
         });
-        match opened {
-            Ok(true) => {}
-            Ok(false) => {
+        // The COPY statement and its query text were scratch.
+        unsafe { self.work.rewind_to(work_mark) };
+        let copy_format = match opened {
+            Ok((true, format)) => format,
+            Ok((false, _)) => {
                 stream.release(cursors);
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -216,7 +300,7 @@ impl Engine {
                 stream.release(cursors);
                 return Err(error);
             }
-        }
+        };
         stream.state = Some(StreamState {
             connection: conn_id,
             txid,
@@ -228,6 +312,7 @@ impl Engine {
             page_limit,
             suspended: false,
             fetch: None,
+            copy: copy_format,
             resumed: false,
         });
         cursors.hold_stream_table(stream.source_table());
@@ -302,6 +387,7 @@ impl Engine {
             page_limit: fetch.limit,
             suspended: false,
             fetch: Some(fetch),
+            copy: None,
             resumed: false,
         });
         self.result_streams_opened = self.result_streams_opened.saturating_add(1);
@@ -482,11 +568,16 @@ impl Engine {
             Ok(DeliveryStop::End) => {
                 let tag = if state.fetch.is_some() {
                     stack_format!(48, "FETCH {}", state.emitted)
+                } else if state.copy.is_some() {
+                    stack_format!(48, "COPY {}", state.emitted)
                 } else {
                     stack_format!(48, "SELECT {}", state.emitted)
                 };
                 stream.release(cursors);
                 txn.release_suspended_statement();
+                if let Some(format) = state.copy {
+                    exec::finish_copy_out(&format, responder)?;
+                }
                 responder.command_complete(tag.as_str())?;
                 Ok(StreamStep::Complete)
             }
@@ -656,6 +747,7 @@ impl Engine {
                 )?,
                 None => self.advance_stream_row(
                     &mut stream.query,
+                    state.copy.as_ref(),
                     state.source_snapshot,
                     arena,
                     txn,
@@ -767,6 +859,7 @@ impl Engine {
     fn advance_stream_row(
         &mut self,
         stream: &mut cursor::CursorQuery,
+        copy: Option<&exec::CopyFmt>,
         source_snapshot: u32,
         arena: &Arena,
         txn: &mut TxnState,
@@ -864,8 +957,24 @@ impl Engine {
             self.storage.set_read_snapshot(source_snapshot);
             // The row reaches send or the private reserve whole; a wait can
             // no longer re-evaluate it.
-            match query::emit_data_row(&self.storage, txid, frame, responder, projected.as_slice())?
-            {
+            let emitted = match copy {
+                Some(format) => exec::emit_copy_row(
+                    &self.storage,
+                    txid,
+                    format,
+                    frame,
+                    responder,
+                    projected.as_slice(),
+                )?,
+                None => query::emit_data_row(
+                    &self.storage,
+                    txid,
+                    frame,
+                    responder,
+                    projected.as_slice(),
+                )?,
+            };
+            match emitted {
                 Ok(()) => Ok(Ok(true)),
                 Err(error) => Ok(Err(error)),
             }

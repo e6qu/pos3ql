@@ -16092,11 +16092,16 @@ pub struct Storage {
     /// The lock retains one allocation frontier through nested evaluation;
     /// every use rewinds to its entry mark.
     index_arena: Mutex<Arena>,
+    /// Decoded fields of stored named composites while one comparison orders
+    /// them; each comparison rewinds to its entry mark.
+    comparison_arena: Mutex<Arena>,
     /// The process-independent locale state selected at engine startup.
     collation: Option<CollationRuntime>,
 }
 
 const INDEX_ARENA_BYTES: usize = 2 * crate::store::MAX_PAYLOAD;
+/// Two decoded composite values of one stored row's size, with their fields.
+const COMPARISON_ARENA_BYTES: usize = 4 * crate::store::MAX_PAYLOAD;
 
 struct CollationScratch {
     left: FixedBuf,
@@ -21129,6 +21134,7 @@ impl Storage {
     pub fn extra_budget_bytes(config: &Config) -> usize {
         [
             INDEX_ARENA_BYTES,
+            COMPARISON_ARENA_BYTES,
             CatalogHistory::budget_bytes(
                 config.catalog_history_bytes,
                 catalog_transaction_capacity(config),
@@ -22212,6 +22218,8 @@ impl Storage {
         let value_indexes =
             ValueIndexPool::new(budget, config.max_value_indexes, config.value_index_rows)?;
         let index_arena = Arena::new(budget, "index expression evaluation", INDEX_ARENA_BYTES)?;
+        let comparison_arena =
+            Arena::new(budget, "named composite comparison", COMPARISON_ARENA_BYTES)?;
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
         budget.draw(snapshot_owner_bytes(), "snapshot and lock owners")?;
@@ -22516,6 +22524,7 @@ impl Storage {
             spill: None,
             value_indexes,
             index_arena: Mutex::new(index_arena),
+            comparison_arena: Mutex::new(comparison_arena),
             collation: None,
         };
         crate::sql::reset_execution_query_workspace();
@@ -22832,6 +22841,24 @@ impl Storage {
         })?;
         self.observe_role_oid(entry.owner);
         Ok(())
+    }
+
+    /// Runs one comparison of stored named composites with the reserved
+    /// decoding scratch, released when the comparison returns.
+    pub(crate) fn with_comparison_scratch<R>(
+        &self,
+        compare: impl for<'s> FnOnce(&'s Arena) -> R,
+    ) -> R {
+        let arena = self
+            .comparison_arena
+            .lock()
+            .expect("composite comparison arena lock poisoned");
+        let mark = arena.mark();
+        let result = compare(&arena);
+        // SAFETY: `R` cannot borrow the arena, so nothing allocated above the
+        // entry mark outlives the comparison.
+        unsafe { arena.rewind_to(mark) };
+        result
     }
 
     /// Installs the configured database-default collation before recovery or

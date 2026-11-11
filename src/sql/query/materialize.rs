@@ -1319,7 +1319,7 @@ fn compare_materialized_rows(
         }
     }
     if distinct_prefix {
-        crate::sql::exec::compare_projected_prefix(a, b, width)
+        crate::sql::exec::compare_projected_prefix(storage, txid, a, b, width)
     } else {
         Ok(core::cmp::Ordering::Equal)
     }
@@ -1448,7 +1448,10 @@ fn prelock_external_run(
             } = context;
             let duplicate = if let Some(prior) = previous {
                 if statement.distinct && plan.n_on == 0 {
-                    crate::sql::exec::compare_projected_prefix(row, prior, plan.width)?.is_eq()
+                    crate::sql::exec::compare_projected_prefix(
+                        storage, txid, row, prior, plan.width,
+                    )?
+                    .is_eq()
                 } else if plan.n_on > 0 {
                     distinct_on_keys_equal(
                         storage,
@@ -1806,7 +1809,10 @@ pub(crate) fn external_materialized_into<'a>(
             } = context;
             let duplicate = if let Some(prior) = previous {
                 if statement.distinct && plan.n_on == 0 {
-                    crate::sql::exec::compare_projected_prefix(row, prior, plan.width)?.is_eq()
+                    crate::sql::exec::compare_projected_prefix(
+                        storage, txid, row, prior, plan.width,
+                    )?
+                    .is_eq()
                 } else if plan.n_on > 0 {
                     distinct_on_keys_equal(
                         storage,

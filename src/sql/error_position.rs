@@ -370,6 +370,25 @@ pub(crate) fn at_node(error: SqlError, expression: &crate::sql::ast::Expr<'_>) -
     error
 }
 
+/// [`at_node`] for a missing comparison operator of an `IN` or quantified
+/// sublink, with PostgreSQL's hint; other errors pass through.
+pub(crate) fn operator_at_node(
+    error: SqlError,
+    expression: &crate::sql::ast::Expr<'_>,
+) -> SqlError {
+    if error.sqlstate != crate::sql::eval::sqlstate::UNDEFINED_FUNCTION
+        || !error
+            .message
+            .as_str()
+            .starts_with("operator does not exist: ")
+    {
+        return error;
+    }
+    let error = at_node(error, expression);
+    record(&error, None, Some(BINARY_OPERATOR_HINT));
+    error
+}
+
 /// Marks `error` as being about a select-list item: `t.*` at its
 /// qualifier, a bare `*` where the parser read it.
 pub(crate) fn at_item(error: SqlError, item: &crate::sql::ast::SelectItem<'_>) -> SqlError {
@@ -671,6 +690,11 @@ pub(crate) fn take_annotation(sqlstate: &str, message: &dyn core::fmt::Display) 
 /// column and a missing or invalid FROM-clause entry.
 pub(crate) fn column_reference(error: SqlError, qualifier: Option<&str>, name: &str) -> SqlError {
     use crate::sql::eval::sqlstate;
+    // PL/pgSQL reports a record variable's missing field without a position.
+    let message = error.message.as_str();
+    if message.starts_with("record \"") && message.contains("\" has no field \"") {
+        return error;
+    }
     if matches!(
         error.sqlstate.as_str(),
         sqlstate::UNDEFINED_COLUMN

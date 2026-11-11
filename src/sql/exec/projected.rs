@@ -1250,10 +1250,13 @@ pub fn decode_projected_pub(bytes: &[u8], col: usize) -> Datum<'_> {
 /// Compares two encoded rows' first `width` columns under SQL equality, NULLs
 /// equal to each other and last: DISTINCT must merge equal values spelled
 /// differently (`1.0` and `1.00`, `'a '::char(3)` and `'a'::char(1)`) and
-/// record values by `record_cmp`. Text compares bytewise, which agrees with
-/// equality under every deterministic collation; callers needing collation
-/// order compare keys with their collation first.
+/// record values by `record_cmp`, stored named composites by their catalog
+/// fields as of `txid`. Text compares bytewise, which agrees with equality
+/// under every deterministic collation; callers needing collation order
+/// compare keys with their collation first.
 pub(crate) fn compare_projected_prefix(
+    storage: &crate::storage::Storage,
+    txid: u32,
     a: &[u8],
     b: &[u8],
     width: usize,
@@ -1273,7 +1276,13 @@ pub(crate) fn compare_projected_prefix(
             (true, false) => core::cmp::Ordering::Greater,
             (false, true) => core::cmp::Ordering::Less,
             (false, false) => compare_projected_values(left, right, &mut |x, y| {
-                crate::sql::eval::compare_datums(x, y)
+                crate::sql::eval::compare_datums_collated(
+                    storage,
+                    txid,
+                    crate::sql::ast::Collation::C,
+                    x,
+                    y,
+                )
             })?,
         };
         if !ord.is_eq() {
@@ -1288,10 +1297,15 @@ pub(crate) fn compare_projected_prefix(
 /// Orders two whole encoded rows under SQL equality as
 /// [`compare_projected_prefix`] does; the set operations and recursive
 /// UNION sort, merge and deduplicate rows by this order.
-pub(crate) fn compare_projected_rows(a: &[u8], b: &[u8]) -> Result<core::cmp::Ordering, SqlError> {
+pub(crate) fn compare_projected_rows(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    a: &[u8],
+    b: &[u8],
+) -> Result<core::cmp::Ordering, SqlError> {
     let width = projected_row_width(a);
     match width.cmp(&projected_row_width(b)) {
-        core::cmp::Ordering::Equal => compare_projected_prefix(a, b, width),
+        core::cmp::Ordering::Equal => compare_projected_prefix(storage, txid, a, b, width),
         different => Ok(different),
     }
 }
@@ -1628,13 +1642,19 @@ fn decode_record_tail<'a>(
 /// DISTINCT over encoded rows: sorts (grouping SQL-equal rows adjacently,
 /// byte order as the tiebreak so the surviving representative is
 /// deterministic) and keeps the first of each run. Returns the live count.
-pub fn sort_dedup_projected(rows: &mut [&[u8]], width: usize) -> Result<usize, SqlError> {
+pub fn sort_dedup_projected(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    rows: &mut [&[u8]],
+    width: usize,
+) -> Result<usize, SqlError> {
     crate::util::try_sort_unstable_by(rows, |a, b| {
-        Ok(compare_projected_prefix(a, b, width)?.then_with(|| a.cmp(b)))
+        Ok(compare_projected_prefix(storage, txid, a, b, width)?.then_with(|| a.cmp(b)))
     })?;
     let mut unique = 0usize;
     for i in 0..rows.len() {
-        let same = i > 0 && compare_projected_prefix(rows[i], rows[unique - 1], width)?.is_eq();
+        let same = i > 0
+            && compare_projected_prefix(storage, txid, rows[i], rows[unique - 1], width)?.is_eq();
         if !same {
             rows[unique] = rows[i];
             unique += 1;

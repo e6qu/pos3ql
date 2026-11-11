@@ -2976,10 +2976,16 @@ impl<'a> Parser<'a> {
         if self.eat_ident("window")? {
             self.window_definitions()?;
         }
+        let mut windows = ArenaList::new(self.arena);
+        for &(_, spec) in self.windows.as_slice().iter().flatten() {
+            self.push(&mut windows, spec)?;
+        }
+        let windows = windows.as_slice();
         Ok(Select {
             items,
             distinct,
             distinct_on,
+            windows,
             from,
             where_clause,
             group_by,
@@ -3215,6 +3221,7 @@ impl<'a> Parser<'a> {
             items: &[],
             distinct: false,
             distinct_on: &[],
+            windows: &[],
             from: None,
             where_clause: None,
             group_by: &[],
@@ -3244,6 +3251,7 @@ impl<'a> Parser<'a> {
                 items: &[],
                 distinct: false,
                 distinct_on: &[],
+                windows: &[],
                 from: None,
                 where_clause: None,
                 group_by: &[],
@@ -3324,6 +3332,7 @@ impl<'a> Parser<'a> {
                 items: &[],
                 distinct: false,
                 distinct_on: &[],
+                windows: &[],
                 from: None,
                 where_clause: None,
                 group_by: &[],
@@ -3607,6 +3616,7 @@ impl<'a> Parser<'a> {
                     items: &[],
                     distinct: false,
                     distinct_on: &[],
+                    windows: &[],
                     from: None,
                     where_clause: None,
                     group_by: &[],
@@ -3661,6 +3671,7 @@ impl<'a> Parser<'a> {
                     items: items.as_slice(),
                     distinct: false,
                     distinct_on: &[],
+                    windows: &[],
                     from: None,
                     where_clause: None,
                     group_by: &[],
@@ -3745,6 +3756,7 @@ impl<'a> Parser<'a> {
                 )])?,
                 distinct: false,
                 distinct_on: &[],
+                windows: &[],
                 from: Some(FromClause {
                     base: source,
                     joins: &[],
@@ -4766,6 +4778,7 @@ impl<'a> Parser<'a> {
                 items,
                 distinct: false,
                 distinct_on: &[],
+                windows: &[],
                 from: Some(inner),
                 where_clause: None,
                 group_by: &[],
@@ -8095,6 +8108,7 @@ impl<'a> Parser<'a> {
                     items: items.as_slice(),
                     distinct: false,
                     distinct_on: &[],
+                    windows: &[],
                     from: Some(FromClause {
                         base: TableRef {
                             schema: None,

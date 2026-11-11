@@ -312,15 +312,16 @@ pub(crate) fn set_query_into_rows<'a>(
 }
 
 /// Whether the reader's current row equals `row` under SQL equality.
-fn same_set_row(current: Option<&[u8]>, row: &[u8]) -> Result<bool, SqlError> {
+fn same_set_row(
+    storage: &Storage,
+    txid: u32,
+    current: Option<&[u8]>,
+    row: &[u8],
+) -> Result<bool, SqlError> {
     Ok(match current {
-        Some(current) => exec::compare_projected_rows(current, row)?.is_eq(),
+        Some(current) => exec::compare_projected_rows(storage, txid, current, row)?.is_eq(),
         None => false,
     })
-}
-
-fn insertion_order(_left: &[u8], _right: &[u8]) -> Result<core::cmp::Ordering, SqlError> {
-    Ok(core::cmp::Ordering::Equal)
 }
 
 fn resolve_set_order(
@@ -483,10 +484,12 @@ fn external_set_leaf<'a>(
 ) -> Result<Option<ExternalRun>, SqlError> {
     let mut sorter = context.storage.external_sorter()?;
     sorter.reset();
-    let mut compare = if sorted {
-        exec::compare_projected_rows as fn(&[u8], &[u8]) -> Result<_, _>
-    } else {
-        insertion_order as fn(&[u8], &[u8]) -> Result<_, _>
+    let mut compare = |left: &[u8], right: &[u8]| {
+        if sorted {
+            exec::compare_projected_rows(context.storage, context.txid, left, right)
+        } else {
+            Ok(core::cmp::Ordering::Equal)
+        }
     };
     select_into_rows_recycling(
         context.storage,
@@ -551,10 +554,13 @@ fn external_set_tree<'a>(
 
     let mut sorter = context.storage.external_sorter()?;
     sorter.reset();
-    let mut output_compare = if sorted || merge_inputs {
-        exec::compare_projected_rows as fn(&[u8], &[u8]) -> Result<_, _>
-    } else {
-        insertion_order as fn(&[u8], &[u8]) -> Result<_, _>
+    let output_sorted = sorted || merge_inputs;
+    let mut output_compare = |left: &[u8], right: &[u8]| {
+        if output_sorted {
+            exec::compare_projected_rows(context.storage, context.txid, left, right)
+        } else {
+            Ok(core::cmp::Ordering::Equal)
+        }
     };
     if *operator == SetOp::Union && *all {
         let mut reader = context.storage.external_run_reader()?;
@@ -592,7 +598,12 @@ fn external_set_tree<'a>(
         while left_reader.row().is_some() {
             let left_length = left_reader.stage_current().expect("current left row");
             let mut left_count = 0u64;
-            while same_set_row(left_reader.row(), left_reader.output(left_length))? {
+            while same_set_row(
+                context.storage,
+                context.txid,
+                left_reader.row(),
+                left_reader.output(left_length),
+            )? {
                 left_count += 1;
                 context
                     .storage
@@ -602,7 +613,9 @@ fn external_set_tree<'a>(
             let left_row = left_reader.output(left_length);
             while right_reader
                 .row()
-                .map(|row| exec::compare_projected_rows(row, left_row))
+                .map(|row| {
+                    exec::compare_projected_rows(context.storage, context.txid, row, left_row)
+                })
                 .transpose()?
                 .is_some_and(|order| order.is_lt())
             {
@@ -619,7 +632,12 @@ fn external_set_tree<'a>(
                         })
                         .expect("spill-attached block store")?;
                 }
-                while same_set_row(right_reader.row(), right_reader.output(right_length))? {
+                while same_set_row(
+                    context.storage,
+                    context.txid,
+                    right_reader.row(),
+                    right_reader.output(right_length),
+                )? {
                     context
                         .storage
                         .with_block_store(|blocks| right_reader.advance(blocks))
@@ -627,7 +645,7 @@ fn external_set_tree<'a>(
                 }
             }
             let mut right_count = 0u64;
-            while same_set_row(right_reader.row(), left_row)? {
+            while same_set_row(context.storage, context.txid, right_reader.row(), left_row)? {
                 right_count += 1;
                 context
                     .storage
@@ -664,7 +682,12 @@ fn external_set_tree<'a>(
                         )
                     })
                     .expect("spill-attached block store")?;
-                while same_set_row(right_reader.row(), right_reader.output(right_length))? {
+                while same_set_row(
+                    context.storage,
+                    context.txid,
+                    right_reader.row(),
+                    right_reader.output(right_length),
+                )? {
                     context
                         .storage
                         .with_block_store(|blocks| right_reader.advance(blocks))
@@ -691,7 +714,12 @@ fn external_set_tree<'a>(
                         )
                     })
                     .expect("spill-attached block store")?;
-                while same_set_row(reader.row(), reader.output(right_length))? {
+                while same_set_row(
+                    context.storage,
+                    context.txid,
+                    reader.row(),
+                    reader.output(right_length),
+                )? {
                     context
                         .storage
                         .with_block_store(|blocks| reader.advance(blocks))

@@ -199,7 +199,9 @@ impl<'a: 's, 's> Check<'a, 's> {
         }
         let mut rows: Option<&'a mut [&'a [&'a Expr<'a>]]> = None;
         for (index, row) in insert.rows.iter().enumerate() {
-            let values = self.expressions(row, &Level::root(), &mut changed)?;
+            let expanded = self.expand_row_variables(row)?;
+            changed |= !core::ptr::eq(expanded, *row);
+            let values = self.expressions(expanded, &Level::root(), &mut changed)?;
             if !core::ptr::eq(values, *row) && rows.is_none() {
                 rows = Some(self.arena.alloc_slice_copy(insert.rows)?);
             }
@@ -237,6 +239,53 @@ impl<'a: 's, 's> Check<'a, 's> {
             rebuilt.returning = self.returning(insert.returning, &target, &mut changed)?;
         }
         keep(insert, rebuilt, changed, self.arena)
+    }
+
+    /// Expands each `r.*` of a VALUES row whose `r` is a row or record
+    /// variable into its fields, as PostgreSQL expands a VALUES list.
+    fn expand_row_variables(&self, row: &'a [&'a Expr<'a>]) -> Bound<&'a [&'a Expr<'a>]> {
+        let variable = |expression: &Expr<'a>| match *expression {
+            Expr::WholeRow(name) if self.variables.procedural_variable(None, name).is_some() => {
+                Some(name)
+            }
+            _ => None,
+        };
+        if !row.iter().any(|expression| variable(expression).is_some()) {
+            return Ok(row);
+        }
+        let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
+        let hooks = crate::sql::eval::EvalHooks {
+            catalog: Some(&catalog),
+            ..crate::sql::eval::NO_HOOKS
+        };
+        let mut expanded = crate::mem::arena::ArenaList::new(self.arena);
+        for &expression in row {
+            let Some(name) = variable(expression) else {
+                expanded.push(expression)?;
+                continue;
+            };
+            let base = &*self.arena.alloc(Expr::Column {
+                qualifier: None,
+                name,
+            })?;
+            let fields = match self.variables.lookup(None, name)? {
+                crate::sql::types::Datum::Record(fields)
+                | crate::sql::types::Datum::Composite { fields, .. } => fields,
+                _ => {
+                    let type_oid =
+                        crate::sql::eval::expression_type_identity(base, self.variables, &hooks)?
+                            .record_field_oid();
+                    catalog_fields(&catalog, type_oid, name, self.arena)?
+                }
+            };
+            for field in fields {
+                expanded.push(&*self.arena.alloc(Expr::Column {
+                    qualifier: Some(name),
+                    name: field.name,
+                })?)?;
+            }
+        }
+        Ok(expanded.as_slice())
     }
 
     fn update(&self, update: &'a Update<'a>) -> Bound<&'a Update<'a>> {
@@ -848,5 +897,26 @@ impl<'a: 's, 's> Check<'a, 's> {
         rebuilt.limit = self.optional(select.limit, &level, &mut changed)?;
         rebuilt.offset = self.optional(select.offset, &level, &mut changed)?;
         keep(select, rebuilt, changed, self.arena)
+    }
+}
+
+/// The declared fields of an unassigned row variable `name` of type
+/// `type_oid`; a record variable without a value has none to expand.
+fn catalog_fields<'a>(
+    catalog: &dyn crate::sql::eval::CatalogAccess,
+    type_oid: i32,
+    name: &str,
+    arena: &'a Arena,
+) -> Result<&'a [crate::sql::types::RecordField<'a>], SqlError> {
+    match catalog.null_composite_fields(type_oid, arena)? {
+        Some(fields) => Ok(fields),
+        None => Err(crate::sql::error_position::with_detail(
+            crate::sql_err!(
+                crate::sql::eval::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "record \"{}\" is not assigned yet",
+                name
+            ),
+            format_args!("The tuple structure of a not-yet-assigned record is indeterminate."),
+        )),
     }
 }

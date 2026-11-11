@@ -3178,6 +3178,10 @@ pub struct Select<'a> {
     /// `DISTINCT ON (exprs)`: keep the first row per distinct value of these
     /// expressions (in ORDER BY order). Empty = plain DISTINCT or none.
     pub distinct_on: &'a [&'a Expr<'a>],
+    /// The `WINDOW` clause's definitions in written order. PostgreSQL numbers
+    /// their sort keys before those of inline `OVER (...)` specifications,
+    /// which decides the order its window evaluation leaves rows in.
+    pub windows: &'a [&'a WindowSpec<'a>],
     pub from: Option<FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,
     pub group_by: &'a [&'a Expr<'a>],

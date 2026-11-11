@@ -1063,7 +1063,7 @@ pub(super) fn grouped_rows<'a>(
                 ));
             }
         }
-        live = crate::sql::exec::sort_dedup_projected(out_rows, width)?;
+        live = crate::sql::exec::sort_dedup_projected(storage, txid, out_rows, width)?;
     }
     let out_rows = &mut out_rows[..live];
 

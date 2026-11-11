@@ -417,18 +417,16 @@ reports a missing FROM-clause entry for `a` where PostgreSQL accepts it. An
 ungrouped-column error inside an aliased parenthesized join names the alias
 (`j.x`) where PostgreSQL names the member table (`a.x`). A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
-PostgreSQL types it as the table's row type `t`. Arrays of a named composite
-type order by their elements' text, so `ARRAY[(10,1)::t]` sorts before
-`ARRAY[(9,1)::t]`; the comparison needs catalog access to read the stored
-elements' fields. A row constructor casts to a table's row type
+PostgreSQL types it as the table's row type `t`. An operator error names a
+named composite array's type `record[]` where PostgreSQL names it (`t[]`),
+and a column error in a FROM-less leaf of a set operation (`SELECT x UNION
+SELECT 1`) has no cursor position. A row constructor casts to a table's row type
 (`ROW(1, 'a')::t`) but not to a view's, and an array of a table's row type
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
-`r v%ROWTYPE`) fails with `0A000`; a table's works. In a PL/pgSQL statement,
-`VALUES (r.*)` does not expand the row variable `r` into its fields. Reading
-a field of a row variable that was never assigned returns NULL without
-checking that the field exists. A `CONSTANT` assignment error has no cursor
-position.
+`r v%ROWTYPE`) fails with `0A000`; a table's works. A `CONSTANT`
+assignment error has no cursor position: PL/pgSQL assignment targets do not
+keep their place in the routine body.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,
 SQL/JSON result types) are reported when the statement would run. In a

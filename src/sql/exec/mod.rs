@@ -26018,6 +26018,56 @@ where
         .map(|field| field.type_oid)
     }
 
+    fn check_unassigned_row_field(
+        &self,
+        qualifier: &str,
+        name: &str,
+        catalog: Option<&dyn super::eval::CatalogAccess>,
+        arena: &'value Arena,
+    ) -> Result<(), SqlError> {
+        let Some(index) = self.record_index(Some(qualifier), name) else {
+            return Ok(());
+        };
+        if !self.values[index].is_null() {
+            return Ok(());
+        }
+        let local = self.locals[index];
+        let catalog = || {
+            catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "named composite catalog access is unavailable"
+                )
+            })
+        };
+        let type_oid = match (local.record_shape, local.ctype) {
+            (Some(PlpgsqlRecordShape::Table(slot)), _) => catalog()?
+                .table_row_type_oid(usize::from(slot))
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "table row type catalog access is unavailable"
+                    )
+                })?,
+            (None, ColType::Composite(Some(creation))) => {
+                crate::sql::types::oid::composite_oid(creation)
+            }
+            _ => return Ok(()),
+        };
+        let fields = catalog()?
+            .null_composite_fields(type_oid, arena)?
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
+        if fields.iter().any(|field| field.name == name) {
+            return Ok(());
+        }
+        Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "record \"{}\" has no field \"{}\"",
+            qualifier,
+            name
+        ))
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if matches!(qualifier, Some("old" | "new")) {
             return self.transition.lookup(qualifier, name);
@@ -26031,7 +26081,8 @@ where
             let fields = match self.values[index] {
                 Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
                 // A row-typed variable that was never assigned reads its
-                // fields as NULL. Its declared fields are not in scope here.
+                // fields as NULL; `check_unassigned_row_field` checks the
+                // field against its declared type.
                 Datum::Null
                     if matches!(
                         self.locals[index].record_shape,
@@ -26952,10 +27003,12 @@ fn in_simple_expression<T>(
     crate::sql::error_context::with_frame(&frame, || {
         crate::sql::error_position::with_internal_source(text, run).map_err(|error| {
             // Names resolve while PostgreSQL analyzes the expression.
-            if matches!(
-                error.sqlstate.as_str(),
-                sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
-            ) {
+            if record_reference_error(&error)
+                || matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                )
+            {
                 frame.planned();
             } else if error.sqlstate.internal_control().is_none() {
                 let mark = arena.mark();
@@ -26975,6 +27028,20 @@ fn in_simple_expression<T>(
     })
 }
 
+/// An unassigned record's field or a missing field of a record variable,
+/// which PostgreSQL reports resolving the reference.
+fn record_reference_error(error: &SqlError) -> bool {
+    let message = error.message.as_str();
+    message.starts_with("record \"")
+        && (error.sqlstate == sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
+            && message.ends_with("\" is not assigned yet")
+            || error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                && message.contains("\" has no field \""))
+}
+
+/// The error PostgreSQL's planner raises folding `expression`'s constant
+/// subexpressions (literals combined by operators and casts), in the order
+/// it folds them, if any.
 /// Whether PostgreSQL's planner folds `expression` to a constant: literals
 /// combined by operators and casts.
 fn folds_to_constant(expression: &Expr<'_>) -> bool {
@@ -70444,6 +70511,7 @@ pub(crate) fn merge<'a>(
         items: star,
         distinct: false,
         distinct_on: &[],
+        windows: &[],
         from: Some(source_from),
         where_clause: None,
         group_by: &[],

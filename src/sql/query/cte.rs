@@ -538,6 +538,7 @@ fn analyze_unreferenced_ctes<'a>(
                 )],
                 distinct: false,
                 distinct_on: &[],
+                windows: &[],
                 from: Some(FromClause {
                     base: TableRef {
                         schema: None,
@@ -947,6 +948,7 @@ fn rule_select<'a>(
         items,
         distinct: false,
         distinct_on: &[],
+        windows: &[],
         from,
         where_clause,
         group_by: &[],
@@ -3231,6 +3233,7 @@ fn wrap_set_tree_with<'a>(
         items: &[],
         distinct: false,
         distinct_on: &[],
+        windows: &[],
         from: None,
         where_clause: None,
         group_by: &[],
@@ -4391,7 +4394,7 @@ fn recursive_path_contains<'a>(
     };
     for payload in crate::sql::array::element_payloads(raw) {
         let member = crate::sql::exec::decode_projected_col_record(payload, 0, arena)?;
-        if crate::sql::eval::membership_eq(&member, key)? == Some(true) {
+        if crate::sql::eval::membership_eq(&member, key, None)? == Some(true) {
             return Ok(true);
         }
     }
@@ -4501,7 +4504,7 @@ fn recursive_noncycle_rows<'a>(
     let mut count = 0usize;
     for &row in rows {
         let mark = crate::sql::exec::decode_projected_col_record(row, cycle.mark, arena)?;
-        if crate::sql::eval::membership_eq(&mark, &cycle.mark_value)? != Some(true) {
+        if crate::sql::eval::membership_eq(&mark, &cycle.mark_value, None)? != Some(true) {
             output[count] = row;
             count += 1;
         }
@@ -4764,6 +4767,7 @@ fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Sele
         items: &[],
         distinct: false,
         distinct_on: &[],
+        windows: &[],
         from: None,
         where_clause: None,
         group_by: &[],
@@ -4794,7 +4798,7 @@ fn external_recursive_tree(
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
         if sorted {
-            crate::sql::exec::compare_projected_rows(left, right)
+            crate::sql::exec::compare_projected_rows(storage, txid, left, right)
         } else {
             Ok(core::cmp::Ordering::Equal)
         }
@@ -4829,8 +4833,13 @@ fn external_recursive_tree(
         .expect("recursive work table has a block store")
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the recursive run decorator receives its snapshot and run state explicitly"
+)]
 fn external_decorate_recursive_run(
     storage: &Storage,
+    txid: u32,
     input: Option<crate::sql::external::ExternalRun>,
     decoration: RecursiveDecoration<'_>,
     base: bool,
@@ -4846,7 +4855,7 @@ fn external_decorate_recursive_run(
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
         if sorted {
-            crate::sql::exec::compare_projected_rows(left, right)
+            crate::sql::exec::compare_projected_rows(storage, txid, left, right)
         } else {
             Ok(core::cmp::Ordering::Equal)
         }
@@ -4876,6 +4885,7 @@ fn external_decorate_recursive_run(
 
 fn external_recursive_noncycle_run(
     storage: &Storage,
+    txid: u32,
     input: Option<crate::sql::external::ExternalRun>,
     decoration: RecursiveDecoration<'_>,
     sorted: bool,
@@ -4892,7 +4902,7 @@ fn external_recursive_noncycle_run(
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
         if sorted {
-            crate::sql::exec::compare_projected_rows(left, right)
+            crate::sql::exec::compare_projected_rows(storage, txid, left, right)
         } else {
             Ok(core::cmp::Ordering::Equal)
         }
@@ -4903,7 +4913,7 @@ fn external_recursive_noncycle_run(
     while let Some(row) = reader.row() {
         let mark = arena.mark();
         let cycle_mark = crate::sql::exec::decode_projected_col_record(row, cycle.mark, arena)?;
-        if crate::sql::eval::membership_eq(&cycle_mark, &cycle.mark_value)? != Some(true) {
+        if crate::sql::eval::membership_eq(&cycle_mark, &cycle.mark_value, None)? != Some(true) {
             storage
                 .with_block_store(|blocks| sorter.push_encoded(blocks, row, &mut compare))
                 .expect("recursive work table has a block store")?;
@@ -4920,6 +4930,7 @@ fn external_recursive_noncycle_run(
 
 fn external_unique_run(
     storage: &Storage,
+    txid: u32,
     run: Option<crate::sql::external::ExternalRun>,
 ) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
     let Some(run) = run else {
@@ -4928,7 +4939,9 @@ fn external_unique_run(
     let mut reader = storage.external_run_reader()?;
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
-    let mut compare = crate::sql::exec::compare_projected_rows;
+    let mut compare = |left: &[u8], right: &[u8]| {
+        crate::sql::exec::compare_projected_rows(storage, txid, left, right)
+    };
     storage
         .with_block_store(|blocks| reader.start(blocks, run))
         .expect("recursive work table has a block store")?;
@@ -4937,7 +4950,8 @@ fn external_unique_run(
             let context = reader.context().expect("checked");
             match context.previous {
                 Some(previous) => {
-                    !crate::sql::exec::compare_projected_rows(previous, context.row)?.is_eq()
+                    !crate::sql::exec::compare_projected_rows(storage, txid, previous, context.row)?
+                        .is_eq()
                 }
                 None => true,
             }
@@ -4959,6 +4973,7 @@ fn external_unique_run(
 
 fn external_recursive_difference(
     storage: &Storage,
+    txid: u32,
     candidates: Option<crate::sql::external::ExternalRun>,
     seen: Option<crate::sql::external::ExternalRun>,
 ) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
@@ -4972,7 +4987,9 @@ fn external_recursive_difference(
     let mut seen_reader = storage.external_run_reader()?;
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
-    let mut compare = crate::sql::exec::compare_projected_rows;
+    let mut compare = |left: &[u8], right: &[u8]| {
+        crate::sql::exec::compare_projected_rows(storage, txid, left, right)
+    };
     storage
         .with_block_store(|blocks| candidate_reader.start(blocks, candidates))
         .expect("recursive work table has a block store")?;
@@ -4980,7 +4997,7 @@ fn external_recursive_difference(
         .with_block_store(|blocks| seen_reader.start(blocks, seen))
         .expect("recursive work table has a block store")?;
     let compare_seen = |seen: Option<&[u8]>, candidate: &[u8]| {
-        seen.map(|seen| crate::sql::exec::compare_projected_rows(seen, candidate))
+        seen.map(|seen| crate::sql::exec::compare_projected_rows(storage, txid, seen, candidate))
             .transpose()
     };
     while let Some(candidate) = candidate_reader.row() {
@@ -5005,6 +5022,7 @@ fn external_recursive_difference(
 
 fn external_recursive_union(
     storage: &Storage,
+    txid: u32,
     left: Option<crate::sql::external::ExternalRun>,
     right: Option<crate::sql::external::ExternalRun>,
     sorted: bool,
@@ -5013,7 +5031,7 @@ fn external_recursive_union(
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
         if sorted {
-            crate::sql::exec::compare_projected_rows(left, right)
+            crate::sql::exec::compare_projected_rows(storage, txid, left, right)
         } else {
             Ok(core::cmp::Ordering::Equal)
         }
@@ -5196,7 +5214,7 @@ fn materialize_recursive<'a>(
         )?;
         let base = if decorated {
             external_decorate_recursive_run(
-                storage, base_raw, decoration, true, !union_all, false, arena,
+                storage, txid, base_raw, decoration, true, !union_all, false, arena,
             )?
         } else {
             base_raw
@@ -5204,7 +5222,7 @@ fn materialize_recursive<'a>(
         let mut all = if union_all {
             base
         } else {
-            external_unique_run(storage, base)?
+            external_unique_run(storage, txid, base)?
         };
         let mut working = all;
         let working_source = arena.alloc_atomic_usize(0).map_err(|_| arena_full())?;
@@ -5279,6 +5297,7 @@ fn materialize_recursive<'a>(
             let candidates = if decorated {
                 external_decorate_recursive_run(
                     storage,
+                    txid,
                     raw_candidates,
                     decoration,
                     false,
@@ -5292,16 +5311,17 @@ fn materialize_recursive<'a>(
             let fresh = if union_all {
                 candidates
             } else {
-                let unique = external_unique_run(storage, candidates)?;
-                external_recursive_difference(storage, unique, all)?
+                let unique = external_unique_run(storage, txid, candidates)?;
+                external_recursive_difference(storage, txid, unique, all)?
             };
             if fresh.is_none_or(|run| run.rows() == 0) {
                 unsafe { arena.rewind_to(iteration_mark) };
                 break;
             }
-            let next_working =
-                external_recursive_noncycle_run(storage, fresh, decoration, !union_all, arena)?;
-            all = external_recursive_union(storage, all, fresh, !union_all)?;
+            let next_working = external_recursive_noncycle_run(
+                storage, txid, fresh, decoration, !union_all, arena,
+            )?;
+            all = external_recursive_union(storage, txid, all, fresh, !union_all)?;
             working = next_working;
             // Completed runs retain only block identities; all query scopes,
             // decoded records, and sorter scratch from this iteration are dead.
@@ -5341,7 +5361,7 @@ fn materialize_recursive<'a>(
             .map_err(|_| arena_full())?;
         let mut kept = 0usize;
         for &r in base_rows.iter() {
-            if !contains_projected_row(&deduped[..kept], r)? {
+            if !contains_projected_row(storage, txid, &deduped[..kept], r)? {
                 deduped[kept] = r;
                 kept += 1;
             }
@@ -5446,8 +5466,8 @@ fn materialize_recursive<'a>(
                 .map_err(|_| arena_full())?;
             let mut kept = 0usize;
             for &r in step_rows.iter() {
-                if !contains_projected_row(all_rows, r)?
-                    && !contains_projected_row(&kept_rows[..kept], r)?
+                if !contains_projected_row(storage, txid, all_rows, r)?
+                    && !contains_projected_row(storage, txid, &kept_rows[..kept], r)?
                 {
                     kept_rows[kept] = r;
                     kept += 1;
@@ -5480,9 +5500,14 @@ fn materialize_recursive<'a>(
 
 /// Whether `rows` holds a row equal to `row` under SQL equality; recursive
 /// UNION treats `1.0` and `1.00` as one row.
-fn contains_projected_row(rows: &[&[u8]], row: &[u8]) -> Result<bool, SqlError> {
+fn contains_projected_row(
+    storage: &Storage,
+    txid: u32,
+    rows: &[&[u8]],
+    row: &[u8],
+) -> Result<bool, SqlError> {
     for &candidate in rows {
-        if crate::sql::exec::compare_projected_rows(candidate, row)?.is_eq() {
+        if crate::sql::exec::compare_projected_rows(storage, txid, candidate, row)?.is_eq() {
             return Ok(true);
         }
     }
@@ -5618,6 +5643,7 @@ fn subst_select_body<'a>(
         items,
         distinct: s.distinct,
         distinct_on,
+        windows: s.windows,
         from,
         where_clause: opt_subst(s.where_clause, context, arena)?,
         group_by,

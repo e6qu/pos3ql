@@ -805,6 +805,18 @@ pub trait ColumnLookup<'a> {
         None
     }
 
+    /// Checks that `qualifier.name`, read as NULL from a row variable that
+    /// holds no value yet, is one of the fields its declared row type has.
+    fn check_unassigned_row_field(
+        &self,
+        _qualifier: &str,
+        _name: &str,
+        _catalog: Option<&dyn CatalogAccess>,
+        _arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        Ok(())
+    }
+
     /// The named table's row as record fields (name + type + value), or None
     /// for an outer-join null row. Used to build a `Datum::Record` for a
     /// whole-row reference; contexts without join rows reject it.
@@ -2159,6 +2171,24 @@ pub trait CatalogAccess {
     /// of first reducing it to scalar text as domains and enums require.
     fn is_composite_type_name(&self, _type_name: &str) -> bool {
         false
+    }
+    /// Orders values holding stored named composites (see
+    /// [`operators::needs_catalog_order`]); their fields come from the
+    /// catalog.
+    /// The row type OID of the table in `slot`, as a row variable declares it.
+    fn table_row_type_oid(&self, _slot: usize) -> Option<i32> {
+        None
+    }
+    fn compare_stored(
+        &self,
+        _collation: Collation,
+        _left: &Datum<'_>,
+        _right: &Datum<'_>,
+    ) -> Result<core::cmp::Ordering, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "named composite catalog access is unavailable"
+        ))
     }
     /// Compares text with a resolved database collation. A query executor must
     /// supply this for the database default; an evaluator without a catalog
@@ -3906,7 +3936,7 @@ fn eval_binary_expression<'a>(
         && comparison_collation.is_some()
         && let (Datum::Record(a), Datum::Record(b)) = (&left, &right)
     {
-        return operators::row_constructor_compare(expression.operator, a, b);
+        return operators::row_constructor_compare(expression.operator, a, b, hooks.catalog);
     }
     Ok(eval_binary_values(
         expression,
@@ -4496,6 +4526,32 @@ fn eval_binary_values<'a>(
             };
         }
     }
+    if operator == BinaryOp::Concat {
+        // A named composite appended to or prepended onto an array of its
+        // type enters the array in its durable form.
+        let durable = |value: Datum<'a>, array: &Datum<'a>| -> Result<Datum<'a>, SqlError> {
+            match (array, value) {
+                (
+                    Datum::Array {
+                        element: super::types::ArrElem::Composite(Some(slot)),
+                        ..
+                    },
+                    Datum::Composite { .. },
+                ) => hooks
+                    .catalog
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "named composite catalog access is unavailable"
+                        )
+                    })?
+                    .composite_array_element(value, *slot, arena),
+                _ => Ok(value),
+            }
+        };
+        l = durable(l, &r)?;
+        r = durable(r, &l)?;
+    }
     if operator == BinaryOp::Concat
         && let Some(value) = array_null_concat(l, r, left, right, row, arena)?
     {
@@ -4553,6 +4609,27 @@ fn eval_binary_values<'a>(
         )?;
         return Ok(OperatorEvaluation {
             value,
+            first_argument: l,
+        });
+    }
+    if matches!(
+        operator,
+        BinaryOp::Contains | BinaryOp::ContainedBy | BinaryOp::Overlaps
+    ) && matches!((&l, &r), (Datum::Array { .. }, Datum::Array { .. }))
+        && operators::needs_catalog_order(&l, &r)
+    {
+        return Ok(OperatorEvaluation {
+            value: operators::array_set_op(operator, l, r, hooks.catalog)?,
+            first_argument: l,
+        });
+    }
+    if let Some(comparison) = comparison
+        && operators::needs_catalog_order(&l, &r)
+    {
+        let collation = comparison_collation.unwrap_or(Collation::Default);
+        let ordering = compare_datums_with_catalog(collation, hooks.catalog, &l, &r)?;
+        return Ok(OperatorEvaluation {
+            value: Datum::Bool(comparison.holds(ordering)),
             first_argument: l,
         });
     }
@@ -5453,6 +5530,10 @@ fn eval_full_inner<'a>(
             varying: false,
         }),
         Expr::Column { qualifier, name } => match row.lookup(qualifier, name) {
+            Ok(Datum::Null) if let Some(qualifier) = qualifier => {
+                row.check_unassigned_row_field(qualifier, name, hooks.catalog, arena)?;
+                Ok(Datum::Null)
+            }
             Ok(v) => materialize_named_composite(v, hooks, arena),
             // A bare name that is not a column but names a FROM item is a
             // whole-row reference (`SELECT t FROM t`, `row_to_json(r)`).
@@ -6018,13 +6099,14 @@ fn eval_full_inner<'a>(
                     (Datum::Record(a), Datum::Record(b))
                         if operand.is_row_constructor() && item.is_row_constructor() =>
                     {
-                        match operators::row_constructor_compare(BinaryOp::Eq, a, b)? {
+                        match operators::row_constructor_compare(BinaryOp::Eq, a, b, hooks.catalog)?
+                        {
                             Datum::Bool(true) => return Ok(Datum::Bool(!negated)),
                             Datum::Bool(_) => {}
                             _ => saw_null = true,
                         }
                     }
-                    _ => match membership_eq(&l, &r)? {
+                    _ => match membership_eq(&l, &r, hooks.catalog)? {
                         Some(true) => return Ok(Datum::Bool(!negated)),
                         Some(false) => {}
                         None => saw_null = true,
@@ -6252,6 +6334,26 @@ fn eval_full_inner<'a>(
                 eval_full(operand, arena, params, row, hooks)?,
             );
             let v = coerce_unknown(v, &witness)?;
+            // Resolve `=` against a single-column subquery's declared output
+            // type even when it is empty or yields only NULLs, as PostgreSQL
+            // does while analysing the query.
+            // A record compares with `record_eq`, whose field types are
+            // checked against each member below; a named composite's type
+            // witness carries no fields.
+            let record =
+                |value: &Datum<'_>| matches!(value, Datum::Record(_) | Datum::Composite { .. });
+            if !v.is_null() && !witness.is_null() && !record(&v) && !record(&witness) {
+                quantified_comparison(
+                    BinaryOp::Eq,
+                    v,
+                    witness,
+                    operand.is_row_constructor(),
+                    collations,
+                    hooks.catalog,
+                    arena,
+                )
+                .map_err(|error| crate::sql::error_position::operator_at_node(error, expression))?;
+            }
             // A bit string is comparable only to another bit string; reject a
             // bit-vs-other membership test up front (PostgreSQL type-checks the
             // operand against the column type even over an empty set).
@@ -6373,7 +6475,8 @@ fn eval_full_inner<'a>(
                 collations,
                 hooks.catalog,
                 arena,
-            )?;
+            )
+            .map_err(|error| crate::sql::error_position::operator_at_node(error, expression))?;
             let mut saw_unknown = false;
             for member in list.values {
                 let left = coerce_unknown(value, member)?;
@@ -6997,6 +7100,12 @@ fn quantified_scalar<'a>(
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     let (left, right) = operators::coerce_comparison_text(left, right, false, false, arena)?;
+    if let Some(comparison) = operators::Comparison::from_binary(operator)
+        && operators::needs_catalog_order(&left, &right)
+    {
+        let ordering = compare_datums_with_catalog(collation, catalog, &left, &right)?;
+        return Ok(Datum::Bool(comparison.holds(ordering)));
+    }
     if let Some(comparison) = operators::Comparison::from_binary(operator)
         && matches!(
             (&left, &right),

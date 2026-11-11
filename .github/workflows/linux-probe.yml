@@ -1,0 +1,20 @@
+name: Linux probe (temporary)
+
+on:
+  pull_request:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build library tests
+        run: cargo test --lib --locked --no-run
+      - name: Default buffers
+        run: POS3QL_PROBE_TRACE=1 cargo test --lib --locked -- --test-threads=1 --nocapture long_streams_release_each_rows_effect_receipts pg::conn::sleep_tests result_streams_end_on_cancel || true
+      - name: 64 KiB receive buffer
+        run: POS3QL_PROBE_TRACE=1 POS3QL_PROBE_RCVBUF=65536 cargo test --lib --locked -- --test-threads=1 --nocapture long_streams_release_each_rows_effect_receipts || true
+      - name: Socket settings
+        run: sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.core.rmem_default net.ipv4.tcp_moderate_rcvbuf || true

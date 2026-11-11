@@ -8010,6 +8010,16 @@ pub(crate) fn constructor_type_from_oid(
             Some(base)
         };
     }
+    // An information_schema domain constructs values of its base type.
+    if let Some((domain, array)) =
+        crate::sql::information_schema_domains::InformationSchemaDomain::from_oid(type_oid)
+    {
+        return if array {
+            ArrElem::from_coltype(domain.base()).map(ColType::Array)
+        } else {
+            Some(domain.base())
+        };
+    }
     ColType::from_oid(type_oid)
 }
 

@@ -49,6 +49,8 @@ use materialize::{external_materialized_into, materialized_rows, materialized_se
 mod scan;
 pub(crate) use plan::plan_time_bool;
 pub use scan::JoinRow;
+#[cfg(test)]
+pub(crate) use scan::derived_candidates_visited;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
     Chained, PaxReadDemand, pax_column_demand,

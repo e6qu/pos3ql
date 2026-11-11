@@ -16,6 +16,7 @@ mod builtin_routine_comments;
 mod canonical_sequences;
 mod cast_and_operator_class_descriptions;
 mod catalog_identity_lookup;
+mod catalog_join_probes;
 mod client_catalog;
 mod compatibility_diagnostics;
 mod composite_parameter_fields;
@@ -34020,7 +34021,7 @@ fn transactional_alter_table_savepoint_and_rename_visibility() {
     assert_eq!(
         data_rows(&owner_dependencies),
         [
-            "FOREIGN KEY (parent_id) REFERENCES public.renamed(id)",
+            "FOREIGN KEY (parent_id) REFERENCES renamed(id)",
             "original_id_idx",
             "stable identity"
         ],
@@ -34036,7 +34037,7 @@ fn transactional_alter_table_savepoint_and_rename_visibility() {
                FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
               WHERE r.relname = 'child' AND c.contype = 'f'",
         )),
-        ["FOREIGN KEY (parent_id) REFERENCES public.original(id)"]
+        ["FOREIGN KEY (parent_id) REFERENCES original(id)"]
     );
     let observer_new = run_txn(
         &mut engine,
@@ -38082,7 +38083,7 @@ fn catalog_indexes_and_constraints_for_psql_d() {
     ));
     assert_eq!(
         fk,
-        ["parent|FOREIGN KEY (pa, pb) REFERENCES public.parent(a, b)"],
+        ["parent|FOREIGN KEY (pa, pb) REFERENCES parent(a, b)"],
         "fk: {fk:?}"
     );
     // A UNIQUE constraint is backed by an index (conindid links them).

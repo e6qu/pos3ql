@@ -5413,13 +5413,33 @@ fn join_key_types_compatible(a: ColType, b: ColType) -> bool {
 /// generate candidates — the full ON and WHERE still run at the leaf, so a
 /// missed extraction never changes a result, only the access path.
 #[allow(clippy::type_complexity)]
+/// The scope column a join key names, written `column`, `table.column` or
+/// `schema.table.column`; `None` for any other expression.
+fn key_column(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<ResolvedColumn> {
+    match *expression {
+        Expr::Column { qualifier, name } => scope.find_column(qualifier, name).ok(),
+        Expr::SchemaColumn {
+            schema,
+            table,
+            name,
+        } => {
+            let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
+            scope.find_column(Some(qualifier.as_str()), name).ok()
+        }
+        _ => None,
+    }
+}
+
+/// Up to eight (probe column, build column) join key pairs and their count.
+type JoinKeyPairs = ([(usize, usize); 8], usize);
+
 fn hash_join_keys<'a>(
     scope: &QueryScope<'a>,
     on: Option<&'a Expr<'a>>,
     where_clause: Option<&'a Expr<'a>>,
     probe_t: usize,
     build_t: usize,
-) -> Result<Option<([(usize, usize); 8], usize)>, SqlError> {
+) -> Result<Option<JoinKeyPairs>, SqlError> {
     let mut conjuncts: [&Expr; MAX_CONJUNCTS] = [&Expr::Null; MAX_CONJUNCTS];
     let mut nc = 0usize;
     for source in [on, where_clause].into_iter().flatten() {
@@ -5449,22 +5469,8 @@ fn hash_join_keys<'a>(
         else {
             continue;
         };
-        let Expr::Column {
-            qualifier: lq,
-            name: ln,
-        } = **left
-        else {
-            continue;
-        };
-        let Expr::Column {
-            qualifier: rq,
-            name: rn,
-        } = **right
-        else {
-            continue;
-        };
-        let (Ok(ResolvedColumn::Table(lt, lc)), Ok(ResolvedColumn::Table(rt, rc))) =
-            (scope.find_column(lq, ln), scope.find_column(rq, rn))
+        let (Some(ResolvedColumn::Table(lt, lc)), Some(ResolvedColumn::Table(rt, rc))) =
+            (key_column(scope, left), key_column(scope, right))
         else {
             continue;
         };
@@ -5502,6 +5508,134 @@ fn hash_join_keys<'a>(
     } else {
         Ok(Some((pairs, npairs)))
     }
+}
+
+/// A hash index over a materialized source (a derived table or catalog
+/// relation) joined below the first level, keyed by one column its join
+/// condition compares with an earlier source's column. Each outer row then
+/// visits only the rows whose key hashes alike instead of every row.
+#[derive(Clone, Copy)]
+pub(crate) struct DerivedProbe<'a> {
+    probe_qualifier: &'a str,
+    probe_name: &'a str,
+    collation: Collation,
+    /// Bucket heads, then each row's next row in its bucket, both
+    /// `u32::MAX`-terminated, and each row's key hash.
+    buckets: &'a [u32],
+    next: &'a [u32],
+    hashes: &'a [u64],
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static DERIVED_CANDIDATES: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_derived_candidate() {
+    DERIVED_CANDIDATES.with(|count| count.set(count.get() + 1));
+}
+
+/// Rows of materialized sources this thread's joins have visited below their
+/// first level, for tests that bound a join's work deterministically.
+#[cfg(test)]
+pub(crate) fn derived_candidates_visited() -> u64 {
+    DERIVED_CANDIDATES.with(core::cell::Cell::get)
+}
+
+/// Smaller sources scan faster than they hash.
+const DERIVED_PROBE_MIN_ROWS: usize = 32;
+
+#[allow(clippy::too_many_arguments)]
+fn derived_probe<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    where_clause: Option<&'a Expr<'a>>,
+    order: &[usize],
+    depth: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<DerivedProbe<'a>>, SqlError> {
+    let table = order[depth];
+    let join = &from.joins[depth - 1];
+    let (Some(rows), None) = (scope.derived[table], scope.external_runs[table]) else {
+        return Ok(None);
+    };
+    if rows.len() < DERIVED_PROBE_MIN_ROWS
+        || rows.len() >= u32::MAX as usize
+        || scope.lateral[table]
+        || !matches!(
+            join.kind,
+            JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left
+        )
+    {
+        return Ok(None);
+    }
+    let on = join.on.or(scope.join_on[depth - 1]);
+    // An inner join's WHERE equality filters its rows as surely as its ON
+    // condition; an outer join's WHERE runs after null extension.
+    let filter = (join.kind != JoinKind::Left)
+        .then_some(where_clause)
+        .flatten();
+    let Some(((probe_table, (probe_column, build_column)), collation)) = order[..depth]
+        .iter()
+        .find_map(|&earlier| {
+            hash_join_keys(scope, on, filter, earlier, table)
+                .ok()
+                .flatten()
+                .map(|(keys, _)| (earlier, keys[0]))
+        })
+        .map(|(earlier, key)| {
+            let collation = scope.defs.get(table).expect("resolved").columns[key.1].collation;
+            ((earlier, key), collation)
+        })
+    else {
+        return Ok(None);
+    };
+    let (probe_qualifier, probe_name) = scope.column_reference_name(probe_table, probe_column);
+    let full = |_| arena_full();
+    let bucket_count = rows.len().next_power_of_two();
+    let buckets = arena
+        .alloc_slice_with(bucket_count, |_| u32::MAX)
+        .map_err(full)?;
+    let next = arena
+        .alloc_slice_with(rows.len(), |_| u32::MAX)
+        .map_err(full)?;
+    let hashes = arena.alloc_slice_with(rows.len(), |_| 0u64).map_err(full)?;
+    // Inserting in reverse leaves each bucket in row order.
+    for (index, bytes) in rows.iter().enumerate().rev() {
+        let mark = arena.mark();
+        let value = crate::sql::exec::decode_projected_col_record(bytes, build_column, arena)?;
+        let hash = if value.is_null() {
+            None
+        } else {
+            Some(hash_key_collated_catalog(
+                storage,
+                txid,
+                &[value],
+                &[0],
+                &[collation],
+            )?)
+        };
+        // SAFETY: the decoded key is not kept; only its hash is.
+        unsafe { arena.rewind_to(mark) };
+        let Some(hash) = hash else { continue };
+        let bucket = (hash as usize) & (bucket_count - 1);
+        hashes[index] = hash;
+        next[index] = buckets[bucket];
+        buckets[bucket] = index as u32;
+    }
+    let probe_qualifier = arena.alloc_str(probe_qualifier).map_err(full)?;
+    let probe_name = arena.alloc_str(probe_name).map_err(full)?;
+    Ok(Some(DerivedProbe {
+        probe_qualifier,
+        probe_name,
+        collation,
+        buckets,
+        next,
+        hashes,
+    }))
 }
 
 /// A selected two-table hash implementation. Planning is shared with EXPLAIN
@@ -6903,6 +7037,7 @@ fn scan_source_mode<'a>(
         // (identity unless a cross join was cost-reordered).
         order: &[usize],
         parameterized: &[Option<IndexAccessPlan<'a>>],
+        derived_probes: &[Option<DerivedProbe<'a>>],
         indexed: Option<&IndexedCandidates<'a>>,
         decode_buffers: &mut RowDecodeBuffers<'a>,
         recycle_rows: bool,
@@ -6990,6 +7125,7 @@ fn scan_source_mode<'a>(
                         sample_plans,
                         order,
                         parameterized,
+                        derived_probes,
                         indexed,
                         decode_buffers,
                         recycle_rows,
@@ -7164,9 +7300,55 @@ fn scan_source_mode<'a>(
                     .with_block_store(|blocks| reader.advance(blocks))
                     .expect("external run has a block store")?;
             }
+        } else if let (Some(rows), Some(probe)) =
+            (scope.derived[order[depth]], derived_probes[depth])
+        {
+            // Only the rows whose join key hashes like the outer row's key can
+            // satisfy the join condition, which still decides each candidate.
+            // The key is hashed in recycled memory; only the hash leaves it.
+            let hash = recycled(arena, recycle_rows, None, || {
+                let outer_row = assemble(
+                    storage,
+                    txid,
+                    scope,
+                    bound,
+                    bound_rowids,
+                    order,
+                    depth,
+                    decode_buffers,
+                    arena,
+                )?;
+                let key = outer_row.lookup(Some(probe.probe_qualifier), probe.probe_name)?;
+                if key.is_null() {
+                    return Ok::<_, SqlError>(None);
+                }
+                hash_key_collated_catalog(storage, txid, &[key], &[0], &[probe.collation]).map(Some)
+            })?;
+            if let Some(hash) = hash {
+                let mut entry = probe.buckets[(hash as usize) & (probe.buckets.len() - 1)];
+                while entry != u32::MAX {
+                    let index = entry as usize;
+                    entry = probe.next[index];
+                    if probe.hashes[index] != hash {
+                        continue;
+                    }
+                    check_timeout()?;
+                    #[cfg(test)]
+                    count_derived_candidate();
+                    let bytes = rows[index];
+                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
+                        visit_candidate!(index, BoundRow::Encoded(bytes), None)
+                    })?;
+                    if !keep_scanning {
+                        return Ok(false);
+                    }
+                }
+            }
         } else if let Some(rows) = scope.derived[order[depth]] {
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
+                #[cfg(test)]
+                count_derived_candidate();
                 let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                     visit_candidate!(index, BoundRow::Encoded(bytes), None)
                 })?;
@@ -7541,6 +7723,7 @@ fn scan_source_mode<'a>(
                 sample_plans,
                 order,
                 parameterized,
+                derived_probes,
                 indexed,
                 decode_buffers,
                 recycle_rows,
@@ -7626,12 +7809,22 @@ fn scan_source_mode<'a>(
     // toward the filtered result size. Results are identical — a partial row
     // that fails such a conjunct cannot satisfy the full WHERE (the conjunct's
     // value does not depend on the still-unbound tables), and the leaf still
-    // evaluates the whole WHERE. Restricted to inner/cross joins so a
-    // WHERE clause over an outer join's nullable side is never pruned early.
-    let all_inner = from
+    // evaluates the whole WHERE. Only tables bound before the first outer
+    // join take part, so a WHERE clause over an outer join's nullable side
+    // is never pruned early; a RIGHT or FULL join makes its left side
+    // nullable too, so it disables pushdown.
+    let pushdown_depth = if from
         .joins
         .iter()
-        .all(|j| matches!(j.kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Comma));
+        .any(|j| matches!(j.kind, JoinKind::Right | JoinKind::Full))
+    {
+        0
+    } else {
+        from.joins
+            .iter()
+            .position(|j| j.kind == JoinKind::Left)
+            .map_or(scope.n, |join| join + 1)
+    };
     // Cost-based execution order: only cross joins (no ON clause, no nullable
     // side) may be reordered freely — an explicit JOIN ... ON's condition is tied
     // to its position. Everything else keeps FROM order (identity). A LATERAL
@@ -7683,7 +7876,7 @@ fn scan_source_mode<'a>(
     let pushdown_counts = arena
         .alloc_slice_with(scope.n, |_| 0usize)
         .map_err(|_| arena_full())?;
-    if all_inner
+    if pushdown_depth >= 1
         && scope.n >= 2
         && let Some(w) = where_clause
     {
@@ -7706,7 +7899,7 @@ fn scan_source_mode<'a>(
                     .map(|t| inv_order[t])
                     .max()
                     .unwrap_or(0);
-                if d < scope.n && pushdown_counts[d] < MAX_CONJUNCTS {
+                if d < pushdown_depth && pushdown_counts[d] < MAX_CONJUNCTS {
                     pushdown_buffers[d][pushdown_counts[d]] = c;
                     pushdown_counts[d] += 1;
                 }
@@ -7749,6 +7942,24 @@ fn scan_source_mode<'a>(
     let parameterized = arena
         .alloc_slice_with(scope.n, |depth| parameterized_plans[depth])
         .map_err(|_| arena_full())?;
+    let derived_probes = arena
+        .alloc_slice_with(scope.n, |_| None)
+        .map_err(|_| arena_full())?;
+    for depth in 1..scope.n {
+        if security_plans[order[depth]].is_none() && sample_plans[order[depth]].is_none() {
+            derived_probes[depth] = derived_probe(
+                storage,
+                scope,
+                from,
+                planning_where_clause,
+                order,
+                depth,
+                txid,
+                arena,
+            )?;
+        }
+    }
+    let derived_probes = &*derived_probes;
     let bound = arena
         .alloc_slice_with(scope.n, |_| None)
         .map_err(|_| arena_full())?;
@@ -7841,6 +8052,7 @@ fn scan_source_mode<'a>(
             sample_plans,
             order,
             parameterized,
+            derived_probes,
             indexed,
             decode_buffers,
             recycle_rows,
@@ -7958,6 +8170,7 @@ fn scan_source_mode<'a>(
                     sample_plans,
                     order,
                     parameterized,
+                    derived_probes,
                     indexed,
                     decode_buffers,
                     recycle_rows,

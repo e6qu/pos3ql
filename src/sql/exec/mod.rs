@@ -69070,6 +69070,7 @@ pub(crate) fn merge<'a>(
         storage,
         txn.txid,
         arena,
+        outer,
     ) {
         return sql_fail(error);
     }
@@ -73213,6 +73214,7 @@ where
         storage,
         txn.txid,
         arena,
+        transition,
     ) {
         return sql_fail(error);
     }
@@ -74845,6 +74847,7 @@ pub(crate) fn update<'a>(
         storage,
         txn.txid,
         arena,
+        outer,
     ) {
         return sql_fail(error);
     }
@@ -76187,6 +76190,7 @@ pub(crate) fn delete<'a>(
         storage,
         txn.txid,
         arena,
+        outer,
     ) {
         return sql_fail(error);
     }

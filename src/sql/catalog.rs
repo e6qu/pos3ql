@@ -17634,8 +17634,14 @@ pub fn constraint_def_text<'a>(
             write_identifier(&mut s, child.columns()[c as usize].name.as_str());
         }
         let _ = s.write_str(") REFERENCES ");
-        write_identifier(&mut s, parent.schema.as_str());
-        let _ = s.write_char('.');
+        // PostgreSQL qualifies the referenced table only when the search
+        // path does not find it by its bare name.
+        if !relation_oid_for_name(storage, txid, None, parent.name.as_str())
+            .matches_oid(user_table_oid(storage, pslot))
+        {
+            write_identifier(&mut s, parent.schema.as_str());
+            let _ = s.write_char('.');
+        }
         write_identifier(&mut s, parent.name.as_str());
         let _ = s.write_char('(');
         for (k, &c) in fk.parent_cols[..fk.n_parent_cols].iter().enumerate() {

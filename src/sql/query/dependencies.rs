@@ -1467,12 +1467,17 @@ pub(crate) fn validate_dml_assignment_casts(
 /// when its executor starts, so a revoked function fails even when no row
 /// matches: assignments, conditions, `ON CONFLICT` and `MERGE` actions and
 /// `RETURNING` lists. Rows reaching evaluation are checked again there.
-pub(crate) fn require_dml_builtin_execute<'a>(
+pub(crate) fn require_dml_builtin_execute<'a, 'o: 'a>(
     statement: &Stmt<'a>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'o>>,
 ) -> Result<(), SqlError> {
+    let outer = outer.map(crate::sql::eval::EnclosingRow);
+    let outer = outer
+        .as_ref()
+        .map(|row| row as &dyn crate::sql::eval::ColumnLookup<'a>);
     let catalog = super::storage_catalog(storage, arena, txid);
     if !crate::sql::eval::CatalogAccess::routine_privileges_present(&catalog) {
         return Ok(());
@@ -1529,12 +1534,17 @@ pub(crate) fn require_dml_builtin_execute<'a>(
             ),
             _ => None,
         };
-        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena, None)?;
+        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena, outer)?;
         let hooks = crate::sql::eval::EvalHooks {
             catalog: Some(&catalog),
             ..crate::sql::eval::NO_HOOKS
         };
-        let row = super::ScopeSchema(&scope);
+        let schema = super::ScopeSchema(&scope);
+        // A routine's variables read in the statement type its expressions.
+        let row = super::Chained {
+            inner: &schema,
+            outer,
+        };
         let check = |expression: &Expr<'a>| {
             crate::sql::eval::require_expression_builtin_execute(expression, &row, &hooks)
         };

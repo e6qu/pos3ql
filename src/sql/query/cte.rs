@@ -185,7 +185,7 @@ fn select_contains_with(select: &Select<'_>) -> bool {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                 expression_contains_with(expression)
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
         })
         || select.where_clause.is_some_and(expression_contains_with)
         || select.having.is_some_and(expression_contains_with)
@@ -513,7 +513,9 @@ fn analyze_unreferenced_ctes<'a>(
         }
         let probe = arena
             .alloc(Select {
-                items: &[SelectItem::Wildcard],
+                items: &[SelectItem::Wildcard(
+                    crate::sql::ast::SourcePosition::UNKNOWN,
+                )],
                 distinct: false,
                 distinct_on: &[],
                 from: Some(FromClause {
@@ -1176,7 +1178,7 @@ pub(crate) fn rule_transition_source<'a>(
         .map_err(|_| arena_full())?;
     let mut old = [&Expr::Null; crate::storage::MAX_COLUMNS];
     let mut new = [&Expr::Null; crate::storage::MAX_COLUMNS];
-    let mut items = [SelectItem::Wildcard; MAX_PROJ];
+    let mut items = [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     let mut item_count = 0usize;
     let mut add_output = |prefix: &str,
                           column: usize,
@@ -2338,7 +2340,7 @@ pub fn rewrite_view_dml<'a>(
             if returning
                 .items
                 .iter()
-                .any(|item| matches!(item, SelectItem::Wildcard)) =>
+                .any(|item| matches!(item, SelectItem::Wildcard(_))) =>
         {
             let from = expand_from_schema(from, storage, txid, arena)?;
             let scope = super::QueryScope::resolve_schema(storage, from, txid, arena, None)?;
@@ -2507,7 +2509,9 @@ fn expand_view_returning<'a>(
     let extra = items.iter().fold(0usize, |count, item| {
         count
             + match item {
-                SelectItem::Wildcard => (exposed_columns.len() + from_star.len()).saturating_sub(1),
+                SelectItem::Wildcard(_) => {
+                    (exposed_columns.len() + from_star.len()).saturating_sub(1)
+                }
                 SelectItem::TableWildcard(qualifier) if *qualifier == view_name => {
                     exposed_columns.len().saturating_sub(1)
                 }
@@ -2521,10 +2525,10 @@ fn expand_view_returning<'a>(
             "RETURNING list is too wide"
         ));
     }
-    let mut output = [SelectItem::Wildcard; MAX_PROJ];
+    let mut output = [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     let mut count = 0usize;
     for item in items {
-        if matches!(item, SelectItem::Wildcard)
+        if matches!(item, SelectItem::Wildcard(_))
             || matches!(item, SelectItem::TableWildcard(qualifier) if *qualifier == view_name)
         {
             for column in exposed_columns {
@@ -2540,7 +2544,7 @@ fn expand_view_returning<'a>(
                 };
                 count += 1;
             }
-            if matches!(item, SelectItem::Wildcard) {
+            if matches!(item, SelectItem::Wildcard(_)) {
                 for &(expression, name) in from_star {
                     output[count] = SelectItem::Expr {
                         expression,
@@ -3124,7 +3128,7 @@ fn select_item_references(item: &SelectItem<'_>, name: &str) -> usize {
         SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
             expr_references(expression, name)
         }
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => 0,
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => 0,
     }
 }
 
@@ -3401,7 +3405,7 @@ fn select_mentions_column(select: &Select<'_>, qualifier: &str, name: &str) -> b
         SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
             expr_mentions_column(expression, qualifier, name)
         }
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
     }) || select
         .where_clause
         .is_some_and(|expression| expr_mentions_column(expression, qualifier, name))
@@ -3580,7 +3584,7 @@ pub(super) fn select_contains_function(
         SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
             expression_has_it(expression)
         }
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
     }) || select.where_clause.is_some_and(expression_has_it)
         || select.having.is_some_and(expression_has_it)
         || select
@@ -4289,7 +4293,7 @@ fn append_recursive_state<'a>(
             "target lists can have at most 1664 entries"
         ));
     }
-    let mut items = [SelectItem::Wildcard; MAX_PROJ];
+    let mut items = [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     items[..select.items.len()].copy_from_slice(select.items);
     for state in 0..state_count {
         let ctype = decoration.state_types[state];
@@ -5349,7 +5353,7 @@ fn subst_select_items<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a [SelectItem<'a>], SqlError> {
-    let mut items = [SelectItem::Wildcard; MAX_PROJ];
+    let mut items = [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     let mut count = 0usize;
     for item in source {
         if let SelectItem::TableWildcard(qualifier) = item
@@ -5385,7 +5389,7 @@ fn subst_select_items<'a>(
             continue;
         }
         let rewritten = match item {
-            SelectItem::Wildcard => SelectItem::Wildcard,
+            SelectItem::Wildcard(at) => SelectItem::Wildcard(*at),
             SelectItem::TableWildcard(qualifier) => {
                 SelectItem::TableWildcard(match context.qualifier {
                     Some(rewrite) if *qualifier == rewrite.from => rewrite.to,

@@ -190,7 +190,7 @@ fn describe_items_with_output_aliases<'q>(
             Ok(())
         };
         match item {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 let Some(def) = def else {
                     return Err(sql_err!(
                         sqlstate::SYNTAX_ERROR,
@@ -451,7 +451,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     let mut column = 0;
     for item in returning.items {
         match item {
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                 column += definition.map_or(0, |definition| definition.n_columns);
             }
             SelectItem::RecordStar(base) => {
@@ -1764,7 +1764,7 @@ fn first_output_name<'a>(select: &crate::sql::ast::Select<'a>) -> Option<&'a str
             expression,
             alias: None,
         } => Some(derived_name(expression)),
-        SelectItem::Wildcard => relation_name(&select.from?.base),
+        SelectItem::Wildcard(_) => relation_name(&select.from?.base),
         SelectItem::TableWildcard(qualifier) => {
             let from = select.from?;
             core::iter::once(&from.base)

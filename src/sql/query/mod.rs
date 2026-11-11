@@ -623,7 +623,7 @@ fn collect_stored_query_composite_field_rename_select<'a>(
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                 rename.collect_expression(expression, columns, nested_outer, sites, count)?;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
         }
     }
     if let Some(from_clause) = &select.from {
@@ -7387,7 +7387,7 @@ fn patch_subquery_column_types<'a>(
     let mut slot = 0usize;
     for item in items {
         match item {
-            SelectItem::Wildcard => slot += scope.map_or(0, |s| s.star_columns()),
+            SelectItem::Wildcard(_) => slot += scope.map_or(0, |s| s.star_columns()),
             SelectItem::TableWildcard(q) => {
                 slot += scope
                     .and_then(|s| s.qualified_star_columns(q).ok())
@@ -7968,7 +7968,7 @@ fn resolve_group_ordinals<'a>(
     let mut target_entries = 0usize;
     for item in statement.items {
         target_entries += match item {
-            SelectItem::Wildcard => scope.map_or(0, QueryScope::star_columns),
+            SelectItem::Wildcard(_) => scope.map_or(0, QueryScope::star_columns),
             SelectItem::TableWildcard(qualifier) => match scope {
                 Some(scope) => scope.qualified_star_columns(qualifier)?,
                 None => 0,
@@ -8097,7 +8097,7 @@ pub(super) fn resolve_sort_key<'a>(
                     }
                     index += 1;
                 }
-                SelectItem::Wildcard => index += scope.star_columns(),
+                SelectItem::Wildcard(_) => index += scope.star_columns(),
                 SelectItem::TableWildcard(qualifier) => {
                     index += scope.qualified_star_columns(qualifier)?;
                 }
@@ -8166,7 +8166,7 @@ fn resolve_position_target<'a>(
                 }
                 remaining -= 1;
             }
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 // A star without a FROM is invalid before any position could
                 // resolve into it, so a missing scope reports the position.
                 let Some(scope) = scope else {
@@ -8390,7 +8390,7 @@ pub fn resolve_view_for_dml<'a>(
     let mut n = 0;
     for it in sel.items {
         match it {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 for c in base_def.columns() {
                     if n == MAX_PROJ {
                         return Err(not_updatable());
@@ -8707,7 +8707,7 @@ fn describe_contextual_items<'a>(
     let catalog = storage_catalog(storage, arena, txid);
     let mut count = 0;
     for item in items {
-        if matches!(item, SelectItem::Wildcard | SelectItem::TableWildcard(_)) {
+        if matches!(item, SelectItem::Wildcard(_) | SelectItem::TableWildcard(_)) {
             let scope = scope.ok_or_else(|| {
                 sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -8797,7 +8797,7 @@ fn describe_contextual_items<'a>(
                 )?;
                 out[count - 1].collation_derivation = collation.1;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                 unreachable!("wildcards were described")
             }
         }
@@ -9454,7 +9454,7 @@ fn validate_projection_source(
     scope: &QueryScope<'_>,
 ) -> Result<(), SqlError> {
     match item {
-        SelectItem::Wildcard if scope.n == 0 => Err(sql_err!(
+        SelectItem::Wildcard(_) if scope.n == 0 => Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
             "SELECT * with no tables specified is not valid"
         )),
@@ -12108,7 +12108,7 @@ pub(super) fn streaming_pax_columns<'a>(
     for item in items {
         let expression = match item {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => expression,
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                 return PaxReadDemand::full_row(scan::PaxFullRowReason::WildcardProjection);
             }
         };
@@ -12209,7 +12209,7 @@ fn project_row_skipping<'a>(
                     n += 1;
                 }
             }
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 let value_of = |t: usize, c: usize| {
                     let vals = row.table_values(t).expect("bound");
                     if vals.is_empty() {
@@ -12351,7 +12351,7 @@ pub fn describe_scope_items<'q>(
                     n += 1;
                 }
             }
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 for k in 0..scope.star_columns() {
                     if n == out.len() {
                         return Err(sql_err!(
@@ -12555,7 +12555,7 @@ pub fn describe_catalog_items_as<'q>(
     let mut column = 0;
     for (item_index, item) in items.iter().enumerate() {
         match item {
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                 column += definition.map_or(0, |table| table.n_columns);
             }
             SelectItem::RecordStar(_) => {
@@ -12613,7 +12613,7 @@ pub fn describe_select_items<'q>(
     let mut column = 0;
     for item in items {
         match item {
-            SelectItem::Wildcard => column += scope.map_or(0, QueryScope::star_columns),
+            SelectItem::Wildcard(_) => column += scope.map_or(0, QueryScope::star_columns),
             SelectItem::TableWildcard(table) => {
                 if let Some(scope) = scope
                     && let Ok(table) = scope.table_index(table)
@@ -12655,7 +12655,7 @@ fn patch_array_subquery_field_types<'q>(
     let mut column = 0;
     for item in items {
         match item {
-            SelectItem::Wildcard => column += outer_scope.map_or(0, QueryScope::star_columns),
+            SelectItem::Wildcard(_) => column += outer_scope.map_or(0, QueryScope::star_columns),
             SelectItem::TableWildcard(table) => {
                 if let Some(scope) = outer_scope
                     && let Ok(table) = scope.table_index(table)

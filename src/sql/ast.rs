@@ -3662,8 +3662,8 @@ impl JoinKind {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SelectItem<'a> {
-    /// `*`
-    Wildcard,
+    /// `*`, with the position of the star where the statement was parsed.
+    Wildcard(SourcePosition),
     /// `t.*`: every column of the named FROM item (its own copies, even for
     /// USING/NATURAL-merged columns).
     TableWildcard(&'a str),

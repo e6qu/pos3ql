@@ -1198,6 +1198,9 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         let third = self.any_ident("column name")?;
+                        if self.peeked == Tok::Op(".") {
+                            return self.catalog_qualified_column(name_at, name, column, third);
+                        }
                         return self.arena_expr(Expr::SchemaColumn {
                             schema: name,
                             table: column,
@@ -1307,6 +1310,9 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         let third = self.any_ident("column name")?;
+                        if self.peeked == Tok::Op(".") {
+                            return self.catalog_qualified_column(name_at, name, column, third);
+                        }
                         return self.arena_expr(Expr::SchemaColumn {
                             schema: name,
                             table: column,

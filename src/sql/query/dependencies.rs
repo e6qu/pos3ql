@@ -1197,6 +1197,44 @@ fn collect_returning_expression<'a>(
 
 /// Check declared assignment types before row selection, triggers, or defaults
 /// can run. A typed NULL and an empty array still carry a cast contract.
+/// `SET (a, b) = (SELECT ...)`: the sub-SELECT must produce one column per
+/// target, checked once at its first target before any row is read.
+pub(super) fn check_multiple_assignment_source(
+    expression: &Expr<'_>,
+    scope: &super::QueryScope<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let Expr::RecordFieldIndex {
+        base: base @ Expr::RowSubquery { select, arity },
+        index: 0,
+    } = expression
+    else {
+        return Ok(());
+    };
+    let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
+    let width = super::describe_select(
+        select,
+        storage,
+        txid,
+        arena,
+        &mut columns,
+        crate::sql::exec::DescriptionTarget::Sql,
+        Some(&super::ScopeSchema(scope)),
+    )?;
+    if width == usize::from(*arity) {
+        return Ok(());
+    }
+    Err(crate::sql::error_position::at_node(
+        sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "number of columns does not match number of values"
+        ),
+        base,
+    ))
+}
+
 pub(crate) fn validate_dml_assignment_casts(
     statement: &Stmt<'_>,
     storage: &Storage,
@@ -1361,6 +1399,7 @@ pub(crate) fn validate_dml_assignment_casts(
                     subquery_literals(predicate, Some(&scope), storage, txid, arena)?;
                 }
                 for (name, expression) in update.assignments {
+                    check_multiple_assignment_source(expression, &scope, storage, txid, arena)?;
                     subquery_literals(expression, Some(&scope), storage, txid, arena)?;
                     assign(name, expression, update.alias)?;
                 }
@@ -1375,6 +1414,9 @@ pub(crate) fn validate_dml_assignment_casts(
                     match when.action() {
                         crate::sql::ast::MergeActionRef::Update(assignments) => {
                             for (name, expression) in assignments {
+                                check_multiple_assignment_source(
+                                    expression, &scope, storage, txid, arena,
+                                )?;
                                 assign(name, expression, merge.target_alias)?;
                             }
                         }
@@ -1961,7 +2003,7 @@ pub(crate) fn visit_projection_types(
                         Some(&catalog),
                     )?,
                 )?,
-                SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                     if let Some(scope) = &scope {
                         let count = match item {
                             SelectItem::TableWildcard(name) => {
@@ -2170,7 +2212,7 @@ fn star_item<'s>(select: &'s Select<'s>) -> Option<&'s SelectItem<'s>> {
     select
         .items
         .iter()
-        .find(|item| matches!(item, SelectItem::Wildcard | SelectItem::TableWildcard(_)))
+        .find(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::TableWildcard(_)))
 }
 
 /// Whether an assigned value writes through a field or subscript.
@@ -2463,7 +2505,7 @@ fn collect_select<'a>(
                         nested,
                     )?;
                 }
-                SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
             }
         }
         for expression in select.distinct_on {
@@ -2552,7 +2594,7 @@ fn collect_select<'a>(
                                 ReferenceScope::Query,
                             )?;
                         }
-                        SelectItem::Wildcard => {
+                        SelectItem::Wildcard(_) => {
                             for table in 0..scope.n {
                                 for column in 0..scope.defs.get(table).expect("resolved").n_columns
                                 {
@@ -3811,7 +3853,7 @@ fn collect_routine_dependencies_with_resolver(
                     &mut unresolved,
                 )?
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
         }
     }
     for expression_node in select
@@ -4049,7 +4091,7 @@ fn record_relation_column_references<'a>(
                     }
                 }
             }
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 for source in sources {
                     for column in 0..source.n_columns {
                         dependencies.mark_referenced_column(source.class, source.slot, column)?;

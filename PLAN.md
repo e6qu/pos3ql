@@ -303,14 +303,12 @@ and an `ON` condition can name a table from an earlier comma-separated item
 where PostgreSQL reports `invalid reference to FROM-clause entry`. A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
 PostgreSQL types it as the table's row type `t`. A qualifier naming an
-aliased table (`UPDATE t x ... RETURNING t.a`) reports `missing FROM-clause
-entry` without PostgreSQL's alias hint, and a qualified star's error
-(`RETURNING missing.*`) has no position. A four-part column name (`a.b.c.d`) is a syntax error where
-PostgreSQL reports `cross-database references are not implemented`.
-An `INSERT ... SELECT *` assignment error has no position where PostgreSQL
-points at the `*` (a qualified `t.*` is positioned), and `UPDATE t SET (a,
-b) = (SELECT * FROM s)` does not check the subquery's column types against
-the targets. A PL/pgSQL variable declared with a view's row type (`r v;` or
+aliased table (`UPDATE t x ... RETURNING t.a`) reports PostgreSQL's
+`invalid reference to FROM-clause entry` without its alias hint. A
+database-qualified name (`postgres.public.t`) works in column references,
+FROM items and `CREATE` targets but is a syntax error in `DROP` and other
+DDL name lists.
+A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. In a PL/pgSQL statement,
 `VALUES (r.*)` does not expand the row variable `r` into its fields, and a
 whole-row star in an expression (`t.* IS NULL`) is a syntax error. Reading

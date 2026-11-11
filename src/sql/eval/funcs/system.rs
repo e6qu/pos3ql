@@ -205,6 +205,12 @@ pub fn set_current_database(database: &str) {
     });
 }
 
+/// Whether `name` is the session's database, which a catalog-qualified name
+/// (`database.schema.table`) may spell out.
+pub(crate) fn is_current_database(name: &str) -> bool {
+    CURRENT_DATABASE.with(|current| current.borrow().as_str() == name)
+}
+
 fn current_database_str(arena: &crate::mem::arena::Arena) -> Result<&str, SqlError> {
     CURRENT_DATABASE.with(|current| {
         let current = *current.borrow();

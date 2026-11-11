@@ -1490,16 +1490,66 @@ impl<'a> Parser<'a> {
             start: self.peek_at,
             end: self.lexer.token_end(),
         };
+        let at = self.peek_at;
         let first = self.col_ident(what)?;
         if self.eat_op(".")? {
             self.record_namespace(source)?;
+            let second = self.col_ident(what)?;
+            if self.eat_op(".")? {
+                let (schema, name) = self.catalog_qualified_name(at, first, second, what)?;
+                return Ok(QualName {
+                    schema: Some(schema),
+                    name,
+                });
+            }
             Ok(QualName {
                 schema: Some(first),
-                name: self.col_ident(what)?,
+                name: second,
             })
         } else {
             Ok(QualName::bare(first))
         }
+    }
+
+    /// The rest of a dotted name after `first.second` when another `.`
+    /// follows: `database.schema.name` must name the session's database, and
+    /// a longer name is improper, as in PostgreSQL's parse analysis.
+    pub(super) fn catalog_qualified_name(
+        &mut self,
+        at: usize,
+        first: &'a str,
+        second: &'a str,
+        what: &str,
+    ) -> Result<(&'a str, &'a str), ParseError> {
+        let third = self.col_ident(what)?;
+        let mut written = stack_format!(PARSE_MESSAGE_BYTES, "{first}.{second}.{third}");
+        let mut parts = 3;
+        while self.eat_op(".")? {
+            let part = self.col_ident(what)?;
+            let _ = core::fmt::Write::write_fmt(&mut written, format_args!(".{part}"));
+            parts += 1;
+        }
+        let error = |sqlstate: &'static str, message: core::fmt::Arguments<'_>| ParseError {
+            at,
+            message: stack_format!(PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate,
+            cursor: Some(at),
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        if parts > 3 {
+            return Err(error(
+                sqlstate::SYNTAX_ERROR,
+                format_args!("improper qualified name (too many dotted names): {written}"),
+            ));
+        } else if !crate::sql::eval::funcs::system::is_current_database(first) {
+            self.analysis_error(error(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                format_args!("cross-database references are not implemented: \"{written}\""),
+            ))?;
+        }
+        Ok((second, third))
     }
 
     fn any_qual_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
@@ -2621,8 +2671,9 @@ impl<'a> Parser<'a> {
         let mut items = ArenaList::new(self.arena);
         loop {
             let item = if self.peeked == Tok::Op("*") {
+                let at = self.peek_at;
                 self.advance()?;
-                SelectItem::Wildcard
+                SelectItem::Wildcard(crate::sql::ast::SourcePosition::new(Some(at)))
             } else if let Some(table) = self.table_wildcard()? {
                 SelectItem::TableWildcard(table)
             } else {
@@ -3617,7 +3668,9 @@ impl<'a> Parser<'a> {
                 view_access: None,
             };
             let select = Select {
-                items: self.arena_slice(&[SelectItem::Wildcard])?,
+                items: self.arena_slice(&[SelectItem::Wildcard(
+                    crate::sql::ast::SourcePosition::UNKNOWN,
+                )])?,
                 distinct: false,
                 distinct_on: &[],
                 from: Some(FromClause {
@@ -3806,10 +3859,18 @@ impl<'a> Parser<'a> {
             end: self.lexer.token_end(),
         };
         let quoted_function_name = matches!(self.peeked, Tok::QuotedIdent(_));
+        let name_at = self.peek_at;
         let first = self.col_ident("table name")?;
         let (schema, table) = if self.eat_op(".")? {
             self.record_namespace(source)?;
-            (Some(first), self.col_ident("table name")?)
+            let second = self.col_ident("table name")?;
+            if self.peeked == Tok::Op(".") && self.eat_op(".")? {
+                let (schema, table) =
+                    self.catalog_qualified_name(name_at, first, second, "table name")?;
+                (Some(schema), table)
+            } else {
+                (Some(first), second)
+            }
         } else {
             (None, first)
         };
@@ -7883,7 +7944,9 @@ impl<'a> Parser<'a> {
                 self.expect_op("(")?;
                 self.assignment_row_values(&mut values)?;
                 values.len()
-            } else if self.eat_op("(")? {
+            } else if self.peeked == Tok::Op("(") {
+                let open_at = self.peek_at;
+                self.advance()?;
                 if matches!(self.peeked, Tok::Ident("select") | Tok::Ident("with")) {
                     let select = self.query_select()?;
                     self.expect_op(")")?;
@@ -7893,7 +7956,8 @@ impl<'a> Parser<'a> {
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                     let arity = u8::try_from(name_count)
                         .map_err(|_| self.err_here("assignment target is too wide"))?;
-                    let record = self.arena_expr(Expr::RowSubquery { select, arity })?;
+                    let record =
+                        self.arena_expr_at(Expr::RowSubquery { select, arity }, open_at)?;
                     for index in 0..name_count {
                         let field = self.arena_expr(Expr::RecordFieldIndex {
                             base: record,
@@ -9643,6 +9707,68 @@ impl<'a> Parser<'a> {
                 Ok(name)
             }
             _ => Err(self.syntax_error_here()),
+        }
+    }
+
+    /// A column reference of four or more names after `catalog.schema.table`:
+    /// `database.schema.table.column` must name the session's database, and a
+    /// longer reference is improper, as in PostgreSQL's parse analysis.
+    pub(super) fn catalog_qualified_column(
+        &mut self,
+        at: usize,
+        catalog: &'a str,
+        schema: &'a str,
+        table: &'a str,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let mut written = stack_format!(PARSE_MESSAGE_BYTES, "{catalog}.{schema}.{table}");
+        let mut last = None;
+        let mut parts = 3;
+        while self.eat_op(".")? {
+            let part = if self.eat_op("*")? {
+                "*"
+            } else {
+                self.any_ident("column name")?
+            };
+            let _ = core::fmt::Write::write_fmt(&mut written, format_args!(".{part}"));
+            last = Some(part);
+            parts += 1;
+            if part == "*" {
+                break;
+            }
+        }
+        let error = |sqlstate: &'static str, message: core::fmt::Arguments<'_>| ParseError {
+            at,
+            message: stack_format!(PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate,
+            cursor: Some(at),
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        if parts > 4 {
+            self.analysis_error(error(
+                sqlstate::SYNTAX_ERROR,
+                format_args!("improper qualified name (too many dotted names): {written}"),
+            ))?;
+            return self.arena_expr(Expr::Null);
+        }
+        if !crate::sql::eval::funcs::system::is_current_database(catalog) {
+            self.analysis_error(error(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                format_args!("cross-database references are not implemented: {written}"),
+            ))?;
+            return self.arena_expr(Expr::Null);
+        }
+        match last.expect("a fourth name was read") {
+            "*" => {
+                let qualifier = self.composed_qualifier(schema, table)?;
+                self.arena_expr(Expr::WholeRow(qualifier))
+            }
+            name => self.arena_expr(Expr::SchemaColumn {
+                schema,
+                table,
+                name,
+            }),
         }
     }
 

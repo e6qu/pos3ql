@@ -197,7 +197,7 @@ impl ParameterInference<'_> {
             match item {
                 ast::SelectItem::Expr { expression, .. }
                 | ast::SelectItem::RecordStar(expression) => visit(expression),
-                ast::SelectItem::Wildcard | ast::SelectItem::TableWildcard(_) => {}
+                ast::SelectItem::Wildcard(_) | ast::SelectItem::TableWildcard(_) => {}
             }
         }
         if let Some(from) = select.from {

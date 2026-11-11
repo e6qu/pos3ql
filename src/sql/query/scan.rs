@@ -1012,7 +1012,7 @@ fn pax_column_demand_bounded(
             }
             // A wildcard belongs to the nested select's own output. It cannot
             // name an enclosing physical column.
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => true,
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => true,
         }) && select
             .distinct_on
             .iter()

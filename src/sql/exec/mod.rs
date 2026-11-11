@@ -64064,7 +64064,7 @@ fn merge_source_columns(
     }
     for item in statement.returning.items {
         match item {
-            SelectItem::Wildcard => return None,
+            SelectItem::Wildcard(_) => return None,
             SelectItem::TableWildcard(qualifier)
                 if qualifier.eq_ignore_ascii_case(source_alias) =>
             {
@@ -64222,7 +64222,7 @@ fn describe_joined_returning<'a>(
                     }
                 });
             }
-            SelectItem::Wildcard => {}
+            SelectItem::Wildcard(_) => {}
         }
         (!conflicting).then_some(alias).flatten()
     };
@@ -64239,7 +64239,7 @@ fn describe_joined_returning<'a>(
                     });
                 });
             }
-            SelectItem::Wildcard => {}
+            SelectItem::Wildcard(_) => {}
         }
         found
     };
@@ -64282,7 +64282,7 @@ fn describe_joined_returning<'a>(
                 &mut out[count..],
                 description_target,
             )?;
-        } else if let Some(star) = star.filter(|_| matches!(item, SelectItem::Wildcard)) {
+        } else if let Some(star) = star.filter(|_| matches!(item, SelectItem::Wildcard(_))) {
             for star_item in star {
                 count += super::query::describe_scope_items(
                     core::slice::from_ref(star_item),
@@ -64697,7 +64697,9 @@ pub(crate) fn merge<'a>(
         base: statement.source,
         joins: &[],
     };
-    let star = match arena.alloc_slice_copy(&[SelectItem::Wildcard]) {
+    let star = match arena.alloc_slice_copy(&[SelectItem::Wildcard(
+        crate::sql::ast::SourcePosition::UNKNOWN,
+    )]) {
         Ok(s) => &*s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
@@ -64735,7 +64737,8 @@ pub(crate) fn merge<'a>(
     };
     let source_select = match merge_source_columns(statement, source_alias, &source_all_def) {
         Some(columns) => {
-            let mut items = [SelectItem::Wildcard; MAX_COLUMNS];
+            let mut items =
+                [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_COLUMNS];
             let mut count = 0usize;
             for (index, column) in source_all_def
                 .columns()
@@ -68743,7 +68746,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     let mut n = 0;
     for item in items {
         match item {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 if let Some(joined) = &joined_row {
                     for index in 0..joined.scope.star_columns() {
                         projected[n] = joined.output_value(joined.scope.star_entry(index));
@@ -68938,7 +68941,7 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
     let mut n = 0usize;
     for item in items {
         match item {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 for index in 0..source_def.n_columns {
                     projected[n] = source.map_or(Datum::Null, |values| values[index]);
                     n += 1;
@@ -69138,7 +69141,7 @@ fn returning_dml_target_columns<Definition0: crate::storage::DefinitionBacking>(
     let mut columns = ColumnSet::EMPTY;
     for item in returning.items {
         columns |= match item {
-            SelectItem::Wildcard => all_columns_mask(definition),
+            SelectItem::Wildcard(_) => all_columns_mask(definition),
             SelectItem::TableWildcard(qualifier) => {
                 if output_aliases.contains(qualifier)
                     || crate::sql::eval::qualifier_answers_target(

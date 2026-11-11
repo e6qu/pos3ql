@@ -308,7 +308,7 @@ pub(crate) fn at_node(error: SqlError, expression: &crate::sql::ast::Expr<'_>) -
 }
 
 /// Marks `error` as being about a select-list item: `t.*` at its
-/// qualifier. A bare `*` keeps no source text, so it has no position.
+/// qualifier, a bare `*` where the parser read it.
 pub(crate) fn at_item(error: SqlError, item: &crate::sql::ast::SelectItem<'_>) -> SqlError {
     use crate::sql::ast::SelectItem;
     match item {
@@ -316,7 +316,7 @@ pub(crate) fn at_item(error: SqlError, item: &crate::sql::ast::SelectItem<'_>) -
             at_expression(error, expression)
         }
         SelectItem::TableWildcard(qualifier) => at_reference(error, qualifier),
-        SelectItem::Wildcard => error,
+        SelectItem::Wildcard(at) => at_parsed_offset(error, at.get()),
     }
 }
 

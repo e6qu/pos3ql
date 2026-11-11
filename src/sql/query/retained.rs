@@ -1536,7 +1536,7 @@ impl<'a> RetainedSelect<'a> {
         let catalog = storage_catalog(storage, arena, txid);
         let expression_mode = Some((storage, txid));
         if !statement.items.iter().all(|item| match item {
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => true,
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => true,
             SelectItem::Expr { expression, .. } => {
                 retained_expression(expression, &catalog, expression_mode)
             }
@@ -1714,7 +1714,7 @@ impl<'a> RetainedSelect<'a> {
         let catalog = storage_catalog(storage, arena, txid);
         let expression_mode = Some((storage, txid));
         if !statement.items.iter().all(|item| match item {
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => true,
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => true,
             SelectItem::Expr { expression, .. } => {
                 retained_expression(expression, &catalog, expression_mode)
             }
@@ -1969,7 +1969,7 @@ impl<'a> RetainedSelect<'a> {
                 SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                     super::super::eval::routine_input_handoff(expression, Some(&catalog))
                 }
-                SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
             })
             && !predicate.is_some_and(|predicate| {
                 super::super::eval::routine_input_handoff(predicate, Some(&catalog))

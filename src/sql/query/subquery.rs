@@ -185,7 +185,7 @@ fn spooled_column_witness<'a>(
         return catalog_type_witness(storage, txid, columns[0].type_oid);
     }
     match select.items.first() {
-        Some(SelectItem::Wildcard) => {
+        Some(SelectItem::Wildcard(_)) => {
             let scope = scope.ok_or_else(|| {
                 sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -1228,7 +1228,7 @@ fn subquery_collations<'a>(
                 .0;
                 count += 1;
             }
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 let scope = scope.as_ref().ok_or_else(|| {
                     sql_err!(
                         sqlstate::SYNTAX_ERROR,
@@ -3036,7 +3036,7 @@ pub(crate) fn subquery_expression_type(
         [SelectItem::Expr { expression, .. }] => {
             crate::sql::exec::infer_routine_argument_oid(expression, &columns)?
         }
-        [SelectItem::Wildcard]
+        [SelectItem::Wildcard(_)]
             if scope
                 .as_ref()
                 .is_some_and(|scope| scope.star_columns() == 1) =>
@@ -3373,14 +3373,14 @@ fn run_subquery<'a>(
     // `SELECT *` is accepted when the source has exactly one column (resolved
     // below); until then a placeholder stands in (a wildcard carries no
     // subqueries or aggregates of its own).
-    let wildcard = matches!(&select.items[0], SelectItem::Wildcard);
+    let wildcard = matches!(&select.items[0], SelectItem::Wildcard(_));
     let table_star = match &select.items[0] {
         SelectItem::TableWildcard(q) => Some(*q),
         _ => None,
     };
     let item: &Expr = match &select.items[0] {
         SelectItem::Expr { expression, .. } => expression,
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
             &Expr::Null
         }
     };

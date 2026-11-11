@@ -47,3 +47,5 @@ SELECT '(1,"abc'::pair116;
 SELECT 'x'::text::pair116;
 SELECT 5::pair116;
 SELECT ROW(1, 'a,b"c')::pair116::text::pair116;
+DROP TABLE orders116;
+DROP TYPE pair116, text_pair116;

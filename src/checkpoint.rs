@@ -1291,6 +1291,18 @@ impl AtomicBlockReadScope {
                 .enter_atomic_reads();
         }
     }
+
+    /// Lets this owner's reads yield again; an enclosing atomic owner still
+    /// keeps them synchronous.
+    pub(crate) fn deactivate(&self) {
+        if self.active.replace(false) {
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .base_mut()
+                .leave_atomic_reads();
+        }
+    }
 }
 
 impl Drop for AtomicBlockReadScope {

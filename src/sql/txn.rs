@@ -444,6 +444,9 @@ pub struct TxnState {
     /// The top-level `CALL` or `DO` body waiting at a saved statement. It
     /// outlives transactions the body commits; ending the statement releases it.
     pub(super) pending_procedure: Option<super::exec::SuspendedProcedure>,
+    /// The top-level write waiting inside its rows; its next run continues
+    /// at the unfinished row. Ending or canceling the statement releases it.
+    retained_write: Option<super::exec::RetainedWrite>,
     /// Saved procedure bodies currently running, and whether a wait inside
     /// one reached a position no saved frame can own, so the whole statement
     /// must instead roll back and run again.
@@ -1162,6 +1165,7 @@ impl TxnState {
             write_completion_boundary: None,
             pending_write_completion: None,
             pending_procedure: None,
+            retained_write: None,
             running_procedures: 0,
             procedure_restart: false,
             cache_capacity_wait: None,
@@ -1701,6 +1705,7 @@ impl TxnState {
 
     pub(crate) fn release_suspended_statement(&mut self) {
         self.suspended_statement = None;
+        self.retained_write = None;
         self.cache_capacity_wait = None;
         self.checkpoint_request = None;
     }
@@ -1762,8 +1767,27 @@ impl TxnState {
         self.trigger_depth
     }
 
+    #[cfg(test)]
     pub(crate) fn has_pending_write_completion(&self) -> bool {
         self.pending_write_completion.is_some()
+    }
+
+    /// Whether the waiting statement keeps work and output it already did:
+    /// its next run continues instead of starting again.
+    pub(crate) fn retains_statement_progress(&self) -> bool {
+        self.pending_write_completion.is_some() || self.retained_write.is_some()
+    }
+
+    pub(super) fn retain_write(&mut self, write: super::exec::RetainedWrite) {
+        self.retained_write = Some(write);
+    }
+
+    pub(super) fn take_retained_write(&mut self) -> Option<super::exec::RetainedWrite> {
+        self.retained_write.take()
+    }
+
+    pub(crate) fn release_retained_write(&mut self) {
+        self.retained_write = None;
     }
 
     pub(crate) fn enter_extension_script(&mut self) {
@@ -3297,6 +3321,7 @@ impl TxnState {
     pub fn clear(&mut self) {
         self.pending_write_completion = None;
         self.pending_procedure = None;
+        self.retained_write = None;
         self.procedure_restart = false;
         self.write_completion_boundary = None;
         self.concurrent_index = None;

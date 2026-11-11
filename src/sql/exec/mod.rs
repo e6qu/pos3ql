@@ -827,7 +827,8 @@ mod row_progress;
 mod trigger_firing;
 mod write_attempts;
 pub(crate) use row_progress::{
-    RowProgress, StepRecord, begin_main_step, cte_step_records, settle_main_step,
+    RetainedWrite, RowProgress, StepRecord, begin_main_step, cte_step_records, is_wait,
+    settle_main_step,
 };
 mod write_completion;
 use write_attempts::execute_procedural_write;
@@ -4008,8 +4009,9 @@ fn execute_row_trigger_body_here<'a, Definition0: crate::storage::DefinitionBack
         transition_rows,
     )?;
     // A trigger body's effects cannot be repeated by a restart, so the
-    // enclosing write reads synchronously from here on.
-    super::query::protect_statement_effects();
+    // enclosing write reads synchronously from here on. A resumable row
+    // rolls them back with the row instead.
+    super::query::protect_replayable_effect();
     firing.execute(context)
 }
 
@@ -34090,8 +34092,9 @@ fn execute_statement_trigger_here<'a>(
         rows,
     )?;
     // A trigger body's effects cannot be repeated by a restart, so the
-    // enclosing write reads synchronously from here on.
-    super::query::protect_statement_effects();
+    // enclosing write reads synchronously from here on. A resumable row
+    // rolls them back with the row instead.
+    super::query::protect_replayable_effect();
     firing.execute(&mut context)?;
     Ok(())
 }
@@ -67452,9 +67455,8 @@ pub(crate) fn merge<'a>(
     };
 
     drop(selection_snapshot);
-    // Row changes start here. The source scan and row locks above restart
-    // from the statement's start after a wait; from now on reads block.
-    super::query::protect_statement_effects();
+    // Row changes start here; a wait before them restarts the statement.
+    row_progress::enter_rows(progress.as_deref_mut());
     // Row progress counts one position per source row and target row pair,
     // plus each source row's NOT MATCHED stage; the last source position is
     // the NOT MATCHED BY SOURCE pass.
@@ -68561,7 +68563,7 @@ pub(crate) fn merge<'a>(
         sql_ok()
     })();
     if let Some(progress) = progress {
-        if matches!(&rows_outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+        if matches!(&rows_outcome, Ok(Err(error)) if progress.stops_for(error))
             && let Err(error) = save_merge_state(
                 progress,
                 affected,
@@ -68740,8 +68742,8 @@ fn emit_merge_progress_returning<'a, Definition0: crate::storage::DefinitionBack
     )? {
         Ok(()) => sql_ok(),
         Err(error) => {
-            if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
-                && let Some(progress) = progress
+            if let Some(progress) = progress
+                && progress.stops_for(&error)
                 && let Err(error) = progress.keep_returning(old, new, arena, &storage.row_work)
             {
                 return sql_fail(error);
@@ -71144,9 +71146,8 @@ where
             }
             (rows.as_slice(), rows.len())
         };
-        // Row changes start here. The source rows above restart
-        // from the statement's start after a wait; from now on reads block.
-        super::query::protect_statement_effects();
+        // Row changes start here; a wait before them restarts the statement.
+        row_progress::enter_rows(progress.as_deref_mut());
         let resumed = match progress.as_deref() {
             Some(progress) => match progress.resume_rows(count, |_| None) {
                 Ok(resumed) => resumed,
@@ -71472,6 +71473,8 @@ where
         Ok(g) => g,
         Err(e) => return sql_fail(e),
     };
+    // `VALUES` rows are evaluated as they are written: row changes start here.
+    row_progress::enter_rows(progress.as_deref_mut());
     let resumed = match progress.as_deref() {
         Some(progress) => match progress.resume_rows(statement.rows.len(), |_| None) {
             Ok(resumed) => resumed,
@@ -71527,9 +71530,6 @@ where
     if let Err(error) = check_insert_values_shape(statement, n_targets) {
         return sql_fail(error);
     }
-    // `VALUES` rows are evaluated as they are written, so reads block from
-    // the first row on.
-    super::query::protect_statement_effects();
     let mut inserted = resumed.changed;
     let first_row = resumed.first;
     let rows_outcome = (|| -> Outcome {
@@ -71836,8 +71836,8 @@ fn emit_row_returning<Definition0: crate::storage::DefinitionBacking>(
     )? {
         Ok(()) => sql_ok(),
         Err(error) => {
-            if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
-                && let Some(progress) = progress
+            if let Some(progress) = progress
+                && progress.stops_for(&error)
                 && let Err(error) = progress.keep_returning(old, new, arena, &storage.row_work)
             {
                 return sql_fail(error);
@@ -72722,9 +72722,8 @@ pub(crate) fn update<'a>(
             Err(error) => return sql_fail(error),
         }
     }
-    // Row changes start here. The source scan and row locks above restart
-    // from the statement's start after a wait; from now on reads block.
-    super::query::protect_statement_effects();
+    // Row changes start here; a wait before them restarts the statement.
+    row_progress::enter_rows(progress.as_deref_mut());
 
     let (first_row, mut updated, saved_transitions) = match progress.as_deref() {
         Some(progress) => match progress.resume_rows(scratch.len(), |index| Some(scratch[index])) {
@@ -73612,8 +73611,7 @@ pub(crate) fn update<'a>(
     if let Some(progress) = progress {
         match &rows_outcome {
             Ok(Err(error))
-                if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
-                    && txn.pending_write_completion.is_none() =>
+                if progress.stops_for(error) && txn.pending_write_completion.is_none() =>
             {
                 if let Err(error) = progress.interrupt(
                     scratch.len(),
@@ -73937,9 +73935,8 @@ pub(crate) fn delete<'a>(
             Err(error) => return sql_fail(error),
         }
     }
-    // Row changes start here. The source scan and row locks above restart
-    // from the statement's start after a wait; from now on reads block.
-    super::query::protect_statement_effects();
+    // Row changes start here; a wait before them restarts the statement.
+    row_progress::enter_rows(progress.as_deref_mut());
     let (first_row, mut deleted, saved_transitions) = match progress.as_deref() {
         Some(progress) => match progress.resume_rows(scratch.len(), |index| Some(scratch[index])) {
             Ok(resume) => (resume.first, resume.changed, resume.transitions[0]),
@@ -74343,8 +74340,7 @@ pub(crate) fn delete<'a>(
     if let Some(progress) = progress {
         match &rows_outcome {
             Ok(Err(error))
-                if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
-                    && txn.pending_write_completion.is_none() =>
+                if progress.stops_for(error) && txn.pending_write_completion.is_none() =>
             {
                 if let Err(error) = progress.interrupt(
                     scratch.len(),

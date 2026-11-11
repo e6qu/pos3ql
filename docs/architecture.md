@@ -68,7 +68,8 @@ The rule for statements: a statement can yield until it performs its first
 **effect** — something a restart could not undo or repeat. Effects are calling
 a volatile function or a user routine body, issuing `nextval`/`setval`, and
 output actually reaching the client. After the first effect, the remaining
-reads of that statement block until the statement ends.
+reads of that statement block until the statement ends, except inside the
+rows of a top-level write (see below).
 
 **Writes restart before their row changes.** `INSERT ... SELECT`, `UPDATE`,
 `DELETE` and `MERGE`, at top level or as a statement of a `CALL` or `DO` body,
@@ -79,10 +80,32 @@ lock wait in this phase rolls the statement back to its start (row images,
 locks, journal records and statistics) and yields; on resume it runs again and
 sees the rows as of its new start, as PostgreSQL would had it started then.
 A sequence or routine call in the scan is an effect as usual: later reads
-block, and a later row-lock wait replays its results. The first row change, `VALUES` row or trigger body is the write's
-first effect: index maintenance, constraint checks, triggers and `RETURNING`
-then read synchronously until the statement ends. A `BEFORE STATEMENT` trigger
-therefore makes the whole scan synchronous.
+block, and a later row-lock wait replays its results. A `BEFORE STATEMENT`
+trigger therefore makes the whole scan synchronous.
+
+**Top-level writes resume at their row.** Once a top-level write starts
+changing rows, a storage or lock wait no longer blocks the worker or
+restarts the statement. Its transaction keeps the write's progress while
+the statement waits: the unfinished row, finished steps, the routine-call
+log and the sequence replay, beside the command, snapshot, clock and
+deadline every waiting statement keeps. Each row reads (index maintenance,
+unique and foreign key checks, trigger bodies, `RETURNING`) yielding; a wait
+rolls back only that row, with its trigger writes and output, and the
+statement's next run selects its rows again under the same command and
+snapshot, skips the changed ones and continues at that row. Sequence values
+and routine results the row already had replay from the statement's log,
+and trigger bodies run again after their writes rolled back, so each
+happens once. An effect a rerun would not repeat identically (a volatile
+built-in such as `random()`, an advisory lock, output that reached the
+client) makes the rest of its row read synchronously; one before the rows,
+in the scan, would select different rows, so such a write reads its rows
+synchronously and a lock wait runs it again from its first start. Reads
+after the last row (statement-level and `AFTER` triggers, deferred checks)
+block. A wait inside a routine body run for a row keeps the body's progress
+and continues it. Cancellation, a statement or lock timeout, an error and
+the end of the transaction release the kept progress. Writes in a `CALL` or
+`DO` body read synchronously after their first row change, `VALUES` row or
+trigger body.
 
 **Routine calls keep a write's changed rows.** A row expression, row trigger
 or `RETURNING` item of `INSERT`, `UPDATE`, `DELETE` or `MERGE` (including
@@ -97,8 +120,9 @@ values when the call was there. Statement triggers, transition rows,
 sequence values and returned rows each happen once. Queued `AFTER` row
 events belong to the statement that queued them (its nesting depth and
 command), so a call that runs between attempts never fires the kept rows'
-events early; they fire when the write ends, as in PostgreSQL. A wait or error inside
-such a call still rolls the whole statement back. `INSTEAD OF` view triggers
+events early; they fire when the write ends, as in PostgreSQL. An error inside
+such a call still rolls the whole statement back; a wait inside it does too
+in a `CALL` or `DO` body, while a top-level write keeps its rows (above). `INSTEAD OF` view triggers
 keep their rows the same way. A statement made of several steps (the
 sub-statements of a data-modifying `WITH` and its main statement; a rule's
 original statement and actions) also keeps the steps it finished: their
@@ -143,6 +167,11 @@ updated before it, as in PostgreSQL.
 **Example:** `UPDATE orders SET status = 'late' WHERE due < now()` over cold
 `orders` yields while it downloads the blocks it scans; other clients run
 meanwhile. Each wait discards only the scan, and the rows change once.
+
+**Example:** `INSERT INTO order_lines SELECT ... FROM staging`, where each
+line's foreign key check reads a cold `products` block, yields at each such
+row; the rows before it stay inserted, and their serial defaults and
+trigger audit rows happen once.
 
 **The worker never waits for a client.** A result larger than the
 connection's send buffer (`conn_send_buffer_bytes`) queues in the
@@ -197,7 +226,8 @@ BY id` sorts first, so its output queues in the spool instead.
 | Output queued for a slow client | Never blocks; the connection waits for the client between messages |
 | Result streams (see above): each row before its first effect | Yields; delivered rows are kept |
 | Writes (`INSERT ... SELECT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`), also in a `CALL` or `DO` body: selecting and locking rows before the first row change, `VALUES` row or trigger body | Yields; the statement restarts from its start (see above) |
-| Writes after their first row change, `VALUES` row or trigger body: index maintenance, constraint checks, triggers, `RETURNING` | Blocks until the statement ends |
+| Top-level writes after their first row change: each row's index maintenance, constraint checks, trigger bodies and `RETURNING`, until an effect a rerun would not repeat identically | Yields; only the unfinished row rolls back (see above) |
+| Writes in a `CALL` or `DO` body after their first row change; a top-level write's row after an effect a rerun would not repeat, or every row when such an effect ran in its scan; reads after a write's last row (statement-level and `AFTER` triggers) | Blocks until the statement ends |
 | Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, rule actions, `INSTEAD OF` view triggers): row expressions, row triggers, `RETURNING`; `BEFORE` and `INSTEAD OF` trigger bodies that need the engine | Run on the engine between attempts; the write keeps its changed rows and finished steps and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
 | DDL and `COPY FROM` | Blocks for the whole statement |
 | Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |

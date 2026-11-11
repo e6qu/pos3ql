@@ -14,11 +14,29 @@
 //! also keeps its finished steps: the next attempt skips them, using their
 //! saved output rows and row counts, and runs the unfinished step at its
 //! row, or from the step's start when no row was unfinished.
+//!
+//! A top-level write also keeps its rows across storage and lock waits: its
+//! transaction holds the progress in a [`RetainedWrite`] while the statement
+//! waits, each row's reads yield until the row's own first effect, and a
+//! wait rolls back only the unfinished row.
 
 use super::*;
 use crate::sql::query::{self, InvocationPosition};
 use crate::sql::sequence::{self, StatementReplayStart};
 use crate::sql::txn::{StatementMark, SuspendedTriggerSql, TransactionEffectMark};
+
+/// A top-level write's progress while its statement waits for storage or a
+/// lock. The transaction keeps it until the statement runs again, ends, or
+/// is canceled; the next run continues at the unfinished row with the same
+/// invocation log and sequence replay.
+pub(crate) struct RetainedWrite {
+    pub(crate) progress: RowProgress,
+    pub(crate) invocations: query::RoutineInvocationState,
+    pub(crate) replay: Option<StatementReplayStart>,
+    /// Where the statement's first run started: its `AFTER` triggers belong
+    /// there, and a run from the start rolls back to it.
+    pub(crate) start: Option<(StatementMark, crate::pg::overflow::OutputMark)>,
+}
 
 /// Where an attempt's replay of routine results and sequence values stands.
 #[derive(Clone, Copy)]
@@ -173,6 +191,12 @@ pub(crate) struct RowProgress {
     /// A multi-step statement of this attempt nested deeper than
     /// `STEP_LEVELS` and runs its steps without progress.
     steps_exhausted: bool,
+    /// The statement keeps this progress across storage and lock waits.
+    retained: bool,
+    /// The unreplayable-effect epoch when the attempt started.
+    attempt_effects: u64,
+    /// This attempt's rows can resume after a wait.
+    rows_resumable: bool,
 }
 
 impl RowProgress {
@@ -190,7 +214,17 @@ impl RowProgress {
             steps: [StepProgress::EMPTY; STEP_LEVELS],
             implicit_level: 0,
             steps_exhausted: false,
+            retained: false,
+            attempt_effects: 0,
+            rows_resumable: false,
         }
+    }
+
+    /// Progress of a statement whose transaction keeps it across waits.
+    pub(crate) const fn retained() -> Self {
+        let mut progress = Self::new();
+        progress.retained = true;
+        progress
     }
 
     /// Records the journal and lock positions of the attempt about to run;
@@ -199,6 +233,8 @@ impl RowProgress {
         self.journal = Some((wal, lock));
         self.running = None;
         self.steps_exhausted = false;
+        self.attempt_effects = query::unreplayable_effect_epoch();
+        self.rows_resumable = false;
         for level in &mut self.steps {
             level.running = false;
         }
@@ -505,6 +541,14 @@ impl RowProgress {
         self.resume.is_some()
     }
 
+    /// Whether the attempt stops for `error` keeping its rows: a routine
+    /// call that needs the engine, or a storage or lock wait in resumable
+    /// rows.
+    pub(crate) fn stops_for(&self, error: &SqlError) -> bool {
+        error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
+            || (self.rows_resumable && is_wait(error))
+    }
+
     /// The suspended command of a nested write, kept with its rows.
     pub(super) fn take_command(&mut self) -> Option<SuspendedTriggerSql> {
         self.command.take()
@@ -709,6 +753,15 @@ impl RowProgress {
                 "a resumed RETURNING row lost its values"
             )
         })?;
+        // The row runs its RETURNING stage again from the same start, so a
+        // second stop inside it saves the same values again.
+        let start = resume.start;
+        self.resume = None;
+        self.running = Some(start);
+        let saved = &*self.returning.insert(saved);
+        if self.rows_resumable {
+            query::reopen_statement_reads();
+        }
         let rows = saved.restore(arena)?;
         let decode = |row: Option<&&[u8]>| -> Result<Option<&'out [Datum<'out>]>, SqlError> {
             let Some(row) = row else {
@@ -754,6 +807,9 @@ impl RowProgress {
         self.returning = None;
         self.state = None;
         self.started = true;
+        if self.rows_resumable {
+            query::reopen_statement_reads();
+        }
         self.running = Some(RowStart {
             index,
             stage,
@@ -767,9 +823,14 @@ impl RowProgress {
         Ok(())
     }
 
-    /// The row phase finished; a later wait or call is not inside a row.
+    /// The row phase finished; a later wait or call is not inside a row,
+    /// so the statement's remaining reads block.
     pub(super) fn finish_rows(&mut self) {
         self.running = None;
+        if self.rows_resumable {
+            query::set_resumable_row(false);
+            query::protect_statement_effects();
+        }
     }
 
     /// Whether an attempt has started changing rows, so running the write
@@ -873,9 +934,9 @@ pub(crate) fn settle_main_step<'a, T>(
     pool: &std::sync::Arc<LeasePool>,
 ) -> Result<Result<(), SqlError>, T> {
     if let Ok(Err(error)) = &outcome
-        && error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
         && !materialized.is_empty()
         && let Some(progress) = progress
+        && progress.stops_for(error)
     {
         let kept = cte_step_records(materialized, arena)
             .and_then(|records| progress.keep_steps(records, &[], arena, pool));
@@ -932,6 +993,39 @@ fn same_row(left: Option<PhysicalRow>, right: Option<PhysicalRow>) -> bool {
     }
 }
 
+/// Where a write's row changes start. The statement's remaining reads block,
+/// unless its transaction keeps its progress across waits and nothing
+/// before the rows would repeat differently when they are selected again:
+/// then each row's reads yield until the row's own first effect, and a wait
+/// rolls back only that row.
+pub(super) fn enter_rows(progress: Option<&mut RowProgress>) {
+    match progress {
+        Some(progress)
+            if progress.retained
+                && query::unreplayable_effect_epoch() == progress.attempt_effects =>
+        {
+            progress.rows_resumable = true;
+        }
+        // A nested write inside a resumable row rolls back with that row.
+        progress => {
+            if let Some(progress) = progress {
+                progress.rows_resumable = false;
+            }
+            query::protect_replayable_effect();
+        }
+    }
+}
+
+/// A storage or lock wait.
+pub(crate) fn is_wait(error: &SqlError) -> bool {
+    matches!(
+        error.sqlstate.internal_control(),
+        Some(
+            crate::sql::eval::InternalControl::LockWait | crate::sql::eval::InternalControl::IoWait
+        )
+    )
+}
+
 /// Starts row `index` of a write that may keep progress. `Some` returns the
 /// values of a row an earlier attempt changed, whose `RETURNING` stage
 /// remains.
@@ -973,10 +1067,7 @@ pub(super) fn settle_rows(
         return Ok(());
     };
     match outcome {
-        Ok(Err(error))
-            if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
-                && txn.pending_write_completion.is_none() =>
-        {
+        Ok(Err(error)) if progress.stops_for(error) && txn.pending_write_completion.is_none() => {
             progress.interrupt(selected, captures, pool)
         }
         _ => {

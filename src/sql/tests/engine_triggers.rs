@@ -148,11 +148,11 @@ fn before_triggers_needing_the_executor_run_once() {
     }
 }
 
-/// A lock wait inside a trigger body running on the executor rolls the
-/// whole statement back, DDL included; another client runs meanwhile, and
-/// the statement then runs once with the same sequence values.
+/// A lock wait inside a trigger body running on the executor keeps the
+/// statement's earlier rows; another client runs meanwhile, and the
+/// statement then finishes once with the same sequence values.
 #[test]
-fn executor_trigger_lock_waits_restart_the_statement_once() {
+fn executor_trigger_lock_waits_resume_the_statement_once() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -171,13 +171,14 @@ fn executor_trigger_lock_waits_restart_the_statement_once() {
         let ExecutionStatus::Blocked {
             completed_statements,
             wait,
-            ..
+            output_mark,
         } = writer.execute_status(&mut engine, sql, true)
         else {
             panic!("{mode:?}: the trigger did not wait");
         };
         assert_eq!(wait, StatementWait::Lock);
-        // The waiting statement rolled back its rows and the trigger's DDL.
+        // The waiting statement keeps its earlier rows uncommitted; other
+        // clients see neither them nor the trigger's DDL.
         assert_eq!(
             data_rows(&holder.success(
                 &mut engine,
@@ -194,7 +195,7 @@ fn executor_trigger_lock_waits_restart_the_statement_once() {
             );
         }
         holder.success(&mut engine, "SELECT pg_advisory_unlock(7)", true);
-        writer.send.clear();
+        output_mark.truncate_unsent(&mut writer.send);
         writer.arena.recycle_front();
         let status = crate::mem::guard::forbid_alloc(|| {
             engine.execute_simple_from(

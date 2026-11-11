@@ -380,7 +380,8 @@ fn statement_call(
         call.operation,
         SequenceOperation::Next | SequenceOperation::Set { .. }
     ) {
-        super::query::protect_statement_effects();
+        // The statement's replay log returns the same value after a wait.
+        super::query::protect_replayable_effect();
     }
     STATEMENT_ARENA.with(|active| {
         let pointer = active.get();
@@ -488,7 +489,7 @@ pub(crate) fn record_caught_cancellation(session: &SeqSession) {
     let mut replay = session.statement_replay.get();
     replay.nonreplayable = true;
     session.statement_replay.set(replay);
-    super::query::protect_statement_effects();
+    super::query::protect_unreplayable_effect();
 }
 
 fn effect_full() -> SqlError {

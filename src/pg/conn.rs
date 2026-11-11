@@ -954,6 +954,7 @@ impl Conn {
         self.finish_lock_wait();
         self.sqlprep.clear_request_type_inputs();
         crate::sql::sequence::finish_statement(self.guc.seq_session());
+        self.txn.release_retained_write();
         engine.cancel_backend_wait(self.id);
         if self.copy.take().is_some() {
             engine.copy_abort(&mut self.txn, &self.guc);
@@ -4072,7 +4073,9 @@ impl Conn {
             max_rows > 0 || self.portals[portal_slot].execution == PortalExecution::Paging;
 
         if need_run {
-            if self.guc.seq_session().retains_statement_effects() {
+            if self.guc.seq_session().retains_statement_effects()
+                || self.txn.retains_statement_progress()
+            {
                 self.arena.recycle_front();
             } else {
                 self.arena.reset();
@@ -4279,7 +4282,7 @@ impl Conn {
                 Ok(crate::sql::ExtendedExecutionStatus::Blocked { wait }) => {
                     self.park(wait, engine.statement_wait_generation(wait, self.id));
                     engine.park_backend_statement(self.id, self.parked_wait);
-                    if !self.txn.has_pending_write_completion() {
+                    if !self.txn.retains_statement_progress() {
                         if paged {
                             self.portals[portal_slot].result.clear();
                         } else if !self.truncate_output(send_mark) {
@@ -4482,6 +4485,7 @@ impl Conn {
         }
         if self.sqlprep.request_input_waiting()
             || self.guc.seq_session().retains_statement_effects()
+            || self.txn.retains_statement_progress()
             || self.result_stream.is_active()
         {
             self.arena.recycle_front();

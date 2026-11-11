@@ -12,6 +12,8 @@ struct ColdTable {
     engine: Engine,
     writer: ConfiguredTransactionSession,
     other: ConfiguredTransactionSession,
+    /// Waits during which the writer's transaction kept the write's rows.
+    kept_waits: usize,
 }
 
 /// `cold_items` (`id`, `code`) holds rows 1..=40 only in saved objects; GET
@@ -41,8 +43,11 @@ fn cold_table(label: &str, mode: crate::config::TransactionMode, setup: &str) ->
         true,
     );
     assert!(crate::mem::guard::forbid_alloc(|| engine.checkpoint()).unwrap());
-    let table = engine.storage.find_table("public", "cold_items").unwrap();
-    {
+    // `cold_items` and any `cold_more` or `cold_extra` the setup creates.
+    for name in ["cold_items", "cold_more", "cold_extra"] {
+        let Some(table) = engine.storage.find_table("public", name) else {
+            continue;
+        };
         engine.storage.finish_row_cleanup(
             RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
             RowCleanupTarget::Table(table),
@@ -59,6 +64,7 @@ fn cold_table(label: &str, mode: crate::config::TransactionMode, setup: &str) ->
         engine,
         writer,
         other,
+        kept_waits: 0,
     }
 }
 
@@ -137,6 +143,7 @@ impl ColdTable {
                 break;
             };
             assert_eq!(wait, StatementWait::ObjectIo, "{sql}");
+            self.kept_waits += usize::from(self.writer.transaction.retains_statement_progress());
             output_mark.truncate_unsent(&mut self.writer.send);
             self.writer.arena.recycle_front();
             completed_statements = completed;
@@ -184,6 +191,7 @@ impl ColdTable {
             engine,
             writer,
             other,
+            ..
         } = self;
         drop((other, writer, engine, server));
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -558,6 +566,125 @@ fn write_rows_keep_progress_across_routine_calls() {
                 ),
                 ["11|40"],
                 "{mode:?} extended={extended}"
+            );
+            cold.finish();
+        }
+    }
+}
+
+/// Storage waits inside a write's rows, several rows in: a foreign key check
+/// of a later row reads the cold parent table. The write keeps its earlier
+/// rows, lets another client run, and continues at the waiting row: sequence
+/// defaults, BEFORE ROW trigger bodies with their own writes and sequence
+/// calls, AFTER ROW triggers, transition tables of AFTER STATEMENT triggers
+/// and `RETURNING` rows each happen once, with PostgreSQL 18.6's
+/// values; both transaction modes, both protocols, implicit and explicit
+/// transactions.
+#[test]
+fn write_rows_resume_after_storage_waits() {
+    let statements: &[(&str, &[&str])] = &[
+        (
+            "INSERT INTO orders(item, note) SELECT CASE WHEN g >= 4 THEN g END, 'o' || g \
+             FROM generate_series(1, 6) g RETURNING n, item, note",
+            &[
+                "1|NULL|o1+",
+                "3|NULL|o2+",
+                "5|NULL|o3+",
+                "7|4|o4+",
+                "9|5|o5+",
+                "11|6|o6+",
+            ],
+        ),
+        (
+            "UPDATE orders SET more = CASE WHEN n > 3 THEN n + 1 END, note = 'u' \
+             WHERE item IS NULL RETURNING n, more, note",
+            &["1|NULL|u+", "3|NULL|u+", "5|6|u+"],
+        ),
+        (
+            "INSERT INTO orders(extra, note) VALUES (NULL, 'v1'), (NULL, 'v2'), (8, 'v3'), \
+             (9, 'v4') RETURNING n, extra, note",
+            &["27|NULL|v1+", "29|NULL|v2+", "31|8|v3+", "33|9|v4+"],
+        ),
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for (extended, explicit) in [(false, false), (true, false), (false, true)] {
+            let mut cold = cold_table(
+                &format!("row-waits-{extended}-{explicit}"),
+                mode,
+                "CREATE TABLE hot_log(stage text); CREATE SEQUENCE numbers; \
+                 CREATE TABLE audit(stage text, n bigint); \
+                 CREATE TABLE cold_more(id integer PRIMARY KEY); \
+                 INSERT INTO cold_more SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_extra(id integer PRIMARY KEY); \
+                 INSERT INTO cold_extra SELECT generate_series(1, 40); \
+                 CREATE TABLE orders(n bigint DEFAULT nextval('numbers'), \
+                 item integer REFERENCES cold_items, more integer REFERENCES cold_more, \
+                 extra integer REFERENCES cold_extra, note text); \
+                 CREATE FUNCTION audit_order() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 INSERT INTO audit VALUES (TG_OP || '-' || NEW.note, nextval('numbers')); \
+                 NEW.note := NEW.note || '+'; RETURN NEW; END$$; \
+                 CREATE TRIGGER audit_order BEFORE INSERT OR UPDATE ON orders \
+                 FOR EACH ROW EXECUTE FUNCTION audit_order(); \
+                 CREATE FUNCTION after_order() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 INSERT INTO audit VALUES ('after-' || NEW.note, nextval('numbers')); \
+                 RETURN NULL; END$$; \
+                 CREATE TRIGGER after_order AFTER INSERT OR UPDATE ON orders \
+                 FOR EACH ROW EXECUTE FUNCTION after_order(); \
+                 CREATE FUNCTION changed_orders() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 INSERT INTO audit SELECT TG_OP || '-changed-' || count(*), nextval('numbers') \
+                 FROM changed; RETURN NULL; END$$; \
+                 CREATE TRIGGER changed_inserts AFTER INSERT ON orders \
+                 REFERENCING NEW TABLE AS changed \
+                 FOR EACH STATEMENT EXECUTE FUNCTION changed_orders(); \
+                 CREATE TRIGGER changed_updates AFTER UPDATE ON orders \
+                 REFERENCING NEW TABLE AS changed \
+                 FOR EACH STATEMENT EXECUTE FUNCTION changed_orders()",
+            );
+            if explicit {
+                cold.writer.success(&mut cold.engine, "BEGIN", true);
+            }
+            for &(sql, returned) in statements {
+                let context = format!("{mode:?} extended={extended} explicit={explicit}: {sql}");
+                let kept = cold.kept_waits;
+                let waits = cold.run(sql, extended, other_client_progresses);
+                assert!(waits > 0, "{context}: a later row must wait");
+                assert!(cold.kept_waits > kept, "{context}: the wait must keep rows");
+                let output = cold.writer.send.readable().to_vec();
+                assert!(
+                    error_sqlstates(&output).is_empty(),
+                    "{context}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                assert_eq!(data_rows(&output), returned, "{context}");
+            }
+            if explicit {
+                cold.writer.success(&mut cold.engine, "COMMIT", true);
+            }
+            let context = format!("{mode:?} extended={extended} explicit={explicit}");
+            assert_eq!(
+                cold.rows("SELECT string_agg(stage || ':' || n, ',' ORDER BY n) FROM audit"),
+                [
+                    "INSERT-o1:2,INSERT-o2:4,INSERT-o3:6,INSERT-o4:8,INSERT-o5:10,INSERT-o6:12,\
+                     after-o1+:13,after-o2+:14,after-o3+:15,after-o4+:16,after-o5+:17,\
+                     after-o6+:18,INSERT-changed-6:19,UPDATE-u:20,UPDATE-u:21,UPDATE-u:22,\
+                     after-u+:23,after-u+:24,after-u+:25,UPDATE-changed-3:26,INSERT-v1:28,\
+                     INSERT-v2:30,INSERT-v3:32,INSERT-v4:34,after-v1+:35,after-v2+:36,\
+                     after-v3+:37,after-v4+:38,INSERT-changed-4:39"
+                ],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows("SELECT count(*), sum(n) FROM orders"),
+                ["10|156"],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows("SELECT count(*) FROM hot_log"),
+                ["3"],
+                "{context}"
             );
             cold.finish();
         }

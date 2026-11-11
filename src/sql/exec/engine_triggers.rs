@@ -106,8 +106,9 @@ pub(super) fn fire<'s, 'a, 'b>(
     })?;
     if let Some(row) = replayed {
         // The body ran on the engine: its effects cannot be repeated by a
-        // restart, so the write reads synchronously from here on.
-        query::protect_statement_effects();
+        // restart, so the write reads synchronously from here on, or, in a
+        // resumable row, the log replays this result after a wait.
+        query::protect_replayable_effect();
         return apply_result(row, new, arena);
     }
     let start = query::active_invocation_position().ok_or_else(log_changed)?;

@@ -91,7 +91,7 @@ QUERIES = (
     ),
     # DISTINCT ON keeps each first row of a local-mode sort.
     (
-        "SELECT DISTINCT ON (id) id, payload FROM result_stream_rows ORDER BY id, payload",
+        "SELECT DISTINCT ON (-id) id, payload FROM result_stream_rows ORDER BY -id DESC",
         TABLE_ROWS,
         LOCAL_PAGED,
     ),

@@ -115,6 +115,42 @@ pub(crate) fn for_each_dependency(
     }
 
     relation_dependencies(storage, txid, arena, visit)?;
+    policy_dependencies(storage, txid, arena, visit)?;
+    for (_, object) in storage.text_search_objects_visible_to(txid) {
+        let class = match object.kind() {
+            crate::sql::ast::TextSearchObjectKind::Parser => PG_TS_PARSER_OID,
+            crate::sql::ast::TextSearchObjectKind::Template => PG_TS_TEMPLATE_OID,
+            crate::sql::ast::TextSearchObjectKind::Dictionary => PG_TS_DICT_OID,
+            crate::sql::ast::TextSearchObjectKind::Configuration => PG_TS_CONFIG_OID,
+        };
+        namespace_edge(
+            storage,
+            txid,
+            ObjectAddress::new(class, object.oid(), 0),
+            object.schema().as_str(),
+            visit,
+        )?;
+    }
+    // Extended statistics belong to their table, as PostgreSQL records.
+    for (_, statistics) in storage.extended_statistics_visible(txid) {
+        let dependent = ObjectAddress::new(PG_STATISTIC_EXT_OID, statistics.oid(), 0);
+        visit(DependencyEdge {
+            dependent,
+            referenced: ObjectAddress::new(
+                PG_CLASS_OID,
+                user_table_oid(storage, usize::from(statistics.table)),
+                0,
+            ),
+            kind: b'a',
+        })?;
+        namespace_edge(
+            storage,
+            txid,
+            dependent,
+            statistics.definition_for(txid).schema.as_str(),
+            visit,
+        )?;
+    }
 
     // A domain is ordered after its parent domain or direct user-defined base
     // type. pg_dump reads this graph to emit a restorable type definition.
@@ -828,6 +864,19 @@ fn relation_dependencies(
             kind: b'i',
         })?;
         let definition = storage.table_def(table, txid);
+        if let Some(composite) = definition.type_membership.composite_slot() {
+            visit(DependencyEdge {
+                dependent: ObjectAddress::new(PG_CLASS_OID, relation, 0),
+                referenced: ObjectAddress::new(
+                    PG_TYPE_OID,
+                    crate::sql::types::oid::composite_oid(
+                        storage.composite_for(composite, txid).creation(),
+                    ),
+                    0,
+                ),
+                kind: b'n',
+            })?;
+        }
         for parent in definition.inheritance.parents_ref() {
             visit(DependencyEdge {
                 dependent: ObjectAddress::new(PG_CLASS_OID, relation, 0),
@@ -1165,4 +1214,64 @@ fn stored_column_number(
         crate::storage::DependencyClass::View => column as i32 + 1,
         _ => unreachable!("only relation dependencies contain column positions"),
     }
+}
+
+/// A policy belongs to its table and depends on what its expressions use.
+fn policy_dependencies(
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    visit: &mut dyn FnMut(DependencyEdge) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    for (slot, policy) in storage.policies_with_slots_visible_to(txid) {
+        let dependent = ObjectAddress::new(PG_POLICY_OID, crate::storage::policy_oid(&policy), 0);
+        visit(DependencyEdge {
+            dependent,
+            referenced: ObjectAddress::new(
+                PG_CLASS_OID,
+                user_table_oid(storage, usize::from(policy.table)),
+                0,
+            ),
+            kind: b'a',
+        })?;
+        let mark = arena.mark();
+        let mut references = [(0, 0, 0); 4 * crate::storage::MAX_STORED_QUERY_DEPENDENCIES];
+        let mut count = 0;
+        for dependency in storage
+            .snapshot_policy_dependencies(slot, txid, arena)?
+            .entries()
+        {
+            let Some((class, object)) = stored_reference(storage, txid, dependency)
+                .filter(|(_, object)| *object >= crate::storage::FIRST_NORMAL_OBJECT_ID)
+            else {
+                continue;
+            };
+            let mut add = |sub: i32| {
+                if !references[..count].contains(&(class, object, sub)) && count < references.len()
+                {
+                    references[count] = (class, object, sub);
+                    count += 1;
+                }
+            };
+            if dependency.referenced_columns.is_empty() {
+                add(0);
+            } else {
+                for column in 0..MAX_COLUMNS {
+                    if dependency.referenced_columns.contains(column) {
+                        add(stored_column_number(storage, txid, dependency, column));
+                    }
+                }
+            }
+        }
+        // SAFETY: the snapshot is not used past this point.
+        unsafe { arena.rewind_to(mark) };
+        for (class, object, sub) in &references[..count] {
+            visit(DependencyEdge {
+                dependent,
+                referenced: ObjectAddress::new(*class, *object, *sub),
+                kind: b'n',
+            })?;
+        }
+    }
+    Ok(())
 }

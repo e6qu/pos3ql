@@ -38253,10 +38253,11 @@ fn collatable_builtin_types_expose_the_default_collation() {
             "SELECT typname, typcollation FROM pg_type \
              WHERE typname IN ('text', 'varchar', 'bpchar', 'name', 'int4') ORDER BY typname",
         )),
+        // PostgreSQL 18 gives `name` the "C" collation (950).
         [
             "bpchar|100",
             "int4|0",
-            "name|100",
+            "name|950",
             "text|100",
             "varchar|100"
         ],
@@ -57964,8 +57965,10 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         "DROP TYPE durable_types.coordinate_renamed",
     );
     assert!(
-        String::from_utf8_lossy(&bytes)
-            .contains("column point of composite type place depends on type coordinate_renamed"),
+        String::from_utf8_lossy(&bytes).contains(
+            "column point of composite type place depends on type \
+                 durable_types.coordinate_renamed"
+        ),
         "{}",
         String::from_utf8_lossy(&bytes)
     );

@@ -345,7 +345,8 @@ their dependents with their own code instead of the `pg_depend` walk that
 `DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`, `SEQUENCE`, `FUNCTION`, `TYPE`,
 `DOMAIN` and `SCHEMA` share, and `pg_depend` still lacks PostgreSQL's rows for
 languages, column collations, index columns, TOAST tables, partition keys,
-`NOT NULL` constraints, extended statistics, types named only inside
+`NOT NULL` constraints, the key columns of extended statistics, the parsers
+and templates of text search objects, types named only inside
 expressions (a cast in a default or routine body), and the column-level rows
 of rules and of views that read a sequence.
 Values and columns of a view's row type need the view's column types,

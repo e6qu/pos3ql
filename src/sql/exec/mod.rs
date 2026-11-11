@@ -49671,7 +49671,7 @@ fn report_composite_type_dependents(
         if definition.type_membership.composite_slot() == Some(slot) {
             let line = stack_format!(
                 192,
-                "typed table {}{}",
+                "table {}{}",
                 definition.name.as_str(),
                 if cascade { "" } else { " depends on type" }
             );

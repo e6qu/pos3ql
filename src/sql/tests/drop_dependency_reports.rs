@@ -740,3 +740,57 @@ fn operator_class_drops_report_like_postgresql() {
         ),
     ]);
 }
+#[test]
+fn typed_table_drops_report_like_postgresql() {
+    check_statements(&[
+        ("CREATE TYPE pt AS (a int, b text)", ""),
+        ("CREATE TABLE typed OF pt", ""),
+        ("CREATE TABLE holder (p pt)", ""),
+        (
+            "DROP TYPE pt",
+            "ERROR:  cannot drop type pt because other objects depend on it\n\
+             DETAIL:  table typed depends on type pt\n\
+             column p of table holder depends on type pt\n\
+             HINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+        ),
+        (
+            "DROP TYPE pt CASCADE",
+            "NOTICE:  drop cascades to 2 other objects\n\
+             DETAIL:  drop cascades to table typed\n\
+             drop cascades to column p of table holder",
+        ),
+        ("SELECT count(*) FROM pg_class WHERE relname = 'typed'", ""),
+    ]);
+}
+
+#[test]
+fn text_search_drops_report_like_postgresql() {
+    check_statements(&[
+        ("CREATE SCHEMA ts", ""),
+        (
+            "CREATE TEXT SEARCH CONFIGURATION ts.cfg (COPY = simple)",
+            "",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY ts.dict (TEMPLATE = simple)",
+            "",
+        ),
+        ("CREATE TABLE ts.t (a int, b int)", ""),
+        ("CREATE STATISTICS ts.st ON a, b FROM ts.t", ""),
+        (
+            "DROP SCHEMA ts",
+            "ERROR:  cannot drop schema ts because other objects depend on it\n\
+             DETAIL:  text search configuration ts.cfg depends on schema ts\n\
+             text search dictionary ts.dict depends on schema ts\n\
+             table ts.t depends on schema ts\n\
+             HINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+        ),
+        (
+            "DROP SCHEMA ts CASCADE",
+            "NOTICE:  drop cascades to 3 other objects\n\
+             DETAIL:  drop cascades to text search configuration ts.cfg\n\
+             drop cascades to text search dictionary ts.dict\n\
+             drop cascades to table ts.t",
+        ),
+    ]);
+}

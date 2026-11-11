@@ -1076,23 +1076,7 @@ pub(crate) fn compare_datums_as(
         (
             Datum::Record(a) | Datum::Composite { fields: a, .. },
             Datum::Record(b) | Datum::Composite { fields: b, .. },
-        ) => {
-            // Field-wise, with a NULL field comparing greater (PostgreSQL
-            // record ordering); shorter record sorts first on a common prefix.
-            for i in 0..a.len().min(b.len()) {
-                let (x, y) = (&a[i].value, &b[i].value);
-                let c = match (x.is_null(), y.is_null()) {
-                    (true, true) => Ordering::Equal,
-                    (true, false) => Ordering::Greater,
-                    (false, true) => Ordering::Less,
-                    (false, false) => compare_datums(x, y)?,
-                };
-                if !c.is_eq() {
-                    return Ok(c);
-                }
-            }
-            a.len().cmp(&b.len())
-        }
+        ) => record_ordering(a, b, false, &builtin_record_field_type_name)?,
         (
             Datum::CompositeText {
                 slot: left_slot,
@@ -1131,16 +1115,36 @@ pub(crate) fn compare_datums_as(
             }
             // PostgreSQL compares contents first, then dimensionality and bounds.
             let (length_a, length_b) = (array::len(ra), array::len(rb));
-            for (x, y) in array::elements(ra, *element).zip(array::elements(rb, *element)) {
-                // Within an array, NULL equals NULL and follows present values.
-                let c = match (x, y) {
-                    (Datum::Null, Datum::Null) => Ordering::Equal,
-                    (Datum::Null, _) => Ordering::Greater,
-                    (_, Datum::Null) => Ordering::Less,
-                    _ => compare_datums(&x, &y)?,
-                };
-                if !c.is_eq() {
-                    return Ok(c);
+            if *element == crate::sql::types::ArrElem::Record {
+                // Record elements keep their structure, which `record_cmp`
+                // needs; their decoded form is rendered text.
+                for (x, y) in array::element_payloads(ra).zip(array::element_payloads(rb)) {
+                    let c = match (array::record_element(x), array::record_element(y)) {
+                        (None, None) => Ordering::Equal,
+                        (None, Some(_)) => Ordering::Greater,
+                        (Some(_), None) => Ordering::Less,
+                        (Some(x), Some(y)) => {
+                            crate::sql::exec::compare_projected_values(x, y, &mut |a, b| {
+                                compare_datums(a, b)
+                            })?
+                        }
+                    };
+                    if !c.is_eq() {
+                        return Ok(c);
+                    }
+                }
+            } else {
+                for (x, y) in array::elements(ra, *element).zip(array::elements(rb, *element)) {
+                    // Within an array, NULL equals NULL and follows present values.
+                    let c = match (x, y) {
+                        (Datum::Null, Datum::Null) => Ordering::Equal,
+                        (Datum::Null, _) => Ordering::Greater,
+                        (_, Datum::Null) => Ordering::Less,
+                        _ => compare_datums(&x, &y)?,
+                    };
+                    if !c.is_eq() {
+                        return Ok(c);
+                    }
                 }
             }
             let content = length_a.cmp(&length_b);
@@ -1187,9 +1191,7 @@ pub(crate) fn compare_datums_as(
         // Enum values order by their member sort key (PostgreSQL's
         // enumsortorder), never by label text. The planner rejects comparing
         // two different enum types, so equal sorts here mean equal members.
-        (Datum::Enum { sort: a, .. }, Datum::Enum { sort: b, .. }) => {
-            a.partial_cmp(b).unwrap_or(Ordering::Equal)
-        }
+        (Datum::Enum { sort: a, .. }, Datum::Enum { sort: b, .. }) => a.total_cmp(b),
         // Intervals compare by canonical microsecond value (PostgreSQL's
         // interval_cmp_value: months count as 30 days, days as 24 hours), so
         // `1 month` = `30 days` = `720 hours`.
@@ -2298,26 +2300,7 @@ fn record_ordering(
 ) -> Result<core::cmp::Ordering, SqlError> {
     let mut ordering = core::cmp::Ordering::Equal;
     for (column, (x, y)) in a.iter().zip(b).enumerate() {
-        if x.type_oid != y.type_oid && x.type_oid != 0 && y.type_oid != 0 {
-            return Err(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
-                "cannot compare dissimilar column types {} and {} at record column {}",
-                type_name(x.type_oid)?.as_str(),
-                type_name(y.type_oid)?.as_str(),
-                column + 1
-            ));
-        }
-        if x.type_oid == crate::sql::types::oid::UNKNOWN {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "could not identify {} for type unknown",
-                if equality {
-                    "an equality operator"
-                } else {
-                    "a comparison function"
-                }
-            ));
-        }
+        check_record_field_types(x.type_oid, y.type_oid, column, equality, type_name)?;
         ordering = match (x.value.is_null(), y.value.is_null()) {
             (true, true) => core::cmp::Ordering::Equal,
             (true, false) => core::cmp::Ordering::Greater,
@@ -2335,6 +2318,39 @@ fn record_ordering(
         ));
     }
     Ok(ordering)
+}
+
+/// The per-column type check of `record_eq`/`record_cmp`: both records'
+/// column `column` (zero-based) must have one type, and that type needs the
+/// operator; `equality` selects which operator the error names.
+pub(crate) fn check_record_field_types(
+    left: i32,
+    right: i32,
+    column: usize,
+    equality: bool,
+    type_name: &dyn Fn(i32) -> Result<crate::util::StackStr<260>, SqlError>,
+) -> Result<(), SqlError> {
+    if left != right && left != 0 && right != 0 {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "cannot compare dissimilar column types {} and {} at record column {}",
+            type_name(left)?.as_str(),
+            type_name(right)?.as_str(),
+            column + 1
+        ));
+    }
+    if left == crate::sql::types::oid::UNKNOWN {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "could not identify {} for type unknown",
+            if equality {
+                "an equality operator"
+            } else {
+                "a comparison function"
+            }
+        ));
+    }
+    Ok(())
 }
 
 /// Orders two non-NULL field values; nested records use the record operators.

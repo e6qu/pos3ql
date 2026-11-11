@@ -46,20 +46,22 @@ struct JsonAggregateDisplay<'a> {
 impl core::fmt::Display for JsonAggregateDisplay<'_> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         use core::fmt::Write;
-        let colon = if self.jsonb { ": " } else { " : " };
         formatter.write_char('[')?;
         for (index, value) in self.values.iter().enumerate() {
             if index > 0 {
                 formatter.write_str(", ")?;
             }
-            crate::sql::json::write_datum_json_styled(value, colon, ", ", formatter)?;
+            // Composite and array values render compactly in json and with
+            // jsonb's canonical spacing in jsonb.
+            let (value_colon, value_comma) = if self.jsonb { (": ", ", ") } else { (":", ",") };
+            crate::sql::json::write_datum_json_styled(value, value_colon, value_comma, formatter)?;
         }
         formatter.write_char(']')
     }
 }
 
 struct JsonObjectAggregateDisplay<'a> {
-    rows: &'a [&'a [u8]],
+    pairs: &'a [(Datum<'a>, Datum<'a>)],
     jsonb: bool,
 }
 
@@ -68,15 +70,16 @@ impl core::fmt::Display for JsonObjectAggregateDisplay<'_> {
         let colon = if self.jsonb { ": " } else { " : " };
         let (open, close) = if self.jsonb { ("{", "}") } else { ("{ ", " }") };
         formatter.write_str(open)?;
-        for (index, encoded) in self.rows.iter().enumerate() {
+        for (index, (key, value)) in self.pairs.iter().enumerate() {
             if index > 0 {
                 formatter.write_str(", ")?;
             }
-            let key = crate::sql::exec::decode_projected_pub(encoded, 0);
-            let value = crate::sql::exec::decode_projected_pub(encoded, 1);
-            crate::sql::json::write_json_display_string(&key, formatter)?;
+            crate::sql::json::write_json_display_string(key, formatter)?;
             formatter.write_str(colon)?;
-            crate::sql::json::write_datum_json_styled(&value, colon, ", ", formatter)?;
+            // Composite and array values render compactly in json and with
+            // jsonb's canonical spacing in jsonb.
+            let (value_colon, value_comma) = if self.jsonb { (": ", ", ") } else { (":", ",") };
+            crate::sql::json::write_datum_json_styled(value, value_colon, value_comma, formatter)?;
         }
         formatter.write_str(close)
     }
@@ -263,53 +266,20 @@ fn compare_ordered_aggregate_rows(
     key_offset: usize,
     collations: &[Collation],
     catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
-    comparison_error: &mut Option<SqlError>,
-) -> core::cmp::Ordering {
-    use core::cmp::Ordering;
-
+) -> Result<core::cmp::Ordering, SqlError> {
     for (index, ordering) in specification.iter().enumerate() {
-        let left_key = crate::sql::exec::decode_projected_pub(left, key_offset + index);
-        let right_key = crate::sql::exec::decode_projected_pub(right, key_offset + index);
-        let result = match (left_key.is_null(), right_key.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => {
-                if ordering.nulls_first {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, true) => {
-                if ordering.nulls_first {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, false) => {
-                match compare_datums_with_catalog(collations[index], catalog, &left_key, &right_key)
-                {
-                    Ok(result) => {
-                        if ordering.descending {
-                            result.reverse()
-                        } else {
-                            result
-                        }
-                    }
-                    Err(error) => {
-                        if comparison_error.is_none() {
-                            *comparison_error = Some(error);
-                        }
-                        Ordering::Equal
-                    }
-                }
-            }
-        };
+        let result = crate::sql::exec::compare_projected_key(
+            collations[index],
+            (ordering.descending, ordering.nulls_first),
+            crate::sql::exec::ProjectedValue::column(left, key_offset + index),
+            crate::sql::exec::ProjectedValue::column(right, key_offset + index),
+            &|collation, x, y| compare_datums_with_catalog(collation, catalog, x, y),
+        )?;
         if !result.is_eq() {
-            return result;
+            return Ok(result);
         }
     }
-    Ordering::Equal
+    Ok(core::cmp::Ordering::Equal)
 }
 
 fn compare_custom_aggregate_rows(
@@ -318,32 +288,20 @@ fn compare_custom_aggregate_rows(
     columns: usize,
     collations: &[Collation],
     catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
-    comparison_error: &mut Option<SqlError>,
-) -> core::cmp::Ordering {
+) -> Result<core::cmp::Ordering, SqlError> {
     for (index, &collation) in collations.iter().take(columns).enumerate() {
-        let left = crate::sql::exec::decode_projected_pub(left, index);
-        let right = crate::sql::exec::decode_projected_pub(right, index);
-        let ordering = match (left.is_null(), right.is_null()) {
-            (true, true) => core::cmp::Ordering::Equal,
-            (true, false) => core::cmp::Ordering::Greater,
-            (false, true) => core::cmp::Ordering::Less,
-            (false, false) => {
-                match compare_datums_with_catalog(collation, catalog, &left, &right) {
-                    Ok(ordering) => ordering,
-                    Err(error) => {
-                        if comparison_error.is_none() {
-                            *comparison_error = Some(error);
-                        }
-                        core::cmp::Ordering::Equal
-                    }
-                }
-            }
-        };
+        let ordering = crate::sql::exec::compare_projected_key(
+            collation,
+            (false, false),
+            crate::sql::exec::ProjectedValue::column(left, index),
+            crate::sql::exec::ProjectedValue::column(right, index),
+            &|collation, x, y| compare_datums_with_catalog(collation, catalog, x, y),
+        )?;
         if !ordering.is_eq() {
-            return ordering;
+            return Ok(ordering);
         }
     }
-    core::cmp::Ordering::Equal
+    Ok(core::cmp::Ordering::Equal)
 }
 
 /// The most general numeric class seen among an aggregate's inputs, driving
@@ -2322,21 +2280,9 @@ impl<'a> AggState<'a> {
             return Ok(());
         }
         let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
-        let mut cmp_err: Option<SqlError> = None;
-        vals.sort_unstable_by(|a, b| {
-            match compare_datums_with_catalog(self.collation, catalog, a, b) {
-                Ok(o) => o,
-                Err(e) => {
-                    if cmp_err.is_none() {
-                        cmp_err = Some(e);
-                    }
-                    core::cmp::Ordering::Equal
-                }
-            }
-        });
-        if let Some(e) = cmp_err {
-            return Err(e);
-        }
+        crate::util::try_sort_unstable_by(vals, |a, b| {
+            compare_datums_with_catalog(self.collation, catalog, a, b)
+        })?;
         let mut prev: Option<Datum<'a>> = None;
         for &v in vals.iter() {
             let fresh = match prev {
@@ -2365,33 +2311,37 @@ impl<'a> AggState<'a> {
         }
         let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
         let spec = self.ord_spec;
-        let mut cmp_err: Option<SqlError> = None;
         if spec.is_empty() && self.distinct {
-            rows.sort_unstable_by(|left, right| {
-                compare_custom_aggregate_rows(
-                    left,
-                    right,
-                    2,
-                    &self.order_collations()[..2],
-                    catalog,
-                    &mut cmp_err,
-                )
-            });
+            crate::mem::arena::try_stable_sort_via(
+                arena,
+                rows,
+                |left, right| {
+                    compare_custom_aggregate_rows(
+                        left,
+                        right,
+                        2,
+                        &self.order_collations()[..2],
+                        catalog,
+                    )
+                },
+                |_| arena_full(),
+            )?;
         } else {
-            rows.sort_unstable_by(|left, right| {
-                compare_ordered_aggregate_rows(
-                    left,
-                    right,
-                    spec,
-                    2,
-                    &self.order_collations()[..spec.len()],
-                    catalog,
-                    &mut cmp_err,
-                )
-            });
-        }
-        if let Some(e) = cmp_err {
-            return Err(e);
+            crate::mem::arena::try_stable_sort_via(
+                arena,
+                rows,
+                |left, right| {
+                    compare_ordered_aggregate_rows(
+                        left,
+                        right,
+                        spec,
+                        2,
+                        &self.order_collations()[..spec.len()],
+                        catalog,
+                    )
+                },
+                |_| arena_full(),
+            )?;
         }
         for &row in rows.iter() {
             let value = crate::sql::exec::decode_projected_pub(row, 0);
@@ -2693,60 +2643,57 @@ impl<'a> AggState<'a> {
         if self.ord_len > 0 {
             let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
             let argument_count = usize::from(self.custom_argument_count);
-            let mut comparison_error = None;
             if self.ord_spec.is_empty() {
-                rows.sort_unstable_by(|left, right| {
-                    compare_custom_aggregate_rows(
-                        left,
-                        right,
-                        argument_count,
-                        &self.order_collations()[..argument_count],
-                        catalog,
-                        &mut comparison_error,
-                    )
-                });
+                crate::mem::arena::try_stable_sort_via(
+                    arena,
+                    rows,
+                    |left, right| {
+                        compare_custom_aggregate_rows(
+                            left,
+                            right,
+                            argument_count,
+                            &self.order_collations()[..argument_count],
+                            catalog,
+                        )
+                    },
+                    |_| arena_full(),
+                )?;
             } else {
                 let offset = usize::from(self.custom_sort_offset);
-                rows.sort_unstable_by(|left, right| {
-                    compare_ordered_aggregate_rows(
-                        left,
-                        right,
-                        self.ord_spec,
-                        offset,
-                        &self.order_collations()[offset..offset + self.ord_spec.len()],
-                        catalog,
-                        &mut comparison_error,
-                    )
-                });
-            }
-            if let Some(error) = comparison_error {
-                return Err(error);
+                crate::mem::arena::try_stable_sort_via(
+                    arena,
+                    rows,
+                    |left, right| {
+                        compare_ordered_aggregate_rows(
+                            left,
+                            right,
+                            self.ord_spec,
+                            offset,
+                            &self.order_collations()[offset..offset + self.ord_spec.len()],
+                            catalog,
+                        )
+                    },
+                    |_| arena_full(),
+                )?;
             }
             let mut previous: Option<&[u8]> = None;
             for &row in rows.iter() {
                 if self.distinct
                     && let Some(prior) = previous
-                {
-                    let mut comparison_error = None;
-                    let equal = compare_custom_aggregate_rows(
+                    && compare_custom_aggregate_rows(
                         prior,
                         row,
                         argument_count,
                         &self.order_collations()[..argument_count],
                         catalog,
-                        &mut comparison_error,
-                    )
-                    .is_eq();
-                    if let Some(error) = comparison_error {
-                        return Err(error);
-                    }
-                    if equal {
-                        continue;
-                    }
+                    )?
+                    .is_eq()
+                {
+                    continue;
                 }
                 let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
                 for (index, value) in values.iter_mut().enumerate().take(argument_count) {
-                    *value = crate::sql::exec::decode_projected_pub(row, index);
+                    *value = crate::sql::exec::decode_projected_col_record(row, index, arena)?;
                 }
                 self.apply_custom_transition(
                     aggregate.transition_oid,
@@ -2847,6 +2794,26 @@ impl<'a> AggState<'a> {
                 "function array_agg(unknown) is not unique"
             )
         })?;
+        let values = if let crate::sql::types::ArrElem::Composite(Some(slot)) = element {
+            // Named composites enter the array codec in their durable form.
+            let catalog = catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "named composite catalog access is unavailable"
+                )
+            })?;
+            let normalized = arena
+                .alloc_slice_with(values.len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for (normalized, &value) in normalized.iter_mut().zip(values) {
+                if !value.is_null() {
+                    *normalized = catalog.composite_array_element(value, slot, arena)?;
+                }
+            }
+            &*normalized
+        } else {
+            values
+        };
         let raw = crate::sql::array::build(values, arena)?;
         Ok(Datum::Array { element, raw })
     }
@@ -2886,8 +2853,19 @@ impl<'a> AggState<'a> {
         } else {
             unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) }
         };
+        // Values decode with their record structure, which JSON renders as
+        // an object rather than the record's text.
+        let pairs = arena
+            .alloc_slice_with(rows.len(), |_| (Datum::Null, Datum::Null))
+            .map_err(|_| arena_full())?;
+        for (pair, row) in pairs.iter_mut().zip(rows) {
+            *pair = (
+                crate::sql::exec::decode_projected_pub(row, 0),
+                crate::sql::exec::decode_projected_col_record(row, 1, arena)?,
+            );
+        }
         let text = arena
-            .alloc_str_display(JsonObjectAggregateDisplay { rows, jsonb })
+            .alloc_str_display(JsonObjectAggregateDisplay { pairs, jsonb })
             .map_err(|_| arena_full())?;
         Ok(Datum::Json { text, jsonb })
     }
@@ -2905,27 +2883,26 @@ impl<'a> AggState<'a> {
             }
             let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
             let spec = self.ord_spec;
-            let mut cmp_err: Option<SqlError> = None;
-            crate::mem::arena::stable_sort_via(arena, rows, |left, right| {
-                compare_ordered_aggregate_rows(
-                    left,
-                    right,
-                    spec,
-                    1,
-                    &self.order_collations()[..spec.len()],
-                    catalog,
-                    &mut cmp_err,
-                )
-            })
-            .map_err(|_| arena_full())?;
-            if let Some(e) = cmp_err {
-                return Err(e);
-            }
+            crate::mem::arena::try_stable_sort_via(
+                arena,
+                rows,
+                |left, right| {
+                    compare_ordered_aggregate_rows(
+                        left,
+                        right,
+                        spec,
+                        1,
+                        &self.order_collations()[..spec.len()],
+                        catalog,
+                    )
+                },
+                |_| arena_full(),
+            )?;
             let out = arena
                 .alloc_slice_with(rows.len(), |_| Datum::Null)
                 .map_err(|_| arena_full())?;
             for (i, &row) in rows.iter().enumerate() {
-                out[i] = crate::sql::exec::decode_projected_pub(row, 0);
+                out[i] = crate::sql::exec::decode_projected_col_record(row, 0, arena)?;
             }
             Ok(out)
         } else if self.distinct {
@@ -2933,24 +2910,12 @@ impl<'a> AggState<'a> {
                 return Ok(&[]);
             }
             let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
-            let mut cmp_err: Option<SqlError> = None;
-            crate::mem::arena::stable_sort_via(
+            crate::mem::arena::try_stable_sort_via(
                 arena,
                 vals,
-                |a, b| match compare_datums_with_catalog(self.collation, catalog, a, b) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        if cmp_err.is_none() {
-                            cmp_err = Some(e);
-                        }
-                        core::cmp::Ordering::Equal
-                    }
-                },
-            )
-            .map_err(|_| arena_full())?;
-            if let Some(e) = cmp_err {
-                return Err(e);
-            }
+                |a, b| compare_datums_with_catalog(self.collation, catalog, a, b),
+                |_| arena_full(),
+            )?;
             let mut unique = 0usize;
             for i in 0..vals.len() {
                 let same = i > 0

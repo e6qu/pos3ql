@@ -9,9 +9,7 @@
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, FromClause, GroupingSet, Select, SelectItem};
-use crate::sql::eval::{
-    ColumnLookup, EvalHooks, SqlError, SubqueryList, compare_datums_collated, eval_full, sqlstate,
-};
+use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, SubqueryList, eval_full, sqlstate};
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::stack_format;
@@ -36,14 +34,10 @@ fn compare_group_rows(
     right: &[u8],
 ) -> Result<core::cmp::Ordering, SqlError> {
     for (index, &collation) in collations.iter().enumerate() {
-        let left = crate::sql::exec::decode_projected_pub(left, index);
-        let right = crate::sql::exec::decode_projected_pub(right, index);
-        let ordering = match (left.is_null(), right.is_null()) {
-            (true, true) => core::cmp::Ordering::Equal,
-            (true, false) => core::cmp::Ordering::Less,
-            (false, true) => core::cmp::Ordering::Greater,
-            (false, false) => compare_datums_collated(storage, txid, collation, &left, &right)?,
-        };
+        let left = crate::sql::exec::ProjectedValue::column(left, index);
+        let right = crate::sql::exec::ProjectedValue::column(right, index);
+        let ordering =
+            super::materialize::compare_materialized_key(storage, txid, collation, left, right)?;
         if !ordering.is_eq() {
             return Ok(ordering);
         }
@@ -270,10 +264,12 @@ pub(super) fn groups_for_mask<'a>(
                 .with_block_store(|blocks| reader.start(blocks, run))
                 .expect("spill-attached block store")?;
             while let Some(context) = reader.context() {
-                let row_index = match crate::sql::exec::decode_projected_pub(context.row, n_keys) {
-                    Datum::Int4(i) => i as u32 as usize,
-                    _ => 0,
+                let Datum::Int4(row_index) =
+                    crate::sql::exec::decode_projected_pub(context.row, n_keys)
+                else {
+                    unreachable!("grouping runs end with the input row position")
                 };
+                let row_index = row_index as u32 as usize;
                 let is_new = match context.previous {
                     None => true,
                     Some(prev) => {
@@ -371,10 +367,14 @@ pub(super) fn groups_for_mask<'a>(
                 },
             )?;
         }
-        keys.sort_unstable_by(|left, right| {
-            compare_group_rows(storage, txid, group_collations, left.0, right.0)
-                .expect("validated group keys compare without error")
-        });
+        // The input position breaks ties, so each group's representative
+        // value is its first input row, as PostgreSQL's hashed grouping keeps.
+        crate::util::try_sort_unstable_by(keys, |left, right| {
+            Ok(
+                compare_group_rows(storage, txid, group_collations, left.0, right.0)?
+                    .then(left.1.cmp(&right.1)),
+            )
+        })?;
         let ng = {
             let mut g = 0usize;
             for i in 0..keys.len() {
@@ -403,20 +403,22 @@ pub(super) fn groups_for_mask<'a>(
         {
             let mut g = 0usize;
             for i in 0..keys.len() {
-                if i > 0
-                    && !compare_group_rows(
+                let new_group = i == 0
+                    || !compare_group_rows(
                         storage,
                         txid,
                         group_collations,
                         keys[i].0,
                         keys[i - 1].0,
                     )?
-                    .is_eq()
-                {
+                    .is_eq();
+                if new_group && i > 0 {
                     g += 1;
                 }
                 group_of[keys[i].1 as usize] = g as u32;
-                rep_keys_buf[g] = keys[i].0;
+                if new_group {
+                    rep_keys_buf[g] = keys[i].0;
+                }
             }
         }
         (ng, &rep_keys_buf[..ng])
@@ -613,7 +615,7 @@ pub(super) fn groups_for_mask<'a>(
     for g in 0..n_groups {
         let mut key_vals = [Datum::Null; crate::sql::parser::MAX_GROUP_TERMS];
         for (k, slot) in key_vals.iter_mut().enumerate().take(n_keys) {
-            *slot = crate::sql::exec::decode_projected_pub(rep_keys[g], k);
+            *slot = crate::sql::exec::decode_projected_col_record(rep_keys[g], k, arena)?;
         }
         let agg_vals: &mut [Datum] = arena
             .alloc_slice_with(n_aggs, |_| Datum::Null)
@@ -999,7 +1001,7 @@ pub(super) fn grouped_rows<'a>(
                 ));
             }
         }
-        live = crate::sql::exec::sort_dedup_projected(out_rows, width);
+        live = crate::sql::exec::sort_dedup_projected(out_rows, width)?;
     }
     let out_rows = &mut out_rows[..live];
 
@@ -1020,42 +1022,27 @@ pub(super) fn grouped_rows<'a>(
                 )?;
             }
         }
-        out_rows.sort_unstable_by(|a, b| {
-            for (k, ob) in statement.order_by.iter().enumerate() {
-                let ka = crate::sql::exec::decode_projected_pub(a, width + k);
-                let kb = crate::sql::exec::decode_projected_pub(b, width + k);
-                // NULL placement follows NULLS FIRST/LAST (absolute, not
-                // affected by ASC/DESC); only the value comparison reverses
-                // for DESC.
-                let ord = match (ka.is_null(), kb.is_null()) {
-                    (true, true) => core::cmp::Ordering::Equal,
-                    (true, false) => {
-                        if ob.nulls_first {
-                            core::cmp::Ordering::Less
-                        } else {
-                            core::cmp::Ordering::Greater
-                        }
+        crate::mem::arena::try_stable_sort_via(
+            arena,
+            out_rows,
+            |a, b| {
+                for (k, ob) in statement.order_by.iter().enumerate() {
+                    let ordering = super::materialize::compare_ordered_key(
+                        storage,
+                        txid,
+                        order_collations[k],
+                        (ob.descending, ob.nulls_first),
+                        crate::sql::exec::ProjectedValue::column(a, width + k),
+                        crate::sql::exec::ProjectedValue::column(b, width + k),
+                    )?;
+                    if !ordering.is_eq() {
+                        return Ok(ordering);
                     }
-                    (false, true) => {
-                        if ob.nulls_first {
-                            core::cmp::Ordering::Greater
-                        } else {
-                            core::cmp::Ordering::Less
-                        }
-                    }
-                    (false, false) => {
-                        let c =
-                            compare_datums_collated(storage, txid, order_collations[k], &ka, &kb)
-                                .expect("validated grouped ORDER BY keys compare without error");
-                        if ob.descending { c.reverse() } else { c }
-                    }
-                };
-                if !ord.is_eq() {
-                    return ord;
                 }
-            }
-            core::cmp::Ordering::Equal
-        });
+                Ok(core::cmp::Ordering::Equal)
+            },
+            |_| arena_full(),
+        )?;
     }
 
     Ok((out_rows, width))

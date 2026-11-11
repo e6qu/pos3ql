@@ -85,6 +85,15 @@ fn table_names_declare_row_variables_that_move_rows_by_position() {
             )[0],
             r#"ERROR 55000 record "p" is not assigned yet detail: The tuple structure of a not-yet-assigned record is indeterminate."#
         );
+        // Reading a field of an unassigned record variable fails the same way.
+        assert_eq!(
+            notices(
+                engine,
+                budget,
+                "DO $$ DECLARE p record; BEGIN RAISE NOTICE '%', p.x; END $$",
+            )[0],
+            r#"ERROR 55000 record "p" is not assigned yet detail: The tuple structure of a not-yet-assigned record is indeterminate."#
+        );
         assert_eq!(
             notices(
                 engine,

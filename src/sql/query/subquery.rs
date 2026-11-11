@@ -3472,8 +3472,10 @@ fn run_subquery<'a>(
                 // reader. Re-encode the scalar into the statement arena
                 // before retaining it in the subquery result.
                 let encoded = crate::sql::exec::encode_projected_pub(vals, arena)?;
-                out.push(crate::sql::exec::decode_projected_pub(encoded, 0))
-                    .map_err(|_| arena_full())?;
+                out.push(crate::sql::exec::decode_projected_col_record(
+                    encoded, 0, arena,
+                )?)
+                .map_err(|_| arena_full())?;
                 any_null |= vals[0].is_null();
                 Ok(())
             },
@@ -3772,24 +3774,37 @@ fn run_subquery<'a>(
     let vals = vals.as_slice();
     let keys = keys.as_slice();
 
-    // Stable insertion sort of row indices by the ORDER BY keys.
+    // Stable sort of row indices by the ORDER BY keys.
     let order = arena
         .alloc_slice_with(count, |i| i)
         .map_err(|_| arena_full())?;
     if n_keys > 0 {
-        for x in 1..count {
-            let mut y = x;
-            while y > 0 {
-                let a = &keys[order[y - 1] * n_keys..order[y - 1] * n_keys + n_keys];
-                let b = &keys[order[y] * n_keys..order[y] * n_keys + n_keys];
-                if cmp_key_rows(a, b, select.order_by) == core::cmp::Ordering::Greater {
-                    order.swap(y - 1, y);
-                    y -= 1;
-                } else {
-                    break;
-                }
-            }
+        let collations = arena
+            .alloc_slice_with(n_keys, |_| crate::sql::ast::Collation::None)
+            .map_err(|_| arena_full())?;
+        for (collation, o) in collations.iter_mut().zip(select.order_by) {
+            // A positional `ORDER BY 1` sorts by the single output column.
+            let expression = match o.expression {
+                Expr::Int(_) => item,
+                e => e,
+            };
+            *collation = scope.expression_collation(storage, arena, expression)?;
         }
+        crate::mem::arena::try_stable_sort_via(
+            arena,
+            order,
+            |&a, &b| {
+                cmp_key_rows(
+                    storage,
+                    txid,
+                    collations,
+                    &keys[a * n_keys..a * n_keys + n_keys],
+                    &keys[b * n_keys..b * n_keys + n_keys],
+                    select.order_by,
+                )
+            },
+            |_| arena_full(),
+        )?;
     }
 
     // Apply OFFSET/LIMIT over the ordered rows.

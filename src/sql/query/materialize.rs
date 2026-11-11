@@ -661,9 +661,12 @@ fn projected_collations<'a>(
     Ok(collations)
 }
 
+/// DISTINCT over encoded rows; a stable sort keeps each group's first input
+/// row, the representative PostgreSQL's hashed DISTINCT returns.
 fn sort_dedup_collated(
     storage: &Storage,
     txid: u32,
+    arena: &Arena,
     rows: &mut [&[u8]],
     width: usize,
     collations: &[Collation],
@@ -676,37 +679,30 @@ fn sort_dedup_collated(
             )?;
         }
     }
-    rows.sort_unstable_by(|left, right| {
+    let compare = |left: &[u8], right: &[u8]| {
         for (index, &collation) in collations.iter().take(width).enumerate() {
             let ordering = compare_materialized_key(
                 storage,
                 txid,
                 collation,
-                &crate::sql::exec::decode_projected_pub(left, index),
-                &crate::sql::exec::decode_projected_pub(right, index),
-            )
-            .expect("validated DISTINCT values compare without error");
+                crate::sql::exec::ProjectedValue::column(left, index),
+                crate::sql::exec::ProjectedValue::column(right, index),
+            )?;
             if !ordering.is_eq() {
-                return ordering;
+                return Ok(ordering);
             }
         }
-        core::cmp::Ordering::Equal
-    });
+        Ok(core::cmp::Ordering::Equal)
+    };
+    crate::mem::arena::try_stable_sort_via(
+        arena,
+        rows,
+        |left, right| compare(left, right),
+        |_| arena_full(),
+    )?;
     let mut unique = 0;
     for index in 0..rows.len() {
-        if index == 0
-            || (0..width).any(|column| {
-                !compare_materialized_key(
-                    storage,
-                    txid,
-                    collations[column],
-                    &crate::sql::exec::decode_projected_pub(rows[index - 1], column),
-                    &crate::sql::exec::decode_projected_pub(rows[index], column),
-                )
-                .expect("validated DISTINCT values compare without error")
-                .is_eq()
-            })
-        {
+        if index == 0 || !compare(rows[index - 1], rows[index])?.is_eq() {
             rows[unique] = rows[index];
             unique += 1;
         }
@@ -1145,7 +1141,7 @@ pub(crate) fn materialized_rows<'a>(
     // row per key in ORDER BY order survives.
     let mut live = rows.len();
     if statement.distinct && n_on == 0 {
-        live = sort_dedup_collated(storage, txid, rows, width, &visible_collations)?;
+        live = sort_dedup_collated(storage, txid, arena, rows, width, &visible_collations)?;
     }
     let rows = &mut rows[..live];
 
@@ -1163,63 +1159,25 @@ pub(crate) fn materialized_rows<'a>(
                 )?;
             }
         }
-        crate::mem::arena::stable_sort_via(arena, rows, |a, b| {
-            for (k, ob) in statement.order_by.iter().enumerate() {
-                let ka = crate::sql::exec::decode_projected_pub(a, width + k);
-                let kb = crate::sql::exec::decode_projected_pub(b, width + k);
-                // NULL placement follows NULLS FIRST/LAST (absolute, not
-                // affected by ASC/DESC); only the value comparison reverses
-                // for DESC.
-                let ord = match (ka.is_null(), kb.is_null()) {
-                    (true, true) => core::cmp::Ordering::Equal,
-                    (true, false) => {
-                        if ob.nulls_first {
-                            core::cmp::Ordering::Less
-                        } else {
-                            core::cmp::Ordering::Greater
-                        }
-                    }
-                    (false, true) => {
-                        if ob.nulls_first {
-                            core::cmp::Ordering::Greater
-                        } else {
-                            core::cmp::Ordering::Less
-                        }
-                    }
-                    (false, false) => {
-                        let c =
-                            compare_materialized_key(storage, txid, key_collations[k], &ka, &kb)
-                                .expect("validated materialized sort keys compare without error");
-                        if ob.descending { c.reverse() } else { c }
-                    }
-                };
-                if !ord.is_eq() {
-                    return ord;
-                }
-            }
-            for j in 0..n_on {
-                let ka = crate::sql::exec::decode_projected_pub(a, width + n_order + j);
-                let kb = crate::sql::exec::decode_projected_pub(b, width + n_order + j);
-                let ord = match (ka.is_null(), kb.is_null()) {
-                    (true, true) => core::cmp::Ordering::Equal,
-                    (true, false) => core::cmp::Ordering::Greater,
-                    (false, true) => core::cmp::Ordering::Less,
-                    (false, false) => compare_materialized_key(
-                        storage,
-                        txid,
-                        key_collations[n_order + j],
-                        &ka,
-                        &kb,
-                    )
-                    .expect("validated materialized sort keys compare without error"),
-                };
-                if !ord.is_eq() {
-                    return ord;
-                }
-            }
-            core::cmp::Ordering::Equal
-        })
-        .map_err(|_| arena_full())?;
+        crate::mem::arena::try_stable_sort_via(
+            arena,
+            rows,
+            |a, b| {
+                compare_materialized_rows(
+                    storage,
+                    txid,
+                    &key_collations,
+                    statement,
+                    width,
+                    n_order,
+                    n_on,
+                    false,
+                    a,
+                    b,
+                )
+            },
+            |_| arena_full(),
+        )?;
     }
 
     // DISTINCT ON: keep the first row of each run of equal ON keys.
@@ -1233,20 +1191,11 @@ pub(crate) fn materialized_rows<'a>(
             }
             let mut same = true;
             for j in 0..n_on {
-                let ka = crate::sql::exec::decode_projected_pub(rows[i], width + n_order + j);
-                let kb = crate::sql::exec::decode_projected_pub(rows[i - 1], width + n_order + j);
-                let equal = match (ka.is_null(), kb.is_null()) {
-                    (true, true) => true,
-                    (true, false) | (false, true) => false,
-                    (false, false) => compare_materialized_key(
-                        storage,
-                        txid,
-                        key_collations[n_order + j],
-                        &ka,
-                        &kb,
-                    )?
-                    .is_eq(),
-                };
+                let ka = crate::sql::exec::ProjectedValue::column(rows[i], width + n_order + j);
+                let kb = crate::sql::exec::ProjectedValue::column(rows[i - 1], width + n_order + j);
+                let equal =
+                    compare_materialized_key(storage, txid, key_collations[n_order + j], ka, kb)?
+                        .is_eq();
                 if !equal {
                     same = false;
                     break;
@@ -1269,21 +1218,24 @@ pub(crate) fn materialized_rows<'a>(
     Ok((rows, width, deferred, identities_at))
 }
 
+/// Orders two encoded key values, NULL last, under `collation`; see
+/// [`crate::sql::exec::compare_projected_key`].
 pub(crate) fn compare_materialized_key(
     storage: &Storage,
     txid: u32,
     collation: Collation,
-    left: &Datum<'_>,
-    right: &Datum<'_>,
+    left: crate::sql::exec::ProjectedValue<'_>,
+    right: crate::sql::exec::ProjectedValue<'_>,
 ) -> Result<core::cmp::Ordering, SqlError> {
-    match (left.is_null(), right.is_null()) {
-        (true, true) => Ok(core::cmp::Ordering::Equal),
-        (true, false) => Ok(core::cmp::Ordering::Greater),
-        (false, true) => Ok(core::cmp::Ordering::Less),
-        (false, false) => {
-            crate::sql::eval::compare_datums_collated(storage, txid, collation, left, right)
-        }
-    }
+    crate::sql::exec::compare_projected_key(
+        collation,
+        (false, false),
+        left,
+        right,
+        &|collation, x, y| {
+            crate::sql::eval::compare_datums_collated(storage, txid, collation, x, y)
+        },
+    )
 }
 
 /// Whether two sorted rows tie on their `n_order` hidden ORDER BY key columns
@@ -1299,18 +1251,34 @@ fn order_keys_equal_collated(
     n_order: usize,
 ) -> Result<bool, SqlError> {
     for (k, &collation) in collations.iter().enumerate().take(n_order) {
-        let ka = crate::sql::exec::decode_projected_pub(a, width + k);
-        let kb = crate::sql::exec::decode_projected_pub(b, width + k);
-        let equal = match (ka.is_null(), kb.is_null()) {
-            (true, true) => true,
-            (false, false) => compare_materialized_key(storage, txid, collation, &ka, &kb)?.is_eq(),
-            _ => false,
-        };
-        if !equal {
+        let ka = crate::sql::exec::ProjectedValue::column(a, width + k);
+        let kb = crate::sql::exec::ProjectedValue::column(b, width + k);
+        if !compare_materialized_key(storage, txid, collation, ka, kb)?.is_eq() {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Orders one encoded key under its `ORDER BY` direction `(descending,
+/// nulls_first)`; see [`crate::sql::exec::compare_projected_key`].
+pub(crate) fn compare_ordered_key(
+    storage: &Storage,
+    txid: u32,
+    collation: Collation,
+    direction: (bool, bool),
+    left: crate::sql::exec::ProjectedValue<'_>,
+    right: crate::sql::exec::ProjectedValue<'_>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    crate::sql::exec::compare_projected_key(
+        collation,
+        direction,
+        left,
+        right,
+        &|collation, x, y| {
+            crate::sql::eval::compare_datums_collated(storage, txid, collation, x, y)
+        },
+    )
 }
 
 #[expect(
@@ -1325,66 +1293,40 @@ fn compare_materialized_rows(
     width: usize,
     n_order: usize,
     n_on: usize,
+    distinct_prefix: bool,
     a: &[u8],
     b: &[u8],
 ) -> Result<core::cmp::Ordering, SqlError> {
     for (key, order) in statement.order_by.iter().enumerate() {
-        let left = crate::sql::exec::decode_projected_pub(a, width + key);
-        let right = crate::sql::exec::decode_projected_pub(b, width + key);
-        let ordering = match (left.is_null(), right.is_null()) {
-            (true, true) => core::cmp::Ordering::Equal,
-            (true, false) => {
-                if order.nulls_first {
-                    core::cmp::Ordering::Less
-                } else {
-                    core::cmp::Ordering::Greater
-                }
-            }
-            (false, true) => {
-                if order.nulls_first {
-                    core::cmp::Ordering::Greater
-                } else {
-                    core::cmp::Ordering::Less
-                }
-            }
-            (false, false) => {
-                let compared =
-                    compare_materialized_key(storage, txid, key_collations[key], &left, &right)?;
-                if order.descending {
-                    compared.reverse()
-                } else {
-                    compared
-                }
-            }
-        };
+        let ordering = compare_ordered_key(
+            storage,
+            txid,
+            key_collations[key],
+            (order.descending, order.nulls_first),
+            crate::sql::exec::ProjectedValue::column(a, width + key),
+            crate::sql::exec::ProjectedValue::column(b, width + key),
+        )?;
         if !ordering.is_eq() {
             return Ok(ordering);
         }
     }
     for index in 0..n_on {
-        let left = crate::sql::exec::decode_projected_pub(a, width + n_order + index);
-        let right = crate::sql::exec::decode_projected_pub(b, width + n_order + index);
-        let ordering = match (left.is_null(), right.is_null()) {
-            (true, true) => core::cmp::Ordering::Equal,
-            (true, false) => core::cmp::Ordering::Greater,
-            (false, true) => core::cmp::Ordering::Less,
-            (false, false) => compare_materialized_key(
-                storage,
-                txid,
-                key_collations[n_order + index],
-                &left,
-                &right,
-            )?,
-        };
+        let ordering = compare_materialized_key(
+            storage,
+            txid,
+            key_collations[n_order + index],
+            crate::sql::exec::ProjectedValue::column(a, width + n_order + index),
+            crate::sql::exec::ProjectedValue::column(b, width + n_order + index),
+        )?;
         if !ordering.is_eq() {
             return Ok(ordering);
         }
     }
-    Ok(if statement.distinct && n_on == 0 {
+    if distinct_prefix {
         crate::sql::exec::compare_projected_prefix(a, b, width)
     } else {
-        core::cmp::Ordering::Equal
-    })
+        Ok(core::cmp::Ordering::Equal)
+    }
 }
 
 #[expect(
@@ -1402,17 +1344,11 @@ fn distinct_on_keys_equal(
     n_on: usize,
 ) -> Result<bool, SqlError> {
     for index in 0..n_on {
-        let left = crate::sql::exec::decode_projected_pub(a, width + n_order + index);
-        let right = crate::sql::exec::decode_projected_pub(b, width + n_order + index);
-        let equal = match (left.is_null(), right.is_null()) {
-            (true, true) => true,
-            (false, false) => {
-                compare_materialized_key(storage, txid, collations[n_order + index], &left, &right)?
-                    .is_eq()
-            }
-            _ => false,
-        };
-        if !equal {
+        let left = crate::sql::exec::ProjectedValue::column(a, width + n_order + index);
+        let right = crate::sql::exec::ProjectedValue::column(b, width + n_order + index);
+        if !compare_materialized_key(storage, txid, collations[n_order + index], left, right)?
+            .is_eq()
+        {
             return Ok(false);
         }
     }
@@ -1476,7 +1412,7 @@ fn prelock_external_run(
             } = context;
             let duplicate = if let Some(prior) = previous {
                 if statement.distinct && plan.n_on == 0 {
-                    crate::sql::exec::compare_projected_prefix(row, prior, plan.width).is_eq()
+                    crate::sql::exec::compare_projected_prefix(row, prior, plan.width)?.is_eq()
                 } else if plan.n_on > 0 {
                     distinct_on_keys_equal(
                         storage,
@@ -1694,6 +1630,7 @@ pub(crate) fn external_materialized_into<'a>(
             plan.width,
             plan.n_order,
             plan.n_on,
+            statement.distinct && plan.n_on == 0,
             left,
             right,
         )
@@ -1833,7 +1770,7 @@ pub(crate) fn external_materialized_into<'a>(
             } = context;
             let duplicate = if let Some(prior) = previous {
                 if statement.distinct && plan.n_on == 0 {
-                    crate::sql::exec::compare_projected_prefix(row, prior, plan.width).is_eq()
+                    crate::sql::exec::compare_projected_prefix(row, prior, plan.width)?.is_eq()
                 } else if plan.n_on > 0 {
                     distinct_on_keys_equal(
                         storage,

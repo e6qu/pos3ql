@@ -939,7 +939,8 @@ use set_rows::PlpgsqlSetResult;
 mod projected;
 use numeric_loops::NumericLoopFrames;
 pub(crate) use projected::{
-    compare_projected_prefix, decode_projected_row_into, encode_projected_by_into,
+    ProjectedValue, compare_projected_key, compare_projected_prefix, compare_projected_rows,
+    compare_projected_values, decode_projected_row_into, encode_projected_by_into,
     encode_projected_into, encode_projected_persistent_pub, pack_projected_rows,
     pack_projected_rows_into, projected_row_len, projected_row_len_by, projected_row_width,
     projected_rows_len, unpack_projected_rows,
@@ -23251,6 +23252,23 @@ where
                     ) || matches!(self.locals[index].ctype, ColType::Composite(_)) =>
                 {
                     return Ok(Datum::Null);
+                }
+                Datum::Null
+                    if matches!(
+                        self.locals[index].record_shape,
+                        Some(PlpgsqlRecordShape::Dynamic)
+                    ) =>
+                {
+                    return Err(crate::sql::error_position::with_detail(
+                        sql_err!(
+                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                            "record \"{}\" is not assigned yet",
+                            qualifier
+                        ),
+                        format_args!(
+                            "The tuple structure of a not-yet-assigned record is indeterminate."
+                        ),
+                    ));
                 }
                 _ => {
                     return Err(sql_err!(
@@ -80383,6 +80401,93 @@ fn coerce_composite_value_inner<'a>(
         }
     }
     Ok(Datum::Composite { slot, fields })
+}
+
+/// Casts a record to a table's row type: each field converts to its
+/// column's type by assignment rules, as a cast to a named composite does.
+pub(crate) fn coerce_table_row_value<'a>(
+    value: Datum<'a>,
+    table: usize,
+    type_name: &str,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<Datum<'a>, SqlError> {
+    let input = match value {
+        Datum::Null => return Ok(Datum::Null),
+        Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+        other => {
+            return Err(sql_err!(
+                sqlstate::CANNOT_COERCE,
+                "cannot cast type {} to {}",
+                crate::sql::eval::type_name_of_pub(&other),
+                type_name
+            ));
+        }
+    };
+    let definition = storage.table_def(table, txid);
+    let columns = definition.columns();
+    if input.len() != columns.len() {
+        return Err(crate::sql::error_position::with_detail(
+            sql_err!(
+                sqlstate::CANNOT_COERCE,
+                "cannot cast type record to {}",
+                type_name
+            ),
+            format_args!(
+                "Input has too {} columns.",
+                if input.len() < columns.len() {
+                    "few"
+                } else {
+                    "many"
+                }
+            ),
+        ));
+    }
+    let fields = arena
+        .alloc_slice_with(input.len(), |_| RecordField {
+            name: "",
+            type_oid: 0,
+            value: Datum::Null,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    for ((out, field), column) in fields.iter_mut().zip(input).zip(columns) {
+        out.name = arena
+            .alloc_str(column.name.as_str())
+            .map_err(|_| super::query::arena_full_pub())?;
+        out.type_oid = match storage.declared_column_type(column, txid)? {
+            crate::storage::DeclaredColumnType::Builtin { oid }
+            | crate::storage::DeclaredColumnType::UserDefined { oid, .. } => oid,
+        };
+        let cast = prepare_assignment_cast(field.type_oid, column, storage, txid, arena)?;
+        let converted = coerce_assignment(
+            field.value,
+            column,
+            PlannedAssignmentCast {
+                input_collation: crate::sql::ast::Collation::None,
+                defined: cast.as_ref(),
+                site: None,
+            },
+            storage,
+            txid,
+            arena,
+            sequences,
+        )?;
+        out.value = match constraints::column_domain_target(storage, column, txid)? {
+            Some(domain) => constraints::coerce_domain_value(
+                storage,
+                domain,
+                converted,
+                txid,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+                sequences,
+            )?,
+            None => converted,
+        };
+    }
+    Ok(Datum::Record(fields))
 }
 
 /// Parses PostgreSQL's composite text form stored in a row. This parser keeps

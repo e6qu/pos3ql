@@ -1397,6 +1397,22 @@ pub fn write_datum_json_styled(
             crate::sql::datetime::format_timestamp_json(*t, true).as_str(),
             out,
         ),
+        Datum::Array {
+            element: crate::sql::types::ArrElem::Record,
+            raw,
+        } => {
+            out.write_char('[')?;
+            for (i, payload) in crate::sql::array::element_payloads(raw).enumerate() {
+                if i > 0 {
+                    out.write_str(comma)?;
+                }
+                match crate::sql::array::record_element(payload) {
+                    Some(value) => write_projected_json(value, colon, comma, out)?,
+                    None => out.write_str("null")?,
+                }
+            }
+            out.write_char(']')
+        }
         Datum::Array { element, raw } => {
             out.write_char('[')?;
             for (i, elem) in crate::sql::array::elements(raw, *element).enumerate() {
@@ -1422,4 +1438,27 @@ pub fn write_datum_json_styled(
         // Everything else renders as a quoted string of its text form.
         other => write_json_display_string(other, out),
     }
+}
+
+/// Writes an encoded value as [`write_datum_json_styled`] does, rendering a
+/// record from its encoded fields (its decoded form is only text).
+fn write_projected_json(
+    value: crate::sql::exec::ProjectedValue<'_>,
+    colon: &str,
+    comma: &str,
+    out: &mut dyn core::fmt::Write,
+) -> core::fmt::Result {
+    let Some(fields) = value.record_fields() else {
+        return write_datum_json_styled(&value.datum(), colon, comma, out);
+    };
+    out.write_char('{')?;
+    for (i, (name, _, field)) in fields.enumerate() {
+        if i > 0 {
+            out.write_str(comma)?;
+        }
+        write_json_raw_string(name, out)?;
+        out.write_str(colon)?;
+        write_projected_json(field, colon, comma, out)?;
+    }
+    out.write_char('}')
 }

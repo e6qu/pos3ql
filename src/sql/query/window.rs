@@ -4,7 +4,7 @@
 //! bounds (ROWS/RANGE/GROUPS, with EXCLUDE), evaluates the window aggregates
 //! and value functions over that frame, and projects the final rows. The entry
 //! points `rewrite_grouped_windows`, `project_window_rows`, `window_select`,
-//! `dedup_window_rows`, and `cmp_key_rows` are called from the query pipeline.
+//! and `cmp_key_rows` are called from the query pipeline.
 
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
@@ -1465,7 +1465,7 @@ pub(crate) fn project_window_rows<'a>(
     // Enclosing query's row, when this window query is a correlated subquery's
     // body; its columns resolve after this query's own.
     outer: Option<&dyn ColumnLookup<'a>>,
-) -> Result<(&'a [&'a [Datum<'a>]], &'a [&'a [Datum<'a>]]), SqlError> {
+) -> Result<WindowRows<'a>, SqlError> {
     let scan_where = window_scan_where(statement, correlated, arena)?;
     let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
     // Per-row correlated-subquery scratch, allocated once and reused across
@@ -1585,8 +1585,11 @@ pub(crate) fn project_window_rows<'a>(
     let order_exprs: &mut [Option<super::ResolvedSortKey<'a>>] = arena
         .alloc_slice_with(n_order, |_| None)
         .map_err(|_| arena_full())?;
+    let collations = arena
+        .alloc_slice_with(n_order, |_| Collation::None)
+        .map_err(|_| arena_full())?;
     for (k, ob) in statement.order_by.iter().enumerate() {
-        order_exprs[k] = Some(super::resolve_sort_key(
+        let key = super::resolve_sort_key(
             ob.expression,
             statement.items,
             scope,
@@ -1594,7 +1597,9 @@ pub(crate) fn project_window_rows<'a>(
             storage,
             txid,
             &order_exprs[..k],
-        )?);
+        )?;
+        collations[k] = scope.expression_collation(storage, arena, key.expression)?;
+        order_exprs[k] = Some(key);
     }
 
     // Project each row (with the window hook) and compute its sort keys.
@@ -1679,7 +1684,95 @@ pub(crate) fn project_window_rows<'a>(
             .alloc_slice_copy(&keys[..n_order])
             .map_err(|_| arena_full())?;
     }
-    Ok((proj_rows, sort_keys))
+    Ok(WindowRows {
+        rows: proj_rows,
+        sort_keys,
+        collations,
+    })
+}
+
+/// Window-projected output rows with each row's ORDER BY key values and the
+/// collation of each key.
+pub(crate) struct WindowRows<'a> {
+    pub(crate) rows: &'a [&'a [Datum<'a>]],
+    sort_keys: &'a [&'a [Datum<'a>]],
+    collations: &'a [Collation],
+}
+
+impl<'a> WindowRows<'a> {
+    /// SELECT DISTINCT: dedups on the projected values under SQL equality,
+    /// each survivor keeping its sort keys.
+    pub(crate) fn distinct(self, arena: &'a Arena) -> Result<Self, SqlError> {
+        let n = self.rows.len();
+        let index = arena.alloc_slice_with(n, |i| i).map_err(|_| arena_full())?;
+        let empty: &[u8] = &[];
+        let encoded = arena
+            .alloc_slice_with(n, |_| empty)
+            .map_err(|_| arena_full())?;
+        for (encoded, row) in encoded.iter_mut().zip(self.rows) {
+            *encoded = crate::sql::exec::encode_projected_pub(row, arena)?;
+        }
+        let width = self.rows.first().map_or(0, |row| row.len());
+        crate::util::try_sort_unstable_by(index, |&a, &b| {
+            crate::sql::exec::compare_projected_prefix(encoded[a], encoded[b], width)
+        })?;
+        let mut unique = 0usize;
+        for k in 0..n {
+            let same = k > 0
+                && crate::sql::exec::compare_projected_prefix(
+                    encoded[index[k]],
+                    encoded[index[unique - 1]],
+                    width,
+                )?
+                .is_eq();
+            if !same {
+                index[unique] = index[k];
+                unique += 1;
+            }
+        }
+        let rows = arena
+            .alloc_slice_with(unique, |k| self.rows[index[k]])
+            .map_err(|_| arena_full())?;
+        let sort_keys = arena
+            .alloc_slice_with(unique, |k| self.sort_keys[index[k]])
+            .map_err(|_| arena_full())?;
+        Ok(Self {
+            rows,
+            sort_keys,
+            collations: self.collations,
+        })
+    }
+
+    /// The row positions in ORDER BY order; ties keep their input order.
+    pub(crate) fn ordered(
+        &self,
+        storage: &Storage,
+        txid: u32,
+        order_by: &[OrderBy<'_>],
+        arena: &'a Arena,
+    ) -> Result<&'a [usize], SqlError> {
+        let order = arena
+            .alloc_slice_with(self.rows.len(), |i| i)
+            .map_err(|_| arena_full())?;
+        if !order_by.is_empty() {
+            crate::mem::arena::try_stable_sort_via(
+                arena,
+                order,
+                |&a, &b| {
+                    cmp_key_rows(
+                        storage,
+                        txid,
+                        self.collations,
+                        self.sort_keys[a],
+                        self.sort_keys[b],
+                        order_by,
+                    )
+                },
+                |_| arena_full(),
+            )?;
+        }
+        Ok(order)
+    }
 }
 
 /// Compares two encoded rows' first `n` columns under SQL equality and order,
@@ -1695,14 +1788,14 @@ fn compare_encoded_keys(
 ) -> Result<core::cmp::Ordering, SqlError> {
     use core::cmp::Ordering;
     for (k, &collation) in collations.iter().enumerate().take(n) {
-        let va = crate::sql::exec::decode_projected_pub(a, at + k);
-        let vb = crate::sql::exec::decode_projected_pub(b, at + k);
-        let c = match (va.is_null(), vb.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            (false, false) => compare_datums_collated(storage, txid, collation, &va, &vb)?,
-        };
+        let c = super::materialize::compare_ordered_key(
+            storage,
+            txid,
+            collation,
+            (false, true),
+            crate::sql::exec::ProjectedValue::column(a, at + k),
+            crate::sql::exec::ProjectedValue::column(b, at + k),
+        )?;
         if c != Ordering::Equal {
             return Ok(c);
         }
@@ -1723,9 +1816,14 @@ fn compare_encoded_order<'a>(
 ) -> Result<core::cmp::Ordering, SqlError> {
     use core::cmp::Ordering;
     for (k, o) in ord.iter().enumerate() {
-        let va = crate::sql::exec::decode_projected_pub(a, at + k);
-        let vb = crate::sql::exec::decode_projected_pub(b, at + k);
-        let c = order_by_key(storage, txid, collations[k], &va, &vb, o)?;
+        let c = super::materialize::compare_ordered_key(
+            storage,
+            txid,
+            collations[k],
+            (o.descending, o.nulls_first),
+            crate::sql::exec::ProjectedValue::column(a, at + k),
+            crate::sql::exec::ProjectedValue::column(b, at + k),
+        )?;
         if c != Ordering::Equal {
             return Ok(c);
         }
@@ -2123,9 +2221,7 @@ pub(crate) fn external_window_into<'a>(
             statement.order_by,
         )?;
         if statement.distinct && by_order.is_eq() {
-            Ok(crate::sql::exec::compare_projected_prefix(
-                left, right, width,
-            ))
+            crate::sql::exec::compare_projected_prefix(left, right, width)
         } else {
             Ok(by_order)
         }
@@ -2306,10 +2402,12 @@ pub(crate) fn external_window_into<'a>(
                 boundary: _,
                 output: _,
             } = context;
-            let duplicate = statement.distinct
-                && previous.is_some_and(|prior| {
-                    crate::sql::exec::compare_projected_prefix(row, prior, width).is_eq()
-                });
+            let duplicate = match previous {
+                Some(prior) if statement.distinct => {
+                    crate::sql::exec::compare_projected_prefix(row, prior, width)?.is_eq()
+                }
+                _ => false,
+            };
             if duplicate {
                 true
             } else if skipped < offset {
@@ -2419,49 +2517,26 @@ pub(crate) fn window_select<'a>(
         responder.command_complete(tag.as_str())?;
         return sql_ok();
     }
-    let (proj_rows, sort_keys) = match project_window_rows(
+    let rows = match project_window_rows(
         // The top-level query has no enclosing row to resolve against.
         storage, txid, statement, from, scope, win_nodes, hooks, correlated, base, arena, params,
         None,
-    ) {
-        Ok(v) => v,
+    )
+    .and_then(|rows| {
+        if statement.distinct {
+            rows.distinct(arena)
+        } else {
+            Ok(rows)
+        }
+    }) {
+        Ok(rows) => rows,
         Err(e) => return sql_fail(e),
     };
-    // DISTINCT dedups on the projected row (encoded order-preserving), with
-    // each surviving row keeping its sort keys.
-    let (proj_rows, sort_keys) = if statement.distinct {
-        match dedup_window_rows(proj_rows, sort_keys, arena) {
-            Ok(pair) => pair,
-            Err(e) => return sql_fail(e),
-        }
-    } else {
-        (proj_rows, sort_keys)
+    let proj_rows = rows.rows;
+    let order = match rows.ordered(storage, txid, statement.order_by, arena) {
+        Ok(order) => order,
+        Err(e) => return sql_fail(e),
     };
-    let count = proj_rows.len();
-
-    // Sort output rows by the ORDER BY keys.
-    let order = match arena.alloc_slice_with(count, |i| i) {
-        Ok(o) => o,
-        Err(_) => return sql_fail(arena_full()),
-    };
-    if !statement.order_by.is_empty() {
-        for x in 1..count {
-            let mut y = x;
-            while y > 0 {
-                let c = cmp_key_rows(
-                    sort_keys[order[y - 1]],
-                    sort_keys[order[y]],
-                    statement.order_by,
-                );
-                if c == core::cmp::Ordering::Greater {
-                    order.swap(y - 1, y);
-                    y -= 1;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
 
     // Emit under OFFSET/LIMIT.
     let mut emitted = 0u64;
@@ -2486,87 +2561,21 @@ pub(crate) fn window_select<'a>(
     sql_ok()
 }
 
-/// Dedups window-projected rows on the projected values (order-preserving
-/// encoding), keeping each survivor's sort keys. Used by SELECT DISTINCT
-/// with window functions.
-#[allow(clippy::type_complexity)]
-pub(crate) fn dedup_window_rows<'a>(
-    proj_rows: &'a [&'a [Datum<'a>]],
-    sort_keys: &'a [&'a [Datum<'a>]],
-    arena: &'a Arena,
-) -> Result<(&'a [&'a [Datum<'a>]], &'a [&'a [Datum<'a>]]), SqlError> {
-    let n = proj_rows.len();
-    let index = arena.alloc_slice_with(n, |i| i).map_err(|_| arena_full())?;
-    let empty: &[u8] = &[];
-    let encoded = arena
-        .alloc_slice_with(n, |_| empty)
-        .map_err(|_| arena_full())?;
-    for i in 0..n {
-        if proj_rows[i].iter().any(|d| matches!(d, Datum::Bpchar(_))) {
-            let key = arena
-                .alloc_slice_with(proj_rows[i].len(), |j| {
-                    crate::sql::eval::text_view(proj_rows[i][j])
-                })
-                .map_err(|_| arena_full())?;
-            encoded[i] = crate::sql::exec::encode_projected_pub(key, arena)?;
-        } else {
-            encoded[i] = crate::sql::exec::encode_projected_pub(proj_rows[i], arena)?;
-        }
-    }
-    index.sort_unstable_by(|&a, &b| encoded[a].cmp(encoded[b]));
-    let mut unique = 0usize;
-    for k in 0..n {
-        let same = k > 0 && encoded[index[k]] == encoded[index[k - 1]];
-        if !same {
-            index[unique] = index[k];
-            unique += 1;
-        }
-    }
-    let empty_row: &[Datum] = &[];
-    let out_rows = arena
-        .alloc_slice_with(unique, |_| empty_row)
-        .map_err(|_| arena_full())?;
-    let out_keys = arena
-        .alloc_slice_with(unique, |_| empty_row)
-        .map_err(|_| arena_full())?;
-    for k in 0..unique {
-        out_rows[k] = proj_rows[index[k]];
-        out_keys[k] = sort_keys[index[k]];
-    }
-    Ok((&*out_rows, &*out_keys))
-}
-
-/// Compares two precomputed sort-key tuples honoring ASC/DESC + NULLS order.
-pub(crate) fn cmp_key_rows(a: &[Datum], b: &[Datum], ord: &[OrderBy]) -> core::cmp::Ordering {
-    use core::cmp::Ordering;
+/// Compares two precomputed sort-key tuples honoring ASC/DESC + NULLS order,
+/// each key under its collation.
+pub(crate) fn cmp_key_rows(
+    storage: &Storage,
+    txid: u32,
+    collations: &[Collation],
+    a: &[Datum],
+    b: &[Datum],
+    ord: &[OrderBy],
+) -> Result<core::cmp::Ordering, SqlError> {
     for (k, o) in ord.iter().enumerate() {
-        let (va, vb) = (&a[k], &b[k]);
-        let base = match (va.is_null(), vb.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => {
-                if o.nulls_first {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, true) => {
-                if o.nulls_first {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, false) => compare_datums(va, vb).unwrap_or(Ordering::Equal),
-        };
-        let c = if o.descending && !va.is_null() && !vb.is_null() {
-            base.reverse()
-        } else {
-            base
-        };
-        if c != Ordering::Equal {
-            return c;
+        let ordering = order_by_key(storage, txid, collations[k], &a[k], &b[k], o)?;
+        if !ordering.is_eq() {
+            return Ok(ordering);
         }
     }
-    Ordering::Equal
+    Ok(core::cmp::Ordering::Equal)
 }

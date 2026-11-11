@@ -165,3 +165,91 @@ fn record_values_treat_null_fields_as_equal_while_row_constructors_do_not() {
         );
     });
 }
+
+#[test]
+fn sorting_grouping_and_set_operations_order_records_by_field_values() {
+    with_engine("record-ordering", |engine, budget| {
+        run_with(engine, budget, "CREATE TABLE ro(a int, b numeric)");
+        run_with(
+            engine,
+            budget,
+            "INSERT INTO ro VALUES (10, 1.0), (9, 1.00), (2, NULL), (10, 1.00), (100, 2), (NULL, 1)",
+        );
+        let ordered = [
+            "(2,)",
+            "(9,1.00)",
+            "(10,1.0)",
+            "(10,1.00)",
+            "(100,2)",
+            "(,1)",
+        ];
+        assert_eq!(
+            rows(engine, budget, "SELECT ROW(a, b) FROM ro ORDER BY 1"),
+            ordered
+        );
+        assert_eq!(
+            rows(
+                engine,
+                budget,
+                "SELECT array_agg(ROW(a, b) ORDER BY ROW(a, b)) FROM ro"
+            ),
+            [r#"{"(2,)","(9,1.00)","(10,1.0)","(10,1.00)","(100,2)","(,1)"}"#]
+        );
+        // Equal fields spelled differently form one group, represented by
+        // its first input row.
+        let distinct = ["(2,)", "(9,1.00)", "(10,1.0)", "(100,2)", "(,1)"];
+        assert_eq!(
+            rows(
+                engine,
+                budget,
+                "SELECT DISTINCT ROW(a, b) FROM ro ORDER BY 1"
+            ),
+            distinct
+        );
+        assert_eq!(
+            rows(
+                engine,
+                budget,
+                "SELECT ROW(a, b), count(*) FROM ro GROUP BY 1 ORDER BY 1"
+            ),
+            ["(2,)|1", "(9,1.00)|1", "(10,1.0)|2", "(100,2)|1", "(,1)|1"]
+        );
+        assert_eq!(
+            rows(
+                engine,
+                budget,
+                "SELECT ROW(a, b) FROM ro UNION SELECT ROW(a, b) FROM ro ORDER BY 1"
+            ),
+            distinct
+        );
+        assert_eq!(
+            rows(
+                engine,
+                budget,
+                "WITH RECURSIVE t(r) AS (SELECT ROW(1.0) UNION SELECT ROW(1.00) FROM t) \
+                 SELECT * FROM t"
+            ),
+            ["(1.0)"]
+        );
+        assert_eq!(
+            rows(
+                engine,
+                budget,
+                "SELECT x FROM (VALUES (ARRAY[ROW(1), NULL]), (ARRAY[ROW(1), ROW(0)])) v(x) \
+                 ORDER BY x"
+            ),
+            ["{(1),(0)}", "{(1),NULL}"]
+        );
+        // A window query's ORDER BY reports a failed comparison instead of
+        // treating the pair as equal.
+        assert_eq!(
+            error(
+                engine,
+                budget,
+                "SELECT row_number() OVER (), r FROM (VALUES (ROW(1)), (ROW('a'::text))) v(r) \
+                 ORDER BY r"
+            ),
+            "ERROR 42804 cannot compare dissimilar column types integer and text at record column 1"
+        );
+    });
+}

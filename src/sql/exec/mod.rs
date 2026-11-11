@@ -21682,6 +21682,7 @@ fn finish_plpgsql_dml_ctes<'a>(
         query.with,
         super::query::CteReader::Select(query),
         materialized,
+        false,
     )
 }
 
@@ -21753,14 +21754,19 @@ fn in_new_plpgsql_command<'a, T>(
 /// Runs the `WITH` queries of a PL/pgSQL `WITH ... INSERT/UPDATE/DELETE`
 /// that its write reads, and returns the write with every `WITH` query
 /// bound in place, with the rows for [`finish_plpgsql_dml_ctes_of`].
+///
+/// `nested` runs the writes as nested writes of the running command: a
+/// dynamic statement's syntax lives in a scratch region the engine's write
+/// attempts cannot extend.
 fn bind_plpgsql_write_ctes<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     with: TriggerDmlWith<'a>,
+    nested: bool,
 ) -> Result<(TriggerDml<'a>, MaterializedWithQueries<'a>), SqlError> {
     let main = super::query::CteReader::Statement(with.statement);
     let materialized = if !with.writes() {
         &[]
-    } else if let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host {
+    } else if !nested && let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host {
         engine
             .bind_dml_ctes(
                 with.ctes,
@@ -21890,11 +21896,12 @@ fn finish_plpgsql_dml_ctes_of<'a>(
     with: &'a [crate::sql::ast::Cte<'a>],
     main: super::query::CteReader<'_>,
     materialized: MaterializedWithQueries<'a>,
+    nested: bool,
 ) -> Result<(), SqlError> {
     if !with.iter().any(|cte| cte.dml.is_some()) {
         return Ok(());
     }
-    let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
+    let (false, PlpgsqlExecHost::Routine { engine, guc, .. }) = (nested, &mut context.host) else {
         run_nested_dml_ctes(context, with, main, materialized, true)?;
         return Ok(());
     };
@@ -28098,7 +28105,7 @@ fn execute_nested_data_modification<'a>(
             params: arguments,
             responder: context.responder,
         };
-        let (expanded, materialized) = bind_plpgsql_write_ctes(&mut context, with)?;
+        let (expanded, materialized) = bind_plpgsql_write_ctes(&mut context, with, true)?;
         let expanded = context
             .arena
             .alloc(expanded.statement())
@@ -28125,6 +28132,7 @@ fn execute_nested_data_modification<'a>(
             with.ctes,
             super::query::CteReader::Statement(with.statement),
             materialized,
+            true,
         )?;
         Ok(rows)
     })
@@ -35971,7 +35979,7 @@ fn execute_trigger_step_in<'a>(
             let (Some(with), TriggerStatement::Dml { source, into, .. }) = (with, statement) else {
                 return attempt(context, status, None, statement, false);
             };
-            let (expanded, materialized) = bind_plpgsql_write_ctes(context, with)?;
+            let (expanded, materialized) = bind_plpgsql_write_ctes(context, with, false)?;
             let expanded = TriggerStatement::Dml {
                 source,
                 statement: expanded,
@@ -35988,6 +35996,7 @@ fn execute_trigger_step_in<'a>(
                 with.ctes,
                 super::query::CteReader::Statement(with.statement),
                 materialized,
+                false,
             )?;
             Ok(step)
         }),

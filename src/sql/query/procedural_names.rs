@@ -484,7 +484,19 @@ impl<'a: 's, 's> Check<'a, 's> {
             Some(VariableConflict::UseVariable) if level.has_column(qualifier, name) => {
                 self.variable_value(reference, qualifier, name).map(Some)
             }
-            Some(_) if self.detached.get().is_some() && !level.has_column(qualifier, name) => {
+            // A record variable stays a reference: its fields are typed by
+            // the enclosing row the query reads, which a constant loses.
+            Some(_)
+                if self.detached.get().is_some()
+                    && !level.has_column(qualifier, name)
+                    && !matches!(
+                        self.variables.col_type(qualifier, name),
+                        Some(
+                            crate::sql::types::ColType::Record
+                                | crate::sql::types::ColType::Composite(_)
+                        )
+                    ) =>
+            {
                 self.variable_value(reference, qualifier, name).map(Some)
             }
             // A trigger's `NEW` and `OLD` rows are variables too.

@@ -149,10 +149,22 @@ Functions and expressions:
   message returns `54000`. This includes the signature that `DROP`, `ALTER`,
   `COMMENT ON` and `GRANT` quote for a routine they cannot find, such as
   `function f(integer) does not exist`.
-- Built-in functions cannot be changed: `ALTER FUNCTION lower(text) STABLE`,
-  `COMMENT ON FUNCTION lower(text)` and `GRANT EXECUTE ON FUNCTION
-  lower(text)` fail with `0A000`. Dropping one fails with `2BP01`, as in
-  PostgreSQL.
+- Each database has its own copy of a built-in function's catalog row, as in
+  PostgreSQL. `ALTER FUNCTION lower(text) STABLE` changes volatility,
+  `PARALLEL`, `LEAKPROOF`, `COST`, `ROWS` and `OWNER TO` in the current
+  database only; `pg_proc` shows the change, and a generated column or
+  publication row filter then rejects a function marked stable or volatile. `REVOKE EXECUTE ON FUNCTION md5(text) FROM PUBLIC` makes a
+  later `SELECT md5('a')` fail with `42501` for roles without a grant, and
+  `GRANT`, `has_function_privilege`, `proacl` and psql's `\df+` follow
+  PostgreSQL. Changes survive restart and are copied by `CREATE DATABASE ...
+  TEMPLATE`. Each changed routine uses one of the `max_builtin_routine_entries`
+  rows (default 64); running out fails with `54000`. Limits: changing
+  `STRICT`, `SECURITY` or `SET`/`RESET` settings of a built-in, and renaming
+  or moving one, fail with `0A000`, because pos3ql runs built-ins through
+  fixed implementations; a revoked `EXECUTE` is checked for function calls
+  but not for the function behind an operator (`1 + 1` still runs after
+  `REVOKE EXECUTE ON FUNCTION int4pl(integer, integer) FROM PUBLIC`).
+  Dropping a built-in fails with `2BP01`, as in PostgreSQL.
 - Array and `CASE` result types follow declarations, including subqueries and
   nulls: `ARRAY[(SELECT NULL::date)]` is `date[]`; mixing integer and bigint
   gives `bigint[]`; an empty constructor needs a type (`ARRAY[]::integer[]`).

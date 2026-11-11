@@ -312,7 +312,7 @@ pub(super) fn build_column(
                 c.name
             ));
         }
-        ColumnDefault::Generated(resolve_generated(gtext, arena)?)
+        ColumnDefault::Generated(resolve_generated(gtext, storage, txid, arena)?)
     } else {
         let column_default = resolve_default(
             c.default,
@@ -457,6 +457,8 @@ pub(super) fn resolve_parsed_collation(
 /// column list and is checked once the table is assembled.
 pub(super) fn resolve_generated(
     text: &str,
+    storage: &Storage,
+    txid: u32,
     arena: &Arena,
 ) -> Result<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>, SqlError> {
     let expression = crate::sql::parser::parse_expr(text, arena)?;
@@ -466,11 +468,15 @@ pub(super) fn resolve_generated(
             "cannot use subquery in column generation expression"
         ));
     }
-    if let Some(name) = expression.contains_nonimmutable_function() {
+    if expression
+        .contains_nonimmutable_function_with(&|name| {
+            storage.builtin_routine_name_is_nonimmutable(name, txid)
+        })
+        .is_some()
+    {
         return Err(sql_err!(
             sqlstate::INVALID_OBJECT_DEFINITION,
-            "generation expression is not immutable (uses {}())",
-            name
+            "generation expression is not immutable"
         ));
     }
     let stored = StackStr::from_str(text);

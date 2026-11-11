@@ -2291,6 +2291,11 @@ pub trait CatalogAccess {
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
+    /// Checks the current role's `EXECUTE` privilege on a selected built-in
+    /// routine in the current database.
+    fn require_builtin_routine_execute(&self, _oid: i32) -> Result<(), SqlError> {
+        Ok(())
+    }
     fn has_database_privilege(
         &self,
         _role: Option<&str>,
@@ -6934,6 +6939,9 @@ fn call<'a>(
         kind,
     } = syntax;
     let args = if let Some((oid, _)) = builtin {
+        if let Some(catalog) = hooks.catalog {
+            catalog.require_builtin_routine_execute(oid)?;
+        }
         bind_builtin_arguments(oid, args, argument_names, variadic, arena)?
     } else {
         args

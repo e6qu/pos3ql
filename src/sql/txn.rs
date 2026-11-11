@@ -779,6 +779,11 @@ pub(crate) enum DdlUndo {
     ParameterAclChanged {
         prior: crate::storage::ParameterAclUndo,
     },
+    /// `ALTER FUNCTION` changed a built-in routine's row in this database.
+    BuiltinRoutineChanged {
+        slot: u16,
+        prior: Option<crate::storage::PendingBuiltinRoutine>,
+    },
     /// A `COMMENT ON` set or removed an object's comment — undo by restoring
     /// the slot's prior uncommitted overlay. On commit, the overlay is
     /// promoted and journaled.

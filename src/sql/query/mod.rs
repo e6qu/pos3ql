@@ -3801,6 +3801,40 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn require_builtin_routine_execute(&self, oid: i32) -> Result<(), SqlError> {
+        let Some(routine) = crate::storage::BuiltinRoutineOid::parse(oid) else {
+            return Ok(());
+        };
+        let Some(slot) = self.storage.builtin_routine_slot(routine) else {
+            return Ok(());
+        };
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::BuiltinRoutine,
+            slot: slot as u16,
+        };
+        if self.txid != 0 {
+            let role = self.storage.current_role_slot(self.txid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role is not present in the role catalog"
+                )
+            })?;
+            if !self.storage.has_object_privilege(
+                object,
+                role,
+                crate::storage::PrivilegeSet::EXECUTE,
+                self.txid,
+            ) {
+                return Err(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for function {}",
+                    routine.signature().name
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
         crate::sql::catalog::validate_enum_input_literal(
             self.storage,
@@ -6141,18 +6175,28 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         if self.storage.role(role).attributes_to(self.txid).superuser {
             return Ok(Some(true));
         }
-        if let Some(public) = super::catalog::intrinsic_routine_public_execute(oid) {
-            let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
-            return Ok(Some(requested.allows(
-                PrivilegeSet::NONE,
-                |_| owner || public,
-                |_| owner,
-            )));
-        }
-        let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
-            return Ok(None);
+        let builtin = crate::storage::BuiltinRoutineOid::parse(oid)
+            .filter(|_| self.storage.routine_slot_by_oid(oid, self.txid).is_none());
+        let object = match builtin.and_then(|routine| self.storage.builtin_routine_slot(routine)) {
+            Some(slot) => crate::storage::AccessObject {
+                class: crate::storage::AccessClass::BuiltinRoutine,
+                slot: slot as u16,
+            },
+            None => {
+                if let Some(public) = super::catalog::intrinsic_routine_public_execute(oid) {
+                    let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
+                    return Ok(Some(requested.allows(
+                        PrivilegeSet::NONE,
+                        |_| owner || public,
+                        |_| owner,
+                    )));
+                }
+                let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
+                    return Ok(None);
+                };
+                crate::storage::Storage::routine_access_object(slot)
+            }
         };
-        let object = crate::storage::Storage::routine_access_object(slot);
         Ok(Some(requested.allows(
             crate::storage::PrivilegeSet::NONE,
             |privilege| {

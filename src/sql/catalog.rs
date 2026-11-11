@@ -10833,7 +10833,9 @@ fn acl<'a>(
         | crate::storage::AccessClass::Enum
         | crate::storage::AccessClass::Composite => crate::storage::PrivilegeSet::TYPE_ALL,
         crate::storage::AccessClass::Index => crate::storage::PrivilegeSet::NONE,
-        crate::storage::AccessClass::Routine => crate::storage::PrivilegeSet::FUNCTION_ALL,
+        crate::storage::AccessClass::Routine | crate::storage::AccessClass::BuiltinRoutine => {
+            crate::storage::PrivilegeSet::FUNCTION_ALL
+        }
         crate::storage::AccessClass::LargeObject => crate::storage::PrivilegeSet::LARGE_OBJECT_ALL,
         crate::storage::AccessClass::ForeignDataWrapper
         | crate::storage::AccessClass::ForeignServer
@@ -22790,6 +22792,10 @@ fn extension_dependency_catalog_identity(
         AccessClass::ForeignDataWrapper => (2328, storage.foreign_wrapper_entry(slot).oid()),
         AccessClass::ForeignServer => (1417, storage.foreign_server_entry(slot).oid()),
         AccessClass::Language => (PG_LANGUAGE_OID, object.slot.into()),
+        AccessClass::BuiltinRoutine => (
+            PG_PROC_OID,
+            storage.builtin_routine_entry(slot).routine?.get(),
+        ),
     })
 }
 
@@ -27910,6 +27916,19 @@ fn builtin_proc_row<'a>(
             "builtin callable namespace is unavailable"
         )
     })?;
+    let routine = crate::storage::BuiltinRoutineOid::parse(signature.oid)
+        .expect("callable signatures name built-in routines");
+    let state = storage.builtin_routine_state(routine, txid);
+    let attributes = state.attributes.attributes;
+    let proacl = match state.access_object() {
+        Some(object) if storage.object_acl_defined(object, txid) => {
+            acl(storage, object, txid, arena)?
+        }
+        _ if intrinsic_routine_public_execute(signature.oid) == Some(false) => {
+            builtin_acl(&["postgres=X/postgres"], arena)?
+        }
+        _ => Datum::Null,
+    };
     let all_types = if metadata.all_arguments.is_empty() {
         Datum::Null
     } else {
@@ -27960,23 +27979,27 @@ fn builtin_proc_row<'a>(
             Datum::Bool(signature.returns_set),
             Datum::Char(signature.kind),
             oidvector(signature.arguments, arena)?,
-            Datum::Bpchar(metadata.volatility),
-            Datum::Bpchar(metadata.parallel),
-            Datum::Int4(10),
-            Datum::Bool(metadata.security_definer),
-            if intrinsic_routine_public_execute(signature.oid) == Some(false) {
-                builtin_acl(&["postgres=X/postgres"], arena)?
-            } else {
-                Datum::Null
-            },
+            Datum::Bpchar(match attributes.volatility {
+                crate::storage::RoutineVolatility::Immutable => "i",
+                crate::storage::RoutineVolatility::Stable => "s",
+                crate::storage::RoutineVolatility::Volatile => "v",
+            }),
+            Datum::Bpchar(match attributes.parallel {
+                crate::storage::RoutineParallel::Safe => "s",
+                crate::storage::RoutineParallel::Restricted => "r",
+                crate::storage::RoutineParallel::Unsafe => "u",
+            }),
+            Datum::Int4(storage.role_oid(usize::from(state.owner))),
+            Datum::Bool(attributes.security_definer),
+            proacl,
             Datum::Int4(metadata.language),
             Datum::Text(metadata.source),
             Datum::Null,
-            Datum::Bool(metadata.strict),
-            Datum::Bool(metadata.leakproof),
+            Datum::Bool(attributes.strict),
+            Datum::Bool(attributes.leakproof),
             Datum::Null,
-            Datum::Float8(metadata.cost),
-            Datum::Float8(metadata.rows),
+            Datum::Float8(state.attributes.cost()),
+            Datum::Float8(state.attributes.rows()),
             Datum::Null,
             Datum::RegObject {
                 type_oid: super::types::oid::REGPROC,

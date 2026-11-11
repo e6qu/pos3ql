@@ -153,6 +153,9 @@ pub struct Config {
     pub max_default_acl_entries: usize,
     /// Fixed number of server-parameter privilege rows.
     pub max_parameter_acl_entries: usize,
+    /// Fixed number of per-database built-in routine rows changed by
+    /// `ALTER FUNCTION`, `GRANT` or `REVOKE` on a PostgreSQL built-in.
+    pub max_builtin_routine_entries: usize,
     /// Fixed number of named index catalog slots. Physical acceleration
     /// bindings draw separately from `max_value_indexes`.
     pub max_indexes: usize,
@@ -467,6 +470,7 @@ impl Config {
             max_column_acl_entries: 1024,
             max_default_acl_entries: 256,
             max_parameter_acl_entries: 128,
+            max_builtin_routine_entries: 64,
             max_indexes: 32,
             max_extended_statistics: 256,
             max_brin_unsummarized_ranges_per_index: 64,
@@ -918,6 +922,10 @@ impl Config {
                 }
                 "max_parameter_acl_entries" => {
                     config.max_parameter_acl_entries =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_builtin_routine_entries" => {
+                    config.max_builtin_routine_entries =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_indexes" => {
@@ -1606,6 +1614,7 @@ impl Config {
             config.max_column_acl_entries,
             config.max_default_acl_entries,
             config.max_parameter_acl_entries,
+            config.max_builtin_routine_entries,
             config.max_indexes,
             config.max_extended_statistics,
             config.max_views,
@@ -1895,6 +1904,11 @@ impl Config {
                 "max_parameter_acl_entries",
                 config.max_parameter_acl_entries,
                 crate::storage::MAX_PARAMETER_ACL_CATALOG_SLOTS,
+            ),
+            (
+                "max_builtin_routine_entries",
+                config.max_builtin_routine_entries,
+                crate::storage::MAX_BUILTIN_ROUTINE_CATALOG_SLOTS,
             ),
         ] {
             if capacity > maximum {
@@ -2594,6 +2608,7 @@ max_acl_entries = 800
 max_column_acl_entries = 1200
 max_default_acl_entries = 500
 max_parameter_acl_entries = 300
+max_builtin_routine_entries = 301
 max_extended_statistics = 333
 max_brin_unsummarized_ranges_per_index = 200
 memtable_bytes = 16MiB   # small for tests
@@ -2639,6 +2654,7 @@ sql_arena_bytes = 4096
         assert_eq!(c.max_column_acl_entries, 1200);
         assert_eq!(c.max_default_acl_entries, 500);
         assert_eq!(c.max_parameter_acl_entries, 300);
+        assert_eq!(c.max_builtin_routine_entries, 301);
         assert_eq!(c.max_extended_statistics, 333);
         assert_eq!(c.max_brin_unsummarized_ranges_per_index, 200);
         assert_eq!(c.memtable_bytes, 16 * MIB);
@@ -3038,6 +3054,9 @@ sql_arena_bytes = 4096
             Config::parse("max_parameter_acl_entries = 0\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\n").is_err()
         );
         assert!(
+            Config::parse("max_builtin_routine_entries = 0\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\n").is_err()
+        );
+        assert!(
             Config::parse(
                 "max_indexes = 0\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\n"
             )
@@ -3239,6 +3258,7 @@ sql_arena_bytes = 4096
             "max_column_acl_entries",
             "max_default_acl_entries",
             "max_parameter_acl_entries",
+            "max_builtin_routine_entries",
         ] {
             let error = Config::parse(&format!(
                 "{name} = 65536\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\n"

@@ -7616,6 +7616,16 @@ impl<'a> Parser<'a> {
         let mut actions = [AlterRoutineAction::SetStrict(false); 32];
         let mut action_count = 0usize;
         loop {
+            // OWNER TO, RENAME TO, SET SCHEMA and DEPENDS ON EXTENSION are
+            // whole commands in PostgreSQL's grammar, never list items.
+            if action_count > 0
+                && matches!(
+                    self.peeked,
+                    Tok::Ident("owner" | "rename" | "depends" | "no")
+                )
+            {
+                return Err(self.syntax_error_here());
+            }
             let action = if self.eat_ident("owner")? {
                 self.expect_ident("to")?;
                 AlterRoutineAction::SetOwner(self.any_ident("role name")?)
@@ -7623,6 +7633,9 @@ impl<'a> Parser<'a> {
                 self.expect_ident("to")?;
                 AlterRoutineAction::Rename(self.col_ident("routine name")?)
             } else if self.eat_ident("set")? {
+                if action_count > 0 && self.eat_ident("schema")? {
+                    return Err(self.syntax_error_here());
+                }
                 if self.eat_ident("schema")? {
                     AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
                 } else {

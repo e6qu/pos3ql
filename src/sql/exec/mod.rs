@@ -10107,7 +10107,7 @@ fn privilege_mask(
         AccessClass::Schema => PrivilegeSet::SCHEMA_ALL,
         AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => PrivilegeSet::TYPE_ALL,
         AccessClass::Index => PrivilegeSet::NONE,
-        AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
+        AccessClass::Routine | AccessClass::BuiltinRoutine => PrivilegeSet::FUNCTION_ALL,
         AccessClass::LargeObject => PrivilegeSet::LARGE_OBJECT_ALL,
         AccessClass::ForeignDataWrapper | AccessClass::ForeignServer | AccessClass::Language => {
             PrivilegeSet::USAGE
@@ -10175,7 +10175,7 @@ fn privilege_object_noun(class: crate::storage::AccessClass) -> &'static str {
         AccessClass::Database => "database",
         AccessClass::Schema => "schema",
         AccessClass::Sequence => "sequence",
-        AccessClass::Routine => "function",
+        AccessClass::Routine | AccessClass::BuiltinRoutine => "function",
         AccessClass::LargeObject => "large object",
         AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => "type",
         AccessClass::Language => "language",
@@ -10441,7 +10441,8 @@ fn apply_default_privileges_to_new_object(
         | AccessClass::LargeObject
         | AccessClass::ForeignDataWrapper
         | AccessClass::ForeignServer
-        | AccessClass::Language => return Ok(()),
+        | AccessClass::Language
+        | AccessClass::BuiltinRoutine => return Ok(()),
     };
     let owner = storage.object_owner(object, txn.txid) as u16;
     let schema = if object.class == AccessClass::Schema {
@@ -10646,6 +10647,7 @@ pub fn reassign_owned(
         AccessClass::Composite,
         AccessClass::Index,
         AccessClass::Routine,
+        AccessClass::BuiltinRoutine,
         AccessClass::Statistics,
         AccessClass::Tablespace,
         AccessClass::Extension,
@@ -11140,6 +11142,19 @@ pub(crate) fn drop_owned(
         Err(error) => return sql_fail(error),
     };
     let owned_roles = &owned_roles[..owned_role_count];
+    // A built-in routine given to the role cannot be dropped with it.
+    for slot in 0..storage.access_class_slots(AccessClass::BuiltinRoutine) {
+        let object = AccessObject {
+            class: AccessClass::BuiltinRoutine,
+            slot: slot as u16,
+        };
+        if storage.access_object_visible_to(object, txn.txid)
+            && owned_roles.contains(&(storage.object_owner(object, txn.txid) as u16))
+            && let Some(routine) = storage.builtin_routine_entry(slot).routine
+        {
+            return sql_fail(routine_lookup::builtin_drop_error(routine.signature()));
+        }
+    }
     if let Err(error) = drop_owned_privileges(storage, txn, owned_roles, arena) {
         return sql_fail(error);
     }
@@ -12102,8 +12117,19 @@ fn resolve_privilege_objects(
         }
         PrivilegeTarget::Routines { kind, identities } => {
             for identity in identities {
-                let slot = resolve_routine_identity(storage, txid, identity, kind)?;
-                add_privilege_object(objects, &mut count, Storage::routine_access_object(slot))?;
+                let object = match lookup_routine(storage, txid, kind, identity)? {
+                    Ok(RoutineTarget::Stored(slot)) => Storage::routine_access_object(slot),
+                    // Each database has its own copy of a built-in's privileges.
+                    Ok(RoutineTarget::Builtin(signature)) => AccessObject {
+                        class: AccessClass::BuiltinRoutine,
+                        slot: storage.ensure_builtin_routine(
+                            crate::storage::BuiltinRoutineOid::parse(signature.oid)
+                                .expect("a resolved built-in routine has a catalog OID"),
+                        )?,
+                    },
+                    Err(miss) => return Err(miss.error(storage, txid, kind, identity)),
+                };
+                add_privilege_object(objects, &mut count, object)?;
             }
         }
         PrivilegeTarget::Objects { kind, names } => {
@@ -12520,7 +12546,7 @@ fn materialize_public_acl_default(
     let public_privileges = if acl_defined {
         crate::storage::PrivilegeSet::NONE
     } else {
-        crate::storage::default_public_object_privileges(object.class)
+        storage.object_default_public_privileges(object)
     };
     // PostgreSQL's initial ACL places PUBLIC before the owner when present.
     for (grantee, privileges) in [
@@ -17141,11 +17167,21 @@ fn publication_members(
             validate_publication_column_mask(storage, slot, mask, txid)?;
         }
         if let Some(filter) = table.filter {
-            if let Some(function) = filter.contains_nonimmutable_function() {
+            if filter
+                .contains_nonimmutable_function_with(&|name| {
+                    storage.builtin_routine_name_is_nonimmutable(name, txid)
+                })
+                .is_some()
+            {
+                crate::sql::eval::stash_diagnostic(
+                    Some(StackStr::from_str(
+                        "User-defined or built-in mutable functions are not allowed.",
+                    )),
+                    None,
+                );
                 return Err(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "publication row filter cannot use non-immutable function \"{}\"",
-                    function
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "invalid publication WHERE expression"
                 ));
             }
             let referenced = crate::sql::exec::ddl::check_referenced_columns(filter, &definition)?;
@@ -39731,6 +39767,352 @@ pub fn drop_aggregate(
     )
 }
 
+/// Applies `ALTER FUNCTION` attribute and configuration actions to a stored
+/// or built-in routine's attributes. `configs[..config_count]` holds the
+/// routine's settings; the slice length is its capacity.
+#[allow(clippy::too_many_arguments)]
+fn apply_routine_definition_actions(
+    storage: &Storage,
+    txid: u32,
+    procedure: bool,
+    set_returning: bool,
+    actions: &[crate::sql::ast::AlterRoutineAction<'_>],
+    guc: Option<&crate::sql::guc::GucState>,
+    attributes: &mut crate::storage::RoutineAttributes,
+    configs: &mut [crate::storage::RoutineConfig],
+    config_count: &mut usize,
+) -> Result<(), SqlError> {
+    let config_count_ref = config_count;
+    let mut config_count = *config_count_ref;
+    for action in actions {
+        let function_only = matches!(
+            action,
+            crate::sql::ast::AlterRoutineAction::SetStrict(_)
+                | crate::sql::ast::AlterRoutineAction::SetVolatility(_)
+                | crate::sql::ast::AlterRoutineAction::SetLeakproof(_)
+                | crate::sql::ast::AlterRoutineAction::SetParallel(_)
+                | crate::sql::ast::AlterRoutineAction::SetCost(_)
+                | crate::sql::ast::AlterRoutineAction::SetRows(_)
+        );
+        if function_only && procedure {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "procedure attributes support only SECURITY and configuration settings"
+            ));
+        }
+        match *action {
+            crate::sql::ast::AlterRoutineAction::SetStrict(value) => {
+                attributes.strict = value;
+            }
+            crate::sql::ast::AlterRoutineAction::SetVolatility(value) => {
+                attributes.volatility = match value {
+                    super::ast::RoutineVolatility::Immutable => {
+                        crate::storage::RoutineVolatility::Immutable
+                    }
+                    super::ast::RoutineVolatility::Stable => {
+                        crate::storage::RoutineVolatility::Stable
+                    }
+                    super::ast::RoutineVolatility::Volatile => {
+                        crate::storage::RoutineVolatility::Volatile
+                    }
+                };
+            }
+            crate::sql::ast::AlterRoutineAction::SetLeakproof(value) => {
+                if value {
+                    let current = super::eval::funcs::system::current_user_owned();
+                    let superuser = storage
+                        .find_role_visible(current.as_str(), txid)
+                        .is_some_and(|role| storage.role(role).attributes_to(txid).superuser);
+                    if !superuser {
+                        return Err(sql_err!(
+                            sqlstate::INSUFFICIENT_PRIVILEGE,
+                            "only superuser can define a leakproof function"
+                        ));
+                    }
+                }
+                attributes.leakproof = value;
+            }
+            crate::sql::ast::AlterRoutineAction::SetSecurityDefiner(value) => {
+                attributes.security_definer = value;
+            }
+            crate::sql::ast::AlterRoutineAction::SetParallel(value) => {
+                attributes.parallel = match value {
+                    super::ast::RoutineParallel::Safe => crate::storage::RoutineParallel::Safe,
+                    super::ast::RoutineParallel::Restricted => {
+                        crate::storage::RoutineParallel::Restricted
+                    }
+                    super::ast::RoutineParallel::Unsafe => crate::storage::RoutineParallel::Unsafe,
+                };
+            }
+            crate::sql::ast::AlterRoutineAction::SetCost(value) => {
+                attributes.cost_bits = Some(value.get().to_bits());
+            }
+            crate::sql::ast::AlterRoutineAction::SetRows(value) => {
+                if !set_returning {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "ROWS is not applicable when function does not return a set"
+                    ));
+                }
+                attributes.rows_bits = Some(value.get().to_bits());
+            }
+            crate::sql::ast::AlterRoutineAction::SetConfig { name, value } => {
+                let Some(guc) = guc else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine configuration state is unavailable"
+                    ));
+                };
+                let stored_name = super::guc::canonical_setting_name(name)?;
+                if value == super::ast::RoutineConfigValue::Default {
+                    guc.validate_setting_value(name, None)?;
+                    if let Some(index) = configs[..config_count]
+                        .iter()
+                        .position(|config| config.name == stored_name)
+                    {
+                        configs.copy_within(index + 1..config_count, index);
+                        config_count -= 1;
+                        configs[config_count] = crate::storage::RoutineConfig::EMPTY;
+                    }
+                    continue;
+                }
+                let stored_value = match value {
+                    super::ast::RoutineConfigValue::Default => {
+                        unreachable!("default removes the setting above")
+                    }
+                    super::ast::RoutineConfigValue::Value(value) => {
+                        guc.validate_setting_value(name, Some(value))?;
+                        StackStr::from_str(value)
+                    }
+                    super::ast::RoutineConfigValue::Current => {
+                        StackStr::from_str(guc.capture_setting_value(name)?.as_str())
+                    }
+                };
+                if stored_value.is_truncated() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "routine configuration value exceeds {} bytes",
+                        crate::storage::ROUTINE_CONFIG_VALUE_MAX
+                    ));
+                }
+                if let Some(index) = configs[..config_count]
+                    .iter()
+                    .position(|config| config.name == stored_name)
+                {
+                    configs[index].value = stored_value;
+                } else {
+                    if config_count == configs.len() {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "too many routine configuration settings (limit {})",
+                            configs.len()
+                        ));
+                    }
+                    configs[config_count] = crate::storage::RoutineConfig {
+                        name: stored_name,
+                        value: stored_value,
+                    };
+                    config_count += 1;
+                }
+            }
+            crate::sql::ast::AlterRoutineAction::ResetConfig(name) => {
+                if let Some(name) = name {
+                    let Some(guc) = guc else {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "routine configuration state is unavailable"
+                        ));
+                    };
+                    guc.validate_setting_value(name, None)?;
+                    if let Some(index) = configs[..config_count]
+                        .iter()
+                        .position(|config| config.name.as_str().eq_ignore_ascii_case(name))
+                    {
+                        configs.copy_within(index + 1..config_count, index);
+                        config_count -= 1;
+                        configs[config_count] = crate::storage::RoutineConfig::EMPTY;
+                    }
+                } else {
+                    configs.fill(crate::storage::RoutineConfig::EMPTY);
+                    config_count = 0;
+                }
+            }
+            _ => unreachable!("definition action set is closed above"),
+        }
+    }
+    *config_count_ref = config_count;
+    Ok(())
+}
+
+/// `ALTER FUNCTION` on a PostgreSQL built-in changes the current database's
+/// copy of its `pg_proc` row. Renaming, moving and extension membership stay
+/// unsupported because built-in routines are resolved by their fixed names.
+#[allow(clippy::too_many_arguments)]
+fn alter_builtin_routine(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    kind: crate::sql::ast::RoutineTargetKind,
+    identity: &super::ast::RoutineIdentity<'_>,
+    signature: &'static super::catalog::BuiltinCallableSignature,
+    actions: &[crate::sql::ast::AlterRoutineAction<'_>],
+    guc: Option<&crate::sql::guc::GucState>,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::sql::ast::AlterRoutineAction;
+    let routine = crate::storage::BuiltinRoutineOid::parse(signature.oid)
+        .expect("a resolved built-in routine has a catalog OID");
+    if let Err(error) = storage.require_builtin_routine_owner(routine, txn.txid) {
+        return sql_fail(error);
+    }
+    let tag = match kind {
+        crate::sql::ast::RoutineTargetKind::Function => "ALTER FUNCTION",
+        crate::sql::ast::RoutineTargetKind::Procedure => "ALTER PROCEDURE",
+        crate::sql::ast::RoutineTargetKind::Aggregate => "ALTER AGGREGATE",
+        crate::sql::ast::RoutineTargetKind::Either => "ALTER ROUTINE",
+    };
+    match actions.first() {
+        Some(AlterRoutineAction::Rename(_))
+        | Some(AlterRoutineAction::SetSchema(_))
+        | Some(AlterRoutineAction::ExtensionDependency { .. }) => {
+            return sql_fail(routine_lookup::builtin_change_error(
+                storage, txn.txid, identity,
+            ));
+        }
+        Some(AlterRoutineAction::SetOwner(role)) => {
+            let role = resolve_role_name(role);
+            let Some(new_owner) = storage.find_role_visible(role.as_str(), txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role \"{}\" does not exist",
+                    role.as_str()
+                ));
+            };
+            let current = super::eval::funcs::system::current_user_owned();
+            let Some(current_role) = storage.find_role_visible(current.as_str(), txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role \"{}\" does not exist",
+                    current.as_str()
+                ));
+            };
+            let superuser = storage.role(current_role).attributes_to(txn.txid).superuser;
+            if !superuser
+                && current_role != new_owner
+                && !storage.role_can_set(current_role, new_owner, txn.txid)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "must be able to SET ROLE \"{}\"",
+                    role.as_str()
+                ));
+            }
+            if !superuser
+                && let Err(error) =
+                    storage.require_schema_create_as(signature.schema, new_owner, txn.txid)
+            {
+                return sql_fail(error);
+            }
+            if let Err(error) = storage.role_reference_ready(new_owner, txn.txid) {
+                return sql_fail(error);
+            }
+            let object = match storage.ensure_builtin_routine(routine) {
+                Ok(slot) => crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::BuiltinRoutine,
+                    slot,
+                },
+                Err(error) => return sql_fail(error),
+            };
+            let old_owner = storage.object_owner(object, txn.txid) as u16;
+            let prior = storage.set_object_owner(object, new_owner, txn.txid);
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::ObjectOwnerChanged { object, prior },
+            ) {
+                storage.restore_object_owner(object, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) =
+                rewrite_object_acl_owner(storage, txn, object, old_owner, new_owner as u16)
+            {
+                return sql_fail(error);
+            }
+            responder.command_complete(tag)?;
+            return sql_ok();
+        }
+        _ => {}
+    }
+    if signature.kind == b'a' {
+        return sql_fail(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "aggregate routine attributes cannot be altered with this command"
+        ));
+    }
+    let fixed_attribute_error = |storage: &Storage| {
+        routine_lookup::signature_error(
+            storage,
+            txn.txid,
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "STRICT, SECURITY and SET of built-in function ",
+            identity,
+            " cannot be changed",
+        )
+    };
+    if actions.iter().any(|action| {
+        matches!(
+            action,
+            AlterRoutineAction::SetConfig { .. } | AlterRoutineAction::ResetConfig(_)
+        )
+    }) {
+        return sql_fail(fixed_attribute_error(storage));
+    }
+    let state = storage.builtin_routine_state(routine, txn.txid);
+    let mut attributes = state.attributes.attributes;
+    let mut configs = [crate::storage::RoutineConfig::EMPTY; 0];
+    let mut config_count = 0;
+    if let Err(error) = apply_routine_definition_actions(
+        storage,
+        txn.txid,
+        signature.kind == b'p',
+        signature.returns_set,
+        actions,
+        guc,
+        &mut attributes,
+        &mut configs,
+        &mut config_count,
+    ) {
+        return sql_fail(error);
+    }
+    // pos3ql runs built-ins by their fixed implementations, so it cannot honor
+    // changed null handling, caller identity or per-call settings.
+    let initial = state.attributes.attributes;
+    if attributes.strict != initial.strict
+        || attributes.security_definer != initial.security_definer
+    {
+        return sql_fail(fixed_attribute_error(storage));
+    }
+    let image = match crate::storage::BuiltinRoutineAttributes::new(routine, attributes) {
+        Ok(image) => image,
+        Err(error) => return sql_fail(error),
+    };
+    let slot = match storage.ensure_builtin_routine(routine) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let prior = match storage.set_builtin_routine_attributes(slot, image, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::BuiltinRoutineChanged { slot, prior },
+    ) {
+        storage.restore_builtin_routine_pending(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete(tag)?;
+    sql_ok()
+}
+
 pub struct AlterRoutineCommand<'command, 'sql> {
     pub kind: crate::sql::ast::RoutineTargetKind,
     pub identity: &'command super::ast::RoutineIdentity<'sql>,
@@ -39757,8 +40139,14 @@ pub fn alter_routine(
             "ALTER ROUTINE has no action"
         ));
     };
-    let slot = match resolve_routine_identity(storage, txn.txid, identity, kind) {
-        Ok(slot) => slot,
+    let slot = match lookup_routine(storage, txn.txid, kind, identity) {
+        Ok(Ok(RoutineTarget::Stored(slot))) => slot,
+        Ok(Ok(RoutineTarget::Builtin(signature))) => {
+            return alter_builtin_routine(
+                storage, txn, kind, identity, signature, actions, guc, responder,
+            );
+        }
+        Ok(Err(miss)) => return sql_fail(miss.error(storage, txn.txid, kind, identity)),
         Err(error) => return sql_fail(error),
     };
     let routine = storage.routine_for(slot, txn.txid);
@@ -39789,177 +40177,18 @@ pub fn alter_routine(
         let mut attributes = routine.attributes;
         let mut configs = routine.configs;
         let mut config_count = routine.config_count;
-        for action in actions {
-            let function_only = matches!(
-                action,
-                crate::sql::ast::AlterRoutineAction::SetStrict(_)
-                    | crate::sql::ast::AlterRoutineAction::SetVolatility(_)
-                    | crate::sql::ast::AlterRoutineAction::SetLeakproof(_)
-                    | crate::sql::ast::AlterRoutineAction::SetParallel(_)
-                    | crate::sql::ast::AlterRoutineAction::SetCost(_)
-                    | crate::sql::ast::AlterRoutineAction::SetRows(_)
-            );
-            if function_only && matches!(routine.kind, crate::storage::RoutineKind::Procedure) {
-                return sql_fail(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "procedure attributes support only SECURITY and configuration settings"
-                ));
-            }
-            match *action {
-                crate::sql::ast::AlterRoutineAction::SetStrict(value) => {
-                    attributes.strict = value;
-                }
-                crate::sql::ast::AlterRoutineAction::SetVolatility(value) => {
-                    attributes.volatility = match value {
-                        super::ast::RoutineVolatility::Immutable => {
-                            crate::storage::RoutineVolatility::Immutable
-                        }
-                        super::ast::RoutineVolatility::Stable => {
-                            crate::storage::RoutineVolatility::Stable
-                        }
-                        super::ast::RoutineVolatility::Volatile => {
-                            crate::storage::RoutineVolatility::Volatile
-                        }
-                    };
-                }
-                crate::sql::ast::AlterRoutineAction::SetLeakproof(value) => {
-                    if value {
-                        let current = super::eval::funcs::system::current_user_owned();
-                        let superuser = storage
-                            .find_role_visible(current.as_str(), txn.txid)
-                            .is_some_and(|role| {
-                                storage.role(role).attributes_to(txn.txid).superuser
-                            });
-                        if !superuser {
-                            return sql_fail(sql_err!(
-                                sqlstate::INSUFFICIENT_PRIVILEGE,
-                                "only superuser can define a leakproof function"
-                            ));
-                        }
-                    }
-                    attributes.leakproof = value;
-                }
-                crate::sql::ast::AlterRoutineAction::SetSecurityDefiner(value) => {
-                    attributes.security_definer = value;
-                }
-                crate::sql::ast::AlterRoutineAction::SetParallel(value) => {
-                    attributes.parallel = match value {
-                        super::ast::RoutineParallel::Safe => crate::storage::RoutineParallel::Safe,
-                        super::ast::RoutineParallel::Restricted => {
-                            crate::storage::RoutineParallel::Restricted
-                        }
-                        super::ast::RoutineParallel::Unsafe => {
-                            crate::storage::RoutineParallel::Unsafe
-                        }
-                    };
-                }
-                crate::sql::ast::AlterRoutineAction::SetCost(value) => {
-                    attributes.cost_bits = Some(value.get().to_bits());
-                }
-                crate::sql::ast::AlterRoutineAction::SetRows(value) => {
-                    if !routine.kind.is_set_returning() {
-                        return sql_fail(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "ROWS is not applicable when function does not return a set"
-                        ));
-                    }
-                    attributes.rows_bits = Some(value.get().to_bits());
-                }
-                crate::sql::ast::AlterRoutineAction::SetConfig { name, value } => {
-                    let Some(guc) = guc else {
-                        return sql_fail(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "routine configuration state is unavailable"
-                        ));
-                    };
-                    let stored_name = match super::guc::canonical_setting_name(name) {
-                        Ok(name) => name,
-                        Err(error) => return sql_fail(error),
-                    };
-                    if value == super::ast::RoutineConfigValue::Default {
-                        if let Err(error) = guc.validate_setting_value(name, None) {
-                            return sql_fail(error);
-                        }
-                        if let Some(index) = configs[..config_count]
-                            .iter()
-                            .position(|config| config.name == stored_name)
-                        {
-                            configs.copy_within(index + 1..config_count, index);
-                            config_count -= 1;
-                            configs[config_count] = crate::storage::RoutineConfig::EMPTY;
-                        }
-                        continue;
-                    }
-                    let stored_value = match value {
-                        super::ast::RoutineConfigValue::Default => {
-                            unreachable!("default removes the setting above")
-                        }
-                        super::ast::RoutineConfigValue::Value(value) => {
-                            match guc.validate_setting_value(name, Some(value)) {
-                                Ok(()) => StackStr::from_str(value),
-                                Err(error) => return sql_fail(error),
-                            }
-                        }
-                        super::ast::RoutineConfigValue::Current => {
-                            match guc.capture_setting_value(name) {
-                                Ok(value) => StackStr::from_str(value.as_str()),
-                                Err(error) => return sql_fail(error),
-                            }
-                        }
-                    };
-                    if stored_value.is_truncated() {
-                        return sql_fail(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "routine configuration value exceeds {} bytes",
-                            crate::storage::ROUTINE_CONFIG_VALUE_MAX
-                        ));
-                    }
-                    if let Some(index) = configs[..config_count]
-                        .iter()
-                        .position(|config| config.name == stored_name)
-                    {
-                        configs[index].value = stored_value;
-                    } else {
-                        if config_count == configs.len() {
-                            return sql_fail(sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "too many routine configuration settings (limit {})",
-                                configs.len()
-                            ));
-                        }
-                        configs[config_count] = crate::storage::RoutineConfig {
-                            name: stored_name,
-                            value: stored_value,
-                        };
-                        config_count += 1;
-                    }
-                }
-                crate::sql::ast::AlterRoutineAction::ResetConfig(name) => {
-                    if let Some(name) = name {
-                        let Some(guc) = guc else {
-                            return sql_fail(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "routine configuration state is unavailable"
-                            ));
-                        };
-                        if let Err(error) = guc.validate_setting_value(name, None) {
-                            return sql_fail(error);
-                        }
-                        if let Some(index) = configs[..config_count]
-                            .iter()
-                            .position(|config| config.name.as_str().eq_ignore_ascii_case(name))
-                        {
-                            configs.copy_within(index + 1..config_count, index);
-                            config_count -= 1;
-                            configs[config_count] = crate::storage::RoutineConfig::EMPTY;
-                        }
-                    } else {
-                        configs.fill(crate::storage::RoutineConfig::EMPTY);
-                        config_count = 0;
-                    }
-                }
-                _ => unreachable!("definition action set is closed above"),
-            }
+        if let Err(error) = apply_routine_definition_actions(
+            storage,
+            txn.txid,
+            matches!(routine.kind, crate::storage::RoutineKind::Procedure),
+            routine.kind.is_set_returning(),
+            actions,
+            guc,
+            &mut attributes,
+            &mut configs,
+            &mut config_count,
+        ) {
+            return sql_fail(error);
         }
         let pending = crate::storage::RoutineDefinition {
             arguments: routine.arguments,
@@ -43697,7 +43926,11 @@ pub fn comment(
                 }
                 // PostgreSQL comments on its built-in routines' catalog rows.
                 Ok(Ok(RoutineTarget::Builtin(builtin))) => {
-                    if let Err(error) = storage.require_builtin_routine_owner(builtin.name, txid) {
+                    if let Err(error) = storage.require_builtin_routine_owner(
+                        crate::storage::BuiltinRoutineOid::parse(builtin.oid)
+                            .expect("a resolved built-in routine has a catalog OID"),
+                        txid,
+                    ) {
                         return sql_fail(error);
                     }
                     match (SqlName::parse(builtin.schema), SqlName::parse(builtin.name)) {
@@ -52957,13 +53190,6 @@ pub fn create_statistics(
                     return sql_fail(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "cannot use subquery in statistics expression"
-                    ));
-                }
-                if let Some(function) = expression.expression.contains_nonimmutable_function() {
-                    return sql_fail(sql_err!(
-                        sqlstate::INVALID_OBJECT_DEFINITION,
-                        "functions in statistics expression must be marked IMMUTABLE (uses {}())",
-                        function
                     ));
                 }
                 if let Err(error) = infer_type_catalog(
@@ -74415,10 +74641,11 @@ fn alter_table_relation(
                         statement.table.name
                     ));
                 }
-                let expression = match ddl::resolve_generated(expression_text, arena) {
-                    Ok(expression) => expression,
-                    Err(error) => return sql_fail(error),
-                };
+                let expression =
+                    match ddl::resolve_generated(expression_text, storage, txn.txid, arena) {
+                        Ok(expression) => expression,
+                        Err(error) => return sql_fail(error),
+                    };
                 new_def.columns[i].default = crate::storage::ColumnDefault::Generated(expression);
                 if let Err(error) =
                     record_table_input_override(&mut input_overrides, i, expression_text, arena)

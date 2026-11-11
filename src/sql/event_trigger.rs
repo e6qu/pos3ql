@@ -992,7 +992,7 @@ fn access_reference(object: crate::storage::AccessObject) -> Option<ObjectRef> {
         AccessClass::Extension => ObjectRef::Extension(slot),
         AccessClass::Trigger => ObjectRef::Trigger(slot),
         AccessClass::LargeObject => ObjectRef::LargeObject(slot),
-        AccessClass::Language => return None,
+        AccessClass::Language | AccessClass::BuiltinRoutine => return None,
         AccessClass::Tablespace
         | AccessClass::Database
         | AccessClass::EventTrigger

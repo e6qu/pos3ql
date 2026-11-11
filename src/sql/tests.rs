@@ -10,6 +10,7 @@ use crate::mem::mutex::Mutex;
 mod array_element_comparisons;
 mod builtin_aggregate_resolution;
 mod builtin_argument_binding;
+mod builtin_routine_changes;
 mod builtin_routine_comments;
 mod canonical_sequences;
 mod catalog_identity_lookup;
@@ -76248,7 +76249,16 @@ fn publication_row_filters_reject_nonimmutable_functions_at_ddl_time() {
          CREATE PUBLICATION publication_filter_volatile_pub \
            FOR TABLE publication_filter_volatile WHERE (random() > 0)",
     );
-    assert!(String::from_utf8_lossy(&output).contains("42P17"));
+    assert_eq!(error_sqlstates(&output), ["0A000"]);
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("invalid publication WHERE expression"),
+        "{text}"
+    );
+    assert!(
+        text.contains("User-defined or built-in mutable functions are not allowed."),
+        "{text}"
+    );
 }
 
 #[test]

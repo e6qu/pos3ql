@@ -104,6 +104,7 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 156 | Index-presence hint | Ten-byte table position, then a strict 0/1 flag. |
 | 157 | Catalog reservation | Eight-byte nonzero creation-counter reservation, kept even when a transaction creates and removes all its images. |
 | 158 | Inherited trigger change | Flags byte, then expected/replacement images: four-byte clone stamp, ten-byte trigger position, ten-byte table position, one-byte enabled mode. |
+| 159 | Built-in routine attributes | Four-byte database identifier, four-byte built-in routine OID, then strict, volatility, parallel, security-definer and leakproof bytes and cost and rows as IEEE-754 bits. Strictness and security must equal PostgreSQL's initial values. Owner and privileges use the object owner and ACL kinds with the routine OID. |
 
 Other payload rules:
 
@@ -160,6 +161,7 @@ inserts a missing writer.
 | `nsp` | Creation stamp, database-owner flag (`0`/`1`), hexadecimal name. Stamp zero is an initial public schema. |
 | `pub` | Creation stamp after the owner, before the flags. |
 | `pacl` | Parameter permissions; an empty row differs from removal. |
+| `brtn` | Built-in routine attributes in the preceding `dbctx` database: OID, five attribute codes, cost and rows bits. `own` and `acl` records for class 20 name the routine OID. |
 | `ptx` | Prepared transaction; owner as decimal role identifier. |
 | `rol` | Role identifier, catalog slot, encoded name and attributes. |
 | `rmem` | Position, stamp, role/member/grantor identifiers, option flags. |

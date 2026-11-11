@@ -5503,7 +5503,11 @@ impl Checkpointer {
                     let class: u8 = parse_field(words.next(), "own class")?;
                     let class = crate::storage::AccessClass::from_u8(class)
                         .ok_or(CheckpointSetupError::Corrupt("invalid own class"))?;
-                    let object_oid = if class == crate::storage::AccessClass::Routine {
+                    let object_oid = if matches!(
+                        class,
+                        crate::storage::AccessClass::Routine
+                            | crate::storage::AccessClass::BuiltinRoutine
+                    ) {
                         parse_field(words.next(), "own routine oid")?
                     } else {
                         0
@@ -5529,13 +5533,9 @@ impl Checkpointer {
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("malformed own record"));
                     }
-                    let object = (if class == crate::storage::AccessClass::Routine {
-                        storage
-                            .routine_slot_by_oid(object_oid, 0)
-                            .map(crate::storage::Storage::routine_access_object)
-                    } else {
-                        storage.resolve_access_object(class, &schema, &name, 0)
-                    })
+                    let object = storage
+                        .resolve_recorded_access_object(class, object_oid, &schema, &name, 0)
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid routine reference"))?
                     .ok_or_else(|| {
                         CheckpointSetupError::ObjectStore(format!(
                             "manifest ownership target does not exist: database {} class {} schema {:?} name {:?}",
@@ -5584,7 +5584,11 @@ impl Checkpointer {
                     let class: u8 = parse_field(words.next(), "acl class")?;
                     let class = crate::storage::AccessClass::from_u8(class)
                         .ok_or(CheckpointSetupError::Corrupt("invalid acl class"))?;
-                    let object_oid = if class == crate::storage::AccessClass::Routine {
+                    let object_oid = if matches!(
+                        class,
+                        crate::storage::AccessClass::Routine
+                            | crate::storage::AccessClass::BuiltinRoutine
+                    ) {
                         parse_field(words.next(), "acl routine oid")?
                     } else {
                         0
@@ -5608,14 +5612,10 @@ impl Checkpointer {
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid acl record"));
                     }
-                    let object = (if class == crate::storage::AccessClass::Routine {
-                        storage
-                            .routine_slot_by_oid(object_oid, 0)
-                            .map(crate::storage::Storage::routine_access_object)
-                    } else {
-                        storage.resolve_access_object(class, &schema, &name, 0)
-                    })
-                    .ok_or(CheckpointSetupError::Corrupt("acl target does not exist"))?;
+                    let object = storage
+                        .resolve_recorded_access_object(class, object_oid, &schema, &name, 0)
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid routine reference"))?
+                        .ok_or(CheckpointSetupError::Corrupt("acl target does not exist"))?;
                     let grantee = if grantee == "PUBLIC" {
                         crate::storage::PUBLIC_ROLE
                     } else {
@@ -5799,6 +5799,49 @@ impl Checkpointer {
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest default privilege rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("brtn") => {
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
+                    let routine: i32 = parse_field(words.next(), "brtn routine")?;
+                    let routine = crate::storage::BuiltinRoutineOid::parse(routine)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid brtn routine"))?;
+                    let mut flags = [0u8; 5];
+                    for flag in &mut flags {
+                        *flag = parse_field(words.next(), "brtn attribute")?;
+                    }
+                    let flag = |value: u8| match value {
+                        0 => Ok(false),
+                        1 => Ok(true),
+                        _ => Err(CheckpointSetupError::Corrupt("invalid brtn flag")),
+                    };
+                    let attributes = crate::storage::RoutineAttributes {
+                        strict: flag(flags[0])?,
+                        volatility: crate::storage::RoutineVolatility::from_code(flags[1])
+                            .ok_or(CheckpointSetupError::Corrupt("invalid brtn volatility"))?,
+                        parallel: crate::storage::RoutineParallel::from_code(flags[2])
+                            .ok_or(CheckpointSetupError::Corrupt("invalid brtn parallel"))?,
+                        security_definer: flag(flags[3])?,
+                        leakproof: flag(flags[4])?,
+                        cost_bits: Some(parse_field(words.next(), "brtn cost")?),
+                        rows_bits: Some(parse_field(words.next(), "brtn rows")?),
+                    };
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("invalid brtn record"));
+                    }
+                    let image = crate::storage::BuiltinRoutineAttributes::new(routine, attributes)
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid brtn image"))?;
+                    storage
+                        .replay_builtin_routine_attributes(
+                            storage.current_database_oid(),
+                            routine,
+                            image,
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest built-in routine rejected: {}",
                                 error.message.as_str()
                             ))
                         })?;
@@ -13183,13 +13226,13 @@ impl Checkpointer {
             for byte in owner.as_str().as_bytes() {
                 let _ = write!(owner_hex, "{byte:02x}");
             }
-            if object.class == crate::storage::AccessClass::Routine {
+            if let Some(routine_oid) = storage.access_object_routine_oid(object) {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
                         "own {} {} {} {} {}",
                         object.class as u8,
-                        crate::storage::routine_oid(&storage.routine(object.slot as usize)),
+                        routine_oid,
                         schema_hex.as_str(),
                         name_hex.as_str(),
                         owner_hex.as_str()
@@ -13284,6 +13327,14 @@ impl Checkpointer {
                 slot: slot as u16,
             })?;
         }
+        for (slot, entry) in storage.checkpoint_builtin_routines() {
+            if entry.ownership.owner != crate::storage::BOOTSTRAP_ROLE {
+                write_owner(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::BuiltinRoutine,
+                    slot: slot as u16,
+                })?;
+            }
+        }
         for (_, acl) in storage.checkpoint_acls() {
             if storage.access_object_is_temporary(acl.object, 0) {
                 continue;
@@ -13318,13 +13369,13 @@ impl Checkpointer {
             for byte in grantor.as_str().as_bytes() {
                 let _ = write!(grantor_hex, "{byte:02x}");
             }
-            if acl.object.class == crate::storage::AccessClass::Routine {
+            if let Some(routine_oid) = storage.access_object_routine_oid(acl.object) {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
                         "acl {} {} {} {} {} {} {} {} {}",
                         acl.object.class as u8,
-                        crate::storage::routine_oid(&storage.routine(acl.object.slot as usize)),
+                        routine_oid,
                         schema_hex.as_str(),
                         name_hex.as_str(),
                         grantee_hex.as_str(),
@@ -13477,6 +13528,30 @@ impl Checkpointer {
                     image.oid().get(),
                     manifest_hex::<130>(row.parameter.as_str()),
                     GrantsHex(image.grants())
+                ),
+            )?;
+        }
+        for (_, entry) in storage.checkpoint_builtin_routines() {
+            let routine = entry.routine.expect("checkpoint built-in rows are claimed");
+            let image = entry.committed;
+            let attributes = image.attributes;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                entry.database,
+            )?;
+            write_manifest(
+                &mut self.manifest_output,
+                format_args!(
+                    "brtn {} {} {} {} {} {} {} {}",
+                    routine.get(),
+                    u8::from(attributes.strict),
+                    attributes.volatility.code(),
+                    attributes.parallel.code(),
+                    u8::from(attributes.security_definer),
+                    u8::from(attributes.leakproof),
+                    image.cost().to_bits(),
+                    image.rows().to_bits(),
                 ),
             )?;
         }

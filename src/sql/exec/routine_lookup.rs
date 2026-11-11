@@ -475,7 +475,7 @@ impl core::fmt::Display for QualifiedName<'_> {
 
 /// `prefix name(type, ...) suffix` with PostgreSQL's `func_signature_string`
 /// spelling of each argument type (`format_type_be`).
-fn signature_error(
+pub(crate) fn signature_error(
     storage: &Storage,
     txid: u32,
     state: &'static str,

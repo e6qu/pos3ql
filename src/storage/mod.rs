@@ -21,6 +21,11 @@ mod catalog_identities;
 mod catalog_keys;
 mod catalog_sources;
 pub(crate) use catalog_identities::{CatalogCreation, CatalogIdentity};
+mod builtin_routines;
+pub(crate) use builtin_routines::{
+    BuiltinRoutineAttributes, BuiltinRoutineEntry, BuiltinRoutineOid,
+    MAX_BUILTIN_ROUTINE_CATALOG_SLOTS, PendingBuiltinRoutine,
+};
 mod default_acls;
 mod partition_triggers;
 pub(crate) use partition_triggers::{PartitionTriggerImage, PartitionTriggerState};
@@ -13098,6 +13103,9 @@ pub(crate) enum AccessClass {
     ForeignServer = 18,
     /// Built-in procedural language, addressed by its stable `pg_language` OID.
     Language = 19,
+    /// A built-in routine's row in one database; the slot names a
+    /// [`BuiltinRoutineEntry`].
+    BuiltinRoutine = 20,
 }
 
 /// A PostgreSQL large-object identity. Zero is reserved by the OID allocator
@@ -13279,6 +13287,7 @@ impl AccessClass {
             17 => Self::ForeignDataWrapper,
             18 => Self::ForeignServer,
             19 => Self::Language,
+            20 => Self::BuiltinRoutine,
             _ => return None,
         })
     }
@@ -13387,7 +13396,7 @@ pub(crate) const fn all_object_privileges(class: AccessClass) -> PrivilegeSet {
         AccessClass::Sequence => PrivilegeSet::SEQUENCE_ALL,
         AccessClass::Schema => PrivilegeSet::SCHEMA_ALL,
         AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => PrivilegeSet::TYPE_ALL,
-        AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
+        AccessClass::Routine | AccessClass::BuiltinRoutine => PrivilegeSet::FUNCTION_ALL,
         AccessClass::LargeObject => PrivilegeSet::LARGE_OBJECT_ALL,
         AccessClass::ForeignDataWrapper | AccessClass::ForeignServer | AccessClass::Language => {
             PrivilegeSet::USAGE
@@ -15950,6 +15959,7 @@ pub struct Storage {
     system_settings: Mutex<FixedVec<SystemSetting>>,
     prepared_transactions: Mutex<PreparedTransactionCatalog>,
     acl_catalog: Mutex<AclCatalog>,
+    builtin_routines: Mutex<FixedVec<BuiltinRoutineEntry>>,
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
     /// fixed slots reused as comments are added and removed.
     comments: Mutex<CommentCatalog>,
@@ -21159,6 +21169,7 @@ impl Storage {
                 .max_parameter_acl_entries
                 .saturating_mul(size_of::<ParameterAclEntry>()),
             ParameterAclRows::budget_bytes(config),
+            Self::builtin_routine_budget_bytes(config),
             config.max_sequences.saturating_mul(
                 size_of::<SequenceDef>().saturating_add(size_of::<SequenceValues>()),
             ),
@@ -21938,6 +21949,11 @@ impl Storage {
             "parameter_acl_entries",
             config.max_parameter_acl_entries,
         )?;
+        let builtin_routine_entries = FixedVec::new(
+            budget,
+            "builtin_routine_entries",
+            config.max_builtin_routine_entries,
+        )?;
         let mut indexes = FixedVec::new(budget, "indexes", config.max_indexes)?;
         let mut brin_maintenance = FixedVec::new(budget, "brin_maintenance", config.max_indexes)?;
         let brin_range_capacity = config
@@ -22277,6 +22293,7 @@ impl Storage {
                 parameters: parameter_acl_entries,
                 parameter_rows: ParameterAclRows::new(config, budget, catalog_origin)?,
             }),
+            builtin_routines: Mutex::new(builtin_routine_entries),
             comments: Mutex::new(CommentCatalog {
                 entries: comments,
                 next_root: core::num::NonZeroU64::new(1).unwrap(),
@@ -24782,6 +24799,7 @@ impl Storage {
                 };
             }
 
+            self.clone_database_builtin_routines(source, target)?;
             for source_slot in 0..self.acl_entry_count() {
                 let entry = self.acl_entry(source_slot);
                 if entry.order.is_none()
@@ -25076,6 +25094,10 @@ impl Storage {
                         .entry_server(usize::from(entry.object.slot))
                         .database
                 }
+                AccessClass::BuiltinRoutine => {
+                    self.builtin_routine_entry(usize::from(entry.object.slot))
+                        .database
+                }
                 AccessClass::Tablespace | AccessClass::Database | AccessClass::Language => continue,
             };
             if object_database == database {
@@ -25087,6 +25109,9 @@ impl Storage {
                 entry.retire();
             }
         }
+        // Privilege rows naming the database's built-in routine rows are
+        // retired above, so their slots can be reused.
+        self.release_database_builtin_routines(database);
         for slot in 0..self.column_acl_entry_count() {
             let prior = self.column_acl_entry(slot);
             let entry = prior;
@@ -26046,6 +26071,7 @@ impl Storage {
             AccessClass::Language => {
                 unreachable!("built-in procedural languages have bootstrap ownership")
             }
+            AccessClass::BuiltinRoutine => self.builtin_routine_ownership(slot),
         }
     }
 
@@ -26096,6 +26122,9 @@ impl Storage {
             }
             AccessClass::Language => {
                 unreachable!("built-in procedural languages have immutable ownership")
+            }
+            AccessClass::BuiltinRoutine => {
+                unreachable!("built-in routine ownership is synchronized separately")
             }
         }
     }
@@ -26510,6 +26539,8 @@ impl Storage {
                 .then(|| self.foreign_server(name, txid).map(|(slot, _)| slot))
                 .flatten(),
             AccessClass::Language => unreachable!("handled before catalog slot lookup"),
+            // Overloaded built-ins are addressed by OID, never by name.
+            AccessClass::BuiltinRoutine => None,
         }?;
         u16::try_from(slot)
             .ok()
@@ -26616,6 +26647,17 @@ impl Storage {
                     SqlName::parse(name).expect("built-in procedural language name is valid"),
                 )
             }
+            AccessClass::BuiltinRoutine => {
+                let signature = self
+                    .builtin_routine_entry(slot)
+                    .routine
+                    .expect("live built-in routine ACL target has a routine")
+                    .signature();
+                (
+                    SqlName::parse(signature.schema).expect("built-in schema fits its name bound"),
+                    SqlName::parse(signature.name).expect("built-in routine fits its name bound"),
+                )
+            }
         }
     }
 
@@ -26656,6 +26698,7 @@ impl Storage {
             AccessClass::Language => {
                 crate::sql::catalog::procedural_language_name(object.slot.into()).is_some()
             }
+            AccessClass::BuiltinRoutine => self.builtin_routine_entry(slot).routine.is_some(),
         }
     }
 
@@ -26695,6 +26738,7 @@ impl Storage {
             AccessClass::Language => {
                 crate::sql::catalog::procedural_language_name(object.slot.into()).is_some()
             }
+            AccessClass::BuiltinRoutine => self.builtin_routine_entry(slot).routine.is_some(),
         }
     }
 
@@ -26725,6 +26769,7 @@ impl Storage {
                 Some(self.foreign_catalog().entry_wrapper(slot).database)
             }
             AccessClass::ForeignServer => Some(self.foreign_catalog().entry_server(slot).database),
+            AccessClass::BuiltinRoutine => Some(self.builtin_routine_entry(slot).database),
             AccessClass::Tablespace | AccessClass::Database | AccessClass::Language => None,
         }
     }
@@ -26901,6 +26946,10 @@ impl Storage {
                         && candidate.created_at == created_at
                         && candidate.ddl_state != CatalogDdlState::Absent
                 })?
+            }
+            AccessClass::BuiltinRoutine => {
+                let routine = self.builtin_routine_entry(source_slot).routine?;
+                self.builtin_routine_slot_in(target_database, routine)?
             }
             AccessClass::Database | AccessClass::Tablespace | AccessClass::Language => return None,
         };
@@ -27301,6 +27350,7 @@ impl Storage {
             AccessClass::ForeignDataWrapper => self.foreign_catalog().wrapper_capacity(),
             AccessClass::ForeignServer => self.foreign_catalog().server_capacity(),
             AccessClass::Language => 0,
+            AccessClass::BuiltinRoutine => self.builtin_routine_count(),
         }
     }
 
@@ -27424,6 +27474,21 @@ impl Storage {
         owner: usize,
         txid: u32,
     ) -> Option<PendingOwnership> {
+        if object.class == AccessClass::BuiltinRoutine {
+            return self.builtin_routine_ownership_mut(usize::from(object.slot), |ownership| {
+                let prior = ownership.pending;
+                if txid == 0 {
+                    ownership.owner = owner as u16;
+                    ownership.pending = None;
+                } else {
+                    ownership.pending = Some(PendingOwnership {
+                        txid,
+                        owner: owner as u16,
+                    });
+                }
+                prior
+            });
+        }
         if object.class == AccessClass::LargeObject {
             let mut catalog = self
                 .large_objects
@@ -27650,6 +27715,17 @@ impl Storage {
     }
 
     pub(crate) fn commit_object_owner(&mut self, object: AccessObject, txid: u32) {
+        if object.class == AccessClass::BuiltinRoutine {
+            self.builtin_routine_ownership_mut(usize::from(object.slot), |ownership| {
+                if let Some(pending) = ownership.pending
+                    && pending.txid == txid
+                {
+                    ownership.owner = pending.owner;
+                    ownership.pending = None;
+                }
+            });
+            return;
+        }
         if object.class == AccessClass::LargeObject {
             let mut catalog = self
                 .large_objects
@@ -27857,6 +27933,12 @@ impl Storage {
         object: AccessObject,
         prior: Option<PendingOwnership>,
     ) {
+        if object.class == AccessClass::BuiltinRoutine {
+            self.builtin_routine_ownership_mut(usize::from(object.slot), |ownership| {
+                ownership.pending = prior;
+            });
+            return;
+        }
         if object.class == AccessClass::LargeObject {
             self.large_objects
                 .lock()
@@ -28357,6 +28439,18 @@ impl Storage {
         drop(catalog);
         self.wake_transaction_waiters(undo.transaction);
         Ok(())
+    }
+
+    /// Whether any committed or unfinished privilege row names `object`.
+    pub(crate) fn access_object_has_acl(&self, object: AccessObject) -> bool {
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .objects
+            .iter()
+            .any(|entry| {
+                entry.object == object && (entry.order.is_some() || entry.pending.is_some())
+            })
     }
 
     pub(crate) fn object_acl_defined(&self, object: AccessObject, txid: u32) -> bool {
@@ -29208,6 +29302,27 @@ impl Storage {
         self.role_has_privileges_of(current, usize::from(role), txid)
     }
 
+    /// PUBLIC's privileges on `object` before any explicit grant. A few
+    /// built-in routines (such as `pg_read_file`) start without PUBLIC
+    /// `EXECUTE`.
+    pub(crate) fn object_default_public_privileges(&self, object: AccessObject) -> PrivilegeSet {
+        if object.class == AccessClass::BuiltinRoutine {
+            let public = self
+                .builtin_routine_entry(usize::from(object.slot))
+                .routine
+                .and_then(|routine| {
+                    crate::sql::catalog::intrinsic_routine_public_execute(routine.get())
+                })
+                .unwrap_or(true);
+            return if public {
+                PrivilegeSet::EXECUTE
+            } else {
+                PrivilegeSet::NONE
+            };
+        }
+        default_public_object_privileges(object.class)
+    }
+
     pub(crate) fn role_has_privileges_of(&self, member: usize, target: usize, txid: u32) -> bool {
         if self.role(member).attributes_to(txid).superuser {
             return true;
@@ -29246,7 +29361,7 @@ impl Storage {
                     || entry.pending.is_some_and(|pending| pending.txid == txid))
         });
         let mut effective = if !acl_defined {
-            default_public_object_privileges(object.class)
+            self.object_default_public_privileges(object)
         } else {
             Self::acl_to_entries(&catalog.objects, object, PUBLIC_ROLE, txid).0
         };
@@ -29438,10 +29553,11 @@ impl Storage {
         ))
     }
 
-    /// Built-in routines belong to the bootstrap superuser.
+    /// Built-in routines belong to the bootstrap superuser until a database's
+    /// copy is given to another role.
     pub(crate) fn require_builtin_routine_owner(
         &self,
-        name: &str,
+        routine: BuiltinRoutineOid,
         txid: u32,
     ) -> Result<(), SqlError> {
         if txid == 0 {
@@ -29453,16 +29569,17 @@ impl Storage {
                 "current role is not present in the role catalog"
             )
         })?;
+        let owner = usize::from(self.builtin_routine_state(routine, txid).owner);
         if self.role(role).attributes_to(txid).superuser
-            || role == usize::from(BOOTSTRAP_ROLE)
-            || self.role_has_privileges_of(role, usize::from(BOOTSTRAP_ROLE), txid)
+            || role == owner
+            || self.role_has_privileges_of(role, owner, txid)
         {
             return Ok(());
         }
         Err(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "must be owner of function {}",
-            name
+            routine.signature().name
         ))
     }
 

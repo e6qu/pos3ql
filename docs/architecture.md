@@ -105,8 +105,9 @@ ORDINALITY`), or a **retained join** of up to eight such items or literal
 where the general executor would hash), optionally with an `ORDER BY` the
 stream sorts itself (local mode), or a **retained grouping** of such a
 source (`GROUP BY`, `HAVING`, aggregates and plain `DISTINCT`, below), or
-`DISTINCT ON` the stream sorts (local mode);
-without grouping sets, set operations, subqueries, CTEs, row locking or row security, whose read position (one
+`DISTINCT ON` the stream sorts (local mode), or a `UNION ALL` of such
+queries without its own `ORDER BY` (below);
+without grouping sets, other set operations, subqueries, CTEs, row locking or row security, whose read position (one
 record per resident row of each table plus the query text) fits
 `result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins
 whose `ON`/`USING` conditions are scalar, non-volatile and call no
@@ -131,7 +132,7 @@ any of its rows reach the client; `pos3ql_result_stream_spooled_total` counts
 those by reason (`shape`, `capacity`, `effects`). A spooled result yields on
 cold storage only until its first byte reaches the client, then reads
 synchronously until it ends. Today that covers other joins, other groupings, sorted
-results in object-store mode, subqueries, set operations, `VALUES` lists, other function sources,
+results in object-store mode, subqueries, set operations other than `UNION ALL`, `VALUES` lists, other function sources,
 row locking, row security, a result that started an effect before it
 overflowed, and a `FETCH` from a scrollable cursor that saves its history. A buffered paged portal
 sends nothing before its first page, so its reads yield throughout.
@@ -323,7 +324,7 @@ being built and are released when it is delivered.
 | Grouping (built: `GROUP BY`, `HAVING`, aggregates) | Each group's key, states and held values; or every input row's keys and aggregated columns, then each group's keys and results | `plan_build_bytes` |
 | `DISTINCT` (built: plain, as a grouping by the output list) | Each distinct output row | `plan_build_bytes` |
 | Sort (built: local mode, also for `DISTINCT ON`) | Sort keys, saved output and input columns of every row | `plan_build_bytes`; object-store mode: the external sorter's runs on the block grid (not built) |
-| Set operations | `UNION ALL`: child cursor; others: sorted runs of both inputs with counts | External runs |
+| Set operations (built: `UNION ALL` in streams) | `UNION ALL`: each query's own plan and the current query; others: sorted runs of both inputs with counts | Stream allocation; others: external runs |
 | Scalar, `IN`/`EXISTS` subquery | Per-outer-row child tree, rewound per row, or a cached sorted run when uncorrelated | Node record or external run |
 | Derived table, CTE read once | Child tree in place | Its nodes |
 
@@ -348,6 +349,16 @@ calls hand off on their row) holds its RowDescription the same way and runs
 in the general executor when its build does not fit. A declared cursor builds
 its hash table at `DECLARE`; one that does not fit saves its rows in
 `cursor_bytes` instead, so a streamed `FETCH` never builds.
+
+**Built: `UNION ALL`.** A stream (not a declared cursor) reads a `UNION
+ALL` as PostgreSQL's Append node does: each query has its own plan in the
+stream's allocation and is read to its end before the next one starts. A
+query's filter, bounds and output run as its rows are read, below the
+statement driver, so every query's expressions must be non-volatile and call
+no routine body; its values are coerced to the combined column types (as the
+general executor coerces them) before the row goes up. The physical tables
+of all queries together are limited to eight, as a retained join's are. A
+`LIMIT` or `OFFSET` on the whole `UNION ALL` applies to the combined rows.
 
 **Built: sorts in local mode.** At its first row a sort reads its whole input
 (yielding on storage waits with the rows saved so far kept), filters it, and

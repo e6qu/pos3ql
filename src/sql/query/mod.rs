@@ -31,7 +31,8 @@ pub(crate) use invocation_results::OwnedRoutineResult;
 use invocation_results::{RoutineInvocationResult, RoutineResults};
 mod retained;
 pub(crate) use retained::{
-    LockedRow, MAX_RETAINED_SOURCES, RetainedSelect, RetainedUse, StreamSource,
+    LockedRow, MAX_RETAINED_SOURCES, RetainedSelect, RetainedUse, StreamSource, set_query_select,
+    stream_query,
 };
 
 #[cfg(test)]

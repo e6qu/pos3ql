@@ -460,6 +460,43 @@ fn advance<'a>(
                     "cursor read its source while a saved input was pending"
                 ));
             }
+            if let RetainedSource::Append {
+                branches,
+                next,
+                targets,
+            } = &mut scan.source
+            {
+                if scan.pending.is_some() {
+                    return Ok(true);
+                }
+                let work = pull.work;
+                let mark = work.mark();
+                let read = next_appended_row(branches, next, targets, pull, work).and_then(|row| {
+                    // The query released its own row: this one starts
+                    // where that one began.
+                    let start = pull.state_arena.mark();
+                    row.map(|bytes| {
+                        pull.state_arena
+                            .alloc_slice_copy(bytes)
+                            .map(|bytes| (start, &*bytes))
+                            .map_err(|_| arena_full())
+                    })
+                    .transpose()
+                });
+                // SAFETY: the encoded row was copied into the state arena.
+                unsafe { work.rewind_to(mark) };
+                let Some((start, bytes)) = read? else {
+                    *state = ReaderState::Complete;
+                    return Ok(false);
+                };
+                scan.pending = Some(PendingRow {
+                    row: RetainedRow::Literal(bytes),
+                    mark: start,
+                    counted: true,
+                    saved: None,
+                });
+                return Ok(true);
+            }
             if !scan.read(pull.state_arena, pull.buffers)? {
                 *state = ReaderState::Complete;
                 if !keep_finished {

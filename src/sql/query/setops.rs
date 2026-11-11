@@ -1030,6 +1030,13 @@ fn leaf_col_unknown<'a>(
                     if matches!(expression, Expr::Cast { .. }) {
                         return false;
                     }
+                    // An untyped literal stays unknown whatever the FROM.
+                    if matches!(
+                        exec::infer_type_pub(expression, None).map(|t| t.0),
+                        Ok(crate::sql::types::oid::UNKNOWN)
+                    ) {
+                        return true;
+                    }
                     let scratch_mark = arena.mark();
                     let raw = match &s.from {
                         None => exec::infer_type_pub(expression, None).map(|t| t.0),
@@ -1429,6 +1436,23 @@ pub(crate) fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
     };
     if numeric(a) && numeric(b) {
         return Some(exec::unify_numeric_tower(a, b));
+    }
+    // The string category: PostgreSQL's select_common_type keeps the
+    // running type unless it is not the preferred `text` and only it casts
+    // implicitly to the next one, so `varchar UNION text` stays varchar.
+    let string = |t| {
+        matches!(
+            t,
+            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name
+        )
+    };
+    if string(a) && string(b) {
+        let implicit = |from, to| from != ColType::Name || to == ColType::Text;
+        return Some(if a != ColType::Text && implicit(a, b) && !implicit(b, a) {
+            b
+        } else {
+            a
+        });
     }
     None
 }

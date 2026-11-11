@@ -127,7 +127,22 @@ impl Engine {
         let mark = self.work.mark();
         let (source, source_len) = match statement {
             Stmt::Select(select) => (
-                query::RetainedSelect::stream_source(&self.storage, txid, select, &self.work),
+                query::stream_query(select, &self.work).and_then(|select| {
+                    query::RetainedSelect::stream_source(&self.storage, txid, select, &self.work)
+                }),
+                source_len,
+            ),
+            Stmt::SetQuery(set) => (
+                query::set_query_select(set, &self.work)
+                    .and_then(|select| query::stream_query(select, &self.work))
+                    .and_then(|select| {
+                        query::RetainedSelect::stream_source(
+                            &self.storage,
+                            txid,
+                            select,
+                            &self.work,
+                        )
+                    }),
                 source_len,
             ),
             // COPY TO STDOUT streams the query it reads.
@@ -136,6 +151,7 @@ impl Engine {
                     .copy_query_text(copy, txid, &self.work)
                     .and_then(|text| {
                         let select = crate::sql::parser::parse_query(text, &self.work)?;
+                        let select = query::stream_query(select, &self.work)?;
                         query::RetainedSelect::stream_source(
                             &self.storage,
                             txid,

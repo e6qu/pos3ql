@@ -1192,6 +1192,50 @@ fn function_sources_stream_rows_as_the_client_reads() {
 }
 
 #[test]
+fn union_all_streams_append_their_queries_as_the_client_reads() {
+    let (mut fixture, mut conn, mut client, _, _) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "stream-union");
+    for (sql, expected) in [
+        (
+            "SELECT id, payload FROM big UNION ALL \
+             SELECT g, repeat('x', 200) FROM generate_series(5001, 8000) g",
+            8000,
+        ),
+        // Each query keeps its own filter and bounds; the outer LIMIT and
+        // OFFSET apply to the combined rows.
+        (
+            "(SELECT id, payload FROM big WHERE id <= 2000) UNION ALL \
+             (SELECT g, repeat('y', 200) FROM generate_series(2001, 9000) g LIMIT 3000) \
+             LIMIT 4500",
+            4500,
+        ),
+        // A bigint column coerces the combined type.
+        (
+            "SELECT id, payload FROM big UNION ALL \
+             SELECT g::bigint, repeat('z', 200) FROM generate_series(5001, 6000) g",
+            6000,
+        ),
+    ] {
+        let expected: usize = expected;
+        let opened = fixture.engine.result_stream_metrics().opened;
+        client.write_all(&query(sql)).unwrap();
+        while fixture.engine.result_stream_metrics().opened == opened {
+            assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        }
+        // The stream holds each query's position, not the rows.
+        assert!(conn.overflow_bytes() < 1024);
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+        let response = messages(&response);
+        assert!(response.iter().all(|message| message.0 != b'E'), "{sql}");
+        let rows: Vec<_> = response
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .collect();
+        assert_rows(&rows, expected);
+    }
+}
+
+#[test]
 fn result_streams_apply_bounds_and_fail_after_delivered_rows() {
     let (mut fixture, mut conn, mut client, _, _) =
         stream_fixture(crate::config::TransactionMode::Mvcc, "stream-bounds");

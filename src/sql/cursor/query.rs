@@ -292,10 +292,31 @@ impl CursorQuery {
                     )
                 })?);
         }
-        let CursorStatement::Select(statement) = bound.statement else {
-            return Ok(false);
-        };
         let mark = self.arena.mark();
+        // A stream appends the queries of a UNION ALL itself.
+        let statement = match (bound.statement, reader_use) {
+            (CursorStatement::Select(statement), crate::sql::query::RetainedUse::Stream) => {
+                crate::sql::query::stream_query(statement, &self.arena)
+            }
+            (CursorStatement::Select(statement), crate::sql::query::RetainedUse::Cursor) => {
+                Ok(statement)
+            }
+            (CursorStatement::SetQuery(query), crate::sql::query::RetainedUse::Stream) => {
+                crate::sql::query::set_query_select(query, &self.arena)
+                    .and_then(|select| crate::sql::query::stream_query(select, &self.arena))
+            }
+            (CursorStatement::SetQuery(_), crate::sql::query::RetainedUse::Cursor) => {
+                return Ok(false);
+            }
+        };
+        let statement = match statement {
+            Ok(statement) => statement,
+            Err(error) => {
+                // SAFETY: nothing borrows the rejected query's bytes.
+                unsafe { self.arena.rewind_to(mark) };
+                return Err(error);
+            }
+        };
         let source = crate::sql::type_input_plans::with_owner(self.owner, || {
             crate::sql::exec::with_bound_parameter_types(bound.parameter_types, || {
                 crate::sql::query::RetainedSelect::open(

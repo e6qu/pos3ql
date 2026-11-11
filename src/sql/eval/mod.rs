@@ -2133,6 +2133,17 @@ pub trait CatalogAccess {
     /// The `FOREIGN KEY (...) REFERENCES ...` definition of the constraint with
     /// this OID, or `None` if no such foreign-key constraint is known.
     fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
+    /// A relation and its partition ancestors as regclass values, nearest first.
+    fn partition_ancestors<'a>(
+        &self,
+        _relation: i32,
+        _arena: &'a Arena,
+    ) -> Result<&'a [Datum<'a>], SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "partition ancestry requires catalog access"
+        ))
+    }
     /// The executable `RANGE|LIST|HASH (...)` clause for a partitioned table.
     fn partition_key_def<'a>(
         &self,

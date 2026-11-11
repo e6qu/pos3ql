@@ -26,6 +26,7 @@ mod nested_planner_inputs;
 pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
+mod partition_ancestry;
 mod polymorphic_resolution;
 mod prepared_object_capacity;
 mod procedural_expression_calls;

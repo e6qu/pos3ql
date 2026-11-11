@@ -61,6 +61,7 @@ fn srf_arity_unqualified(name: &str) -> Option<SrfArity> {
             "pg_snapshot_xip",
             "txid_snapshot_xip",
             "pg_options_to_table",
+            "pg_partition_ancestors",
             "aclexplode",
             "pg_get_sequence_data",
             "ts_token_type",
@@ -1356,6 +1357,17 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     )?;
                 }
                 return Ok(values);
+            }
+            if name.eq_ignore_ascii_case("pg_partition_ancestors") {
+                if args.len() != 1 || *variadic {
+                    return Err(srf_signature_error(name));
+                }
+                return partition_ancestor_values(
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    storage,
+                    txid,
+                    arena,
+                );
             }
             if name.eq_ignore_ascii_case("pg_snapshot_xip")
                 || name.eq_ignore_ascii_case("txid_snapshot_xip")
@@ -3164,6 +3176,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_gsub = builtin_name.eq_ignore_ascii_case("generate_subscripts");
     let is_snapshot_xip = builtin_name.eq_ignore_ascii_case("pg_snapshot_xip")
         || builtin_name.eq_ignore_ascii_case("txid_snapshot_xip");
+    let is_partition_ancestors = builtin_name.eq_ignore_ascii_case("pg_partition_ancestors");
     let is_stt = builtin_name.eq_ignore_ascii_case("string_to_table");
     let is_options = builtin_name.eq_ignore_ascii_case("pg_options_to_table");
     let is_acl_explode = builtin_name.eq_ignore_ascii_case("aclexplode");
@@ -3195,6 +3208,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_rstt
         || is_gsub
         || is_snapshot_xip
+        || is_partition_ancestors
         || is_stt
         || is_options
         || is_acl_explode
@@ -3826,6 +3840,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             crate::sql::eval::generate_series_result_type(start, has_numeric, has_int8)
         } else if is_gsub {
             ColType::Int4
+        } else if is_partition_ancestors {
+            ColType::Regclass
         } else if is_snapshot_xip {
             if tref.table.eq_ignore_ascii_case("txid_snapshot_xip") {
                 ColType::Int8
@@ -3857,9 +3873,16 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             ));
         };
         // A single-column function's default column name is `value` for
-        // array_elements, else the (aliased) function name.
+        // array_elements, its OUT parameter's name for pg_partition_ancestors,
+        // else the (aliased) function name.
         default_cols[0] = table_function_column(
-            SqlName::parse(if is_elems { "value" } else { name })?,
+            SqlName::parse(if is_elems {
+                "value"
+            } else if is_partition_ancestors {
+                "relid"
+            } else {
+                name
+            })?,
             single_type,
             None,
             -1,
@@ -4648,6 +4671,24 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     .alloc_slice_with(1, |_| encoded)
                     .map(|rows| &*rows)
                     .map_err(|_| arena_full());
+            }
+            if tref.table.eq_ignore_ascii_case("pg_partition_ancestors") {
+                if args.len() != 1 {
+                    return Err(srf_signature_error(tref.table));
+                }
+                let values =
+                    partition_ancestor_values(eval_argument(args[0])?, storage, txid, arena)?;
+                const EMPTY: &[u8] = &[];
+                let rows = arena
+                    .alloc_slice_with(values.len(), |_| EMPTY)
+                    .map_err(|_| arena_full())?;
+                for (row, value) in rows.iter_mut().zip(values) {
+                    *row = crate::sql::exec::encode_projected_pub(
+                        core::slice::from_ref(value),
+                        arena,
+                    )?;
+                }
+                return Ok(&*rows);
             }
             if tref.table.eq_ignore_ascii_case("pg_snapshot_xip")
                 || tref.table.eq_ignore_ascii_case("txid_snapshot_xip")
@@ -7179,4 +7220,20 @@ fn rows_from_base_rows_outer<'a, C: ColumnLookup<'a>>(
         *encoded = crate::sql::exec::encode_projected_pub(&values[..total_width], arena)?;
     }
     Ok(&*rows)
+}
+
+/// `pg_partition_ancestors(regclass)` for a regclass-coercible argument.
+fn partition_ancestor_values<'a>(
+    relation: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    let catalog = super::storage_catalog(storage, arena, txid);
+    let relation =
+        crate::sql::eval::regobject_cast(relation, ColType::Regclass, Some(&catalog), arena)?;
+    let Some(oid) = relation.catalog_oid() else {
+        return Ok(&[]);
+    };
+    crate::sql::catalog::partition_ancestors(storage, txid, oid as i32, arena)
 }

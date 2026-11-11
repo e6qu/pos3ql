@@ -314,7 +314,8 @@ MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
 column uses its row type, fail with `0A000`; a `DROP TABLE ... CASCADE` that
 reaches both columns and routines reports two notices where PostgreSQL reports
 one, and a routine's dependency on a row type is described as depending on the
-table. In a SQL-language function, `o.note` for a composite parameter `o` fails
+table. `pg_partition_tree` is rejected (`0A000` in `FROM`, `42883` in a select
+list). In a SQL-language function, `o.note` for a composite parameter `o` fails
 with `42P01` (`(o).note` works). The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.

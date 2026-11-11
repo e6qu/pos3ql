@@ -1647,10 +1647,37 @@ pub(crate) fn dispatch<'a>(
                     cat, oid, arena,
                 )?))
             }
-            "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => {
+            "pg_partition_root" => {
                 arity(1)?;
-                eval_full(args[0], arena, params, row, hooks)
+                let Some(cat) = hooks.catalog else {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "pg_partition_root requires catalog access"
+                    ));
+                };
+                let relation = super::super::regobject_cast(
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    ColType::Regclass,
+                    Some(cat),
+                    arena,
+                )?;
+                let Some(oid) = relation.catalog_oid() else {
+                    return Ok(Datum::Null);
+                };
+                Ok(cat
+                    .partition_ancestors(oid as i32, arena)?
+                    .last()
+                    .copied()
+                    .unwrap_or(Datum::Null))
             }
+            "pg_partition_ancestors" => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "set-valued function called in context that cannot accept a set"
+            )),
+            "pg_partition_tree" => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "pg_partition_tree is not supported"
+            )),
             _ if predicate == Some(CatalogPredicateKind::Privilege) => {
                 let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
                 let Some(cat) = hooks.catalog else {

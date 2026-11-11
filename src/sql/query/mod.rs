@@ -5515,6 +5515,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         super::catalog::constraint_def_text(self.storage, self.txid, oid, arena)
     }
+    fn partition_ancestors<'a>(
+        &self,
+        relation: i32,
+        arena: &'a Arena,
+    ) -> Result<&'a [Datum<'a>], SqlError> {
+        super::catalog::partition_ancestors(self.storage, self.txid, relation, arena)
+    }
     fn expression_def<'a>(
         &self,
         node: &str,

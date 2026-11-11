@@ -10282,6 +10282,61 @@ pub(crate) fn relation_row_type_oid(
     }
 }
 
+/// `pg_partition_ancestors`: the relation and every ancestor, nearest first,
+/// as regclass values. A relation outside a partition tree has none.
+pub(crate) fn partition_ancestors<'a>(
+    storage: &Storage,
+    transaction: u32,
+    relation: i32,
+    arena: &'a Arena,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    let Some(slot) = table_slot_by_oid(storage, transaction, relation) else {
+        return Ok(&[]);
+    };
+    let parent = |slot: usize| {
+        storage
+            .table_def(slot, transaction)
+            .partition
+            .attachment
+            .map(|attachment| usize::from(attachment.parent))
+    };
+    {
+        let definition = storage.table_def(slot, transaction);
+        if definition.partition.attachment.is_none() && definition.partition.scheme.is_none() {
+            return Ok(&[]);
+        }
+    }
+    let mut depth = 0usize;
+    let mut current = Some(slot);
+    while let Some(table) = current {
+        depth += 1;
+        if depth > storage.table_count() {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "partition ancestry of relation {} is cyclic",
+                relation
+            ));
+        }
+        current = parent(table);
+    }
+    let catalog = super::query::storage_catalog(storage, arena, transaction);
+    let values = arena
+        .alloc_slice_with(depth, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let mut current = Some(slot);
+    for value in values.iter_mut() {
+        let table = current.expect("counted ancestor");
+        *value = super::eval::regobject_cast(
+            Datum::Oid(user_table_oid(storage, table) as u32),
+            ColType::Regclass,
+            Some(&catalog),
+            arena,
+        )?;
+        current = parent(table);
+    }
+    Ok(values)
+}
+
 pub(crate) fn table_slot_by_oid(storage: &Storage, transaction: u32, oid: i32) -> Option<usize> {
     (0..storage.table_count()).find(|slot| {
         storage.table_slot_visible_to(*slot, transaction) && user_table_oid(storage, *slot) == oid

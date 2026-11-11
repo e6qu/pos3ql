@@ -5923,11 +5923,7 @@ pub fn infer_type_res(
                 .map(|a| infer_type_res(a, columns))
                 .transpose()?
                 .unwrap_or((oid::TEXT, -1)),
-            "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => args
-                .first()
-                .map(|a| infer_type_res(a, columns))
-                .transpose()?
-                .unwrap_or((oid::INT4, 4)),
+            "pg_partition_ancestors" | "pg_partition_root" => of(ColType::Regclass),
             // Window-only functions.
             "row_number" | "rank" | "dense_rank" | "ntile" => of(ColType::Int8),
             "percent_rank" | "cume_dist" => of(ColType::Float8),

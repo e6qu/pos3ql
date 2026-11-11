@@ -25326,6 +25326,11 @@ fn execute_nested_data_modification<'a>(
         context.arena,
         None,
     )?;
+    if let Some(command) = rewritten_write_target(context.storage(), statement, context.txn) {
+        return execute_rewritten_nested_write(
+            context, statement, arguments, capture, pending, progress, command,
+        );
+    }
     match statement {
         Stmt::Insert(statement) => {
             let assignment_casts = prepare_dml_assignment_casts(
@@ -27503,6 +27508,124 @@ fn routine_utility_outcome(outcome: Outcome) -> Result<(), SqlError> {
             "PL/pgSQL utility command response exceeded the output buffer"
         )),
     }
+}
+
+/// The command of a routine's `INSERT`, `UPDATE` or `DELETE` whose target
+/// is a view or a table with rules for it: the engine rewrites those.
+fn rewritten_write_target(
+    storage: &Storage,
+    statement: &Stmt<'_>,
+    txn: &TxnState,
+) -> Option<&'static str> {
+    let (relation, event, command) = match statement {
+        Stmt::Insert(insert) => (insert.table, crate::storage::RewriteEvent::Insert, "INSERT"),
+        Stmt::Update(update) => (update.table, crate::storage::RewriteEvent::Update, "UPDATE"),
+        Stmt::Delete(delete) => (delete.table, crate::storage::RewriteEvent::Delete, "DELETE"),
+        _ => return None,
+    };
+    match storage.resolve_relation(relation.schema, relation.name, txn.txid)? {
+        crate::storage::ResolvedRelation::View(_) => Some(command),
+        crate::storage::ResolvedRelation::Table(slot) => storage
+            .firing_rules_for(
+                crate::storage::RuleTarget::Table(slot as u16),
+                event,
+                txn.replication_apply,
+                txn.txid,
+            )
+            .next()
+            .map(|_| command),
+        crate::storage::ResolvedRelation::Catalog => None,
+    }
+}
+
+/// A static PL/pgSQL write reads the routine's variables through a scope the
+/// engine's rule and view rewriting cannot take yet; it fails loudly instead
+/// of skipping the rules or reporting the view missing.
+fn reject_static_rewritten_write(
+    context: &TriggerExecContext<'_, '_, '_>,
+    statement: &Stmt<'_>,
+) -> Result<(), SqlError> {
+    match rewritten_write_target(context.storage(), statement, context.txn) {
+        Some(command) => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "static PL/pgSQL {} on a view or a table with rules is not supported",
+            command
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Runs a routine's write to a view or a ruled table through the engine's
+/// rewriting, as a nested command keeping its rows like the direct writes.
+fn execute_rewritten_nested_write<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    statement: &'a Stmt<'a>,
+    arguments: &'a [Datum<'a>],
+    capture: Option<&mut super::ReturningCapture<'_>>,
+    pending: &mut Option<write_completion::PendingNestedWrite>,
+    mut progress: Option<&mut RowProgress>,
+    command_name: &str,
+) -> Result<u64, SqlError> {
+    let arena = context.arena;
+    let boundary = context.nested_write_boundary();
+    let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} on a view or a table with rules is not supported inside a trigger fired by a write",
+            command_name
+        ));
+    };
+    let engine = &mut **engine;
+    let mut command = enter_write_command(context.txn, &engine.storage, progress.as_deref_mut())?;
+    let txn = &mut *command;
+    let parent_boundary = txn.write_completion_boundary;
+    txn.write_completion_boundary = boundary.map(|mark| super::txn::WriteCompletionBoundary {
+        mark,
+        command: txn.command_id(),
+        depth: txn.trigger_depth(),
+    });
+    let responder = &mut *context.responder;
+    responder.clear_affected_rows();
+    let connection_id = engine.work.connection_id();
+    let outcome = responder.without_query_output(|responder| {
+        super::Engine::execute_data_modification(
+            &mut engine.storage,
+            &mut engine.dml_scratch,
+            arena,
+            statement,
+            DmlAuthorization::Invoker,
+            txn,
+            arguments,
+            guc,
+            responder,
+            // The capture lives for this call only.
+            match capture {
+                Some(capture) => Some(capture as &mut super::ReturningCapture<'_>),
+                None => None,
+            },
+            progress.as_deref_mut(),
+            connection_id,
+        )
+    });
+    txn.write_completion_boundary = parent_boundary;
+    let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+    {
+        txn.pending_write_completion.take()
+    } else {
+        None
+    };
+    if let Some(completion) = completion {
+        *pending = Some(write_completion::PendingNestedWrite::new(
+            command.suspend(),
+            completion,
+        ));
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+            "nested dynamic write completion is pending"
+        ));
+    }
+    leave_write_command(command, progress);
+    dynamic_dml_outcome(responder, outcome, command_name)
 }
 
 fn dynamic_dml_outcome(
@@ -30797,6 +30920,7 @@ fn execute_trigger_step_in<'a>(
                 into,
                 ..
             } => execute_trigger_statement(|| {
+                reject_static_rewritten_write(context, &Stmt::Insert(statement))?;
                 let statement = match transition_relations {
                     Some(relations) => Insert {
                         select: statement
@@ -30987,6 +31111,7 @@ fn execute_trigger_step_in<'a>(
                 into,
                 ..
             } => execute_trigger_statement(|| {
+                reject_static_rewritten_write(context, &Stmt::Update(statement))?;
                 let statement = match transition_relations {
                     Some(relations) => {
                         let dml = context
@@ -31140,6 +31265,7 @@ fn execute_trigger_step_in<'a>(
                 into,
                 ..
             } => execute_trigger_statement(|| {
+                reject_static_rewritten_write(context, &Stmt::Delete(statement))?;
                 let statement = match transition_relations {
                     Some(relations) => {
                         let dml = context

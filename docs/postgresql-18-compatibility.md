@@ -147,6 +147,18 @@ Syntax and errors:
   scalar result (`return type mismatch in function declared to return
   integer`, detail `Actual return type is text.`), with context `SQL function
   "f"`; an untyped literal there is text.
+- A routine's `INSERT`, `UPDATE` or `DELETE` on a view or on a table with
+  rules goes through the view's triggers and the rules, as at top level, when
+  it runs through `EXECUTE` or in a SQL-language function. A static PL/pgSQL
+  statement on such a target fails with `0A000` (`static PL/pgSQL INSERT on a
+  view or a table with rules is not supported`), where PostgreSQL runs it.
+  For example, `EXECUTE 'INSERT INTO active_orders VALUES ($1)' USING id`
+  works; `INSERT INTO active_orders VALUES (id)` in the same body does not.
+- A rule on a data-modifying `WITH` sub-statement's target must leave one
+  statement, as in PostgreSQL: `DO ALSO`, conditional, multi-statement,
+  `NOTHING` and `NOTIFY` `INSTEAD` rules fail with `0A000` before anything
+  runs. The command tag of a statement an unconditional `INSTEAD` rule
+  replaces counts the last `INSTEAD` action of the same command.
 - `INSERT`, `UPDATE`, `DELETE` and `MERGE ... RETURNING ... INTO [STRICT]
   targets` in PL/pgSQL store the returned row and set `FOUND` and
   `ROW_COUNT`. A routine called in the statement's rows or `RETURNING` list

@@ -115,4 +115,19 @@ INSERT INTO v VALUES (5, 1), (6, stocked()) RETURNING id, a, stocked();
 UPDATE v SET a = stocked() WHERE id < 3 RETURNING id, a, stocked();
 DELETE FROM v WHERE id > 4 RETURNING id, stocked();
 SELECT * FROM stock ORDER BY id;
+
+-- Writes from routines to views and ruled tables go through their rewriting.
+CREATE VIEW plain AS SELECT id, a FROM stock;
+DO $$BEGIN
+  EXECUTE 'INSERT INTO plain VALUES ($1, $2)' USING 20, 2;
+  EXECUTE 'INSERT INTO v VALUES (21, stocked())';
+  EXECUTE 'INSERT INTO src VALUES (3, 3)';
+  EXECUTE 'UPDATE src SET v = 0 WHERE id = 3';
+END$$;
+CREATE FUNCTION add_plain(x int) RETURNS int LANGUAGE sql
+  AS $$INSERT INTO plain VALUES (x, x) RETURNING id$$;
+SELECT add_plain(30);
+SELECT * FROM stock ORDER BY id;
+SELECT * FROM src ORDER BY id;
+SELECT * FROM log WHERE id > 100 ORDER BY id, v;
 DROP SCHEMA step_progress CASCADE;

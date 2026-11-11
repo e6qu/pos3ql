@@ -116,7 +116,10 @@ is owned.
   `VALUES` over several rows). A data-modifying `WITH` sub-statement runs
   to completion before the main statement reads it, where PostgreSQL
   interleaves them, so a call in the main statement sees all of its rows.
-  PL/pgSQL rejects statements that start with `WITH` (`0A000`). A static PL/pgSQL `MERGE` source subquery cannot read routine
+  PL/pgSQL rejects statements that start with `WITH` (`0A000`), and a
+  static PL/pgSQL `INSERT`, `UPDATE` or `DELETE` on a view or a table with
+  rules fails with `0A000`: the rewriter does not yet read routine
+  variables (`EXECUTE` and SQL-language functions work). A static PL/pgSQL `MERGE` source subquery cannot read routine
   variables (`42703`). Triggers fired inside a write run
   without the engine's utility
   executor, so DDL there (PL/pgSQL `CREATE TABLE`, or a SQL procedure that a

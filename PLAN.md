@@ -333,7 +333,11 @@ reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
 PL/pgSQL `CALL` in a trigger function fails with `0A000`, and a procedure
 called from PL/pgSQL that waits for storage or a lock runs again from its
 start when its statement resumes (finished effects replay from the statement
-journal) instead of resuming at a saved position inside the procedure. Relation row types: values and columns of a
+journal) instead of resuming at a saved position inside the procedure. Relation row types: a `PREPARE` parameter
+of a table's row type (`PREPARE q(t) AS SELECT $1.a`) fails with `42704`
+(`type "t" does not exist`); a field of an undeclared parameter in a simple
+query (`SELECT ($1).a`) reports `42703` where PostgreSQL reports `42P02`
+(`there is no parameter $1`); values and columns of a
 view's row type, and dropping a relation through `DROP SCHEMA`, `DROP
 MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
 column uses its row type, fail with `0A000`; a `DROP TABLE ... CASCADE` that

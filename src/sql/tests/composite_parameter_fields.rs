@@ -67,3 +67,25 @@ fn named_composites_convert_to_json_objects() {
         ["{\"a\":1,\"c\":{\"a\":2}}|{\"a\": 1, \"c\": {\"a\": 2}}|{\"a\":1,\n \"c\":{\"a\":2}}"]
     );
 }
+
+/// `$1.field` selects a field of a positional composite parameter, as
+/// PostgreSQL's `PARAM opt_indirection` grammar allows.
+#[test]
+fn positional_parameter_fields_parse_and_run() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE pair(a integer, b text); \
+         CREATE FUNCTION first_of(pair) RETURNS integer LANGUAGE sql AS 'SELECT $1.a'; \
+         CREATE FUNCTION second_of(pair) RETURNS text LANGUAGE sql AS 'SELECT $1.b || ''z'''",
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT first_of(ROW(3, 'x')::pair), second_of(ROW(4, 'y')::pair)",
+        ),
+        ["3|yz"]
+    );
+}

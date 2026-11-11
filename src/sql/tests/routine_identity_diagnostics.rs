@@ -487,13 +487,7 @@ fn built_in_routine_targets_follow_postgresql() {
             )],
         ),
         ("ALTER FUNCTION lower(text) CALLED ON NULL INPUT", NONE),
-        (
-            "ALTER FUNCTION lower(text) SET search_path = public",
-            &[(
-                'E',
-                "0A000",
-                "SET and RESET of built-in function lower(text) are not supported",
-            )],
-        ),
+        ("ALTER FUNCTION lower(text) SET search_path = public", NONE),
+        ("ALTER FUNCTION lower(text) RESET ALL", NONE),
     ]);
 }

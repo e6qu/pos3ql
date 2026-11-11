@@ -695,7 +695,18 @@ impl<'a> Parser<'a> {
             Tok::Param(n) => {
                 self.advance()?;
                 self.max_param = self.max_param.max(n);
-                self.arena_expr(Expr::Param(n))
+                // PostgreSQL's `PARAM opt_indirection`: `$1.field`, `$1.*`.
+                let mut base = self.arena_expr(Expr::Param(n))?;
+                while self.peeked == Tok::Op(".") {
+                    self.advance()?;
+                    if self.peeked == Tok::Op("*") {
+                        self.advance()?;
+                        return self.arena_expr(Expr::Field { base, field: "*" });
+                    }
+                    let field = self.any_ident("field name")?;
+                    base = self.arena_expr(Expr::Field { base, field })?;
+                }
+                Ok(base)
             }
             Tok::Op("(") => {
                 let source_position_at = self.peek_at;

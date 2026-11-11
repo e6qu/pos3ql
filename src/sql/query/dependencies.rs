@@ -1339,6 +1339,15 @@ pub(crate) fn require_dml_builtin_execute<'a>(
     let (target, alias) = match statement {
         Stmt::Update(update) => (update.table, update.alias),
         Stmt::Delete(delete) => (delete.table, delete.alias),
+        // `VALUES` and `SELECT` sources are checked as they are evaluated.
+        Stmt::Insert(insert)
+            if insert.returning.items.is_empty()
+                && insert
+                    .on_conflict
+                    .is_none_or(|conflict| conflict.update.is_none()) =>
+        {
+            return Ok(());
+        }
         Stmt::Insert(insert) => (insert.table, None),
         Stmt::Merge(merge) => (merge.target, merge.target_alias),
         _ => return Ok(()),
@@ -1355,14 +1364,20 @@ pub(crate) fn require_dml_builtin_execute<'a>(
             Stmt::Update(update) => update.from,
             Stmt::Delete(delete) => delete.using,
             // `ON CONFLICT DO UPDATE` reads the proposed row as `excluded`.
-            Stmt::Insert(_) => Some(
-                &*arena
-                    .alloc(FromClause {
-                        base: target_table_ref(target, Some("excluded")),
-                        joins: &[],
-                    })
-                    .map_err(|_| super::arena_full())?,
-            ),
+            Stmt::Insert(insert)
+                if insert
+                    .on_conflict
+                    .is_some_and(|conflict| conflict.update.is_some()) =>
+            {
+                Some(
+                    &*arena
+                        .alloc(FromClause {
+                            base: target_table_ref(target, Some("excluded")),
+                            joins: &[],
+                        })
+                        .map_err(|_| super::arena_full())?,
+                )
+            }
             Stmt::Merge(merge) => Some(
                 &*arena
                     .alloc(FromClause {

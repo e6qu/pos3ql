@@ -441,6 +441,7 @@ step "stalled result clients do not stall other sessions (object-store mode)"
 restart_main_server result-streams
 ensure_psycopg_venv || exit 1
 if "$VENV/bin/python" "$EXT/result_streams.py" --host 127.0.0.1 --p3 "$PG_PORT" \
+    --storage-mode object-store \
     > "$WORK/result_streams.out" 2>&1; then
   ok "stalled result clients"
 else

@@ -6,7 +6,9 @@ extended Execute (Parse/Bind/Execute(0)/Sync) and through a paged portal
 (Execute with a row limit, repeated, then Execute(0)), and stops reading with
 a small receive buffer. The results are a generated series, a scan
 of one table, joins and sorts (pos3ql resumes them row by row, and evaluates
-a paged portal's rows as each Execute asks for them).
+a paged portal's rows as each Execute asks for them). --storage-mode names
+the server's mode: object-store mode sorts in external runs, so its sorted
+result spools and is not paged.
 Client B, a psycopg session, must keep completing queries while A is stalled.
 A `COPY ... TO STDOUT` of the table is stalled the same way. A then reads
 everything: exactly one RowDescription per simple query, every row once and
@@ -31,6 +33,8 @@ TABLE_ROWS = 5000
 # Results must exceed what loopback socket buffers can absorb (Linux grows a
 # send buffer to 4 MiB), so the server really holds output for a stalled client.
 ALL_PROTOCOLS = ("simple", "extended", "paged")
+# Paged only in local storage mode; see the sorted query below.
+LOCAL_PAGED = ("simple", "extended", "local-paged")
 COPY_TABLE = "COPY result_stream_rows TO STDOUT"
 QUERIES = (
     (f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g", ROWS, ALL_PROTOCOLS),
@@ -49,11 +53,12 @@ QUERIES = (
     ),
     # Local-mode sorts and hash joins resume row by row after their build;
     # rows must still arrive as 1..n, so the sort key reverses a descending
-    # expression.
+    # expression. Object-store mode sorts in external runs: that result
+    # spools, and a paged portal would buffer more than portal_result_bytes.
     (
         "SELECT id, payload FROM result_stream_rows ORDER BY -id DESC",
         TABLE_ROWS,
-        ALL_PROTOCOLS,
+        LOCAL_PAGED,
     ),
     # Two tables' read positions exceed the starter result_stream_bytes, so
     # this hash join spools; a paged portal would buffer more than
@@ -244,11 +249,22 @@ def interleaved_portals(host, port, user, database):
     return shape
 
 
-def probe(host, port, user, database):
+def protocols_for(protocols, mode):
+    for protocol in protocols:
+        if protocol == "local-paged":
+            if mode == "local":
+                yield "paged"
+        else:
+            yield protocol
+
+
+def probe(host, port, user, database, mode):
     create_table(host, port, user, database)
     results = {"interleaved": interleaved_portals(host, port, user, database)}
     for query, rows, protocol in [
-        (query, rows, protocol) for query, rows, protocols in QUERIES for protocol in protocols
+        (query, rows, protocol)
+        for query, rows, protocols in QUERIES
+        for protocol in protocols_for(protocols, mode)
     ]:
         sock = stalled_client(host, port, user, database)
         if protocol == "simple":
@@ -321,15 +337,21 @@ def main():
     parser.add_argument("--pg", type=int, help="PostgreSQL 18 reference port")
     parser.add_argument("--user", default="postgres")
     parser.add_argument("--database", default="postgres")
+    parser.add_argument(
+        "--storage-mode",
+        choices=("local", "object-store"),
+        required=True,
+        help="pos3ql's storage mode, which decides whether its sorts stream",
+    )
     args = parser.parse_args()
-    actual = probe(args.host, args.p3, args.user, args.database)
+    actual = probe(args.host, args.p3, args.user, args.database, args.storage_mode)
     if args.pg is not None:
         with psycopg.connect(
             host=args.host, port=args.pg, user=args.user, dbname="postgres", connect_timeout=5
         ) as connection:
             version = connection.info.server_version
         assert version // 10000 == 18, f"reference is PostgreSQL {version}"
-        reference = probe(args.host, args.pg, args.user, args.database)
+        reference = probe(args.host, args.pg, args.user, args.database, args.storage_mode)
         assert actual == reference, (actual, reference)
     print("ok: stalled result clients do not stall other sessions")
 

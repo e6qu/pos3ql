@@ -19,10 +19,12 @@ struct Fixture {
     config: Config,
 }
 
-fn fixture() -> Fixture {
+/// Each test owns its data directory: tests run concurrently in one process,
+/// and the first to finish removes its directory.
+fn fixture(name: &str) -> Fixture {
     let mut config = Config::default_dev();
     config.data_dir = std::env::temp_dir()
-        .join(format!("pos3ql-sleep-statements-{}", std::process::id()))
+        .join(format!("pos3ql-sleep-{name}-{}", std::process::id()))
         .to_string_lossy()
         .into_owned();
     config.remove_test_data_dir_on_drop();
@@ -143,7 +145,7 @@ fn sqlstates(messages: &[(u8, Vec<u8>)]) -> Vec<String> {
 
 #[test]
 fn sleeping_statement_parks_on_a_timer_while_other_sessions_run() {
-    let mut fixture = fixture();
+    let mut fixture = fixture("timer");
     let (mut sleeper, mut sleeper_client) = connection(&mut fixture, 1);
     let (mut other, mut other_client) = connection(&mut fixture, 2);
     send(
@@ -202,7 +204,7 @@ fn sleeping_statement_parks_on_a_timer_while_other_sessions_run() {
 
 #[test]
 fn statement_timeout_and_cancellation_end_a_sleep() {
-    let mut fixture = fixture();
+    let mut fixture = fixture("timeout");
     let (mut sleeper, mut sleeper_client) = connection(&mut fixture, 1);
     send(
         &mut sleeper,

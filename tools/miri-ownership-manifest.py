@@ -6,7 +6,31 @@ from pathlib import Path
 import re
 
 
-GROUPS = {"memory-sql": ("mem::", "sql::"), "storage": ("storage::",)}
+# Each proof belongs to the group of its longest matching module prefix. The
+# split keeps every group's interpreter run inside the CI job budget.
+GROUPS = {
+    "memory-sql": ("mem::", "sql::"),
+    "sql-exec": ("sql::exec::",),
+    "storage": ("storage::",),
+    "storage-definitions": (
+        "storage::definition_images::",
+        "storage::transaction_admission::",
+    ),
+}
+
+
+def owner(name):
+    matches = [
+        (len(prefix), group)
+        for group, prefixes in GROUPS.items()
+        for prefix in prefixes
+        if name.startswith(prefix)
+    ]
+    if not matches:
+        return None
+    longest = max(length for length, _ in matches)
+    owners = {group for length, group in matches if length == longest}
+    return owners.pop() if len(owners) == 1 else None
 
 
 def read_manifest(path):
@@ -17,14 +41,13 @@ def read_manifest(path):
     ):
         raise ValueError("ownership manifest must contain unique, complete test names")
     for name in names:
-        owners = [group for group, prefixes in GROUPS.items() if name.startswith(prefixes)]
-        if len(owners) != 1:
+        if owner(name) is None:
             raise ValueError(f"ownership proof must belong to exactly one group: {name}")
     return names
 
 
 def select(names, group):
-    selected = [name for name in names if name.startswith(GROUPS[group])]
+    selected = [name for name in names if owner(name) == group]
     if not selected:
         raise ValueError(f"ownership group is empty: {group}")
     return selected

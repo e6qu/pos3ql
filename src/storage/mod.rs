@@ -46954,6 +46954,11 @@ impl Storage {
             Some(expected) => expected,
             None => return false,
         };
+        // PostgreSQL's IsBinaryCoercible: every composite, including a
+        // relation row type or a domain over one, coerces to `record`.
+        if expected_oid == oid::RECORD && matches!(actual.ctype, ColType::Composite(_)) {
+            return true;
+        }
         // Resolve domain candidates through their base types. Execution still
         // checks the declared domain before the routine receives the value.
         let actual_base = actual.ctype.oid();

@@ -4652,6 +4652,17 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             .whole_row_type(table)
             .or_else(|| self.outer.and_then(|outer| outer.whole_row_type(table)))
     }
+
+    /// Grouping keys match by this identity (`a` and `t.a` are one key). Only
+    /// this query level's columns have one; an enclosing row's columns and a
+    /// winning PL/pgSQL variable are never this level's grouping keys.
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        if self.inner_column_wins(qualifier, name) {
+            self.inner.column_identity(qualifier, name)
+        } else {
+            None
+        }
+    }
 }
 
 /// Materializes a `LATERAL` FROM item's rows for one outer row: its body sees

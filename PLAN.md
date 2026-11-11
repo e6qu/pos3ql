@@ -110,7 +110,8 @@ is owned.
     index-probed joins, RIGHT and FULL joins, grouping,
     subqueries, set operations, sorts in object-store mode (external runs
     with a run reader per stream; a large ordered `SELECT` there still
-    spools), and more
+    spools, and a paged portal of one buffers in `portal_result_bytes`),
+    and more
     set-returning functions than the generator builtins (series, subscripts,
     one-array `unnest`, regex, and the `json`/`jsonb` `_each`,
     `_array_elements` and `_object_keys` families, alone or in `ROWS FROM`):

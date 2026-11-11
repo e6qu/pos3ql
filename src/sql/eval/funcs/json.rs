@@ -64,16 +64,7 @@ impl<'a> SqlJsonWriter<'_, 'a> {
                 )
             }
             Datum::Composite { fields, .. } | Datum::Record(fields) => {
-                out.write_char('{').map_err(|_| arena_full())?;
-                for (index, field) in fields.iter().enumerate() {
-                    if index != 0 {
-                        out.write_char(',').map_err(|_| arena_full())?;
-                    }
-                    json::write_json_raw_string(field.name, out).map_err(|_| arena_full())?;
-                    out.write_char(':').map_err(|_| arena_full())?;
-                    self.write(field.value, field.type_oid, out)?;
-                }
-                out.write_char('}').map_err(|_| arena_full())
+                self.fields(fields, ",", out)
             }
             value => {
                 if let Some(catalog) = self.catalog
@@ -106,6 +97,58 @@ impl<'a> SqlJsonWriter<'_, 'a> {
                 }
                 json::write_datum_json(&value, false, out).map_err(|_| arena_full())
             }
+        }
+    }
+
+    /// PostgreSQL's `composite_to_json`: field names as keys, each value
+    /// converted as `to_json` converts it, members joined by `separator`.
+    fn fields(
+        &self,
+        fields: &[crate::sql::types::RecordField<'a>],
+        separator: &str,
+        out: &mut dyn Write,
+    ) -> Result<(), SqlError> {
+        out.write_char('{').map_err(|_| arena_full())?;
+        for (index, field) in fields.iter().enumerate() {
+            if index != 0 {
+                out.write_str(separator).map_err(|_| arena_full())?;
+            }
+            json::write_json_raw_string(field.name, out).map_err(|_| arena_full())?;
+            out.write_char(':').map_err(|_| arena_full())?;
+            self.write(field.value, field.type_oid, out)?;
+        }
+        out.write_char('}').map_err(|_| arena_full())
+    }
+
+    /// `row_to_json(record, pretty)`: line feeds separate only the top-level
+    /// members, as PostgreSQL's `use_line_feeds` does.
+    fn row(&self, value: Datum<'a>, line_feeds: bool, out: &mut dyn Write) -> Result<(), SqlError> {
+        let separator = if line_feeds { ",\n " } else { "," };
+        match value {
+            Datum::CompositeText {
+                slot,
+                physical_fields,
+                text,
+            } => {
+                let catalog = self.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "JSON composite catalog access is unavailable"
+                    )
+                })?;
+                self.row(
+                    catalog.materialize_composite(slot, physical_fields, text, self.arena)?,
+                    line_feeds,
+                    out,
+                )
+            }
+            Datum::Composite { fields, .. } | Datum::Record(fields) => {
+                self.fields(fields, separator, out)
+            }
+            other => Err(crate::sql::eval::function_argument_mismatch(
+                "row_to_json",
+                &other,
+            )),
         }
     }
 
@@ -1859,12 +1902,42 @@ pub(crate) fn dispatch<'a>(
                         name
                     ));
                 }
-                let v = eval_full(args[0], arena, params, row, hooks)?;
-                let jsonb = name == "to_jsonb";
-                let mut buf = ArenaString::new(arena);
-                json::write_datum_json(&v, jsonb, &mut buf).map_err(|_| arena_full())?;
-                let text = buf.as_str();
-                Ok(Datum::Json { text, jsonb })
+                let value = eval_full(args[0], arena, params, row, hooks)?;
+                let line_feeds = if args.len() == 2 {
+                    match eval_full(args[1], arena, params, row, hooks)? {
+                        Datum::Bool(line_feeds) => line_feeds,
+                        Datum::Null => return Ok(Datum::Null),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
+                    }
+                } else {
+                    false
+                };
+                if value.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let mut buffer = ArenaString::new(arena);
+                if name == "row_to_json" {
+                    SqlJsonWriter {
+                        catalog: hooks.catalog,
+                        arena,
+                    }
+                    .row(value, line_feeds, &mut buffer)?;
+                } else {
+                    write_sql_json_argument(args[0], value, arena, row, hooks, &mut buffer)?;
+                }
+                let text = buffer.as_str();
+                if name != "to_jsonb" {
+                    return Ok(Datum::Json { text, jsonb: false });
+                }
+                // jsonb keeps PostgreSQL's key order and spacing, not the
+                // source order the json rendering has.
+                let value = json::parse(text, arena)?;
+                Ok(Datum::Json {
+                    text: json_to_text(&value, arena)?,
+                    jsonb: true,
+                })
             }
             // `jsonb_set(target, path, new_value [, create_if_missing])`.
             "jsonb_set" | "jsonb_set_lax" => {

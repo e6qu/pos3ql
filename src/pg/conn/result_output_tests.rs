@@ -596,6 +596,46 @@ fn stream_fixture(
     (fixture, reader, reader_client, other, other_client)
 }
 
+/// A stream waiting for its client is ready the moment its output has left,
+/// whichever flush emptied it: the reactor learns this from the wait's
+/// remaining time, since a flush outside its retry pass raises no later
+/// socket event.
+#[test]
+fn drained_client_output_waits_report_no_remaining_time() {
+    let (mut fixture, mut conn, mut client, _, _) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "stream-drained");
+    client
+        .write_all(&query("SELECT id, payload FROM big"))
+        .unwrap();
+    assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+    assert_eq!(
+        conn.parked_wait(),
+        Some(crate::sql::StatementWait::ClientOutput)
+    );
+    assert_eq!(conn.parked_wait_remaining(), None, "output is still queued");
+    let deadline = Instant::now() + crate::test_wait::HANG;
+    let mut received = Vec::new();
+    while !(conn.send.is_empty() && conn.overflow_bytes() == 0) {
+        assert!(Instant::now() < deadline, "queued output never left");
+        read_available(&mut client, &mut received);
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| conn.on_writable()),
+            After::Continue
+        );
+    }
+    assert_eq!(
+        conn.parked_wait(),
+        Some(crate::sql::StatementWait::ClientOutput)
+    );
+    assert_eq!(conn.parked_wait_remaining(), Some(Duration::ZERO));
+    let response = drain_after(&mut conn, &mut fixture.engine, &mut client, 1, received);
+    let rows = messages(&response)
+        .iter()
+        .filter(|message| message.0 == b'D')
+        .count();
+    assert_eq!(rows, 5000);
+}
+
 #[test]
 fn retained_selects_resume_as_streams_while_other_sessions_progress() {
     for mode in [

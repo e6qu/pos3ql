@@ -1414,7 +1414,13 @@ impl Conn {
         } else {
             None
         };
-        [lock, sleep, self.statement_wait_remaining()]
+        // A statement waiting for its client is ready as soon as all queued
+        // output has left, even when the last flush happened after this
+        // turn's retries: no further socket event will report it.
+        let client = (self.parked_wait == crate::sql::StatementWait::ClientOutput
+            && self.transport_output_empty())
+        .then_some(Duration::ZERO);
+        [lock, sleep, client, self.statement_wait_remaining()]
             .into_iter()
             .flatten()
             .min()

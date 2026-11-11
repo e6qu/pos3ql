@@ -192,6 +192,13 @@ pub fn parse_date(s: &str) -> Result<i32, SqlError> {
     if trimmed.eq_ignore_ascii_case("infinity") {
         return Ok(DATE_INFINITY);
     }
+    if trimmed.eq_ignore_ascii_case("epoch") {
+        return Ok(-(PG_EPOCH_SECS / 86_400) as i32);
+    }
+    if let Some(day) = special_day(trimmed) {
+        let local = special_local_micros(day).ok_or_else(out_of_range)?;
+        return Ok(local.div_euclid(86_400_000_000) as i32);
+    }
     if trimmed.eq_ignore_ascii_case("-infinity") {
         return Ok(DATE_NEG_INFINITY);
     }
@@ -1077,6 +1084,31 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     if t.eq_ignore_ascii_case("infinity") {
         return Ok(TIMESTAMP_INFINITY);
     }
+    if t.eq_ignore_ascii_case("epoch") {
+        return Ok(-PG_EPOCH_SECS * 1_000_000);
+    }
+    if let Some(day) = special_day(t) {
+        let out_of_range = || {
+            sql_err!(
+                sqlstate::DATETIME_FIELD_OVERFLOW,
+                "date/time field value out of range: \"{}\"",
+                s
+            )
+        };
+        return match day {
+            SpecialDay::Now if apply_timezone => Ok(transaction_micros()),
+            day => {
+                let local = special_local_micros(day).ok_or_else(out_of_range)?;
+                if apply_timezone {
+                    super::timezone::session()
+                        .resolve_local(local)
+                        .ok_or_else(out_of_range)
+                } else {
+                    Ok(local)
+                }
+            }
+        };
+    }
     if t.eq_ignore_ascii_case("-infinity") {
         return Ok(TIMESTAMP_NEG_INFINITY);
     }
@@ -1253,6 +1285,17 @@ fn parse_time_parts(s: &str, type_name: &str) -> Result<(i64, Option<i32>), SqlE
             s
         )
     };
+    // PostgreSQL's special time inputs: midnight UTC and the transaction's
+    // session-zone time of day.
+    if s.trim().eq_ignore_ascii_case("allballs") {
+        return Ok((0, Some(0)));
+    }
+    if s.trim().eq_ignore_ascii_case("now") {
+        let now = transaction_micros();
+        let offset = super::timezone::session().resolve(now).0;
+        let local = now + i64::from(offset) * 1_000_000;
+        return Ok((local.rem_euclid(86_400_000_000), Some(offset)));
+    }
     let t = s.trim();
     // Split off a trailing zone: `Z`, a named `UTC`, or `±HH[:MM[:SS]]`. The
     // sign has to be past the start so a lone offset is not read as a time.
@@ -2591,6 +2634,42 @@ pub fn statement_micros() -> i64 {
 pub fn transaction_micros() -> i64 {
     let at = TRANSACTION_START.with(|t| t.get());
     if at == 0 { statement_micros() } else { at }
+}
+
+/// PostgreSQL's special date and timestamp inputs that name a day.
+#[derive(Clone, Copy)]
+enum SpecialDay {
+    Now,
+    Today,
+    Tomorrow,
+    Yesterday,
+}
+
+fn special_day(text: &str) -> Option<SpecialDay> {
+    [
+        ("now", SpecialDay::Now),
+        ("today", SpecialDay::Today),
+        ("tomorrow", SpecialDay::Tomorrow),
+        ("yesterday", SpecialDay::Yesterday),
+    ]
+    .into_iter()
+    .find_map(|(name, day)| text.eq_ignore_ascii_case(name).then_some(day))
+}
+
+/// The session-zone wall time a special input denotes: the transaction's
+/// timestamp for `now`, else midnight of the named day.
+fn special_local_micros(day: SpecialDay) -> Option<i64> {
+    const DAY: i64 = 86_400_000_000;
+    let now = transaction_micros();
+    let local =
+        now.checked_add(i64::from(super::timezone::session().resolve(now).0) * 1_000_000)?;
+    let midnight = local.div_euclid(DAY) * DAY;
+    match day {
+        SpecialDay::Now => Some(local),
+        SpecialDay::Today => Some(midnight),
+        SpecialDay::Tomorrow => midnight.checked_add(DAY),
+        SpecialDay::Yesterday => midnight.checked_sub(DAY),
+    }
 }
 
 /// `clock_timestamp()`: the actual wall clock, read afresh each call.

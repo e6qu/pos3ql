@@ -99,6 +99,14 @@ Row types:
 
 Functions and expressions:
 
+- `pg_get_expr`, `pg_get_constraintdef`, `pg_get_function_arguments` and
+  `pg_get_functiondef` print column defaults, CHECK constraints, parameter
+  defaults and `RETURN` bodies as PostgreSQL does: `DEFAULT 'x'` on a `text`
+  column is shown as `'x'::text`, and `CHECK (v <> '')` on a `varchar` column as
+  `CHECK (((v)::text <> ''::text))`. Expressions outside the deparser's typed
+  coverage, `pretty` output and `pg_get_viewdef` keep their stored spelling
+  (see [PLAN](../PLAN.md#close-application-compatibility-gaps)).
+
 - Named arguments and omitted defaults run in declared input order and share
   the caller's session, so a default calling `nextval('order_numbers')` updates
   `currval`. Function lookup never runs arguments to discover their types.

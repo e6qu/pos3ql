@@ -70,6 +70,8 @@ mod views;
 
 #[path = "catalog_constraints.rs"]
 mod constraints;
+#[path = "catalog_deparse.rs"]
+pub(crate) mod deparse;
 #[path = "catalog_expressions.rs"]
 pub(crate) mod expressions;
 #[path = "catalog_information.rs"]
@@ -14708,7 +14710,30 @@ pub fn function_def_text<'a>(
             let _ = write!(definition, "AS {0}{body}{0}", delimiter.as_str());
         }
         crate::storage::RoutineBodyKind::Return => {
-            let _ = write!(definition, "RETURN {}", routine.body.as_str());
+            let context = deparse::Context {
+                storage,
+                txid,
+                table: None,
+                parameters: routine.parameters(),
+            };
+            let deparsed = match routine
+                .function_result_contract()
+                .and_then(|result| storage.routine_type_oid(result.ctype, result.user_type, txid))
+                .filter(|type_oid| crate::storage::PolymorphicType::from_oid(*type_oid).is_none())
+            {
+                Some(type_oid) => deparse::deparse(
+                    &context,
+                    routine.body.as_str(),
+                    deparse::Destination::Assignment(type_oid),
+                    arena,
+                )?,
+                None => None,
+            };
+            let _ = write!(
+                definition,
+                "RETURN {}",
+                deparsed.unwrap_or(routine.body.as_str())
+            );
         }
         crate::storage::RoutineBodyKind::Atomic => {
             let _ = definition.write_str("BEGIN ATOMIC\n");
@@ -15191,10 +15216,28 @@ fn write_routine_arguments(
         write_visible_routine_type(output, storage, txid, parameter.ctype, parameter.user_type);
         if !identity && let Some(default) = parameter.mode.default() {
             let _ = output.write_str(" DEFAULT ");
-            let _ = output.write_str(super::enum_values::checks::canonical_display(
-                default.as_str(),
-                arena,
-            )?);
+            let context = deparse::Context {
+                storage,
+                txid,
+                table: None,
+                parameters: &[],
+            };
+            let deparsed = match storage
+                .routine_type_oid(parameter.ctype, parameter.user_type, txid)
+                .filter(|type_oid| crate::storage::PolymorphicType::from_oid(*type_oid).is_none())
+            {
+                Some(type_oid) => deparse::deparse(
+                    &context,
+                    default.as_str(),
+                    deparse::Destination::Assignment(type_oid),
+                    arena,
+                )?,
+                None => None,
+            };
+            let _ = output.write_str(match deparsed {
+                Some(deparsed) => deparsed,
+                None => super::enum_values::checks::canonical_display(default.as_str(), arena)?,
+            });
         }
     }
     Ok(())
@@ -15715,13 +15758,17 @@ fn pg_description<'a>(
                 let Ok(oid) = i32::try_from(subid) else {
                     continue;
                 };
-                let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
-                    continue;
-                };
-                (
-                    crate::storage::routine_oid(&storage.routine_for(slot, txid)),
-                    PG_PROC_OID,
-                )
+                if builtin_callable_by_oid(oid).is_some() {
+                    (oid, PG_PROC_OID)
+                } else {
+                    let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+                        continue;
+                    };
+                    (
+                        crate::storage::routine_oid(&storage.routine_for(slot, txid)),
+                        PG_PROC_OID,
+                    )
+                }
             }
             crate::storage::CommentClass::Policy => {
                 let Ok(oid) = i32::try_from(subid) else {
@@ -16582,7 +16629,8 @@ fn visit_comments_for_object(
                     && subid == 0
                     && signed_oid.is_some_and(|oid| {
                         i32::try_from(csub) == Ok(oid)
-                            && storage.routine_slot_by_oid(oid, txid).is_some()
+                            && (storage.routine_slot_by_oid(oid, txid).is_some()
+                                || builtin_callable_by_oid(oid).is_some())
                     })
             }
             "pg_policy" => {
@@ -17009,7 +17057,26 @@ pub fn constraint_def_text<'a>(
             }
             let mut rendered = StackStr::<1024>::new();
             use core::fmt::Write as _;
-            let _ = write!(rendered, "CHECK (({}))", check.expression.as_str());
+            let context = deparse::Context {
+                storage,
+                txid,
+                table: Some(&table),
+                parameters: &[],
+            };
+            match deparse::deparse(
+                &context,
+                check.expression.as_str(),
+                deparse::Destination::Condition,
+                arena,
+            )? {
+                // A bare boolean column is printed without its own parentheses.
+                Some(deparsed) => {
+                    let _ = write!(rendered, "CHECK ({deparsed})");
+                }
+                None => {
+                    let _ = write!(rendered, "CHECK (({}))", check.expression.as_str());
+                }
+            }
             append_constraint_attributes(
                 &mut rendered,
                 crate::storage::ConstraintTiming::NotDeferrable,

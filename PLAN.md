@@ -266,9 +266,12 @@ order and startup limits hold throughout. The
 **Work:** audit PostgreSQL 18 built-in functions by signature and executed
 behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
-unsupported case into an explicit error. Known gaps: `ALTER`, `COMMENT ON`
-and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
-with `0A000` where PostgreSQL changes the catalog entry; arrays of
+unsupported case into an explicit error. Known gaps: `ALTER` and `GRANT` on a
+built-in function (`ALTER FUNCTION lower(text) STABLE`, `REVOKE EXECUTE ON
+FUNCTION lower(text) FROM PUBLIC`) fail with `0A000` where PostgreSQL changes
+the catalog entry (`COMMENT ON FUNCTION` works); built-in functions have no
+`pg_description` text of their own (`obj_description('lower(text)'::regprocedure)`
+is NULL where PostgreSQL returns `lowercase`); arrays of
 `information_schema` domains (`information_schema.cardinal_number[]`) are
 rejected with `0A000`. A parameter typed from a called
 built-in (`PREPARE q AS SELECT round($1)`) is not recorded as that type:
@@ -278,11 +281,17 @@ PostgreSQL's `double precision` gives 2. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final
-statement runs. Expressions are shown as stored, not deparsed: `pg_get_expr`,
-`pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
-`text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
-the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
-than one deparsed statement per line. Syntax and scanner errors in a client's
+statement runs. Column defaults, CHECK constraints, routine parameter defaults
+and `RETURN` bodies are printed in PostgreSQL's analyzed form (`'x'::text`,
+`((k >= 1) AND (k <= 5))`), but only for literals, columns, parameters,
+operators, `IN`, `LIKE`, `IS NULL`, `CASE`, casts, SQL value functions and
+built-in function calls; other expressions (subqueries, user-defined function
+calls, `$n` parameters, array constructors) are still printed as stored, and
+pretty requests are not honored: `pg_get_expr(..., true)` prints the stored
+text and `pg_get_constraintdef(oid, true)` (used by psql's `\d`) prints the
+fully parenthesized form where PostgreSQL drops redundant parentheses. `pg_get_viewdef` returns the view's query text, a `BEGIN
+ATOMIC` body is printed as written rather than one deparsed statement per line,
+and index, trigger, rule and policy expressions are not deparsed. Syntax and scanner errors in a client's
 query report PostgreSQL's wording and cursor position (the `P` field that psql shows as `LINE 1:` and a caret), but
 other errors do not yet: PostgreSQL also points at the unknown relation, column,
 type, function or failed constant (`SELECT * FROM missing_table` reports

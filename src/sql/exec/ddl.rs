@@ -325,12 +325,17 @@ pub(super) fn build_column(
         )?;
         // A domain-typed column with no column-level DEFAULT inherits the
         // domain's DEFAULT (baked in at creation, re-evaluated per insert).
-        if matches!(column_default, ColumnDefault::None) {
-            domain_default
+        match column_default {
+            ColumnDefault::None => domain_default
                 .map(ColumnDefault::Expression)
-                .unwrap_or(ColumnDefault::None)
-        } else {
-            column_default
+                .unwrap_or(ColumnDefault::None),
+            // PostgreSQL stores no default for a NULL constant unless it
+            // must override a domain's own default.
+            ColumnDefault::Constant {
+                value: crate::storage::OwnedDatum::Null,
+                ..
+            } if domain_default.is_none() => ColumnDefault::None,
+            column_default => column_default,
         }
     };
     // SERIAL requests a bound nextval default during table creation.

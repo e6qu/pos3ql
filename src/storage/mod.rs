@@ -29438,6 +29438,34 @@ impl Storage {
         ))
     }
 
+    /// Built-in routines belong to the bootstrap superuser.
+    pub(crate) fn require_builtin_routine_owner(
+        &self,
+        name: &str,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        if txid == 0 {
+            return Ok(());
+        }
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        if self.role(role).attributes_to(txid).superuser
+            || role == usize::from(BOOTSTRAP_ROLE)
+            || self.role_has_privileges_of(role, usize::from(BOOTSTRAP_ROLE), txid)
+        {
+            return Ok(());
+        }
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be owner of function {}",
+            name
+        ))
+    }
+
     pub(crate) fn require_language_usage(&self, name: &str, txid: u32) -> Result<(), SqlError> {
         if txid == 0 {
             return Ok(());

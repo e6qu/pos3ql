@@ -516,7 +516,19 @@ deparsing can fail with `XX000`. This matches PostgreSQL's
 
 Information-schema views follow the pinned PostgreSQL 18.6
 [definitions](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql),
-including hiding definitions from non-owners and masking password fields.
+including hiding definitions from non-owners and masking password fields. Their
+columns have that script's domains (`sql_identifier`, `cardinal_number`,
+`character_data`, `yes_or_no`, `time_stamp`), which also exist as ordinary
+types with their CHECK constraints.
+
+Every table, materialized view and view has a row type named like the relation,
+usable in casts, columns and routine signatures; the relation owns it, so
+dropping the relation reaches the routines and columns that use it.
+
+Column defaults, CHECK constraints and routine defaults are printed in
+PostgreSQL's analyzed form for the expression shapes listed in
+[PLAN](../PLAN.md#close-application-compatibility-gaps): **example:**
+`DEFAULT 'x'` on a `text` column is `'x'::text` in `pg_get_expr`.
 
 - `tableoid` must be named explicitly.
 - Index vectors start at subscript zero and keep that bound when cast to

@@ -2475,10 +2475,14 @@ pub(crate) fn dispatch<'a>(
                         None => -1,
                     },
                 };
-                let type_mod = match eval_full(args[1], arena, params, row, hooks)? {
+                let modifier = eval_full(args[1], arena, params, row, hooks)?;
+                // A NULL modifier means "no modifier", not a NULL result. An
+                // explicit -1 still marks the modifier as given, which makes
+                // PostgreSQL spell unconstrained `character` as `bpchar`.
+                let modifier_given = !modifier.is_null();
+                let type_mod = match modifier {
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
-                    // A NULL modifier means "no modifier", not a NULL result.
                     _ => -1,
                 };
                 if let Some(cat) = hooks.catalog
@@ -2496,7 +2500,11 @@ pub(crate) fn dispatch<'a>(
                     ColType::Array(element) => (element.to_coltype(), true),
                     scalar => (scalar, false),
                 };
-                let name = base.name();
+                let name = if base == ColType::Bpchar && modifier_given && type_mod < 0 {
+                    "bpchar"
+                } else {
+                    base.name()
+                };
                 // Array typmods describe their elements. Render the base under
                 // that modifier, then attach [] as PostgreSQL does.
                 let mut text = match TypeMod::decode(base, type_mod) {

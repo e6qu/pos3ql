@@ -43682,20 +43682,34 @@ pub fn comment(
             )
         }
         CommentTarget::Routine { kind, identity } => {
-            let slot = match resolve_routine_identity(storage, txid, &identity, kind) {
-                Ok(slot) => slot,
+            match lookup_routine(storage, txid, kind, &identity) {
+                Ok(Ok(RoutineTarget::Stored(slot))) => {
+                    if let Err(error) = storage.require_routine_owner(slot, txid) {
+                        return sql_fail(error);
+                    }
+                    let routine = storage.routine_for(slot, txid);
+                    (
+                        CommentClass::Routine,
+                        routine.schema_for(txid),
+                        routine.name_for(txid),
+                        crate::storage::routine_oid(&routine) as u32,
+                    )
+                }
+                // PostgreSQL comments on its built-in routines' catalog rows.
+                Ok(Ok(RoutineTarget::Builtin(builtin))) => {
+                    if let Err(error) = storage.require_builtin_routine_owner(builtin.name, txid) {
+                        return sql_fail(error);
+                    }
+                    match (SqlName::parse(builtin.schema), SqlName::parse(builtin.name)) {
+                        (Ok(schema), Ok(name)) => {
+                            (CommentClass::Routine, schema, name, builtin.oid as u32)
+                        }
+                        (Err(error), _) | (_, Err(error)) => return sql_fail(error),
+                    }
+                }
+                Ok(Err(miss)) => return sql_fail(miss.error(storage, txid, kind, &identity)),
                 Err(error) => return sql_fail(error),
-            };
-            if let Err(error) = storage.require_routine_owner(slot, txid) {
-                return sql_fail(error);
             }
-            let routine = storage.routine_for(slot, txid);
-            (
-                CommentClass::Routine,
-                routine.schema_for(txid),
-                routine.name_for(txid),
-                crate::storage::routine_oid(&routine) as u32,
-            )
         }
         CommentTarget::Type {
             name: type_name,

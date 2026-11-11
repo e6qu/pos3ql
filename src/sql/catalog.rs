@@ -4529,6 +4529,14 @@ pub(crate) fn builtin_cast_properties(source: i32, target: i32) -> Option<(bool,
     None
 }
 
+/// The function of a `pg_cast` row whose method is a function call.
+pub(crate) fn builtin_function_cast_procedure(source: i32, target: i32) -> Option<i32> {
+    builtin_properties::CASTS
+        .iter()
+        .find(|cast| cast.source == source && cast.target == target && cast.method == b'f')
+        .map(|cast| cast.procedure)
+}
+
 /// Visits the actual input/output or cast functions; binary paths visit none.
 pub(crate) fn builtin_cast_procedures(
     source: i32,

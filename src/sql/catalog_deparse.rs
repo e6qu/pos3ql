@@ -763,7 +763,7 @@ impl Context<'_> {
                 operand: None,
                 whens,
                 otherwise,
-                synthetic: false,
+                origin: crate::sql::ast::CaseOrigin::Written,
             } => {
                 let Some((_, first)) = whens.first() else {
                     return output.unsupported();
@@ -1137,7 +1137,7 @@ pub(crate) fn view_definition<'a>(
             operand: None,
             whens,
             otherwise,
-            synthetic: false,
+            origin: crate::sql::ast::CaseOrigin::Written,
         } = expression
         {
             // The indented layout starts a searched CASE on its own line.

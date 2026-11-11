@@ -23,6 +23,7 @@ mod function_progress;
 mod geometric_casts;
 mod geometry_assignments;
 mod index_parent_ownership;
+mod indirect_execute_privileges;
 mod information_schema_domains;
 mod key_preparation;
 mod nested_planner_inputs;

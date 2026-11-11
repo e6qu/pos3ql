@@ -1606,7 +1606,8 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             | Expr::Array(_)
             | Expr::ArraySubquery(_)
             | Expr::Case {
-                synthetic: false, ..
+                origin: crate::sql::ast::CaseOrigin::Written,
+                ..
             } => name_of(operand),
             Expr::Cast { operand, .. } => {
                 cast_source_name(operand).or_else(|| cast_target_name(type_name))
@@ -1622,7 +1623,10 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         // A desugared CASE (`IS TRUE`, `IS DISTINCT FROM`) is anonymous, as
         // PostgreSQL labels those `?column?`; a real CASE forwards to its ELSE.
         Expr::Case {
-            synthetic: true, ..
+            origin:
+                crate::sql::ast::CaseOrigin::BooleanTest
+                | crate::sql::ast::CaseOrigin::DistinctFrom { .. },
+            ..
         } => None,
         Expr::Case {
             otherwise: Some(e), ..
@@ -1696,7 +1700,8 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
     }
     match expression {
         Expr::Case {
-            synthetic: false, ..
+            origin: crate::sql::ast::CaseOrigin::Written,
+            ..
         } => "case",
         Expr::WholeRow(t) => t,
         Expr::Exists(_) => "exists",

@@ -543,7 +543,7 @@ fn bind_expression<'a>(
             operand: None,
             whens,
             otherwise,
-            synthetic,
+            origin,
         } => {
             let whens = arena.alloc_slice_copy(whens).map_err(full)?;
             for (condition, value) in whens.iter_mut() {
@@ -556,7 +556,7 @@ fn bind_expression<'a>(
                 otherwise: otherwise
                     .map(|value| bind_expression(value, arena, columns, defaults))
                     .transpose()?,
-                synthetic: *synthetic,
+                origin: *origin,
             }
         }
         Expr::Array(items) => {

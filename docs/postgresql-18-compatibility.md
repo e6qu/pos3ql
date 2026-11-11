@@ -153,19 +153,27 @@ Functions and expressions:
   `function f(integer) does not exist`.
 - Each database has its own copy of a built-in function's catalog row, as in
   PostgreSQL. `ALTER FUNCTION lower(text) STABLE` changes volatility,
-  `PARALLEL`, `LEAKPROOF`, `COST`, `ROWS` and `OWNER TO` in the current
-  database only; `pg_proc` shows the change, and a generated column or
-  publication row filter then rejects a function marked stable or volatile. `REVOKE EXECUTE ON FUNCTION md5(text) FROM PUBLIC` makes a
-  later `SELECT md5('a')` fail with `42501` for roles without a grant, and
-  `GRANT`, `has_function_privilege`, `proacl` and psql's `\df+` follow
-  PostgreSQL. Changes survive restart and are copied by `CREATE DATABASE ...
-  TEMPLATE`. Each changed routine uses one of the `max_builtin_routine_entries`
-  rows (default 64); running out fails with `54000`. Limits: changing
-  `STRICT`, `SECURITY` or `SET`/`RESET` settings of a built-in, and renaming
-  or moving one, fail with `0A000`, because pos3ql runs built-ins through
-  fixed implementations; a revoked `EXECUTE` is checked for function calls
-  but not for the function behind an operator (`1 + 1` still runs after
-  `REVOKE EXECUTE ON FUNCTION int4pl(integer, integer) FROM PUBLIC`).
+  `PARALLEL`, `LEAKPROOF`, `COST`, `ROWS`, `STRICT`, `SECURITY` and `OWNER
+  TO` in the current database only; `pg_proc` shows the change, and a
+  generated column or publication row filter then rejects a function marked
+  stable or volatile. As in PostgreSQL, a built-in still runs with its own
+  null handling and as the caller: `STRICT` only makes a constant NULL input
+  fold to NULL (`array_append(ARRAY[1], NULL)` is NULL, but a NULL column
+  value is still appended), and `SECURITY DEFINER` changes nothing at run
+  time. `REVOKE EXECUTE ON FUNCTION md5(text) FROM PUBLIC` makes a later
+  `SELECT md5('a')` fail with `42501` for roles without a grant. The check
+  also covers the function behind an operator, cast, `IN`, `ANY`, `LIKE`,
+  regular-expression match, simple `CASE`, `IS DISTINCT FROM`, `NULLIF`,
+  `DISTINCT`, `GROUP BY` and `UNION`/`INTERSECT`/`EXCEPT`: after
+  `REVOKE EXECUTE ON FUNCTION int4pl(integer, integer) FROM PUBLIC`,
+  `SELECT a + 1 FROM t` fails even when `t` is empty, as PostgreSQL checks
+  every function when a plan starts. `GRANT`, `has_function_privilege`,
+  `proacl` and psql's `\df+` follow PostgreSQL. Changes survive restart and
+  are copied by `CREATE DATABASE ... TEMPLATE`. Each changed routine uses one
+  of the `max_builtin_routine_entries` rows (default 64); running out fails
+  with `54000`. Limits: `SET`/`RESET` settings of a built-in, and renaming or
+  moving one, fail with `0A000`; operator functions that pos3ql does not list
+  in `pg_proc` (`texteq`, `int4um`) cannot be granted or revoked (`42883`).
   Dropping a built-in fails with `2BP01`, as in PostgreSQL.
 - Array and `CASE` result types follow declarations, including subqueries and
   nulls: `ARRAY[(SELECT NULL::date)]` is `date[]`; mixing integer and bigint

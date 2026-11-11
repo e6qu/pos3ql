@@ -32,8 +32,8 @@ impl BuiltinRoutineOid {
 }
 
 /// The `pg_proc` attributes of a built-in routine that `ALTER FUNCTION` may
-/// change. Null handling, security and per-call settings are fixed, because
-/// pos3ql runs each built-in through its own implementation.
+/// change. Per-call settings are not stored: `SET` and `RESET` of a built-in
+/// are rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BuiltinRoutineAttributes {
     pub attributes: RoutineAttributes,
@@ -64,18 +64,12 @@ impl BuiltinRoutineAttributes {
         }
     }
 
-    /// Accepts an image of `routine` whose estimates are present and whose
-    /// fixed attributes match the initialized catalog.
+    /// Accepts an image of `routine` whose estimates are present.
     pub(crate) fn new(
-        routine: BuiltinRoutineOid,
+        _routine: BuiltinRoutineOid,
         attributes: RoutineAttributes,
     ) -> Result<Self, SqlError> {
-        let initial = Self::catalog(routine).attributes;
-        if attributes.cost_bits.is_none()
-            || attributes.rows_bits.is_none()
-            || attributes.strict != initial.strict
-            || attributes.security_definer != initial.security_definer
-        {
+        if attributes.cost_bits.is_none() || attributes.rows_bits.is_none() {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "built-in routine attribute image is invalid"
@@ -522,8 +516,8 @@ mod tests {
         changed.volatility = RoutineVolatility::Stable;
         assert!(BuiltinRoutineAttributes::new(lower, changed).is_ok());
         changed.strict = false;
-        assert!(BuiltinRoutineAttributes::new(lower, changed).is_err());
-        changed.strict = true;
+        changed.security_definer = true;
+        assert!(BuiltinRoutineAttributes::new(lower, changed).is_ok());
         changed.cost_bits = None;
         assert!(BuiltinRoutineAttributes::new(lower, changed).is_err());
     }

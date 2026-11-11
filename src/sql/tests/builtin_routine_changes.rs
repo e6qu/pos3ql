@@ -66,8 +66,6 @@ fn builtin_routine_changes_are_per_database_enforced_and_recovered() {
         );
         for (sql, state) in [
             ("ALTER FUNCTION lower(text) ROWS 10", "22023"),
-            ("ALTER FUNCTION lower(text) CALLED ON NULL INPUT", "0A000"),
-            ("ALTER FUNCTION lower(text) SECURITY DEFINER", "0A000"),
             (
                 "ALTER FUNCTION lower(text) SET search_path = public",
                 "0A000",
@@ -128,4 +126,42 @@ fn builtin_routine_changes_are_per_database_enforced_and_recovered() {
             ["NULL"]
         );
     }
+}
+
+/// PostgreSQL stores a built-in's changed `STRICT` and `SECURITY` but runs
+/// the compiled function as before; only its planner folds a constant NULL
+/// input of a function `pg_proc` marks strict.
+#[test]
+fn builtin_strictness_and_security_change_only_the_catalog_and_folding() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE nulls(a integer); INSERT INTO nulls VALUES (NULL); \
+         ALTER FUNCTION array_append(anycompatiblearray, anycompatible) STRICT; \
+         ALTER FUNCTION lower(text) CALLED ON NULL INPUT SECURITY DEFINER",
+    );
+    assert!(
+        error_sqlstates(&output).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT array_append(ARRAY[1], NULL) IS NULL, array_append(ARRAY[1], a) \
+             FROM nulls"
+        )),
+        ["t|{1,NULL}"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT proisstrict, prosecdef, lower(NULL) IS NULL FROM pg_proc \
+             WHERE oid = 'lower(text)'::regprocedure"
+        )),
+        ["f|t|t"]
+    );
 }

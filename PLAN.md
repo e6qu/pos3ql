@@ -266,12 +266,16 @@ order and startup limits hold throughout. The
 **Work:** audit PostgreSQL 18 built-in functions by signature and executed
 behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
-unsupported case into an explicit error. Known gaps: changing `STRICT`,
-`SECURITY` or `SET` of a built-in function, or renaming or moving one, fails
-with `0A000` where PostgreSQL changes the catalog entry; a revoked built-in
-`EXECUTE` is not checked for the function behind an operator (`1 + 1` after
-`REVOKE EXECUTE ON FUNCTION int4pl(integer, integer) FROM PUBLIC`);
-`DROP ROLE` reports dependent objects without PostgreSQL's `DETAIL` list
+unsupported case into an explicit error. Known gaps: `SET`/`RESET` of a
+built-in function, or renaming or moving one, fails with `0A000` where
+PostgreSQL changes the catalog entry (built-in rows need storage for
+`proconfig`, and every built-in name lookup must consult a renamed or moved
+row); about half of PostgreSQL's 3,413 `pg_proc` rows, mostly operator and
+type support functions such as `texteq`, are not listed, so they cannot be
+granted, revoked or called by name; a revoked user-defined function is
+checked when it is called rather than when a plan starts, and window
+`PARTITION BY` keys and row comparisons do not check the `=` function of
+each key; `DROP ROLE` reports dependent objects without PostgreSQL's `DETAIL` list
 (`owner of function lower(text)`); built-in functions have no
 `pg_description` text of their own (`obj_description('lower(text)'::regprocedure)`
 is NULL where PostgreSQL returns `lowercase`). A parameter typed from a called

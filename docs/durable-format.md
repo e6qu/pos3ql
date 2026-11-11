@@ -104,7 +104,7 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 156 | Index-presence hint | Ten-byte table position, then a strict 0/1 flag. |
 | 157 | Catalog reservation | Eight-byte nonzero creation-counter reservation, kept even when a transaction creates and removes all its images. |
 | 158 | Inherited trigger change | Flags byte, then expected/replacement images: four-byte clone stamp, ten-byte trigger position, ten-byte table position, one-byte enabled mode. |
-| 159 | Built-in routine attributes | Four-byte database identifier, four-byte built-in routine OID, then strict, volatility, parallel, security-definer and leakproof bytes and cost and rows as IEEE-754 bits. Strictness and security must equal PostgreSQL's initial values. Owner and privileges use the object owner and ACL kinds with the routine OID. |
+| 159 | Built-in routine attributes | Four-byte database identifier, four-byte built-in routine OID, then strict, volatility, parallel, security-definer and leakproof bytes and cost and rows as IEEE-754 bits. Owner and privileges use the object owner and ACL kinds with the routine OID. |
 
 Other payload rules:
 

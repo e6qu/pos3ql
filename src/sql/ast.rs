@@ -5779,11 +5779,10 @@ pub enum Expr<'a> {
         operand: Option<&'a Expr<'a>>,
         whens: &'a [(&'a Expr<'a>, &'a Expr<'a>)],
         otherwise: Option<&'a Expr<'a>>,
-        /// True when this `CASE` is the desugaring of a syntactic construct that
-        /// is not itself a `CASE` — `IS TRUE`, `IS DISTINCT FROM`. PostgreSQL
-        /// labels those output columns `?column?`, not `case`, so the flag lets
-        /// naming tell them from a `CASE` the query actually wrote.
-        synthetic: bool,
+        /// The syntax this node represents. PostgreSQL labels `IS TRUE` and
+        /// `IS DISTINCT FROM` output columns `?column?`, not `case`, and
+        /// deparses them in their own spelling.
+        origin: CaseOrigin,
     },
     /// The DEFAULT keyword inside INSERT VALUES.
     DefaultMarker,
@@ -5868,6 +5867,20 @@ pub enum Expr<'a> {
         array: &'a Expr<'a>,
         all: bool,
     },
+}
+
+/// The SQL construct an [`Expr::Case`] node was parsed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseOrigin {
+    /// A `CASE` expression the query wrote.
+    Written,
+    /// `x IS [NOT] TRUE` or `x IS [NOT] FALSE`.
+    BooleanTest,
+    /// `x IS [NOT] DISTINCT FROM y`: `WHEN x IS NULL AND y IS NULL`, then
+    /// `WHEN x IS NULL OR y IS NULL`, else the `=` comparison of `x` and `y`
+    /// (negated for `IS DISTINCT FROM`), as PostgreSQL's `DistinctExpr` calls
+    /// the equality operator's function.
+    DistinctFrom { negated: bool },
 }
 
 pub(crate) fn is_volatile_function(name: &str) -> bool {
@@ -5991,7 +6004,39 @@ fn is_nonimmutable_function(name: &str) -> bool {
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
-impl Expr<'_> {
+impl<'a> Expr<'a> {
+    /// The operands of `x IS [NOT] DISTINCT FROM y` and whether it is negated
+    /// (`IS NOT DISTINCT FROM`).
+    pub(crate) fn distinct_from_operands(&self) -> Option<(&'a Expr<'a>, &'a Expr<'a>, bool)> {
+        let Expr::Case {
+            origin: CaseOrigin::DistinctFrom { negated },
+            otherwise: Some(otherwise),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let otherwise: &'a Expr<'a> = otherwise;
+        let equality: &'a Expr<'a> = match otherwise {
+            Expr::Unary {
+                operator: UnaryOp::Not,
+                operand,
+                ..
+            } if !negated => operand,
+            _ if *negated => otherwise,
+            _ => return None,
+        };
+        match equality {
+            Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } => Some((left, right, *negated)),
+            _ => None,
+        }
+    }
+
     pub(crate) const fn source_position(&self) -> SourcePosition {
         match self {
             Self::Call {

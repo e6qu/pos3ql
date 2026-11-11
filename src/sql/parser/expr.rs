@@ -215,7 +215,7 @@ impl<'a> Parser<'a> {
                         operand: None,
                         whens,
                         otherwise: Some(else_v),
-                        synthetic: true,
+                        origin: crate::sql::ast::CaseOrigin::BooleanTest,
                     })?;
                     continue;
                 }
@@ -943,7 +943,7 @@ impl<'a> Parser<'a> {
                     operand,
                     whens: whens.as_slice(),
                     otherwise,
-                    synthetic: false,
+                    origin: crate::sql::ast::CaseOrigin::Written,
                 })
             }
             Tok::Ident("true") => {
@@ -3231,17 +3231,23 @@ impl<'a> Parser<'a> {
             left: l_null,
             right: r_null,
         })?;
-        let cmp_op = if negated {
-            BinaryOp::Eq
-        } else {
-            BinaryOp::NotEq
-        };
-        let cmp = self.arena_expr(Expr::Binary {
+        // PostgreSQL's DistinctExpr calls the `=` operator's function and
+        // negates its result; it never looks up `<>`.
+        let equal = self.arena_expr(Expr::Binary {
             source_position,
-            operator: cmp_op,
+            operator: BinaryOp::Eq,
             left,
             right,
         })?;
+        let cmp = if negated {
+            equal
+        } else {
+            self.arena_expr(Expr::Unary {
+                source_position,
+                operator: UnaryOp::Not,
+                operand: equal,
+            })?
+        };
         let both_val = self.arena_expr(Expr::Bool(negated))?;
         let either_val = self.arena_expr(Expr::Bool(!negated))?;
         let whens = self.arena_slice(&[(both, both_val), (either, either_val)])?;
@@ -3249,7 +3255,7 @@ impl<'a> Parser<'a> {
             operand: None,
             whens,
             otherwise: Some(cmp),
-            synthetic: true,
+            origin: crate::sql::ast::CaseOrigin::DistinctFrom { negated },
         })
     }
 

@@ -1322,6 +1322,64 @@ pub(crate) fn validate_dml_assignment_casts(
     result
 }
 
+/// PostgreSQL checks `EXECUTE` on every function an `UPDATE` or `DELETE`
+/// plan calls when its executor starts, so a revoked function fails even
+/// when no row matches. Rows reaching evaluation are checked again there.
+pub(crate) fn require_dml_builtin_execute<'a>(
+    statement: &Stmt<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let catalog = super::storage_catalog(storage, arena, txid);
+    if !crate::sql::eval::CatalogAccess::builtin_routine_privileges_present(&catalog) {
+        return Ok(());
+    }
+    let (target, alias, extra, assignments, where_clause) = match statement {
+        Stmt::Update(update) => (
+            update.table,
+            update.alias,
+            update.from,
+            update.assignments,
+            update.where_clause,
+        ),
+        Stmt::Delete(delete) => (
+            delete.table,
+            delete.alias,
+            delete.using,
+            &[][..],
+            delete.where_clause,
+        ),
+        _ => return Ok(()),
+    };
+    if !matches!(
+        storage.resolve_relation(target.schema, target.name, txid),
+        Some(ResolvedRelation::Table(_))
+    ) {
+        return Ok(());
+    }
+    let mark = arena.mark();
+    let result = (|| {
+        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena)?;
+        let hooks = crate::sql::eval::EvalHooks {
+            catalog: Some(&catalog),
+            ..crate::sql::eval::NO_HOOKS
+        };
+        let row = super::ScopeSchema(&scope);
+        for expression in assignments
+            .iter()
+            .map(|(_, expression)| *expression)
+            .chain(where_clause)
+        {
+            crate::sql::eval::require_expression_builtin_execute(expression, &row, &hooks)?;
+        }
+        Ok(())
+    })();
+    // The check returns no arena-backed values.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "schema-only INSERT projection assignment context"

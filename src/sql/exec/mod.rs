@@ -40047,23 +40047,21 @@ fn alter_builtin_routine(
             "aggregate routine attributes cannot be altered with this command"
         ));
     }
-    let fixed_attribute_error = |storage: &Storage| {
-        routine_lookup::signature_error(
-            storage,
-            txn.txid,
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "STRICT, SECURITY and SET of built-in function ",
-            identity,
-            " cannot be changed",
-        )
-    };
+    // Built-in rows carry no per-call settings (see the PLAN.md gap).
     if actions.iter().any(|action| {
         matches!(
             action,
             AlterRoutineAction::SetConfig { .. } | AlterRoutineAction::ResetConfig(_)
         )
     }) {
-        return sql_fail(fixed_attribute_error(storage));
+        return sql_fail(routine_lookup::signature_error(
+            storage,
+            txn.txid,
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "SET and RESET of built-in function ",
+            identity,
+            " are not supported",
+        ));
     }
     let state = storage.builtin_routine_state(routine, txn.txid);
     let mut attributes = state.attributes.attributes;
@@ -40081,14 +40079,6 @@ fn alter_builtin_routine(
         &mut config_count,
     ) {
         return sql_fail(error);
-    }
-    // pos3ql runs built-ins by their fixed implementations, so it cannot honor
-    // changed null handling, caller identity or per-call settings.
-    let initial = state.attributes.attributes;
-    if attributes.strict != initial.strict
-        || attributes.security_definer != initial.security_definer
-    {
-        return sql_fail(fixed_attribute_error(storage));
     }
     let image = match crate::storage::BuiltinRoutineAttributes::new(routine, attributes) {
         Ok(image) => image,
@@ -68142,6 +68132,14 @@ pub(crate) fn update<'a>(
     {
         return sql_fail(error);
     }
+    if let Err(error) = super::query::require_dml_builtin_execute(
+        &Stmt::Update(*statement),
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.lock_table(
         txn.txid,
         table_index,
@@ -69240,6 +69238,15 @@ pub(crate) fn delete<'a>(
     ) {
         return sql_fail(error);
     }
+    if let Err(error) = super::query::require_dml_builtin_execute(
+        &Stmt::Delete(*statement),
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        return sql_fail(error);
+    }
+
     if let Err(error) = storage.lock_table(
         txn.txid,
         table_index,

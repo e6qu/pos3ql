@@ -284,8 +284,8 @@ pub(crate) use dependencies::collect_routine_signature_row_types;
 pub(crate) use dependencies::collect_runtime_expression;
 pub(crate) use dependencies::collect_runtime_statement;
 pub(crate) use dependencies::{
-    for_each_dml_assignment, validate_dml_assignment_casts, visit_dml_assignment_types,
-    visit_projection_types,
+    for_each_dml_assignment, require_dml_builtin_execute, validate_dml_assignment_casts,
+    visit_dml_assignment_types, visit_projection_types,
 };
 
 pub(crate) fn stored_routine_dependencies(
@@ -3801,6 +3801,21 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn builtin_routine_privileges_present(&self) -> bool {
+        self.txid != 0 && self.storage.builtin_routine_count() != 0
+    }
+
+    fn builtin_routine_strict(&self, oid: i32) -> Option<bool> {
+        let routine = crate::storage::BuiltinRoutineOid::parse(oid)?;
+        Some(
+            self.storage
+                .builtin_routine_state(routine, self.txid)
+                .attributes
+                .attributes
+                .strict,
+        )
+    }
+
     fn require_builtin_routine_execute(&self, oid: i32) -> Result<(), SqlError> {
         let Some(routine) = crate::storage::BuiltinRoutineOid::parse(oid) else {
             return Ok(());
@@ -7427,6 +7442,35 @@ fn check_key_types<'a>(
             SelectItem::Expr { expression, .. } => Some(*expression),
             _ => None,
         });
+    let catalog = storage_catalog(storage, arena, txid);
+    if super::eval::CatalogAccess::builtin_routine_privileges_present(&catalog) {
+        // PostgreSQL checks every function a plan calls when the executor
+        // starts, so a revoked function fails even when no row reaches it.
+        let hooks = super::eval::EvalHooks {
+            catalog: Some(&catalog),
+            ..super::eval::NO_HOOKS
+        };
+        let row = ScopeSchema(scope);
+        let items = statement.items.iter().filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                Some(*expression)
+            }
+            _ => None,
+        });
+        let joins = statement
+            .from
+            .iter()
+            .flat_map(|from| from.joins.iter().filter_map(|join| join.on));
+        for expression in items
+            .chain(statement.where_clause)
+            .chain(statement.group_by.iter().copied())
+            .chain(statement.having)
+            .chain(statement.distinct_on.iter().copied())
+            .chain(joins)
+        {
+            super::eval::require_expression_builtin_execute(expression, &row, &hooks)?;
+        }
+    }
     for key in statement
         .group_by
         .iter()
@@ -7440,6 +7484,14 @@ fn check_key_types<'a>(
                 "could not identify an equality operator for type {}",
                 ctype.name()
             ));
+        }
+        // Grouping and duplicate removal call the key type's `=` function,
+        // which PostgreSQL's executor checks for EXECUTE.
+        if super::eval::CatalogAccess::builtin_routine_privileges_present(&catalog) {
+            let (oid, _) = infer_scope_type(key, scope)?;
+            let oid = super::eval::CatalogAccess::domain_base_type(&catalog, oid)
+                .map_or(oid, ColType::oid);
+            super::eval::require_builtin_operator_types_execute(&catalog, "=", Some(oid), oid)?;
         }
     }
     for order in statement.order_by {
@@ -8913,7 +8965,7 @@ fn rewrite_grouped_expr<'a>(
             negated: *negated,
             case_insensitive: *case_insensitive,
         }),
-        Expr::Case { operand, whens, otherwise, synthetic } => {
+        Expr::Case { operand, whens, otherwise, origin } => {
             let operand = match operand {
                 Some(o) => Some(rewrite(o)?),
                 None => None,
@@ -8929,7 +8981,7 @@ fn rewrite_grouped_expr<'a>(
                 Some(o) => Some(rewrite(o)?),
                 None => None,
             };
-            alloc(Expr::Case { operand, whens, otherwise, synthetic: *synthetic })
+            alloc(Expr::Case { operand, whens, otherwise, origin: *origin })
         }
         Expr::Call {
             name,

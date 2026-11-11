@@ -15278,6 +15278,18 @@ impl Engine {
                 relation.name
             )));
         }
+        if outer_returns_rows
+            && storage
+                .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+                .filter(|(_, rule)| rule.definition_for(txn.txid).returning_action.is_some())
+                .nth(1)
+                .is_some()
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot have RETURNING lists in multiple rules"
+            )));
+        }
         let insert_event = event == crate::storage::RewriteEvent::Insert;
         let mut original_filter: Option<&Expr<'a>> = None;
         for (rule_slot, rule) in
@@ -15546,6 +15558,16 @@ impl Engine {
                     };
                     let use_returning = outer_returns_rows
                         && definition.returning_action == Some(action_index as u8);
+                    let action = if use_returning {
+                        match Self::rule_action_with_returning(
+                            storage, statement, columns, action, txn.txid, arena,
+                        ) {
+                            Ok(action) => action,
+                            Err(error) => return Ok(Err(error)),
+                        }
+                    } else {
+                        action
+                    };
                     let action_rows = match steps.begin(progress.as_deref_mut(), txn, responder) {
                         Ok(Some(affected)) => affected,
                         Ok(None) => {
@@ -15648,6 +15670,77 @@ impl Engine {
         };
         responder.command_complete(tag.as_str())?;
         Ok(Ok(()))
+    }
+
+    /// The rule action that produces the triggering statement's RETURNING
+    /// rows: its own RETURNING list becomes the triggering list, evaluated
+    /// over the action's entries.
+    fn rule_action_with_returning<'a>(
+        storage: &Storage,
+        statement: &'a Stmt<'a>,
+        columns: &'a [&'a str],
+        action: &'a Stmt<'a>,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<&'a Stmt<'a>, SqlError> {
+        let (outer, table, alias, other_sources) = match statement {
+            Stmt::Insert(insert) => (insert.returning, insert.table, None, false),
+            Stmt::Update(update) => (
+                update.returning,
+                update.table,
+                update.alias,
+                update.from.is_some(),
+            ),
+            Stmt::Delete(delete) => (
+                delete.returning,
+                delete.table,
+                delete.alias,
+                delete.using.is_some(),
+            ),
+            _ => unreachable!("rewrite input is data-modifying"),
+        };
+        let entries = query::rule_returning_entries(action, storage, txid, arena)?;
+        let items = query::rule_returning_items(
+            outer,
+            query::RuleReturningRelation {
+                name: alias.unwrap_or(table.name),
+                schema: alias.is_none().then_some(table.schema).flatten(),
+                columns,
+                other_sources,
+            },
+            entries,
+            storage,
+            txid,
+            arena,
+        )?;
+        let rewritten = match action {
+            Stmt::Insert(insert) => Stmt::Insert(Insert {
+                returning: ast::Returning {
+                    items,
+                    ..insert.returning
+                },
+                ..*insert
+            }),
+            Stmt::Update(update) => Stmt::Update(ast::Update {
+                returning: ast::Returning {
+                    items,
+                    ..update.returning
+                },
+                ..*update
+            }),
+            Stmt::Delete(delete) => Stmt::Delete(ast::Delete {
+                returning: ast::Returning {
+                    items,
+                    ..delete.returning
+                },
+                ..*delete
+            }),
+            _ => unreachable!("a rule RETURNING action is INSERT, UPDATE or DELETE"),
+        };
+        arena
+            .alloc(rewritten)
+            .map(|action| &*action)
+            .map_err(|_| query::arena_full_pub())
     }
 
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -16537,7 +16630,7 @@ impl Engine {
             }
         })();
         if continuation.is_none()
-            && txn.write_completion_boundary.is_some()
+            && txn.retains_write_frame()
             && result.as_ref().is_ok_and(|outcome| {
                 outcome.as_ref().is_err_and(|error| {
                     matches!(
@@ -16840,6 +16933,7 @@ impl Engine {
                 },
                 command: txn.command_id(),
                 depth: txn.trigger_depth(),
+                retained: true,
             });
             let prior_handoff = core::mem::replace(&mut txn.write_completion_boundary, boundary);
             let outcome = {
@@ -16923,7 +17017,7 @@ impl Engine {
             {
                 // Running the call after a rollback would hide the attempt's
                 // changes from it, unlike PostgreSQL.
-                return Ok(Err(exec::retained_progress_required()));
+                return Ok(Err(progress.progress_required()));
             }
             // A write that kept rows undoes only its unfinished row.
             let (rollback, output_mark) =

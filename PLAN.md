@@ -93,7 +93,10 @@ every subquery of a static statement (derived tables, `UPDATE ... FROM`,
 row trigger bodies that need the engine (DDL, view and rule writes,
 procedures with DDL, calls reading the trigger's own writes), which run once
 on it between write attempts with their result kept in the invocation log;
-`FOR` loops over a data change whose `AFTER` trigger waits; multi-step
+`FOR` loops over a data change whose `AFTER` trigger waits; `AFTER` triggers
+of writes in a PL/pgSQL or SQL-language function called from a query, which
+run on the engine (DDL and routine calls included) and restart the statement
+on a wait; multi-step
 statements nested in another's step (a rule action whose target has rules),
 which keep their own steps up to four levels deep.
 The
@@ -125,24 +128,24 @@ is owned.
   PL/pgSQL and SQL-language bodies. Move that progress into a
   startup-reserved owner so a storage or lock wait in the row phase also
   resumes at its row instead of restarting the statement. Extend row
-  progress to foreign tables, to data-modifying `WITH` inside routine
-  bodies, and to multi-step statements nested more than four deep: a
-  routine call after their first row change fails with `0A000` (`SQL row
-  expression requires retained write progress`), because restarting would
-  hide the earlier rows from the call. `INSERT ... SELECT` evaluates its whole source
-  before writing, so a volatile call in the source does not see rows
-  inserted earlier by the same statement (this includes a rule action's
-  `VALUES` over several rows); fixing it needs the source and the row phase
-  to keep separate invocation logs, since the source then runs ahead of the
-  rows by a different amount in each attempt, and a selection that grows
-  between attempts. A data-modifying `WITH` sub-statement runs to completion
+  progress to foreign tables and to data-modifying `WITH` inside routine
+  bodies: a routine call after their first row change fails with `0A000`
+  (`SQL row expression requires retained write progress`), because
+  restarting would hide the earlier rows from the call. Multi-step
+  statements nested more than four deep fail the same way with `54000`
+  (`multi-step statements nest deeper than the 4 levels write progress
+  keeps`), the fixed per-statement capacity. `INSERT ... SELECT` materializes its source
+  before writing. Volatile user routine calls in its output list (also a
+  rule action's `VALUES` over several rows) run as each row is inserted, as
+  in PostgreSQL; calls in its `WHERE`, join conditions, subqueries,
+  aggregate arguments or a `UNION`/`INTERSECT`/`EXCEPT` branch still run
+  before the first row, so they do not see rows the statement inserts.
+  Running those row by row needs the source and the row phase to keep
+  separate invocation logs, since the source then runs ahead of the rows by
+  a different amount in each attempt. A data-modifying `WITH` sub-statement runs to completion
   before the main statement reads it, where PostgreSQL interleaves them row
   by row, so a call in the main statement sees all of its rows. A PL/pgSQL
-  `WITH ... INSERT/UPDATE/DELETE` statement fails with `0A000`. A PL/pgSQL
-  function called from a query (`SELECT f()`) runs its writes' `AFTER`
-  triggers without the engine, so DDL or a routine call there fails with
-  `0A000`; handing them to the function needs its frame to own the completion
-  across waits, as `CALL` and `DO` frames do.
+  `WITH ... INSERT/UPDATE/DELETE` statement fails with `0A000`.
 - **Routine variables in `WITH`:** the `WITH` queries of a PL/pgSQL
   `RETURN QUERY`, `SELECT ... INTO`, `PERFORM` or `FOR` query read the
   routine's variables, materialized or not, but three other `WITH` positions
@@ -431,6 +434,10 @@ SQL/JSON result types) are reported when the statement would run. In a
 `SELECT`, an unknown relation, a modifier's unknown type and an output column
 written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
+A `RETURNING` list routed through a rule's `RETURNING` list reads the rule's
+relation only: `UPDATE v ... FROM o RETURNING o.label`, `*` beside `FROM` or
+`USING` sources, and subqueries in that list fail with `0A000` where
+PostgreSQL evaluates them.
 COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.

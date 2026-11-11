@@ -501,6 +501,7 @@ pub(crate) fn check_domain_constraints(
 /// 23505 for the key `columns` of `values`, with PostgreSQL's detail and
 /// the constraint's table.
 fn unique_violation(
+    duplicate: DuplicateKey,
     name: SqlName,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     columns: &[u16],
@@ -510,16 +511,28 @@ fn unique_violation(
         .iter()
         .map(|column| def.columns()[*column as usize].name.as_str());
     let keys = columns.iter().map(|column| values[*column as usize]);
-    described_unique_violation(name, def, &mut { names }, &mut { keys })
+    duplicate_key_error(duplicate, name, def, &mut { names }, &mut { keys })
 }
 
-fn described_unique_violation<'v>(
+/// Whether a duplicate key meets a written row or an index being built.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DuplicateKey {
+    Write,
+    IndexBuild,
+}
+
+fn duplicate_key_error<'v>(
+    duplicate: DuplicateKey,
     name: SqlName,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     names: &mut dyn Iterator<Item = &str>,
     keys: &mut dyn Iterator<Item = Datum<'v>>,
 ) -> SqlError {
-    let detail = match key_detail(names, keys, format_args!(" already exists.")) {
+    let suffix = match duplicate {
+        DuplicateKey::Write => format_args!(" already exists."),
+        DuplicateKey::IndexBuild => format_args!(" is duplicated."),
+    };
+    let detail = match key_detail(names, keys, suffix) {
         Ok(detail) => detail,
         Err(error) => return error,
     };
@@ -531,11 +544,18 @@ fn described_unique_violation<'v>(
             name.as_str(),
         ),
     );
-    sql_err!(
-        sqlstate::UNIQUE_VIOLATION,
-        "duplicate key value violates unique constraint \"{}\"",
-        name.as_str()
-    )
+    match duplicate {
+        DuplicateKey::Write => sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "duplicate key value violates unique constraint \"{}\"",
+            name.as_str()
+        ),
+        DuplicateKey::IndexBuild => sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "could not create unique index \"{}\"",
+            name.as_str()
+        ),
+    }
 }
 
 /// Whether the row `rowid`'s committed key equals `values` under this index's
@@ -848,6 +868,7 @@ fn enforce_expression_index_uniqueness<'a>(
     nulls_not_distinct: bool,
     name: SqlName,
     predicate: Option<&'a Expr<'a>>,
+    duplicate: DuplicateKey,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let decoder =
@@ -866,7 +887,7 @@ fn enforce_expression_index_uniqueness<'a>(
             expression_texts[position].unwrap_or(def.columns()[*column as usize].name.as_str())
         });
         let values = keys[..columns.len()].iter().copied();
-        described_unique_violation(name, def, &mut { names }, &mut { values })
+        duplicate_key_error(duplicate, name, def, &mut { names }, &mut { values })
     };
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
         if let Some(predicate) = predicate
@@ -956,6 +977,7 @@ fn enforce_key_uniqueness(
     columns: &[u16],
     nulls_not_distinct: bool,
     name: SqlName,
+    duplicate: DuplicateKey,
     source: UniqueKeySource,
 ) -> Result<(), SqlError> {
     if !nulls_not_distinct && columns.iter().any(|&c| values[c as usize].is_null()) {
@@ -973,6 +995,7 @@ fn enforce_key_uniqueness(
             txid,
             def,
             name,
+            duplicate,
         )?;
         return pending_scan_uniqueness(
             storage,
@@ -985,6 +1008,7 @@ fn enforce_key_uniqueness(
             txid,
             def,
             name,
+            duplicate,
         );
     }
     if storage.has_pending_table_def(table_index, txid) {
@@ -1000,6 +1024,7 @@ fn enforce_key_uniqueness(
                 txid,
                 def,
                 name,
+                duplicate,
             )?;
         }
         return pending_scan_uniqueness(
@@ -1013,6 +1038,7 @@ fn enforce_key_uniqueness(
             txid,
             def,
             name,
+            duplicate,
         );
     }
 
@@ -1073,7 +1099,9 @@ fn enforce_key_uniqueness(
                     ),
                 };
                 match matched {
-                    Ok(true) => result = Err(unique_violation(name, def, columns, values)),
+                    Ok(true) => {
+                        result = Err(unique_violation(duplicate, name, def, columns, values))
+                    }
                     Ok(false) => {}
                     Err(e) => result = Err(e),
                 }
@@ -1094,6 +1122,7 @@ fn enforce_key_uniqueness(
             txid,
             def,
             name,
+            duplicate,
         )?;
     }
     pending_scan_uniqueness(
@@ -1107,6 +1136,7 @@ fn enforce_key_uniqueness(
         txid,
         def,
         name,
+        duplicate,
     )
 }
 
@@ -1130,6 +1160,7 @@ fn committed_scan_uniqueness(
     txid: u32,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     name: SqlName,
+    duplicate: DuplicateKey,
 ) -> Result<(), SqlError> {
     let decoder =
         crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
@@ -1157,7 +1188,7 @@ fn committed_scan_uniqueness(
                 )
             })?;
             if matched {
-                return Err(unique_violation(name, def, columns, values));
+                return Err(unique_violation(duplicate, name, def, columns, values));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -1181,6 +1212,7 @@ fn pending_scan_uniqueness(
     txid: u32,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     name: SqlName,
+    duplicate: DuplicateKey,
 ) -> Result<(), SqlError> {
     let decoder =
         crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
@@ -1213,7 +1245,7 @@ fn pending_scan_uniqueness(
                     "statement is waiting for a concurrent unique-key writer"
                 ));
             }
-            return Err(unique_violation(name, def, columns, values));
+            return Err(unique_violation(duplicate, name, def, columns, values));
         }
         Ok(ControlFlow::Continue(()))
     })?;
@@ -1237,6 +1269,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
     columns: &[u16],
     nulls_not_distinct: bool,
     name: SqlName,
+    duplicate: DuplicateKey,
     predicate: &Expr,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -1280,7 +1313,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 matches(&other)
             })?;
             if matched {
-                return Err(unique_violation(name, def, columns, values));
+                return Err(unique_violation(duplicate, name, def, columns, values));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -1307,7 +1340,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 "statement is waiting for a concurrent unique-key writer"
             ));
         }
-        Err(unique_violation(name, def, columns, values))
+        Err(unique_violation(duplicate, name, def, columns, values))
     })?;
     Ok(())
 }
@@ -1348,7 +1381,8 @@ pub(crate) fn index_predicate_matches(
 
 /// Unique/PK enforcement for the single-column column flags: each `unique`
 /// column's value must not equal that column in any other visible row.
-pub fn check_unique(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_unique(
     storage: &Storage,
     table_index: usize,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
@@ -1356,6 +1390,7 @@ pub fn check_unique(
     values: &[Datum],
     self_rowid: Option<u64>,
     txid: u32,
+    duplicate: DuplicateKey,
 ) -> Result<(), SqlError> {
     for (i, column) in def.columns().iter().enumerate() {
         if !column.unique {
@@ -1378,6 +1413,7 @@ pub fn check_unique(
             &[i as u16],
             false,
             name,
+            duplicate,
             UniqueKeySource::Cache,
         )?;
     }
@@ -1386,7 +1422,7 @@ pub fn check_unique(
 
 /// Enforces both column-level UNIQUE/PRIMARY KEY and every UNIQUE index.
 #[allow(clippy::too_many_arguments)]
-pub fn check_all_unique(
+pub(crate) fn check_all_unique(
     storage: &Storage,
     table_index: usize,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
@@ -1395,8 +1431,18 @@ pub fn check_all_unique(
     self_rowid: Option<u64>,
     txid: u32,
     arena: &Arena,
+    duplicate: DuplicateKey,
 ) -> Result<(), SqlError> {
-    check_unique(storage, table_index, def, schema, values, self_rowid, txid)?;
+    check_unique(
+        storage,
+        table_index,
+        def,
+        schema,
+        values,
+        self_rowid,
+        txid,
+        duplicate,
+    )?;
     check_unique_indexes(
         storage,
         table_index,
@@ -1666,6 +1712,7 @@ pub(crate) fn check_reindex_constraints(
             &[column as u16],
             false,
             name,
+            DuplicateKey::IndexBuild,
             UniqueKeySource::Rows,
         )?;
     }
@@ -1687,6 +1734,7 @@ pub(crate) fn check_reindex_constraints(
             key.columns(),
             key.kind.nulls_not_distinct(),
             key.name,
+            DuplicateKey::IndexBuild,
             UniqueKeySource::Rows,
         )?;
     }
@@ -1821,6 +1869,10 @@ pub fn check_unique_indexes(
                 index.nulls_not_distinct,
                 name,
                 predicate,
+                match check {
+                    UniqueIndexCheck::Cache => DuplicateKey::Write,
+                    UniqueIndexCheck::Rebuild { .. } => DuplicateKey::IndexBuild,
+                },
                 arena,
             )?;
             continue;
@@ -1838,6 +1890,10 @@ pub fn check_unique_indexes(
                 icols,
                 index.nulls_not_distinct,
                 name,
+                match check {
+                    UniqueIndexCheck::Cache => DuplicateKey::Write,
+                    UniqueIndexCheck::Rebuild { .. } => DuplicateKey::IndexBuild,
+                },
                 expression,
                 arena,
             )?;
@@ -1853,6 +1909,10 @@ pub fn check_unique_indexes(
                 icols,
                 index.nulls_not_distinct,
                 name,
+                match check {
+                    UniqueIndexCheck::Cache => DuplicateKey::Write,
+                    UniqueIndexCheck::Rebuild { .. } => DuplicateKey::IndexBuild,
+                },
                 UniqueKeySource::Cache,
             )?;
         }
@@ -2080,6 +2140,12 @@ pub(crate) fn enforce_row_constraints(
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     let self_rowid = row.excluded();
+    // Existing rows meeting a new key are its index being built.
+    let duplicate = if matches!(row, ConstraintRow::Existing { .. }) {
+        DuplicateKey::IndexBuild
+    } else {
+        DuplicateKey::Write
+    };
     check_index_tuple_sizes(storage, def, values, txid, arena)?;
     let constraint_table = storage
         .find_visible(def.schema.as_str(), def.name.as_str(), txid)
@@ -2097,7 +2163,7 @@ pub(crate) fn enforce_row_constraints(
                 continue;
             }
             check_all_unique(
-                storage, candidate, def, schema, values, self_rowid, txid, arena,
+                storage, candidate, def, schema, values, self_rowid, txid, arena, duplicate,
             )?;
             check_or_defer_unique_keys(
                 storage,
@@ -2134,6 +2200,7 @@ pub(crate) fn enforce_row_constraints(
             self_rowid,
             txid,
             arena,
+            duplicate,
         )?;
         check_or_defer_unique_keys(
             storage,
@@ -2330,6 +2397,12 @@ fn check_or_defer_unique_keys(
             key.columns(),
             key.kind.nulls_not_distinct(),
             key.name,
+            // Existing rows meeting a new key are its index being built.
+            if matches!(row, ConstraintRow::Existing { .. }) {
+                DuplicateKey::IndexBuild
+            } else {
+                DuplicateKey::Write
+            },
             UniqueKeySource::Cache,
         )?;
     }
@@ -2691,6 +2764,7 @@ pub(crate) fn validate_constraint_obligation(
                     key.columns(),
                     key.kind.nulls_not_distinct(),
                     key.name,
+                    DuplicateKey::Write,
                     UniqueKeySource::Cache,
                 )?;
             } else if let Some(foreign_key) = foreign_key {

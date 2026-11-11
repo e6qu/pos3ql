@@ -163,7 +163,7 @@ pub(super) fn execute_procedural_write<'a, T>(
                     && effects.changed(context)
                     && !calls.pending_firing_started_at(effects.transaction)
                 {
-                    break Err(retained_progress_required());
+                    break Err(progress.progress_required());
                 }
                 let PlpgsqlExecHost::Routine {
                     engine,

@@ -1079,6 +1079,7 @@ pub(crate) use row_progress::{RowProgress, StepRecord};
 mod write_completion;
 use write_attempts::execute_procedural_write;
 pub(crate) use write_attempts::retained_progress_required;
+mod deferred_source;
 pub(super) use write_completion::SuspendedWriteCompletion;
 pub(super) use write_completion::resume as resume_write_completion;
 
@@ -1106,12 +1107,12 @@ pub(crate) use ddl::check_referenced_columns;
 use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build_def};
 
 pub(crate) mod constraints;
+pub use constraints::check_unique_indexes;
 use constraints::{
     ConstraintRow, MAX_FK_CASCADE_DEPTH, ParsedChecks, apply_fk_parent_actions,
     check_index_tuple_sizes, enforce_row_constraints, parse_checks, parse_generated,
     referenced_key_changed, table_is_referenced,
 };
-pub use constraints::{check_all_unique, check_unique, check_unique_indexes};
 pub(crate) use constraints::{coerce_domain_value, parse_defaults};
 
 #[derive(Clone, Copy)]
@@ -18879,11 +18880,13 @@ static NO_TRIGGER_DML_COLUMNS: NoColumns = NoColumns;
 /// converted and encoded by a trigger's short-lived read phase. The latter
 /// has no storage borrow; its write phase must not repeat assignment casts.
 #[derive(Clone, Copy)]
-pub enum InsertSource<'a> {
+pub(crate) enum InsertSource<'a> {
     Statement,
     MaterializedSelect {
         rows: &'a [&'a [u8]],
         assignments: AssignmentCasts<'a>,
+        /// Rows staged unconverted, with their deferred calls still to run.
+        deferred: Option<deferred_source::DeferredSource<'a>>,
     },
 }
 
@@ -19966,7 +19969,7 @@ fn execute_plpgsql_call<'a>(
             values: outputs.values,
         });
     };
-    let retained = context.txn.write_completion_boundary.is_some();
+    let retained = context.txn.retains_write_frame();
     let outcome = with_bound_parameter_types(&types[..arguments.len()], || {
         engine.execute_call(
             *name,
@@ -26087,6 +26090,7 @@ fn materialize_trigger_insert_source<'result, 'query>(
     txid: u32,
     execution: TriggerQueryExecution<'_, '_, 'result>,
     scope: Option<&dyn ColumnLookup<'query>>,
+    deferred: bool,
 ) -> Result<&'result [&'result [u8]], SqlError>
 where
     'result: 'query,
@@ -26150,6 +26154,13 @@ where
         scope,
         Some(&live),
         &mut |values| {
+            if deferred {
+                // Converted with the calls' results as each row is written.
+                let encoded = encode_projected_persistent_pub(values, result_arena)?;
+                return rows
+                    .push(encoded)
+                    .map_err(|_| super::query::arena_full_pub());
+            }
             let values = coerce_insert_projection(
                 values,
                 &definition,
@@ -26479,7 +26490,7 @@ impl PlpgsqlExecHost<'_> {
         }
         // A saved procedure body keeps statement boundaries in each
         // transaction it starts.
-        let retained = txn.write_completion_boundary.is_some();
+        let retained = txn.retains_write_frame();
         let prior_configuration = txn.capture_configuration();
         let next = match command {
             PlpgsqlTransactionCommand::Commit(next) => {
@@ -26537,6 +26548,7 @@ impl PlpgsqlExecHost<'_> {
                     .statement_mark(engine.wal.stage_mark(txn.txid), engine.storage.lock_mark()),
                 command: txn.command_id(),
                 depth: txn.trigger_depth(),
+                retained: true,
             });
         }
         Ok(())
@@ -26552,14 +26564,19 @@ struct TriggerExecContext<'s, 'a, 'b> {
 }
 
 impl<'s, 'a, 'b> TriggerExecContext<'s, 'a, 'b> {
-    fn nested_write_boundary(&self) -> Option<super::txn::StatementMark> {
-        self.txn.write_completion_boundary?;
+    /// Where a nested write's AFTER work starts when this frame takes it,
+    /// and whether the frame keeps it across a wait.
+    fn nested_write_boundary(&self) -> Option<(super::txn::StatementMark, bool)> {
+        let retained = self.txn.write_completion_boundary?.retained;
         let PlpgsqlExecHost::Routine { engine, .. } = &self.host else {
             return None;
         };
-        Some(self.txn.statement_mark(
-            engine.wal.stage_mark(self.txn.txid),
-            engine.storage.lock_mark(),
+        Some((
+            self.txn.statement_mark(
+                engine.wal.stage_mark(self.txn.txid),
+                engine.storage.lock_mark(),
+            ),
+            retained,
         ))
     }
     /// A trigger can use the caller's execution services, but cannot end its
@@ -27576,11 +27593,21 @@ fn execute_nested_data_modification<'a>(
                 )?),
                 None => None,
             };
+            let deferred = match statement.select {
+                Some(select) => deferred_source::defer_source_calls(
+                    select,
+                    context.storage(),
+                    context.txn.txid,
+                    context.arena,
+                    None,
+                )?,
+                None => None,
+            };
             let prepared_select = match statement.select {
                 Some(select) => Some(materialize_trigger_insert_source(
                     context.storage(),
                     statement,
-                    select,
+                    deferred.as_ref().map_or(select, |deferred| deferred.select),
                     source_casts.expect("prepared SELECT has a cast plan"),
                     context.arena,
                     context.arena,
@@ -27590,6 +27617,7 @@ fn execute_nested_data_modification<'a>(
                         seq_session: context.seq_session(),
                     },
                     None,
+                    deferred.is_some(),
                 )?),
                 None => None,
             };
@@ -27602,10 +27630,11 @@ fn execute_nested_data_modification<'a>(
             let txn = &mut *command;
             let parent_boundary = txn.write_completion_boundary;
             txn.write_completion_boundary =
-                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                     mark,
                     command: txn.command_id(),
                     depth: txn.trigger_depth(),
+                    retained,
                 });
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
@@ -27627,6 +27656,7 @@ fn execute_nested_data_modification<'a>(
                         InsertSource::MaterializedSelect {
                             rows,
                             assignments: assignment_casts,
+                            deferred,
                         }
                     }),
                     progress.as_deref_mut(),
@@ -27661,10 +27691,11 @@ fn execute_nested_data_modification<'a>(
             let txn = &mut *command;
             let parent_boundary = txn.write_completion_boundary;
             txn.write_completion_boundary =
-                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                     mark,
                     command: txn.command_id(),
                     depth: txn.trigger_depth(),
+                    retained,
                 });
             let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
@@ -27720,10 +27751,11 @@ fn execute_nested_data_modification<'a>(
             let txn = &mut *command;
             let parent_boundary = txn.write_completion_boundary;
             txn.write_completion_boundary =
-                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                     mark,
                     command: txn.command_id(),
                     depth: txn.trigger_depth(),
+                    retained,
                 });
             let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
@@ -27796,10 +27828,11 @@ fn execute_nested_data_modification<'a>(
             let txn = &mut *command;
             let parent_boundary = txn.write_completion_boundary;
             txn.write_completion_boundary =
-                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                     mark,
                     command: txn.command_id(),
                     depth: txn.trigger_depth(),
+                    retained,
                 });
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
@@ -29986,11 +30019,13 @@ fn execute_rewritten_nested_write<'a>(
     let mut command = enter_write_command(context.txn, &engine.storage, progress.as_deref_mut())?;
     let txn = &mut *command;
     let parent_boundary = txn.write_completion_boundary;
-    txn.write_completion_boundary = boundary.map(|mark| super::txn::WriteCompletionBoundary {
-        mark,
-        command: txn.command_id(),
-        depth: txn.trigger_depth(),
-    });
+    txn.write_completion_boundary =
+        boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
+            mark,
+            command: txn.command_id(),
+            depth: txn.trigger_depth(),
+            retained,
+        });
     let responder = &mut *context.responder;
     responder.clear_affected_rows();
     let connection_id = engine.work.connection_id();
@@ -31894,7 +31929,7 @@ fn execute_trigger_step_in<'a>(
         }
         return Ok(control_flow::Step::complete());
     }
-    let retained_parent = context.txn.write_completion_boundary.is_some()
+    let retained_parent = context.txn.retains_write_frame()
         && matches!(&context.host, PlpgsqlExecHost::Routine { .. });
     let position = match status.pending_statement.take() {
         Some(position) => {
@@ -31957,7 +31992,8 @@ fn execute_trigger_step_in<'a>(
     .then(|| {
         context
             .nested_write_boundary()
-            .map(|mark| (mark, context.responder.mark()))
+            .filter(|(_, retained)| *retained)
+            .map(|(mark, _)| (mark, context.responder.mark()))
     })
     .flatten();
     // As at top level, a write yields while it selects and locks its rows and
@@ -34067,6 +34103,7 @@ fn execute_trigger_step_in<'a>(
                     context.arena,
                     Some(&scope),
                 )?;
+                let mut deferred = None;
                 let prepared_select = match statement.select {
                     Some(select) => {
                         let casts = prepare_insert_select_casts(
@@ -34077,10 +34114,17 @@ fn execute_trigger_step_in<'a>(
                             context.arena,
                             Some(&scope),
                         )?;
+                        deferred = deferred_source::defer_source_calls(
+                            select,
+                            context.storage(),
+                            context.txn.txid,
+                            context.arena,
+                            Some(&scope),
+                        )?;
                         Some(materialize_trigger_insert_source(
                             context.storage(),
                             &statement,
-                            select,
+                            deferred.as_ref().map_or(select, |deferred| deferred.select),
                             casts,
                             context.arena,
                             context.arena,
@@ -34090,6 +34134,7 @@ fn execute_trigger_step_in<'a>(
                                 seq_session: context.seq_session(),
                             },
                             Some(&scope),
+                            deferred.is_some(),
                         )?)
                     }
                     None => None,
@@ -34110,10 +34155,11 @@ fn execute_trigger_step_in<'a>(
                 let txn = &mut *command;
                 let parent_boundary = txn.write_completion_boundary;
                 txn.write_completion_boundary =
-                    boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                         mark,
                         command: txn.command_id(),
                         depth: txn.trigger_depth(),
+                        retained,
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
@@ -34141,6 +34187,7 @@ fn execute_trigger_step_in<'a>(
                             InsertSource::MaterializedSelect {
                                 rows,
                                 assignments: assignment_casts,
+                                deferred,
                             }
                         }),
                         progress.as_deref_mut(),
@@ -34298,10 +34345,11 @@ fn execute_trigger_step_in<'a>(
                 let txn = &mut *command;
                 let parent_boundary = txn.write_completion_boundary;
                 txn.write_completion_boundary =
-                    boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                         mark,
                         command: txn.command_id(),
                         depth: txn.trigger_depth(),
+                        retained,
                     });
                 let mut scratch = storage.row_work.lease(0).map_err(|error| {
                     sql_err!(
@@ -34486,10 +34534,11 @@ fn execute_trigger_step_in<'a>(
                 let txn = &mut *command;
                 let parent_boundary = txn.write_completion_boundary;
                 txn.write_completion_boundary =
-                    boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                         mark,
                         command: txn.command_id(),
                         depth: txn.trigger_depth(),
+                        retained,
                     });
                 let mut scratch = storage.row_work.lease(0).map_err(|error| {
                     sql_err!(
@@ -34650,10 +34699,11 @@ fn execute_trigger_step_in<'a>(
                 let txn = &mut *command;
                 let parent_boundary = txn.write_completion_boundary;
                 txn.write_completion_boundary =
-                    boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    boundary.map(|(mark, retained)| super::txn::WriteCompletionBoundary {
                         mark,
                         command: txn.command_id(),
                         depth: txn.trigger_depth(),
+                        retained,
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
@@ -37472,14 +37522,16 @@ pub fn create_trigger(
         return sql_fail(if trigger.or_replace {
             sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation is an internal or a child trigger",
-                trigger.name
+                "trigger \"{}\" for relation \"{}\" is an internal or a child trigger",
+                trigger.name,
+                storage.trigger_target_name(target, txn.txid).as_str()
             )
         } else {
             sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation already exists",
-                trigger.name
+                "trigger \"{}\" for relation \"{}\" already exists",
+                trigger.name,
+                storage.trigger_target_name(target, txn.txid).as_str()
             )
         });
     }
@@ -37510,8 +37562,9 @@ pub fn create_trigger(
         if !trigger.or_replace {
             return sql_fail(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation already exists",
-                trigger.name
+                "trigger \"{}\" for relation \"{}\" already exists",
+                trigger.name,
+                storage.trigger_target_name(target, txn.txid).as_str()
             ));
         }
         if matches!(
@@ -38459,8 +38512,9 @@ pub fn alter_trigger(
             {
                 return sql_fail(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,
-                    "trigger \"{}\" for relation already exists",
-                    name.as_str()
+                    "trigger \"{}\" for relation \"{}\" already exists",
+                    name.as_str(),
+                    storage.trigger_target_name(target, txn.txid).as_str()
                 ));
             }
             (name, trigger.enabled_to(txn.txid))
@@ -48553,20 +48607,6 @@ fn stored_rule_definition(
             ));
         }
     }
-    if returning_action.is_some()
-        && storage
-            .rules_for(target, event, txn.txid)
-            .any(|(_, existing)| {
-                let existing = existing.definition_for(txn.txid);
-                existing.returning_action.is_some()
-                    && !(rule.or_replace && existing.name.as_str() == rule.name)
-            })
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot have multiple RETURNING lists in rules for the same relation and event"
-        ));
-    }
     if let Some(condition) = rule.condition {
         if condition.contains_subquery() {
             return Err(sql_err!(
@@ -48733,9 +48773,29 @@ fn stored_rule_definition(
             "permanent rules cannot reference temporary relations"
         ));
     }
-    let transition_values = [&Expr::Null; crate::storage::MAX_COLUMNS];
-    for action in rule.actions {
-        super::query::expand_stored_rule_action_exec(
+    // OLD and NEW are typed NULLs here, so RETURNING items that read them
+    // describe with the relation's column types.
+    let mut transition_values = [&Expr::Null; crate::storage::MAX_COLUMNS];
+    for (index, metadata) in condition_columns.metadata[..condition_columns.count]
+        .iter()
+        .enumerate()
+    {
+        let type_name =
+            super::catalog::user_type_name_text(storage, txn.txid, metadata.type_oid, arena)?
+                .unwrap_or(metadata.ctype.name());
+        transition_values[index] = arena
+            .alloc(Expr::Cast {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                operand: &Expr::Null,
+                type_name,
+                type_mod: metadata.type_mod,
+                binding: crate::sql::ast::CastBinding::Resolve,
+            })
+            .map(|expression| &*expression)
+            .map_err(|_| arena_full())?;
+    }
+    for (index, action) in rule.actions.iter().enumerate() {
+        let expanded = super::query::expand_stored_rule_action_exec(
             action.statement,
             storage,
             txn.txid,
@@ -48751,6 +48811,16 @@ fn stored_rule_definition(
             condition_columns.old,
             condition_columns.new,
         )?;
+        if returning_action == Some(index as u8) {
+            check_rule_returning_list(
+                storage,
+                txn.txid,
+                target,
+                &condition_columns,
+                expanded,
+                arena,
+            )?;
+        }
     }
     Ok((
         crate::storage::RuleDefinition {
@@ -48768,6 +48838,78 @@ fn stored_rule_definition(
         },
         dependencies,
     ))
+}
+
+/// PostgreSQL's `checkRuleResultList` for a rule's RETURNING list: one entry
+/// per relation attribute (dropped ones included), each of the column's type,
+/// with typmods equal unless either is unspecified.
+fn check_rule_returning_list(
+    storage: &Storage,
+    txid: u32,
+    target: crate::storage::RuleTarget,
+    relation: &RuleConditionColumns<'_>,
+    action: &Stmt<'_>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mut entries = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let count = describe_data_modification_columns(
+        storage,
+        action,
+        arena,
+        txid,
+        &mut entries,
+        DescriptionTarget::Wire,
+    )?;
+    let definitions = storage.table_definition_images();
+    let table = match target {
+        crate::storage::RuleTarget::Table(slot) => {
+            Some(definitions.definition(storage, usize::from(slot), txid)?)
+        }
+        crate::storage::RuleTarget::View(_) => None,
+    };
+    let attributes = table.map_or(relation.count, |table| usize::from(table.attributes.count));
+    for (position, entry) in entries[..count].iter().enumerate() {
+        if position >= attributes {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "RETURNING list has too many entries"
+            ));
+        }
+        let column = match table {
+            Some(table) => table.attribute_column(position as u16 + 1).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot create a RETURNING list for a relation containing dropped columns"
+                )
+            })?,
+            None => position,
+        };
+        let name = relation.names[column];
+        let metadata = relation.metadata[column];
+        if entry.type_oid != metadata.type_oid {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "RETURNING list's entry {} has different type from column \"{}\"",
+                position + 1,
+                name
+            ));
+        }
+        if entry.type_mod != metadata.type_mod && entry.type_mod != -1 && metadata.type_mod != -1 {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "RETURNING list's entry {} has different size from column \"{}\"",
+                position + 1,
+                name
+            ));
+        }
+    }
+    if count != attributes {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "RETURNING list has too few entries"
+        ));
+    }
+    Ok(())
 }
 
 pub fn create_rule(
@@ -73948,8 +74090,11 @@ where
     };
     let statement = &typed_statement;
     let source_assignment_casts = match source {
-        InsertSource::MaterializedSelect { .. } => None,
-        InsertSource::Statement => match statement.select {
+        InsertSource::MaterializedSelect { deferred: None, .. } => None,
+        InsertSource::MaterializedSelect {
+            deferred: Some(_), ..
+        }
+        | InsertSource::Statement => match statement.select {
             Some(select) => match prepare_insert_select_casts(
                 statement, select, storage, txn.txid, arena, transition,
             ) {
@@ -74217,57 +74362,77 @@ where
     // the source may read the table being inserted into. Each emitted source
     // row converts before the next row runs; encoded values are already typed.
     if let Some(sel) = statement.select {
-        let (rows_bytes, count): (&[&[u8]], usize) =
-            if let InsertSource::MaterializedSelect { rows, .. } = source {
-                (rows, rows.len())
-            } else {
-                let sel = match transition_relations {
-                    Some(relations) => match super::query::bind_materialized_relations(
-                        sel, relations, storage, txn.txid, arena,
-                    ) {
-                        Ok(select) => select,
-                        Err(error) => return sql_fail(error),
-                    },
-                    None => sel,
-                };
-                let mut rows = crate::mem::arena::ArenaList::new_persistent(arena);
-                let mut fill = |vals: &[Datum]| -> Result<(), SqlError> {
-                    let vals = coerce_insert_projection(
-                        vals,
-                        def,
-                        &targets[..n_targets],
-                        source_assignment_casts.expect("SELECT has a cast plan"),
-                        statement.overriding,
-                        storage,
-                        txn.txid,
-                        arena,
-                        Some(&crate::sql::sequence::SeqEval::new(
-                            storage,
-                            seq_session,
-                            coercion_txid,
-                        )),
-                    )?;
+        let deferred;
+        let (rows_bytes, count): (&[&[u8]], usize) = if let InsertSource::MaterializedSelect {
+            rows,
+            deferred: staged,
+            ..
+        } = source
+        {
+            deferred = staged;
+            (rows, rows.len())
+        } else {
+            let sel = match transition_relations {
+                Some(relations) => match super::query::bind_materialized_relations(
+                    sel, relations, storage, txn.txid, arena,
+                ) {
+                    Ok(select) => select,
+                    Err(error) => return sql_fail(error),
+                },
+                None => sel,
+            };
+            deferred = match deferred_source::defer_source_calls(
+                sel, storage, txn.txid, arena, transition,
+            ) {
+                Ok(deferred) => deferred,
+                Err(error) => return sql_fail(error),
+            };
+            let sel = deferred.as_ref().map_or(sel, |deferred| deferred.select);
+            let keep_raw = deferred.is_some();
+            let mut rows = crate::mem::arena::ArenaList::new_persistent(arena);
+            let mut fill = |vals: &[Datum]| -> Result<(), SqlError> {
+                if keep_raw {
+                    // Converted with the calls' results as each row is written.
                     let encoded = encode_projected_persistent_pub(vals, arena)?;
                     rows.push(encoded).map_err(|_| super::eval::arena_full())?;
-                    Ok(())
-                };
-                {
-                    let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                    if let Err(e) = super::query::select_into_rows_recycling(
-                        storage,
-                        txn.txid,
-                        sel,
-                        arena,
-                        params,
-                        None,
-                        Some(&live),
-                        &mut fill,
-                    ) {
-                        return sql_fail(e);
-                    }
+                    return Ok(());
                 }
-                (rows.as_slice(), rows.len())
+                let vals = coerce_insert_projection(
+                    vals,
+                    def,
+                    &targets[..n_targets],
+                    source_assignment_casts.expect("SELECT has a cast plan"),
+                    statement.overriding,
+                    storage,
+                    txn.txid,
+                    arena,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        coercion_txid,
+                    )),
+                )?;
+                let encoded = encode_projected_persistent_pub(vals, arena)?;
+                rows.push(encoded).map_err(|_| super::eval::arena_full())?;
+                Ok(())
             };
+            {
+                let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                if let Err(e) = super::query::select_into_rows_recycling(
+                    storage,
+                    txn.txid,
+                    sel,
+                    arena,
+                    params,
+                    None,
+                    Some(&live),
+                    &mut fill,
+                ) {
+                    return sql_fail(e);
+                }
+            }
+            (rows.as_slice(), rows.len())
+        };
         // Row changes start here. The source rows above restart
         // from the statement's start after a wait; from now on reads block.
         super::query::protect_statement_effects();
@@ -74388,7 +74553,42 @@ where
                     }
                     Err(error) => return sql_fail(error),
                 }
-                let n_src = projected_row_width(bytes);
+                let converted = match &deferred {
+                    Some(deferred) => {
+                        let source = match deferred_source_row(
+                            deferred,
+                            bytes,
+                            storage,
+                            txn.txid,
+                            seq_session,
+                            arena,
+                            params,
+                        )
+                        .and_then(|row| {
+                            coerce_insert_projection(
+                                row,
+                                def,
+                                &targets[..n_targets],
+                                source_assignment_casts.expect("SELECT has a cast plan"),
+                                statement.overriding,
+                                storage,
+                                txn.txid,
+                                arena,
+                                Some(&crate::sql::sequence::SeqEval::new(
+                                    storage,
+                                    seq_session,
+                                    coercion_txid,
+                                )),
+                            )
+                        }) {
+                            Ok(row) => row,
+                            Err(error) => return sql_fail(error),
+                        };
+                        Some(source)
+                    }
+                    None => None,
+                };
+                let n_src = converted.map_or_else(|| projected_row_width(bytes), <[Datum]>::len);
                 if n_src > n_targets || (n_src < n_targets && !statement.columns.is_empty()) {
                     let msg = if n_src > n_targets {
                         "INSERT has more expressions than target columns"
@@ -74412,7 +74612,7 @@ where
                         IdentityAction::UseSequence => continue,
                         IdentityAction::Accept => {}
                     }
-                    let v = decode_projected_pub(bytes, i);
+                    let v = converted.map_or_else(|| decode_projected_pub(bytes, i), |row| row[i]);
                     values[targets[i]] = v;
                     explicit[targets[i]] = true;
                 }
@@ -83537,10 +83737,11 @@ fn alter_table_relation(
                     Ok(name) => name,
                     Err(error) => return sql_fail(error),
                 };
+                // A rewrite builds the table's indexes again.
                 if let Some(name) = duplicate_name {
                     return sql_fail(sql_err!(
                         sqlstate::UNIQUE_VIOLATION,
-                        "duplicate key value violates unique constraint \"{}\"",
+                        "could not create unique index \"{}\"",
                         name.as_str()
                     ));
                 }
@@ -86085,6 +86286,33 @@ fn insert_more_targets(columns: &[&str], at: usize) -> SqlError {
         Some(column) => crate::sql::error_position::at_reference(error, column),
         None => error,
     }
+}
+
+/// One materialized source row with its deferred calls evaluated, in the
+/// written source's shape and types.
+fn deferred_source_row<'a>(
+    deferred: &deferred_source::DeferredSource<'a>,
+    bytes: &'a [u8],
+    storage: &Storage,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<&'a [Datum<'a>], SqlError> {
+    let width = projected_row_width(bytes);
+    let row = arena
+        .alloc_slice_with(width, |_| Datum::Null)
+        .map_err(|_| super::eval::arena_full())?;
+    decode_projected_row_into(bytes, arena, row)?;
+    let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let hooks = super::eval::EvalHooks {
+        catalog: Some(&catalog),
+        sequences: Some(&sequences),
+        ..super::eval::NO_HOOKS
+    };
+    deferred.evaluate(row, arena, params, &hooks)?;
+    Ok(&row[..deferred.width])
 }
 
 #[expect(

@@ -297,6 +297,7 @@ fn run_pending_firing<'w, Definition0: crate::storage::DefinitionBacking>(
         mark: txn.statement_mark(engine.wal.stage_mark(txn.txid), engine.storage.lock_mark()),
         command,
         depth: txn.trigger_depth(),
+        retained: true,
     });
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {

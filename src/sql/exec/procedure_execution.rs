@@ -157,6 +157,7 @@ fn run<'a>(
         mark,
         command: context.txn.command_id(),
         depth: context.txn.trigger_depth(),
+        retained: true,
     });
     context.txn.running_procedures = context
         .txn

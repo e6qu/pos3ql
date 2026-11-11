@@ -5838,8 +5838,8 @@ fn eval_full_inner<'a>(
             // A row `IS NULL` is true only when *every* field is null, and
             // `IS NOT NULL` only when every field is non-null — so a mixed row
             // is false for both (PostgreSQL's row null-test, not a plain
-            // negation).
-            if let Datum::Record(fields) = v {
+            // negation). A whole-row reference is a named composite.
+            if let Datum::Record(fields) | Datum::Composite { fields, .. } = v {
                 let result = if negated {
                     fields.iter().all(|f| !f.value.is_null())
                 } else {

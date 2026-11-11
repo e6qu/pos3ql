@@ -22354,15 +22354,16 @@ fn parse_trigger_for_header<'a>(
     {
         match plpgsql_cursor_variable(cursor) {
             Some(Some(bound)) => {
-                if variable.label.is_some() {
-                    // The loop declares its record, which a qualified name
-                    // cannot spell.
-                    return Err(super::error_position::at_subject(
-                        sql_err!(sqlstate::SYNTAX_ERROR, "syntax error at or near \"IN\""),
-                        target_source,
-                    ));
-                }
-                let open = parse_bound_cursor_open(cursor, bound, source[split..].trim(), arena)?;
+                let arguments = match source[split..].trim() {
+                    // PostgreSQL points a missing argument list at `LOOP`.
+                    "" => {
+                        let end =
+                            source.as_ptr() as usize - segment.as_ptr() as usize + source.len();
+                        &segment[end..].trim_start()[..0]
+                    }
+                    arguments => arguments,
+                };
+                let open = parse_bound_cursor_open(cursor, bound, arguments, arena)?;
                 let targets = arena
                     .alloc_slice_copy(&[PlpgsqlVariableName::plain(variable.name)])
                     .map_err(|_| super::query::arena_full_pub())?;
@@ -24157,7 +24158,14 @@ fn validate_plpgsql_constant_assignments(
                         };
                         validate_block(statement.block, locals, Some(&local), has_parameter)?;
                     } else if let TriggerForSource::Cursor { .. } = statement.source {
-                        // The loop declares its own record.
+                        // The loop declares its own record; a qualified name
+                        // must still name a known variable.
+                        if statement.target.label.is_some()
+                            && binding_constant(statement.target, locals, shadowed, has_parameter)
+                                .is_none()
+                        {
+                            reject(statement.target, locals, shadowed, has_parameter)?;
+                        }
                         let local = ScopedLocal {
                             label: statement.label,
                             name: statement.target.name,

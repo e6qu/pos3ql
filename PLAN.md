@@ -269,11 +269,7 @@ Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: `ALTER`, `COMMENT ON`
 and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
 with `0A000` where PostgreSQL changes the catalog entry; `information_schema`
-domains such as `cardinal_number` do not exist. A parameter typed from a called
-built-in (`PREPARE q AS SELECT round($1)`) is not recorded as that type:
-`pg_prepared_statements.parameter_types` is empty, `pg_typeof($1)` is
-`unknown`, and `round($1)` with `2.5` rounds as `numeric` (3) where
-PostgreSQL's `double precision` gives 2. A SQL function whose earlier
+domains such as `cardinal_number` do not exist. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

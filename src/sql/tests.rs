@@ -27,6 +27,7 @@ mod oid_alias_comparisons;
 mod owner_role_inheritance;
 mod polymorphic_resolution;
 mod prepared_object_capacity;
+mod prepared_parameter_types;
 mod procedural_expression_calls;
 mod procedural_progress;
 mod procedural_subtransactions;

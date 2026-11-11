@@ -46198,7 +46198,7 @@ impl Storage {
             txid,
             RoutineCallKind::Function,
         ) {
-            RoutineCallSelection::Builtin { oid, .. } => self.builtin_call_input_oids(
+            RoutineCallSelection::Builtin { oid, .. } => self.builtin_call_parameter_oids(
                 oid,
                 argument_names,
                 actual_oids,

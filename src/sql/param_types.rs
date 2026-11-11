@@ -233,7 +233,11 @@ impl ParameterInference<'_> {
                 && *index >= 1
                 && (*index as usize) <= oids.len()
             {
-                oids[*index as usize - 1] = type_oid;
+                // Another position's concrete type wins over a pseudo-type.
+                let slot = &mut oids[*index as usize - 1];
+                if !accepts_any_type(type_oid) || *slot == types::oid::UNKNOWN {
+                    *slot = type_oid;
+                }
             }
         };
         match expression {
@@ -634,6 +638,70 @@ impl ParameterInference<'_> {
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+/// Finishes inferred parameter types as PostgreSQL's parse analysis does: a
+/// referenced parameter still `unknown` resolves to `text`, while one never
+/// referenced, or only passed where any type is accepted (`pg_typeof($1)`),
+/// has no type and fails with `42P18`.
+/// https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_param.c#L270
+pub(crate) fn finish_unresolved(
+    text: &str,
+    arena: &Arena,
+    oids: &mut [i32],
+) -> Result<(), SqlError> {
+    let undetermined = |index: usize| {
+        sql_err!(
+            sqlstate::INDETERMINATE_DATATYPE,
+            "could not determine data type of parameter ${}",
+            index + 1
+        )
+    };
+    for (index, oid) in oids.iter_mut().enumerate() {
+        if accepts_any_type(*oid) {
+            return Err(undetermined(index));
+        }
+        if *oid == types::oid::UNKNOWN {
+            if !references_parameter(text, arena, index + 1) {
+                return Err(undetermined(index));
+            }
+            *oid = types::oid::TEXT;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `oid` is a pseudo-type an argument position accepts without
+/// determining the argument's own type.
+fn accepts_any_type(oid: i32) -> bool {
+    matches!(
+        oid,
+        types::oid::ANY
+            | types::oid::ANYELEMENT
+            | types::oid::ANYNONARRAY
+            | types::oid::ANYENUM
+            | types::oid::ANYRANGE
+            | types::oid::ANYMULTIRANGE
+            | types::oid::ANYARRAY
+            | types::oid::ANYCOMPATIBLE
+            | types::oid::ANYCOMPATIBLEARRAY
+            | types::oid::ANYCOMPATIBLENONARRAY
+            | types::oid::ANYCOMPATIBLERANGE
+            | types::oid::ANYCOMPATIBLEMULTIRANGE
+    )
+}
+
+fn references_parameter(text: &str, arena: &Arena, parameter: usize) -> bool {
+    let mut lexer = crate::sql::lexer::Lexer::new(text, arena);
+    loop {
+        match lexer.next_token() {
+            Ok(crate::sql::lexer::Tok::Param(found)) if found as usize == parameter => {
+                return true;
+            }
+            Ok(crate::sql::lexer::Tok::Eof) | Err(_) => return false,
+            Ok(_) => {}
         }
     }
 }

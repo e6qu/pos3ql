@@ -288,8 +288,7 @@ fn with_schema_context<'a, 's, R>(
         {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
-                "WITH query \"{}\" is not recursive",
-                cte.name
+                "WITH query is not recursive"
             ));
         }
         if let Some(dml) = cte.dml {
@@ -3637,10 +3636,23 @@ fn recursive_parts<'a>(
             name
         ));
     };
-    if !q.order_by.is_empty() || q.limit.is_some() || q.offset.is_some() {
+    // PostgreSQL names the first such clause, in this order.
+    let unsupported = if !q.order_by.is_empty() {
+        Some("ORDER BY")
+    } else if q.offset.is_some() {
+        Some("OFFSET")
+    } else if q.limit.is_some() {
+        Some("LIMIT")
+    } else if !q.locking.is_empty() {
+        Some("FOR UPDATE/SHARE")
+    } else {
+        None
+    };
+    if let Some(clause) = unsupported {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "ORDER BY/LIMIT in a recursive query is not implemented"
+            "{} in a recursive query is not implemented",
+            clause
         ));
     }
     if set_tree_references(left, name) > 0 {

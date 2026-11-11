@@ -3325,10 +3325,13 @@ pub(crate) fn apply_fk_parent_actions(
             }
             use crate::storage::FkAction as StorageFkAction;
             if existence_only {
-                let code = if action == StorageFkAction::Restrict {
-                    "23001"
+                // PostgreSQL names a RESTRICT action and drops "still" from
+                // its detail, since no deferral could change the outcome.
+                let restrict = action == StorageFkAction::Restrict;
+                let (code, setting, still) = if restrict {
+                    ("23001", "RESTRICT setting of ", "")
                 } else {
-                    "23503"
+                    ("23503", "", "still ")
                 };
                 let detail = key_detail(
                     &mut parent_columns
@@ -3338,7 +3341,7 @@ pub(crate) fn apply_fk_parent_actions(
                         .iter()
                         .map(|column| old_parent[*column as usize]),
                     format_args!(
-                        " is still referenced from table \"{}\".",
+                        " is {still}referenced from table \"{}\".",
                         cdef.name.as_str()
                     ),
                 )?;
@@ -3352,7 +3355,7 @@ pub(crate) fn apply_fk_parent_actions(
                 );
                 return Err(sql_err!(
                     code,
-                    "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
+                    "update or delete on table \"{}\" violates {setting}foreign key constraint \"{}\" on table \"{}\"",
                     parent_name,
                     fk.name.as_str(),
                     cdef.name.as_str()

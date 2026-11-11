@@ -8482,7 +8482,7 @@ fn call<'a>(
                 Some(Datum::Null) => {
                     return Err(sql_err!(
                         sqlstate::NULL_VALUE_NOT_ALLOWED,
-                        "null value not allowed"
+                        "null array element not allowed in this context"
                     ));
                 }
                 None => return Ok(Datum::Null),

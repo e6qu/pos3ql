@@ -3249,9 +3249,7 @@ impl<'a> Parser<'a> {
                 None
             };
             if (search.is_some() || cycle.is_some()) && (!recursive || dml.is_some()) {
-                return Err(self.err_here(
-                    "SEARCH and CYCLE clauses require a recursive SELECT common table expression",
-                ));
+                return Err(self.err_here("WITH query is not recursive"));
             }
             self.push(
                 &mut ctes,
@@ -3711,11 +3709,13 @@ impl<'a> Parser<'a> {
                 .arena
                 .alloc(select)
                 .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+            // After `AS`, only an alias may follow: anything else, including
+            // a reserved word, is PostgreSQL's syntax error at that token.
             let explicit_as = self.eat_ident("as")?;
             let alias = if let Tok::Ident(word) = self.peeked {
                 if is_column_name_keyword(word) {
                     if explicit_as {
-                        return Err(self.err_here("subquery alias is missing"));
+                        return Err(self.syntax_error_here());
                     }
                     None
                 } else {
@@ -3723,7 +3723,7 @@ impl<'a> Parser<'a> {
                     Some(word)
                 }
             } else if explicit_as {
-                return Err(self.err_here("subquery alias is missing"));
+                return Err(self.syntax_error_here());
             } else {
                 None
             };
@@ -11930,7 +11930,11 @@ mod tests {
         });
         with_parser("SELECT * FROM (SELECT 1) AS", |p| {
             let error = p.next_stmt().unwrap_err();
-            assert_eq!(error.message.as_str(), "subquery alias is missing");
+            assert_eq!(error.message.as_str(), "syntax error at end of input");
+        });
+        with_parser("SELECT * FROM (SELECT 1) AS select", |p| {
+            let error = p.next_stmt().unwrap_err();
+            assert_eq!(error.message.as_str(), "syntax error at or near \"select\"");
         });
     }
 

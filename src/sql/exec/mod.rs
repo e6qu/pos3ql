@@ -56459,6 +56459,15 @@ pub fn create_index(
                 }
             }
         };
+        // A mismatched operator class names the column's declared type,
+        // including a user-defined one, as PostgreSQL does.
+        let input_type_name =
+            match crate::sql::catalog::user_type_name_fixed(storage, txn.txid, type_oid) {
+                Ok(name) => name
+                    .or_else(|| builtin_type_name_fixed(type_oid))
+                    .unwrap_or_else(|| crate::util::StackStr::from_str(input.ctype.name())),
+                Err(error) => return sql_fail(error),
+            };
         if let Some(operator_class) = index_column.operator_class {
             if command.method == crate::sql::ast::IndexAccessMethod::Hash {
                 if !index_column.operator_class_options.is_empty() {
@@ -56491,7 +56500,7 @@ pub fn create_index(
                         sqlstate::DATATYPE_MISMATCH,
                         "operator class \"{}\" does not accept data type {}",
                         operator_class.name,
-                        input.ctype.name()
+                        input_type_name.as_str()
                     ));
                 }
                 let class = crate::storage::IndexOperatorClass::Hash(parsed);
@@ -56523,7 +56532,7 @@ pub fn create_index(
                         sqlstate::DATATYPE_MISMATCH,
                         "operator class \"{}\" does not accept data type {}",
                         operator_class.name,
-                        input.ctype.name()
+                        input_type_name.as_str()
                     ));
                 }
                 use crate::sql::types::BrinOperatorClassKind;
@@ -56603,7 +56612,7 @@ pub fn create_index(
                         sqlstate::DATATYPE_MISMATCH,
                         "operator class \"{}\" does not accept data type {}",
                         operator_class.name,
-                        input.ctype.name()
+                        input_type_name.as_str()
                     ));
                 }
                 let supplied = index_column.operator_class_options;
@@ -56669,7 +56678,7 @@ pub fn create_index(
                         sqlstate::DATATYPE_MISMATCH,
                         "operator class \"{}\" does not accept data type {}",
                         operator_class.name,
-                        input.ctype.name()
+                        input_type_name.as_str()
                     ));
                 }
                 let class = crate::storage::IndexOperatorClass::Gin(parsed);
@@ -56709,7 +56718,7 @@ pub fn create_index(
                         sqlstate::DATATYPE_MISMATCH,
                         "operator class \"{}\" does not accept data type {}",
                         operator_class.name,
-                        input.ctype.name()
+                        input_type_name.as_str()
                     ));
                 }
                 let class = crate::storage::IndexOperatorClass::SpGist(parsed);
@@ -56738,7 +56747,7 @@ pub fn create_index(
                         sqlstate::DATATYPE_MISMATCH,
                         "operator class \"{}\" does not accept data type {}",
                         operator_class.name,
-                        input.ctype.name()
+                        input_type_name.as_str()
                     ));
                 }
                 if definition.comparison_function().is_none() {
@@ -56788,7 +56797,7 @@ pub fn create_index(
                     sqlstate::DATATYPE_MISMATCH,
                     "operator class \"{}\" does not accept data type {}",
                     operator_class.name,
-                    input.ctype.name()
+                    input_type_name.as_str()
                 ));
             }
             let class = crate::storage::IndexOperatorClass::Btree(parsed);
@@ -77017,12 +77026,25 @@ fn alter_table_relation(
                         .any(|exclusion| exclusion.name.as_str() == *name)
                     || named_key_columns(&new_def, name).is_some()
                 {
-                    return sql_fail(sql_err!(
-                        sqlstate::WRONG_OBJECT_TYPE,
-                        "constraint \"{}\" of relation \"{}\" is not a foreign key constraint",
-                        name,
-                        new_def.name.as_str()
-                    ));
+                    // PostgreSQL rejects a deferrability change first, then
+                    // an enforceability change, on a non-foreign-key constraint.
+                    let deferrability =
+                        alteration.deferrable.is_some() || alteration.initially.is_some();
+                    return sql_fail(if !deferrability && alteration.enforced.is_some() {
+                        sql_err!(
+                            sqlstate::WRONG_OBJECT_TYPE,
+                            "cannot alter enforceability of constraint \"{}\" of relation \"{}\"",
+                            name,
+                            new_def.name.as_str()
+                        )
+                    } else {
+                        sql_err!(
+                            sqlstate::WRONG_OBJECT_TYPE,
+                            "constraint \"{}\" of relation \"{}\" is not a foreign key constraint",
+                            name,
+                            new_def.name.as_str()
+                        )
+                    });
                 } else {
                     return sql_fail(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,

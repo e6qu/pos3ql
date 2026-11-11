@@ -229,15 +229,25 @@ fn statement_timeout_and_cancellation_end_a_sleep() {
         &mut sleeper_client,
         "SELECT pg_sleep(30)",
     );
+    let parked_after_send = sleeper.parked_wait();
+    let mut retries = Vec::new();
     while sleeper.parked_wait().is_some() {
         let remaining = sleeper.parked_wait_remaining().unwrap();
         assert!(remaining <= Duration::from_millis(100));
         std::thread::sleep(remaining);
-        retry(&mut sleeper, &mut fixture.engine);
+        retries.push(retry(&mut sleeper, &mut fixture.engine));
     }
     assert!(started.elapsed() < Duration::from_secs(10));
+    let queued = (sleeper.send.len(), sleeper.overflow_bytes());
     let response = received(&mut sleeper, &mut sleeper_client);
-    assert_eq!(sqlstates(&response), ["57014"], "{}", describe(&response));
+    assert_eq!(
+        sqlstates(&response),
+        ["57014"],
+        "response [{}]; parked after send {parked_after_send:?}; retries {retries:?}; \
+         queued {queued:?}; later [{}]",
+        describe(&response),
+        describe(&received(&mut sleeper, &mut sleeper_client))
+    );
     send(
         &mut sleeper,
         &mut fixture.engine,

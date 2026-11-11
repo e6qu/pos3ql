@@ -5304,7 +5304,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         Datum::Null => {
                             return Err(sql_err!(
                                 sqlstate::NULL_VALUE_NOT_ALLOWED,
-                                "null value not allowed"
+                                "null array element not allowed in this context"
                             ));
                         }
                         _ => return Err(srf_signature_error(tref.table)),

@@ -1723,6 +1723,23 @@ impl TxnState {
         })
     }
 
+    /// Joins the nested command already running instead of starting one:
+    /// the `WITH` queries of a PL/pgSQL statement and its write share one
+    /// command and snapshot, so neither sees the other's changes.
+    pub(crate) fn share_trigger_sql<'txn>(
+        &'txn mut self,
+        storage: &Storage,
+    ) -> TriggerSqlScope<'txn> {
+        let parent_command = self.command_id;
+        let parent_depth = self.trigger_depth;
+        TriggerSqlScope {
+            transaction: self,
+            parent_command,
+            parent_depth,
+            _snapshot: storage.same_statement_snapshot(),
+        }
+    }
+
     pub(crate) fn trigger_depth(&self) -> u16 {
         self.trigger_depth
     }

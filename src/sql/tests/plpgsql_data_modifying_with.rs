@@ -1,6 +1,6 @@
-//! Data-modifying `WITH` queries in PL/pgSQL `SELECT ... INTO`, `PERFORM`
-//! and `RETURN QUERY`, and in SQL-language functions, compared with
-//! PostgreSQL 18.6.
+//! `WITH` queries in PL/pgSQL statements, writes, `EXECUTE` and FOR
+//! queries, and data-modifying ones in SQL-language functions, compared
+//! with PostgreSQL 18.6.
 
 use super::compatibility_diagnostics::{diagnostics, with_engine};
 use super::*;
@@ -105,6 +105,64 @@ fn plpgsql_statements_read_ordinary_with_queries() {
                  RAISE NOTICE '% %', t, n; END $$",
             )),
             ["NOTICE 00000 6 4", "DO"]
+        );
+    });
+}
+
+#[test]
+fn plpgsql_writes_run_with_queries_in_one_command() {
+    with_engine("plpgsql-write-with", |engine, budget| {
+        for sql in [
+            "CREATE TABLE t (a int, b int)",
+            "INSERT INTO t VALUES (1, 10), (2, 20)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // WITH queries read the routine's variables and the rows earlier
+        // statements wrote; the write does not see their changes.
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "DO $$ DECLARE n int := 5; x int; BEGIN \
+                 WITH s AS (SELECT a FROM t WHERE a = 1) UPDATE t SET b = b + n FROM s WHERE t.a = s.a; \
+                 WITH s AS (INSERT INTO t VALUES (3, n) RETURNING a) INSERT INTO t SELECT a + 10, n FROM s; \
+                 WITH d AS (DELETE FROM t WHERE a = 13 RETURNING a) DELETE FROM t WHERE a IN (SELECT a - 10 FROM d); \
+                 WITH i AS (INSERT INTO t VALUES (80, 0) RETURNING a) UPDATE t SET b = b + 1 WHERE a >= 80; \
+                 WITH i AS (INSERT INTO t VALUES (81, 0) RETURNING a) SELECT count(*) INTO x FROM t WHERE a = 81; \
+                 RAISE NOTICE 'seen %', x; END $$",
+            )),
+            ["NOTICE 00000 seen 0", "DO"]
+        );
+        assert_eq!(
+            data_rows(&run_with(engine, budget, "SELECT * FROM t ORDER BY a")),
+            ["1|15", "2|20", "80|0", "81|0"]
+        );
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "DO $$ DECLARE n int := 1; x int; BEGIN \
+                 EXECUTE 'WITH s AS (SELECT count(*)::int AS c FROM t WHERE a > $1) SELECT c FROM s' INTO x USING n; \
+                 EXECUTE 'WITH s AS (SELECT 1 AS a) INSERT INTO t SELECT a + 40, $1 FROM s' USING n; \
+                 RAISE NOTICE 'count %', x; END $$",
+            )),
+            ["NOTICE 00000 count 3", "DO"]
+        );
+        assert_eq!(
+            data_rows(&run_with(engine, budget, "SELECT b FROM t WHERE a = 41")),
+            ["1"]
+        );
+        // A cursor reruns its query at each FETCH and cannot keep the rows
+        // its WITH queries wrote.
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "DO $$ DECLARE c refcursor; BEGIN \
+                 OPEN c FOR WITH i AS (INSERT INTO t VALUES (9, 9) RETURNING a) SELECT a FROM i; END $$",
+            ))[0],
+            "ERROR 0A000 OPEN of a query with data-modifying WITH queries is not supported"
         );
     });
 }

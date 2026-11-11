@@ -284,16 +284,18 @@ and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
 constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
 `INSERT has more target columns than expressions` without its position; other
-target and expression count errors are positioned. PL/pgSQL `SELECT ... INTO`, `PERFORM` and `RETURN QUERY` run a
-data-changing `WITH`, but other routine positions do not: a PL/pgSQL
-`WITH ... INSERT/UPDATE/DELETE` statement is rejected as an unsupported
-body, `FOR ... IN WITH ...` rejects a data-modifying `WITH` with `0A000`, a
-`WITH` query of a PL/pgSQL statement cannot read the routine's variables
-(the materialized query runs without the enclosing row), `EXECUTE` and a cursor's query report the
-`WITH` name unknown, and a trigger function rejects it with `0A000`. A
-SQL-language function's query runs them before reading, as a top-level
-query does. These need the routine's write
-path to run the `WITH` writes under the main statement's snapshot. A `LATERAL` item inside a
+target and expression count errors are positioned. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
+queries, including data-modifying ones, in one new command as PostgreSQL
+does. Remaining: `OPEN ... FOR` a query with data-modifying `WITH` queries
+fails with `0A000` (the cursor reruns its query at each `FETCH` and cannot
+keep the written rows); a trigger function fired outside a routine (an
+ordinary `INSERT` firing a BEFORE trigger) rejects data-modifying `WITH`
+queries with `0A000`; and a PL/pgSQL write with `WITH` queries whose nested
+AFTER trigger waits fails with `0A000` instead of resuming. A derived table
+in FROM, or a `WITH` query run as one, that names a routine variable or a
+trigger's `NEW`/`OLD` row fails as an unknown column in a function called
+from SQL or an AFTER trigger (`SELECT a INTO x FROM (SELECT n + 1 AS a) q`):
+describing it for planner inputs does not see the routine's variables. A `LATERAL` item inside a
 parenthesized join or a derived table can reference only the FROM items
 beside it, so `a JOIN (b JOIN LATERAL (SELECT a.x) s ON true) ON true`
 reports a missing FROM-clause entry for `a` where PostgreSQL accepts it. An

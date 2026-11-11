@@ -8729,7 +8729,7 @@ pub(crate) fn describe_select<'a>(
     description_target: crate::sql::exec::DescriptionTarget,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<usize, SqlError> {
-    let sel = if outer.is_some() {
+    let sel = if outer.is_some() || !sel.with.is_empty() {
         expand_ctes(sel, storage, txid, arena)?
     } else {
         sel

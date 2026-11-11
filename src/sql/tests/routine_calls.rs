@@ -4266,7 +4266,7 @@ fn view_definitions_accept_postgresql_text_view_names() {
 /// A table's or view's row type in a routine signature is unsupported and
 /// says so, instead of claiming the type does not exist.
 #[test]
-fn relation_row_types_in_routine_signatures_are_rejected_explicitly() {
+fn relation_row_types_in_routine_signatures_resolve_like_postgresql() {
     use super::routine_identity_diagnostics::{NONE, check};
     check(&[
         (
@@ -4277,22 +4277,12 @@ fn relation_row_types_in_routine_signatures_are_rejected_explicitly() {
         (
             "CREATE FUNCTION takes_row(signature_rows) RETURNS integer LANGUAGE sql \
              AS 'SELECT 1'",
-            &[(
-                'E',
-                "0A000",
-                "relation row type \"signature_rows\" cannot be used as a routine argument \
-                 or result type",
-            )],
+            NONE,
         ),
         (
             "CREATE FUNCTION returns_row() RETURNS public.signature_view LANGUAGE sql \
              AS 'SELECT 1'",
-            &[(
-                'E',
-                "0A000",
-                "relation row type \"public.signature_view\" cannot be used as a routine \
-                 argument or result type",
-            )],
+            NONE,
         ),
         (
             "CREATE FUNCTION takes_missing(signature_missing) RETURNS integer LANGUAGE sql \

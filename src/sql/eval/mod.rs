@@ -594,6 +594,19 @@ pub trait ColumnLookup<'a> {
     }
 }
 
+/// A whole-row reference to a relation has the relation's row type; any other
+/// FROM item yields an anonymous record.
+fn whole_row_value<'a>(
+    row: &dyn ColumnLookup<'a>,
+    table: &str,
+    fields: &'a [RecordField<'a>],
+) -> Datum<'a> {
+    match row.whole_row_type(table) {
+        Some(ColType::Composite(Some(slot))) => Datum::Composite { slot, fields },
+        _ => Datum::Record(fields),
+    }
+}
+
 /// Static type identity retained until a context decides how PostgreSQL
 /// resolves an unconstrained expression.
 #[derive(Clone, Copy)]
@@ -3806,7 +3819,7 @@ fn eval_full_inner<'a>(
             Some(fields) if row.whole_row_is_scalar(table) => {
                 Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
             }
-            Some(fields) => Ok(Datum::Record(fields)),
+            Some(fields) => Ok(whole_row_value(row, table, fields)),
             None => Ok(Datum::Null), // outer-join null row
         },
         Expr::Bool(b) => Ok(Datum::Bool(b)),
@@ -3831,7 +3844,7 @@ fn eval_full_inner<'a>(
                     Ok(Some(fields)) if row.whole_row_is_scalar(name) => {
                         Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
                     }
-                    Ok(Some(fields)) => Ok(Datum::Record(fields)),
+                    Ok(Some(fields)) => Ok(whole_row_value(row, name, fields)),
                     Ok(None) => Ok(Datum::Null),
                     Err(_) => Err(e),
                 }
@@ -5305,7 +5318,58 @@ pub(crate) fn quantified_comparison<'a>(
     };
     let left = materialize(left)?;
     let right = materialize(right)?;
+    let composite =
+        matches!(left, Datum::Composite { .. }) || matches!(right, Datum::Composite { .. });
     match (left, right) {
+        (
+            Datum::Record(left) | Datum::Composite { fields: left, .. },
+            Datum::Record(right) | Datum::Composite { fields: right, .. },
+        ) if composite => {
+            // Composite-typed values use the record btree operators: NULL
+            // fields are equal to each other and sort after other values.
+            if left.len() != right.len() {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "cannot compare record types with different numbers of columns"
+                ));
+            }
+            for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                let (left, right) = (
+                    typed_field_value(left, catalog, arena)?,
+                    typed_field_value(right, catalog, arena)?,
+                );
+                let ordering = match (left.is_null(), right.is_null()) {
+                    (true, true) => core::cmp::Ordering::Equal,
+                    (true, false) => core::cmp::Ordering::Greater,
+                    (false, true) => core::cmp::Ordering::Less,
+                    (false, false) => {
+                        let collation = collations.get(index).copied().unwrap_or(Collation::None);
+                        let field = |operator| {
+                            quantified_scalar(operator, left, right, collation, catalog, arena)
+                        };
+                        if field(BinaryOp::Eq)? == Datum::Bool(true) {
+                            core::cmp::Ordering::Equal
+                        } else if field(BinaryOp::Lt)? == Datum::Bool(true) {
+                            core::cmp::Ordering::Less
+                        } else {
+                            core::cmp::Ordering::Greater
+                        }
+                    }
+                };
+                if !ordering.is_eq() {
+                    return Ok(Datum::Bool(match operator {
+                        BinaryOp::NotEq => true,
+                        BinaryOp::Lt | BinaryOp::LtEq => ordering.is_lt(),
+                        BinaryOp::Gt | BinaryOp::GtEq => ordering.is_gt(),
+                        _ => false,
+                    }));
+                }
+            }
+            Ok(Datum::Bool(matches!(
+                operator,
+                BinaryOp::Eq | BinaryOp::LtEq | BinaryOp::GtEq
+            )))
+        }
         (
             Datum::Record(left) | Datum::Composite { fields: left, .. },
             Datum::Record(right) | Datum::Composite { fields: right, .. },

@@ -35,6 +35,7 @@ pub(crate) mod identifiers;
 pub mod identity;
 pub(crate) mod index_interval;
 pub(crate) mod index_signature;
+pub(crate) mod information_schema_domains;
 pub mod json;
 pub mod jsonpath;
 pub(crate) mod large_object;
@@ -19246,9 +19247,16 @@ impl Engine {
             Stmt::CreateTable(c) => {
                 exec::create_table(&mut self.storage, &mut self.wal, txn, c, arena, responder)
             }
-            Stmt::DropTable(d) => {
-                exec::drop_table(&mut self.storage, &mut self.wal, txn, d, arena, responder)
-            }
+            Stmt::DropTable(d) => exec::drop_table(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                &mut self.dml_scratch,
+                d,
+                arena,
+                guc.seq_session(),
+                responder,
+            ),
             Stmt::CreateView {
                 name,
                 persistence,

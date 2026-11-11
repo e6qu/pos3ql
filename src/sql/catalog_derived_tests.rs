@@ -1537,7 +1537,9 @@ fn catalog_snapshot_schemata_joins_selected_owner_names_and_current_permissions(
     );
     assert_eq!(
         data_rows(&reader.success(&mut engine, report, true)),
-        ["snapshot_space_visible|snapshot_schema_owner|name|character varying"]
+        [
+            "snapshot_space_visible|snapshot_schema_owner|information_schema.sql_identifier|information_schema.character_data"
+        ]
     );
     writer.success(&mut engine, "ALTER ROLE snapshot_schema_owner RENAME TO snapshot_schema_owner_after; GRANT CREATE ON SCHEMA snapshot_space_hidden TO snapshot_schema_reader", true);
     reader.success(
@@ -1548,8 +1550,8 @@ fn catalog_snapshot_schemata_joins_selected_owner_names_and_current_permissions(
     assert_eq!(
         data_rows(&reader.success(&mut engine, report, true)),
         [
-            "snapshot_space_hidden|postgres|name|character varying",
-            "snapshot_space_visible|snapshot_schema_owner|name|character varying",
+            "snapshot_space_hidden|postgres|information_schema.sql_identifier|information_schema.character_data",
+            "snapshot_space_visible|snapshot_schema_owner|information_schema.sql_identifier|information_schema.character_data",
         ]
     );
     writer.success(
@@ -1564,14 +1566,16 @@ fn catalog_snapshot_schemata_joins_selected_owner_names_and_current_permissions(
     );
     assert_eq!(
         data_rows(&reader.success(&mut engine, report, true)),
-        ["snapshot_space_hidden|postgres|name|character varying"]
+        [
+            "snapshot_space_hidden|postgres|information_schema.sql_identifier|information_schema.character_data"
+        ]
     );
     reader.success(&mut engine, "COMMIT; RESET ROLE", true);
     assert_eq!(
         data_rows(&reader.success(&mut engine, report, true)),
         [
-            "snapshot_space_hidden|postgres|name|character varying",
-            "snapshot_space_visible|snapshot_schema_owner_after|name|character varying",
+            "snapshot_space_hidden|postgres|information_schema.sql_identifier|information_schema.character_data",
+            "snapshot_space_visible|snapshot_schema_owner_after|information_schema.sql_identifier|information_schema.character_data",
         ]
     );
 }

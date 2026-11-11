@@ -276,7 +276,10 @@ pub(crate) fn column_domain_target(
     if bound.polymorphic_type().is_some() {
         return Ok(None);
     }
-    let Some(identity) = bound.user_type else {
+    let Some(identity) = bound.user_type.filter(|identity| {
+        identity.relation_row_type_creation().is_none()
+            && identity.information_schema_domain_binding().is_none()
+    }) else {
         return Ok(None);
     };
     let reference = crate::storage::TypeReference::from_bound_name(identity)?;
@@ -302,6 +305,15 @@ pub(crate) fn check_domain_constraints(
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     for (i, col) in def.columns().iter().enumerate() {
+        if let Some(domain) = col
+            .user_type
+            .and_then(crate::storage::UserTypeName::information_schema_domain_binding)
+        {
+            if !matches!(col.ctype, ColType::Array(_)) {
+                domain.validate(&values.get(i).copied().unwrap_or(Datum::Null))?;
+            }
+            continue;
+        }
         let Some(slot) = column_domain_target(storage, col, txid)? else {
             continue;
         };

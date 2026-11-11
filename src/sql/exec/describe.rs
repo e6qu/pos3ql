@@ -92,6 +92,16 @@ pub(crate) fn wire_column_description<'a>(
     storage: &crate::storage::Storage,
     txid: u32,
 ) -> Result<ColDesc<'a>, SqlError> {
+    if let Some((domain, false)) =
+        crate::sql::information_schema_domains::InformationSchemaDomain::from_oid(
+            description.type_oid,
+        )
+    {
+        description.type_oid = domain.base().oid();
+        description.typlen = domain.base().typlen();
+        description.type_mod = domain.base_type_mod();
+        return Ok(description);
+    }
     let Some((crate::storage::NamedTypeKind::Domain, creation, false)) =
         crate::storage::NamedTypeKind::from_oid(description.type_oid)
     else {
@@ -1283,19 +1293,13 @@ fn describe_record_star<'q>(
             };
             if let Some(slot) = slot {
                 let storage = storage.expect("checked");
-                let target = crate::storage::TypeDefinitionTarget::by_creation(
-                    storage,
-                    crate::storage::NamedTypeKind::Composite,
-                    slot,
-                )?;
-                let composite = storage
-                    .read_composite_definition(target, txid)?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "composite type no longer exists"
-                        )
-                    })?;
+
+                let composite = storage.row_type_definition(slot, txid)?.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "composite type no longer exists"
+                    )
+                })?;
                 for field in composite.active_fields_for(txid) {
                     let name = arena.alloc_str(field.name.as_str()).map_err(|_| {
                         sql_err!(
@@ -2110,6 +2114,12 @@ pub trait ColTypeResolver {
         None
     }
 
+    /// The declared row type of a whole-row reference that is neither a scalar
+    /// nor an anonymous record: a relation source's own row type.
+    fn whole_row_composite_type(&self, _name: &str) -> Option<ColType> {
+        None
+    }
+
     /// The columns of the FROM item exposed as `name`, for resolving a
     /// whole-row record's field shape (`(t).c`, `(t).*`). Defaults to None.
     fn table_columns(&self, _name: &str) -> Option<&[ColumnMeta]> {
@@ -2573,17 +2583,11 @@ pub(crate) fn catalog_composite_field(
     slot: Option<crate::storage::TypeCreation>,
     name: &str,
 ) -> Option<StaticTypeMeta> {
-    let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage,
-        crate::storage::NamedTypeKind::Composite,
-        slot?,
-    )
-    .ok()?;
-    let definition = storage.read_composite_definition(target, txid).ok()??;
+    let definition = storage.row_type_definition(slot?, txid).ok()??;
     let field = definition
         .active_fields()
         .find(|field| field.name.as_str().eq_ignore_ascii_case(name))?;
-    composite_field_metadata(storage, txid, field)
+    composite_field_metadata(storage, txid, &field)
 }
 
 pub(crate) fn visit_catalog_composite_fields(
@@ -2592,18 +2596,12 @@ pub(crate) fn visit_catalog_composite_fields(
     slot: Option<crate::storage::TypeCreation>,
     visit: &mut dyn FnMut(&str, StaticTypeMeta),
 ) -> Option<usize> {
-    let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage,
-        crate::storage::NamedTypeKind::Composite,
-        slot?,
-    )
-    .ok()?;
-    let definition = storage.read_composite_definition(target, txid).ok()??;
+    let definition = storage.row_type_definition(slot?, txid).ok()??;
     let mut count = 0;
     for field in definition.active_fields() {
         visit(
             field.name.as_str(),
-            composite_field_metadata(storage, txid, field)?,
+            composite_field_metadata(storage, txid, &field)?,
         );
         count += 1;
     }
@@ -5107,7 +5105,10 @@ pub fn infer_type_res(
         },
         // A whole-row reference is an anonymous record — unless it is a function
         // scan's whole row, which is its single scalar column.
-        Expr::WholeRow(t) => match columns.whole_row_scalar_type(t) {
+        Expr::WholeRow(t) => match columns
+            .whole_row_scalar_type(t)
+            .or_else(|| columns.whole_row_composite_type(t))
+        {
             Some(ty) => of(ty),
             None => (oid::RECORD, -1),
         },
@@ -5149,7 +5150,10 @@ pub fn infer_type_res(
             // which is its single scalar column.
             Err(e) if qualifier.is_none() && columns.is_whole_row(name) => {
                 let _ = e;
-                match columns.whole_row_scalar_type(name) {
+                match columns
+                    .whole_row_scalar_type(name)
+                    .or_else(|| columns.whole_row_composite_type(name))
+                {
                     Some(t) => of(t),
                     None => (oid::RECORD, -1),
                 }
@@ -5162,6 +5166,11 @@ pub fn infer_type_res(
             crate::sql::ast::UnaryOp::Not => of(ColType::Bool),
             crate::sql::ast::UnaryOp::Neg => {
                 let inferred = infer_type_res(operand, columns)?;
+                // A domain operand uses its base type's operator.
+                let inferred = match columns.domain_base_type(inferred.0) {
+                    Some(base) => (base.oid(), base.typlen()),
+                    None => inferred,
+                };
                 let ctype = coltype_of_oid(inferred.0).unwrap_or(ColType::Text);
                 if !matches!(
                     ctype,

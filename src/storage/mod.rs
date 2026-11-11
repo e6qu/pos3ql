@@ -107,6 +107,8 @@ pub(crate) use type_edits::{
 mod domain_validation;
 mod relation_identities;
 pub(crate) use relation_identities::{MAX_RELATION_GENERATION, RelationIdentity};
+mod relation_row_types;
+pub(crate) use relation_row_types::RowTypeRelation;
 mod definition_dependencies;
 mod publication_generations;
 pub(crate) use publication_generations::IndexGenerationChange;
@@ -7813,7 +7815,10 @@ fn polymorphic_type(ctype: ColType, user_type: Option<UserTypeName>) -> Option<P
     let identity = user_type?;
     match identity.binding {
         type_references::TypeBinding::Polymorphic(kind) => Some(kind),
-        type_references::TypeBinding::Captured(_) | type_references::TypeBinding::Stored(_) => None,
+        type_references::TypeBinding::Captured(_)
+        | type_references::TypeBinding::Stored(_)
+        | type_references::TypeBinding::Relation(_)
+        | type_references::TypeBinding::InformationSchema(_) => None,
         type_references::TypeBinding::Declaration => (identity.schema.as_str() == "pg_catalog")
             .then(|| PolymorphicType::from_name(identity.name.as_str()))
             .flatten(),
@@ -33128,6 +33133,14 @@ impl Storage {
         execution_path()
     }
 
+    /// Whether unqualified type names see `information_schema`'s domains.
+    pub(crate) fn information_schema_on_path(&self) -> bool {
+        self.path()
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, PathEntry::InformationSchema))
+    }
+
     pub(crate) fn path_namespace_rank(&self, schema: &str, txid: u32) -> Option<usize> {
         self.path().entries().iter().position(|entry| match entry {
             PathEntry::Catalog => schema == "pg_catalog",
@@ -43523,6 +43536,29 @@ impl Storage {
                 oid: column.ctype.oid(),
             });
         };
+        if let Some(domain) = identity.information_schema_domain_binding() {
+            return Ok(DeclaredColumnType::UserDefined {
+                oid: if matches!(column.ctype, ColType::Array(_)) {
+                    domain.array_oid()
+                } else {
+                    domain.oid()
+                },
+                schema: identity.schema,
+                name: identity.name,
+            });
+        }
+        if let Some(creation) = identity.relation_row_type_creation() {
+            let array = matches!(column.ctype, ColType::Array(_));
+            let current = self.bind_relation_row_type(creation, array, txid)?;
+            let current = current.user_type.expect("relation row type has a name");
+            return Ok(DeclaredColumnType::UserDefined {
+                oid: self
+                    .relation_row_type_oid(creation, array, txid)
+                    .expect("bound relation row type is visible"),
+                schema: current.schema,
+                name: current.name,
+            });
+        }
         let catalog = self
             .type_catalog
             .lock()
@@ -46618,6 +46654,16 @@ impl Storage {
                 && !matches!(ctype, ColType::Array(element) if element.is_named()))
             .then(|| ctype.oid());
         };
+        if let Some(creation) = identity.relation_row_type_creation() {
+            return self.relation_row_type_oid(creation, matches!(ctype, ColType::Array(_)), txid);
+        }
+        if let Some(domain) = identity.information_schema_domain_binding() {
+            return Some(if matches!(ctype, ColType::Array(_)) {
+                domain.array_oid()
+            } else {
+                domain.oid()
+            });
+        }
         let catalog = self
             .type_catalog
             .lock()
@@ -46642,6 +46688,16 @@ impl Storage {
         if !result.requires_type_catalog() {
             return Ok(result);
         }
+        if let Some(creation) = result
+            .user_type
+            .and_then(UserTypeName::relation_row_type_creation)
+        {
+            return self.bind_relation_row_type(
+                creation,
+                matches!(result.ctype, ColType::Array(_)),
+                txid,
+            );
+        }
         self.type_catalog
             .lock()
             .expect("type catalog lock poisoned")
@@ -46649,8 +46705,11 @@ impl Storage {
     }
 
     pub(crate) fn routine_result_for_oid(&self, type_oid: i32, txid: u32) -> Option<RoutineResult> {
-        if NamedTypeKind::from_oid(type_oid).is_none() {
+        let Some((kind, creation, array)) = NamedTypeKind::from_oid(type_oid) else {
             return Self::builtin_routine_result_for_oid(type_oid);
+        };
+        if kind == NamedTypeKind::Composite && self.row_type_relation(creation, txid).is_some() {
+            return self.bind_relation_row_type(creation, array, txid).ok();
         }
         let catalog = self
             .type_catalog
@@ -46660,6 +46719,17 @@ impl Storage {
     }
 
     fn builtin_routine_result_for_oid(type_oid: i32) -> Option<RoutineResult> {
+        // An information_schema domain resolves through its base type, as a
+        // domain does for call resolution; its own identity is not storable.
+        if let Some((domain, array)) =
+            crate::sql::information_schema_domains::InformationSchemaDomain::from_oid(type_oid)
+        {
+            return Some(RoutineResult::builtin(if array {
+                ColType::Array(ArrElem::from_coltype(domain.base())?)
+            } else {
+                domain.base()
+            }));
+        }
         if let Some(kind) = PolymorphicType::from_oid(type_oid) {
             return Some(RoutineResult {
                 ctype: ColType::Text,
@@ -46748,6 +46818,11 @@ impl Storage {
     }
 
     pub(crate) fn domain_base_type_for_oid(&self, type_oid: i32, txid: u32) -> Option<ColType> {
+        if let Some((domain, false)) =
+            crate::sql::information_schema_domains::InformationSchemaDomain::from_oid(type_oid)
+        {
+            return Some(domain.base());
+        }
         let (kind, creation, array) = NamedTypeKind::from_oid(type_oid)?;
         if kind != NamedTypeKind::Domain || array {
             return None;
@@ -46764,6 +46839,16 @@ impl Storage {
         array: bool,
         txid: u32,
     ) -> Option<i32> {
+        if let Some(creation) = identity.relation_row_type_creation() {
+            return self.relation_row_type_oid(creation, array, txid);
+        }
+        if let Some(domain) = identity.information_schema_domain_binding() {
+            return Some(if array {
+                domain.array_oid()
+            } else {
+                domain.oid()
+            });
+        }
         let catalog = self
             .type_catalog
             .lock()

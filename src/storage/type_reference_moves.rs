@@ -171,7 +171,9 @@ impl TypeReferenceMove {
                 return key.slot() == self.identity.slot()
                     && key.created_at() == self.identity.created_at();
             }
-            TypeBinding::Polymorphic(_) => return false,
+            TypeBinding::Polymorphic(_)
+            | TypeBinding::Relation(_)
+            | TypeBinding::InformationSchema(_) => return false,
             TypeBinding::Declaration => {}
         }
         if identity.schema != self.prior.schema || identity.name != self.prior.name {

@@ -268,8 +268,9 @@ behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: `ALTER`, `COMMENT ON`
 and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
-with `0A000` where PostgreSQL changes the catalog entry; `information_schema`
-domains such as `cardinal_number` do not exist. A parameter typed from a called
+with `0A000` where PostgreSQL changes the catalog entry; arrays of
+`information_schema` domains (`information_schema.cardinal_number[]`) are
+rejected with `0A000`. A parameter typed from a called
 built-in (`PREPARE q AS SELECT round($1)`) is not recorded as that type:
 `pg_prepared_statements.parameter_types` is empty, `pg_typeof($1)` is
 `unknown`, and `round($1)` with `2.5` rounds as `numeric` (3) where
@@ -307,9 +308,14 @@ reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
 PL/pgSQL `CALL` in a trigger function fails with `0A000`, and a procedure
 called from PL/pgSQL that waits for storage or a lock runs again from its
 start when its statement resumes (finished effects replay from the statement
-journal) instead of resuming at a saved position inside the procedure. A table's or view's row type cannot
-appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
-where PostgreSQL accepts it. The
+journal) instead of resuming at a saved position inside the procedure. Relation row types: values and columns of a
+view's row type, and dropping a relation through `DROP SCHEMA`, `DROP
+MATERIALIZED VIEW` or `DROP FOREIGN TABLE ... CASCADE` while another table's
+column uses its row type, fail with `0A000`; a `DROP TABLE ... CASCADE` that
+reaches both columns and routines reports two notices where PostgreSQL reports
+one, and a routine's dependency on a row type is described as depending on the
+table. In a SQL-language function, `o.note` for a composite parameter `o` fails
+with `42P01` (`(o).note` works). The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

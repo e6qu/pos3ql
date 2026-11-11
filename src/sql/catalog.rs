@@ -10262,23 +10262,24 @@ pub(crate) fn user_table_oid(storage: &Storage, slot: usize) -> i32 {
 }
 
 pub(crate) fn table_row_type_oid(storage: &Storage, slot: usize, array: bool) -> i32 {
-    crate::storage::RelationIdentity::parse(storage.table(slot).created_at())
-        .expect("admitted table has a durable relation identity")
-        .companion_oid(if array {
-            FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID
-        } else {
-            FIRST_TABLE_COMPOSITE_TYPE_OID
-        })
+    relation_row_type_oid(storage, crate::storage::RowTypeRelation::Table(slot), array)
 }
 
 pub(crate) fn view_row_type_oid(storage: &Storage, slot: usize, array: bool) -> i32 {
-    crate::storage::RelationIdentity::parse(storage.view_catalog_identity(slot).created_at())
-        .expect("admitted view has a durable relation identity")
-        .companion_oid(if array {
-            FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID
-        } else {
-            FIRST_VIEW_COMPOSITE_TYPE_OID
-        })
+    relation_row_type_oid(storage, crate::storage::RowTypeRelation::View(slot), array)
+}
+
+pub(crate) fn relation_row_type_oid(
+    storage: &Storage,
+    relation: crate::storage::RowTypeRelation,
+    array: bool,
+) -> i32 {
+    let creation = storage.relation_row_type_creation(relation);
+    if array {
+        super::types::oid::composite_array_oid(creation)
+    } else {
+        super::types::oid::composite_oid(creation)
+    }
 }
 
 pub(crate) fn table_slot_by_oid(storage: &Storage, transaction: u32, oid: i32) -> Option<usize> {
@@ -11505,14 +11506,6 @@ pub(crate) fn domain_oid(storage: &Storage, slot: usize, txid: u32) -> i32 {
     crate::sql::types::oid::domain_oid(storage.domain_for(slot, txid).creation())
 }
 
-/// Tables/materialized views and plain views have distinct composite-type OID
-/// bands. PostgreSQL gives every row-bearing relation a separate pg_type row.
-pub(crate) const FIRST_TABLE_COMPOSITE_TYPE_OID: i32 = super::types::oid::FIRST_TABLE_COMPOSITE;
-pub(crate) const FIRST_VIEW_COMPOSITE_TYPE_OID: i32 = super::types::oid::FIRST_VIEW_COMPOSITE;
-pub(crate) const FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID: i32 =
-    super::types::oid::FIRST_TABLE_COMPOSITE_ARRAY;
-pub(crate) const FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID: i32 =
-    super::types::oid::FIRST_VIEW_COMPOSITE_ARRAY;
 pub(crate) const FIRST_TOAST_RELATION_OID: i32 = 320_000_000;
 pub(crate) const FIRST_TOAST_INDEX_OID: i32 = crate::storage::FIRST_TOAST_INDEX_OID;
 
@@ -13239,7 +13232,17 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
 }
 
 pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Option<i32> {
+    use crate::sql::information_schema_domains::InformationSchemaDomain;
     use crate::sql::types::oid;
+    if type_name.starts_with("information_schema.") {
+        return InformationSchemaDomain::from_name(type_name, false).map(|(domain, array)| {
+            if array {
+                domain.array_oid()
+            } else {
+                domain.oid()
+            }
+        });
+    }
     let (base, array) = type_name
         .strip_suffix("[]")
         .map_or((type_name, false), |base| (base, true));
@@ -13262,6 +13265,15 @@ pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Op
             oid::composite_array_oid(storage.composite_for(slot, txid).creation())
         } else {
             oid::composite_oid(storage.composite_for(slot, txid).creation())
+        });
+    }
+    if let Some((domain, array)) =
+        InformationSchemaDomain::from_name(type_name, storage.information_schema_on_path())
+    {
+        return Some(if array {
+            domain.array_oid()
+        } else {
+            domain.oid()
         });
     }
     // The composite rowtype PostgreSQL gives every table and view.
@@ -13896,10 +13908,7 @@ fn routine_declared_signature<'a>(
         if index != 0 {
             write!(text, ",").map_err(|_| super::eval::arena_full())?;
         }
-        let qualified = argument
-            .user_type
-            .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
-        write_routine_type_name(&mut text, argument.ctype, argument.user_type, qualified)
+        write_routine_type(&mut text, storage, txid, argument.ctype, argument.user_type)
             .map_err(|_| super::eval::arena_full())?;
     }
     write!(text, ")").map_err(|_| super::eval::arena_full())?;
@@ -13917,10 +13926,7 @@ pub(crate) fn routine_type_display<'a>(
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     let mut text = StackStr::<320>::new();
-    let qualified = result
-        .user_type
-        .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
-    write_routine_type_name(&mut text, result.ctype, result.user_type, qualified)
+    write_routine_type(&mut text, storage, txid, result.ctype, result.user_type)
         .map_err(|_| super::eval::arena_full())?;
     if text.is_truncated() {
         return Err(super::eval::arena_full());
@@ -13928,6 +13934,28 @@ pub(crate) fn routine_type_display<'a>(
     arena
         .alloc_str(text.as_str())
         .map_err(|_| super::eval::arena_full())
+}
+
+/// Writes a declared routine type as PostgreSQL's `format_type` would: a
+/// relation row type takes its relation's current name, and a type outside
+/// the search path is schema-qualified.
+fn write_routine_type(
+    output: &mut impl core::fmt::Write,
+    storage: &Storage,
+    txid: u32,
+    ctype: ColType,
+    user_type: Option<crate::storage::UserTypeName>,
+) -> Result<(), core::fmt::Error> {
+    let user_type = user_type.map(|identity| {
+        identity
+            .relation_row_type_creation()
+            .and_then(|creation| storage.bind_relation_row_type(creation, false, txid).ok())
+            .and_then(|current| current.user_type)
+            .unwrap_or(identity)
+    });
+    let qualified =
+        user_type.is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
+    write_routine_type_name(output, ctype, user_type, qualified)
 }
 
 fn write_routine_type_name(
@@ -14316,10 +14344,7 @@ pub(crate) fn operator_oid_for_signature(
         use core::fmt::Write;
         let mut message = StackStr::<1024>::from_str("operator does not exist: ");
         if let Some(left) = signature.left {
-            let qualified = left
-                .user_type
-                .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
-            write_routine_type_name(&mut message, left.ctype, left.user_type, qualified)
+            write_routine_type(&mut message, storage, txid, left.ctype, left.user_type)
                 .expect("bounded operator type");
             message
                 .write_char(' ')
@@ -14338,10 +14363,7 @@ pub(crate) fn operator_oid_for_signature(
             message
                 .write_char(' ')
                 .expect("bounded operator diagnostic");
-            let qualified = right
-                .user_type
-                .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
-            write_routine_type_name(&mut message, right.ctype, right.user_type, qualified)
+            write_routine_type(&mut message, storage, txid, right.ctype, right.user_type)
                 .expect("bounded operator type");
         }
         sql_err!(sqlstate::UNDEFINED_FUNCTION, "{}", message.as_str())
@@ -14500,10 +14522,7 @@ pub(crate) fn operator_name_by_oid<'a>(
                     .map_err(|_| super::eval::arena_full())?;
             }
             if let Some(argument) = argument {
-                let qualified = argument
-                    .user_type
-                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
-                write_routine_type_name(&mut text, argument.ctype, argument.user_type, qualified)
+                write_routine_type(&mut text, storage, txid, argument.ctype, argument.user_type)
                     .map_err(|_| super::eval::arena_full())?;
             } else {
                 text.write_str("NONE")
@@ -15133,9 +15152,7 @@ pub(crate) fn write_visible_routine_type(
     ctype: ColType,
     user_type: Option<crate::storage::UserTypeName>,
 ) {
-    let qualified =
-        user_type.is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
-    let _ = write_routine_type_name(output, ctype, user_type, qualified);
+    let _ = write_routine_type(output, storage, txid, ctype, user_type);
 }
 
 /// PostgreSQL's `print_function_rettype` for a routine that has a result.
@@ -15963,6 +15980,20 @@ pub(crate) fn user_type_name_fixed(
     txid: u32,
     oid: i32,
 ) -> Result<Option<StackStr<260>>, SqlError> {
+    if let Some((domain, array)) =
+        crate::sql::information_schema_domains::InformationSchemaDomain::from_oid(oid)
+    {
+        let mut rendered = StackStr::<260>::new();
+        use core::fmt::Write as _;
+        if !storage.information_schema_on_path() {
+            let _ = rendered.write_str("information_schema.");
+        }
+        let _ = rendered.write_str(domain.name());
+        if array {
+            let _ = rendered.write_str("[]");
+        }
+        return Ok(Some(rendered));
+    }
     let (schema, name, array) =
         if let Some((_, _, array)) = crate::storage::NamedTypeKind::from_oid(oid) {
             let Some(identity) = storage
@@ -15973,51 +16004,7 @@ pub(crate) fn user_type_name_fixed(
             };
             (identity.schema, identity.name, array)
         } else {
-            let Some((view_type, array)) = [
-                (FIRST_TABLE_COMPOSITE_TYPE_OID, false, false),
-                (FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID, false, true),
-                (FIRST_VIEW_COMPOSITE_TYPE_OID, true, false),
-                (FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID, true, true),
-            ]
-            .into_iter()
-            .find_map(|(first, view, array)| {
-                oid.checked_sub(first)
-                    .and_then(|created| u64::try_from(created).ok())
-                    .and_then(crate::storage::RelationIdentity::parse)
-                    .map(|_| (view, array))
-            }) else {
-                return Ok(None);
-            };
-            let mut relation_type = None;
-            let table_count = if view_type { 0 } else { storage.table_count() };
-            for slot in 0..table_count {
-                if !storage.table_slot_visible_to(slot, txid) {
-                    continue;
-                }
-                if table_row_type_oid(storage, slot, array) != oid {
-                    continue;
-                }
-                let definition = storage.table_def(slot, txid);
-                relation_type = Some((definition.schema, definition.name, array));
-                break;
-            }
-            if view_type {
-                for slot in 0..storage.view_count() {
-                    if !storage.view_slot_visible_to(slot, txid) {
-                        continue;
-                    }
-                    if view_row_type_oid(storage, slot, array) != oid {
-                        continue;
-                    }
-                    let view = storage.view(slot);
-                    relation_type = Some((view.schema_for(txid), view.name_for(txid), array));
-                    break;
-                }
-            }
-            let Some(relation_type) = relation_type else {
-                return Ok(None);
-            };
-            relation_type
+            return Ok(None);
         };
     let written = stack_format!(160, "{}{}", name.as_str(), if array { "[]" } else { "" });
     let unqualified_visible = user_type_oid(storage, txid, written.as_str()) == Some(oid);
@@ -16885,6 +16872,18 @@ pub fn constraint_def_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    if let Some(check) = super::information_schema_domains::InformationSchemaDomain::ALL
+        .into_iter()
+        .filter_map(super::information_schema_domains::InformationSchemaDomain::check)
+        .find(|check| check.oid == oid)
+    {
+        let rendered = stack_format!(256, "CHECK (({}))", check.source);
+        return Ok(Some(alloc_rendered(
+            &rendered,
+            "domain constraint definition is too long",
+            arena,
+        )?));
+    }
     let fks = collect_fkeys(storage, txid, arena)?;
     for info in fks {
         if info.oid != oid {
@@ -17926,6 +17925,16 @@ fn materialize_with_hidden<'a>(
         } else {
             crate::sql::ast::Collation::None
         };
+        // information_schema columns are declared with its domains.
+        if specification.schema == "information_schema"
+            && let Some(domain) =
+                super::information_schema_domains::view_column_domain(specification.name, name)
+        {
+            column.user_type = Some(crate::storage::UserTypeName::information_schema_domain(
+                domain,
+            ));
+            column.collation = domain.collation();
+        }
     }
     let mut count = visible;
     if specification.relation.is_some() {
@@ -21760,7 +21769,11 @@ fn pg_constraint_values<'a>(
             let domain = storage.domain_for(slot, txid);
             domain.checks().len() + usize::from(domain.not_null)
         })
-        .sum::<usize>();
+        .sum::<usize>()
+        + super::information_schema_domains::InformationSchemaDomain::ALL
+            .into_iter()
+            .filter(|domain| domain.check().is_some())
+            .count();
     let out = catalog_rows(
         arena,
         index_constraints
@@ -22285,6 +22298,59 @@ fn pg_constraint_values<'a>(
             )?;
             n += 1;
         }
+    }
+    // The information_schema domains' CHECK constraints.
+    for domain in super::information_schema_domains::InformationSchemaDomain::ALL {
+        let Some(check) = domain.check() else {
+            continue;
+        };
+        if n == out.len() {
+            return Err(catalog_capacity_exceeded("pg_constraint"));
+        }
+        out[n] = row(
+            &[
+                Datum::Int4(check.oid),
+                text(check.name, arena)?,
+                Datum::Int4(0),
+                Datum::Int4(domain.oid()),
+                text("c", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                text(" ", arena)?,
+                text(" ", arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                Datum::Int4(PG_CONSTRAINT_OID),
+                Datum::Int4(INFORMATION_SCHEMA_NS_OID),
+                text(" ", arena)?,
+                Datum::Bool(true),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                text(
+                    super::enum_values::checks::resolve(
+                        check.source,
+                        domain.base(),
+                        storage,
+                        txid,
+                        arena,
+                    )?,
+                    arena,
+                )?,
+            ],
+            arena,
+        )?;
+        n += 1;
     }
     // PostgreSQL 18 column order and types:
     // https://www.postgresql.org/docs/18/catalog-pg-constraint.html
@@ -30809,6 +30875,65 @@ fn pg_type<'a>(
             )?;
             n += 1;
         }
+        // PostgreSQL's information_schema domains and their array types.
+        for domain in super::information_schema_domains::InformationSchemaDomain::ALL {
+            let base = domain.base();
+            let collation = domain.collation().oid();
+            for array in [false, true] {
+                out[n] = row(
+                    &[
+                        Datum::Int4(if array {
+                            domain.array_oid()
+                        } else {
+                            domain.oid()
+                        }),
+                        if array {
+                            text(
+                                arena
+                                    .alloc_str(stack_format!(64, "_{}", domain.name()).as_str())
+                                    .map_err(|_| arena_full())?,
+                                arena,
+                            )?
+                        } else {
+                            text(domain.name(), arena)?
+                        },
+                        Datum::Int4(if array { -1 } else { i32::from(base.typlen()) }),
+                        Datum::Int4(collation),
+                        Datum::Int4(INFORMATION_SCHEMA_NS_OID),
+                        text(if array { "b" } else { "d" }, arena)?,
+                        text(if array { "A" } else { domain.category() }, arena)?,
+                        Datum::Int4(if array { 0 } else { base.oid() }),
+                        Datum::Int4(if array { domain.oid() } else { 0 }),
+                        Datum::Int4(if array { 0 } else { domain.array_oid() }),
+                        Datum::Int4(0),
+                        Datum::Int4(if array { -1 } else { domain.base_type_mod() }),
+                        Datum::Bool(false),
+                        match domain.default_text().filter(|_| !array) {
+                            Some(default) => text(default, arena)?,
+                            None => Datum::Null,
+                        },
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Int4(PG_TYPE_OID),
+                        Datum::Int4(10),
+                        Datum::Bool(true),
+                        text(if array { "x" } else { type_storage(base) }, arena)?,
+                        match domain.default_text().filter(|_| !array) {
+                            Some(default) => text(
+                                super::enum_values::checks::describe_default(
+                                    default, base, storage, txid, arena,
+                                )?,
+                                arena,
+                            )?,
+                            None => Datum::Null,
+                        },
+                    ],
+                    arena,
+                )?;
+                n += 1;
+            }
+        }
     }
     // User-defined domains: typtype 'd', with their base type and constraints.
     for slot in 0..storage.domain_count() {
@@ -32463,14 +32588,69 @@ fn info_domains<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
+    use super::information_schema_domains::InformationSchemaDomain;
     let definition = schema::require("domains", true);
     let visible_domains = (0..storage.domain_count())
         .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
         .count();
     let output = arena
-        .alloc_slice_with(visible_domains, |_| &[] as &[Datum])
+        .alloc_slice_with(visible_domains + InformationSchemaDomain::ALL.len(), |_| {
+            &[] as &[Datum]
+        })
         .map_err(|_| arena_full())?;
     let mut count = 0;
+    let character_bytes = storage
+        .current_database_encoding(txid)
+        .maximum_character_bytes();
+    for domain in InformationSchemaDomain::ALL {
+        let base = domain.base();
+        let scalar =
+            information::ScalarMetadata::new(base.oid(), domain.base_type_mod(), character_bytes)?;
+        let collated = domain.collation() == crate::sql::ast::Collation::C;
+        let collation = |value: &'static str| {
+            if collated {
+                text(value, arena)
+            } else {
+                Ok(Datum::Null)
+            }
+        };
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text("information_schema", arena)?,
+                text(domain.name(), arena)?,
+                text(base.name(), arena)?,
+                scalar.character_length.map_or(Datum::Null, Datum::Int4),
+                scalar.octet_length.map_or(Datum::Null, Datum::Int4),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                collation("postgres")?,
+                collation("pg_catalog")?,
+                collation("C")?,
+                scalar.precision.map_or(Datum::Null, Datum::Int4),
+                scalar.radix.map_or(Datum::Null, Datum::Int4),
+                scalar.scale.map_or(Datum::Null, Datum::Int4),
+                scalar.datetime_precision.map_or(Datum::Null, Datum::Int4),
+                Datum::Null,
+                Datum::Null,
+                match domain.default_text() {
+                    Some(default) => text(default, arena)?,
+                    None => Datum::Null,
+                },
+                text("postgres", arena)?,
+                text("pg_catalog", arena)?,
+                text(base.catalog_name(), arena)?,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                text("1", arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for slot in 0..storage.domain_count() {
         let domain = storage.domain_for(slot, txid);
         if !storage.domain_slot_visible_to(slot, txid) {
@@ -32685,6 +32865,20 @@ fn information_schema_usage_type(
     declared_oid: i32,
     usage: InformationSchemaTypeUsage,
 ) -> Result<Option<(SqlName, StackStr<64>)>, SqlError> {
+    if let Some((domain, false)) =
+        super::information_schema_domains::InformationSchemaDomain::from_oid(declared_oid)
+    {
+        return Ok(Some(match usage {
+            InformationSchemaTypeUsage::Domain => (
+                SqlName::parse("information_schema").expect("catalog schema fits"),
+                StackStr::from_str(domain.name()),
+            ),
+            InformationSchemaTypeUsage::UnderlyingType => (
+                SqlName::parse("pg_catalog").expect("catalog schema fits"),
+                StackStr::from_str(domain.base().catalog_name()),
+            ),
+        }));
+    }
     let domain = match crate::storage::NamedTypeKind::from_oid(declared_oid) {
         Some((crate::storage::NamedTypeKind::Domain, creation, false)) => {
             let target = crate::storage::TypeDefinitionTarget::by_creation(
@@ -32736,14 +32930,31 @@ fn info_domain_udt_usage<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
+    use super::information_schema_domains::InformationSchemaDomain;
     let definition = schema::require("domain_udt_usage", true);
     let visible_domains = (0..storage.domain_count())
         .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
         .count();
     let output = arena
-        .alloc_slice_with(visible_domains, |_| &[] as &[Datum])
+        .alloc_slice_with(visible_domains + InformationSchemaDomain::ALL.len(), |_| {
+            &[] as &[Datum]
+        })
         .map_err(|_| arena_full())?;
     let mut count = 0;
+    for domain in InformationSchemaDomain::ALL {
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text("pg_catalog", arena)?,
+                text(domain.base().catalog_name(), arena)?,
+                text("postgres", arena)?,
+                text("information_schema", arena)?,
+                text(domain.name(), arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for slot in 0..storage.domain_count() {
         let domain = storage.domain_for(slot, txid);
         if !storage.domain_slot_visible_to(slot, txid) {

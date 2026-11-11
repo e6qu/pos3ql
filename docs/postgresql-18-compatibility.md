@@ -45,6 +45,13 @@ Schemas and catalogs:
   `0A000` and is never redirected to `public`. Tables, views, sequences, and
   composite types in `pg_catalog` or `pg_toast` keep PostgreSQL's `42501`;
   missing CREATE permission is also `42501`.
+- `information_schema`'s domains (`cardinal_number`, `character_data`,
+  `sql_identifier`, `time_stamp`, `yes_or_no`) exist as in PostgreSQL: its view
+  columns have those types (`pg_typeof(table_name)` is
+  `information_schema.sql_identifier`; the wire type is the base type), casts
+  and table columns check them (`(-1)::information_schema.cardinal_number`
+  fails with `23514`), and `pg_type`, `pg_constraint` and the domain views list
+  them. Casts to arrays of these domains fail with `0A000`.
 - `information_schema` views can be queried, but their relation OIDs cannot:
   `'information_schema.columns'::regclass` and `to_regclass(...)` fail with
   `0A000` (`relation OIDs for information_schema views are not supported`).
@@ -71,6 +78,24 @@ Identity, inheritance, and partitions:
 - Ordinary `INHERITS` does not inherit identity generation. Partitions use the
   parent's sequence, but `pg_get_serial_sequence` returns NULL for a child.
   Detaching a partition clears its inherited identity; rolling back restores it.
+
+Row types:
+
+- Every table, partitioned table, foreign table, materialized view and view has
+  a row type named like the relation. `ROW(1, 'a')::orders`, `'(1,a)'::orders`,
+  `orders[]`, whole-row references (`SELECT o FROM orders o` has type
+  `orders`), routine parameters and results (`RETURNS SETOF orders`) and table
+  columns (`CREATE TABLE archive(o orders)`) behave as in PostgreSQL. A routine
+  or column using the row type blocks `DROP TABLE orders`; `CASCADE` drops the
+  routine or column. Comparing two composite values uses PostgreSQL's record
+  ordering, so `ROW(1, NULL)::orders = ROW(1, NULL)::orders` is true.
+- While a column uses the row type, `ALTER TABLE orders ADD COLUMN ... DEFAULT`
+  and `ALTER COLUMN ... TYPE` fail with `0A000` as in PostgreSQL. Dropping the
+  relation through `DROP SCHEMA ... CASCADE` or `DROP MATERIALIZED VIEW`, or a
+  `DROP FOREIGN TABLE ... CASCADE`, while another schema's column uses its row
+  type fails with `0A000` instead of dropping that column.
+- Values and columns of a view's row type are rejected with `0A000`; routine
+  signatures may name it.
 
 Functions and expressions:
 

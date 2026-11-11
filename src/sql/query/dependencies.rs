@@ -2647,6 +2647,12 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             .or_else(|| self.scope.and_then(|scope| scope.func_scalar_type(name)))
     }
 
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        self.scope?
+            .whole_row_type(name)
+            .filter(|ctype| matches!(ctype, ColType::Composite(_)))
+    }
+
     fn table_columns(&self, name: &str) -> Option<&[crate::storage::ColumnMeta]> {
         if let Some(definition) = self.output_definition(name) {
             return Some(definition.columns());
@@ -4335,6 +4341,78 @@ fn collect_expression<'a>(
     }
 }
 
+/// A routine whose declared parameter or result type is a relation's row type
+/// depends on that relation, as PostgreSQL records for the row type.
+pub(crate) fn collect_routine_signature_row_types(
+    types: impl IntoIterator<Item = crate::storage::RoutineResult>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    for result in types {
+        let Some(identity) = result.user_type else {
+            continue;
+        };
+        let Some(creation) = identity.relation_row_type_creation() else {
+            continue;
+        };
+        let relation = storage.row_type_relation(creation, txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type \"{}\" does not exist",
+                identity.name.as_str()
+            )
+        })?;
+        record_relation_row_type(
+            relation,
+            identity.schema,
+            identity.name,
+            storage,
+            txid,
+            dependencies,
+        )?;
+    }
+    Ok(())
+}
+
+/// Records a dependency on the relation that owns a referenced row type.
+fn record_relation_row_type(
+    relation: crate::storage::RowTypeRelation,
+    referenced_schema: SqlName,
+    referenced_name: SqlName,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    let (class, resolved, slot) = match relation {
+        crate::storage::RowTypeRelation::Table(slot) => {
+            (DependencyClass::Table, ResolvedRelation::Table(slot), slot)
+        }
+        crate::storage::RowTypeRelation::View(slot) => {
+            (DependencyClass::View, ResolvedRelation::View(slot), slot)
+        }
+    };
+    let identity = storage.capture_stored_query_relation(resolved, txid)?;
+    if dependencies
+        .entries()
+        .iter()
+        .any(|dependency| dependency.identity == identity)
+    {
+        return Ok(());
+    }
+    let (schema, name) = storage.row_type_relation_name(relation, txid);
+    dependencies.push(StoredQueryDependency {
+        class,
+        slot: slot as u16,
+        identity,
+        referenced_columns: crate::storage::ColumnSet::EMPTY,
+        schema,
+        name,
+        referenced_schema,
+        referenced_name,
+    })
+}
+
 fn collect_type_oid(
     type_oid: i32,
     source: &Expr<'_>,
@@ -4346,6 +4424,12 @@ fn collect_type_oid(
     let Some((kind, creation, _)) = crate::storage::NamedTypeKind::from_oid(type_oid) else {
         return Ok(());
     };
+    if kind == crate::storage::NamedTypeKind::Composite
+        && let Some(relation) = storage.row_type_relation(creation, txid)
+    {
+        let (schema, name) = storage.row_type_relation_name(relation, txid);
+        return record_relation_row_type(relation, schema, name, storage, txid, dependencies);
+    }
     let crate::storage::TypeDefinitionTarget::Bound(reference) =
         crate::storage::TypeDefinitionTarget::by_creation(storage, kind, creation)?
     else {
@@ -4504,6 +4588,16 @@ fn collect_type(
                 dependencies,
             );
         }
+        if let Some(relation) = storage.resolve_relation_row_type(bare, txid) {
+            return record_relation_row_type(
+                relation,
+                referenced_schema,
+                referenced_name,
+                storage,
+                txid,
+                dependencies,
+            );
+        }
         return Ok(());
     }
     for entry in path.entries() {
@@ -4544,6 +4638,16 @@ fn collect_type(
                 }
             }
         }
+    }
+    if let Some(relation) = storage.resolve_relation_row_type(bare, txid) {
+        return record_relation_row_type(
+            relation,
+            referenced_schema,
+            referenced_name,
+            storage,
+            txid,
+            dependencies,
+        );
     }
     Ok(())
 }

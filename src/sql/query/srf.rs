@@ -2862,51 +2862,10 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
         count += 1;
         Ok(())
     };
-    use crate::sql::types::oid;
-    if let Some(ColType::Composite(Some(creation))) = ColType::from_oid(composite_oid) {
-        let target = crate::storage::TypeDefinitionTarget::by_creation(
-            storage,
-            crate::storage::NamedTypeKind::Composite,
-            creation,
-        )?;
-        let definition = storage
-            .read_composite_definition(target, txid)?
-            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
-        for field in definition.active_fields() {
-            push(table_function_column(
-                field.name,
-                field.ctype,
-                field.user_type,
-                field.type_mod,
-                field.collation,
-            ))?;
-        }
-        return Ok(count);
-    }
-    // A table or view rowtype contributes its own columns.
-    if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&composite_oid) {
-        let slot =
-            crate::sql::catalog::table_slot_by_row_type_oid(storage, txid, composite_oid, false)
-                .ok_or_else(|| {
-                    sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
-                })?;
-        for column in storage.table_def(slot, txid).columns() {
-            push(table_function_column(
-                column.name,
-                column.ctype,
-                None,
-                column.type_mod,
-                column.collation,
-            ))?;
-        }
-        return Ok(count);
-    }
-    if (oid::FIRST_VIEW_COMPOSITE..oid::FIRST_TABLE_COMPOSITE_ARRAY).contains(&composite_oid) {
-        let slot =
-            crate::sql::catalog::view_slot_by_row_type_oid(storage, txid, composite_oid, false)
-                .ok_or_else(|| {
-                    sql_err!(sqlstate::INTERNAL_ERROR, "view rowtype OID is not a view")
-                })?;
+    // A view's row type is described from its stored query.
+    if let Some(slot) =
+        crate::sql::catalog::view_slot_by_row_type_oid(storage, txid, composite_oid, false)
+    {
         let view = storage.view(slot);
         let width = view.columns_for(txid).names().len();
         let described = arena
@@ -2930,6 +2889,19 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
                 user_type,
                 column.type_mod,
                 column.collation,
+            ))?;
+        }
+        return Ok(count);
+    }
+    if let Some(ColType::Composite(Some(creation))) = ColType::from_oid(composite_oid) {
+        let definition = storage.require_row_type_definition(creation, txid)?;
+        for field in definition.active_fields() {
+            push(table_function_column(
+                field.name,
+                field.ctype,
+                field.user_type,
+                field.type_mod,
+                field.collation,
             ))?;
         }
         return Ok(count);
@@ -3631,13 +3603,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         names.len()
     } else if let Some((_, ref routine)) = routine {
         if let Some(creation) = routine_composite_result(routine, storage, txid)? {
-            let target = crate::storage::TypeDefinitionTarget::by_creation(
-                storage,
-                crate::storage::NamedTypeKind::Composite,
-                creation,
-            )?;
             let definition = storage
-                .read_composite_definition(target, txid)?
+                .row_type_definition(creation, txid)?
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -4255,15 +4222,10 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
         statement_arena,
     )?;
     let rows = if let Some(creation) = produced.composite {
-        let target = crate::storage::TypeDefinitionTarget::by_creation(
-            storage,
-            crate::storage::NamedTypeKind::Composite,
-            creation,
-        )?;
         // Release this declaration reader before materializing individual values.
         let width = {
             let definition = storage
-                .read_composite_definition(target, txid)?
+                .row_type_definition(creation, txid)?
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_OBJECT,

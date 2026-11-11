@@ -4298,12 +4298,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn whole_row_type(&self, table: &str) -> Option<crate::sql::types::ColType> {
-        self.scope.qualified_star_columns(table).ok()?;
-        Some(
-            self.scope
-                .func_scalar_type(table)
-                .unwrap_or(crate::sql::types::ColType::Record),
-        )
+        self.scope.whole_row_type(table)
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {

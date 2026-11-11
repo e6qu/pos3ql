@@ -2847,6 +2847,29 @@ impl<'a> AggState<'a> {
                 "function array_agg(unknown) is not unique"
             )
         })?;
+        // Named composite members enter the array codec in their durable
+        // scalar form, as an ARRAY constructor stores them.
+        let values = if let crate::sql::types::ArrElem::Composite(Some(slot)) = element
+            && values
+                .iter()
+                .any(|value| matches!(value, Datum::Composite { .. }))
+        {
+            let catalog = catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "named composite catalog access is unavailable"
+                )
+            })?;
+            let members = arena.alloc_slice_copy(values).map_err(|_| arena_full())?;
+            for member in members.iter_mut() {
+                if matches!(member, Datum::Composite { .. }) {
+                    *member = catalog.composite_array_element(*member, slot, arena)?;
+                }
+            }
+            &*members
+        } else {
+            values
+        };
         let raw = crate::sql::array::build(values, arena)?;
         Ok(Datum::Array { element, raw })
     }

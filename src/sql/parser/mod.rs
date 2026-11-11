@@ -8456,7 +8456,7 @@ impl<'a> Parser<'a> {
                 name: base,
                 array: false,
             };
-            name = if schema == "pg_catalog" || schema == "information_schema" {
+            name = if schema == "pg_catalog" {
                 quoted = base_quoted;
                 base
             } else {

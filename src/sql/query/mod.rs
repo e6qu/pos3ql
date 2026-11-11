@@ -280,6 +280,7 @@ pub(crate) fn parse_stored_rule_statement<'a>(
 
 pub(crate) use dependencies::collect as collect_query_dependencies;
 pub(crate) use dependencies::collect_routine_parameter_defaults;
+pub(crate) use dependencies::collect_routine_signature_row_types;
 pub(crate) use dependencies::collect_runtime_expression;
 pub(crate) use dependencies::collect_runtime_statement;
 pub(crate) use dependencies::{
@@ -1224,13 +1225,8 @@ impl<'a> RoutineResultShape<'a> {
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         if let Some(ColType::Composite(Some(creation))) = kind.function_result() {
-            let target = crate::storage::TypeDefinitionTarget::by_creation(
-                storage,
-                crate::storage::NamedTypeKind::Composite,
-                creation,
-            )?;
             let definition = storage
-                .read_composite_definition(target, txid)?
+                .row_type_definition(creation, txid)?
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -3005,7 +3001,6 @@ impl StorageCatalog<'_, '_, '_, '_> {
         type_oid: i32,
         arena: &'a Arena,
     ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
-        use super::types::oid;
         let field_type_oid = |ctype: ColType,
                               user_type: Option<crate::storage::UserTypeName>|
          -> Result<i32, SqlError> {
@@ -3023,16 +3018,9 @@ impl StorageCatalog<'_, '_, '_, '_> {
             }
         };
         let mut columns = ArenaList::new(arena);
-        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid) {
-            let slot = super::catalog::table_slot_by_row_type_oid(
-                self.storage,
-                self.txid,
-                type_oid,
-                false,
-            )
-            .ok_or_else(|| {
-                sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
-            })?;
+        if let Some(slot) =
+            super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
+        {
             for column in self.storage.table_def(slot, self.txid).columns() {
                 let name = arena
                     .alloc_str(column.name.as_str())
@@ -4370,8 +4358,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         type_oid: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
-        use super::types::oid;
-        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_TABLE_COMPOSITE_ARRAY).contains(&type_oid) {
+        if super::catalog::view_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
+            .is_some()
+        {
             return self.rowtype_fields(type_oid, arena).map(Some);
         }
         let Some((crate::storage::NamedTypeKind::Composite, creation, false)) =
@@ -4379,12 +4368,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         else {
             return Ok(None);
         };
-        let target = crate::storage::TypeDefinitionTarget::by_creation(
-            self.storage,
-            crate::storage::NamedTypeKind::Composite,
-            creation,
-        )?;
-        let Some(definition) = self.storage.read_composite_definition(target, self.txid)? else {
+
+        let Some(definition) = self.storage.row_type_definition(creation, self.txid)? else {
             return Ok(None);
         };
         let fields = arena
@@ -4532,12 +4517,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         else {
             return Ok(None);
         };
-        let target = crate::storage::TypeDefinitionTarget::by_creation(
-            self.storage,
-            crate::storage::NamedTypeKind::Composite,
-            creation,
-        )?;
-        let Some(definition) = self.storage.read_composite_definition(target, self.txid)? else {
+
+        let Some(definition) = self.storage.row_type_definition(creation, self.txid)? else {
             return Ok(None);
         };
         let modifiers = arena
@@ -6434,6 +6415,35 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         arena: &'a Arena,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Option<Datum<'a>>, SqlError> {
+        if let Some((domain, array)) =
+            super::information_schema_domains::InformationSchemaDomain::from_name(
+                type_name,
+                self.storage.information_schema_on_path(),
+            )
+            .filter(|_| {
+                type_name.starts_with("information_schema.")
+                    || super::catalog::user_type_oid(self.storage, self.txid, type_name)
+                        .is_some_and(|oid| {
+                            super::information_schema_domains::InformationSchemaDomain::from_oid(
+                                oid,
+                            )
+                            .is_some()
+                        })
+            })
+        {
+            if array {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "arrays of domain information_schema.{} are not supported",
+                    domain.name()
+                ));
+            }
+            let base = super::eval::cast_to(value, domain.base(), arena)?;
+            let base =
+                super::exec::apply_cast_typmod(base, domain.base(), domain.base_type_mod(), arena)?;
+            domain.validate(&base)?;
+            return Ok(Some(base));
+        }
         if let Some(element_name) = type_name.strip_suffix("[]") {
             if let Some(slot) = self.storage.resolve_enum_slot(element_name, self.txid) {
                 return super::exec::coerce_user_type_array(
@@ -6481,6 +6491,22 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 )
                 .map(Some);
             }
+            if let Some(relation) = self
+                .storage
+                .resolve_relation_row_type(element_name, self.txid)
+            {
+                return super::exec::coerce_user_type_array(
+                    value,
+                    super::types::ArrElem::Composite(Some(
+                        self.storage.relation_row_type_creation(relation),
+                    )),
+                    self.storage,
+                    self.txid,
+                    arena,
+                    sequences,
+                )
+                .map(Some);
+            }
             return Ok(None);
         }
         if let Some(slot) = self.storage.resolve_domain_slot(type_name, self.txid) {
@@ -6519,27 +6545,32 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .map(Some);
         }
         let Some(slot) = self.storage.resolve_enum_slot(type_name, self.txid) else {
-            // A table/view rowtype name: NULL casts populate nothing; other
-            // values report PostgreSQL's cannot-coerce error until rowtype
-            // value decoding exists.
-            let (qualifier, bare) = type_name
-                .split_once('.')
-                .map_or((None, type_name), |(schema, name)| (Some(schema), name));
-            if self
-                .storage
-                .resolve_relation(qualifier, bare, self.txid)
-                .is_some()
-            {
-                if value.is_null() {
-                    return Ok(Some(Datum::Null));
-                }
-                return Err(sql_err!(
-                    sqlstate::CANNOT_COERCE,
-                    "cannot cast type record to {}",
-                    type_name
-                ));
+            // A table's or view's own row type.
+            let Some(relation) = self.storage.resolve_relation_row_type(type_name, self.txid)
+            else {
+                return Ok(None);
+            };
+            let creation = self.storage.relation_row_type_creation(relation);
+            return match value {
+                Datum::Null => Ok(Datum::Null),
+                Datum::Text(text) => super::exec::decode_composite_text(
+                    text,
+                    creation,
+                    self.storage,
+                    self.txid,
+                    arena,
+                    sequences,
+                ),
+                value => super::exec::coerce_composite_value(
+                    value,
+                    Some(creation),
+                    self.storage,
+                    self.txid,
+                    arena,
+                    sequences,
+                ),
             }
-            return Ok(None);
+            .map(Some);
         };
         super::exec::coerce_enum_value(
             value,
@@ -12205,13 +12236,9 @@ fn array_subquery_field_type_inner<'q>(
     else {
         return Ok(None);
     };
-    let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage,
-        crate::storage::NamedTypeKind::Composite,
-        creation,
-    )?;
+
     let composite = storage
-        .read_composite_definition(target, txid)?
+        .row_type_definition(creation, txid)?
         .ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -12639,13 +12666,7 @@ fn user_type_expression_description<'q>(
                 && let Some((ColType::Composite(Some(creation)), _)) =
                     super::exec::catalog_column_type(storage, txid, base.type_oid)
             {
-                let target = crate::storage::TypeDefinitionTarget::by_creation(
-                    storage,
-                    crate::storage::NamedTypeKind::Composite,
-                    creation,
-                )
-                .ok()?;
-                let definition = storage.read_composite_definition(target, txid).ok()??;
+                let definition = storage.row_type_definition(creation, txid).ok()??;
                 let field = definition
                     .active_fields()
                     .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))?;
@@ -13003,19 +13024,12 @@ fn describe_scope_record_star<'q>(
                 _ => None,
             };
             if let Some(slot) = slot {
-                let target = crate::storage::TypeDefinitionTarget::by_creation(
-                    storage,
-                    crate::storage::NamedTypeKind::Composite,
-                    slot,
-                )?;
-                let definition = storage
-                    .read_composite_definition(target, txid)?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "composite type no longer exists"
-                        )
-                    })?;
+                let definition = storage.row_type_definition(slot, txid)?.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "composite type no longer exists"
+                    )
+                })?;
                 for field in definition.active_fields() {
                     let type_oid = storage
                         .routine_type_oid(field.ctype, field.user_type, txid)
@@ -13070,6 +13084,14 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
         self.0.n == 0
     }
 
+    fn named_type_oid(&self, type_name: &str) -> Option<i32> {
+        self.0.named_type_oid(type_name)
+    }
+
+    fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
+        self.0.domain_base_type(type_oid)
+    }
+
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         let entry = self.0.find_column(qualifier, name)?;
         Ok(self.0.output_type(entry))
@@ -13102,6 +13124,12 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
         self.0.func_scalar_type(name)
+    }
+
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        self.0
+            .whole_row_type(name)
+            .filter(|ctype| matches!(ctype, ColType::Composite(_)))
     }
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
@@ -13563,6 +13591,18 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
             self.outer_scope
                 .and_then(|scope| scope.func_scalar_type(name))
         })
+    }
+
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        let composite = |scope: &QueryScope<'_>| {
+            scope
+                .whole_row_type(name)
+                .filter(|ctype| matches!(ctype, ColType::Composite(_)))
+        };
+        if self.scope.qualified_star_columns(name).is_ok() {
+            return composite(self.scope);
+        }
+        self.outer_scope.and_then(composite)
     }
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {

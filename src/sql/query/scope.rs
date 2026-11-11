@@ -333,6 +333,7 @@ impl<'a> QueryDefinitions<'a> {
 /// The resolved FROM clause: per table, its exposed name (alias or table
 /// name), definition, and storage slot.
 pub struct QueryScope<'d> {
+    storage: &'d Storage,
     txid: u32,
     type_sources: Option<crate::storage::StatementFileLease>,
     pub names: &'d mut [&'d str],
@@ -367,6 +368,9 @@ pub struct QueryScope<'d> {
     /// alias yields that scalar, not a one-field record (which is how a
     /// subquery- or storage-derived table's whole-row reference behaves).
     pub func_scalar: &'d mut [bool],
+    /// The row type of a physical relation source; its whole-row reference
+    /// has that type rather than an anonymous record.
+    row_types: &'d mut [Option<crate::storage::TypeCreation>],
     pub n: usize,
     /// USING/NATURAL-merged join columns (see `MergedColumn`).
     pub merged: &'d mut [MergedColumn<'d>],
@@ -515,8 +519,7 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
     }
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
-        self.0.qualified_star_columns(table).ok()?;
-        Some(self.0.func_scalar_type(table).unwrap_or(ColType::Record))
+        self.0.whole_row_type(table)
     }
 }
 
@@ -643,6 +646,9 @@ impl<'d> QueryScope<'d> {
         let func_scalar = arena
             .alloc_slice_with(table_count, |_| false)
             .map_err(|_| arena_full())?;
+        let row_types = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
         let merged = arena
             .alloc_slice_with(0, |_| MergedColumn {
                 name: "",
@@ -660,6 +666,7 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(join_count.max(1), |_| None)
             .map_err(|_| arena_full())?;
         Ok(QueryScope {
+            storage,
             txid,
             type_sources: None,
             names,
@@ -677,6 +684,7 @@ impl<'d> QueryScope<'d> {
             external_runs,
             lateral,
             func_scalar,
+            row_types,
             n: 0,
             merged,
             n_merged: 0,
@@ -1594,6 +1602,8 @@ impl<'d> QueryScope<'d> {
         };
         self.defs.sources[self.n] = Some(source);
         self.slots[self.n] = slot;
+        self.row_types[self.n] =
+            Some(storage.relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)));
         self.authorization_roles[self.n] = tref.authorization_role;
         self.n += 1;
         Ok(())
@@ -2067,6 +2077,35 @@ impl<'d> QueryScope<'d> {
     /// scalar output column — the type a whole-row reference to it carries. A
     /// storage- or subquery-derived table returns None (its whole-row reference
     /// is a record).
+    /// The declared type of a whole-row reference to a FROM item: a function
+    /// scan's single scalar column, a relation's row type, or an anonymous
+    /// record for every other source.
+    pub fn whole_row_type(&self, name: &str) -> Option<ColType> {
+        self.qualified_star_columns(name).ok()?;
+        if let Some(scalar) = self.func_scalar_type(name) {
+            return Some(scalar);
+        }
+        let composite = self
+            .using_alias(name)
+            .is_none()
+            .then(|| self.table_index(name).ok())
+            .flatten()
+            .and_then(|table| self.row_types[table]);
+        Some(composite.map_or(ColType::Record, |creation| {
+            ColType::Composite(Some(creation))
+        }))
+    }
+
+    /// The OID a type name denotes under this scope's transaction.
+    pub(crate) fn named_type_oid(&self, type_name: &str) -> Option<i32> {
+        crate::sql::catalog::user_type_oid(self.storage, self.txid, type_name)
+            .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
+    }
+
+    pub(crate) fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
+        self.storage.domain_base_type_for_oid(type_oid, self.txid)
+    }
+
     pub fn func_scalar_type(&self, name: &str) -> Option<ColType> {
         self.func_scalar_column(name)
             .map(|column| self.output_type(column))

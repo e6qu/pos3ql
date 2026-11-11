@@ -1870,15 +1870,17 @@ pub(crate) fn function_lookup_error(
     failure: FunctionLookupFailure,
     columns: &dyn ColTypeResolver,
 ) -> SqlError {
-    let format = || -> Result<crate::util::StackStr<192>, SqlError> {
-        use core::fmt::Write;
-        if argument_names.len() > argument_oids.len() {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "function diagnostic argument mapping changed"
-            ));
-        }
-        let mut message = crate::util::StackStr::<192>::new();
+    if argument_names.len() > argument_oids.len() {
+        return sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "function diagnostic argument mapping changed"
+        );
+    }
+    let state = match failure {
+        FunctionLookupFailure::Missing => sqlstate::UNDEFINED_FUNCTION,
+        FunctionLookupFailure::Ambiguous => sqlstate::AMBIGUOUS_FUNCTION,
+    };
+    crate::sql::error_position::full_message_error(state, |message| {
         let _ = write!(message, "function {}(", name);
         for (index, type_oid) in argument_oids.iter().copied().enumerate() {
             if index != 0 {
@@ -1900,24 +1902,8 @@ pub(crate) fn function_lookup_error(
             FunctionLookupFailure::Missing => ") does not exist",
             FunctionLookupFailure::Ambiguous => ") is not unique",
         });
-        if message.is_truncated() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "function diagnostic exceeds SQL error message capacity (192 bytes)"
-            ));
-        }
-        Ok(message)
-    };
-    match format() {
-        Ok(message) => SqlError {
-            message,
-            sqlstate: crate::sql::eval::SqlState::known(match failure {
-                FunctionLookupFailure::Missing => sqlstate::UNDEFINED_FUNCTION,
-                FunctionLookupFailure::Ambiguous => sqlstate::AMBIGUOUS_FUNCTION,
-            }),
-        },
-        Err(error) => error,
-    }
+        Ok(())
+    })
 }
 
 pub trait ColTypeResolver {

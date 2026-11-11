@@ -301,3 +301,72 @@ fn is_type_modifier_failure(message: &str) -> bool {
         || message.starts_with("bit string length")
         || message.starts_with("bit string too long")
 }
+
+/// The longest message an error reports in full: a function signature with
+/// PostgreSQL's 100 arguments (`FUNC_MAX_ARGS`), each a quoted,
+/// schema-qualified array type name of two `NAMEDATALEN - 1` identifiers with
+/// every quote doubled, plus the surrounding wording.
+pub(crate) const FULL_MESSAGE_BYTES: usize = 1024
+    + crate::storage::MAX_ROUTINE_ARGUMENTS * (4 * crate::sql::lexer::MAX_IDENTIFIER_BYTES + 16);
+
+struct FullMessage {
+    text: crate::util::StackStr<FULL_MESSAGE_BYTES>,
+    sqlstate: Option<crate::sql::eval::SqlState>,
+    message_hash: u64,
+}
+
+std::thread_local! {
+    static FULL_MESSAGE: core::cell::RefCell<FullMessage> = const {
+        core::cell::RefCell::new(FullMessage {
+            text: crate::util::StackStr::new(),
+            sqlstate: None,
+            message_hash: 0,
+        })
+    };
+}
+
+/// An error whose message may exceed [`SqlError`]'s inline capacity. The
+/// error carries the message's start; the complete text is kept beside it
+/// and reported in its place, as for a positioned error.
+pub(crate) fn full_message_error(
+    sqlstate: &'static str,
+    write: impl FnOnce(&mut dyn core::fmt::Write) -> Result<(), SqlError>,
+) -> SqlError {
+    FULL_MESSAGE.with(|full| {
+        let mut full = full.borrow_mut();
+        full.text.clear();
+        full.sqlstate = None;
+        if let Err(error) = write(&mut full.text) {
+            return error;
+        }
+        if full.text.is_truncated() {
+            return crate::sql_err!(
+                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "error message exceeds {} bytes",
+                FULL_MESSAGE_BYTES
+            );
+        }
+        let error = crate::sql_err!(sqlstate, "{}", full.text.as_str());
+        if error.message.is_truncated() {
+            full.sqlstate = Some(error.sqlstate);
+            full.message_hash = message_hash(&error.message);
+        }
+        error
+    })
+}
+
+/// Runs `report` with the complete text of the error being reported when
+/// [`full_message_error`] kept one for it, or `None`.
+pub(crate) fn with_full_message<R>(
+    sqlstate: &str,
+    message: &dyn core::fmt::Display,
+    report: impl FnOnce(Option<&str>) -> R,
+) -> R {
+    FULL_MESSAGE.with(|full| {
+        let mut full = full.borrow_mut();
+        let matches = full.sqlstate.is_some_and(|state| state == sqlstate)
+            && full.message_hash == message_hash(message);
+        full.sqlstate = None;
+        report(matches.then_some(full.text.as_str()))
+    })
+}

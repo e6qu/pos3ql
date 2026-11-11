@@ -2310,37 +2310,42 @@ impl<'b> Responder<'b> {
         let analysis_hint = annotation
             .hint
             .filter(|_| diagnostic.as_ref().is_none_or(|d| d.hint.is_none()));
-        self.control(|buffer| {
-            let mut m = MsgOut::begin(buffer, wire::MSG_ERROR_RESPONSE);
-            m.u8(b'S');
-            m.cstr(severity);
-            m.u8(b'V');
-            m.cstr(severity);
-            m.u8(b'C');
-            m.cstr(sqlstate);
-            m.u8(b'M');
-            m.cstr_display(message);
-            if let Some(d) = &diagnostic {
-                if let Some(detail) = &d.detail {
-                    m.u8(b'D');
-                    m.cstr(detail.as_str());
+        crate::sql::error_position::with_full_message(sqlstate, message, |full_message| {
+            self.control(|buffer| {
+                let mut m = MsgOut::begin(buffer, wire::MSG_ERROR_RESPONSE);
+                m.u8(b'S');
+                m.cstr(severity);
+                m.u8(b'V');
+                m.cstr(severity);
+                m.u8(b'C');
+                m.cstr(sqlstate);
+                m.u8(b'M');
+                match full_message {
+                    Some(full_message) => m.cstr(full_message),
+                    None => m.cstr_display(message),
+                };
+                if let Some(d) = &diagnostic {
+                    if let Some(detail) = &d.detail {
+                        m.u8(b'D');
+                        m.cstr(detail.as_str());
+                    }
+                    if let Some(h) = &d.hint {
+                        m.u8(b'H');
+                        m.cstr(h.as_str());
+                    }
                 }
-                if let Some(h) = &d.hint {
+                if let Some(hint) = analysis_hint {
                     m.u8(b'H');
-                    m.cstr(h.as_str());
+                    m.cstr(hint);
                 }
-            }
-            if let Some(hint) = analysis_hint {
-                m.u8(b'H');
-                m.cstr(hint);
-            }
-            // PostgreSQL sends the cursor after detail and hint.
-            if let Some(cursor) = cursor {
-                m.u8(b'P');
-                m.cstr(stack_format!(20, "{}", cursor.get()).as_str());
-            }
-            m.u8(0);
-            m.finish()
+                // PostgreSQL sends the cursor after detail and hint.
+                if let Some(cursor) = cursor {
+                    m.u8(b'P');
+                    m.cstr(stack_format!(20, "{}", cursor.get()).as_str());
+                }
+                m.u8(0);
+                m.finish()
+            })
         })
     }
 

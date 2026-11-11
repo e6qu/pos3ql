@@ -598,3 +598,38 @@ fn analysis_errors_point_at_their_subject() {
         }
     });
 }
+
+#[test]
+fn long_messages_are_reported_whole() {
+    with_engine("long-error-messages", |engine, budget| {
+        let arguments = vec!["1::numeric"; 40].join(", ");
+        let signature = vec!["numeric"; 40].join(", ");
+        let output = run_with(engine, budget, &format!("SELECT missingfn({arguments})"));
+        assert_eq!(
+            diagnostics(&output)[0].split(" @").next().unwrap(),
+            format!("ERROR 42883 function missingfn({signature}) does not exist")
+        );
+        let column = "c".repeat(63);
+        let table = "t".repeat(63);
+        let output = run_with(
+            engine,
+            budget,
+            &format!("CREATE TABLE {table} ({column} int NULL NOT NULL)"),
+        );
+        assert!(
+            diagnostics(&output)[0].starts_with(&format!(
+                "ERROR 42601 conflicting NULL/NOT NULL declarations for column \"{column}\" of table \"{table}\""
+            )),
+            "{:?}",
+            diagnostics(&output)
+        );
+        let literal = "y".repeat(300);
+        let output = run_with(engine, budget, &format!("SELECT 'x' '{literal}'"));
+        assert_eq!(
+            diagnostics(&output),
+            [format!(
+                "ERROR 42601 syntax error at or near \"'{literal}'\" @12"
+            )]
+        );
+    });
+}

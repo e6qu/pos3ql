@@ -24060,10 +24060,10 @@ pub(crate) fn report_parse_error(
 }
 
 pub(crate) fn parse_error_to_sql(error: &ParseError) -> SqlError {
-    SqlError {
-        sqlstate: SqlState::known(error.sqlstate),
-        message: stack_format!(192, "{}", error.message.as_str()),
-    }
+    error_position::full_message_error(error.sqlstate, |message| {
+        let _ = message.write_str(error.message.as_str());
+        Ok(())
+    })
 }
 
 /// Rewrites a CREATE SCHEMA element to create inside the new schema. An

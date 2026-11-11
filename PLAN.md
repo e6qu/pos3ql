@@ -103,32 +103,41 @@ is owned.
   replication apply and deferred triggers. A routine call inside the rows
   already keeps the changed rows within the running statement (row progress:
   the next attempt selects the rows again under the original command and
-  continues at the unfinished row). Move that progress into a startup-reserved
-  owner so a storage or lock wait in the row phase also resumes at its row
-  instead of restarting the statement. Extend row progress to foreign tables,
-  to rules and data-modifying `WITH` inside PL/pgSQL and SQL-language
+  continues at the unfinished row), also for views and rules written from
+  PL/pgSQL and SQL-language bodies. Move that progress into a
+  startup-reserved owner so a storage or lock wait in the row phase also
+  resumes at its row instead of restarting the statement. Extend row
+  progress to foreign tables, to data-modifying `WITH` inside routine
   bodies, and to a multi-step statement inside another's step: a routine
   call after their first row change fails with `0A000` (`SQL row expression
   requires retained write progress`), because restarting would hide the
   earlier rows from the call. `INSERT ... SELECT` evaluates its whole source
   before writing, so a volatile call in the source does not see rows
   inserted earlier by the same statement (this includes a rule action's
-  `VALUES` over several rows). A data-modifying `WITH` sub-statement runs
-  to completion before the main statement reads it, where PostgreSQL
-  interleaves them, so a call in the main statement sees all of its rows.
-  PL/pgSQL rejects statements that start with `WITH` (`0A000`). A `FOR`
-  loop over a data change fails with `0A000` when an `AFTER` trigger of
-  that change waits, since the loop has no owner for its returned rows. A derived table in a static PL/pgSQL statement (a `FROM`
-  subquery, `UPDATE ... FROM`, or a `MERGE` source) cannot read routine
-  variables (`42703`): input preparation describes it without the routine's
-  scope. Binding variables as parameters when the statement is parsed, as
-  PostgreSQL's parser hook does and as static writes to views already do,
+  `VALUES` over several rows); fixing it needs the source and the row phase
+  to keep separate invocation logs, since the source then runs ahead of the
+  rows by a different amount in each attempt, and a selection that grows
+  between attempts. A data-modifying `WITH` sub-statement runs to completion
+  before the main statement reads it, where PostgreSQL interleaves them row
+  by row, so a call in the main statement sees all of its rows. PL/pgSQL
+  rejects statements that start with `WITH` (`0A000`). A `FOR` loop over a
+  data change fails with `0A000` when an `AFTER` trigger of that change
+  waits, since the loop has no owner for its returned rows.
+- **Routine variables in static statements:** a derived table in a static
+  PL/pgSQL statement (a `FROM` subquery, `UPDATE ... FROM`, or a `MERGE`
+  source) cannot read routine variables (`42703`): input preparation
+  describes it without the routine's scope. Binding variables as parameters
+  when the statement is parsed, as PostgreSQL's parser hook does and as
+  static writes to views and `FOR` loops over data changes already do,
   fixes the class. In a trigger, `(new).f` fails in an `UPDATE` (`42703`),
-  and `(r).f` fails after `r := new` because the record loses its row type. Triggers fired inside a write run
-  without the engine's utility
-  executor, so DDL there (PL/pgSQL `CREATE TABLE`, or a SQL procedure that a
-  BEFORE trigger calls) and writes to views or tables with rules fail with
-  `0A000`.
+  and `(r).f` fails after `r := new` because the record loses its row type.
+- **Triggers fired inside a write** run without the engine's utility
+  executor, so DDL there (PL/pgSQL `CREATE TABLE`, `EXECUTE 'CREATE ...'`,
+  or a SQL procedure that a BEFORE trigger calls) and writes to views or
+  tables with rules from a `BEFORE` row trigger, or from a trigger of a write
+  another trigger made, fail with `0A000`. Running the trigger body on the
+  engine between write attempts, as routine calls in the rows already run,
+  removes the limit.
 - **Results and cursors:** resume more large results row by row; only
   single-table `SELECT` from a simple Query or an unpaged `Execute` does today.
   Remaining: paged and named portals (`Execute` with a row limit still buffers

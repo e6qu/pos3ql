@@ -154,6 +154,11 @@ Syntax and errors:
   rows, so `INSERT INTO active_orders VALUES (id)` works in a body. In a
   `BEFORE` row trigger, or a trigger of a write that another trigger made,
   it fails with `0A000`.
+- A subquery in `FROM`, an `UPDATE ... FROM` item or a `MERGE` source in a
+  static PL/pgSQL statement cannot read the routine's variables: `MERGE INTO
+  t USING (SELECT id_var AS id) s ...` fails with `42703` (`column "id_var"
+  does not exist`), where PostgreSQL reads the variable. Pass the value with
+  `EXECUTE ... USING` instead.
 - A rule on a data-modifying `WITH` sub-statement's target must leave one
   statement, as in PostgreSQL: `DO ALSO`, conditional, multi-statement,
   `NOTHING` and `NOTIFY` `INSTEAD` rules fail with `0A000` before anything

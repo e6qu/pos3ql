@@ -43,6 +43,11 @@ fn set_buffer(socket: &impl AsRawFd, option: libc::c_int, bytes: libc::c_int) {
 /// shrinks an advertised window: shrinking the buffer after connecting lets
 /// Linux overrun it, drop loopback segments and recover only through
 /// backed-off retransmission timeouts, stalling the transfer for seconds.
+///
+/// macOS still grows the client's receive buffer with the arrival rate, up
+/// to `net.inet.tcp.autorcvbufmax` (4 MiB), even before the client reads: a
+/// result of a few hundred kilobytes can fit in the kernel whole and finish
+/// within the turn that opened it.
 fn socket_pair() -> (TcpStream, TcpStream) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     set_buffer(&listener, libc::SO_RCVBUF, 4096);
@@ -1162,14 +1167,13 @@ fn function_sources_stream_rows_as_the_client_reads() {
     ] {
         let opened = fixture.engine.result_stream_metrics().opened;
         send_large(&mut conn, &mut fixture.engine, &mut client, &query(&sql));
-        // Loopback may still be delivering the request's tail.
-        for _ in 0..50 {
+        // Loopback may still be delivering the request's tail: each turn
+        // waits for input only until the request runs. The stream may also
+        // finish within that turn when the client's kernel buffer has grown
+        // to hold the whole result (see `socket_pair`).
+        while fixture.engine.result_stream_metrics().opened == opened {
             assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-            if conn.result_streams.is_active() {
-                break;
-            }
         }
-        assert!(conn.result_streams.is_active(), "{sql:.80}");
         // The stream holds the call's position, not its rows.
         assert!(conn.overflow_bytes() < 1024);
         let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);

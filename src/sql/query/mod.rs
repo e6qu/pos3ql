@@ -7487,8 +7487,10 @@ fn check_key_types<'a>(
         }
         // Grouping and duplicate removal call the key type's `=` function,
         // which PostgreSQL's executor checks for EXECUTE.
-        if super::eval::CatalogAccess::builtin_routine_privileges_present(&catalog) {
-            let (oid, _) = infer_scope_type(key, scope)?;
+        // A key whose type is not known yet reports that when evaluated.
+        if super::eval::CatalogAccess::builtin_routine_privileges_present(&catalog)
+            && let Ok((oid, _)) = infer_scope_type(key, scope)
+        {
             let oid = super::eval::CatalogAccess::domain_base_type(&catalog, oid)
                 .map_or(oid, ColType::oid);
             super::eval::require_builtin_operator_types_execute(&catalog, "=", Some(oid), oid)?;

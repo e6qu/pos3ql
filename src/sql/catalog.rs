@@ -10088,7 +10088,7 @@ pub(crate) fn synthesize_current<'a>(
         ),
         (false, "pg_seclabel") => empty_monitoring_view("pg_seclabel", arena),
         (false, "pg_shdepend") => pg_shdepend(storage, txid, arena),
-        (false, "pg_description") => pg_description(storage, txid, arena),
+        (false, "pg_description") => pg_description(storage, txid, purpose, arena),
         (false, "pg_shdescription") => pg_shdescription(storage, txid, arena),
         (false, "pg_seclabels") => finish(schema::require("pg_seclabels", false), &[], arena),
         (false, "pg_shseclabel") => finish(schema::require("pg_shseclabel", false), &[], arena),
@@ -15748,14 +15748,20 @@ fn table_size(storage: &Storage, txid: u32, slot: usize) -> Result<i64, SqlError
 fn pg_description<'a>(
     storage: &Storage,
     txid: u32,
+    purpose: Materialization,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_description", false);
+    // Shipped descriptions never change, so history keeps only stored rows;
+    // a reader without a stored row falls back to the shipped text.
+    let shipped = match purpose {
+        Materialization::Query => routine_descriptions::ROUTINE_DESCRIPTIONS,
+        Materialization::History => &[],
+    };
     let out = arena
-        .alloc_slice_with(
-            storage.comment_capacity() + routine_descriptions::ROUTINE_DESCRIPTIONS.len(),
-            |_| &[] as &[Datum],
-        )
+        .alloc_slice_with(storage.comment_capacity() + shipped.len(), |_| {
+            &[] as &[Datum]
+        })
         .map_err(|_| arena_full())?;
     let mut n = 0;
     // Shipped built-in routine descriptions, unless a comment replaced or
@@ -15772,7 +15778,7 @@ fn pg_description<'a>(
     }
     let commented = &mut commented[..commented_count];
     commented.sort_unstable();
-    for &(oid, description) in routine_descriptions::ROUTINE_DESCRIPTIONS {
+    for &(oid, description) in shipped {
         if commented.binary_search(&(oid as u32)).is_ok() {
             continue;
         }

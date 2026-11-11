@@ -37,9 +37,22 @@ COPY_TABLE = "COPY result_stream_rows TO STDOUT"
 QUERIES = (
     (f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g", ROWS, ALL_PROTOCOLS),
     ("SELECT id, payload FROM result_stream_rows", TABLE_ROWS, ALL_PROTOCOLS),
+    # Nested-loop joins resume row by row, paged portals included.
     (
         f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g, (VALUES (1)) v",
         ROWS,
+        ALL_PROTOCOLS,
+    ),
+    (
+        "SELECT r.id, r.payload, t.k FROM result_stream_rows r "
+        "LEFT JOIN (VALUES (0), (1)) t(k) ON t.k = r.id % 2",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+    ),
+    # A sorted result still spools; it delivers the same messages.
+    (
+        "SELECT id, payload FROM result_stream_rows ORDER BY id DESC",
+        TABLE_ROWS,
         ("simple", "extended"),
     ),
     # COPY TO STDOUT of one table resumes row by row too.

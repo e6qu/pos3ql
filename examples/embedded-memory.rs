@@ -216,6 +216,8 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     config.result_spool_leases = 1;
     config.result_stream_bytes = 64 << 10;
     config.result_stream_slots = 1;
+    config.plan_build_bytes = 64 << 10;
+    config.plan_build_leases = 1;
     config.query_workspace_slots = 1;
     config.max_prepared_transactions = 0;
     config.max_subscriptions = 1;

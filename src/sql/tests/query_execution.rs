@@ -735,3 +735,45 @@ fn query_reads_held_locking_cancel() {
         true,
     );
 }
+
+#[test]
+fn sorted_statements_postpone_volatile_output_and_hand_off_routines_per_row() {
+    let config = test_config("sorted-statement-handoff");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // PostgreSQL 18.6 returns these rows: volatile output runs after the
+    // sort, in output order.
+    session.success(
+        &mut engine,
+        "CREATE TABLE ja(id int, v text); INSERT INTO ja VALUES (1,'a'),(2,'b'),(3,'c'); \
+         CREATE TABLE jb(k int, w text); INSERT INTO jb VALUES (1,'x'),(3,'y'); \
+         CREATE SEQUENCE s2; \
+         CREATE FUNCTION tagf(i int) RETURNS text LANGUAGE sql AS $$ SELECT 'r' || i $$",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, nextval('s2') FROM ja ORDER BY id DESC; \
+             SELECT ja.id, tagf(ja.id), jb.w FROM ja LEFT JOIN jb ON jb.k = ja.id \
+             ORDER BY ja.id DESC; \
+             SELECT id FROM ja ORDER BY id DESC LIMIT 2 OFFSET 1; \
+             SELECT tagf(id) FROM ja ORDER BY v DESC",
+            true
+        )),
+        [
+            "3|1",
+            "2|2",
+            "1|3",
+            "3|r3|y",
+            "2|r2|NULL",
+            "1|r1|x",
+            "2",
+            "1",
+            "r3",
+            "r2",
+            "r1"
+        ]
+    );
+}

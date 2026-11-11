@@ -107,17 +107,19 @@ impl ResultStream {
         }
     }
 
-    /// The table a held stream reads; a FETCH stream's cursor holds its own.
-    pub(crate) fn source_table(&self) -> Option<usize> {
-        self.state?;
-        self.query.retained.as_ref()?.source_table()
+    /// The tables a held stream reads; a FETCH stream's cursor holds its own.
+    pub(crate) fn source_tables(&self) -> StreamTables {
+        match (&self.state, self.query.retained.as_ref()) {
+            (Some(_), Some(query)) => query.source_tables(),
+            _ => NO_STREAM_TABLES,
+        }
     }
 
     /// Drops the query, its reader leases and position, and its table hold.
     pub(crate) fn release(&mut self, cursors: &mut CursorPool) {
         self.state = None;
         self.query.clear();
-        cursors.hold_stream_table(self.index, None);
+        cursors.hold_stream_tables(self.index, NO_STREAM_TABLES);
     }
 }
 

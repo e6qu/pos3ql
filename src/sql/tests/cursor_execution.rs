@@ -3250,3 +3250,98 @@ fn scroll_cursors_keep_one_fetch_of_rows_and_reread_their_input_to_move_back() {
         ]
     );
 }
+
+#[test]
+fn join_cursors_evaluate_rows_per_fetch_and_materialize_scrolled_output() {
+    use crate::sql::cursor::FetchMotion;
+    let config = test_config("cursor-retained-joins");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // PostgreSQL 18.6 returns the rows below for these statements.
+    session.success(
+        &mut engine,
+        "CREATE TABLE ja(id int, v text); INSERT INTO ja VALUES (1,'a'),(2,'b'),(3,'c'); \
+         CREATE TABLE jb(k int, w text); INSERT INTO jb VALUES (1,'x'),(3,'y'); \
+         CREATE SEQUENCE js; BEGIN; \
+         DECLARE c CURSOR FOR SELECT nextval('js'), ja.id, jb.w FROM ja JOIN jb \
+         ON jb.k = ja.id + 0",
+        true,
+    );
+    // The join is read as the cursor fetches, not at DECLARE.
+    let (slot, _) = session
+        .cursors
+        .read_request("c", FetchMotion::Count(1), false)
+        .unwrap()
+        .expect("retained join cursor");
+    assert_eq!(session.cursors.produced_rows(slot), 0);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT is_scrollable FROM pg_cursors WHERE name='c'; \
+             SELECT last_value, is_called FROM js; FETCH 1 FROM c; \
+             SELECT last_value FROM js; FETCH ALL FROM c; CLOSE c",
+            true
+        )),
+        ["f", "1|f", "1|1|x", "1", "2|3|y"]
+    );
+    // A scrollable join returns its saved output on revisit, as
+    // PostgreSQL's Material node does: nextval is not called again.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "DECLARE s SCROLL CURSOR FOR SELECT nextval('js'), ja.id, jb.w FROM ja \
+             LEFT JOIN jb ON jb.k = ja.id + 0; \
+             SELECT is_scrollable FROM pg_cursors WHERE name='s'; FETCH 2 FROM s; \
+             FETCH PRIOR FROM s; FETCH ALL FROM s; FETCH FIRST FROM s; \
+             SELECT last_value FROM js; CLOSE s",
+            true
+        )),
+        [
+            "t", "3|1|x", "4|2|NULL", "3|1|x", "4|2|NULL", "5|3|y", "3|1|x", "5"
+        ]
+    );
+    // Without volatile output a scrollable join rereads its input to move
+    // back.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "DECLARE p SCROLL CURSOR FOR SELECT ja.id, jb.w FROM ja LEFT JOIN jb \
+             ON jb.k = ja.id + 0 WHERE ja.id > 1; \
+             FETCH ALL FROM p; FETCH ABSOLUTE 1 FROM p; FETCH RELATIVE 1 FROM p; \
+             FETCH BACKWARD 1 FROM p; CLOSE p; COMMIT",
+            true
+        )),
+        ["2|NULL", "3|y", "2|NULL", "3|y", "2|NULL"]
+    );
+    // A column equality is a hash join, as in the general executor: its
+    // build table stays while the scrollable cursor rereads its probe side.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; DECLARE h CURSOR FOR SELECT ja.id, jb.w FROM ja LEFT JOIN jb \
+             ON jb.k = ja.id; SELECT is_scrollable FROM pg_cursors WHERE name='h'; \
+             FETCH 2 FROM h; FETCH ALL FROM h; \
+             DECLARE h2 SCROLL CURSOR FOR SELECT ja.id, jb.w FROM ja JOIN jb \
+             ON jb.k = ja.id; FETCH ALL FROM h2; FETCH FIRST FROM h2; \
+             FETCH NEXT FROM h2; FETCH PRIOR FROM h2; COMMIT",
+            true
+        )),
+        [
+            "f", "1|x", "2|NULL", "3|y", "1|x", "3|y", "1|x", "3|y", "1|x"
+        ]
+    );
+    // A function source on the nullable side of a RIGHT or FULL join is
+    // read once, not per left-hand row.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT * FROM (VALUES (1)) v RIGHT JOIN generate_series(1, 3) g \
+             ON v.column1 = g; \
+             SELECT * FROM (VALUES (1), (2)) v(x) FULL JOIN generate_series(2, 3) g \
+             ON x = g ORDER BY 1, 2",
+            true
+        )),
+        ["1|1", "NULL|2", "NULL|3", "1|NULL", "2|2", "NULL|3"]
+    );
+}

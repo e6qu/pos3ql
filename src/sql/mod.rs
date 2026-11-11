@@ -15692,13 +15692,15 @@ impl Engine {
         loop {
             self.storage.set_read_snapshot(source_snapshot);
             let next = {
-                let (_, buffers) = self.work.cursor_parts();
+                let (work, buffers) = self.work.cursor_parts();
                 source.prepare_statement_row(
                     &self.storage,
                     txn.txid,
                     datetime::now_micros(),
                     arena,
                     buffers,
+                    work,
+                    params,
                 )
             };
             match next {
@@ -23007,7 +23009,12 @@ impl Engine {
                             description,
                             crate::pg::respond::CursorRowOutput::Save(rows),
                         );
-                        query.prepare_source(storage, txid, &mut capture)
+                        query.prepare_source(
+                            storage,
+                            txid,
+                            &mut capture,
+                            query::RetainedUse::Cursor,
+                        )
                     };
                     match prepared {
                         Ok(true) => return Ok(()),

@@ -419,7 +419,8 @@ mod tests {
                         &mut Responder::for_cursor(
                             &mut description,
                             crate::pg::respond::CursorRowOutput::Save(&mut rows)
-                        )
+                        ),
+                        crate::sql::query::RetainedUse::Cursor,
                     )
                     .unwrap()
             );

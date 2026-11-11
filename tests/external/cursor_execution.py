@@ -136,6 +136,22 @@ def probe(args, trace):
             error(owner, "functions.argument_error_at_fetch", "FETCH NEXT FROM broken", "22023")
             owner.execute("ROLLBACK")
 
+            # A join cursor projects each joined row at its FETCH; a NULL key
+            # never matches and a LEFT JOIN returns the unmatched row.
+            owner.execute("SELECT setval('calls',700,false)")
+            owner.execute("CREATE TABLE join_keys(k integer, label text)")
+            owner.execute("INSERT INTO join_keys VALUES (1, 'one'), (NULL, 'none'), (3, 'three')")
+            owner.execute("BEGIN")
+            owner.execute(
+                "DECLARE joined NO SCROLL CURSOR FOR SELECT s.id, j.label, nextval('calls') "
+                "FROM source_rows s LEFT JOIN join_keys j ON j.k = s.id WHERE s.id = 2"
+            )
+            rows(owner, "joins.declare", "SELECT last_value,is_called FROM calls", [(700, False)])
+            rows(owner, "joins.left_unmatched", "FETCH NEXT FROM joined", [(2, None, 700)])
+            rows(owner, "joins.end", "FETCH NEXT FROM joined", [])
+            rows(owner, "joins.one_call", "SELECT last_value,is_called FROM calls", [(700, True)])
+            owner.execute("ROLLBACK")
+
             # A forward FETCH larger than pos3ql's cursor_bytes streams its
             # rows; each is projected when it is fetched.
             owner.execute("SELECT setval('calls',1000,false)")

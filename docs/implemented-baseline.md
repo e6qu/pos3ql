@@ -299,6 +299,23 @@ more `VALUES` rows allow scrolling; one row, `UNION ALL` and a provably empty
 result are forward-only and return saved rows. `pg_cursors.is_scrollable`
 reports the choice made at declaration.
 
+A cursor over a join of tables, `VALUES` lists and retained set-returning
+functions (inner, cross or `LEFT`, with a non-volatile condition) also reads
+as it fetches, as a nested loop or, for a two-table equality join, a hash
+join whose build table is held in `plan_build_bytes`:
+
+```sql
+DECLARE c CURSOR FOR SELECT nextval('s'), o.id, c.name
+  FROM orders o JOIN customers c ON c.id = o.customer_id + 0;
+FETCH 1 FROM c;  -- reads one joined row and takes one number
+```
+
+Such a cursor is `NO SCROLL` without a scroll option, as in PostgreSQL. A
+`SCROLL` join cursor whose output list or filter calls a volatile function
+returns a revisited row's first values, as PostgreSQL's Material node does;
+without volatile functions it reads its input again to move back. A join the
+engine reads with index lookups per outer row still runs at `DECLARE`.
+
 A row-locking cursor locks each row when a `FETCH` or `MOVE` reaches it, not
 at `DECLARE`, after evaluating its output list and before `OFFSET` counts it:
 

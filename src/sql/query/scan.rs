@@ -5438,6 +5438,29 @@ pub(crate) struct HashJoinPlan<'a> {
     build_capacity: usize,
 }
 
+/// A hash plan's sources and keys, as a retained reader rebuilds it.
+pub(crate) struct HashKeyLayout<'p> {
+    pub(crate) probe_table: usize,
+    pub(crate) build_table: usize,
+    /// Equi-key column pairs (probe, build).
+    pub(crate) keys: &'p [(usize, usize)],
+    pub(crate) collations: &'p [Collation],
+    /// The planned build row count.
+    pub(crate) capacity: usize,
+}
+
+impl HashJoinPlan<'_> {
+    pub(crate) fn key_layout(&self) -> HashKeyLayout<'_> {
+        HashKeyLayout {
+            probe_table: self.probe_table,
+            build_table: self.build_table,
+            keys: &self.keys[..self.key_count],
+            collations: &self.key_collations[..self.key_count],
+            capacity: self.build_capacity,
+        }
+    }
+}
+
 /// Selects the hash implementation only when its fixed build table and
 /// equi-key representation can execute this join exactly. Every other shape
 /// selects the ordinary nested-loop implementation before execution.

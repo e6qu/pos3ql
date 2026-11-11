@@ -233,8 +233,9 @@ fn sqlstate_of(payload: &[u8]) -> &str {
     panic!("error without SQLSTATE")
 }
 
-/// A join is not a retained shape: a large result queues in the spool.
-const BIG: &str = "SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g, (VALUES (1)) v";
+/// A window function is not a retained shape: a large result queues in the
+/// spool.
+const BIG: &str = "SELECT g, repeat('x', 200), count(*) OVER () FROM generate_series(1, 5000) g";
 
 /// Rows 1..=count in order, each exactly once.
 fn assert_rows(rows: &[&(u8, &[u8])], count: usize) {
@@ -655,6 +656,209 @@ fn retained_selects_resume_as_streams_while_other_sessions_progress() {
     }
 }
 
+#[test]
+fn joins_stream_rows_as_the_client_reads() {
+    let (mut fixture, mut conn, mut client, mut other, mut other_client) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "stream-joins");
+    run(
+        &mut other,
+        &mut fixture.engine,
+        &mut other_client,
+        "CREATE TABLE tags(k int, label text); \
+         INSERT INTO tags VALUES (0, 'zero'), (1, 'one'), (2, NULL), (3, 'three')",
+    );
+    // Each joins every row of big to at most one tag; neither condition is a
+    // column equality, so the general executor also reads a nested loop.
+    for (sql, expected) in [
+        (
+            "SELECT b.id, b.payload, t.label FROM big b JOIN tags t ON t.k = b.id % 4",
+            5000,
+        ),
+        (
+            "SELECT b.id, b.payload, t.label FROM big b LEFT JOIN tags t \
+             ON t.k = b.id % 8 AND t.label IS NOT NULL",
+            5000,
+        ),
+        (
+            "SELECT b.id, b.payload, g FROM big b CROSS JOIN generate_series(1, 2) g \
+             WHERE g <= 1",
+            5000,
+        ),
+        (
+            "SELECT b.id, b.payload, v.x FROM big b, (VALUES (1), (2)) v(x) \
+             WHERE v.x = b.id % 2 + 1",
+            5000,
+        ),
+        // Column equalities: the general executor hashes tags, and the
+        // stream builds the same hash table in plan_build_bytes.
+        (
+            "SELECT b.id, b.payload, t.label FROM big b LEFT JOIN tags t ON t.k = b.id",
+            5000,
+        ),
+        (
+            "SELECT b.id, b.payload, c.id FROM big b, big c WHERE c.id = b.id",
+            5000,
+        ),
+    ] {
+        let opened = fixture.engine.result_stream_metrics().opened;
+        client.write_all(&query(sql)).unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        assert!(conn.result_streams.is_active(), "{sql}");
+        assert!(conn.overflow_bytes() < 1024, "{sql}");
+        // DDL on a joined table waits for the stream's holds.
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+        let response = messages(&response);
+        let mut ids: Vec<i64> = response
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .map(|message| first_text(message.1).parse().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=expected).collect::<Vec<i64>>(), "{sql}");
+        assert_eq!(
+            response[response.len() - 2].1,
+            format!("SELECT {expected}\0").as_bytes(),
+            "{sql}"
+        );
+        assert_eq!(
+            fixture.engine.result_stream_metrics().opened,
+            opened + 1,
+            "{sql}"
+        );
+        // The same statement through the general executor returns the same
+        // rows: compare every column.
+        let mut streamed: Vec<Vec<Option<Vec<u8>>>> = response
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .map(|message| row_values(message.1))
+            .collect();
+        streamed.sort();
+        let general = run(
+            &mut other,
+            &mut fixture.engine,
+            &mut other_client,
+            &format!("SELECT * FROM ({sql}) q ORDER BY 1"),
+        );
+        let general: Vec<Vec<Option<Vec<u8>>>> = messages(&general)
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .map(|message| row_values(message.1))
+            .collect();
+        assert_eq!(streamed.len(), general.len(), "{sql}");
+        let mut general = general;
+        general.sort();
+        assert_eq!(streamed, general, "{sql}");
+    }
+}
+
+fn row_values(payload: &[u8]) -> Vec<Option<Vec<u8>>> {
+    let count = u16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
+    let mut at = 2;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        let length = i32::from_be_bytes(payload[at..at + 4].try_into().unwrap());
+        at += 4;
+        if length < 0 {
+            values.push(None);
+        } else {
+            values.push(Some(payload[at..at + length as usize].to_vec()));
+            at += length as usize;
+        }
+    }
+    values
+}
+
+#[test]
+fn sorted_results_stream_rows_as_the_client_reads() {
+    let (mut fixture, mut conn, mut client, mut other, mut other_client) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "stream-sorts");
+    run(
+        &mut other,
+        &mut fixture.engine,
+        &mut other_client,
+        "CREATE TABLE tags(k int, label text); \
+         INSERT INTO tags VALUES (0, 'zero'), (1, 'one'), (2, NULL), (3, 'three')",
+    );
+    for (sql, expected) in [
+        ("SELECT id, payload FROM big ORDER BY id DESC", 5000),
+        (
+            "SELECT b.id, b.payload, t.label FROM big b LEFT JOIN tags t ON t.k = b.id % 4 \
+             ORDER BY t.label NULLS FIRST, b.id DESC",
+            5000,
+        ),
+        // With LIMIT, output that PostgreSQL could postpone past the sort
+        // must be a column or constant.
+        (
+            &*format!(
+                "SELECT g, '{}' FROM generate_series(1, 6000) g \
+                 WHERE g % 3 <> 0 ORDER BY g % 7, g LIMIT 3000 OFFSET 5",
+                "x".repeat(200)
+            ),
+            3000,
+        ),
+    ] {
+        let opened = fixture.engine.result_stream_metrics().opened;
+        client.write_all(&query(sql)).unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        assert!(conn.result_streams.is_active(), "{sql}");
+        assert!(conn.overflow_bytes() < 1024, "{sql}");
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+        let response = messages(&response);
+        let streamed: Vec<Vec<Option<Vec<u8>>>> = response
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .map(|message| row_values(message.1))
+            .collect();
+        assert_eq!(streamed.len(), expected, "{sql}");
+        assert_eq!(
+            fixture.engine.result_stream_metrics().opened,
+            opened + 1,
+            "{sql}"
+        );
+        // The general executor returns the same rows in the same order.
+        let general = run(
+            &mut other,
+            &mut fixture.engine,
+            &mut other_client,
+            &format!("SELECT * FROM ({sql}) q"),
+        );
+        let general: Vec<Vec<Option<Vec<u8>>>> = messages(&general)
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .map(|message| row_values(message.1))
+            .collect();
+        assert!(streamed == general, "{sql}");
+    }
+    // A stream's sort holds its rows in plan_build_bytes; one that does not
+    // fit fails by name before any row is sent.
+    drop((conn, other, fixture));
+    let mut config = fixture_config(
+        crate::config::TransactionMode::Mvcc,
+        "stream-sort-capacity",
+        16 << 20,
+    );
+    config.result_stream_bytes = 1 << 20;
+    config.plan_build_bytes = 64 << 10;
+    let mut fixture = Fixture::with_config(config);
+    let (mut conn, mut client) = connection(&mut fixture, 1);
+    let response = run(
+        &mut conn,
+        &mut fixture.engine,
+        &mut client,
+        "SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g ORDER BY g DESC",
+    );
+    let response = messages(&response);
+    let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+    assert_eq!(kinds, b"TEZ");
+    let error = response[1].1;
+    assert_eq!(sqlstate_of(error), "54000");
+    assert!(
+        error
+            .windows(b"plan_build_bytes".len())
+            .any(|part| part == b"plan_build_bytes")
+    );
+}
+
 /// Writes a request larger than the loopback buffers, letting the
 /// connection read as the socket fills; the caller processes the rest.
 fn send_large(conn: &mut Conn, engine: &mut Engine, client: &mut TcpStream, mut bytes: &[u8]) {
@@ -903,7 +1107,7 @@ fn spooled_results_record_why_they_did_not_stream() {
         "CREATE SEQUENCE numbers",
     );
     for sql in [
-        "SELECT id, payload FROM big ORDER BY id",
+        "SELECT id, payload, count(*) OVER () FROM big",
         "SELECT id, nextval('numbers'), payload FROM big",
     ] {
         let response = run(&mut conn, &mut fixture.engine, &mut client, sql);
@@ -1100,7 +1304,7 @@ fn paged_portal_rows_use_the_spool_and_fail_by_name_when_it_is_full() {
         let (mut conn, mut client) = connection(&mut fixture, 1);
         let mut input = frontend(
             wire::FMSG_PARSE,
-            b"\0SELECT repeat('x', 1000) FROM generate_series(1, 60), (VALUES (1)) v\0\0\0",
+            b"\0SELECT repeat('x', 1000), count(*) OVER () FROM generate_series(1, 60)\0\0\0",
         );
         input.extend_from_slice(&frontend(wire::FMSG_BIND, b"\0\0\0\0\0\0\0\0"));
         input.extend_from_slice(&frontend(wire::FMSG_EXECUTE, b"\0\0\0\0\x32"));
@@ -1225,14 +1429,36 @@ fn routine_replays_never_repeat_or_panic_after_rows_reach_the_client() {
     let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
     assert_eq!(&kinds[kinds.len() - 2..], b"CZ");
     assert_eq!(count(&mut conn, &mut fixture.engine, &mut client), "301");
-    // A join still restarts the statement for a routine's first call. Before
-    // any row leaves, the restart completes without repeating rows.
+    // A retained join hands its calls off per row too, before and after
+    // rows reach the client.
+    for (call_at, total) in [(1, "302"), (4000, "303")] {
+        let response = run(
+            &mut conn,
+            &mut fixture.engine,
+            &mut client,
+            &format!(
+                "SELECT g, repeat('x', 200), CASE WHEN g = {call_at} THEN audit_row(g) END \
+                 FROM generate_series(1, 5000) g CROSS JOIN (VALUES (1)) v"
+            ),
+        );
+        let response = messages(&response);
+        let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
+        assert_eq!(&kinds[kinds.len() - 2..], b"CZ");
+        let rows: Vec<_> = response
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .collect();
+        assert_rows(&rows, 5000);
+        assert_eq!(count(&mut conn, &mut fixture.engine, &mut client), total);
+    }
+    // A RIGHT JOIN still restarts the statement for a routine's first call.
+    // Before any row leaves, the restart completes without repeating rows.
     let response = run(
         &mut conn,
         &mut fixture.engine,
         &mut client,
         "SELECT g, repeat('x', 200), CASE WHEN g = 1 THEN audit_row(g) END \
-         FROM generate_series(1, 5000) g CROSS JOIN (VALUES (1)) v",
+         FROM (VALUES (1)) v RIGHT JOIN generate_series(1, 5000) g ON true",
     );
     let response = messages(&response);
     let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
@@ -1242,7 +1468,7 @@ fn routine_replays_never_repeat_or_panic_after_rows_reach_the_client() {
         .filter(|message| message.0 == b'D')
         .collect();
     assert_rows(&rows, 5000);
-    assert_eq!(count(&mut conn, &mut fixture.engine, &mut client), "302");
+    assert_eq!(count(&mut conn, &mut fixture.engine, &mut client), "304");
     // After rows already left it cannot restart: it fails loudly instead of
     // repeating rows, and its call rolls back.
     let response = run(
@@ -1250,7 +1476,7 @@ fn routine_replays_never_repeat_or_panic_after_rows_reach_the_client() {
         &mut fixture.engine,
         &mut client,
         "SELECT g, repeat('x', 200), CASE WHEN g = 4000 THEN audit_row(g) END \
-         FROM generate_series(1, 5000) g CROSS JOIN (VALUES (1)) v",
+         FROM (VALUES (1)) v RIGHT JOIN generate_series(1, 5000) g ON true",
     );
     let response = messages(&response);
     let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
@@ -1261,7 +1487,7 @@ fn routine_replays_never_repeat_or_panic_after_rows_reach_the_client() {
         .filter(|message| message.0 == b'D')
         .collect();
     assert_rows(&rows, rows.len());
-    assert_eq!(count(&mut conn, &mut fixture.engine, &mut client), "302");
+    assert_eq!(count(&mut conn, &mut fixture.engine, &mut client), "304");
 }
 
 #[test]
@@ -1651,8 +1877,11 @@ fn suspended_portals_hold_their_table_and_share_the_stream_slots() {
 fn buffered_paged_portals_name_portal_result_bytes_when_full() {
     let (mut fixture, mut conn, mut client, _, _) =
         stream_fixture(crate::config::TransactionMode::Mvcc, "paged-full");
-    // Sorting is not a retained shape: the paged portal buffers its result.
-    let mut input = parse("", "SELECT id, payload FROM big ORDER BY id");
+    // A subquery is not a retained shape: the paged portal buffers its result.
+    let mut input = parse(
+        "",
+        "SELECT id, payload FROM big WHERE id > (SELECT 0) ORDER BY id",
+    );
     input.extend_from_slice(&bind("", ""));
     input.extend_from_slice(&execute("", 10));
     input.extend_from_slice(&sync());
@@ -1908,7 +2137,8 @@ fn streamed_copy_fails_after_delivered_rows_and_matches_unstreamed_output() {
         &mut conn,
         &mut fixture.engine,
         &mut client,
-        "COPY (SELECT payload, id FROM big ORDER BY id) TO STDOUT (FORMAT binary)",
+        "COPY (SELECT payload, id FROM big WHERE id > (SELECT 0) ORDER BY id) \
+         TO STDOUT (FORMAT binary)",
     );
     assert_eq!(
         fixture.engine.result_stream_metrics().spooled_shape,

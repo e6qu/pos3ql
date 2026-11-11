@@ -384,6 +384,11 @@ pub struct QueryScope<'d> {
     /// `FromClause::joins` (whose `on` is None for such joins). Filled only
     /// on the executor path (predicate synthesis needs an arena).
     pub join_on: &'d mut [Option<&'d Expr<'d>>],
+    /// Whether the FROM item being added may refer to the items before it
+    /// without `LATERAL`. PostgreSQL makes a function implicitly lateral,
+    /// except on the nullable side of a RIGHT or FULL join, where it is read
+    /// once like any other item.
+    implicit_lateral: bool,
 }
 
 /// Type-only lookup over FROM items already registered in a scope. Table
@@ -684,6 +689,7 @@ impl<'d> QueryScope<'d> {
             output,
             n_output: 0,
             join_on,
+            implicit_lateral: true,
         })
     }
 
@@ -732,6 +738,10 @@ impl<'d> QueryScope<'d> {
             catalog_scan(&from.base, predicate, from.joins.is_empty()),
         )?;
         for j in from.joins {
+            scope.implicit_lateral = !matches!(
+                j.kind,
+                crate::sql::ast::JoinKind::Right | crate::sql::ast::JoinKind::Full
+            );
             scope.add_exec(
                 storage,
                 &j.table,
@@ -1044,6 +1054,10 @@ impl<'d> QueryScope<'d> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
         scope.add_schema(storage, &from.base, txid, arena, outer)?;
         for j in from.joins {
+            scope.implicit_lateral = !matches!(
+                j.kind,
+                crate::sql::ast::JoinKind::Right | crate::sql::ast::JoinKind::Full
+            );
             scope.add_schema(storage, &j.table, txid, arena, outer)?;
         }
         scope.build_merges(from, arena, None)?;
@@ -1400,10 +1414,11 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        // Every table function is implicitly lateral to preceding FROM items;
-        // the keyword is optional for functions in PostgreSQL. Such rows are
-        // built per left-hand row by the scan.
-        if tref.lateral || self.n > 0 {
+        // A table function is implicitly lateral to preceding FROM items
+        // (the keyword is optional for functions in PostgreSQL) unless it is
+        // the nullable side of a RIGHT or FULL join. Lateral rows are built
+        // per left-hand row by the scan.
+        if tref.lateral || self.n > 0 && self.implicit_lateral {
             self.names[self.n] = exposed;
             self.defs.set_arena(self.n, def_reference);
             self.derived[self.n] = Some(&[]);

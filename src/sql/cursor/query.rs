@@ -229,6 +229,7 @@ impl CursorQuery {
         storage: &crate::storage::Storage,
         txid: u32,
         responder: &mut crate::pg::respond::Responder<'_>,
+        reader_use: crate::sql::query::RetainedUse,
     ) -> Result<bool, SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
         if self.result_type_oids.is_none() {
@@ -299,6 +300,7 @@ impl CursorQuery {
                     bound.params,
                     &self.arena,
                     responder,
+                    reader_use,
                 )
             })
         });

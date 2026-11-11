@@ -148,6 +148,15 @@ impl Engine {
             }
             // A generator retains only its next value.
             Ok(Some(query::StreamSource::Generated)) => Some(0),
+            Ok(Some(query::StreamSource::Join(tables))) => {
+                tables.iter().flatten().try_fold(0usize, |total, &table| {
+                    crate::storage::RowCursor::position_bytes(
+                        self.storage.resident_row_entries(table),
+                        self.max_spill_generations_per_table,
+                    )
+                    .and_then(|bytes| total.checked_add(bytes))
+                })
+            }
             _ => return Err(SpoolReason::Shape),
         };
         // Plus the copied text, its parse tree and the bound scope.
@@ -268,13 +277,18 @@ impl Engine {
             let Some((format, names, count)) = copy_format else {
                 return stream
                     .query
-                    .prepare_source(&self.storage, txid, responder)
+                    .prepare_source(&self.storage, txid, responder, query::RetainedUse::Stream)
                     .map(|ready| (ready, None))
                     .map_err(stream_capacity);
             };
             let ready = responder
                 .without_row_description(|responder| {
-                    stream.query.prepare_source(&self.storage, txid, responder)
+                    stream.query.prepare_source(
+                        &self.storage,
+                        txid,
+                        responder,
+                        query::RetainedUse::Stream,
+                    )
                 })
                 .map_err(stream_capacity)?;
             exec::begin_copy_out(&format, &names[..count], responder).map_err(|_| {
@@ -315,7 +329,7 @@ impl Engine {
             copy: copy_format,
             resumed: false,
         });
-        cursors.hold_stream_table(stream.index(), stream.source_table());
+        cursors.hold_stream_tables(stream.index(), stream.source_tables());
         self.result_streams_opened = self.result_streams_opened.saturating_add(1);
         Ok(())
     }

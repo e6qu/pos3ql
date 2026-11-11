@@ -73,11 +73,16 @@ pub struct CursorPool {
     emit: Vec<u32>,
     next_unnamed: u64,
     next_plan_generation: u64,
-    /// The table each of this connection's held result streams reads. A
-    /// suspended portal keeps it open between statements, and a running
-    /// stream's routine calls run nested statements, so DDL on it must see it.
-    stream_tables: Box<[Option<usize>]>,
+    /// The tables each of this connection's held result streams reads. A
+    /// suspended portal keeps them open between statements, and a running
+    /// stream's routine calls run nested statements, so DDL on them must see
+    /// them.
+    stream_tables: Box<[StreamTables]>,
 }
+
+/// The physical tables one result stream reads.
+pub(crate) type StreamTables = [Option<usize>; crate::sql::query::MAX_RETAINED_SOURCES];
+pub(crate) const NO_STREAM_TABLES: StreamTables = [None; crate::sql::query::MAX_RETAINED_SOURCES];
 
 const CURSOR_STATEMENT_BYTES: usize = 4096;
 pub(crate) const DESCRIPTION_BYTES: usize = 1024;
@@ -123,7 +128,10 @@ pub(crate) fn require_table_idle(table: usize, name: &str, command: &str) -> Res
                         .retained
                         .as_ref()
                         .is_some_and(|query| query.uses_table(table))
-            }) || pool.stream_tables.contains(&Some(table))
+            }) || pool
+                .stream_tables
+                .iter()
+                .any(|tables| tables.contains(&Some(table)))
         })
     });
     if busy {
@@ -610,7 +618,7 @@ impl CursorPool {
             .saturating_add(
                 config
                     .result_stream_slots
-                    .saturating_mul(core::mem::size_of::<Option<usize>>()),
+                    .saturating_mul(core::mem::size_of::<StreamTables>()),
             )
     }
 
@@ -658,7 +666,7 @@ impl CursorPool {
         budget.draw_array(row_capacity, core::mem::size_of::<u32>(), "cursor_emit")?;
         budget.draw_array(
             config.result_stream_slots,
-            core::mem::size_of::<Option<usize>>(),
+            core::mem::size_of::<StreamTables>(),
             "result_stream_tables",
         )?;
         Ok(Self {
@@ -666,7 +674,7 @@ impl CursorPool {
             emit: Vec::with_capacity(row_capacity),
             next_unnamed: 1,
             next_plan_generation: 1,
-            stream_tables: vec![None; config.result_stream_slots].into_boxed_slice(),
+            stream_tables: vec![NO_STREAM_TABLES; config.result_stream_slots].into_boxed_slice(),
         })
     }
 
@@ -681,13 +689,13 @@ impl CursorPool {
         }
         self.emit.clear();
         self.next_unnamed = 1;
-        self.stream_tables.fill(None);
+        self.stream_tables.fill(NO_STREAM_TABLES);
     }
 
-    /// Records the table a newly held result stream reads, or none once the
+    /// Records the tables a newly held result stream reads, or none once the
     /// stream is released.
-    pub(crate) fn hold_stream_table(&mut self, stream: usize, table: Option<usize>) {
-        self.stream_tables[stream] = table;
+    pub(crate) fn hold_stream_tables(&mut self, stream: usize, tables: StreamTables) {
+        self.stream_tables[stream] = tables;
     }
 
     fn find(&self, name: &str) -> Option<usize> {

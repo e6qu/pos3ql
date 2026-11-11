@@ -39,6 +39,8 @@ tree and the packaged `/etc/pos3ql/pos3ql.conf`; physical limits are in
 | `result_spool_leases` | yes | Connections that can hold queued result rows at once (e.g. `max_connections`). |
 | `result_stream_bytes` | yes | Per-connection query, parameters and read positions of a large result that resumes row by row as its client reads (e.g. `256KiB`); at least 64 KiB, or `0` to disable resuming so such results queue in the spool. |
 | `result_stream_slots` | yes | Result streams per connection, each `result_stream_bytes` (e.g. `2`; at least 1): a running statement uses one and each suspended paged portal keeps one. With every slot held, another large result queues in the spool and another paged portal buffers in `portal_result_bytes`. |
+| `plan_build_bytes` | yes | Shared bytes for the build sides of streamed plan nodes, such as the hash table of a streamed or cursor-read hash join; a multiple of 64 (e.g. `16MiB`). A build that does not fit fails its statement with `54000` naming this setting. |
+| `plan_build_leases` | yes | Plan nodes that can hold a build side at once (e.g. `64`); each streamed or cursor-read hash join holds three while it is open. |
 | `large_object_pages` | no (default `8192`, must be nonzero) | Resident 2 KiB large-object pages. |
 
 ## Operational listener

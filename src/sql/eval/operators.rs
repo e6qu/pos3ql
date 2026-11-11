@@ -91,7 +91,7 @@ pub(crate) fn compare_text_collated<'a>(
         Collation::Default | Collation::Catalog(_) => catalog
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::INTERNAL_ERROR,
+                    sqlstate::FEATURE_NOT_SUPPORTED,
                     "database collation comparator is unavailable"
                 )
             })?
@@ -646,7 +646,7 @@ pub fn compare_datums_with_catalog(
         Collation::Default | Collation::Catalog(_) => catalog
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::INTERNAL_ERROR,
+                    sqlstate::FEATURE_NOT_SUPPORTED,
                     "database collation comparator is unavailable"
                 )
             })?

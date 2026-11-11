@@ -467,6 +467,7 @@ pub(crate) struct NamedParameter<'a> {
     pub qualifier: Option<&'a str>,
     pub name: &'a str,
     pub index: u32,
+    pub conflict: crate::sql::guc::VariableConflict,
 }
 
 /// The parts of PostgreSQL's `TypeNameToString` for a parsed type name.
@@ -1366,7 +1367,7 @@ impl<'a> Parser<'a> {
                     .map(|parameter| {
                         (
                             parameter.index,
-                            crate::sql::ast::ParameterSource::PlpgsqlCursor,
+                            crate::sql::ast::ParameterSource::PlpgsqlCursor(parameter.conflict),
                         )
                     })
             })
@@ -1384,7 +1385,7 @@ impl<'a> Parser<'a> {
         {
             return Some((
                 parameter.index,
-                crate::sql::ast::ParameterSource::PlpgsqlCursor,
+                crate::sql::ast::ParameterSource::PlpgsqlCursor(parameter.conflict),
             ));
         }
         self.routine_name

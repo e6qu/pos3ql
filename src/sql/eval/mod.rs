@@ -1317,6 +1317,15 @@ pub fn qualifier_answers_target(
 
 pub struct NoColumns;
 
+/// The column lookup a parameter reference skips when its variable wins: it
+/// reads as no column of that name, so the parameter branch answers.
+pub(crate) fn parameter_wins() -> SqlError {
+    sql_err!(
+        sqlstate::UNDEFINED_COLUMN,
+        "a PL/pgSQL variable takes precedence over the column"
+    )
+}
+
 /// Which meaning a name has when a relation in front of `outer` has a column
 /// of that name and a PL/pgSQL variable in `outer` may share it, as
 /// PostgreSQL's `plpgsql.variable_conflict` decides: Ok(true) for the column,
@@ -4640,14 +4649,13 @@ fn eval_full_inner<'a>(
             name,
             index,
             source,
-        } => match row.lookup(qualifier, name) {
-            Ok(_) if source == crate::sql::ast::ParameterSource::PlpgsqlCursor => Err(sql_err!(
-                sqlstate::AMBIGUOUS_COLUMN,
-                "column reference \"{}{}{}\" is ambiguous",
-                qualifier.unwrap_or(""),
-                if qualifier.is_some() { "." } else { "" },
-                name
-            )),
+        } => match match source.collision() {
+            crate::sql::ast::ParameterCollision::Parameter => Err(parameter_wins()),
+            _ => row.lookup(qualifier, name),
+        } {
+            Ok(_) if source.collision() == crate::sql::ast::ParameterCollision::Ambiguous => {
+                Err(ambiguous_procedural_reference(qualifier, name))
+            }
             Ok(value) => materialize_named_composite(value, hooks, arena),
             Err(error)
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
@@ -6427,14 +6435,13 @@ fn expression_collation<'a>(
             name,
             index,
             source,
-        } => match row.resolve_column_type(*qualifier, name) {
-            Ok(_) if *source == super::ast::ParameterSource::PlpgsqlCursor => Err(sql_err!(
-                sqlstate::AMBIGUOUS_COLUMN,
-                "column reference \"{}{}{}\" is ambiguous",
-                qualifier.unwrap_or(""),
-                if qualifier.is_some() { "." } else { "" },
-                name,
-            )),
+        } => match match source.collision() {
+            super::ast::ParameterCollision::Parameter => Err(parameter_wins()),
+            _ => row.resolve_column_type(*qualifier, name),
+        } {
+            Ok(_) if source.collision() == super::ast::ParameterCollision::Ambiguous => {
+                Err(ambiguous_procedural_reference(*qualifier, name))
+            }
             Ok(ctype) => Ok(DerivedCollation::implicit(
                 row.collation(*qualifier, name),
                 ctype.is_collatable(),
@@ -6452,7 +6459,7 @@ fn expression_collation<'a>(
                             )
                         })
                     }
-                    super::ast::ParameterSource::PlpgsqlCursor => None,
+                    super::ast::ParameterSource::PlpgsqlCursor(_) => None,
                 })
             }
             Err(error) => Err(error),
@@ -11083,11 +11090,12 @@ fn coerce_enum_value<'a>(
         Datum::Bpchar(s) => s.trim_end_matches(' '),
         _ => return Ok(value),
     };
+    // Without catalog access the label cannot be checked; a context-free
+    // constant probe leaves this to execution.
     let catalog = hooks.catalog.ok_or_else(|| {
         sql_err!(
-            sqlstate::INVALID_TEXT_REPRESENTATION,
-            "invalid input value for enum: \"{}\"",
-            label
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "enum input requires catalog access"
         )
     })?;
     let Some(sort) = catalog.enum_label_sort(slot, label)? else {
@@ -11425,7 +11433,7 @@ mod tests {
                 qualifier: None,
                 name: "input",
                 index: 1,
-                source: ParameterSource::PlpgsqlCursor,
+                source: ParameterSource::PlpgsqlCursor(crate::sql::guc::VariableConflict::Error),
             };
             assert_eq!(
                 routine_input_collation(&[&cursor], &Columns, None)

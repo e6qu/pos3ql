@@ -284,10 +284,7 @@ and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
 constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
 `INSERT has more target columns than expressions` without its position; other
-target and expression count errors are positioned. Under
-`#variable_conflict use_variable` a variable that is also a column fails with
-`0A000`: aggregate inputs and grouping keys bind names to columns before the
-variable could win. PL/pgSQL `SELECT ... INTO`, `PERFORM` and `RETURN QUERY` run a
+target and expression count errors are positioned. PL/pgSQL `SELECT ... INTO`, `PERFORM` and `RETURN QUERY` run a
 data-changing `WITH`, but other routine positions do not: a PL/pgSQL
 `WITH ... INSERT/UPDATE/DELETE` statement is rejected as an unsupported
 body, `FOR ... IN WITH ...` rejects a data-modifying `WITH` with `0A000`, a

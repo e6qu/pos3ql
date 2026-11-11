@@ -6,7 +6,7 @@ use crate::sql::types::ColType;
 use crate::util::StackStr;
 
 mod expression_copy;
-pub(crate) use expression_copy::duplicate_expression;
+pub(crate) use expression_copy::{duplicate_expression, rewrite_expression, rewrite_expressions};
 
 /// A normalized PostgreSQL configuration parameter identity.  Configuration
 /// parameters are not SQL objects: they may be dotted and their spelling is
@@ -5775,7 +5775,30 @@ pub enum AlterStatisticsAction<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParameterSource {
     SqlRoutine,
-    PlpgsqlCursor,
+    /// A PL/pgSQL variable captured by a cursor query, with the body's
+    /// `plpgsql.variable_conflict` rule for a column of the same name.
+    PlpgsqlCursor(crate::sql::guc::VariableConflict),
+}
+
+/// What a parameter reference means when a column has the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParameterCollision {
+    Column,
+    Parameter,
+    Ambiguous,
+}
+
+impl ParameterSource {
+    pub(crate) const fn collision(self) -> ParameterCollision {
+        use crate::sql::guc::VariableConflict;
+        match self {
+            Self::SqlRoutine | Self::PlpgsqlCursor(VariableConflict::UseColumn) => {
+                ParameterCollision::Column
+            }
+            Self::PlpgsqlCursor(VariableConflict::UseVariable) => ParameterCollision::Parameter,
+            Self::PlpgsqlCursor(VariableConflict::Error) => ParameterCollision::Ambiguous,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

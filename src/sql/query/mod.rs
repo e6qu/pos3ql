@@ -76,7 +76,7 @@ pub(crate) use cte::{CteReader, dml_cte_runs_after};
 mod dependencies;
 mod procedural_names;
 pub(crate) use procedural_names::{
-    check_expression as check_procedural_expression, check_statement as check_procedural_statement,
+    bind_expression as bind_procedural_expression, bind_statement as bind_procedural_statement,
 };
 mod type_inputs;
 pub(crate) use type_inputs::capture_contextual_expression_type_inputs;

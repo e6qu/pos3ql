@@ -173,12 +173,12 @@ Syntax and errors:
   ambiguous, as in PostgreSQL: with parameter `a`, `UPDATE t SET b = 1/(a-15)`
   fails with `42702` (`column reference "a" is ambiguous`, detail `It could
   refer to either a PL/pgSQL variable or a table column.`) before any row is
-  read, at any query level. `#variable_conflict use_column` at the start of
-  the body, or the superuser setting `plpgsql.variable_conflict =
-  use_column`, reads the column instead. `use_variable` works for names that
-  are not columns; a name that is also a column fails with `0A000` instead of
-  reading the variable. The setting exists from startup, as if PL/pgSQL were
-  preloaded.
+  read, at any query level, including a cursor's query at `OPEN`.
+  `#variable_conflict use_column` at the start of the body, or the superuser
+  setting `plpgsql.variable_conflict = use_column`, reads the column instead;
+  `use_variable` reads the variable everywhere, so with variable `a = 2`,
+  `SELECT sum(a) FROM t` adds 2 per row and `GROUP BY a` makes one group. The
+  setting exists from startup, as if PL/pgSQL were preloaded.
 - A PL/pgSQL function keeps the `plpgsql.variable_conflict` and
   `plpgsql.print_strict_params` values it was compiled under, as PostgreSQL's
   per-session function cache does: the creating session compiles it at

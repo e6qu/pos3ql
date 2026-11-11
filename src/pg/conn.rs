@@ -437,7 +437,7 @@ pub struct Conn {
     /// Output after this mark waits for the reactor's publication barrier.
     publication_hold: Option<OutputMark>,
     /// A large result resuming row by row for the message at the front of `recv`.
-    result_stream: crate::sql::cursor::ResultStream,
+    result_streams: crate::sql::cursor::ResultStreams,
     pub arena: Arena,
     pub txn: TxnState,
     pub sqlprep: SqlPreparedPool,
@@ -616,7 +616,7 @@ impl Conn {
                 HELD_NOTIFICATION_BYTES,
             )?,
             publication_hold: None,
-            result_stream: crate::sql::cursor::ResultStream::new(config, budget)?,
+            result_streams: crate::sql::cursor::ResultStreams::new(config, budget)?,
             arena: Arena::new(budget, "conn_sql_arena", config.sql_arena_bytes)?,
             txn: TxnState::new_with_config(budget, config)?,
             sqlprep: SqlPreparedPool::new(config, budget)?,
@@ -681,7 +681,7 @@ impl Conn {
         self.overflow.reset();
         self.held_notifications.clear();
         self.publication_hold = None;
-        self.result_stream.release(&mut self.cursors);
+        self.result_streams.release_all(&mut self.cursors);
         self.arena.reset();
         self.txn.clear();
         self.sqlprep.clear();
@@ -733,7 +733,7 @@ impl Conn {
     pub fn close(&mut self) -> Option<TcpStream> {
         // Return any spool lease and stream readers immediately.
         self.overflow.clear();
-        self.result_stream.release(&mut self.cursors);
+        self.result_streams.release_all(&mut self.cursors);
         self.held_notifications.clear();
         self.publication_hold = None;
         self.copy = None;
@@ -805,7 +805,7 @@ impl Conn {
 
     #[cfg(test)]
     pub(crate) fn result_stream_active(&self) -> bool {
-        self.result_stream.is_active()
+        self.result_streams.is_active()
     }
 
     pub(crate) fn owns_pending_object_reads(&self) -> bool {
@@ -875,7 +875,7 @@ impl Conn {
         self.overflow.clear();
         self.held_notifications.clear();
         self.publication_hold = None;
-        self.result_stream.release(&mut self.cursors);
+        self.result_streams.release_all(&mut self.cursors);
         self.finish_lock_wait();
         self.replication_completion_pending = false;
         self.start_termination();
@@ -897,7 +897,7 @@ impl Conn {
         // result stream waiting for its client is a running statement.
         if !self.parked
             || (self.parked_wait == crate::sql::StatementWait::ClientOutput
-                && !self.result_stream.is_active())
+                && !self.result_streams.is_active())
         {
             return false;
         }
@@ -916,16 +916,14 @@ impl Conn {
             return false;
         }
         if let Some(crate::sql::cursor::StreamProtocol::Extended { portal }) =
-            self.result_stream.protocol()
+            self.result_streams.protocol()
         {
             // The interrupted portal cannot be resumed.
             self.portals[portal].active = false;
             self.portals[portal].execution = PortalExecution::Fresh;
         }
         // A suspended portal is not the parked statement; it stays.
-        if self.result_stream.is_active() {
-            self.result_stream.release(&mut self.cursors);
-        }
+        self.result_streams.release_active(&mut self.cursors);
         // The next Query starts at its first statement.
         self.resume_statement = 0;
         let extended = self.copy.as_ref().map_or_else(
@@ -2118,22 +2116,26 @@ impl Conn {
     /// Releases a suspended portal's stream once its portal is closed or
     /// rebound or its transaction ended, as PostgreSQL drops portals then.
     fn release_orphaned_portal_stream(&mut self) {
-        let Some(slot) = self.result_stream.suspended_portal() else {
-            return;
-        };
-        let portal = &self.portals[slot];
-        let owned = portal.active
-            && portal.execution == PortalExecution::Streaming
-            && self.txn.is_active()
-            && self
-                .result_stream
-                .state
-                .is_some_and(|state| state.txid == self.txn.txid);
-        if !owned {
-            self.result_stream.release(&mut self.cursors);
-            if self.portals[slot].execution == PortalExecution::Streaming {
-                self.portals[slot].active = false;
-                self.portals[slot].execution = PortalExecution::Fresh;
+        for index in 0..self.result_streams.len() {
+            let stream = self.result_streams.get(index);
+            let Some(slot) = stream.suspended_portal() else {
+                continue;
+            };
+            let portal = &self.portals[slot];
+            let owned = portal.active
+                && portal.execution == PortalExecution::Streaming
+                && self.txn.is_active()
+                && stream
+                    .state
+                    .is_some_and(|state| state.txid == self.txn.txid);
+            if !owned {
+                self.result_streams
+                    .get_mut(index)
+                    .release(&mut self.cursors);
+                if self.portals[slot].execution == PortalExecution::Streaming {
+                    self.portals[slot].active = false;
+                    self.portals[slot].execution = PortalExecution::Fresh;
+                }
             }
         }
     }
@@ -4075,7 +4077,7 @@ impl Conn {
             // later Execute messages can continue draining it.
             let rfmt = portal.result_formats;
             let stream_early = !engine.publication_required() || simple_query_can_stream(text);
-            let stream_available = !self.result_stream.is_held();
+            let stream_available = self.result_streams.free().is_some();
             let mut completion = None;
             let mut transport_failed = false;
             let result = crate::sql::type_input_plans::with_owner(portal.plan, || {
@@ -4166,12 +4168,14 @@ impl Conn {
                     let mut responder = Responder::for_execute(&mut self.send, rfmt).with_output(
                         OutputSink::new(&mut self.overflow, None, ClientWriter::None).for_stream(),
                     );
+                    let index = self.result_streams.free();
                     match discarded
                         .then_some(())
                         .ok_or_else(promoted_output_sent)
-                        .and_then(|()| {
+                        .and_then(|()| index.ok_or_else(no_free_stream))
+                        .and_then(|index| {
                             engine.open_result_stream(
-                                &mut self.result_stream,
+                                self.result_streams.get_mut(index),
                                 crate::sql::cursor::StreamProtocol::Extended {
                                     portal: portal_slot,
                                 },
@@ -4193,7 +4197,7 @@ impl Conn {
                         Ok(()) => Ok(true),
                         Err(error) => engine
                             .fail_result_stream(
-                                &mut self.result_stream,
+                                index.map(|index| self.result_streams.get_mut(index)),
                                 error,
                                 &mut self.txn,
                                 &mut self.cursors,
@@ -4465,7 +4469,7 @@ impl Conn {
         }
         if self.sqlprep.request_input_waiting()
             || self.guc.seq_session().retains_statement_effects()
-            || self.result_stream.is_active()
+            || self.result_streams.is_active()
         {
             self.arena.recycle_front();
         } else {
@@ -4476,7 +4480,7 @@ impl Conn {
             // A promoted statement resumes as a result stream; statements
             // after it then run as usual.
             if let Some(crate::sql::cursor::StreamProtocol::Simple { statement }) =
-                self.result_stream.protocol()
+                self.result_streams.protocol()
                 && let Some(step) = self.continue_query_stream(engine, total, statement)
             {
                 return step;
@@ -4486,7 +4490,7 @@ impl Conn {
             // waits for this client. Bytes may leave during the statement only
             // when they cannot precede an object-store publication.
             let stream_early = !engine.publication_required() || simple_query_can_stream(text);
-            let stream_available = !self.result_stream.is_held();
+            let stream_available = self.result_streams.free().is_some();
             let (result, transport_failed) = {
                 let lock_timeout_expired = self.lock_timeout_expired();
                 let writer = match (stream_early, self.tls.as_mut(), self.stream.as_mut()) {
@@ -4651,9 +4655,17 @@ impl Conn {
     fn continue_portal_stream(&mut self, engine: &mut Engine, slot: usize, max_rows: i32) -> Step {
         let formats = self.portals[slot].result_formats;
         let text = self.prepared[self.portals[slot].statement].query();
-        if self.result_stream.suspended_portal() == Some(slot)
+        let Some(index) = self.result_streams.portal(slot) else {
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                sqlstate::INTERNAL_ERROR,
+                "portal result stream is not open",
+            );
+        };
+        if self.result_streams.get(index).suspended_portal() == Some(slot)
             && let Err(error) = engine.resume_portal_stream(
-                &mut self.result_stream,
+                self.result_streams.get_mut(index),
                 (max_rows > 0).then_some(max_rows as u64),
                 text,
                 &self.txn,
@@ -4668,7 +4680,7 @@ impl Conn {
                 error.message.as_str(),
             );
         }
-        if !self.result_stream.is_active() {
+        if !self.result_streams.get(index).is_active() {
             return ext_err(
                 &mut self.send,
                 &mut self.phase,
@@ -4690,7 +4702,7 @@ impl Conn {
                     .guard_publication(engine.publication_required()),
             );
             let step = engine.continue_result_stream(
-                &mut self.result_stream,
+                self.result_streams.get_mut(index),
                 &mut self.arena,
                 &mut self.txn,
                 &mut self.sqlprep,
@@ -4773,9 +4785,10 @@ impl Conn {
             let mut responder = Responder::new(&mut self.send).with_output(
                 OutputSink::new(&mut self.overflow, None, ClientWriter::None).for_stream(),
             );
-            let opened = if discarded {
+            let index = self.result_streams.free();
+            let opened = if discarded && let Some(index) = index {
                 engine.open_result_stream(
-                    &mut self.result_stream,
+                    self.result_streams.get_mut(index),
                     crate::sql::cursor::StreamProtocol::Simple { statement },
                     None,
                     pending.fetch,
@@ -4791,13 +4804,15 @@ impl Conn {
                     &mut responder,
                     self.id,
                 )
+            } else if discarded {
+                Err(no_free_stream())
             } else {
                 Err(promoted_output_sent())
             };
             match opened {
                 Ok(()) => return None,
                 Err(error) => engine.fail_result_stream(
-                    &mut self.result_stream,
+                    index.map(|index| self.result_streams.get_mut(index)),
                     error,
                     &mut self.txn,
                     &mut self.cursors,
@@ -4823,6 +4838,9 @@ impl Conn {
         let text = query_text(&self.recv, total);
         let stream_early = !engine.publication_required() || simple_query_can_stream(text);
         let lock_timeout_expired = self.lock_timeout_expired();
+        let Some(stream) = self.result_streams.active_mut() else {
+            return Some(self.finish_failed_query_stream(engine, total));
+        };
         let (step, transport_failed) = {
             let writer = match (stream_early, self.tls.as_mut(), self.stream.as_mut()) {
                 (false, _, _) | (true, _, None) => ClientWriter::None,
@@ -4835,7 +4853,7 @@ impl Conn {
                     .guard_publication(engine.publication_required()),
             );
             let step = engine.continue_result_stream(
-                &mut self.result_stream,
+                stream,
                 &mut self.arena,
                 &mut self.txn,
                 &mut self.sqlprep,
@@ -5220,6 +5238,15 @@ impl Conn {
 }
 
 /// A promoted attempt's output reached the client; the stream cannot start.
+/// A promoted statement found every result stream held, though one was free
+/// when it started.
+fn no_free_stream() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "promoted statement found no free result stream"
+    )
+}
+
 fn promoted_output_sent() -> SqlError {
     sql_err!(
         sqlstate::INTERNAL_ERROR,

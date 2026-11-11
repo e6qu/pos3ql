@@ -613,7 +613,7 @@ fn retained_selects_resume_as_streams_while_other_sessions_progress() {
             stalled.parked_wait(),
             Some(crate::sql::StatementWait::ClientOutput)
         );
-        assert!(stalled.result_stream.is_active());
+        assert!(stalled.result_streams.is_active());
         // A stream is not an SQL cursor: pg_cursors and max_cursors ignore it.
         assert_eq!(stalled.cursors.len(), 0);
         assert_eq!(fixture.engine.result_stream_metrics().opened, opened + 1);
@@ -629,7 +629,7 @@ fn retained_selects_resume_as_streams_while_other_sessions_progress() {
         };
         let response = run(&mut other, &mut fixture.engine, &mut other_client, progress);
         assert!(messages(&response).iter().all(|message| message.0 != b'E'));
-        assert!(stalled.result_stream.is_active());
+        assert!(stalled.result_streams.is_active());
 
         let response = drain(&mut stalled, &mut fixture.engine, &mut stalled_client, 2);
         let response = messages(&response);
@@ -650,7 +650,7 @@ fn retained_selects_resume_as_streams_while_other_sessions_progress() {
             1
         );
         assert_eq!(response[first_ready - 1].1, b"SELECT 5000\0");
-        assert!(!stalled.result_stream.is_active());
+        assert!(!stalled.result_streams.is_active());
         assert!(stalled.parked_wait().is_none());
     }
 }
@@ -689,7 +689,7 @@ fn function_sources_stream_rows_as_the_client_reads() {
         let opened = fixture.engine.result_stream_metrics().opened;
         send_large(&mut conn, &mut fixture.engine, &mut client, &query(&sql));
         assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-        assert!(conn.result_stream.is_active(), "{sql:.80}");
+        assert!(conn.result_streams.is_active(), "{sql:.80}");
         // The stream holds the call's position, not its rows.
         assert!(conn.overflow_bytes() < 1024);
         let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
@@ -717,7 +717,7 @@ fn result_streams_apply_bounds_and_fail_after_delivered_rows() {
         ))
         .unwrap();
     assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-    assert!(conn.result_stream.is_active());
+    assert!(conn.result_streams.is_active());
     let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
     let response = messages(&response);
     let rows: Vec<_> = response
@@ -734,7 +734,7 @@ fn result_streams_apply_bounds_and_fail_after_delivered_rows() {
         .write_all(&query("SELECT id, 1 / (id - 3001), payload FROM big"))
         .unwrap();
     assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-    assert!(conn.result_stream.is_active());
+    assert!(conn.result_streams.is_active());
     let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
     let response = messages(&response);
     let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
@@ -747,7 +747,7 @@ fn result_streams_apply_bounds_and_fail_after_delivered_rows() {
     assert_eq!(&kinds[kinds.len() - 2..], b"EZ");
     assert_eq!(sqlstate_of(response[kinds.len() - 2].1), "22012");
     assert_eq!(response[kinds.len() - 1].1, b"I");
-    assert!(!conn.result_stream.is_active());
+    assert!(!conn.result_streams.is_active());
 }
 
 #[test]
@@ -763,11 +763,11 @@ fn result_streams_end_on_cancel_timeout_and_disconnect() {
             .write_all(&query("SELECT id, payload FROM big"))
             .unwrap();
         assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-        assert!(conn.result_stream.is_active());
+        assert!(conn.result_streams.is_active());
         assert!(crate::mem::guard::forbid_alloc(|| {
             conn.cancel_parked(&mut fixture.engine)
         }));
-        assert!(!conn.result_stream.is_active());
+        assert!(!conn.result_streams.is_active());
         let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
         let response = messages(&response);
         let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
@@ -790,7 +790,7 @@ fn result_streams_end_on_cancel_timeout_and_disconnect() {
             .write_all(&query("SELECT id, payload FROM big"))
             .unwrap();
         assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-        assert!(conn.result_stream.is_active());
+        assert!(conn.result_streams.is_active());
         std::thread::sleep(Duration::from_millis(200));
         let generation = fixture.engine.lock_generation();
         let pending = crate::mem::guard::forbid_alloc(|| {
@@ -798,7 +798,7 @@ fn result_streams_end_on_cancel_timeout_and_disconnect() {
         })
         .expect("the deadline wakes the stream");
         conn.finish_response(pending, None);
-        assert!(!conn.result_stream.is_active());
+        assert!(!conn.result_streams.is_active());
         let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
         let response = messages(&response);
         let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
@@ -817,10 +817,10 @@ fn result_streams_end_on_cancel_timeout_and_disconnect() {
             .write_all(&query("SELECT id, payload FROM big"))
             .unwrap();
         assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-        assert!(conn.result_stream.is_active());
+        assert!(conn.result_streams.is_active());
         fixture.engine.rollback_txn(&mut conn.txn, &conn.guc);
         drop(conn.close());
-        assert!(!conn.result_stream.is_active());
+        assert!(!conn.result_streams.is_active());
         let response = run(
             &mut other,
             &mut fixture.engine,
@@ -857,7 +857,7 @@ fn unpaged_extended_execute_resumes_retained_results() {
         input.extend_from_slice(&frontend(wire::FMSG_SYNC, b""));
         client.write_all(&input).unwrap();
         assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-        assert!(conn.result_stream.is_active());
+        assert!(conn.result_streams.is_active());
         let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
         let response = messages(&response);
         let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
@@ -881,7 +881,7 @@ fn unpaged_extended_execute_resumes_retained_results() {
                 assert_eq!(sqlstate_of(response[kinds.len() - 2].1), code);
             }
         }
-        assert!(!conn.result_stream.is_active());
+        assert!(!conn.result_streams.is_active());
     }
 }
 
@@ -906,7 +906,7 @@ fn spooled_results_record_why_they_did_not_stream() {
             .filter(|message| message.0 == b'D')
             .count();
         assert_eq!(rows, 5000, "{sql}");
-        assert!(!conn.result_stream.is_active());
+        assert!(!conn.result_streams.is_active());
     }
     let after = fixture.engine.result_stream_metrics();
     assert_eq!(after.opened, before.opened);
@@ -972,7 +972,7 @@ fn stream_rows_take_their_effects_once_across_client_waits() {
             ))
             .unwrap();
         assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-        assert!(conn.result_stream.is_active());
+        assert!(conn.result_streams.is_active());
         let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
         let response = messages(&response);
         let rows: Vec<_> = response
@@ -1025,7 +1025,7 @@ fn stream_rows_wait_for_locks_without_repeating_delivered_rows_or_effects() {
         ))
         .unwrap();
     assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-    assert!(conn.result_stream.is_active());
+    assert!(conn.result_streams.is_active());
     // Read until the stream waits for the lock with rows already delivered.
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut received = Vec::new();
@@ -1038,7 +1038,7 @@ fn stream_rows_wait_for_locks_without_repeating_delivered_rows_or_effects() {
             conn.finish_response(pending, None);
         }
     }
-    assert!(conn.result_stream.is_active());
+    assert!(conn.result_streams.is_active());
     run(
         &mut holder,
         &mut fixture.engine,
@@ -1296,7 +1296,7 @@ fn long_streams_release_each_rows_effect_receipts() {
         ))
         .unwrap();
     assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-    assert!(conn.result_stream.is_active());
+    assert!(conn.result_streams.is_active());
     let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
     let response = messages(&response);
     let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
@@ -1330,7 +1330,7 @@ fn tls_result_streams_resume_while_the_client_reads_ciphertext() {
         client.write_tls(&mut socket).unwrap();
     }
     assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-    assert!(conn.result_stream.is_active());
+    assert!(conn.result_streams.is_active());
     assert_eq!(
         conn.parked_wait(),
         Some(crate::sql::StatementWait::ClientOutput)
@@ -1345,7 +1345,7 @@ fn tls_result_streams_resume_while_the_client_reads_ciphertext() {
         "SELECT count(*) FROM big",
     );
     assert!(messages(&response).iter().all(|message| message.0 != b'E'));
-    assert!(conn.result_stream.is_active());
+    assert!(conn.result_streams.is_active());
     let mut plaintext = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     while messages(&plaintext)
@@ -1380,7 +1380,7 @@ fn tls_result_streams_resume_while_the_client_reads_ciphertext() {
     assert_rows(&rows, 5000);
     assert_eq!(response[first_ready - 1].1, b"SELECT 5000\0");
     assert_eq!(&kinds[first_ready + 1..], b"TDCZ");
-    assert!(!conn.result_stream.is_active());
+    assert!(!conn.result_streams.is_active());
 }
 
 #[test]
@@ -1423,7 +1423,7 @@ fn a_stream_whose_open_outgrows_its_estimate_fails_by_name() {
     assert_eq!(sqlstate_of(response[0].1), "54000");
     let message = String::from_utf8_lossy(response[0].1);
     assert!(message.contains("result_stream_bytes"), "{message}");
-    assert!(!conn.result_stream.is_active());
+    assert!(!conn.result_streams.is_active());
     let response = run(&mut conn, &mut fixture.engine, &mut client, "SELECT 5");
     assert!(
         messages(&response)
@@ -1507,8 +1507,8 @@ fn paged_portals_evaluate_rows_per_execute_across_client_waits() {
             assert_eq!(conn.on_writable(), After::Continue);
         }
         assert_eq!(fixture.engine.result_stream_metrics().opened, opened + 1);
-        assert!(conn.result_stream.is_held());
-        assert!(!conn.result_stream.is_active());
+        assert!(conn.result_streams.is_held());
+        assert!(!conn.result_streams.is_active());
         {
             let response = messages(&received);
             let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
@@ -1535,7 +1535,7 @@ fn paged_portals_evaluate_rows_per_execute_across_client_waits() {
             conn.parked_wait(),
             Some(crate::sql::StatementWait::ClientOutput)
         );
-        assert!(conn.result_stream.is_active());
+        assert!(conn.result_streams.is_active());
         let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
         let response = messages(&response);
         let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
@@ -1553,28 +1553,37 @@ fn paged_portals_evaluate_rows_per_execute_across_client_waits() {
             assert_eq!(second_text(row.1), Some((index + 11).to_string().as_str()));
         }
         // Sync ended the implicit transaction and with it the portal.
-        assert!(!conn.result_stream.is_held());
+        assert!(!conn.result_streams.is_held());
     }
 }
 
 #[test]
-fn suspended_portals_hold_their_table_and_leave_one_stream_to_share() {
+fn suspended_portals_hold_their_table_and_share_the_stream_slots() {
     let (mut fixture, mut conn, mut client, _, _) =
         stream_fixture(crate::config::TransactionMode::Mvcc, "paged-hold");
+    assert_eq!(fixture.config.result_stream_slots, 2);
     let before = fixture.engine.result_stream_metrics();
     let mut input = query("BEGIN");
     input.extend_from_slice(&parse("first", "SELECT id, payload FROM big"));
     input.extend_from_slice(&bind("a", "first"));
     input.extend_from_slice(&execute("a", 2));
-    // The stream is held, so this portal pages from its own buffer.
+    // The second stream slot holds this portal too.
     input.extend_from_slice(&parse(
         "second",
         "SELECT id, payload FROM big WHERE id <= 40",
     ));
     input.extend_from_slice(&bind("b", "second"));
     input.extend_from_slice(&execute("b", 3));
+    // Both slots are held, so this portal pages from its own buffer.
+    input.extend_from_slice(&parse(
+        "third",
+        "SELECT id, payload FROM big WHERE id <= 20",
+    ));
+    input.extend_from_slice(&bind("c", "third"));
+    input.extend_from_slice(&execute("c", 2));
     input.extend_from_slice(&execute("a", 2));
     input.extend_from_slice(&execute("b", 3));
+    input.extend_from_slice(&execute("c", 2));
     input.extend_from_slice(&sync());
     client.write_all(&input).unwrap();
     assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
@@ -1585,15 +1594,21 @@ fn suspended_portals_hold_their_table_and_leave_one_stream_to_share() {
         .filter(|message| message.0 == b'D')
         .map(|message| first_text(message.1))
         .collect();
-    assert_eq!(rows, ["1", "2", "1", "2", "3", "3", "4", "4", "5", "6"]);
+    assert_eq!(
+        rows,
+        [
+            "1", "2", "1", "2", "3", "1", "2", "3", "4", "4", "5", "6", "3", "4"
+        ]
+    );
     assert_eq!(
         response.iter().filter(|message| message.0 == b's').count(),
-        4
+        6
     );
     let after = fixture.engine.result_stream_metrics();
-    assert_eq!(after.opened, before.opened + 1);
+    assert_eq!(after.opened, before.opened + 2);
     assert_eq!(after.spooled_capacity, before.spooled_capacity + 1);
-    assert!(conn.result_stream.is_held());
+    assert!(conn.result_streams.is_held());
+    assert!(conn.result_streams.free().is_none());
 
     // DDL on the table of a suspended portal fails as in PostgreSQL; the
     // failed transaction keeps the portal from running until it ends.
@@ -1616,7 +1631,7 @@ fn suspended_portals_hold_their_table_and_leave_one_stream_to_share() {
     assert_eq!(sqlstate_of(response[0].1), "25P02");
     let response = run(&mut conn, &mut fixture.engine, &mut client, "ROLLBACK");
     assert!(messages(&response).iter().all(|message| message.0 != b'E'));
-    assert!(!conn.result_stream.is_held());
+    assert!(!conn.result_streams.is_held());
     let response = run(
         &mut conn,
         &mut fixture.engine,
@@ -1674,7 +1689,7 @@ fn forward_fetches_stream_cursor_rows_as_the_client_reads() {
             conn.parked_wait(),
             Some(crate::sql::StatementWait::ClientOutput)
         );
-        assert!(conn.result_stream.is_active());
+        assert!(conn.result_streams.is_active());
         assert!(conn.overflow_bytes() < 1024);
         let progress = if mode == crate::config::TransactionMode::Mvcc {
             "SELECT count(*) FROM big"
@@ -1714,7 +1729,7 @@ fn forward_fetches_stream_cursor_rows_as_the_client_reads() {
             3
         );
         assert!(fixture.engine.result_stream_metrics().opened >= opened + 2);
-        assert!(!conn.result_stream.is_held());
+        assert!(!conn.result_streams.is_held());
     }
 }
 
@@ -1775,7 +1790,7 @@ fn copy_to_stdout_streams_rows_as_the_client_reads() {
             conn.parked_wait(),
             Some(crate::sql::StatementWait::ClientOutput)
         );
-        assert!(conn.result_stream.is_active());
+        assert!(conn.result_streams.is_active());
         assert!(conn.overflow_bytes() < 1024);
         let progress = if mode == crate::config::TransactionMode::Mvcc {
             "SELECT count(*) FROM big"
@@ -1806,7 +1821,7 @@ fn copy_to_stdout_streams_rows_as_the_client_reads() {
         assert_eq!(lines[1], format!("4001,{}", "x".repeat(200)));
         assert_eq!(select[select.len() - 2].1, b"COPY 1000\0");
         assert_eq!(fixture.engine.result_stream_metrics().opened, opened + 2);
-        assert!(!conn.result_stream.is_held());
+        assert!(!conn.result_streams.is_held());
     }
 }
 

@@ -138,8 +138,8 @@ pub(crate) struct OutputSink<'b> {
 pub(crate) enum SpoolReason {
     /// The query shape cannot resume from a retained read position.
     Shape,
-    /// Its retained read position would exceed `result_stream_bytes`, or the
-    /// connection's one stream allocation is held by a suspended portal.
+    /// Its retained read position would exceed `result_stream_bytes`, or
+    /// suspended portals hold every one of the connection's streams.
     Capacity,
     /// The statement started an effect before its output overflowed.
     Effects,

@@ -12,6 +12,9 @@
 //! first row and evaluates rows as each Execute asks for them. Between
 //! Executes the stream is suspended: it holds its read position, but no
 //! statement is running, so other statements of the transaction may run.
+//!
+//! A connection owns `result_stream_slots` streams: at most one runs at a
+//! time, and every other may hold a suspended portal.
 
 use super::*;
 
@@ -58,14 +61,21 @@ pub(crate) struct StreamState {
 pub(crate) struct ResultStream {
     pub(crate) query: CursorQuery,
     pub(crate) state: Option<StreamState>,
+    /// This stream's slot among its connection's streams.
+    index: usize,
 }
 
 impl ResultStream {
-    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+    fn new(config: &Config, budget: &mut Budget, index: usize) -> Result<Self, BudgetError> {
         Ok(Self {
             query: CursorQuery::new(budget, config.result_stream_bytes)?,
             state: None,
+            index,
         })
+    }
+
+    pub(crate) fn index(&self) -> usize {
+        self.index
     }
 
     /// A statement is running in the stream.
@@ -107,6 +117,99 @@ impl ResultStream {
     pub(crate) fn release(&mut self, cursors: &mut CursorPool) {
         self.state = None;
         self.query.clear();
-        cursors.hold_stream_table(None);
+        cursors.hold_stream_table(self.index, None);
+    }
+}
+
+/// A connection's startup-reserved result streams.
+pub(crate) struct ResultStreams {
+    slots: Box<[ResultStream]>,
+}
+
+impl ResultStreams {
+    /// Startup bytes for the streams' control records and query arenas.
+    pub(crate) fn budget_bytes(config: &Config) -> usize {
+        config.result_stream_slots.saturating_mul(
+            core::mem::size_of::<ResultStream>().saturating_add(config.result_stream_bytes),
+        )
+    }
+
+    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+        budget.draw_array(
+            config.result_stream_slots,
+            core::mem::size_of::<ResultStream>(),
+            "result_stream_slots",
+        )?;
+        let mut slots = Vec::with_capacity(config.result_stream_slots);
+        for index in 0..config.result_stream_slots {
+            slots.push(ResultStream::new(config, budget, index)?);
+        }
+        Ok(Self {
+            slots: slots.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) fn get(&self, index: usize) -> &ResultStream {
+        &self.slots[index]
+    }
+
+    pub(crate) fn get_mut(&mut self, index: usize) -> &mut ResultStream {
+        &mut self.slots[index]
+    }
+
+    /// The running stream, if any.
+    pub(crate) fn active(&self) -> Option<&ResultStream> {
+        self.slots.iter().find(|stream| stream.is_active())
+    }
+
+    pub(crate) fn active_mut(&mut self) -> Option<&mut ResultStream> {
+        self.slots.iter_mut().find(|stream| stream.is_active())
+    }
+
+    /// A statement is running in one of the streams.
+    pub(crate) fn is_active(&self) -> bool {
+        self.active().is_some()
+    }
+
+    /// The protocol owner of the running stream.
+    pub(crate) fn protocol(&self) -> Option<StreamProtocol> {
+        self.active().and_then(ResultStream::protocol)
+    }
+
+    /// Some stream is held, running or suspended.
+    #[cfg(test)]
+    pub(crate) fn is_held(&self) -> bool {
+        self.slots.iter().any(ResultStream::is_held)
+    }
+
+    /// A stream that no statement or portal holds.
+    pub(crate) fn free(&self) -> Option<usize> {
+        self.slots.iter().position(|stream| !stream.is_held())
+    }
+
+    /// The stream a portal holds, running or suspended.
+    pub(crate) fn portal(&self, portal: usize) -> Option<usize> {
+        self.slots.iter().position(|stream| {
+            stream
+                .state
+                .is_some_and(|state| state.protocol == StreamProtocol::Extended { portal })
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Releases the running stream; suspended portals keep theirs.
+    pub(crate) fn release_active(&mut self, cursors: &mut CursorPool) {
+        if let Some(stream) = self.active_mut() {
+            stream.release(cursors);
+        }
+    }
+
+    pub(crate) fn release_all(&mut self, cursors: &mut CursorPool) {
+        for stream in self.slots.iter_mut() {
+            stream.release(cursors);
+        }
     }
 }

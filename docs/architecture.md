@@ -136,10 +136,12 @@ because they save every visited row for backward motion.
 opens such a statement's stream before its first row. Each `Execute`
 evaluates only the rows it returns, then the portal suspends with
 `PortalSuspended`, keeping its read position and snapshot while other
-statements of the transaction run. The connection has one stream allocation:
-while a suspended portal holds it, other large results spool for `capacity`,
-and another paged portal buffers its whole result in `portal_result_bytes`
-(`54000` naming that setting when full), as do paged portals of other shapes.
+statements of the transaction run. The connection has `result_stream_slots`
+stream allocations: a running stream uses one and each suspended portal keeps
+one, so a client can page a second portal while the first is suspended. When
+all are held, other large results spool for `capacity`, and another paged
+portal buffers its whole result in `portal_result_bytes` (`54000` naming that
+setting when full), as do paged portals of other shapes.
 DDL on a suspended portal's table fails with `55006`, as in PostgreSQL. The
 stream ends when its portal completes, is closed or rebound, or its
 transaction ends.
@@ -188,7 +190,7 @@ replays instead of running the effect again.
 | Checked literal inputs saved with routines and stored definitions | `table_metadata_bytes` / `table_metadata_leases`, with `routine_input_slots` control records |
 | Execution schemas | `definition_image_slots` |
 | Result output queued for a slow client | Rows: `result_spool_bytes` / `result_spool_leases`, released as soon as the client drains them. Closing messages: a private reserve of `conn_send_buffer_bytes` per connection |
-| A result stream's query text, parameters, row positions and saved-file readers | `result_stream_bytes` per connection; released at completion, error, cancel, timeout or disconnect, and for a paged portal when the portal is closed or rebound or its transaction ends. Not visible in `pg_cursors` and not counted in `max_cursors`. A streamed `FETCH` keeps its rows' state in its cursor's own allocations |
+| A result stream's query text, parameters, row positions and saved-file readers | `result_stream_bytes` per stream, `result_stream_slots` streams per connection; released at completion, error, cancel, timeout or disconnect, and for a paged portal when the portal is closed or rebound or its transaction ends. Not visible in `pg_cursors` and not counted in `max_cursors`. A streamed `FETCH` keeps its rows' state in its cursor's own allocations |
 
 Further rules that apply to every saved owner:
 
@@ -490,7 +492,7 @@ row-work memory.
 | `cursor_query_bytes` | Per-cursor query state, including the declared type IDs a `WITH HOLD` cursor keeps after commit |
 | `cursor_bytes` | Per-cursor typed output rows, sharing their bytes and `floor(cursor_bytes / 6)` row positions with the saved input rows a scrollable cursor evaluates again or an ordered row-locking cursor sorts |
 | `conn_send_buffer_bytes` | Reserved twice per connection: the send buffer and the private output reserve that holds a result's closing messages. The largest single backend message must fit it |
-| `result_stream_bytes` | One result stream per connection; required (starter: 256 KiB, minimum 64 KiB); zero disables streams. The estimate counts every resident row of the table, so a table with many uncheckpointed rows spools instead |
+| `result_stream_bytes`, `result_stream_slots` | `result_stream_slots` result streams per connection of `result_stream_bytes` each; both required (starter: 256 KiB, minimum 64 KiB, and 2 slots, at least 1); zero bytes disables streams. The estimate counts every resident row of the table, so a table with many uncheckpointed rows spools instead |
 | Held notifications | 64 KiB per connection for notifications that arrive while a result is in progress; a listener further behind is closed rather than sent a truncated stream |
 
 Tables store their actual columns, not a maximum-width array; dropped columns

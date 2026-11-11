@@ -179,9 +179,52 @@ def create_table(host, port, user, database):
             )
 
 
+def interleaved_portals(host, port, user, database):
+    """Two paged portals of one transaction read in turns by a stalled client.
+
+    pos3ql holds each suspended portal in its own result stream slot
+    (result_stream_slots), so both evaluate rows per Execute.
+    """
+    sock = stalled_client(host, port, user, database)
+    portals = (
+        (b"a", f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g".encode()),
+        (b"b", b"SELECT id, payload FROM result_stream_rows"),
+    )
+    request = message(b"Q", b"BEGIN\0")
+    for name, query in portals:
+        request += message(b"P", name + b"\0" + query + b"\0\0\0")
+        request += message(b"B", name + b"\0" + name + b"\0\0\0\0\0\0\0")
+        request += message(b"E", name + b"\0" + struct.pack("!i", PAGE))
+    for name, _ in portals:
+        request += message(b"E", name + b"\0" + struct.pack("!i", PAGE))
+    for name, _ in portals:
+        request += message(b"E", name + b"\0\0\0\0\0")
+    request += message(b"S") + message(b"Q", b"COMMIT\0")
+    sock.sendall(request)
+    time.sleep(STALL_SECONDS / 2)
+    elapsed = other_session_progress(host, port, user, database)
+    assert elapsed < 60, f"interleaved portals: another session needed {elapsed:.1f}s"
+    shape = []
+    for kind, payload in read_until_ready(sock, 3):
+        if kind == b"D":
+            (length,) = struct.unpack("!i", payload[2:6])
+            value = int(payload[6 : 6 + length])
+            if shape and shape[-1][0] == "D" and shape[-1][2] + 1 == value:
+                shape[-1] = ("D", shape[-1][1], value)
+            else:
+                shape.append(("D", value, value))
+        elif kind == b"C":
+            shape.append(("C", payload.rstrip(b"\0").decode()))
+        else:
+            shape.append((kind.decode(), None))
+    sock.close()
+    print(f"interleaved portals: {shape} (other session {elapsed:.2f}s)", flush=True)
+    return shape
+
+
 def probe(host, port, user, database):
     create_table(host, port, user, database)
-    results = {}
+    results = {"interleaved": interleaved_portals(host, port, user, database)}
     for query, rows, protocol in [
         (query, rows, protocol) for query, rows, protocols in QUERIES for protocol in protocols
     ]:

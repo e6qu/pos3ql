@@ -21,7 +21,7 @@ mod scroll;
 mod stream;
 pub(crate) use query::{CursorLocal, CursorQuery, CursorStatement};
 pub(crate) use scroll::{Revisit, ScrollAction, ScrollInput, ScrollScan, VisitOutcome};
-pub(crate) use stream::{FetchStream, ResultStream, StreamProtocol, StreamState};
+pub(crate) use stream::{FetchStream, ResultStream, ResultStreams, StreamProtocol, StreamState};
 
 /// One FETCH/MOVE motion, normalized by the parser: positive counts move
 /// forward, negative backward (`NEXT` is `Count(1)`, `PRIOR` is `Count(-1)`,
@@ -73,10 +73,10 @@ pub struct CursorPool {
     emit: Vec<u32>,
     next_unnamed: u64,
     next_plan_generation: u64,
-    /// The table this connection's held result stream reads. A suspended
-    /// portal keeps it open between statements, and a running stream's
-    /// routine calls run nested statements, so DDL on it must see it.
-    stream_table: Option<usize>,
+    /// The table each of this connection's held result streams reads. A
+    /// suspended portal keeps it open between statements, and a running
+    /// stream's routine calls run nested statements, so DDL on it must see it.
+    stream_tables: Box<[Option<usize>]>,
 }
 
 const CURSOR_STATEMENT_BYTES: usize = 4096;
@@ -123,7 +123,7 @@ pub(crate) fn require_table_idle(table: usize, name: &str, command: &str) -> Res
                         .retained
                         .as_ref()
                         .is_some_and(|query| query.uses_table(table))
-            }) || pool.stream_table == Some(table)
+            }) || pool.stream_tables.contains(&Some(table))
         })
     });
     if busy {
@@ -534,6 +534,11 @@ impl CursorPool {
                     ),
             )
             .saturating_add(row_capacity.saturating_mul(core::mem::size_of::<u32>()))
+            .saturating_add(
+                config
+                    .result_stream_slots
+                    .saturating_mul(core::mem::size_of::<Option<usize>>()),
+            )
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -576,12 +581,17 @@ impl CursorPool {
             });
         }
         budget.draw_array(row_capacity, core::mem::size_of::<u32>(), "cursor_emit")?;
+        budget.draw_array(
+            config.result_stream_slots,
+            core::mem::size_of::<Option<usize>>(),
+            "result_stream_tables",
+        )?;
         Ok(Self {
             slots,
             emit: Vec::with_capacity(row_capacity),
             next_unnamed: 1,
             next_plan_generation: 1,
-            stream_table: None,
+            stream_tables: vec![None; config.result_stream_slots].into_boxed_slice(),
         })
     }
 
@@ -596,13 +606,13 @@ impl CursorPool {
         }
         self.emit.clear();
         self.next_unnamed = 1;
-        self.stream_table = None;
+        self.stream_tables.fill(None);
     }
 
     /// Records the table a newly held result stream reads, or none once the
     /// stream is released.
-    pub(crate) fn hold_stream_table(&mut self, table: Option<usize>) {
-        self.stream_table = table;
+    pub(crate) fn hold_stream_table(&mut self, stream: usize, table: Option<usize>) {
+        self.stream_tables[stream] = table;
     }
 
     fn find(&self, name: &str) -> Option<usize> {
@@ -2003,7 +2013,7 @@ mod tests {
                         Ok(_) => panic!("cursor pool accepted an incomplete reservation"),
                         Err(error) => error,
                     };
-                    assert_eq!(error.what, "cursor_emit");
+                    assert_eq!(error.what, "result_stream_tables");
                     assert_eq!(error.requested, error.remaining + 1);
                 }
             }

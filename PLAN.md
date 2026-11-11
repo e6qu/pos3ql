@@ -112,8 +112,6 @@ is owned.
   - `FETCH` from scrollable cursors, including PostgreSQL's default for table
     scans, saves every visited row in `cursor_bytes`: the retained read
     position cannot move backward over saved generations.
-  - A second paged portal while one holds the connection's stream buffers
-    into `portal_result_bytes`.
   - PL/pgSQL `FOR rec IN c LOOP` over a bound cursor is rejected with
     `0A000`; it needs a loop frame that opens, fetches and closes the cursor
     across waits in every procedural executor.

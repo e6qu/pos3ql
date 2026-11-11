@@ -315,7 +315,7 @@ impl Engine {
             copy: copy_format,
             resumed: false,
         });
-        cursors.hold_stream_table(stream.source_table());
+        cursors.hold_stream_table(stream.index(), stream.source_table());
         self.result_streams_opened = self.result_streams_opened.saturating_add(1);
         Ok(())
     }
@@ -463,7 +463,7 @@ impl Engine {
     ) -> Result<StreamStep, WireFull> {
         let Some(mut state) = stream.state.filter(|state| !state.suspended) else {
             return self.fail_result_stream(
-                stream,
+                Some(stream),
                 sql_err!(sqlstate::INTERNAL_ERROR, "no result stream is open"),
                 txn,
                 cursors,
@@ -476,7 +476,7 @@ impl Engine {
             || state.command != txn.command_id()
         {
             return self.fail_result_stream(
-                stream,
+                Some(stream),
                 sql_err!(
                     sqlstate::SERIALIZATION_FAILURE,
                     "result stream resumed outside its statement"
@@ -611,7 +611,7 @@ impl Engine {
                         .expect("an open cursor's name is valid");
                     cursors.fail(name.as_str());
                 }
-                self.fail_result_stream(stream, error, txn, cursors, guc, responder)
+                self.fail_result_stream(Some(stream), error, txn, cursors, guc, responder)
             }
         }
     }
@@ -619,14 +619,16 @@ impl Engine {
     /// Ends a stream with an error after its delivered rows.
     pub(crate) fn fail_result_stream(
         &mut self,
-        stream: &mut ResultStream,
+        stream: Option<&mut ResultStream>,
         error: SqlError,
         txn: &mut TxnState,
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<StreamStep, WireFull> {
-        stream.release(cursors);
+        if let Some(stream) = stream {
+            stream.release(cursors);
+        }
         txn.release_suspended_statement();
         sequence::finish_statement(guc.seq_session());
         if error.sqlstate == sqlstate::DEADLOCK_DETECTED {

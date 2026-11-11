@@ -38,6 +38,7 @@ tree and the packaged `/etc/pos3ql/pos3ql.conf`; physical limits are in
 | `result_spool_bytes` | yes | Shared bytes queuing result rows for clients that read slower than statements produce them; a multiple of 64 (e.g. `16MiB`). A client further behind gets `54000` naming this setting after the rows already queued. |
 | `result_spool_leases` | yes | Connections that can hold queued result rows at once (e.g. `max_connections`). |
 | `result_stream_bytes` | yes | Per-connection query, parameters and read positions of a large result that resumes row by row as its client reads (e.g. `256KiB`); at least 64 KiB, or `0` to disable resuming so such results queue in the spool. |
+| `result_stream_slots` | yes | Result streams per connection, each `result_stream_bytes` (e.g. `2`; at least 1): a running statement uses one and each suspended paged portal keeps one. With every slot held, another large result queues in the spool and another paged portal buffers in `portal_result_bytes`. |
 | `large_object_pages` | no (default `8192`, must be nonzero) | Resident 2 KiB large-object pages. |
 
 ## Operational listener
@@ -155,7 +156,7 @@ Scrape `/metrics` from the private network. Suggested first alerts:
 | Connections near `pos3ql_postgres_connection_capacity` | Raise the startup limit or reduce client concurrency. |
 | WAL or row-heap use near capacity | Check checkpoint progress and object-store latency. |
 | Sustained object read latency, cache misses, or prefetch saturation | Compare the working set with cache and object-read slot capacities. |
-| `pos3ql_result_stream_spooled_total{reason="capacity"}` grows | Large results queue in the spool (or paged portals buffer in `portal_result_bytes`) because their read position exceeds `result_stream_bytes`, or another suspended portal holds the connection's stream; raise it, checkpoint more often, or finish one portal before paging the next. |
+| `pos3ql_result_stream_spooled_total{reason="capacity"}` grows | Large results queue in the spool (or paged portals buffer in `portal_result_bytes`) because their read position exceeds `result_stream_bytes`, or suspended portals hold all `result_stream_slots`; raise the setting that applies, checkpoint more often, or finish one portal before paging the next. |
 
 Counters reset at process start. Block-object request counters cover
 immutable SST traffic through the cache stack only, not root, commit-batch,

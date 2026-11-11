@@ -3959,6 +3959,9 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         new.as_deref_mut(),
         transition_rows,
     )?;
+    // A trigger body's effects cannot be repeated by a restart, so the
+    // enclosing write reads synchronously from here on.
+    super::query::protect_statement_effects();
     firing.execute(context)
 }
 
@@ -28077,13 +28080,16 @@ fn execute_trigger_step<'a>(
             .map(|mark| (mark, context.responder.mark()))
     })
     .flatten();
-    // Writes read storage synchronously, as top-level writing statements do.
-    let atomic_reads = match &context.host {
+    // As at top level, a write yields while it selects and locks its rows and
+    // restarts from `write_start`; its row changes make later reads block
+    // until this statement ends.
+    let write_reads = match &context.host {
         PlpgsqlExecHost::Routine { engine, .. } if write_start.is_some() => {
-            engine.atomic_block_read_scope()
+            engine.deferred_block_read_scope()
         }
         _ => None,
     };
+    let write_effects = super::query::enter_statement_read_effect_scope(write_reads.as_ref());
     let mut execute = || match statement {
         TriggerStatement::Null => execute_trigger_statement(|| Ok(None)),
         TriggerStatement::TransactionControl(command) => execute_trigger_statement(|| {
@@ -30616,7 +30622,8 @@ fn execute_trigger_step<'a>(
         }),
         None => execute(),
     };
-    drop(atomic_reads);
+    drop(write_effects);
+    drop(write_reads);
     if let Some((mark, output)) = write_start
         && status.pending_write.is_none()
         && result.as_ref().is_err_and(|error| {
@@ -31659,6 +31666,9 @@ fn execute_statement_trigger<'a>(
         None,
         rows,
     )?;
+    // A trigger body's effects cannot be repeated by a restart, so the
+    // enclosing write reads synchronously from here on.
+    super::query::protect_statement_effects();
     firing.execute(&mut context)?;
     Ok(())
 }
@@ -64739,6 +64749,9 @@ pub(crate) fn merge<'a>(
         Err(e) => return sql_fail(e),
     };
 
+    // Row changes start here. The source scan and row locks above restart
+    // from the statement's start after a wait; from now on reads block.
+    super::query::protect_statement_effects();
     let mut affected_count = 0u64;
     let has_not_matched_by_source = statement.whens.iter().any(|when| {
         matches!(
@@ -67662,6 +67675,9 @@ where
                 }
                 (rows.as_slice(), rows.len())
             };
+        // Row changes start here. The source rows above restart
+        // from the statement's start after a wait; from now on reads block.
+        super::query::protect_statement_effects();
 
         let default_exprs = match parse_defaults(def, arena, storage, txn.txid) {
             Ok(d) => d,
@@ -67888,6 +67904,9 @@ where
     } else {
         None
     };
+    // `VALUES` rows are evaluated as they are written, so reads block from
+    // the first row on.
+    super::query::protect_statement_effects();
     let mut inserted = 0u64;
     for row_exprs in statement.rows {
         if row_exprs.len() > n_targets {
@@ -68961,6 +68980,9 @@ pub(crate) fn update<'a>(
             Err(error) => return sql_fail(error),
         }
     }
+    // Row changes start here. The source scan and row locks above restart
+    // from the statement's start after a wait; from now on reads block.
+    super::query::protect_statement_effects();
 
     let mut transition_capture = if transition_capture_required(
         storage,
@@ -70038,6 +70060,9 @@ pub(crate) fn delete<'a>(
             Err(error) => return sql_fail(error),
         }
     }
+    // Row changes start here. The source scan and row locks above restart
+    // from the statement's start after a wait; from now on reads block.
+    super::query::protect_statement_effects();
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         match describe_returning_items(

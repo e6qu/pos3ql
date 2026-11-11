@@ -34,8 +34,10 @@ logical replication, backup and recovery from object storage work today and are
 compared with PostgreSQL 18 in CI. Object-store requests overlap and commits
 share uploads. SQL runs on one CPU worker. Many paths already pause during a
 storage wait and resume later: reads, cleanup, merges, checkpoints, cursors,
-PL/pgSQL and SQL-language functions, and triggers. Writing statements, and any
-statement after its first effect, still block that worker on a storage read. No measurement on separate machines has been published.
+PL/pgSQL and SQL-language functions, triggers, and the row selection of
+`INSERT ... SELECT`, `UPDATE`, `DELETE` and `MERGE`. A write's row changes,
+DDL, and any statement after its first effect still block that worker on a
+storage read. No measurement on separate machines has been published.
 
 ## Milestones
 
@@ -76,7 +78,9 @@ including nested `CALL`, resuming at the waiting statement after their own
 taken per `FETCH` and scrollable cursors that evaluate revisited rows again;
 client output that never blocks the worker on a slow reader; large
 single-table results resuming row by row across client, storage and lock
-waits. The
+waits; `INSERT ... SELECT`, `UPDATE`, `DELETE` and `MERGE`, at top level and
+in `CALL` and `DO` bodies, yielding on storage reads while they select and lock
+rows and restarting from their start. The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
 
@@ -86,13 +90,25 @@ is owned.
   grouping, subqueries) restarts once for each first call of a SQL-language
   routine, so its work grows with the square of those calls; single-table,
   `VALUES` and `generate_series` sources hand each call off on its row.
-- **Write phases:** BEFORE/INSTEAD triggers, source scans, row locks, partitions,
-  constraints, transition tables, rules, data-modifying common table
-  expressions (CTEs), COPY, replication apply and deferred triggers. Keep the
-  original command and rollback boundary. Replace the current explicit rejection
-  of row progress in multirow updates with saved progress: a child statement must
-  see earlier changed rows before the next row is written, and each operation
-  keeps its own transition table and firing order.
+- **Write phases:** a write yields only before its first row change, `VALUES`
+  row or trigger body; after that, row changes, index maintenance, constraint
+  checks, BEFORE/INSTEAD and statement triggers, partition routing, transition
+  tables, rules and `RETURNING` read synchronously, and so do DDL, COPY,
+  replication apply and deferred triggers. Save write progress instead: the
+  selected row set and the next row to change in a startup-reserved owner, so a
+  row-phase wait resumes at that row without repeating earlier rows, triggers
+  or `RETURNING` output. Keep the original command and rollback boundary.
+  Replace the current explicit rejection of row progress in multirow updates
+  (`SQL row expression requires retained write progress`) with that saved
+  progress: a child statement must see earlier changed rows before the next row
+  is written, and each operation keeps its own transition table and firing
+  order. Triggers fired inside a write run without the engine's utility
+  executor, so DDL there (PL/pgSQL `CREATE TABLE`, or a SQL procedure that a
+  BEFORE trigger calls) fails with `0A000`; running the row phase from the
+  engine with saved progress gives them that executor. A PL/pgSQL `INSERT`,
+  `UPDATE` or `DELETE` whose expressions call a PL/pgSQL function fails with
+  `0A000` (`PL/pgSQL functions require a resumable query executor`); the
+  statement needs the invocation log that SQL-language function writes use.
 - **Results and cursors:** resume more large results row by row; only
   single-table `SELECT` from a simple Query or an unpaged `Execute` does today.
   Remaining: paged and named portals (`Execute` with a row limit still buffers

@@ -70,6 +70,24 @@ a volatile function or a user routine body, issuing `nextval`/`setval`, and
 output actually reaching the client. After the first effect, the remaining
 reads of that statement block until the statement ends.
 
+**Writes restart before their row changes.** `INSERT ... SELECT`, `UPDATE`,
+`DELETE` and `MERGE`, at top level or as a statement of a `CALL` or `DO` body,
+first select their rows: `INSERT ... SELECT` materializes its source rows,
+`UPDATE` and `DELETE` collect the target rows and lock each one, and `MERGE`
+joins its source and target. Nothing has changed yet, so a cold read or a row
+lock wait in this phase rolls the statement back to its start (row images,
+locks, journal records and statistics) and yields; on resume it runs again and
+sees the rows as of its new start, as PostgreSQL would had it started then.
+A sequence or routine call in the scan is an effect as usual: later reads
+block, and a later row-lock wait replays its results. The first row change, `VALUES` row or trigger body is the write's
+first effect: index maintenance, constraint checks, triggers and `RETURNING`
+then read synchronously until the statement ends. A `BEFORE STATEMENT` trigger
+therefore makes the whole scan synchronous.
+
+**Example:** `UPDATE orders SET status = 'late' WHERE due < now()` over cold
+`orders` yields while it downloads the blocks it scans; other clients run
+meanwhile. Each wait discards only the scan, and the rows change once.
+
 **The worker never waits for a client.** A result larger than the
 connection's send buffer (`conn_send_buffer_bytes`) queues in the
 connection's **overflow area**: rows lease space from the shared result spool
@@ -122,9 +140,11 @@ BY id` sorts first, so its output queues in the spool instead.
 | A statement after its first effect (volatile function, routine body, sequence change, first output byte reaching the client) | Blocks until the statement ends |
 | Output queued for a slow client | Never blocks; the connection waits for the client between messages |
 | Result streams (see above): each row before its first effect | Yields; delivered rows are kept |
-| Writing statements: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, DDL, `COPY FROM` | Blocks for the whole statement |
-| Top-level `CALL` and `DO` bodies: queries before the statement's first effect | Yields; the body resumes at its waiting statement |
-| Writes and statements after the first effect inside a `CALL` or `DO` body | Blocks |
+| Writes (`INSERT ... SELECT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`), also in a `CALL` or `DO` body: selecting and locking rows before the first row change, `VALUES` row or trigger body | Yields; the statement restarts from its start (see above) |
+| Writes after their first row change, `VALUES` row or trigger body: index maintenance, constraint checks, triggers, `RETURNING` | Blocks until the statement ends |
+| DDL and `COPY FROM` | Blocks for the whole statement |
+| Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |
+| Statements after the first effect inside a `CALL` or `DO` body | Blocks |
 | Commit processing, deferred constraint triggers, `SET CONSTRAINTS`, `PREPARE TRANSACTION`, `COMMIT PREPARED`/`ROLLBACK PREPARED` | Blocks |
 | `COPY` rows and completion; logical-replication apply and initial copy | Blocks |
 | Large-object fast-path calls, login event triggers, manual `CHECKPOINT` | Blocks |

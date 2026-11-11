@@ -9071,6 +9071,14 @@ impl Engine {
             .map(Checkpointer::atomic_block_read_scope)
     }
 
+    /// Reads that yield until `query::protect_statement_effects` activates
+    /// the scope.
+    fn deferred_block_read_scope(&self) -> Option<crate::checkpoint::AtomicBlockReadScope> {
+        self.ckpt
+            .as_ref()
+            .map(Checkpointer::deferred_atomic_block_read_scope)
+    }
+
     /// Enables reactor-driven reads for durable blocks. Root and journal
     /// uploads use their separately reserved clients and completion state.
     pub(crate) fn enable_async_block_reads(&mut self) {
@@ -19011,10 +19019,22 @@ impl Engine {
             return Ok(Err(error));
         }
         // A top-level procedure body owns its waits: its queries may yield on
-        // storage reads before an effect, while its writes block.
-        let retained_body =
-            reset_workspace && matches!(statement, Stmt::Call { .. } | Stmt::Do { .. });
-        let _atomic_reads = if statement_writes(statement) && !retained_body {
+        // storage reads before an effect. A top-level data change yields
+        // while it selects and locks its rows, and restarts from its start
+        // after the wait; its row changes are an effect (see
+        // `protect_statement_effects`), after which reads block.
+        let yields_before_effects = reset_workspace
+            && matches!(
+                statement,
+                Stmt::Call { .. }
+                    | Stmt::Do { .. }
+                    | Stmt::Insert(_)
+                    | Stmt::Update(_)
+                    | Stmt::Delete(_)
+                    | Stmt::Merge(_)
+                    | Stmt::With { .. }
+            );
+        let _atomic_reads = if statement_writes(statement) && !yields_before_effects {
             self.ckpt
                 .as_ref()
                 .map(Checkpointer::atomic_block_read_scope)

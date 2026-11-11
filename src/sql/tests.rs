@@ -53,6 +53,7 @@ mod transaction_publication;
 mod type_input_binding;
 mod type_input_positions;
 mod virtual_search_path;
+mod write_progress;
 
 #[test]
 fn sequence_session_setval_modes_lastval_identity_and_privileges_match_postgresql() {

@@ -117,6 +117,13 @@ Functions and expressions:
   fails with `22023`.
 - An unmatched PL/pgSQL `CASE` without `ELSE` raises `20000` (`case not found`,
   hint `CASE statement is missing ELSE part.`).
+- PL/pgSQL bound cursors (`c [NO] [SCROLL] CURSOR [(lo int, hi int)] FOR
+  query` in `DECLARE`) open with `OPEN c` or `OPEN c(2, hi := 3)`; arguments
+  convert to their declared types and the query reads them by name. As in
+  PostgreSQL 18 the variable stays NULL until `OPEN` names the portal, and
+  argument mistakes fail with `42601` when the routine is created.
+  `FOR rec IN c LOOP` over a bound cursor is rejected with `0A000`; open the
+  cursor and `FETCH` in a `LOOP` instead.
 - User error codes such as `PZ001` behave as ordinary errors: `WHEN SQLSTATE
   'PZ001'`, `'PZ000'` (category match), or `WHEN OTHERS` catch them.
 - `pg_input_is_valid` and `pg_input_error_info` report invalid values, but an
@@ -289,8 +296,10 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | `routine_input_slots` | Per-backend routine plan instances |
 | `max_prepared`, `prepared_bytes` | Prepared statements per namespace and bytes per statement, shared with bound portals |
 | `cursor_bytes`, `cursor_query_bytes` | See [cursors](#cursor-capacity) |
-| `conn_send_buffer_bytes`, `result_spool_bytes`, `result_spool_leases` | Result output: the send buffer, then rows queued in the shared spool for a slow client (a private reserve of the send-buffer size holds closing messages). Only a client lagging by more than the spool gets `54000`; the largest single message must fit the send buffer. A paged portal (`Execute` with a row limit) still buffers its result in `portal_result_bytes` |
-| `result_stream_bytes` (required; starter 256 KiB, minimum 64 KiB) | Per-connection read position of a large single-table `SELECT` that resumes row by row; a larger estimate spools the result instead, and a stream that still outgrows it fails with `54000` naming the setting |
+| `conn_send_buffer_bytes`, `result_spool_bytes`, `result_spool_leases` | Result output: the send buffer, then rows queued in the shared spool for a slow client (a private reserve of the send-buffer size holds closing messages). Only a client lagging by more than the spool gets `54000`; the largest single message must fit the send buffer. A paged portal (`Execute` with a row limit) that cannot stream (another shape, or suspended portals hold every `result_stream_slots` stream) buffers its result in `portal_result_bytes` and fails with `54000` naming it when full |
+| `plan_build_bytes`, `plan_build_leases` (required; starter 16 MiB and 64) | Shared build sides of streamed sorts and streamed or cursor-read hash joins; a build that does not fit runs the statement as it ran without streaming (the result spools; a cursor saves its rows at `DECLARE`) |
+| `result_stream_bytes` (required; starter 256 KiB, minimum 64 KiB) | Read position of each large `SELECT` from one table, builtin set-returning functions or a join of them that resumes row by row, including a paged portal between its `Execute` messages; a larger estimate, or a stream that outgrows it while opening, spools the result instead; a stream that outgrows it after its first row fails with `54000` naming the setting |
+| `result_stream_slots` (required; starter 2, at least 1) | Result streams per connection: one running statement plus suspended paged portals. A paged portal opened while every slot is held buffers in `portal_result_bytes` |
 | `txn_rows`, `copy_transition_bytes` (256 KiB default) | Streamed COPY statement-trigger inputs per connection |
 | `commit_queue_slots` | Commits waiting for durability |
 | `memtable_bytes` (≤ `u32::MAX`) | Two heap buffers are reserved; reclamation returns `54000` while both are retained |
@@ -310,13 +319,21 @@ description, and `floor(cursor_bytes / 6)` row positions. Each saved row costs
 its data plus six bytes. Long column names can fill the description even when
 rows fit; raising `cursor_bytes` does not help there.
 
-- `NO SCROLL`: `cursor_bytes` bounds one fetched batch and is reused.
-- `SCROLL`: every visited row stays in `cursor_bytes`, so history can exhaust it.
-  When revisited rows are evaluated again, the history holds each row's input
+- `NO SCROLL` (and forward-only by shape): a top-level forward `FETCH n` or
+  `FETCH ALL` from a cursor that reads as you fetch streams its rows to the
+  client without saving them, so any count works; other fetches, such as a
+  `FETCH` inside a routine, `RELATIVE`/`ABSOLUTE` or one over a row-locking
+  cursor, buffer one batch in `cursor_bytes`, which is reused.
+- `SCROLL` without volatile functions, unordered and not locking: only the
+  current fetch's rows stay in `cursor_bytes`; a top-level forward fetch
+  streams, and moving back reads the input again from its first row.
+- Other `SCROLL` cursors keep every visited row in `cursor_bytes`, so history
+  can exhaust it. When revisited rows are evaluated again, the history holds each row's input
   columns plus 17 bytes of row identity, and a volatile filter adds the rows it
   rejected; the current fetch's output shares the same bytes.
-- Ordered row-locking cursors save every qualifying row's input columns (plus
-  17 bytes) at the first `FETCH`.
+- Ordered cursors save every qualifying row's input columns (plus 17 bytes)
+  at the first `FETCH`: the columns the query reads, or every column of a
+  row-locking cursor.
 - `WITH HOLD`: the unread suffix (plus history when scrolling) must fit; a
   scrollable cursor whose rows are evaluated again saves its whole result.
 

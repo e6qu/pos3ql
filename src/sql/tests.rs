@@ -32106,7 +32106,9 @@ fn owned_copy_to_sources_preserve_saved_leaf_rows_pending_changes_and_cold_recov
             "COPY export_low TO STDOUT (FORMAT csv, HEADER true); COPY export_other TO STDOUT (FORMAT csv)",
             true
         )),
-        ["id,note", "3,moved", "30,\"far, saved\"", "31,added"]
+        // COPY reads a table in the order SELECT scans it: pending rows,
+        // then saved ones.
+        ["id,note", "3,moved", "31,added", "30,\"far, saved\""]
     );
     assert_eq!(
         copy_data_rows(&session.success(
@@ -32114,7 +32116,7 @@ fn owned_copy_to_sources_preserve_saved_leaf_rows_pending_changes_and_cold_recov
             "COPY export_low (note, id) TO STDOUT; COPY export_other (note, id) TO STDOUT",
             true
         )),
-        ["moved\t3", "far, saved\t30", "added\t31"]
+        ["moved\t3", "added\t31", "far, saved\t30"]
     );
     let binary = session.success(
         &mut engine,

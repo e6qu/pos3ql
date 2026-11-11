@@ -17022,6 +17022,72 @@ struct ParsedTriggerLocalDecl<'a> {
     initial: Option<&'a Expr<'a>>,
     constant: bool,
     not_null: bool,
+    /// `name [NO] [SCROLL] CURSOR [(arguments)] FOR query`: a `refcursor`
+    /// local whose `OPEN` runs this query.
+    bound: Option<BoundPlpgsqlCursor<'a>>,
+}
+
+/// A bound cursor's declared query, as PostgreSQL's `cursor_explicit_expr`.
+#[derive(Clone, Copy)]
+struct BoundPlpgsqlCursor<'a> {
+    scroll: super::cursor::CursorScroll,
+    parameters: &'a [BoundCursorParameter<'a>],
+    query: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct BoundCursorParameter<'a> {
+    name: SqlName,
+    type_name: &'a str,
+}
+
+/// One argument of `OPEN c(...)`, already in declaration order and converted
+/// to its parameter's type; the query sees it under the parameter's name.
+#[derive(Clone, Copy)]
+struct BoundCursorArgument<'a> {
+    name: SqlName,
+    type_name: &'a str,
+    value: &'a Expr<'a>,
+}
+
+thread_local! {
+    /// The bound cursors of the program being parsed, for its `OPEN`s.
+    static BOUND_CURSORS: core::cell::Cell<(*const (), usize)> =
+        const { core::cell::Cell::new((core::ptr::null(), 0)) };
+}
+
+/// Runs `parse` with `locals` visible to [`bound_plpgsql_cursor`].
+fn with_bound_plpgsql_cursors<'a, T>(
+    locals: &'a [ParsedTriggerLocalDecl<'a>],
+    parse: impl FnOnce() -> T,
+) -> T {
+    struct Restore((*const (), usize));
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BOUND_CURSORS.with(|slot| slot.set(self.0));
+        }
+    }
+    let previous = BOUND_CURSORS.with(|slot| slot.replace((locals.as_ptr().cast(), locals.len())));
+    let _restore = Restore(previous);
+    parse()
+}
+
+/// The bound cursor declared as `name` in the program being parsed.
+fn bound_plpgsql_cursor<'a>(name: SqlName, _arena: &'a Arena) -> Option<BoundPlpgsqlCursor<'a>> {
+    let (pointer, len) = BOUND_CURSORS.with(core::cell::Cell::get);
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: `with_bound_plpgsql_cursors` publishes these declarations only
+    // while the program that owns them is parsed from the same arena, and
+    // restores the previous value before that borrow ends. Statements parsed
+    // in that window borrow the arena for the declarations' lifetime.
+    let locals =
+        unsafe { core::slice::from_raw_parts(pointer.cast::<ParsedTriggerLocalDecl<'a>>(), len) };
+    locals
+        .iter()
+        .find(|local| local.name == name)
+        .and_then(|local| local.bound)
 }
 
 /// A local declaration has either a complete type spelling or a catalog
@@ -17529,6 +17595,8 @@ struct PlpgsqlCursorOpen<'a> {
     variable: SqlName,
     scroll: super::cursor::CursorScroll,
     query: PlpgsqlCursorQuery<'a>,
+    /// A bound cursor's arguments, visible to its query by parameter name.
+    arguments: &'a [BoundCursorArgument<'a>],
 }
 
 #[derive(Clone, Copy)]
@@ -18900,18 +18968,21 @@ fn parse_trigger_local<'a>(
     if declaration.is_empty() {
         return Err(unsupported_trigger_body());
     }
-    // `name [NO] [SCROLL] CURSOR ... FOR query` declares a bound cursor.
-    let cursor = strip_trigger_keyword(declaration, "no")
-        .map(str::trim_start)
-        .unwrap_or(declaration);
-    let cursor = strip_trigger_keyword(cursor, "scroll")
-        .map(str::trim_start)
-        .unwrap_or(cursor);
-    if strip_trigger_keyword(cursor, "cursor").is_some() {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "PL/pgSQL bound cursor declarations are not supported; declare a refcursor and use OPEN ... FOR"
-        ));
+    if let Some(bound) = parse_bound_plpgsql_cursor(declaration, arena)? {
+        if constant || not_null || initial.is_some() {
+            return Err(unsupported_trigger_body());
+        }
+        return Ok(ParsedTriggerLocalDecl {
+            name,
+            ty: ParsedPlpgsqlLocalType::Named {
+                name: "refcursor",
+                type_mod: -1,
+            },
+            initial: None,
+            constant: false,
+            not_null: false,
+            bound: Some(bound),
+        });
     }
     let ty = if declaration.eq_ignore_ascii_case("record") {
         ParsedPlpgsqlLocalType::Record
@@ -18941,7 +19012,68 @@ fn parse_trigger_local<'a>(
         initial,
         constant,
         not_null,
+        bound: None,
     })
+}
+
+/// `[NO] [SCROLL] CURSOR [(name type, ...)] {FOR | IS} query` after a local's
+/// name. Locals merely named `scroll` or `cursor` are not cursors.
+fn parse_bound_plpgsql_cursor<'a>(
+    declaration: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<BoundPlpgsqlCursor<'a>>, SqlError> {
+    let (scroll, rest) = if let Some(rest) = strip_trigger_keyword(declaration, "no")
+        .and_then(|rest| strip_trigger_keyword(rest.trim_start(), "scroll"))
+    {
+        (super::cursor::CursorScroll::NoScroll, rest.trim_start())
+    } else if let Some(rest) = strip_trigger_keyword(declaration, "scroll") {
+        (super::cursor::CursorScroll::Scroll, rest.trim_start())
+    } else {
+        (super::cursor::CursorScroll::Default, declaration)
+    };
+    let Some(rest) = strip_trigger_keyword(rest, "cursor") else {
+        return Ok(None);
+    };
+    let mut rest = rest.trim_start();
+    let mut parameters = ProgramList::new(arena);
+    if rest.starts_with('(') {
+        // The first top-level token follows the parenthesized parameters.
+        let after = scan_trigger_top_level(rest, arena, |_, start, _| Ok(Some(start)))?
+            .ok_or_else(unsupported_trigger_body)?;
+        let list = rest[..after]
+            .trim_end()
+            .strip_suffix(')')
+            .ok_or_else(unsupported_trigger_body)?;
+        let (arguments, count) = split_trigger_arguments(&list[1..], arena)?;
+        for argument in arguments.iter().take(count).flatten() {
+            let (parameter, split) = parse_plpgsql_identifier_prefix(argument, arena)?;
+            let type_name = argument[split..].trim();
+            if type_name.is_empty() {
+                return Err(unsupported_trigger_body());
+            }
+            parameters.push(BoundCursorParameter {
+                name: parameter,
+                type_name,
+            })?;
+        }
+        rest = &rest[after..];
+    }
+    let query = strip_trigger_keyword(rest, "for")
+        .or_else(|| strip_trigger_keyword(rest, "is"))
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .ok_or_else(unsupported_trigger_body)?;
+    super::plpgsql_inputs::record(
+        super::plpgsql_inputs::Kind::Statement,
+        query.as_ptr() as usize,
+        query,
+        query,
+    )?;
+    Ok(Some(BoundPlpgsqlCursor {
+        scroll,
+        parameters: parameters.as_slice(),
+        query,
+    }))
 }
 
 fn strip_plpgsql_type_suffix<'a>(value: &'a str, suffix: &str) -> Option<&'a str> {
@@ -19728,6 +19860,15 @@ fn parse_trigger_for_header<'a>(
             TriggerForSource::Query(parse_plpgsql_query(source, source, arena)?),
         )));
     }
+    if let Ok((cursor, split)) = parse_plpgsql_identifier_prefix(source, arena)
+        && bound_plpgsql_cursor(cursor, arena).is_some()
+        && (source[split..].trim().is_empty() || source[split..].trim_start().starts_with('('))
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "FOR loops over bound cursors are not supported; OPEN the cursor and FETCH in a LOOP"
+        ));
+    }
     let reverse = if let Some(rest) = strip_trigger_keyword(source, "reverse") {
         source = rest.trim();
         true
@@ -20063,6 +20204,9 @@ fn parse_plpgsql_cursor_open<'a>(
     let body = body.trim();
     let (variable, split) = parse_plpgsql_identifier_prefix(body, arena)?;
     let body = body[split..].trim();
+    if let Some(bound) = bound_plpgsql_cursor(variable, arena) {
+        return parse_bound_cursor_open(variable, bound, body, arena).map(Some);
+    }
     let Some(for_at) = trigger_top_level_keyword(body, "for", arena)? else {
         return Err(unsupported_trigger_body());
     };
@@ -20099,7 +20243,123 @@ fn parse_plpgsql_cursor_open<'a>(
         variable,
         scroll,
         query,
+        arguments: &[],
     }))
+}
+
+/// `OPEN c [(arguments)]` of a bound cursor, checked as PostgreSQL's
+/// `read_cursor_args` does when the routine is created. Positional arguments
+/// precede named ones (`name := value` or `name => value`).
+fn parse_bound_cursor_open<'a>(
+    variable: SqlName,
+    bound: BoundPlpgsqlCursor<'a>,
+    body: &'a str,
+    arena: &'a Arena,
+) -> Result<PlpgsqlCursorOpen<'a>, SqlError> {
+    let syntax = |message: core::fmt::Arguments<'_>| {
+        let mut text = StackStr::<256>::new();
+        let _ = core::fmt::Write::write_fmt(&mut text, message);
+        sql_err!(sqlstate::SYNTAX_ERROR, "{}", text.as_str())
+    };
+    let name = variable.as_str();
+    if body.is_empty() {
+        if !bound.parameters.is_empty() {
+            return Err(syntax(format_args!("cursor \"{name}\" has arguments")));
+        }
+        return Ok(PlpgsqlCursorOpen {
+            variable,
+            scroll: bound.scroll,
+            query: PlpgsqlCursorQuery::Static(bound.query),
+            arguments: &[],
+        });
+    }
+    let Some(list) = body
+        .strip_prefix('(')
+        .and_then(|list| list.trim_end().strip_suffix(')'))
+    else {
+        return Err(syntax(format_args!(
+            "syntax error at or near \"{}\"",
+            body.split_ascii_whitespace().next().unwrap_or(body)
+        )));
+    };
+    if bound.parameters.is_empty() {
+        return Err(syntax(format_args!("cursor \"{name}\" has no arguments")));
+    }
+    let (sources, count) = split_trigger_arguments(list, arena)?;
+    if count > bound.parameters.len() {
+        return Err(syntax(format_args!(
+            "too many arguments for cursor \"{name}\""
+        )));
+    }
+    let mut values: [Option<&'a str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+    let mut named = false;
+    for (position, source) in sources.iter().take(count).flatten().enumerate() {
+        let assignment = scan_trigger_top_level(source, arena, |token, start, end| {
+            Ok(matches!(token, crate::sql::lexer::Tok::Op(":=" | "=>")).then_some((start, end)))
+        })?;
+        let (index, value) = match assignment {
+            Some((start, end)) => {
+                named = true;
+                let parameter = parse_plpgsql_identifier(source[..start].trim(), arena)?.name;
+                let index = bound
+                    .parameters
+                    .iter()
+                    .position(|candidate| candidate.name == parameter)
+                    .ok_or_else(|| {
+                        syntax(format_args!(
+                            "cursor \"{name}\" has no argument named \"{}\"",
+                            parameter.as_str()
+                        ))
+                    })?;
+                (index, source[end..].trim())
+            }
+            None if named => {
+                return Err(syntax(format_args!(
+                    "positional argument cannot follow named argument"
+                )));
+            }
+            None => (position, *source),
+        };
+        if values[index].is_some() {
+            return Err(syntax(format_args!(
+                "value for parameter \"{}\" of cursor \"{name}\" specified more than once",
+                bound.parameters[index].name.as_str()
+            )));
+        }
+        values[index] = Some(value);
+    }
+    if values[..bound.parameters.len()].iter().any(Option::is_none) {
+        return Err(syntax(format_args!(
+            "not enough arguments for cursor \"{name}\""
+        )));
+    }
+    let mut arguments = ProgramList::new(arena);
+    for (parameter, value) in bound.parameters.iter().zip(values) {
+        let value = value.expect("every parameter has a value");
+        // The value converts to the parameter's declared type, as an
+        // assignment does.
+        let converted = arena
+            .alloc_str_display(format_args!("CAST(({value}) AS {})", parameter.type_name))
+            .map_err(|_| super::query::arena_full_pub())?;
+        let expression = super::parser::parse_expr(converted, arena)?;
+        super::plpgsql_inputs::record(
+            super::plpgsql_inputs::Kind::Expression,
+            core::ptr::from_ref(expression) as usize,
+            converted,
+            value,
+        )?;
+        arguments.push(BoundCursorArgument {
+            name: parameter.name,
+            type_name: parameter.type_name,
+            value: expression,
+        })?;
+    }
+    Ok(PlpgsqlCursorOpen {
+        variable,
+        scroll: bound.scroll,
+        query: PlpgsqlCursorQuery::Static(bound.query),
+        arguments: arguments.as_slice(),
+    })
 }
 
 fn parse_plpgsql_cursor_motion<'a>(
@@ -20852,21 +21112,27 @@ fn parse_plpgsql_program_inner<'a>(
     let loop_labels = arena
         .alloc_slice_with(segments.len().max(1), |_| None)
         .map_err(|_| super::query::arena_full_pub())?;
-    let (body, ending) = parse_trigger_block(
-        segments,
-        &mut at,
-        arena,
-        loop_labels,
-        0,
-        false,
-        program_kind,
-    )?;
+    with_bound_plpgsql_cursors(locals, || {
+        parse_plpgsql_program_body(locals, segments, &mut at, arena, loop_labels, program_kind)
+    })
+}
+
+fn parse_plpgsql_program_body<'a>(
+    locals: &'a [ParsedTriggerLocalDecl<'a>],
+    segments: &'a [&'a str],
+    at: &mut usize,
+    arena: &'a Arena,
+    loop_labels: &mut [Option<SqlName>],
+    program_kind: PlpgsqlProgramKind,
+) -> Result<ParsedTriggerProgram<'a>, SqlError> {
+    let (body, ending) =
+        parse_trigger_block(segments, at, arena, loop_labels, 0, false, program_kind)?;
     let body = match ending {
         TriggerBlockEnd::End => body,
         TriggerBlockEnd::Exception => {
             let exception = parse_trigger_exception_handlers(
                 segments,
-                &mut at,
+                at,
                 arena,
                 loop_labels,
                 0,
@@ -20881,7 +21147,7 @@ fn parse_plpgsql_program_inner<'a>(
         }
         _ => return Err(unsupported_trigger_body()),
     };
-    if at != segments.len() {
+    if *at != segments.len() {
         return Err(unsupported_trigger_body());
     }
     Ok(ParsedTriggerProgram {
@@ -26497,10 +26763,13 @@ fn prepare_static_plpgsql_statement<'a>(
             source: TriggerForSource::Query(query),
             ..
         }) => (Kind::Query, core::ptr::from_ref(query) as usize),
+        // A bound cursor's arguments are variables only its query sees:
+        // its inputs are checked when OPEN binds the query with them.
         TriggerStatement::Utility { source, .. }
         | TriggerStatement::Dml { source, .. }
         | TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
             query: PlpgsqlCursorQuery::Static(source),
+            arguments: [],
             ..
         }) => (Kind::Statement, source.as_ptr() as usize),
         _ => return Ok((statement, None)),
@@ -27174,6 +27443,55 @@ fn execute_trigger_step<'a>(
                         scope.cursor_locals(context.storage(), context.txn.txid, context.arena)?
                     } else {
                         &[]
+                    };
+                    // A bound cursor's arguments precede, and so shadow, the
+                    // routine's variables of the same names.
+                    let captured = if statement.arguments.is_empty() {
+                        captured
+                    } else {
+                        let all = context
+                            .arena
+                            .alloc_slice_with(statement.arguments.len() + captured.len(), |_| {
+                                super::cursor::CursorLocal {
+                                    name: SqlName::EMPTY,
+                                    type_oid: 0,
+                                    value: Datum::Null,
+                                }
+                            })
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        for (slot, argument) in all.iter_mut().zip(statement.arguments) {
+                            let declared = resolve_routine_type(
+                                context.storage(),
+                                context.txn.txid,
+                                argument.type_name,
+                            )?;
+                            let type_oid = context
+                                .storage()
+                                .routine_type_oid(
+                                    declared.ctype,
+                                    declared.user_type,
+                                    context.txn.txid,
+                                )
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_OBJECT,
+                                        "type \"{}\" does not exist",
+                                        argument.type_name
+                                    )
+                                })?;
+                            *slot = super::cursor::CursorLocal {
+                                name: argument.name,
+                                type_oid,
+                                value: eval_procedural_expression(
+                                    context,
+                                    argument.value,
+                                    &scope,
+                                    None,
+                                )?,
+                            };
+                        }
+                        all[statement.arguments.len()..].copy_from_slice(captured);
+                        &*all
                     };
                     let PlpgsqlExecHost::Routine {
                         engine,
@@ -60443,296 +60761,170 @@ fn decode_binary_bit<'a>(
     Ok(Datum::Bit { bits, varying })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "COPY emission owns the typed row, format, policy, and wire boundary"
-)]
-fn emit_copy_out_row<'a, Definition0: crate::storage::DefinitionBacking>(
+/// The query a table-form `COPY ... TO STDOUT` reads: its target columns
+/// from only the named relation, in the order a `SELECT` scans it, as
+/// PostgreSQL scans the relation for both. Row security then applies as it
+/// does to that `SELECT`.
+pub(crate) fn copy_select_text<'a>(
     storage: &Storage,
-    definition: &crate::storage::TableDefinition<Definition0>,
-    txid: u32,
     setup: &CopySetup,
+    txid: u32,
     arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let def = setup
+        .definitions
+        .definition(storage, setup.table_index, txid)?;
+    let relation = crate::storage::RelationDefinition::from_definition(def);
+    let schema = super::eval::quote_ident_str(relation.schema.as_str(), arena)?;
+    let table = super::eval::quote_ident_str(relation.name.as_str(), arena)?;
+    let mut columns = ArenaList::new(arena);
+    for &target in &setup.targets[..setup.n_targets] {
+        let name = super::eval::quote_ident_str(def.columns()[target].name.as_str(), arena)?;
+        columns.push(name).map_err(|_| super::eval::arena_full())?;
+    }
+    let columns = columns.as_slice();
+    let length = "SELECT  FROM ONLY .".len()
+        + schema.len()
+        + table.len()
+        + columns.iter().map(|name| name.len()).sum::<usize>()
+        + columns.len().saturating_sub(1) * 2;
+    let text = arena
+        .alloc_slice_with(length, |_| 0u8)
+        .map_err(|_| super::eval::arena_full())?;
+    let mut at = 0;
+    let mut put = |part: &str| {
+        text[at..at + part.len()].copy_from_slice(part.as_bytes());
+        at += part.len();
+    };
+    put("SELECT ");
+    for (index, name) in columns.iter().enumerate() {
+        if index > 0 {
+            put(", ");
+        }
+        put(name);
+    }
+    put(" FROM ONLY ");
+    put(schema);
+    put(".");
+    put(table);
+    core::str::from_utf8(text)
+        .map_err(|_| sql_err!(sqlstate::INTERNAL_ERROR, "COPY query text is not UTF-8"))
+}
+
+/// Starts `COPY ... TO STDOUT` output: CopyOutResponse, the binary header and
+/// the optional header line of column names.
+pub(crate) fn begin_copy_out(
+    fmt: &CopyFmt,
+    names: &[&str],
     responder: &mut Responder,
-    security: Option<super::query::RowSecurityPlan<'a>>,
-    values: &mut [Datum<'a>; MAX_COLUMNS],
-) -> Result<bool, SqlError> {
-    super::query::check_timeout()?;
-    if let Some(plan) = security {
-        let row = RowCtx {
-            def: crate::storage::RelationDefinition::from_definition(definition),
-            values: &values[..definition.n_columns],
-            alias: None,
-        };
-        let catalog = super::query::storage_catalog(storage, arena, txid);
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            ..NO_HOOKS
-        };
-        if !super::query::row_security_passes(plan, &row, storage, txid, arena, &[], &hooks)? {
-            return Ok(false);
-        }
-    }
-    let fmt = &setup.fmt;
+) -> Result<(), crate::pg::wire::WireFull> {
+    responder.copy_out_response(names.len(), fmt.binary)?;
     if fmt.binary {
-        let mut plans = [BinaryFieldPlan::Direct; MAX_COLUMNS];
-        for (i, plan) in plans.iter_mut().enumerate().take(setup.n_targets) {
-            let target = setup.targets[i];
-            if let Datum::CompositeText {
-                slot,
-                physical_fields,
-                text,
-            } = values[target]
-            {
-                values[target] = decode_stored_composite_text(
-                    text,
-                    slot,
-                    physical_fields,
-                    storage,
-                    txid,
-                    arena,
-                )?;
-            }
-            *plan = binary_field_plan(&values[target], storage, txid, arena)?;
-            if matches!(*plan, BinaryFieldPlan::Unavailable) {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "no binary output function available for type aclitem"
-                ));
-            }
-        }
-        responder
-            .copy_binary_row(setup.n_targets, &|message| {
-                for i in 0..setup.n_targets {
-                    encode_binary_field_plan(message, &values[setup.targets[i]], plans[i]);
-                }
-            })
-            .map_err(wire_to_sql)?;
-        return Ok(true);
+        responder.copy_binary_header()?;
     }
-    let render = responder.render_context();
-    let mut texts: [Option<&[u8]>; MAX_COLUMNS] = [None; MAX_COLUMNS];
-    for (i, text) in texts.iter_mut().enumerate().take(setup.n_targets) {
-        let catalog = super::query::storage_catalog(storage, arena, txid);
-        let output = super::eval::materialize_composite_text_output(
-            values[setup.targets[i]],
-            &catalog,
-            arena,
-        )?;
-        *text = Responder::datum_wire_text(&output, render, arena)?;
-    }
-    responder
-        .copy_data_row(&|out| {
-            for (i, text) in texts.iter().enumerate().take(setup.n_targets) {
+    if !matches!(fmt.header, crate::sql::ast::CopyHeader::None) {
+        responder.copy_data_row(&|out| {
+            for (i, name) in names.iter().enumerate() {
                 if i > 0 {
                     out(&[fmt.delimiter]);
                 }
                 if fmt.csv {
-                    let force =
-                        fmt.force_quote_all || CopyFmt::forced(fmt.force_quote, setup.targets[i]);
                     crate::sql::copy::encode_field_csv_bytes(
                         out,
-                        *text,
+                        Some(name.as_bytes()),
                         fmt.null.as_str().as_bytes(),
                         fmt.delimiter,
                         fmt.quote,
                         fmt.escape,
-                        force,
+                        false,
                     );
-                } else if let Some(value) = text {
-                    crate::sql::copy::encode_field_bytes(out, Some(value));
                 } else {
-                    out(fmt.null.as_str().as_bytes());
+                    crate::sql::copy::encode_field_bytes(out, Some(name.as_bytes()));
                 }
             }
-        })
-        .map_err(wire_to_sql)?;
-    Ok(true)
+        })?;
+    }
+    Ok(())
 }
 
-/// COPY TO STDOUT: every visible row, targets in COPY order, each value in
-/// its wire text form with COPY's escapes. Returns the row count for the
-/// command tag.
-pub fn copy_out(
+/// Ends `COPY ... TO STDOUT` output before its CommandComplete.
+pub(crate) fn finish_copy_out(
+    fmt: &CopyFmt,
+    responder: &mut Responder,
+) -> Result<(), crate::pg::wire::WireFull> {
+    if fmt.binary {
+        responder.copy_binary_trailer()?;
+    }
+    responder.copy_done()
+}
+
+/// Sends one result row as COPY data in `fmt`, byte-identical to
+/// PostgreSQL's COPY output.
+pub(crate) fn emit_copy_row(
     storage: &Storage,
     txid: u32,
-    setup: &CopySetup,
+    fmt: &CopyFmt,
     arena: &Arena,
     responder: &mut Responder,
-    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<u64, SqlError> {
-    let def = setup
-        .definitions
-        .definition(storage, setup.table_index, txid)?;
-    let security = setup
-        .security_role
-        .map(|role| {
-            super::query::plan_row_security(
-                storage,
-                setup.table_index,
-                usize::from(role),
-                PolicyCommandKind::Select,
-                super::query::RowSecurityExpression::Using,
-                txid,
-                arena,
-            )
-        })
-        .transpose()?
-        .flatten();
-    let fmt = &setup.fmt;
+    values: &[Datum],
+) -> Result<Result<(), SqlError>, crate::pg::wire::WireFull> {
+    let n = values.len();
     if fmt.binary {
-        for &target in &setup.targets[..setup.n_targets] {
-            let oid = storage
-                .declared_column_type(&def.columns()[target], txid)?
-                .catalog_oid();
-            match binary_output_capability(storage, oid, txid) {
-                BinaryOutputCapability::Supported
-                | BinaryOutputCapability::MissingAclItemElementSend => {}
-                BinaryOutputCapability::MissingAclItemSend => {
-                    return Err(sql_err!(
+        let mut plans = [BinaryFieldPlan::Direct; MAX_COLUMNS];
+        for (i, plan) in plans.iter_mut().enumerate().take(n) {
+            *plan = match binary_field_plan(&values[i], storage, txid, arena) {
+                Ok(BinaryFieldPlan::Unavailable) => {
+                    return Ok(Err(sql_err!(
                         sqlstate::UNDEFINED_FUNCTION,
                         "no binary output function available for type aclitem"
-                    ));
+                    )));
                 }
-                BinaryOutputCapability::Unsupported => {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "COPY BINARY cannot send a column of type oid {}",
-                        oid
-                    ));
-                }
+                Ok(plan) => plan,
+                Err(error) => return Ok(Err(error)),
+            };
+        }
+        responder.copy_binary_row(n, &|m| {
+            for (i, plan) in plans.iter().enumerate().take(n) {
+                encode_binary_field_plan(m, &values[i], *plan);
+            }
+        })?;
+        return Ok(Ok(()));
+    }
+    let render = responder.render_context();
+    let mut texts: [Option<&[u8]>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    for (i, slot) in texts.iter_mut().enumerate().take(n) {
+        let text = super::eval::materialize_composite_text_output(values[i], &catalog, arena)
+            .and_then(|output| Responder::datum_wire_text(&output, render, arena));
+        *slot = match text {
+            Ok(text) => text,
+            Err(error) => return Ok(Err(error)),
+        };
+    }
+    responder.copy_data_row(&|out| {
+        for (i, text) in texts.iter().enumerate().take(n) {
+            if i > 0 {
+                out(&[fmt.delimiter]);
+            }
+            if fmt.csv {
+                let force = fmt.force_quote_all || CopyFmt::forced(fmt.force_quote, i);
+                crate::sql::copy::encode_field_csv_bytes(
+                    out,
+                    *text,
+                    fmt.null.as_str().as_bytes(),
+                    fmt.delimiter,
+                    fmt.quote,
+                    fmt.escape,
+                    force,
+                );
+            } else if let Some(value) = text {
+                crate::sql::copy::encode_field_bytes(out, Some(value));
+            } else {
+                out(fmt.null.as_str().as_bytes());
             }
         }
-    }
-    responder
-        .copy_out_response(setup.n_targets, fmt.binary)
-        .map_err(wire_to_sql)?;
-    if fmt.binary {
-        responder.copy_binary_header().map_err(wire_to_sql)?;
-    }
-    // A header line of column names, in the same field format as the data.
-    if !matches!(fmt.header, crate::sql::ast::CopyHeader::None) {
-        responder
-            .copy_data_row(&|out| {
-                for i in 0..setup.n_targets {
-                    if i > 0 {
-                        out(&[fmt.delimiter]);
-                    }
-                    let name = def.columns()[setup.targets[i]].name.as_str();
-                    if fmt.csv {
-                        crate::sql::copy::encode_field_csv_bytes(
-                            out,
-                            Some(name.as_bytes()),
-                            fmt.null.as_str().as_bytes(),
-                            fmt.delimiter,
-                            fmt.quote,
-                            fmt.escape,
-                            false,
-                        );
-                    } else {
-                        crate::sql::copy::encode_field_bytes(out, Some(name.as_bytes()));
-                    }
-                }
-            })
-            .map_err(wire_to_sql)?;
-    }
-    if def.kind == crate::storage::TableKind::Foreign {
-        let rows =
-            crate::sql::foreign::materialize(storage, setup.table_index, txid, arena, sequences)?;
-        let mut count = 0u64;
-        for row in rows {
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            for (column, value) in values.iter_mut().enumerate().take(def.n_columns) {
-                *value = decode_projected_pub(row, column);
-            }
-            count += u64::from(emit_copy_out_row(
-                storage,
-                def,
-                txid,
-                setup,
-                arena,
-                responder,
-                security,
-                &mut values,
-            )?);
-        }
-        if fmt.binary {
-            responder.copy_binary_trailer().map_err(wire_to_sql)?;
-        }
-        responder.copy_done().map_err(wire_to_sql)?;
-        return Ok(count);
-    }
-    // Table-form COPY exports ONLY the named relation. The query form
-    // supplies descendant scans and an explicit order when requested.
-    let table = setup.table_index;
-    let scan = storage.captured_row_scan_in(table, txid, arena)?;
-    let mut schema = [ColType::Bool; MAX_COLUMNS];
-    def.schema(&mut schema);
-    storage.record_relation_scan(txid, table, None, 0, crate::sql::datetime::now_micros())?;
-    let mut visible = 0usize;
-    let _ = scan.for_each_home(&mut |_, _| {
-        visible = visible.checked_add(1).ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "COPY TO row count exceeds the statement boundary"
-            )
-        })?;
-        Ok(core::ops::ControlFlow::Continue(()))
     })?;
-    let tokens = arena
-        .alloc_slice_with(visible, |_| None::<crate::storage::OrderedRowSnapshot>)
-        .map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "COPY TO snapshot exceeds the statement arena"
-            )
-        })?;
-    let mut fill = 0usize;
-    let _ = scan.for_each_home(&mut |rowid, home| {
-        let token = tokens.get_mut(fill).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "COPY TO captured row count changed"
-            )
-        })?;
-        *token = Some(scan.retain(rowid, &home)?);
-        fill += 1;
-        Ok(core::ops::ControlFlow::Continue(()))
-    })?;
-    if fill != visible {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "COPY TO captured row count changed"
-        ));
-    }
-    tokens
-        .sort_unstable_by_key(|token| token.as_ref().expect("COPY tokens are initialized").rowid());
-    let mut count = 0u64;
-    for token in tokens.iter().copied().flatten() {
-        super::query::check_timeout()?;
-        let rowid = token.rowid();
-        storage.record_relation_tuple_read(txid, table, None)?;
-        let emitted = storage.with_row_bytes(table, rowid, token.read()?, |bytes| {
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
-            emit_copy_out_row(
-                storage,
-                def,
-                txid,
-                setup,
-                arena,
-                responder,
-                security,
-                &mut values,
-            )
-        })?;
-        count += u64::from(emitted);
-    }
-    if fmt.binary {
-        responder.copy_binary_trailer().map_err(wire_to_sql)?;
-    }
-    responder.copy_done().map_err(wire_to_sql)?;
-    Ok(count)
+    Ok(Ok(()))
 }
 
 fn wire_to_sql(_: crate::pg::wire::WireFull) -> SqlError {
@@ -60746,7 +60938,7 @@ fn wire_to_sql(_: crate::pg::wire::WireFull) -> SqlError {
 /// are the query's output columns (named for `FORCE_QUOTE` and the header),
 /// with no backing table. Mirrors [`CopyFmt::resolve`] but resolves the
 /// `force_*` column lists against the output column names.
-fn copy_fmt_for_columns(
+pub(crate) fn copy_fmt_for_columns(
     names: &[&str],
     options: &crate::sql::ast::CopyOptions,
 ) -> Result<CopyFmt, SqlError> {
@@ -60835,7 +61027,46 @@ pub fn copy_out_query(
     arena: &Arena,
     params: &[Datum],
     responder: &mut Responder,
+) -> Result<Result<u64, SqlError>, crate::pg::wire::WireFull> {
+    let mut transport_full = false;
+    let result = copy_out_rows(
+        storage,
+        txid,
+        sql,
+        options,
+        seq,
+        arena,
+        params,
+        responder,
+        &mut transport_full,
+    );
+    if transport_full {
+        // The output spool or a promotion to a result stream stopped the
+        // statement; its owner names the reason.
+        return Err(crate::pg::wire::WireFull);
+    }
+    Ok(result)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "COPY TO runs one statement's query, format and output boundary"
+)]
+fn copy_out_rows(
+    storage: &Storage,
+    txid: u32,
+    sql: &str,
+    options: &crate::sql::ast::CopyOptions,
+    seq: Option<&dyn crate::sql::eval::SequenceAccess>,
+    arena: &Arena,
+    params: &[Datum],
+    responder: &mut Responder,
+    transport_full: &mut bool,
 ) -> Result<u64, SqlError> {
+    let mut wire = |_: crate::pg::wire::WireFull| {
+        *transport_full = true;
+        wire_to_sql(crate::pg::wire::WireFull)
+    };
     let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
     let n = super::query::describe_query(sql, storage, txid, arena, &mut columns)?;
     let mut names = [""; MAX_PROJ];
@@ -60864,101 +61095,17 @@ pub fn copy_out_query(
             }
         }
     }
-    responder
-        .copy_out_response(n, fmt.binary)
-        .map_err(wire_to_sql)?;
-    if fmt.binary {
-        responder.copy_binary_header().map_err(wire_to_sql)?;
-    }
-    if !matches!(fmt.header, crate::sql::ast::CopyHeader::None) {
-        responder
-            .copy_data_row(&|out| {
-                for (i, c) in columns[..n].iter().enumerate() {
-                    if i > 0 {
-                        out(&[fmt.delimiter]);
-                    }
-                    if fmt.csv {
-                        crate::sql::copy::encode_field_csv_bytes(
-                            out,
-                            Some(c.name.as_bytes()),
-                            fmt.null.as_str().as_bytes(),
-                            fmt.delimiter,
-                            fmt.quote,
-                            fmt.escape,
-                            false,
-                        );
-                    } else {
-                        crate::sql::copy::encode_field_bytes(out, Some(c.name.as_bytes()));
-                    }
-                }
-            })
-            .map_err(wire_to_sql)?;
-    }
+    begin_copy_out(&fmt, &names[..n], responder).map_err(&mut wire)?;
     let sel = crate::sql::parser::parse_query(sql, arena)?;
     let sel = super::query::expand_ctes_exec(sel, storage, txid, arena, params, &[], seq)?;
-    let render = responder.render_context();
     let fmt = &fmt;
     let mut count = 0u64;
     super::query::select_into_rows(storage, txid, sel, arena, params, None, seq, &mut |vals| {
-        if fmt.binary {
-            let mut plans = [BinaryFieldPlan::Direct; MAX_COLUMNS];
-            for (i, plan) in plans.iter_mut().enumerate().take(n) {
-                *plan = binary_field_plan(&vals[i], storage, txid, arena)?;
-                if matches!(*plan, BinaryFieldPlan::Unavailable) {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_FUNCTION,
-                        "no binary output function available for type aclitem"
-                    ));
-                }
-            }
-            responder
-                .copy_binary_row(n, &|m| {
-                    for (i, plan) in plans.iter().enumerate().take(n) {
-                        encode_binary_field_plan(m, &vals[i], *plan);
-                    }
-                })
-                .map_err(wire_to_sql)?;
-        } else {
-            let mut texts: [Option<&[u8]>; MAX_COLUMNS] = [None; MAX_COLUMNS];
-            let catalog = super::query::storage_catalog(storage, arena, txid);
-            for (i, slot) in texts.iter_mut().enumerate().take(n) {
-                let output =
-                    super::eval::materialize_composite_text_output(vals[i], &catalog, arena)?;
-                *slot = Responder::datum_wire_text(&output, render, arena)?;
-            }
-            responder
-                .copy_data_row(&|out| {
-                    for (i, text) in texts.iter().enumerate().take(n) {
-                        if i > 0 {
-                            out(&[fmt.delimiter]);
-                        }
-                        if fmt.csv {
-                            let force = fmt.force_quote_all || CopyFmt::forced(fmt.force_quote, i);
-                            crate::sql::copy::encode_field_csv_bytes(
-                                out,
-                                *text,
-                                fmt.null.as_str().as_bytes(),
-                                fmt.delimiter,
-                                fmt.quote,
-                                fmt.escape,
-                                force,
-                            );
-                        } else if let Some(value) = text {
-                            crate::sql::copy::encode_field_bytes(out, Some(value));
-                        } else {
-                            out(fmt.null.as_str().as_bytes());
-                        }
-                    }
-                })
-                .map_err(wire_to_sql)?;
-        }
+        emit_copy_row(storage, txid, fmt, arena, responder, &vals[..n]).map_err(&mut wire)??;
         count += 1;
         Ok(())
     })?;
-    if fmt.binary {
-        responder.copy_binary_trailer().map_err(wire_to_sql)?;
-    }
-    responder.copy_done().map_err(wire_to_sql)?;
+    finish_copy_out(fmt, responder).map_err(&mut wire)?;
     Ok(count)
 }
 

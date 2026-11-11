@@ -15800,6 +15800,7 @@ pub struct Storage {
     statistics_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     /// Client result output queued behind slow readers.
     result_spool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    plan_build: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     row_overlay: std::sync::Arc<RowOverlayPool>,
     row_walks: RowWalkPool,
     snapshot_reclamation: SnapshotReclamation,
@@ -20940,6 +20941,10 @@ impl Storage {
                 config.result_spool_bytes,
                 config.result_spool_leases,
             ),
+            crate::mem::lease_pool::LeasePool::budget_bytes(
+                config.plan_build_bytes,
+                config.plan_build_leases,
+            ),
             SnapshotReclamation::budget_bytes(),
             row_ownership::HeapRowOwnership::budget_bytes(config),
             type_reference_moves::DefinitionPublication::budget_bytes(config),
@@ -21224,6 +21229,12 @@ impl Storage {
             crate::mem::lease_pool::Purpose::RESULT_SPOOL,
             config.result_spool_bytes,
             config.result_spool_leases,
+        )?;
+        let plan_build = crate::mem::lease_pool::LeasePool::new(
+            budget,
+            crate::mem::lease_pool::Purpose::PLAN_BUILD,
+            config.plan_build_bytes,
+            config.plan_build_leases,
         )?;
         let table_definition_images =
             definition_images::TableDefinitionImagePool::new(config, budget, &metadata_pool)?;
@@ -22041,6 +22052,7 @@ impl Storage {
             metadata_pool,
             statistics_pool,
             result_spool,
+            plan_build,
             row_overlay,
             row_walks,
             snapshot_reclamation,
@@ -51932,6 +51944,11 @@ impl Storage {
 
     pub(crate) fn result_spool(&self) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
         &self.result_spool
+    }
+
+    /// The shared pool holding retained plan nodes' build sides.
+    pub(crate) fn plan_build(&self) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
+        &self.plan_build
     }
 
     pub(crate) fn lock_mark(&self) -> u64 {

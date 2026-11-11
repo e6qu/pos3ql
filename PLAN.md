@@ -69,8 +69,8 @@ declaration initializers; SQL-language function bodies, child calls and return
 checks; SQL cursors executing from retained query state, including row locks
 taken per `FETCH` and scrollable cursors that evaluate revisited rows again;
 client output that never blocks the worker on a slow reader; large
-single-table results resuming row by row across client, storage and lock
-waits. The
+single-table and generated-series results, and paged portals over them,
+resuming row by row across client, storage and lock waits. The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
 
@@ -78,10 +78,16 @@ is owned.
 
 - **Functions:** callers and expression positions that have no owning query;
   PL/pgSQL return conversion that can wait; one timing count per completed call.
-  A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
-  grouping, subqueries) restarts once for each first call of a SQL-language
-  routine, so its work grows with the square of those calls; single-table,
-  `VALUES` and `generate_series` sources hand each call off on its row.
+  A top-level `SELECT` that the retained reader cannot hold (grouping,
+  subqueries, sorts in object-store mode or over non-volatile routine
+  output, joins it would probe through an index)
+  restarts once for each first call of a SQL-language routine, so its work
+  grows with the square of those calls; single-table, `VALUES` and
+  `generate_series` sources, retained nested-loop and hash joins, local-mode
+  sorts (volatile output runs after the sort), and cursors ordered by source
+  columns, hand each call off on its row. Removing the
+  restart needs those shapes retained (above): the general executor cannot run
+  a routine body inside expression evaluation.
 - **Write phases:** BEFORE/INSTEAD triggers, source scans, row locks, partitions,
   constraints, transition tables, rules, data-modifying common table
   expressions (CTEs), COPY, replication apply and deferred triggers. Keep the
@@ -89,20 +95,45 @@ is owned.
   of row progress in multirow updates with saved progress: a child statement must
   see earlier changed rows before the next row is written, and each operation
   keeps its own transition table and firing order.
-- **Results and cursors:** resume more large results row by row; only
-  single-table `SELECT` from a simple Query or an unpaged `Execute` does today.
-  Remaining: paged and named portals (`Execute` with a row limit still buffers
-  into `portal_result_bytes`), `FETCH` output, `COPY TO`, and more retained
-  shapes (joins, sorting, grouping, subqueries, set operations, and more
-  set-returning functions than `generate_series` and one-array `unnest`).
-  Cursors over those shapes still run at `DECLARE`, so a scrollable sorted
-  cursor returns saved values where PostgreSQL evaluates a volatile output
-  list again, and a row-locking cursor over a join, or ordered by an
-  expression that is not a source column, locks its rows at `DECLARE`.
-  PL/pgSQL bound cursor declarations (`c CURSOR FOR ...` in `DECLARE`) are
-  rejected with `0A000`; a `refcursor` opened with `OPEN ... FOR` works. Saving a held cursor at
-  commit yields during storage waits. Cursors keep declared record and domain
-  types after their source query ends.
+- **Results and cursors:** large results resume row by row for `SELECT`
+  from one table or builtin set-returning functions with constant arguments,
+  or a nested-loop or hash join of up to eight such items and `VALUES` lists,
+  with an `ORDER BY` sorted in `plan_build_bytes` in local mode, including
+  paged portals, forward `FETCH` from `NO SCROLL` cursors and
+  `COPY ... TO STDOUT` of such a query or one table. Remaining:
+  - More retained shapes, by the
+    [retained plan tree design](docs/architecture.md#retained-plan-tree-partly-built):
+    index-probed joins, RIGHT and FULL joins, grouping,
+    subqueries, set operations, sorts in object-store mode (external runs
+    with a run reader per stream; a large ordered `SELECT` there still
+    spools), and more
+    set-returning functions than the generator builtins (series, subscripts,
+    one-array `unnest`, regex, and the `json`/`jsonb` `_each`,
+    `_array_elements` and `_object_keys` families, alone or in `ROWS FROM`):
+    function arguments that are not constants, user-defined and other builtin
+    set-returning functions, and column definition lists such as
+    `jsonb_to_recordset(...) AS t(a int)`.
+    Cursors over those shapes run at `DECLARE`: a scrollable cursor ordered by
+    an expression that is not a source column returns saved values where
+    PostgreSQL evaluates a volatile output list again, and a row-locking cursor
+    over a join, or ordered by such an expression, locks its rows at `DECLARE`.
+    Cursors over retained joins already read as they fetch; declared cursors
+    do not yet use the retained sort.
+  - Scrollable cursors whose revisited rows are evaluated again (volatile
+    output or filter), ordered scrollable cursors and held cursors still save
+    their history in `cursor_bytes`. A scrollable cursor moving back rereads
+    its input from the first row; retained position checkpoints would bound
+    that reread.
+  - PL/pgSQL `FOR rec IN c LOOP` over a bound cursor is rejected with
+    `0A000`; it needs a loop frame that opens the cursor (a real portal, so
+    `pg_cursors`, `42P03` for an open cursor and the cursor variable behave as
+    in PostgreSQL), fetches one row per iteration and closes it on every exit,
+    across waits in every procedural executor. Materializing the query like
+    `FOR ... IN SELECT` would differ from PostgreSQL in those three ways.
+  - Saving a held cursor at commit reads storage synchronously: the fourteen
+    callers of the commit path (statement, protocol, procedure and
+    replication commits) do not yet accept a wait before the commit is
+    staged.
 
 **Done when:**
 

@@ -2017,7 +2017,7 @@ fn cursor_trigger_functions_validate_return_when_the_execution_path_finishes() {
 }
 
 #[test]
-fn cursor_retained_scroll_reuses_history_and_extends_only_when_needed() {
+fn cursor_retained_scroll_keeps_one_fetch_and_rereads_with_its_snapshot() {
     use crate::sql::cursor::FetchMotion;
     let config = test_config("cursor-retained-scroll");
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -2038,18 +2038,20 @@ fn cursor_retained_scroll_reuses_history_and_extends_only_when_needed() {
         ["FETCH 0"]
     );
     assert_eq!(session.cursors.produced_rows(slot), 0);
+    // The cursor keeps one fetch's rows; returning to an earlier row reads
+    // the input again from the first row with the cursor's snapshot.
     for (sql, expected, produced) in [
         ("FETCH NEXT FROM scrolling", "20", 1),
         ("FETCH 0 FROM scrolling", "20", 1),
         ("FETCH NEXT FROM scrolling", "40", 2),
-        ("FETCH PRIOR FROM scrolling", "20", 2),
+        ("FETCH PRIOR FROM scrolling", "20", 1),
     ] {
         assert_eq!(
             data_rows(&session.success(&mut engine, sql, true)),
             [expected]
         );
         assert_eq!(session.cursors.produced_rows(slot), produced);
-        assert_eq!(session.cursors.buffered_rows(slot), produced);
+        assert_eq!(session.cursors.buffered_rows(slot), 1);
     }
     assert_eq!(
         command_tags(&session.success(&mut engine, "MOVE FORWARD 2 FROM scrolling", true)),
@@ -2064,7 +2066,7 @@ fn cursor_retained_scroll_reuses_history_and_extends_only_when_needed() {
         data_rows(&session.success(&mut engine, "FETCH LAST FROM scrolling", true)),
         ["80"]
     );
-    assert_eq!(session.cursors.buffered_rows(slot), 4);
+    assert_eq!(session.cursors.buffered_rows(slot), 1);
     assert_eq!(
         data_rows(&session.success(&mut engine, "FETCH BACKWARD ALL FROM scrolling", true)),
         ["60", "40", "20"]
@@ -2986,5 +2988,360 @@ fn locking_cursors_reject_repeatable_read_changes_and_bound_sorted_rows() {
             true
         )),
         ["10"]
+    );
+}
+
+#[test]
+fn ordered_cursors_sort_at_the_first_fetch_and_project_each_row_when_fetched() {
+    let config = test_config("ordered-cursor-projection");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE sorted_calls; CREATE TABLE sorted_rows(id int, g int, v text); \
+         INSERT INTO sorted_rows VALUES (1,2,'a'),(2,1,'b'),(3,2,'c'),(4,1,'d'),(5,3,'e')",
+        true,
+    );
+    // Expected rows come from PostgreSQL 18.6: the output list runs after
+    // the sort, one row per fetch, and equal keys keep scan order.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; DECLARE ordered NO SCROLL CURSOR FOR \
+             SELECT v, nextval('sorted_calls') FROM sorted_rows ORDER BY g, id DESC; \
+             SELECT last_value, is_called FROM sorted_calls; FETCH 2 ordered; \
+             SELECT last_value, is_called FROM sorted_calls; FETCH ALL ordered; COMMIT",
+            true
+        )),
+        ["1|f", "d|1", "b|2", "2|t", "c|3", "a|4", "e|5"]
+    );
+    // A scrollable sorted cursor evaluates a revisited row's output again;
+    // its filter ran once, before the sort.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT setval('sorted_calls', 100, false); BEGIN; \
+             DECLARE scrolled SCROLL CURSOR FOR \
+             SELECT v, nextval('sorted_calls') FROM sorted_rows WHERE id > 1 ORDER BY id; \
+             FETCH NEXT scrolled; FETCH NEXT scrolled; FETCH PRIOR scrolled; \
+             FETCH LAST scrolled; FETCH ABSOLUTE 1 scrolled; COMMIT",
+            true
+        )),
+        ["100", "b|100", "c|101", "b|102", "e|106", "b|107"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; DECLARE by_group CURSOR FOR SELECT v FROM sorted_rows ORDER BY g; \
+             FETCH ALL by_group; FETCH BACKWARD 2 by_group; \
+             DECLARE filtered SCROLL CURSOR FOR \
+             SELECT v FROM sorted_rows WHERE random() < 2 ORDER BY id DESC; \
+             FETCH 2 filtered; FETCH PRIOR filtered; \
+             SELECT is_scrollable FROM pg_cursors WHERE name = 'filtered'; COMMIT",
+            true
+        )),
+        ["b", "d", "a", "c", "e", "e", "c", "e", "d", "e", "t"]
+    );
+    // LIMIT and OFFSET apply after the sort; a held cursor saves its sorted
+    // rows at commit.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; DECLARE windowed NO SCROLL CURSOR FOR              SELECT v FROM sorted_rows ORDER BY id DESC LIMIT 2 OFFSET 1; FETCH ALL windowed;              DECLARE scroll_window SCROLL CURSOR FOR              SELECT v, nextval('sorted_calls') FROM sorted_rows ORDER BY id LIMIT 2 OFFSET 1;              FETCH ALL scroll_window; FETCH PRIOR scroll_window; COMMIT;              DECLARE held CURSOR WITH HOLD FOR SELECT v FROM sorted_rows ORDER BY g DESC, id;              FETCH 2 held; FETCH ALL held; CLOSE held",
+            true
+        )),
+        [
+            "d", "c", "b|109", "c|110", "c|110", "e", "a", "c", "b", "d"
+        ]
+    );
+}
+
+#[test]
+fn generate_subscripts_cursors_produce_rows_as_they_are_fetched() {
+    let config = test_config("subscript-cursor-generator");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // Expected rows come from PostgreSQL 18.6.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE SEQUENCE subscript_calls START 50; BEGIN; \
+             DECLARE subs NO SCROLL CURSOR FOR SELECT s, nextval('subscript_calls') \
+             FROM generate_subscripts('[3:5]={a,b,c}'::text[], 1, true) s; \
+             SELECT last_value, is_called FROM subscript_calls; FETCH 2 subs; FETCH ALL subs; \
+             DECLARE missing CURSOR FOR SELECT * FROM generate_subscripts(ARRAY[1,2], 2); \
+             FETCH ALL missing; \
+             DECLARE forward SCROLL CURSOR FOR \
+             SELECT s FROM generate_subscripts(ARRAY[[1,2],[3,4]], 2) s; \
+             FETCH ALL forward; FETCH PRIOR forward; \
+             SELECT is_scrollable FROM pg_cursors WHERE name = 'forward'; COMMIT",
+            true
+        )),
+        ["50|f", "5|50", "4|51", "3|52", "1", "2", "2", "t"]
+    );
+}
+
+#[test]
+fn regex_json_and_multi_array_cursors_produce_rows_as_they_are_fetched() {
+    let config = test_config("multi-value-cursor-generator");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // Expected rows come from PostgreSQL 18.6: each nextval runs when its row
+    // is fetched, after the sequence was read untouched.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE SEQUENCE gen_calls START 70; BEGIN; \
+             DECLARE u NO SCROLL CURSOR FOR SELECT a, b, nextval('gen_calls') \
+             FROM unnest(ARRAY[1,2,3], ARRAY['x','y']) AS t(a, b); \
+             SELECT last_value, is_called FROM gen_calls; FETCH 2 u; FETCH ALL u; \
+             DECLARE m NO SCROLL CURSOR FOR SELECT m, nextval('gen_calls') \
+             FROM regexp_matches('a1b22c333', '([a-z])(\\d+)', 'g') m; \
+             FETCH 1 m; FETCH ALL m; \
+             DECLARE sp CURSOR FOR SELECT * FROM regexp_split_to_table('one, two,,three', ',\\s*'); \
+             FETCH ALL sp; FETCH PRIOR sp; \
+             DECLARE je NO SCROLL CURSOR FOR SELECT key, value, nextval('gen_calls') \
+             FROM json_each('{\"b\": [1, 2], \"a\": \"x\", \"b\": null}'); \
+             FETCH ALL je; CLOSE u; CLOSE m; CLOSE sp; CLOSE je; \
+             DECLARE jbe CURSOR FOR SELECT * FROM jsonb_each_text('{\"b\": [1,  2], \"a\": \"x\\ty\", \"c\": null, \"b\": 3}'); \
+             FETCH ALL jbe; \
+             DECLARE ae CURSOR FOR SELECT * FROM json_array_elements_text('[1, \"two\", null, {\"k\" :  1}]'); \
+             FETCH ALL ae; \
+             DECLARE ab CURSOR FOR SELECT * FROM jsonb_array_elements('[1.50, \"two\", null, {\"k\" :  1}]'); \
+             FETCH ALL ab; CLOSE jbe; CLOSE ae; \
+             DECLARE k CURSOR FOR SELECT * FROM jsonb_object_keys('{\"bb\": 1, \"a\": 2, \"bb\": 3}'); \
+             FETCH ALL k; \
+             DECLARE k2 CURSOR FOR SELECT * FROM json_object_keys('{\"bb\": 1, \"a\": 2, \"bb\": 3}'); \
+             FETCH ALL k2; COMMIT",
+            true
+        )),
+        [
+            "70|f",
+            "1|x|70",
+            "2|y|71",
+            "3|NULL|72",
+            "{a,1}|73",
+            "{b,22}|74",
+            "{c,333}|75",
+            "one",
+            "two",
+            "",
+            "three",
+            "three",
+            "b|[1, 2]|76",
+            "a|\"x\"|77",
+            "b|null|78",
+            "a|x\ty",
+            "b|3",
+            "c|NULL",
+            "1",
+            "two",
+            "NULL",
+            "{\"k\" :  1}",
+            "1.50",
+            "\"two\"",
+            "null",
+            "{\"k\": 1}",
+            "a",
+            "bb",
+            "bb",
+            "a",
+            "bb",
+        ]
+    );
+}
+
+#[test]
+fn rows_from_and_ordinality_cursors_advance_their_calls_in_lockstep() {
+    let config = test_config("rows-from-cursor-generator");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // Expected rows come from PostgreSQL 18.6.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE SEQUENCE ord_calls START 5; BEGIN; \
+             DECLARE r NO SCROLL CURSOR FOR SELECT *, nextval('ord_calls') FROM ROWS FROM \
+             (json_each('{\"a\":1,\"b\":2}'), regexp_split_to_table('x-y-z', '-'), \
+             generate_series(1, 2)) WITH ORDINALITY AS t(k, v, piece, n, ord); \
+             SELECT last_value, is_called FROM ord_calls; FETCH 1 r; FETCH ALL r; \
+             DECLARE o SCROLL CURSOR FOR \
+             SELECT * FROM jsonb_array_elements_text('[\"p\", \"q\"]') WITH ORDINALITY; \
+             FETCH ALL o; FETCH PRIOR o; FETCH FIRST o; COMMIT",
+            true
+        )),
+        [
+            "5|f",
+            "a|1|x|1|1|5",
+            "b|2|y|2|2|6",
+            "NULL|NULL|z|NULL|3|7",
+            "p|1",
+            "q|2",
+            "q|2",
+            "p|1",
+        ]
+    );
+    // Argument errors surface at the first FETCH, before any row.
+    for (query, code) in [
+        ("json_each('[1]')", sqlstate::INVALID_PARAMETER_VALUE),
+        (
+            "regexp_matches('abc', '(', 'g')",
+            sqlstate::INVALID_REGULAR_EXPRESSION,
+        ),
+        (
+            "regexp_split_to_table('abc', 'b', 'g')",
+            sqlstate::INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "jsonb_object_keys('[1]')",
+            sqlstate::INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "json_array_elements('{\"a\":1}')",
+            sqlstate::INVALID_PARAMETER_VALUE,
+        ),
+    ] {
+        session.success(
+            &mut engine,
+            &format!("BEGIN; DECLARE failing CURSOR FOR SELECT * FROM {query}"),
+            true,
+        );
+        let reply = session.execute(&mut engine, "FETCH 1 failing", true);
+        assert_eq!(error_sqlstates(&reply), [code], "{query}");
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+}
+
+#[test]
+fn scroll_cursors_keep_one_fetch_of_rows_and_reread_their_input_to_move_back() {
+    // Every visited row of these cursors exceeds cursor_bytes; each FETCH's
+    // own rows fit it. Expected rows come from PostgreSQL 18.6.
+    let mut config = test_config("windowed-scroll-cursor");
+    config.cursor_bytes = 1024;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE TABLE win(id integer, payload text); INSERT INTO win SELECT g, \
+             repeat('x', 40) FROM generate_series(1,400) g; BEGIN; DECLARE c CURSOR FOR \
+             SELECT id, length(payload) FROM win WHERE id % 2 = 0; FETCH 3 FROM c; FETCH 3 \
+             FROM c; FETCH PRIOR FROM c; FETCH BACKWARD 2 FROM c; MOVE 150 FROM c; FETCH \
+             RELATIVE -3 FROM c; FETCH ABSOLUTE -1 FROM c; FETCH ABSOLUTE 2 FROM c; FETCH \
+             LAST FROM c; FETCH NEXT FROM c; FETCH PRIOR FROM c; FETCH FIRST FROM c; FETCH \
+             0 FROM c; MOVE ABSOLUTE 120 FROM c; FETCH BACKWARD 3 FROM c; FETCH 2 FROM c; \
+             SELECT is_scrollable FROM pg_cursors WHERE name = 'c'; DECLARE g CURSOR FOR \
+             SELECT * FROM generate_series(1, 400) WITH ORDINALITY; MOVE 300 FROM g; FETCH \
+             BACKWARD 2 FROM g; FETCH ABSOLUTE 5 FROM g; FETCH RELATIVE 390 FROM g; DECLARE \
+             h CURSOR WITH HOLD FOR SELECT id FROM win WHERE id > 390; MOVE 7 FROM h; \
+             COMMIT; FETCH PRIOR FROM h; FETCH FIRST FROM h; FETCH ALL FROM h; CLOSE h;",
+            true
+        )),
+        [
+            "2|40", "4|40", "6|40", "8|40", "10|40", "12|40", "10|40", "8|40", "6|40", "300|40",
+            "400|40", "4|40", "400|40", "400|40", "2|40", "2|40", "238|40", "236|40", "234|40",
+            "236|40", "238|40", "t", "299|299", "298|298", "5|5", "395|395", "396", "391", "392",
+            "393", "394", "395", "396", "397", "398", "399", "400",
+        ]
+    );
+}
+
+#[test]
+fn join_cursors_evaluate_rows_per_fetch_and_materialize_scrolled_output() {
+    use crate::sql::cursor::FetchMotion;
+    let config = test_config("cursor-retained-joins");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // PostgreSQL 18.6 returns the rows below for these statements.
+    session.success(
+        &mut engine,
+        "CREATE TABLE ja(id int, v text); INSERT INTO ja VALUES (1,'a'),(2,'b'),(3,'c'); \
+         CREATE TABLE jb(k int, w text); INSERT INTO jb VALUES (1,'x'),(3,'y'); \
+         CREATE SEQUENCE js; BEGIN; \
+         DECLARE c CURSOR FOR SELECT nextval('js'), ja.id, jb.w FROM ja JOIN jb \
+         ON jb.k = ja.id + 0",
+        true,
+    );
+    // The join is read as the cursor fetches, not at DECLARE.
+    let (slot, _) = session
+        .cursors
+        .read_request("c", FetchMotion::Count(1), false)
+        .unwrap()
+        .expect("retained join cursor");
+    assert_eq!(session.cursors.produced_rows(slot), 0);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT is_scrollable FROM pg_cursors WHERE name='c'; \
+             SELECT last_value, is_called FROM js; FETCH 1 FROM c; \
+             SELECT last_value FROM js; FETCH ALL FROM c; CLOSE c",
+            true
+        )),
+        ["f", "1|f", "1|1|x", "1", "2|3|y"]
+    );
+    // A scrollable join returns its saved output on revisit, as
+    // PostgreSQL's Material node does: nextval is not called again.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "DECLARE s SCROLL CURSOR FOR SELECT nextval('js'), ja.id, jb.w FROM ja \
+             LEFT JOIN jb ON jb.k = ja.id + 0; \
+             SELECT is_scrollable FROM pg_cursors WHERE name='s'; FETCH 2 FROM s; \
+             FETCH PRIOR FROM s; FETCH ALL FROM s; FETCH FIRST FROM s; \
+             SELECT last_value FROM js; CLOSE s",
+            true
+        )),
+        [
+            "t", "3|1|x", "4|2|NULL", "3|1|x", "4|2|NULL", "5|3|y", "3|1|x", "5"
+        ]
+    );
+    // Without volatile output a scrollable join rereads its input to move
+    // back.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "DECLARE p SCROLL CURSOR FOR SELECT ja.id, jb.w FROM ja LEFT JOIN jb \
+             ON jb.k = ja.id + 0 WHERE ja.id > 1; \
+             FETCH ALL FROM p; FETCH ABSOLUTE 1 FROM p; FETCH RELATIVE 1 FROM p; \
+             FETCH BACKWARD 1 FROM p; CLOSE p; COMMIT",
+            true
+        )),
+        ["2|NULL", "3|y", "2|NULL", "3|y", "2|NULL"]
+    );
+    // A column equality is a hash join, as in the general executor: its
+    // build table stays while the scrollable cursor rereads its probe side.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; DECLARE h CURSOR FOR SELECT ja.id, jb.w FROM ja LEFT JOIN jb \
+             ON jb.k = ja.id; SELECT is_scrollable FROM pg_cursors WHERE name='h'; \
+             FETCH 2 FROM h; FETCH ALL FROM h; \
+             DECLARE h2 SCROLL CURSOR FOR SELECT ja.id, jb.w FROM ja JOIN jb \
+             ON jb.k = ja.id; FETCH ALL FROM h2; FETCH FIRST FROM h2; \
+             FETCH NEXT FROM h2; FETCH PRIOR FROM h2; COMMIT",
+            true
+        )),
+        [
+            "f", "1|x", "2|NULL", "3|y", "1|x", "3|y", "1|x", "3|y", "1|x"
+        ]
+    );
+    // A function source on the nullable side of a RIGHT or FULL join is
+    // read once, not per left-hand row.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT * FROM (VALUES (1)) v RIGHT JOIN generate_series(1, 3) g \
+             ON v.column1 = g; \
+             SELECT * FROM (VALUES (1), (2)) v(x) FULL JOIN generate_series(2, 3) g \
+             ON x = g ORDER BY 1, 2",
+            true
+        )),
+        ["1|1", "NULL|2", "NULL|3", "1|NULL", "2|2", "NULL|3"]
     );
 }

@@ -1232,12 +1232,17 @@ fn bind_exception_variables<'a>(
         | TriggerStatement::SelectInto(TriggerSelectInto { query, .. }) => {
             site(Kind::Query, core::ptr::from_ref(query) as usize)
         }
-        TriggerStatement::Utility { source, .. }
-        | TriggerStatement::Dml { source, .. }
-        | TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
+        TriggerStatement::Utility { source, .. } | TriggerStatement::Dml { source, .. } => {
+            site(Kind::Statement, source.as_ptr() as usize)
+        }
+        TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
             query: PlpgsqlCursorQuery::Static(source),
+            arguments,
             ..
-        }) => site(Kind::Statement, source.as_ptr() as usize),
+        }) => {
+            site(Kind::Statement, source.as_ptr() as usize)
+                || arguments.iter().any(|argument| expression(argument.value))
+        }
         TriggerStatement::DynamicQuery(query)
         | TriggerStatement::ReturnDynamicQuery(query)
         | TriggerStatement::DynamicSelectInto(PlpgsqlDynamicSelectInto { query, .. })

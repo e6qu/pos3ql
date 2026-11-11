@@ -272,9 +272,7 @@ with `0A000` where PostgreSQL changes the catalog entry; `information_schema`
 domains such as `cardinal_number` do not exist. An untyped parameter is typed
 `text` instead of from the called function's signature, so `SELECT abs($1)`
 prepared without parameter types fails with `42883` (`function abs(text) does
-not exist`) where PostgreSQL infers `integer`. PostgreSQL 17 and 18 array
-functions `array_reverse`, `array_sort`, `array_sample` and `array_shuffle` do
-not exist. A SQL function whose earlier
+not exist`) where PostgreSQL infers `integer`. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

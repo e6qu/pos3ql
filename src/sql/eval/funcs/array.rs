@@ -383,6 +383,10 @@ pub(crate) fn dispatch<'a>(
                 | "array_to_string"
                 | "array_fill"
                 | "string_to_array"
+                | "array_reverse"
+                | "array_sort"
+                | "array_sample"
+                | "array_shuffle"
         )
     {
         return None;
@@ -1053,6 +1057,176 @@ pub(crate) fn dispatch<'a>(
                 }
                 Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(out) }))
             }
+            // PostgreSQL 18's first-dimension reorderings: each item along the
+            // first dimension (a sub-array of a multidimensional array) moves
+            // as one block.
+            "array_reverse" | "array_sort" | "array_sample" | "array_shuffle" => {
+                let (minimum, maximum) = match name {
+                    "array_sort" => (1, 3),
+                    "array_sample" => (2, 2),
+                    _ => (1, 1),
+                };
+                if star || !(minimum..=maximum).contains(&args.len()) {
+                    return Err(arity_err(name, args.len()));
+                }
+                let mut values = [Datum::Null; 3];
+                for (value, argument) in values.iter_mut().zip(args) {
+                    *value = eval_full(argument, arena, params, row, hooks)?;
+                }
+                if values[..args.len()].iter().any(Datum::is_null) {
+                    return Ok(Datum::Null);
+                }
+                let (element, raw) = match compatible_array_input(values[0], arena)? {
+                    Datum::Array { element, raw } => (element, raw),
+                    other => return Err(type_mismatch(name, &other)),
+                };
+                let shape = array::shape(raw).expect("array datum invariant");
+                let count = shape.dimension(0).unwrap_or(0);
+                if shape.dimension_count() == 0 || count == 0 {
+                    if name == "array_sample" {
+                        let Datum::Int4(size) = cast_to(values[1], ColType::Int4, arena)? else {
+                            unreachable!("integer cast")
+                        };
+                        if size != 0 {
+                            return Err(sample_size_error(0));
+                        }
+                    }
+                    return Ok(values[0]);
+                }
+                let block = shape.element_count() / count;
+                let items = array::alloc_items(arena, shape.element_count())?;
+                for (item, value) in items.iter_mut().zip(array::elements(raw, element)) {
+                    *item = value;
+                }
+                let order = arena
+                    .alloc_slice_with(count, |index| index)
+                    .map_err(|_| arena_full())?;
+                let mut kept = count;
+                match name {
+                    "array_reverse" => order.reverse(),
+                    "array_shuffle" | "array_sample" => {
+                        if name == "array_sample" {
+                            let Datum::Int4(size) = cast_to(values[1], ColType::Int4, arena)?
+                            else {
+                                unreachable!("integer cast")
+                            };
+                            kept = usize::try_from(size)
+                                .ok()
+                                .filter(|size| *size <= count)
+                                .ok_or_else(|| sample_size_error(count))?;
+                        }
+                        // PostgreSQL's partial Fisher-Yates over the session
+                        // random sequence (`setseed` repeats it).
+                        for index in 0..kept {
+                            let draw = crate::sql::guc::active_random()?;
+                            let span = (count - index) as f64;
+                            let pick = index + ((draw * span) as usize).min(count - index - 1);
+                            order.swap(index, pick);
+                        }
+                    }
+                    _ => {
+                        let descending = matches!(values[1], Datum::Bool(true));
+                        let nulls_first = match args.len() {
+                            3 => matches!(values[2], Datum::Bool(true)),
+                            _ => descending,
+                        };
+                        // PostgreSQL looks up the ordering only to compare two items.
+                        if count > 1 && !element.to_coltype().has_builtin_ordering() {
+                            return Err(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "could not identify a comparison function for type {}",
+                                element.to_coltype().name()
+                            ));
+                        }
+                        let collation = super::super::resolve_comparison_collation(
+                            args[0],
+                            args[0],
+                            row,
+                            hooks.catalog,
+                        )?;
+                        let compare =
+                            |left: usize, right: usize| -> Result<core::cmp::Ordering, SqlError> {
+                                for offset in 0..block {
+                                    let (a, b) = (
+                                        items[left * block + offset],
+                                        items[right * block + offset],
+                                    );
+                                    let order = match (a.is_null(), b.is_null()) {
+                                        (true, true) => core::cmp::Ordering::Equal,
+                                        (true, false) if block == 1 => {
+                                            return Ok(if nulls_first {
+                                                core::cmp::Ordering::Less
+                                            } else {
+                                                core::cmp::Ordering::Greater
+                                            });
+                                        }
+                                        (false, true) if block == 1 => {
+                                            return Ok(if nulls_first {
+                                                core::cmp::Ordering::Greater
+                                            } else {
+                                                core::cmp::Ordering::Less
+                                            });
+                                        }
+                                        // Inside sub-arrays NULL sorts last, as in array comparison.
+                                        (true, false) => core::cmp::Ordering::Greater,
+                                        (false, true) => core::cmp::Ordering::Less,
+                                        (false, false) => {
+                                            super::super::operators::compare_datums_with_catalog(
+                                                collation,
+                                                hooks.catalog,
+                                                &a,
+                                                &b,
+                                            )?
+                                        }
+                                    };
+                                    if order.is_ne() {
+                                        return Ok(if descending {
+                                            order.reverse()
+                                        } else {
+                                            order
+                                        });
+                                    }
+                                }
+                                Ok(core::cmp::Ordering::Equal)
+                            };
+                        // Insertion sort keeps memory fixed and stops at the first error.
+                        for next in 1..count {
+                            let mut at = next;
+                            while at > 0 && compare(order[at - 1], order[at])?.is_gt() {
+                                order.swap(at - 1, at);
+                                at -= 1;
+                            }
+                        }
+                    }
+                }
+                let output = array::alloc_items(arena, kept * block)?;
+                for (slot, index) in order[..kept].iter().enumerate() {
+                    output[slot * block..(slot + 1) * block]
+                        .copy_from_slice(&items[index * block..(index + 1) * block]);
+                }
+                let mut dimensions = [0usize; array::MAX_DIMENSIONS];
+                let mut lower_bounds = [1i32; array::MAX_DIMENSIONS];
+                for index in 0..shape.dimension_count() {
+                    dimensions[index] = shape.dimension(index).unwrap_or(0);
+                    lower_bounds[index] = shape.lower_bound(index).unwrap_or(1);
+                }
+                dimensions[0] = kept;
+                if name == "array_sample" {
+                    lower_bounds[0] = 1;
+                }
+                let dimension_count = shape.dimension_count();
+                Ok(Datum::Array {
+                    element,
+                    raw: array::build_shaped(
+                        output,
+                        array::Shape::new(
+                            &dimensions[..dimension_count],
+                            &lower_bounds[..dimension_count],
+                        )?,
+                        arena,
+                    )?,
+                })
+            }
             "array_fill" => {
                 if args.len() != 2 && args.len() != 3 || star {
                     return Err(arity_err(name, args.len()));
@@ -1207,4 +1381,12 @@ fn require_search_equality(
         ));
     }
     Ok(())
+}
+
+fn sample_size_error(count: usize) -> SqlError {
+    sql_err!(
+        sqlstate::INVALID_PARAMETER_VALUE,
+        "sample size must be between 0 and {}",
+        count
+    )
 }

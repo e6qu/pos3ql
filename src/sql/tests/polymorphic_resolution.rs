@@ -260,3 +260,48 @@ fn sleep_functions_have_postgresql_catalog_contracts() {
         ]
     );
 }
+
+/// PostgreSQL 18's `array_reverse`, `array_sort`, `array_sample` and
+/// `array_shuffle` reorder items along the first dimension.
+#[test]
+fn first_dimension_array_reorderings_match_postgresql() {
+    assert_eq!(
+        rows(&[
+            "SELECT array_reverse('[2:4]={1,2,3}'::int[]), array_reverse('{{1,2},{3,4}}'::int[]), \
+                    array_reverse('{}'::int[]), array_reverse(NULL::int[]) IS NULL",
+            "SELECT array_sort('{3,null,1,2}'::int[]), array_sort('{3,null,1,2}'::int[], true), \
+                    array_sort('{3,null,1,2}'::int[], true, false), \
+                    array_sort('{3,null,1,2}'::int[], false, true), \
+                    array_sort('[2:4]={c,a,b}'::text[]), array_sort('{{3,4},{1,2}}'::int[])",
+            "SELECT array_sort(ARRAY['(1,2)'::point]), \
+                    array_sort(array_sample('[2:4]={1,2,3}'::int[], 3)), \
+                    array_dims(array_sample('[2:4]={1,2,3}'::int[], 2)), \
+                    array_dims(array_shuffle('[2:4]={1,2,3}'::int[])), \
+                    array_sort(array_shuffle(ARRAY[3,1,2])), array_sample('{1}'::int[], 0)",
+        ]),
+        [
+            vec!["[2:4]={3,2,1}|{{3,4},{1,2}}|{}|t"],
+            vec!["{1,2,3,NULL}|{NULL,3,2,1}|{3,2,1,NULL}|{NULL,1,2,3}|[2:4]={a,b,c}|{{1,2},{3,4}}"],
+            vec!["{\"(1,2)\"}|{1,2,3}|[1:2]|[2:4]|{1,2,3}|{}"],
+        ]
+    );
+    use super::routine_identity_diagnostics::check;
+    check(&[
+        (
+            "SELECT array_sort(ARRAY['(1,2)'::point, '(0,1)'])",
+            &[(
+                'E',
+                "0A000",
+                "could not identify a comparison function for type point",
+            )],
+        ),
+        (
+            "SELECT array_sample('{1,2,3}'::int[], 4)",
+            &[('E', "22023", "sample size must be between 0 and 3")],
+        ),
+        (
+            "SELECT array_sample('{1,2,3}'::int[], -1)",
+            &[('E', "22023", "sample size must be between 0 and 3")],
+        ),
+    ]);
+}

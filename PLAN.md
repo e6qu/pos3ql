@@ -276,7 +276,6 @@ listed built-in that is neither implemented nor an operator, cast or input
 function fails with `0A000` when called; `pg_shdepend` omits other
 databases' rows, and `DROP ROLE`'s `DETAIL` orders owners by OID rather than
 catalog insertion;
-`pg_describe_object` of a built-in operator class or family is empty;
 `pg_attrdef` OIDs derive from
 table slots rather than creation identities; built-in operators, types and other
 catalog objects have no shipped `pg_description` text (built-in routines

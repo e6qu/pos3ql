@@ -670,6 +670,56 @@ pub(crate) fn describe_object_text<'a>(
     if class_id == 3256 {
         return policy_description(catalog, object, arena).map(Some);
     }
+    if class_id == 2605
+        && let Some((source, target)) = catalog.cast_type_oids(object_id)
+    {
+        let name = |oid: i32| match super::super::regtype_of_oid_with_catalog(
+            i64::from(oid),
+            Some(catalog),
+            arena,
+        )? {
+            Datum::Regtype { name, .. } => Ok(name),
+            _ => Err(arena_full()),
+        };
+        let (source, target) = (name(source)?, name(target)?);
+        return described(
+            stack_format!(1024, "cast from {} to {}", source, target),
+            arena,
+        )
+        .map(Some);
+    }
+    if class_id == 2616 || class_id == 2753 {
+        let visible = if class_id == 2616 {
+            catalog.operator_class_is_visible(object_id)
+        } else {
+            catalog.operator_family_is_visible(object_id)
+        };
+        let name = crate::sql::types::acl_identifier(
+            object.object_name.as_ref().map_or("", |name| name.as_str()),
+        );
+        let name = if visible == Some(true) {
+            stack_format!(130, "{}", name.as_str())
+        } else {
+            let schema = crate::sql::types::acl_identifier(
+                object
+                    .schema_name
+                    .as_ref()
+                    .map_or("", |schema| schema.as_str()),
+            );
+            stack_format!(130, "{}.{}", schema.as_str(), name.as_str())
+        };
+        return described(
+            stack_format!(
+                1024,
+                "{} {} for access method {}",
+                object.object_type.as_str(),
+                name.as_str(),
+                object.address_args[0].as_str()
+            ),
+            arena,
+        )
+        .map(Some);
+    }
     if let Some(text) = attached_object_description(catalog, object, arena)? {
         return Ok(Some(text));
     }

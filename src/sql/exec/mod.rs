@@ -14893,11 +14893,15 @@ pub(crate) fn drop_schema(
                 let definition = storage.operator_family_for(*family, txn.txid);
                 let _ = write!(out, "operator family ");
                 write_rel(out, &definition.schema, &definition.name);
+                // User-defined operator classes and families are btree only.
+                let _ = write!(out, " for access method btree");
             }
             SchemaObject::OperatorClass(class) => {
                 let definition = storage.operator_class_for(*class, txn.txid);
                 let _ = write!(out, "operator class ");
                 write_rel(out, &definition.schema, &definition.name);
+                // User-defined operator classes and families are btree only.
+                let _ = write!(out, " for access method btree");
             }
             SchemaObject::Statistics(statistics) => {
                 let definition = storage

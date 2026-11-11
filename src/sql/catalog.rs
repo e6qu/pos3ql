@@ -23489,7 +23489,8 @@ fn pg_depend<'a>(
         let source = catalog_routine_result_oid(storage, txid, cast.source)?;
         let target = catalog_routine_result_oid(storage, txid, cast.target)?;
         for type_oid in [source, target] {
-            if ColType::from_oid(type_oid).is_none() {
+            // Built-in types are pinned and have no dependency rows.
+            if crate::storage::NamedTypeKind::from_oid(type_oid).is_some() {
                 push(PG_CAST_OID, cast.oid(), PG_TYPE_OID, type_oid, 0, "n")?;
             }
         }
@@ -25556,6 +25557,132 @@ fn pg_operator<'a>(
 
 // PostgreSQL 18.6 bootstrap metadata; reference query and hashes are retained
 // in tests/external/reference/2026-11-03-input-plans/planner-metadata-reference.zip.
+/// PostgreSQL's built-in BRIN operator families.
+const BUILTIN_BRIN_FAMILIES: &[(i32, &str)] = &[
+    (4054, "integer_minmax_ops"),
+    (4055, "numeric_minmax_ops"),
+    (4056, "text_minmax_ops"),
+    (4058, "timetz_minmax_ops"),
+    (4059, "datetime_minmax_ops"),
+    (4062, "char_minmax_ops"),
+    (4064, "bytea_minmax_ops"),
+    (4065, "name_minmax_ops"),
+    (4068, "oid_minmax_ops"),
+    (4069, "tid_minmax_ops"),
+    (4070, "float_minmax_ops"),
+    (4074, "macaddr_minmax_ops"),
+    (4075, "network_minmax_ops"),
+    (4076, "bpchar_minmax_ops"),
+    (4077, "time_minmax_ops"),
+    (4078, "interval_minmax_ops"),
+    (4079, "bit_minmax_ops"),
+    (4080, "varbit_minmax_ops"),
+    (4081, "uuid_minmax_ops"),
+    (4082, "pg_lsn_minmax_ops"),
+    (4102, "network_inclusion_ops"),
+    (4103, "range_inclusion_ops"),
+    (4104, "box_inclusion_ops"),
+    (4109, "macaddr8_minmax_ops"),
+    (4572, "integer_bloom_ops"),
+    (4573, "text_bloom_ops"),
+    (4574, "numeric_bloom_ops"),
+    (4575, "timetz_bloom_ops"),
+    (4576, "datetime_bloom_ops"),
+    (4577, "char_bloom_ops"),
+    (4578, "bytea_bloom_ops"),
+    (4579, "name_bloom_ops"),
+    (4580, "oid_bloom_ops"),
+    (4581, "tid_bloom_ops"),
+    (4582, "float_bloom_ops"),
+    (4583, "macaddr_bloom_ops"),
+    (4584, "macaddr8_bloom_ops"),
+    (4585, "network_bloom_ops"),
+    (4586, "bpchar_bloom_ops"),
+    (4587, "time_bloom_ops"),
+    (4588, "interval_bloom_ops"),
+    (4589, "uuid_bloom_ops"),
+    (4590, "pg_lsn_bloom_ops"),
+    (4602, "integer_minmax_multi_ops"),
+    (4603, "numeric_minmax_multi_ops"),
+    (4604, "timetz_minmax_multi_ops"),
+    (4605, "datetime_minmax_multi_ops"),
+    (4606, "oid_minmax_multi_ops"),
+    (4607, "tid_minmax_multi_ops"),
+    (4608, "float_minmax_multi_ops"),
+    (4609, "macaddr_minmax_multi_ops"),
+    (4610, "macaddr8_minmax_multi_ops"),
+    (4611, "network_minmax_multi_ops"),
+    (4612, "time_minmax_multi_ops"),
+    (4613, "interval_minmax_multi_ops"),
+    (4614, "uuid_minmax_multi_ops"),
+    (4615, "pg_lsn_minmax_multi_ops"),
+];
+
+/// A built-in operator family's access method and name.
+pub(crate) fn builtin_operator_family(oid: i32) -> Option<(i32, &'static str)> {
+    BUILTIN_TREE_HASH_FAMILIES
+        .iter()
+        .map(|&(family, method, name)| (family, method, name))
+        .chain(
+            BUILTIN_BRIN_FAMILIES
+                .iter()
+                .map(|&(family, name)| (family, 3580, name)),
+        )
+        .chain(
+            super::gist_catalog::FAMILIES
+                .iter()
+                .map(|&(family, name)| (family, 783, name)),
+        )
+        .chain(
+            super::gin_catalog::FAMILIES
+                .iter()
+                .map(|&(family, name)| (family, 2742, name)),
+        )
+        .chain(
+            super::spgist_catalog::FAMILIES
+                .iter()
+                .map(|&(family, name)| (family, 4000, name)),
+        )
+        .find_map(|(family, method, name)| (family == oid).then_some((method, name)))
+}
+
+/// A built-in operator class's access method and name.
+pub(crate) fn builtin_operator_class(oid: i32) -> Option<(i32, &'static str)> {
+    if let Some(class) = BUILTIN_TREE_HASH_CLASSES
+        .iter()
+        .find(|class| class.0 == oid)
+    {
+        return Some((class.1, class.2));
+    }
+    if let Some(class) = super::types::BrinOperatorClass::from_oid(oid) {
+        return Some((3580, class.name()));
+    }
+    if let Some(class) = super::types::GistOperatorClass::from_oid(oid) {
+        return Some((783, class.name()));
+    }
+    if let Some(class) = super::types::GinOperatorClass::from_oid(oid) {
+        return Some((2742, class.name()));
+    }
+    super::types::SpGistOperatorClass::from_oid(oid).map(|class| (4000, class.name()))
+}
+
+/// The source and target type OIDs of a built-in or visible user cast.
+pub(crate) fn cast_type_oids(storage: &Storage, txid: u32, oid: i32) -> Option<(i32, i32)> {
+    if let Some(cast) = builtin_properties::CASTS
+        .iter()
+        .find(|cast| cast.oid == oid)
+    {
+        return Some((cast.source, cast.target));
+    }
+    let (_, cast) = storage
+        .casts_visible_to(txid)
+        .find(|(_, cast)| cast.oid() == oid)?;
+    Some((
+        catalog_routine_result_oid(storage, txid, cast.source).ok()?,
+        catalog_routine_result_oid(storage, txid, cast.target).ok()?,
+    ))
+}
+
 const BUILTIN_TREE_HASH_CLASSES: &[(i32, i32, &str, i32, i32, bool, i32)] = &[
     (1978, 403, "int4_ops", 1976, 23, true, 0),
     (1979, 403, "int2_ops", 1976, 21, true, 0),
@@ -25741,65 +25868,7 @@ fn pg_opfamily<'a>(
         )?;
         count += 1;
     }
-    for (oid, name) in [
-        (4054, "integer_minmax_ops"),
-        (4055, "numeric_minmax_ops"),
-        (4056, "text_minmax_ops"),
-        (4058, "timetz_minmax_ops"),
-        (4059, "datetime_minmax_ops"),
-        (4062, "char_minmax_ops"),
-        (4064, "bytea_minmax_ops"),
-        (4065, "name_minmax_ops"),
-        (4068, "oid_minmax_ops"),
-        (4069, "tid_minmax_ops"),
-        (4070, "float_minmax_ops"),
-        (4074, "macaddr_minmax_ops"),
-        (4075, "network_minmax_ops"),
-        (4076, "bpchar_minmax_ops"),
-        (4077, "time_minmax_ops"),
-        (4078, "interval_minmax_ops"),
-        (4079, "bit_minmax_ops"),
-        (4080, "varbit_minmax_ops"),
-        (4081, "uuid_minmax_ops"),
-        (4082, "pg_lsn_minmax_ops"),
-        (4102, "network_inclusion_ops"),
-        (4103, "range_inclusion_ops"),
-        (4104, "box_inclusion_ops"),
-        (4109, "macaddr8_minmax_ops"),
-        (4572, "integer_bloom_ops"),
-        (4573, "text_bloom_ops"),
-        (4574, "numeric_bloom_ops"),
-        (4575, "timetz_bloom_ops"),
-        (4576, "datetime_bloom_ops"),
-        (4577, "char_bloom_ops"),
-        (4578, "bytea_bloom_ops"),
-        (4579, "name_bloom_ops"),
-        (4580, "oid_bloom_ops"),
-        (4581, "tid_bloom_ops"),
-        (4582, "float_bloom_ops"),
-        (4583, "macaddr_bloom_ops"),
-        (4584, "macaddr8_bloom_ops"),
-        (4585, "network_bloom_ops"),
-        (4586, "bpchar_bloom_ops"),
-        (4587, "time_bloom_ops"),
-        (4588, "interval_bloom_ops"),
-        (4589, "uuid_bloom_ops"),
-        (4590, "pg_lsn_bloom_ops"),
-        (4602, "integer_minmax_multi_ops"),
-        (4603, "numeric_minmax_multi_ops"),
-        (4604, "timetz_minmax_multi_ops"),
-        (4605, "datetime_minmax_multi_ops"),
-        (4606, "oid_minmax_multi_ops"),
-        (4607, "tid_minmax_multi_ops"),
-        (4608, "float_minmax_multi_ops"),
-        (4609, "macaddr_minmax_multi_ops"),
-        (4610, "macaddr8_minmax_multi_ops"),
-        (4611, "network_minmax_multi_ops"),
-        (4612, "time_minmax_multi_ops"),
-        (4613, "interval_minmax_multi_ops"),
-        (4614, "uuid_minmax_multi_ops"),
-        (4615, "pg_lsn_minmax_multi_ops"),
-    ] {
+    for &(oid, name) in BUILTIN_BRIN_FAMILIES {
         rows[count] = row(
             &[
                 Datum::Int4(2753),

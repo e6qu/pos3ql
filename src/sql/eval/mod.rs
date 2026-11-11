@@ -2031,6 +2031,10 @@ pub trait CatalogAccess {
     fn attribute_default_column(&self, _oid: i32) -> Option<(i32, i32)> {
         None
     }
+    /// The source and target types of the cast with this `pg_cast` OID.
+    fn cast_type_oids(&self, _oid: i32) -> Option<(i32, i32)> {
+        None
+    }
     /// Whether this OID names a relation visible to the current query.
     fn relation_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a type visible to the current query.

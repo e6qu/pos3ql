@@ -1534,7 +1534,8 @@ fn builtin_routine_type_name(
         }
         scalar => (scalar.name(), scalar.catalog_name()),
     };
-    let name = if display.trim_end_matches("[]") == catalog_name {
+    // format_type prints `json` unqualified, as the SQL/JSON standard names it.
+    let name = if display.trim_end_matches("[]") == catalog_name && catalog_name != "json" {
         crate::stack_format!(512, "pg_catalog.{display}")
     } else {
         StackStr::from_str(display)
@@ -1618,10 +1619,88 @@ fn access_method_object(
     schema: &str,
     name: &str,
 ) -> Result<EventObject, SqlError> {
+    access_method_object_using(class_id, oid, object_type, schema, name, "btree")
+}
+
+/// A built-in operator class or family, which lives in `pg_catalog`.
+fn builtin_access_method_object(
+    class_id: i32,
+    oid: i32,
+    method: i32,
+    name: &str,
+) -> Result<EventObject, SqlError> {
+    let method = catalog::access_method_name(method).ok_or_else(graph_full)?;
+    let object_type = if class_id == catalog::PG_OPCLASS_OID {
+        "operator class"
+    } else {
+        "operator family"
+    };
+    access_method_object_using(class_id, oid, object_type, "pg_catalog", name, method)
+}
+
+/// PostgreSQL's identity of a built-in cast: both types as
+/// `format_type_be_qualified` prints them.
+fn builtin_cast_object(oid: i32, source: i32, target: i32) -> Result<EventObject, SqlError> {
+    let qualified_type = |type_oid: i32| -> Result<EventAddressPart, SqlError> {
+        let name = catalog::intrinsic_type_name(type_oid).ok_or_else(graph_full)?;
+        // format_type prints these SQL-standard spellings without a schema.
+        const SQL_NAMES: &[&str] = &[
+            "bit",
+            "boolean",
+            "character",
+            "real",
+            "double precision",
+            "smallint",
+            "integer",
+            "bigint",
+            "numeric",
+            "interval",
+            "time without time zone",
+            "time with time zone",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "bit varying",
+            "character varying",
+            "json",
+        ];
+        let name = if SQL_NAMES.contains(&name) {
+            StackStr::from_str(name)
+        } else {
+            crate::stack_format!(512, "pg_catalog.{name}")
+        };
+        (!name.is_truncated())
+            .then_some(name)
+            .ok_or_else(graph_full)
+    };
+    let source = qualified_type(source)?;
+    let target = qualified_type(target)?;
+    let mut identity = EventIdentity::new();
+    write!(identity, "({} AS {})", source.as_str(), target.as_str()).map_err(|_| graph_full())?;
+    let mut object = base_object(
+        catalog::PG_CAST_OID,
+        oid,
+        "cast",
+        None,
+        None,
+        identity,
+        false,
+    );
+    object.address_names[0] = source;
+    object.address_names[1] = target;
+    object.address_name_count = 2;
+    Ok(object)
+}
+
+fn access_method_object_using(
+    class_id: i32,
+    oid: i32,
+    object_type: &str,
+    schema: &str,
+    name: &str,
+    method: &str,
+) -> Result<EventObject, SqlError> {
     let mut identity = qualified(schema, name)?;
-    identity
-        .write_str(" USING btree")
-        .map_err(|_| graph_full())?;
+    write!(identity, " USING {method}").map_err(|_| graph_full())?;
     let mut object = base_object(
         class_id,
         oid,
@@ -1631,7 +1710,7 @@ fn access_method_object(
         identity,
         false,
     );
-    object.address_args[0] = StackStr::from_str("btree");
+    object.address_args[0] = StackStr::from_str(method);
     object.address_arg_count = 1;
     Ok(object)
 }
@@ -2730,20 +2809,28 @@ fn existing_catalog_object(
                 .operator_slot_by_oid(object_id, txid)
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
-        catalog::PG_OPFAMILY_OID => EventObjectRef::Primary(ObjectRef::OperatorFamily(
-            storage
-                .operator_family_slot_by_oid(object_id, txid)
-                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-        )),
-        catalog::PG_OPCLASS_OID => EventObjectRef::Primary(ObjectRef::OperatorClass(
-            storage
-                .operator_class_slot_by_oid(
-                    crate::storage::OperatorClassOid::parse(object_id)
-                        .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-                    txid,
-                )
-                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-        )),
+        catalog::PG_OPFAMILY_OID => {
+            if let Some(slot) = storage.operator_family_slot_by_oid(object_id, txid) {
+                EventObjectRef::Primary(ObjectRef::OperatorFamily(slot))
+            } else {
+                let (method, name) = catalog::builtin_operator_family(object_id)
+                    .filter(|_| sub_id == 0)
+                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?;
+                return builtin_access_method_object(class_id, object_id, method, name);
+            }
+        }
+        catalog::PG_OPCLASS_OID => {
+            if let Some(slot) = crate::storage::OperatorClassOid::parse(object_id)
+                .and_then(|oid| storage.operator_class_slot_by_oid(oid, txid))
+            {
+                EventObjectRef::Primary(ObjectRef::OperatorClass(slot))
+            } else {
+                let (method, name) = catalog::builtin_operator_class(object_id)
+                    .filter(|_| sub_id == 0)
+                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?;
+                return builtin_access_method_object(class_id, object_id, method, name);
+            }
+        }
         catalog::PG_COLLATION_OID => EventObjectRef::Primary(ObjectRef::Collation(
             storage
                 .collations_visible_to(txid)
@@ -2812,12 +2899,19 @@ fn existing_catalog_object(
                 .find_map(|(slot, rule)| (rule.oid() == object_id).then_some(slot))
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
-        catalog::PG_CAST_OID => EventObjectRef::Primary(ObjectRef::Cast(
-            storage
+        catalog::PG_CAST_OID => {
+            if let Some(slot) = storage
                 .casts_visible_to(txid)
                 .find_map(|(slot, cast)| (cast.oid() == object_id).then_some(slot))
-                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-        )),
+            {
+                EventObjectRef::Primary(ObjectRef::Cast(slot))
+            } else {
+                let (source, target) = catalog::cast_type_oids(storage, txid, object_id)
+                    .filter(|_| sub_id == 0)
+                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?;
+                return builtin_cast_object(object_id, source, target);
+            }
+        }
         catalog::PG_POLICY_OID => EventObjectRef::Primary(ObjectRef::Policy(
             storage
                 .policies_with_slots_visible_to(txid)

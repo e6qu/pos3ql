@@ -13,6 +13,7 @@ mod builtin_argument_binding;
 mod builtin_routine_changes;
 mod builtin_routine_comments;
 mod canonical_sequences;
+mod cast_and_operator_class_descriptions;
 mod catalog_identity_lookup;
 mod client_catalog;
 mod composite_parameter_fields;

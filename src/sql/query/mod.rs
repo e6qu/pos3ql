@@ -5500,6 +5500,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::attribute_default_column(self.storage, self.txid, oid)
     }
 
+    fn cast_type_oids(&self, oid: i32) -> Option<(i32, i32)> {
+        super::catalog::cast_type_oids(self.storage, self.txid, oid)
+    }
+
     fn default_acl_description<'a>(
         &self,
         oid: i32,

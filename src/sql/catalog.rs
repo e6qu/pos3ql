@@ -4451,6 +4451,41 @@ pub(crate) fn validate_explicit_cast(
     super::eval::validate_catalog_reference_cast(source, target)
 }
 
+/// PostgreSQL's `can_coerce_type` in assignment context: equal types,
+/// domains through their base types, `pg_cast` entries marked implicit or
+/// assignment, element-wise array conversion, and type I/O into the string
+/// category.
+pub(crate) fn assignment_coercible(storage: &Storage, txid: u32, source: i32, target: i32) -> bool {
+    use super::types::oid;
+    if source == target || source == oid::UNKNOWN || target == oid::ANY {
+        return true;
+    }
+    let base = |type_oid: i32| {
+        storage
+            .domain_base_type_for_oid(type_oid, txid)
+            .map_or(type_oid, ColType::oid)
+    };
+    let (source, target) = (base(source), base(target));
+    if source == target {
+        return true;
+    }
+    if storage
+        .cast_for_oids(source, target, txid)
+        .is_some_and(|(_, cast)| cast.context.permits_assignment())
+        || builtin_cast_context(source, target)
+            .is_some_and(crate::storage::CastContext::permits_assignment)
+    {
+        return true;
+    }
+    match (ColType::from_oid(source), ColType::from_oid(target)) {
+        (Some(ColType::Array(source)), Some(ColType::Array(target))) => {
+            assignment_coercible(storage, txid, source.element_oid(), target.element_oid())
+        }
+        (_, Some(target)) => super::types::type_category(target) == "S",
+        _ => false,
+    }
+}
+
 pub(crate) fn builtin_cast_context(
     source: i32,
     target: i32,

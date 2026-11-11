@@ -77,7 +77,9 @@ is owned.
 **Remaining:**
 
 - **Functions:** callers and expression positions that have no owning query;
-  PL/pgSQL return conversion that can wait; one timing count per completed call.
+  PL/pgSQL return conversion that can wait. A SQL function that waits, called
+  once per row of a multi-row statement, adds one extra call to
+  `pg_stat_user_functions` (`SELECT f() FROM generate_series(1, 2)` counts 3).
   A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
   grouping, subqueries) restarts once for each first call of a SQL-language
   routine, so its work grows with the square of those calls; single-table,
@@ -266,17 +268,17 @@ behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: `ALTER`, `COMMENT ON`
 and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
-with `0A000` where PostgreSQL changes the catalog entry; `array_replace` takes
-the replacement's runtime type, so `array_replace('{a}'::refcursor[], 'a',
-'b')` fails with `42804` where PostgreSQL returns `{b}`; `information_schema`
-domains such as `cardinal_number` do not exist. `CREATE FUNCTION` checks that
-a SQL body ends with a result statement but not its column count or types, so
-`RETURNS integer AS 'SELECT 1, 2'` fails only when called (`42P13`, `Final
-statement must return exactly one column.`) and `RETURNS integer AS 'SELECT
-''a''::text'` converts at the call where PostgreSQL rejects the definition
-(`Actual return type is text.`). A polymorphic SQL function's runtime result
-mismatch names the declared type (`anyelement`) where PostgreSQL names the
-resolved one. Expressions are shown as stored, not deparsed: `pg_get_expr`,
+with `0A000` where PostgreSQL changes the catalog entry; `information_schema`
+domains such as `cardinal_number` do not exist. An untyped parameter is typed
+`text` instead of from the called function's signature, so `SELECT abs($1)`
+prepared without parameter types fails with `42883` (`function abs(text) does
+not exist`) where PostgreSQL infers `integer`. PostgreSQL 17 and 18 array
+functions `array_reverse`, `array_sort`, `array_sample` and `array_shuffle` do
+not exist. A SQL function whose earlier
+statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
+SELECT a FROM t`) has its result converted value by value at the call instead
+of being type-checked like PostgreSQL's analysis just before the final
+statement runs. Expressions are shown as stored, not deparsed: `pg_get_expr`,
 `pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
 `text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
 the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
@@ -295,8 +297,7 @@ than 63 bytes`) where PostgreSQL truncates it with a `NOTICE`. Assigning to an
 array element or slice (`UPDATE t SET a[1] = 9`) fails with `0A000`. A slice
 followed by an index (`a[1:1][1]`) indexes the slice where PostgreSQL treats the
 whole list as a slice, and a subscripted scalar subquery is named `?column?`
-where PostgreSQL names it after the subquery's column. `pg_sleep` and its
-variants are catalog entries only: calling them fails as an unknown function.
+where PostgreSQL names it after the subquery's column.
 Checks the parser makes where PostgreSQL checks later
 still fail with `42601` and `syntax error: <description>`: type modifiers
 (`numeric(2000)` is `22023` `NUMERIC precision 2000 must be between 1 and
@@ -304,11 +305,13 @@ still fail with `42601` and `syntax error: <description>`: type modifiers
 role and large-object values, and SQL/JSON result types. An unsupported cast
 reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
 `42846` `cannot cast type integer to timestamp without time zone`.
-PL/pgSQL `CALL`, written directly or run with `EXECUTE`, fails with `0A000`
-(`CALL is not supported in PL/pgSQL`); supporting it needs output parameters
-assigned to the caller's variables, PostgreSQL's transaction-control rules for
-the calling chain, and a saved call position so the called procedure can pause
-and resume like other nested routines. A table's or view's row type cannot
+A field of an unassigned PL/pgSQL record (`RAISE NOTICE '%', rec.a`) fails
+with `42P01` (`missing FROM-clause entry for table "rec"`) where PostgreSQL
+reports `55000` (`record "rec" is not assigned yet`).
+PL/pgSQL `CALL` in a trigger function fails with `0A000`, and a procedure
+called from PL/pgSQL that waits for storage or a lock runs again from its
+start when its statement resumes (finished effects replay from the statement
+journal) instead of resuming at a saved position inside the procedure. A table's or view's row type cannot
 appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
 where PostgreSQL accepts it. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current

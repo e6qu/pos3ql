@@ -5871,6 +5871,13 @@ pub enum Expr<'a> {
 }
 
 pub(crate) fn is_volatile_function(name: &str) -> bool {
+    // Every PostgreSQL 18.6 built-in declared volatile (`provolatile = 'v'`),
+    // whichever overload a call selects, plus extension routines below.
+    if super::catalog::builtin_callable_signatures(name.strip_prefix("pg_catalog.").unwrap_or(name))
+        .any(|signature| signature.catalog.volatility == "v")
+    {
+        return true;
+    }
     const NAMES: &[&str] = &[
         "clock_timestamp",
         "timeofday",

@@ -84,15 +84,29 @@ Functions and expressions:
   renames, schema moves, or new overloads; `nextval('order_numbers'::text)`
   looks the name up at each call.
 - A SQL function or procedure with a result must end with a `SELECT` or a
-  data-modifying statement with `RETURNING`. Otherwise `CREATE` fails with
-  `42P13` (`return type mismatch in function declared to return integer`);
-  with `check_function_bodies = off` the error comes from the first call.
+  data-modifying statement with `RETURNING` whose columns fit the declared
+  result. Otherwise `CREATE` fails with `42P13` (`return type mismatch in
+  function declared to return integer`) and PostgreSQL's detail, such as
+  `Final statement must return exactly one column.` for `RETURNS integer AS
+  'SELECT 1, 2'` or `Actual return type is text.` for `AS 'SELECT ''a''::text'`.
+  Conversions allowed in assignment pass (`SELECT 1::bigint` for `integer`).
+  With `check_function_bodies = off`, or with polymorphic arguments, the check
+  runs at the call and names the resolved type (`declared to return boolean`).
   Procedure output parameters take the final statement's first row.
   Transaction control in a quoted SQL body (`AS 'COMMIT'`) is stored, and a
   call that reaches it fails with `0A000`, as in PostgreSQL. A `BEGIN ATOMIC`
   body accepts only queries, data changes and `CALL`; anything else fails at
   `CREATE` (`0A000`, `COMMIT is not yet supported in unquoted SQL function
   body`).
+- PL/pgSQL `CALL` assigns output parameters to the variables written as
+  their arguments: `CALL doubled(x, y)` updates `x` and `y`, and a constant in
+  an output position fails with `42601` (`procedure parameter "b" is an output
+  parameter but corresponding argument is not writable`). `EXECUTE 'CALL ...'`
+  returns the outputs only through `INTO`. A called procedure may `COMMIT`
+  when every caller up to the top-level `CALL` or `DO` could; from a function,
+  an explicit transaction block, an exception block, or a `SECURITY DEFINER`
+  or `SET` procedure it fails with `2D000` (`invalid transaction
+  termination`). `CALL` in a trigger function fails with `0A000`.
 - A built-in function cannot implement `CREATE CAST` or `CREATE OPERATOR`
   (`0A000`). Aggregate support functions can name supported built-ins.
 - A missing-function message that does not fit the fixed 192-byte error
@@ -108,6 +122,23 @@ Functions and expressions:
   gives `bigint[]`; an empty constructor needs a type (`ARRAY[]::integer[]`).
   `pg_typeof(nextval('order_numbers'))` still issues one number. `OFFSET` is
   evaluated before `LIMIT`.
+- Polymorphic built-ins choose their argument types before running, as
+  PostgreSQL's parse analysis does. An untyped literal takes the type of the
+  other arguments: `array_append(ARRAY['2020-01-01'::date], '2020-01-02')`,
+  `greatest(1, '2')` and `int4range(1,5) @> '[2,3)'` work, and typed inputs
+  of `anycompatible` functions convert to one common type
+  (`array_replace(ARRAY[1], 1, 2.5)` is `numeric[]`). `timestamp + '1 day'`
+  adds an interval; `date + '1'` fails with `42725` (`operator is not unique`).
+- `DISTINCT`, `GROUP BY`, set operations and array search need a type's
+  default equality: `SELECT DISTINCT '(1,2)'::point` fails with `42883`
+  (`could not identify an equality operator for type point`), as for `xml`
+  and `json`, even though `box = box` (area equality) works.
+- `pg_sleep`, `pg_sleep_for` and `pg_sleep_until` do not hold the SQL worker:
+  the statement waits on a timer (`pg_stat_activity` shows `Timeout` /
+  `PgSleep`) while other connections run, and resumes without repeating work
+  it already did, so `SELECT nextval('s'), pg_sleep(1), nextval('s')` returns
+  consecutive numbers. `statement_timeout` and a cancel request end the wait
+  with `57014`.
 - Enum literals are checked before rows are chosen: `'missing'::order_status`
   raises `22P02` even in an unused `CASE` arm, while
   `'missing'::text::order_status` converts only when run.

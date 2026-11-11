@@ -803,8 +803,23 @@ pub(crate) fn dispatch<'a>(
                 // by binary search over an ascending array of bucket lower bounds
                 // (0 below the first bound), matching PostgreSQL's width_bucket_array.
                 if args.len() == 2 {
-                    let operand = eval_full(args[0], arena, params, row, hooks)?;
-                    let thresholds = eval_full(args[1], arena, params, row, hooks)?;
+                    let mut values = [
+                        eval_full(args[0], arena, params, row, hooks)?,
+                        eval_full(args[1], arena, params, row, hooks)?,
+                    ];
+                    super::array::coerce_compatible_arguments(
+                        name,
+                        &[
+                            super::array::CompatibleRole::Element,
+                            super::array::CompatibleRole::Array,
+                        ],
+                        args,
+                        &mut values,
+                        arena,
+                        row,
+                        hooks,
+                    )?;
+                    let [operand, thresholds] = values;
                     if operand.is_null() {
                         return Ok(Datum::Null);
                     }
@@ -814,6 +829,19 @@ pub(crate) fn dispatch<'a>(
                             "width_bucket: thresholds argument must be an array"
                         ));
                     };
+                    let shape = array::shape(raw).expect("array datum invariant");
+                    if shape.dimension_count() > 1 {
+                        return Err(sql_err!(
+                            sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                            "thresholds must be one-dimensional array"
+                        ));
+                    }
+                    if array::elements(raw, element).any(|bound| bound.is_null()) {
+                        return Err(sql_err!(
+                            sqlstate::NULL_VALUE_NOT_ALLOWED,
+                            "thresholds array must not contain NULLs"
+                        ));
+                    }
                     let (mut left, mut right) = (0usize, array::len(raw));
                     while left < right {
                         let mid = left + (right - left) / 2;

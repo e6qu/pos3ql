@@ -254,7 +254,7 @@ impl Candidate {
                 return false;
             }
         }
-        true
+        binding.resolve(storage, transaction).is_some()
     }
 
     fn score(
@@ -329,10 +329,46 @@ fn category(storage: &Storage, transaction: u32, type_oid: i32) -> &'static str 
         .map_or("P", |result| type_category(result.ctype))
 }
 
-// PostgreSQL 18.6 pg_type, typispreferred; the reference query and digest are
-// recorded with the callable contract extraction evidence.
 fn preferred_type(type_oid: i32) -> bool {
-    matches!(type_oid, 16 | 25 | 26 | 701 | 869 | 1184 | 1186 | 1562)
+    crate::sql::types::preferred_type_oid(type_oid)
+}
+
+fn compatible_binding(
+    inputs: &[(bool, i32)],
+    base: impl Fn(i32) -> i32,
+) -> Option<PolymorphicBinding> {
+    let mut binding = PolymorphicBinding::EMPTY;
+    for (array, type_oid) in inputs {
+        if *type_oid == oid::UNKNOWN {
+            continue;
+        }
+        let kind = if *array {
+            PolymorphicType::CompatibleArray
+        } else {
+            PolymorphicType::Compatible
+        };
+        binding.bind(kind, base(*type_oid))?;
+    }
+    Some(binding)
+}
+
+/// [`Storage::compatible_element_oid`] for built-in types only, where no
+/// catalog cast or domain can take part.
+pub(crate) fn builtin_compatible_element_oid(inputs: &[(bool, i32)]) -> Option<i32> {
+    let builtin =
+        |oid: i32| ColType::from_oid(oid).filter(|_| super::NamedTypeKind::from_oid(oid).is_none());
+    compatible_binding(inputs, |oid| oid)?
+        .resolve_with(
+            |oid| oid,
+            |oid| builtin(oid).map(type_category),
+            |from, to| {
+                from == to
+                    || builtin(from).zip(builtin(to)).is_some_and(|(from, to)| {
+                        crate::sql::types::builtin_implicit_cast(from, to)
+                    })
+            },
+        )?
+        .concrete_oid(PolymorphicType::Compatible)
 }
 
 impl Storage {
@@ -462,6 +498,7 @@ impl Storage {
                 binding.bind(kind, base_oid(self, txid, actual))?;
             }
         }
+        let binding = binding.resolve(self, txid)?;
         let mut expected = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
         for ((output, &declared), &actual) in expected.iter_mut().zip(declared).zip(actual) {
             *output = if declared == oid::ANY {
@@ -510,6 +547,15 @@ impl Storage {
         ))
     }
 
+    /// The common element type that PostgreSQL selects for one call's
+    /// `anycompatible` inputs. Each input is `(is_array, type_oid)`; unknown
+    /// inputs are skipped as in parse analysis. `None` means no common type.
+    pub(crate) fn compatible_element_oid(&self, inputs: &[(bool, i32)], txid: u32) -> Option<i32> {
+        compatible_binding(inputs, |oid| base_oid(self, txid, oid))?
+            .resolve(self, txid)?
+            .concrete_oid(PolymorphicType::Compatible)
+    }
+
     pub(crate) fn builtin_call_result_oid(
         &self,
         routine_oid: i32,
@@ -533,7 +579,9 @@ impl Storage {
                 binding.bind(kind, base_oid(self, transaction, *actual))?;
             }
         }
-        binding.concrete_oid(result_kind)
+        binding
+            .resolve(self, transaction)?
+            .concrete_oid(result_kind)
     }
 
     pub(crate) fn procedure_call_parameter_oids(
@@ -795,6 +843,10 @@ mod tests {
             for vector in [ColType::Int2Vector, ColType::OidVector] {
                 let mut binding = PolymorphicBinding::EMPTY;
                 binding.bind(PolymorphicType::Array, vector.oid()).unwrap();
+                let mut mixed = binding;
+                let binding = binding
+                    .resolve_with(|oid| oid, |_| None, |_, _| false)
+                    .unwrap();
                 assert_eq!(
                     binding.concrete_oid(PolymorphicType::Array),
                     Some(vector.oid())
@@ -809,7 +861,7 @@ mod tests {
                     Some(element)
                 );
                 let ordinary = super::super::array_oid_for_element(element).unwrap();
-                assert!(binding.bind(PolymorphicType::Array, ordinary).is_none());
+                assert!(mixed.bind(PolymorphicType::Array, ordinary).is_none());
                 assert!(
                     super::super::polymorphic_element_oid(PolymorphicType::NonArray, vector.oid())
                         .is_none()
@@ -818,6 +870,9 @@ mod tests {
             let mut compatible = PolymorphicBinding::EMPTY;
             compatible
                 .bind(PolymorphicType::CompatibleArray, ColType::Int2Vector.oid())
+                .unwrap();
+            let compatible = compatible
+                .resolve_with(|oid| oid, |_| None, |_, _| false)
                 .unwrap();
             assert_eq!(
                 compatible.concrete_oid(PolymorphicType::CompatibleArray),

@@ -44,6 +44,7 @@ pub(crate) enum StatementEffectKind {
     Cursor,
     RoutineInput,
     PlanAllocation,
+    Sleep,
 }
 
 #[derive(Clone, Copy)]
@@ -262,6 +263,71 @@ pub(super) fn enter_statement<'arena, 'session>(
 
 pub(crate) fn finish_statement(session: &SeqSession) {
     session.statement_replay.set(StatementSequenceReplay::EMPTY);
+    session.set_sleep_until(None);
+}
+
+/// `pg_sleep` and its variants. The first attempt records the wake time in the
+/// session and reports a wait, so the connection parks on a timer instead of
+/// holding the SQL worker; the resumed statement replays the sleeps that
+/// already finished from its effect journal. `seconds` runs once, when the
+/// sleep starts, as PostgreSQL computes its end time once. The statement
+/// timeout is checked at every attempt, as PostgreSQL checks interrupts.
+pub(crate) fn sleep(
+    key: &[super::types::Datum<'_>],
+    seconds: impl FnOnce() -> Result<f64, SqlError>,
+    output: &Arena,
+) -> Result<(), SqlError> {
+    let session = STATEMENT_SESSION.with(Cell::get);
+    if session.is_null() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "pg_sleep requires a resumable statement"
+        ));
+    }
+    // SAFETY: enter_statement keeps the session borrowed on this thread for
+    // the whole statement; this call returns before the scope ends.
+    let session = unsafe { &*session };
+    statement_effect(
+        StatementEffectKind::Sleep,
+        key,
+        StatementEffectRetry::Restart,
+        output,
+        || StatementEffectAttempt {
+            result: (|| {
+                super::query::check_timeout()?;
+                let now = super::datetime::now_micros();
+                let deadline = match session.sleep_until() {
+                    Some(deadline) => deadline,
+                    None => {
+                        let seconds = seconds()?;
+                        // NaN and non-positive delays end at once, as in
+                        // PostgreSQL's loop; infinity sleeps until interrupted.
+                        if seconds.is_nan() || seconds <= 0.0 {
+                            return Ok(&[][..]);
+                        }
+                        let micros = (seconds * 1_000_000.0).ceil();
+                        let deadline = if micros >= (i64::MAX - now) as f64 {
+                            i64::MAX
+                        } else {
+                            now + micros as i64
+                        };
+                        session.set_sleep_until(Some(deadline));
+                        deadline
+                    }
+                };
+                if now >= deadline {
+                    session.set_sleep_until(None);
+                    return Ok(&[][..]);
+                }
+                Err(sql_err!(
+                    sqlstate::INTERNAL_LOCK_WAIT,
+                    "statement is sleeping"
+                ))
+            })(),
+            rewound_state: false,
+        },
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]

@@ -4073,44 +4073,170 @@ fn function_definitions_use_postgresql_layout() {
     );
 }
 
-/// PL/pgSQL cannot run CALL yet; it fails loudly instead of misreporting the
-/// statement as malformed. A utility command run with EXECUTE ... INTO keeps
-/// PostgreSQL's wording.
+/// PL/pgSQL `CALL` assigns output parameters to the argument variables, and
+/// `EXECUTE 'CALL ...'` returns them only through INTO. Expected notices and
+/// errors come from PostgreSQL 18.6.
 #[test]
-fn plpgsql_call_is_rejected_as_unsupported() {
-    use super::routine_identity_diagnostics::{NONE, check};
-    const UNSUPPORTED: &[super::routine_identity_diagnostics::Expected] =
-        &[('E', "0A000", "CALL is not supported in PL/pgSQL")];
+fn plpgsql_call_assigns_outputs_and_checks_writable_arguments() {
+    use super::routine_identity_diagnostics::{Expected, NONE, check};
+    fn notice(text: &'static str) -> [Expected; 1] {
+        [('N', "00000", text)]
+    }
+    const NOT_WRITABLE_A: &[Expected] = &[(
+        'E',
+        "42601",
+        "procedure parameter \"a\" is an output parameter but corresponding argument is not writable",
+    )];
+    const NOT_WRITABLE_B: &[Expected] = &[(
+        'E',
+        "42601",
+        "procedure parameter \"b\" is an output parameter but corresponding argument is not writable",
+    )];
+    const NOT_WRITABLE_C: &[Expected] = &[(
+        'E',
+        "42601",
+        "procedure parameter \"c\" is an output parameter but corresponding argument is not writable",
+    )];
     check(&[
         (
             "CREATE TABLE call_rows(a integer); \
              CREATE PROCEDURE call_insert(x integer) LANGUAGE sql \
-                 AS 'INSERT INTO call_rows VALUES (x)'",
+                 AS 'INSERT INTO call_rows VALUES (x)'; \
+             CREATE PROCEDURE doubled(INOUT a int, OUT b text) LANGUAGE plpgsql \
+                 AS $$BEGIN a := a * 2; b := 'b' || a; END$$; \
+             CREATE PROCEDURE tripled(INOUT a int, OUT b text) LANGUAGE sql \
+                 AS 'SELECT a * 3, ''s'''",
             NONE,
         ),
-        ("DO $$BEGIN CALL call_insert(1); END$$", UNSUPPORTED),
+        ("DO $$BEGIN CALL call_insert(1); END$$", NONE),
         (
-            "CREATE FUNCTION calls_procedure() RETURNS void LANGUAGE plpgsql \
-             AS $$BEGIN call call_insert(1); END$$",
-            UNSUPPORTED,
+            "DO $$DECLARE x int := 5; y text; BEGIN CALL doubled(x, y); \
+             RAISE NOTICE 'x=% y=%', x, y; END$$",
+            &notice("x=10 y=b10"),
         ),
         (
-            "DO $$BEGIN EXECUTE 'CALL call_insert(2)'; END$$",
-            UNSUPPORTED,
+            "DO $$DECLARE x int := 5; y text; BEGIN CALL tripled(x, y); \
+             RAISE NOTICE 'x=% y=%', x, y; END$$",
+            &notice("x=15 y=s"),
         ),
+        (
+            "DO $$DECLARE x int := 5; y text; BEGIN \
+             EXECUTE 'CALL doubled($1, $2)' USING x, y; RAISE NOTICE 'x=% y=%', x, y; END$$",
+            &notice("x=5 y=<NULL>"),
+        ),
+        (
+            "DO $$DECLARE x int := 5; y text; BEGIN \
+             EXECUTE 'CALL doubled($1, $2)' INTO x, y USING x, y; \
+             RAISE NOTICE 'x=% y=%', x, y; END$$",
+            &notice("x=10 y=b10"),
+        ),
+        (
+            "DO $$DECLARE y text; BEGIN CALL doubled(5, y); END$$",
+            NOT_WRITABLE_A,
+        ),
+        (
+            "DO $$DECLARE x int := 1; BEGIN CALL doubled(a => x, b => NULL); END$$",
+            NOT_WRITABLE_B,
+        ),
+        (
+            "CREATE PROCEDURE defaults(a int, b int DEFAULT 7, INOUT c int DEFAULT 0) \
+             LANGUAGE plpgsql AS $$BEGIN c := a + b; END$$",
+            NONE,
+        ),
+        (
+            "DO $$DECLARE r int; BEGIN CALL defaults(1, c => r); RAISE NOTICE 'r=%', r; END$$",
+            &notice("r=8"),
+        ),
+        (
+            "DO $$DECLARE r int; BEGIN CALL defaults(1); END$$",
+            NOT_WRITABLE_C,
+        ),
+        (
+            "CREATE PROCEDURE spread(VARIADIC a int[]) LANGUAGE plpgsql \
+             AS $$BEGIN RAISE NOTICE '%', a; END$$",
+            NONE,
+        ),
+        ("DO $$BEGIN CALL spread(1, 2, 3); END$$", &notice("{1,2,3}")),
+        ("DO $$BEGIN EXECUTE 'CALL call_insert(2)'; END$$", NONE),
         (
             "DO $$DECLARE r integer; BEGIN EXECUTE 'CALL call_insert(3)' INTO r; END$$",
-            UNSUPPORTED,
-        ),
-        (
-            "DO $$DECLARE r integer; BEGIN EXECUTE 'CREATE TABLE into_rows(a integer)' INTO r; END$$",
             &[(
                 'E',
                 "42601",
                 "INTO used with a command that cannot return data",
             )],
         ),
-        ("SELECT count(*) FROM call_rows", NONE),
+        (
+            "DO $$BEGIN CALL missing_proc(1, 'a'); END$$",
+            &[(
+                'E',
+                "42883",
+                "procedure missing_proc(integer, unknown) does not exist",
+            )],
+        ),
+        (
+            "CALL lower('a')",
+            &[('E', "42809", "lower(unknown) is not a procedure")],
+        ),
+        (
+            "CREATE FUNCTION call_in_sql() RETURNS void LANGUAGE sql AS 'CALL call_insert(4)'; \
+             SELECT call_in_sql()",
+            NONE,
+        ),
+        (
+            "DO $$DECLARE rec record; BEGIN SELECT 7 AS a INTO rec; CALL call_insert(rec.a); END$$",
+            NONE,
+        ),
+        (
+            "DO $$BEGIN CALL call_insert((SELECT 1)); END$$",
+            &[('E', "0A000", "cannot use subquery in CALL argument")],
+        ),
+        (
+            "CALL call_insert(EXISTS(SELECT 1)::int)",
+            &[('E', "0A000", "cannot use subquery in CALL argument")],
+        ),
+    ]);
+}
+
+/// Transaction control in a called procedure follows the calling chain: a
+/// `CALL` from a top-level `DO` or procedure may commit, while one from a
+/// function, an explicit transaction block, an exception block, a SECURITY
+/// DEFINER procedure or a procedure with SET options is atomic.
+#[test]
+fn plpgsql_call_follows_postgresql_transaction_control_rules() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    let invalid = &[('E', "2D000", "invalid transaction termination")][..];
+    check(&[
+        (
+            "CREATE TABLE committed(a integer); \
+             CREATE PROCEDURE commits() LANGUAGE plpgsql AS $$BEGIN \
+                 INSERT INTO committed VALUES (10); COMMIT; \
+                 INSERT INTO committed VALUES (11); ROLLBACK; END$$; \
+             CREATE PROCEDURE wraps() LANGUAGE plpgsql AS $$BEGIN CALL commits(); END$$; \
+             CREATE PROCEDURE definer() LANGUAGE plpgsql SECURITY DEFINER \
+                 AS $$BEGIN CALL commits(); END$$; \
+             CREATE PROCEDURE configured() LANGUAGE plpgsql SET search_path = public \
+                 AS $$BEGIN CALL commits(); END$$; \
+             CREATE FUNCTION from_function() RETURNS int LANGUAGE plpgsql \
+                 AS $$BEGIN CALL commits(); RETURN 1; END$$",
+            NONE,
+        ),
+        ("DO $$BEGIN CALL commits(); END$$", NONE),
+        ("CALL wraps()", NONE),
+        ("BEGIN; DO $$BEGIN CALL commits(); END$$", invalid),
+        ("ROLLBACK", NONE),
+        (
+            "DO $$BEGIN BEGIN CALL commits(); \
+             EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'caught %: %', SQLSTATE, SQLERRM; END; END$$",
+            &[(
+                'N',
+                "00000",
+                "caught 2D000: invalid transaction termination",
+            )],
+        ),
+        ("SELECT from_function()", invalid),
+        ("CALL definer()", invalid),
+        ("CALL configured()", invalid),
     ]);
 }
 
@@ -4213,4 +4339,26 @@ fn unquoted_bodies_reject_utility_statements_at_creation() {
             "{sql}"
         );
     }
+}
+
+/// Each completed procedure call, top-level or from PL/pgSQL, is one call in
+/// `pg_stat_user_functions`, as in PostgreSQL 18.6.
+#[test]
+fn procedure_calls_are_counted_in_function_statistics() {
+    let config = test_config("procedure-call-statistics");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(
+        &mut engine,
+        "SET track_functions = 'all'; \
+         CREATE PROCEDURE counted(INOUT a int) LANGUAGE plpgsql AS $$BEGIN a := a + 1; END$$; \
+         CREATE PROCEDURE counted_sql() LANGUAGE sql AS 'SELECT 1'; \
+         CALL counted(1); \
+         DO $$DECLARE x int := 1; BEGIN CALL counted(x); CALL counted(x); END$$; \
+         CALL counted_sql(); \
+         SELECT funcname, calls FROM pg_stat_user_functions ORDER BY 1",
+        true,
+    );
+    assert_eq!(data_rows(&output)[1..], ["counted|3", "counted_sql|1"]);
 }

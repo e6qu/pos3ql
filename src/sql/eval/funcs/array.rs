@@ -16,7 +16,7 @@ use crate::sql_err;
 
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, cast_to, compare_datums, eval_full,
-    load_array, sqlstate, text_arg, text_view, type_mismatch, unify_arr_elem,
+    load_array, sqlstate, text_arg, text_view, type_mismatch,
 };
 
 /// Compatible-array declarations promote PostgreSQL's catalog vectors to
@@ -30,6 +30,179 @@ fn compatible_array_input<'a>(
         Datum::OidVector { .. } => cast_to(value, ColType::Array(ArrElem::Oid), arena),
         _ => Ok(value),
     }
+}
+
+/// How one argument takes part in an `anycompatible` call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompatibleRole {
+    Array,
+    Element,
+}
+
+/// The `anycompatible` roles of the array built-ins' inputs, as declared in
+/// PostgreSQL 18.6 `pg_proc`.
+fn compatible_roles(name: &str) -> Option<&'static [CompatibleRole]> {
+    use CompatibleRole::{Array, Element};
+    Some(match name {
+        "array_append" | "array_remove" | "array_position" | "array_positions" => &[Array, Element],
+        "array_prepend" => &[Element, Array],
+        "array_cat" => &[Array, Array],
+        "array_replace" => &[Array, Element, Element],
+        _ => return None,
+    })
+}
+
+/// Resolves an `anycompatible` call as PostgreSQL's parse analysis does: the
+/// common element type comes from the inputs' declared types, untyped literals
+/// read their text as that type, and typed inputs convert implicitly. The
+/// values in `values` are replaced by their coerced forms; the common element
+/// is returned.
+pub(crate) fn coerce_compatible_arguments<'a>(
+    name: &str,
+    roles: &[CompatibleRole],
+    args: &[&Expr<'a>],
+    values: &mut [Datum<'a>],
+    arena: &'a crate::mem::arena::Arena,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<ArrElem, SqlError> {
+    let mut inputs = [(false, 0); 3];
+    for (index, role) in roles.iter().enumerate() {
+        inputs[index] = (
+            *role == CompatibleRole::Array,
+            super::super::expression_type_identity(args[index], row, hooks)?.routine_argument_oid(),
+        );
+    }
+    let inputs = &inputs[..roles.len()];
+    let element_oid = if inputs
+        .iter()
+        .all(|(_, oid)| *oid == crate::sql::types::oid::UNKNOWN)
+    {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "could not determine polymorphic type anycompatible because input has type unknown"
+        ));
+    } else {
+        match hooks.catalog {
+            Some(catalog) => catalog.compatible_element_oid(inputs),
+            None => crate::storage::builtin_compatible_element_oid(inputs),
+        }
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function {} does not exist",
+                name
+            )
+        })?
+    };
+    let element = hooks
+        .catalog
+        .and_then(|catalog| catalog.domain_base_type(element_oid))
+        .or_else(|| ColType::from_oid(element_oid))
+        .and_then(ArrElem::from_coltype)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{} does not support element type {}",
+                name,
+                element_oid
+            )
+        })?;
+    for (index, (array, input_oid)) in inputs.iter().enumerate() {
+        let value = values[index];
+        if value.is_null() {
+            continue;
+        }
+        let target = if *array {
+            ColType::Array(element)
+        } else {
+            element.to_coltype()
+        };
+        values[index] = if *input_oid == crate::sql::types::oid::UNKNOWN && element.is_named() {
+            let catalog = hooks.catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "{} named argument types require a catalog",
+                    name
+                )
+            })?;
+            let element_name = catalog.type_name(element_oid, arena)?.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "{} argument type no longer exists",
+                    name
+                )
+            })?;
+            let type_name = if *array {
+                let mut written = crate::util::StackStr::<264>::new();
+                use core::fmt::Write as _;
+                write!(written, "{element_name}[]").map_err(|_| arena_full())?;
+                arena
+                    .alloc_str(written.as_str())
+                    .map_err(|_| arena_full())?
+            } else {
+                element_name
+            };
+            catalog
+                .cast_user_type(type_name, value, arena, hooks.sequences)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "{} argument type no longer exists",
+                        name
+                    )
+                })?
+        } else {
+            let value = compatible_array_input(value, arena)?;
+            match value {
+                Datum::Array {
+                    element: actual, ..
+                } if *array && actual == element => value,
+                _ if !*array && ArrElem::from_datum(&value) == Some(element) => value,
+                _ => cast_to(value, target, arena)?,
+            }
+        };
+    }
+    Ok(element)
+}
+
+/// The common type that PostgreSQL's `select_common_type` gives the inputs of
+/// `COALESCE`, `GREATEST` and `LEAST`, or `None` when it is a catalog-defined
+/// type or the typed inputs have none (their comparison reports the mismatch).
+/// Untyped literals alone resolve to `text`. Returns each input's declared
+/// type alongside, so callers convert exactly the untyped ones.
+pub(crate) fn common_argument_type<'a>(
+    args: &[&Expr<'a>],
+    arena: &'a crate::mem::arena::Arena,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(Option<ColType>, &'a [i32]), SqlError> {
+    let inputs = arena
+        .alloc_slice_with(args.len(), |_| (false, crate::sql::types::oid::UNKNOWN))
+        .map_err(|_| arena_full())?;
+    for (input, argument) in inputs.iter_mut().zip(args) {
+        input.1 =
+            super::super::expression_type_identity(argument, row, hooks)?.routine_argument_oid();
+    }
+    let declared = arena
+        .alloc_slice_with(args.len(), |index| inputs[index].1)
+        .map_err(|_| arena_full())?;
+    if declared
+        .iter()
+        .all(|oid| *oid == crate::sql::types::oid::UNKNOWN)
+    {
+        return Ok((Some(ColType::Text), declared));
+    }
+    let common = match hooks.catalog {
+        Some(catalog) => catalog.compatible_element_oid(inputs),
+        None => crate::storage::builtin_compatible_element_oid(inputs),
+    };
+    Ok((
+        common
+            .filter(|oid| crate::storage::NamedTypeKind::from_oid(*oid).is_none())
+            .and_then(ColType::from_oid),
+        declared,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -370,9 +543,20 @@ pub(crate) fn dispatch<'a>(
                         if star { 1 } else { args.len() }
                     ));
                 }
-                let a =
-                    compatible_array_input(eval_full(args[0], arena, params, row, hooks)?, arena)?;
-                let target = eval_full(args[1], arena, params, row, hooks)?;
+                let mut values = [
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    eval_full(args[1], arena, params, row, hooks)?,
+                ];
+                coerce_compatible_arguments(
+                    name,
+                    compatible_roles(name).expect("compatible array function"),
+                    args,
+                    &mut values,
+                    arena,
+                    row,
+                    hooks,
+                )?;
+                let [a, target] = values;
                 let (element, raw) = match a {
                     Datum::Array { element, raw } => (element, raw),
                     Datum::Null => return Ok(Datum::Null),
@@ -437,9 +621,20 @@ pub(crate) fn dispatch<'a>(
                 // 1-based indices of every element equal to the target (NULL-safe),
                 // as an int[] (`{}` when none); NULL only for a NULL array argument.
                 arity(2)?;
-                let a =
-                    compatible_array_input(eval_full(args[0], arena, params, row, hooks)?, arena)?;
-                let target = eval_full(args[1], arena, params, row, hooks)?;
+                let mut values = [
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    eval_full(args[1], arena, params, row, hooks)?,
+                ];
+                coerce_compatible_arguments(
+                    name,
+                    compatible_roles(name).expect("compatible array function"),
+                    args,
+                    &mut values,
+                    arena,
+                    row,
+                    hooks,
+                )?;
+                let [a, target] = values;
                 let (element, raw) = match a {
                     Datum::Array { element, raw } => (element, raw),
                     Datum::Null => return Ok(Datum::Null),
@@ -501,26 +696,29 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     (1, 0)
                 };
-                let arr = compatible_array_input(
-                    eval_full(args[array_index], arena, params, row, hooks)?,
+                let mut values = [
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    eval_full(args[1], arena, params, row, hooks)?,
+                ];
+                let element = coerce_compatible_arguments(
+                    name,
+                    compatible_roles(name).expect("compatible array function"),
+                    args,
+                    &mut values,
                     arena,
+                    row,
+                    hooks,
                 )?;
-                let elem = eval_full(args[elem_index], arena, params, row, hooks)?;
+                let (arr, elem) = (values[array_index], values[elem_index]);
                 let (source, raw) = match arr {
                     Datum::Array { element, raw } => (element, Some(raw)),
-                    Datum::Null => (ArrElem::from_datum(&elem).unwrap_or(ArrElem::Text), None),
+                    Datum::Null => (element, None),
                     _ => {
                         return Err(type_mismatch(
                             "array_append/prepend requires an array",
                             &arr,
                         ));
                     }
-                };
-                // The result element type promotes to hold both the array's elements
-                // and the new one (PostgreSQL's polymorphic anyarray/anyelement).
-                let element = match ArrElem::from_datum(&elem) {
-                    Some(e) => unify_arr_elem(source, e)?,
-                    None => source,
                 };
                 let source_count = raw.map_or(0, array::len);
                 let items = array::alloc_items(arena, source_count + 1)?;
@@ -573,10 +771,20 @@ pub(crate) fn dispatch<'a>(
             // `array_cat(a, b)`: concatenate two arrays of the same element type.
             "array_cat" => {
                 arity(2)?;
-                let a =
-                    compatible_array_input(eval_full(args[0], arena, params, row, hooks)?, arena)?;
-                let b =
-                    compatible_array_input(eval_full(args[1], arena, params, row, hooks)?, arena)?;
+                let mut values = [
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    eval_full(args[1], arena, params, row, hooks)?,
+                ];
+                coerce_compatible_arguments(
+                    name,
+                    compatible_roles(name).expect("compatible array function"),
+                    args,
+                    &mut values,
+                    arena,
+                    row,
+                    hooks,
+                )?;
+                let [a, b] = values;
                 match (a, b) {
                     (Datum::Array { .. }, Datum::Array { .. }) => {
                         super::super::array_concat(a, b, arena)
@@ -594,9 +802,20 @@ pub(crate) fn dispatch<'a>(
             "array_remove" | "array_replace" => {
                 let is_replace = name == "array_replace";
                 arity(if is_replace { 3 } else { 2 })?;
-                let arr =
-                    compatible_array_input(eval_full(args[0], arena, params, row, hooks)?, arena)?;
-                let target = eval_full(args[1], arena, params, row, hooks)?;
+                let mut values = [Datum::Null; 3];
+                for (value, argument) in values.iter_mut().zip(args) {
+                    *value = eval_full(argument, arena, params, row, hooks)?;
+                }
+                let element = coerce_compatible_arguments(
+                    name,
+                    compatible_roles(name).expect("compatible array function"),
+                    args,
+                    &mut values[..args.len()],
+                    arena,
+                    row,
+                    hooks,
+                )?;
+                let [arr, target, to] = values;
                 let (source, raw) = match arr {
                     Datum::Array { element, raw } => (element, raw),
                     Datum::Null => return Ok(Datum::Null),
@@ -611,27 +830,13 @@ pub(crate) fn dispatch<'a>(
                 }
                 // PostgreSQL needs the element equality for any non-empty
                 // array, even to remove or replace NULLs.
-                if shape.dimension_count() > 0 && !source.to_coltype().has_builtin_equality() {
+                if shape.dimension_count() > 0 && !source.to_coltype().has_default_equality() {
                     return Err(crate::sql::eval::operators::could_not_identify_equality(
                         source.to_coltype(),
                     ));
                 }
-                let (element, replacement) = if is_replace {
-                    let to = eval_full(args[2], arena, params, row, hooks)?;
-                    // The result promotes to hold both the kept and replaced values.
-                    let element = match ArrElem::from_datum(&to) {
-                        Some(e) => unify_arr_elem(source, e)?,
-                        None => source,
-                    };
-                    let replacement = if to.is_null() {
-                        Datum::Null
-                    } else {
-                        cast_to(to, element.to_coltype(), arena)?
-                    };
-                    (element, replacement)
-                } else {
-                    (source, Datum::Null)
-                };
+                debug_assert_eq!(source, element);
+                let replacement = to;
                 let to_coltype = element.to_coltype();
                 let items = array::alloc_items(arena, shape.element_count())?;
                 let mut n = 0usize;
@@ -852,8 +1057,22 @@ pub(crate) fn dispatch<'a>(
                 if args.len() != 2 && args.len() != 3 || star {
                     return Err(arity_err(name, args.len()));
                 }
+                // The dimension and bound inputs are declared integer[]; an
+                // untyped literal is read as that type.
+                let integer_array = |index: usize| -> Result<Datum<'a>, SqlError> {
+                    let value = eval_full(args[index], arena, params, row, hooks)?;
+                    if !value.is_null()
+                        && super::super::expression_type_identity(args[index], row, hooks)?
+                            .routine_argument_oid()
+                            == crate::sql::types::oid::UNKNOWN
+                    {
+                        cast_to(value, ColType::Array(ArrElem::Int4), arena)
+                    } else {
+                        Ok(value)
+                    }
+                };
                 let value = eval_full(args[0], arena, params, row, hooks)?;
-                let dims = eval_full(args[1], arena, params, row, hooks)?;
+                let dims = integer_array(1)?;
                 if dims.is_null() {
                     return Err(sql_err!(
                         sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -896,7 +1115,7 @@ pub(crate) fn dispatch<'a>(
                 }
                 let mut lower_bounds = [1i32; array::MAX_DIMENSIONS];
                 if args.len() == 3 {
-                    let lows = eval_full(args[2], arena, params, row, hooks)?;
+                    let lows = integer_array(2)?;
                     let Datum::Array {
                         element: low_element,
                         raw: low_raw,
@@ -982,7 +1201,7 @@ fn require_search_equality(
     dimensions: usize,
     target: &Datum<'_>,
 ) -> Result<(), SqlError> {
-    if dimensions > 0 && !target.is_null() && !element.to_coltype().has_builtin_equality() {
+    if dimensions > 0 && !target.is_null() && !element.to_coltype().has_default_equality() {
         return Err(crate::sql::eval::operators::could_not_identify_equality(
             element.to_coltype(),
         ));

@@ -779,8 +779,8 @@ pub(crate) use describe::{
     CatalogCols, FunctionLookupFailure, builtin_binary_type, builtin_call, builtin_record_srf_call,
     builtin_type_name_fixed, catalog_builtin_call_result_metadata, catalog_composite_field,
     catalog_operator_first_argument_type, catalog_routine_record_field, expand_record_call_items,
-    function_lookup_error, numeric_log_type, resolved_set_call, visit_catalog_composite_fields,
-    visit_catalog_rowtype_fields,
+    function_lookup_error, numeric_log_type, procedure_lookup_error, resolved_set_call,
+    visit_catalog_composite_fields, visit_catalog_rowtype_fields,
 };
 pub use describe::{
     ColTypeResolver, DefCols, DescriptionTarget, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
@@ -17684,6 +17684,11 @@ enum TriggerStatement<'a> {
         source: &'a str,
         statement: &'a Stmt<'a>,
     },
+    /// `CALL`: output parameters are assigned to the argument variables.
+    Call {
+        source: &'a str,
+        statement: &'a Stmt<'a>,
+    },
     CursorOpen(PlpgsqlCursorOpen<'a>),
     CursorMotion(PlpgsqlCursorMotion<'a>),
     CursorClose(SqlName),
@@ -18437,14 +18442,286 @@ where
     }
 }
 
-/// Procedures called from PL/pgSQL would need their output parameters
-/// assigned to variables and their transaction control checked against the
-/// calling chain; pos3ql runs CALL only as a top-level statement.
-fn plpgsql_call_unsupported() -> SqlError {
-    sql_err!(
-        sqlstate::FEATURE_NOT_SUPPORTED,
-        "CALL is not supported in PL/pgSQL"
-    )
+/// `EXECUTE 'CALL ...'`: the `USING` values are the statement's parameters,
+/// and the output parameters come back as a row rather than being assigned.
+fn execute_plpgsql_dynamic_call<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    query: BoundPlpgsqlCommand<'a>,
+) -> Result<ProcedureOutputs<'a>, SqlError> {
+    let Stmt::Call {
+        name,
+        arguments,
+        argument_names,
+        variadic,
+    } = query.statement
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "dynamic CALL lost its statement"
+        ));
+    };
+    let input_source = plpgsql_command_source(query.source, context.arena)?;
+    let arena = context.arena;
+    let PlpgsqlExecHost::Routine {
+        engine,
+        guc,
+        sqlprep,
+        cursors,
+        transaction_context,
+    } = &mut context.host
+    else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "CALL is not supported in a trigger function"
+        ));
+    };
+    let mut outputs = ProcedureOutputs::new([true; crate::storage::MAX_ROUTINE_ARGUMENTS]);
+    let outcome = super::type_input_plans::with_owner(query.owner, || {
+        super::type_inputs::with_source(input_source, query.source, query.inputs, || {
+            with_bound_parameter_types(query.parameter_types, || {
+                engine.execute_call(
+                    *name,
+                    arguments,
+                    argument_names,
+                    *variadic,
+                    arena,
+                    query.arguments,
+                    context.txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    *transaction_context,
+                    context.responder,
+                    Some(&mut outputs),
+                )
+            })
+        })
+    });
+    routine_utility_outcome(outcome)?;
+    Ok(outputs)
+}
+
+/// Output values of a static PL/pgSQL `CALL` and the variable named by each
+/// written argument.
+struct PlpgsqlCallOutputs<'a> {
+    arguments: [Option<SqlName>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    assigned: [Option<u8>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    values: [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+}
+
+/// Runs a static `CALL` as PL/pgSQL's `exec_stmt_call` does: arguments are
+/// evaluated in the block's scope and passed as typed parameters, each output
+/// parameter needs a variable argument, and the call is non-atomic only when
+/// this block may control transactions itself.
+fn execute_plpgsql_call<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    statement: &'a Stmt<'a>,
+    locals: &[TriggerLocalDecl],
+    scope: &TriggerLocalScope<'_, 'a>,
+) -> Result<PlpgsqlCallOutputs<'a>, SqlError> {
+    let Stmt::Call {
+        name,
+        arguments,
+        argument_names,
+        variadic,
+    } = statement
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "PL/pgSQL CALL lost its statement"
+        ));
+    };
+    if arguments.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many procedure arguments"
+        ));
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument.contains_subquery())
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot use subquery in CALL argument"
+        ));
+    }
+    let arena = context.arena;
+    let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let mut types = [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let mut writable = [false; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let mut targets = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    // Arguments are PL/pgSQL expressions: record fields, subqueries and
+    // function calls evaluate as in any other statement of the block.
+    for (value, argument) in values.iter_mut().zip(arguments.iter()) {
+        *value = eval_procedural_expression(context, argument, scope, None)?;
+    }
+    {
+        let catalog = super::query::storage_catalog(context.storage(), arena, context.txn.txid);
+        let sequences = crate::sql::sequence::SeqEval::new(
+            context.storage(),
+            context.seq_session(),
+            context.txn.txid,
+        );
+        let hooks = crate::sql::eval::EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequences),
+            ..crate::sql::eval::NO_HOOKS
+        };
+        for (index, argument) in arguments.iter().enumerate() {
+            types[index] = crate::sql::eval::expression_type_identity(argument, scope, &hooks)?
+                .routine_argument_oid();
+            if let Expr::Column {
+                qualifier: None,
+                name,
+            } = argument
+                && let Ok(local) = trigger_local_index(locals, SqlName::parse(name)?)
+            {
+                writable[index] = true;
+                targets[index] = Some(locals[local].name);
+            }
+        }
+    }
+    let parameters = arena
+        .alloc_slice_with(arguments.len(), |index| {
+            Expr::Param(u32::try_from(index + 1).expect("bounded by MAX_ROUTINE_ARGUMENTS"))
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let parameters = arena
+        .alloc_slice_with(arguments.len(), |index| &parameters[index])
+        .map_err(|_| super::query::arena_full_pub())?;
+    let PlpgsqlExecHost::Routine {
+        engine,
+        guc,
+        sqlprep,
+        cursors,
+        transaction_context,
+    } = &mut context.host
+    else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "CALL is not supported in a trigger function"
+        ));
+    };
+    let mut outputs = ProcedureOutputs::new(writable);
+    let outcome = with_bound_parameter_types(&types[..arguments.len()], || {
+        engine.execute_call(
+            *name,
+            parameters,
+            argument_names,
+            *variadic,
+            arena,
+            &values[..arguments.len()],
+            context.txn,
+            sqlprep,
+            cursors,
+            guc,
+            *transaction_context,
+            context.responder,
+            Some(&mut outputs),
+        )
+    });
+    routine_utility_outcome(outcome)?;
+    Ok(PlpgsqlCallOutputs {
+        arguments: targets,
+        assigned: outputs.assigned,
+        values: outputs.values,
+    })
+}
+
+/// Output parameters of a procedure called from PL/pgSQL. Static `CALL`
+/// assigns each to the variable written as its argument, so every output
+/// argument must be writable; `EXECUTE 'CALL ...'` returns them as one row.
+pub(crate) struct ProcedureOutputs<'a> {
+    /// Whether each written argument is a variable the call may assign.
+    pub writable: [bool; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    /// The output ordinal each written argument receives, if any.
+    pub assigned: [Option<u8>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    pub values: [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    pub count: usize,
+}
+
+impl<'a> ProcedureOutputs<'a> {
+    pub(crate) fn new(writable: [bool; crate::storage::MAX_ROUTINE_ARGUMENTS]) -> Self {
+        Self {
+            writable,
+            assigned: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
+            values: [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS],
+            count: 0,
+        }
+    }
+
+    /// PL/pgSQL's `make_callstmt_target` check, before the procedure runs.
+    pub(crate) fn bind(
+        &mut self,
+        routine: &crate::storage::RoutineDef,
+        argument_names: &[Option<&str>],
+        argument_count: usize,
+        variadic: bool,
+    ) -> Result<(), SqlError> {
+        let mapping = routine
+            .procedure_argument_parameters(argument_names, argument_count, variadic)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "selected procedure has no CALL argument mapping"
+                )
+            })?;
+        let mut output = 0u8;
+        for (index, parameter) in routine.parameters().iter().enumerate() {
+            if !parameter.mode.is_output() {
+                continue;
+            }
+            let argument = mapping[..argument_count]
+                .iter()
+                .position(|mapped| usize::from(*mapped) == index);
+            match argument {
+                Some(argument) if self.writable[argument] => {
+                    self.assigned[argument] = Some(output);
+                }
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "procedure parameter \"{}\" is an output parameter but corresponding argument is not writable",
+                        parameter.name.as_str()
+                    ));
+                }
+            }
+            output += 1;
+        }
+        Ok(())
+    }
+
+    /// Records the finished call's outputs, converted to their declared types.
+    pub(crate) fn record(
+        &mut self,
+        routine: &crate::storage::RoutineDef,
+        values: &[Datum<'_>],
+        storage: &Storage,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        let outputs = routine
+            .parameters()
+            .iter()
+            .filter(|parameter| parameter.mode.is_output());
+        for ((slot, value), parameter) in self.values.iter_mut().zip(values).zip(outputs) {
+            *slot = coerce_routine_argument(
+                detach_routine_datum(*value, arena)?,
+                crate::storage::RoutineArgumentDef {
+                    name: parameter.name,
+                    ctype: parameter.ctype,
+                    user_type: parameter.user_type,
+                },
+                storage,
+                txid,
+                arena,
+                None,
+            )?;
+        }
+        self.count = values.len();
+        Ok(())
+    }
 }
 
 fn unsupported_trigger_body() -> SqlError {
@@ -19194,12 +19471,14 @@ fn parse_trigger_assert<'a>(
 
 fn raise_format_arguments(format: &str) -> usize {
     let mut arguments = 0usize;
-    let mut characters = format.chars();
+    let mut characters = format.chars().peekable();
     while let Some(character) = characters.next() {
         if character != '%' {
             continue;
         }
-        if characters.next() != Some('%') {
+        // `%%` is a literal percent; any other `%` takes the next argument
+        // and leaves the following character in the message.
+        if characters.next_if_eq(&'%').is_none() {
             arguments += 1;
         }
     }
@@ -20383,7 +20662,20 @@ fn parse_trigger_statement<'a>(
         return Ok(TriggerStatement::LocalAssign(assignment));
     }
     if strip_trigger_keyword(segment, "call").is_some() {
-        return Err(plpgsql_call_unsupported());
+        super::plpgsql_inputs::record(
+            super::plpgsql_inputs::Kind::Statement,
+            segment.as_ptr() as usize,
+            segment,
+            segment,
+        )?;
+        let statement = super::parser::parse_stored_statement(segment, arena)?;
+        if !matches!(statement, Stmt::Call { .. }) {
+            return Err(unsupported_trigger_body());
+        }
+        return Ok(TriggerStatement::Call {
+            source: segment,
+            statement,
+        });
     }
     Err(unsupported_trigger_body())
 }
@@ -21123,6 +21415,7 @@ fn validate_plpgsql_constant_assignments(
                 | TriggerStatement::Assign(_)
                 | TriggerStatement::DynamicQuery(_)
                 | TriggerStatement::Utility { .. }
+                | TriggerStatement::Call { .. }
                 | TriggerStatement::Dml { .. }
                 | TriggerStatement::CursorOpen(_)
                 | TriggerStatement::CursorClose(_)
@@ -23763,6 +24056,10 @@ fn execute_bound_plpgsql_utility<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     query: BoundPlpgsqlCommand<'a>,
 ) -> Result<(), SqlError> {
+    if let Stmt::Call { .. } = query.statement {
+        // Without INTO, EXECUTE discards a procedure's output row.
+        return execute_plpgsql_dynamic_call(context, query).map(|_| ());
+    }
     let input_source = plpgsql_command_source(query.source, context.arena)?;
     super::type_input_plans::with_owner(query.owner, || {
         super::type_inputs::with_source(input_source, query.source, query.inputs, || {
@@ -25618,7 +25915,9 @@ fn execute_bound_plpgsql_utility<'a>(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "procedural-language catalog mutation is not supported"
                 ))),
-                Stmt::Call { .. } => Ok(Err(plpgsql_call_unsupported())),
+                Stmt::Call { .. } => {
+                    unreachable!("PL/pgSQL CALL runs through execute_plpgsql_dynamic_call")
+                }
                 _ => Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "PL/pgSQL utility command is not implemented"
@@ -26087,13 +26386,13 @@ fn trigger_format_message<'a>(
 
     let mut message = StackStr::<192>::new();
     let mut argument = 0usize;
-    let mut characters = format.chars();
+    let mut characters = format.chars().peekable();
     while let Some(character) = characters.next() {
         if character != '%' {
             let _ = message.write_char(character);
             continue;
         }
-        if characters.next() == Some('%') {
+        if characters.next_if_eq(&'%').is_some() {
             let _ = message.write_char('%');
             continue;
         }
@@ -26498,6 +26797,7 @@ fn prepare_static_plpgsql_statement<'a>(
             ..
         }) => (Kind::Query, core::ptr::from_ref(query) as usize),
         TriggerStatement::Utility { source, .. }
+        | TriggerStatement::Call { source, .. }
         | TriggerStatement::Dml { source, .. }
         | TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
             query: PlpgsqlCursorQuery::Static(source),
@@ -26588,6 +26888,16 @@ fn prepare_static_plpgsql_statement<'a>(
             }
         }
         TriggerStatement::Utility { .. } => TriggerStatement::Utility {
+            source: site.text,
+            statement: restore_plpgsql_statement(
+                site.text,
+                prepared.bindings,
+                &engine.storage,
+                context.txn.txid,
+                context.arena,
+            )?,
+        },
+        TriggerStatement::Call { .. } => TriggerStatement::Call {
             source: site.text,
             statement: restore_plpgsql_statement(
                 site.text,
@@ -28013,7 +28323,17 @@ fn execute_trigger_step<'a>(
                         }
                         debug_assert_eq!(affected, row_count as u64);
                     }
-                    Stmt::Call { .. } => return Err(plpgsql_call_unsupported()),
+                    Stmt::Call { .. } => {
+                        // EXECUTE ... INTO takes the output parameters as one row.
+                        let outputs = execute_plpgsql_dynamic_call(context, query)?;
+                        if outputs.count == 0 {
+                            return Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "INTO used with a command that cannot return data"
+                            ));
+                        }
+                        capture(&outputs.values[..outputs.count])?;
+                    }
                     _ => {
                         return Err(sql_err!(
                             sqlstate::SYNTAX_ERROR,
@@ -28105,6 +28425,34 @@ fn execute_trigger_step<'a>(
 
                 Ok(None)
             })
+        }),
+        TriggerStatement::Call { statement, .. } => execute_trigger_statement(|| {
+            let transition = TriggerTransition {
+                definition,
+                old,
+                new: new.as_deref(),
+            };
+            let scope = TriggerLocalScope {
+                locals,
+                values: &local_values[..locals.len()],
+                found: status.found,
+                invocation,
+                transition: &transition,
+            };
+            let outputs = execute_plpgsql_call(context, statement, locals, &scope)?;
+            for (argument, output) in outputs.arguments.iter().zip(outputs.assigned) {
+                if let (Some(name), Some(output)) = (argument, output) {
+                    assign_trigger_local(
+                        context,
+                        locals,
+                        local_values,
+                        *name,
+                        outputs.values[usize::from(output)],
+                    )?;
+                }
+            }
+            status.set_row_count(0)?;
+            Ok(None)
         }),
         TriggerStatement::Utility { source, statement } => execute_trigger_statement(|| {
             execute_bound_plpgsql_utility(
@@ -36526,6 +36874,275 @@ pub(crate) struct ValidatedRoutineBody {
     creation_path: StackStr<128>,
 }
 
+/// The fields of a record result: `RETURNS TABLE` columns, or else the
+/// output parameters in declaration order.
+pub(crate) fn record_columns<'a>(
+    result_columns: &'a [crate::storage::RoutineArgumentDef],
+    parameters: &[RoutineParameterDef],
+    arena: &'a Arena,
+) -> Result<&'a [crate::storage::RoutineArgumentDef], SqlError> {
+    if !result_columns.is_empty() {
+        return Ok(result_columns);
+    }
+    let outputs = parameters
+        .iter()
+        .filter(|parameter| parameter.mode.is_output());
+    let columns = arena
+        .alloc_slice_with(outputs.clone().count(), |_| {
+            crate::storage::RoutineArgumentDef::EMPTY
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    for (column, parameter) in columns.iter_mut().zip(outputs) {
+        *column = crate::storage::RoutineArgumentDef {
+            name: parameter.name,
+            ctype: parameter.ctype,
+            user_type: parameter.user_type,
+        };
+    }
+    Ok(columns)
+}
+
+/// The result check at a call, for a body CREATE did not check
+/// (`check_function_bodies` off, or polymorphic inputs now resolved). As in
+/// PostgreSQL, it runs only when no earlier statement can change the catalog
+/// the final statement reads; otherwise its values convert as they are produced.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the call check reads the resolved declaration and the parsed body"
+)]
+pub(crate) fn check_called_sql_routine_result(
+    storage: &Storage,
+    txid: u32,
+    program: &super::query::RoutineFunctionProgram<'_>,
+    kind: crate::storage::RoutineKind,
+    record_columns: &[crate::storage::RoutineArgumentDef],
+    arguments: &[crate::storage::RoutineArgumentDef],
+    contract: super::query::RoutineResultContract<'_>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let super::query::RoutineResultContract::Returns(declared) = contract else {
+        return Ok(());
+    };
+    if program.preceding.iter().any(|step| {
+        !matches!(
+            step,
+            super::query::RoutinePrelude::Statement(
+                Stmt::Select(_)
+                    | Stmt::SetQuery(_)
+                    | Stmt::Insert(_)
+                    | Stmt::Update(_)
+                    | Stmt::Delete(_)
+                    | Stmt::Merge(_)
+            )
+        )
+    }) {
+        return Ok(());
+    }
+    let _formal = enter_routine_parameter_types(
+        arguments,
+        Some(&super::query::storage_catalog(storage, arena, txid)),
+        crate::sql::ast::Collation::None,
+    )?;
+    check_sql_routine_result(
+        storage,
+        txid,
+        program,
+        kind,
+        record_columns,
+        declared,
+        arena,
+    )
+}
+
+/// PostgreSQL's `check_sql_stmt_retval` type checks at CREATE: a scalar
+/// result takes exactly one column that converts to it by assignment, and a
+/// row result takes one such column per field. An untyped literal output is
+/// `text`, as parse analysis leaves it.
+pub(crate) fn check_sql_routine_result(
+    storage: &Storage,
+    txid: u32,
+    program: &super::query::RoutineFunctionProgram<'_>,
+    kind: crate::storage::RoutineKind,
+    record_columns: &[crate::storage::RoutineArgumentDef],
+    declared: &str,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    use crate::sql::types::oid;
+    let type_oid = |ctype: ColType, user_type| {
+        storage
+            .routine_type_oid(ctype, user_type, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "routine result type identity is unavailable"
+                )
+            })
+    };
+    let mut expected = [0i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let (scalar, expected_count) = match kind.checked_body_result(
+        if matches!(kind, crate::storage::RoutineKind::Procedure) {
+            &[]
+        } else {
+            record_columns
+        },
+        !record_columns.is_empty(),
+    ) {
+        None => return Ok(()),
+        Some(result) if result.polymorphic_type().is_some() => return Ok(()),
+        Some(result) if result.ctype == ColType::Record => {
+            for (slot, column) in expected.iter_mut().zip(record_columns) {
+                *slot = type_oid(column.ctype, column.user_type)?;
+            }
+            if record_columns.is_empty() || record_columns.len() > expected.len() {
+                return Ok(());
+            }
+            (None, record_columns.len())
+        }
+        Some(result) => {
+            let result_oid = type_oid(result.ctype, result.user_type)?;
+            match crate::storage::NamedTypeKind::from_oid(result_oid) {
+                Some((crate::storage::NamedTypeKind::Composite, creation, false)) => {
+                    let mut count = 0;
+                    let mut overflow = false;
+                    visit_catalog_composite_fields(
+                        storage,
+                        txid,
+                        Some(creation),
+                        &mut |_, field| {
+                            match expected.get_mut(count) {
+                                Some(slot) => *slot = field.type_oid,
+                                None => overflow = true,
+                            }
+                            count += 1;
+                        },
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "composite result type no longer exists"
+                        )
+                    })?;
+                    if overflow {
+                        // Wider rows than routine arguments keep the runtime check.
+                        return Ok(());
+                    }
+                    (Some(result_oid), count)
+                }
+                _ => {
+                    expected[0] = result_oid;
+                    (Some(result_oid), 0)
+                }
+            }
+        }
+    };
+    let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let count = match program.result {
+        super::query::RoutineFunctionResult::Query(super::query::RoutineQuery::Select(select)) => {
+            let select = super::query::expand_ctes(select, storage, txid, arena)?;
+            super::query::describe_select(
+                select,
+                storage,
+                txid,
+                arena,
+                &mut described,
+                DescriptionTarget::Sql,
+                None,
+            )?
+        }
+        super::query::RoutineFunctionResult::Query(super::query::RoutineQuery::Set(query)) => {
+            super::query::describe_set_query(
+                storage,
+                txid,
+                query,
+                &mut described,
+                arena,
+                DescriptionTarget::Sql,
+            )?
+        }
+        super::query::RoutineFunctionResult::DataModification(statement) => {
+            describe_data_modification_columns(
+                storage,
+                statement,
+                arena,
+                txid,
+                &mut described,
+                DescriptionTarget::Sql,
+            )?
+        }
+        _ => return Ok(()),
+    };
+    let actual = |index: usize| match described[index].type_oid {
+        oid::UNKNOWN => oid::TEXT,
+        type_oid => type_oid,
+    };
+    let display = |type_oid: i32| -> Result<&str, SqlError> {
+        let result = storage
+            .routine_result_for_oid(type_oid, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "routine result type identity is unavailable"
+                )
+            })?;
+        super::catalog::routine_type_display(storage, txid, result, arena)
+    };
+    if let Some(result_oid) = scalar {
+        if expected_count == 0 {
+            if count != 1 {
+                return Err(super::query::routine_result_width_mismatch(
+                    declared, true, count, 1,
+                ));
+            }
+            if super::catalog::assignment_coercible(storage, txid, actual(0), result_oid) {
+                return Ok(());
+            }
+            let detail =
+                crate::stack_format!(192, "Actual return type is {}.", display(actual(0))?);
+            return Err(super::query::routine_result_mismatch(
+                declared,
+                detail.as_str(),
+            ));
+        }
+        // A single column of the whole row type is the row itself.
+        if count == 1 && super::catalog::assignment_coercible(storage, txid, actual(0), result_oid)
+        {
+            return Ok(());
+        }
+    }
+    for (index, expected) in expected.iter().copied().enumerate().take(count) {
+        if index >= expected_count {
+            return Err(super::query::routine_result_width_mismatch(
+                declared,
+                false,
+                count,
+                expected_count,
+            ));
+        }
+        if !super::catalog::assignment_coercible(storage, txid, actual(index), expected) {
+            let detail = crate::stack_format!(
+                192,
+                "Final statement returns {} instead of {} at column {}.",
+                display(actual(index))?,
+                display(expected)?,
+                index + 1
+            );
+            return Err(super::query::routine_result_mismatch(
+                declared,
+                detail.as_str(),
+            ));
+        }
+    }
+    if count != expected_count {
+        return Err(super::query::routine_result_width_mismatch(
+            declared,
+            false,
+            count,
+            expected_count,
+        ));
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "body validation requires explicit resolved declarations, input ownership and configuration"
@@ -36637,6 +37254,21 @@ pub(crate) fn validate_routine_body(
                     body_inputs,
                     |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 )?;
+                if let super::query::RoutineResultContract::Returns(declared) = sql_result {
+                    check_sql_routine_result(
+                        storage,
+                        txn.txid,
+                        &program,
+                        kind,
+                        record_columns(
+                            &result_columns[..result_column_count],
+                            &parameters[..routine.arguments.len()],
+                            arena,
+                        )?,
+                        declared,
+                        arena,
+                    )?;
+                }
                 if body_kind != crate::storage::RoutineBodyKind::String {
                     let raw_path = guc.search_path();
                     let user = super::eval::funcs::system::session_user_owned();
@@ -36703,6 +37335,21 @@ pub(crate) fn validate_routine_body(
                     body_inputs,
                     |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 )?;
+                if let super::query::RoutineResultContract::Returns(declared) = sql_result {
+                    check_sql_routine_result(
+                        storage,
+                        txn.txid,
+                        &program,
+                        kind,
+                        record_columns(
+                            &result_columns[..result_column_count],
+                            &parameters[..routine.arguments.len()],
+                            arena,
+                        )?,
+                        declared,
+                        arena,
+                    )?;
+                }
                 if body_kind != crate::storage::RoutineBodyKind::String {
                     let raw_path = guc.search_path();
                     let user = super::eval::funcs::system::session_user_owned();
@@ -36763,6 +37410,21 @@ pub(crate) fn validate_routine_body(
                     body_inputs,
                     |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 )?;
+                if let super::query::RoutineResultContract::Returns(declared) = sql_result {
+                    check_sql_routine_result(
+                        storage,
+                        txn.txid,
+                        &program,
+                        kind,
+                        record_columns(
+                            &result_columns[..result_column_count],
+                            &parameters[..routine.arguments.len()],
+                            arena,
+                        )?,
+                        declared,
+                        arena,
+                    )?;
+                }
                 if body_kind != crate::storage::RoutineBodyKind::String {
                     let raw_path = guc.search_path();
                     let user = super::eval::funcs::system::session_user_owned();

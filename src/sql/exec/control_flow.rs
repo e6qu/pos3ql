@@ -1233,6 +1233,7 @@ fn bind_exception_variables<'a>(
             site(Kind::Query, core::ptr::from_ref(query) as usize)
         }
         TriggerStatement::Utility { source, .. }
+        | TriggerStatement::Call { source, .. }
         | TriggerStatement::Dml { source, .. }
         | TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
             query: PlpgsqlCursorQuery::Static(source),

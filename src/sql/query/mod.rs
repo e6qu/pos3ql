@@ -3581,6 +3581,25 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 validate_stored_type_inputs(parser, self.storage, self.txid, dependencies.view())
             },
         )?;
+        super::exec::check_called_sql_routine_result(
+            self.storage,
+            self.txid,
+            &function_program,
+            routine.kind,
+            super::exec::record_columns(
+                routine.table_columns().unwrap_or(&[]),
+                routine.parameters(),
+                self.routine_workspace,
+            )?,
+            routine.arguments(),
+            RoutineResultContract::stored(
+                self.storage,
+                self.txid,
+                routine,
+                self.routine_workspace,
+            )?,
+            self.routine_workspace,
+        )?;
         let program_access = routine_program_access(&function_program);
         if program_access == RoutineProgramAccess::Engine {
             return Err(sql_err!(
@@ -6559,6 +6578,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
     }
 
+    fn compatible_element_oid(&self, inputs: &[(bool, i32)]) -> Option<i32> {
+        self.storage.compatible_element_oid(inputs, self.txid)
+    }
+
     fn user_type_identity_oid(
         &self,
         identity: crate::storage::UserTypeName,
@@ -7252,15 +7275,29 @@ fn check_key_types<'a>(
         infer_scope_type(e, scope)
             .ok()
             .and_then(|(oid, _)| ColType::from_oid(oid))
-            .filter(|ctype| !ctype.has_builtin_equality())
+            .filter(|ctype| !ctype.has_default_equality())
     };
     let unordered_cid = |e: &Expr<'a>| {
         infer_scope_type(e, scope)
             .ok()
             .and_then(|(oid, _)| ColType::from_oid(oid))
-            .is_some_and(|ctype| ctype.has_builtin_equality() && !ctype.has_builtin_ordering())
+            .is_some_and(|ctype| ctype.has_default_equality() && !ctype.has_builtin_ordering())
     };
-    for key in statement.group_by.iter().chain(statement.distinct_on) {
+    let distinct_items = statement
+        .items
+        .iter()
+        .filter(|_| statement.distinct && statement.distinct_on.is_empty())
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        });
+    for key in statement
+        .group_by
+        .iter()
+        .copied()
+        .chain(statement.distinct_on.iter().copied())
+        .chain(distinct_items)
+    {
         if let Some(ctype) = noncomparable(key) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
@@ -10003,6 +10040,20 @@ pub(crate) fn constant_select_resumable<'a>(
     };
     if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
+    }
+    // DISTINCT compares whole rows with each type's default equality.
+    if statement.distinct
+        && statement.distinct_on.is_empty()
+        && let Some(ctype) = columns[..n]
+            .iter()
+            .filter_map(|column| ColType::from_oid(column.type_oid))
+            .find(|ctype| !ctype.has_default_equality())
+    {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "could not identify an equality operator for type {}",
+            ctype.name()
+        ));
     }
     // A window function needs rows to compute over, and this path has no scan
     // to give it. A FROM-less SELECT is exactly one row, though, so it can be

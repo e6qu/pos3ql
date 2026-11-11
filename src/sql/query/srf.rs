@@ -5967,6 +5967,20 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     super::validate_stored_type_inputs(parser, storage, txid, dependencies.view())
                 },
             )?;
+            super::super::exec::check_called_sql_routine_result(
+                storage,
+                txid,
+                &program,
+                routine.kind,
+                super::super::exec::record_columns(
+                    routine.table_columns().unwrap_or(&[]),
+                    routine.parameters(),
+                    arena,
+                )?,
+                routine.arguments(),
+                super::RoutineResultContract::stored(storage, txid, routine, arena)?,
+                arena,
+            )?;
             let access = super::routine_program_access(&program);
             let sequences = hooks.sequences;
             if access == super::RoutineProgramAccess::Engine

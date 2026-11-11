@@ -69,6 +69,12 @@ pub(crate) enum CommonTypeError {
     Conversion { from: ColType, to: ColType },
 }
 
+/// PostgreSQL 18.6 `pg_type.typispreferred`: bool, text, oid, float8, inet,
+/// timestamptz, interval and varbit.
+pub(crate) fn preferred_type_oid(type_oid: i32) -> bool {
+    matches!(type_oid, 16 | 25 | 26 | 701 | 869 | 1184 | 1186 | 1562)
+}
+
 pub(crate) fn type_category(ctype: ColType) -> &'static str {
     use ColType::*;
     match ctype {
@@ -2510,10 +2516,29 @@ impl ColType {
         )
     }
 
+    /// Whether PostgreSQL finds a default btree or hash equality for the type
+    /// (`lookup_type_cache` with `TYPECACHE_EQ_OPR`), as DISTINCT, grouping,
+    /// set operations, array comparison and array search require. Geometric
+    /// types keep their `=` operators (box area equality, for example) but
+    /// have no such operator class, like `xml` and the snapshot types. An
+    /// array has one exactly when its element does.
+    pub fn has_default_equality(self) -> bool {
+        match self {
+            Self::Array(element) => element.to_coltype().has_default_equality(),
+            _ => {
+                self.has_builtin_equality()
+                    && !matches!(
+                        self,
+                        Self::Xml | Self::Geometry(_) | Self::PgSnapshot | Self::TxidSnapshot
+                    )
+            }
+        }
+    }
+
     /// Whether PostgreSQL exposes the ordering operators needed by SQL sort
     /// keys. Command IDs have equality but deliberately have no ordering.
-    pub const fn has_builtin_ordering(self) -> bool {
-        self.has_builtin_equality() && !matches!(self, Self::Cid | Self::Array(ArrElem::Cid))
+    pub fn has_builtin_ordering(self) -> bool {
+        self.has_default_equality() && !matches!(self, Self::Cid | Self::Array(ArrElem::Cid))
     }
 
     /// Whether values of this type carry a PostgreSQL collation.

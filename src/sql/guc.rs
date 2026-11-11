@@ -476,6 +476,10 @@ pub struct SeqSession {
     caches: [Cell<SequenceCache>; INLINE_SEQUENCE_SLOTS],
     overflow_currvals: Option<FixedVec<Cell<(u64, i64)>>>,
     overflow_caches: Option<FixedVec<Cell<SequenceCache>>>,
+    /// The wake time (microseconds since the Unix epoch) of the `pg_sleep`
+    /// call that the current statement is parked on. The statement's effect
+    /// journal replays the sleeps that already finished.
+    sleep_until: Cell<Option<i64>>,
 }
 
 const INLINE_SEQUENCE_SLOTS: usize = 64;
@@ -526,7 +530,17 @@ impl SeqSession {
             caches: [const { Cell::new(SequenceCache::EMPTY) }; INLINE_SEQUENCE_SLOTS],
             overflow_currvals: None,
             overflow_caches: None,
+            sleep_until: Cell::new(None),
         }
+    }
+
+    /// The wake time of the sleep the current statement waits for.
+    pub(crate) fn sleep_until(&self) -> Option<i64> {
+        self.sleep_until.get()
+    }
+
+    pub(super) fn set_sleep_until(&self, deadline: Option<i64>) {
+        self.sleep_until.set(deadline);
     }
 
     pub(crate) const fn extra_budget_bytes(sequence_capacity: usize) -> usize {

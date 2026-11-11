@@ -1327,6 +1327,9 @@ impl Conn {
                     self.parked_generation != engine.cache_capacity_generation()
                 }
                 crate::sql::StatementWait::ClientOutput => self.transport_output_empty(),
+                crate::sql::StatementWait::Timer => self
+                    .sleep_remaining()
+                    .is_none_or(|remaining| remaining.is_zero()),
             };
         if !ready {
             return None;
@@ -1372,10 +1375,26 @@ impl Conn {
         } else {
             None
         };
-        [lock, self.statement_wait_remaining()]
+        let sleep = if self.parked_wait == crate::sql::StatementWait::Timer {
+            self.sleep_remaining()
+        } else {
+            None
+        };
+        [lock, sleep, self.statement_wait_remaining()]
             .into_iter()
             .flatten()
             .min()
+    }
+
+    /// Time until the parked `pg_sleep` call's wake time.
+    fn sleep_remaining(&self) -> Option<Duration> {
+        self.guc.seq_session().sleep_until().map(|deadline| {
+            Duration::from_micros(
+                deadline
+                    .saturating_sub(crate::sql::datetime::now_micros())
+                    .max(0) as u64,
+            )
+        })
     }
 
     fn statement_wait_remaining(&self) -> Option<Duration> {
@@ -1400,6 +1419,15 @@ impl Conn {
     }
 
     fn park(&mut self, wait: crate::sql::StatementWait, generation: u64) {
+        // `pg_sleep` reports a lock-style wait; its recorded wake time makes
+        // the connection wait on a timer, outside lock_timeout.
+        let wait = if wait == crate::sql::StatementWait::Lock
+            && self.guc.seq_session().sleep_until().is_some()
+        {
+            crate::sql::StatementWait::Timer
+        } else {
+            wait
+        };
         self.parked = true;
         self.parked_generation = generation;
         self.parked_wait = wait;
@@ -2246,7 +2274,7 @@ impl Conn {
                                 crate::sql::StatementWait::Lock
                             };
                             self.park(wait, engine.statement_wait_generation(wait, self.id));
-                            engine.park_backend_statement(self.id, wait);
+                            engine.park_backend_statement(self.id, self.parked_wait);
                             return Step::Parked;
                         }
                         self.cursors.on_rollback();
@@ -2354,7 +2382,7 @@ impl Conn {
                         crate::sql::StatementWait::Lock
                     };
                     self.park(wait, engine.statement_wait_generation(wait, self.id));
-                    engine.park_backend_statement(self.id, wait);
+                    engine.park_backend_statement(self.id, self.parked_wait);
                     return Step::Parked;
                 }
                 Err(error) => {
@@ -2507,7 +2535,7 @@ impl Conn {
             }
             Ok(crate::sql::ExtendedExecutionStatus::Blocked { wait }) => {
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
-                engine.park_backend_statement(self.id, wait);
+                engine.park_backend_statement(self.id, self.parked_wait);
                 Step::Parked
             }
             Err(WireFull) => Step::Close,
@@ -3142,7 +3170,7 @@ impl Conn {
             };
             self.copy = Some(copy);
             self.park(wait, engine.statement_wait_generation(wait, self.id));
-            engine.park_backend_statement(self.id, wait);
+            engine.park_backend_statement(self.id, self.parked_wait);
             return Step::Parked;
         }
         self.copy_transition_scratch.clear();
@@ -3802,7 +3830,7 @@ impl Conn {
                     crate::sql::StatementWait::Lock
                 };
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
-                engine.park_backend_statement(self.id, wait);
+                engine.park_backend_statement(self.id, self.parked_wait);
                 return Step::Parked;
             }
             Ok(Err(error)) => {
@@ -4212,7 +4240,7 @@ impl Conn {
                 }
                 Ok(crate::sql::ExtendedExecutionStatus::Blocked { wait }) => {
                     self.park(wait, engine.statement_wait_generation(wait, self.id));
-                    engine.park_backend_statement(self.id, wait);
+                    engine.park_backend_statement(self.id, self.parked_wait);
                     if !self.txn.has_pending_write_completion() {
                         if paged {
                             self.portals[portal_slot].result.clear();
@@ -4533,7 +4561,7 @@ impl Conn {
             }) => {
                 self.resume_statement = completed_statements;
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
-                engine.park_backend_statement(self.id, wait);
+                engine.park_backend_statement(self.id, self.parked_wait);
                 self.arena.recycle_front();
                 if !self.truncate_output(output_mark) {
                     // A restart would repeat rows the client already has.
@@ -4646,7 +4674,7 @@ impl Conn {
             }
             Ok(crate::sql::StreamStep::Wait(wait)) => {
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
-                engine.park_backend_statement(self.id, wait);
+                engine.park_backend_statement(self.id, self.parked_wait);
                 self.arena.recycle_front();
                 Step::Parked
             }
@@ -4770,7 +4798,7 @@ impl Conn {
             Ok(crate::sql::StreamStep::Wait(wait)) => {
                 self.resume_statement = statement;
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
-                engine.park_backend_statement(self.id, wait);
+                engine.park_backend_statement(self.id, self.parked_wait);
                 self.arena.recycle_front();
                 Some(Step::Parked)
             }
@@ -6581,6 +6609,9 @@ mod bind_inputs_tests;
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 #[path = "conn/result_output_tests.rs"]
 mod result_output_tests;
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[path = "conn/sleep_tests.rs"]
+mod sleep_tests;
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {

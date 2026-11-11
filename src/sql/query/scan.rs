@@ -6121,9 +6121,10 @@ fn scan_source_mode<'a>(
         Ok(())
     }
 
-    /// Executes a previously selected two-table hash plan. Its fixed capacity
-    /// is a plan invariant: stale statistics that exceed it raise 54000 rather
-    /// than changing the execution strategy after query execution begins.
+    /// Executes a previously selected two-table hash plan. Its capacity is
+    /// the planner's estimate; a build side larger than that estimate (rows
+    /// spilled to object storage are estimated, not counted) grows the table
+    /// in the statement arena instead of changing the execution strategy.
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join_plan<'a>(
         storage: &'a Storage,
@@ -6154,14 +6155,14 @@ fn scan_source_mode<'a>(
         let build_external_run = scope.external_runs[build_t];
         let build_count = plan.build_capacity;
         let completed = (|| -> Result<bool, SqlError> {
-            let buckets_len = (build_count * 2).next_power_of_two().max(16);
-            let entries = arena
+            let mut buckets_len = (build_count * 2).next_power_of_two().max(16);
+            let mut entries = arena
                 .alloc_slice_with(build_count, |_| EMPTY_HASH_ENTRY)
                 .map_err(|_| arena_full())?;
-            let next = arena
+            let mut next = arena
                 .alloc_slice_with(build_count, |_| 0u32)
                 .map_err(|_| arena_full())?;
-            let buckets = arena
+            let mut buckets = arena
                 .alloc_slice_with(buckets_len, |_| u32::MAX)
                 .map_err(|_| arena_full())?;
             let mut build_schema = [ColType::Bool; MAX_COLUMNS];
@@ -6175,6 +6176,33 @@ fn scan_source_mode<'a>(
             let hash_cols: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
             let mut key_vals = [Datum::Null; 8];
             let mut n = 0usize;
+            // Doubles the entries and rehashes them into twice as many
+            // buckets. Chains keep their order: later rows first.
+            macro_rules! grow_build {
+                () => {{
+                    if n == entries.len() {
+                        let grown = entries.len().checked_mul(2).ok_or_else(arena_full)?;
+                        let old_entries = &*entries;
+                        entries = arena
+                            .alloc_slice_with(grown, |index| {
+                                old_entries.get(index).copied().unwrap_or(EMPTY_HASH_ENTRY)
+                            })
+                            .map_err(|_| arena_full())?;
+                        next = arena
+                            .alloc_slice_with(grown, |_| 0u32)
+                            .map_err(|_| arena_full())?;
+                        buckets_len = (grown * 2).next_power_of_two().max(16);
+                        buckets = arena
+                            .alloc_slice_with(buckets_len, |_| u32::MAX)
+                            .map_err(|_| arena_full())?;
+                        for index in 0..n {
+                            let bucket = (entries[index].hash as usize) & (buckets_len - 1);
+                            next[index] = buckets[bucket];
+                            buckets[bucket] = index as u32;
+                        }
+                    }
+                }};
+            }
             macro_rules! insert_build {
                 ($rowid:expr, $row:expr, $values:expr) => {{
                     let values = $values;
@@ -6187,9 +6215,7 @@ fn scan_source_mode<'a>(
                         }
                     }
                     if !any_null {
-                        if n == entries.len() {
-                            return Err(arena_full());
-                        }
+                        grow_build!();
                         let hash = hash_key_collated_catalog(
                             storage,
                             txid,
@@ -6253,15 +6279,25 @@ fn scan_source_mode<'a>(
                 scan.for_each_spilled_row_batch(arena, false, Some(demand), &mut |rows| {
                     for spilled in rows {
                         storage.record_relation_tuple_read(txid, build_slot, None)?;
-                        let crate::storage::SpilledRowRepresentation::Values(values) =
-                            spilled.representation
-                        else {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "PAX scan did not return selected values"
-                            ));
-                        };
-                        insert_build!(Some(spilled.rowid), BoundRow::Values(values), values);
+                        // Rows not yet in column blocks arrive encoded.
+                        match spilled.representation {
+                            crate::storage::SpilledRowRepresentation::Values(values) => {
+                                insert_build!(
+                                    Some(spilled.rowid),
+                                    BoundRow::Values(values),
+                                    values
+                                );
+                            }
+                            crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                                rowenc::decode(bytes, build_schema, &mut decoded)?;
+                                insert_build!(
+                                    Some(spilled.rowid),
+                                    BoundRow::Encoded(bytes),
+                                    &decoded[..build_schema.len()]
+                                );
+                            }
+                        }
                     }
                     Ok(ControlFlow::Continue(()))
                 })?;
@@ -6293,9 +6329,7 @@ fn scan_source_mode<'a>(
                     if any_null {
                         return Ok(ControlFlow::Continue(()));
                     }
-                    if n == entries.len() {
-                        return Err(arena_full());
-                    }
+                    grow_build!();
                     let hash = hash_key_collated_catalog(
                         storage,
                         txid,
@@ -6347,13 +6381,16 @@ fn scan_source_mode<'a>(
                     for spilled in rows {
                         check_timeout()?;
                         storage.record_relation_tuple_read(txid, probe_slot, None)?;
-                        let crate::storage::SpilledRowRepresentation::Values(values) =
-                            spilled.representation
-                        else {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "PAX scan did not return selected values"
-                            ));
+                        // Rows not yet in column blocks arrive encoded.
+                        let values = match spilled.representation {
+                            crate::storage::SpilledRowRepresentation::Values(values) => values,
+                            crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                                rowenc::decode(bytes, probe_schema, &mut decoded)?;
+                                &*arena
+                                    .alloc_slice_copy(&decoded[..probe_schema.len()])
+                                    .map_err(|_| arena_full())?
+                            }
                         };
                         let mut any_null = false;
                         for i in 0..nkeys {

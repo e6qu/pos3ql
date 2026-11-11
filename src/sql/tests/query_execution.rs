@@ -895,3 +895,60 @@ fn grouped_statements_keep_fixed_aggregate_states_per_group() {
     );
     session.success(&mut engine, "ROLLBACK", true);
 }
+
+#[test]
+fn hash_joins_grow_past_estimates_of_spilled_tables() {
+    // Rows spilled to object storage are estimated, not counted: a build
+    // side larger than the estimate grows its table, and rows still in
+    // memory join with column-block rows, as in PostgreSQL 18.6.
+    let name = "hash-join-spilled-estimate";
+    let mut config = test_config(name);
+    config.row_overlay_slots = 512;
+    config.txn_rows = 512;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("{name}-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE spilled_rows(id int, payload text)",
+        false,
+    );
+    for first in (1..=3000).step_by(500) {
+        session.success(
+            &mut engine,
+            &format!(
+                "INSERT INTO spilled_rows SELECT g, repeat('x', 100) \
+                 FROM generate_series({first}, {}) g",
+                first + 499
+            ),
+            false,
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+    session.success(
+        &mut engine,
+        "CREATE TABLE fresh_rows(id int, tag text); \
+         INSERT INTO fresh_rows SELECT g, 't' FROM generate_series(1, 100) g",
+        false,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*), sum(length(r.payload)) FROM spilled_rows r \
+             JOIN spilled_rows s ON s.id = r.id; \
+             SELECT count(*) FROM spilled_rows r JOIN fresh_rows f ON f.id = r.id; \
+             SELECT count(*) FROM fresh_rows f JOIN spilled_rows r ON r.id = f.id",
+            false,
+        )),
+        ["3000|300000", "100", "100"]
+    );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

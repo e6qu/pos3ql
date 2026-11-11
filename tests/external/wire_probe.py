@@ -980,10 +980,10 @@ def test_paged_portal_capacity_is_a_named_error_not_a_disconnect():
     simple_query(s, "BEGIN")
     parse = frontend_message(
         b"P",
-        # Grouping is not a retained shape, so this paged portal buffers its
-        # whole result in portal_result_bytes.
+        # A set operation is not a retained shape, so this paged portal
+        # buffers its whole result in portal_result_bytes.
         b"bounded_statement\x00SELECT repeat('x', 1024) || g FROM generate_series(1,100) g "
-        b"GROUP BY g\x00\x00\x00",
+        b"UNION ALL SELECT 'end'\x00\x00\x00",
     )
     bind = frontend_message(
         b"B", b"bounded_portal\x00bounded_statement\x00" + struct.pack("!hhh", 0, 0, 0)

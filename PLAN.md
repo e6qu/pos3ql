@@ -288,9 +288,7 @@ target and expression count errors are positioned. PL/pgSQL statements, writes, 
 queries, including data-modifying ones, in one new command as PostgreSQL
 does. Remaining: `OPEN ... FOR` a query with data-modifying `WITH` queries
 fails with `0A000` (the cursor reruns its query at each `FETCH` and cannot
-keep the written rows); a trigger function fired outside a routine (an
-ordinary `INSERT` firing a BEFORE trigger) rejects data-modifying `WITH`
-queries with `0A000`; and a PL/pgSQL write with `WITH` queries whose nested
+keep the written rows); and a PL/pgSQL write with `WITH` queries whose nested
 AFTER trigger waits fails with `0A000` instead of resuming. A derived table
 in FROM, or a `WITH` query run as one, that names a routine variable or a
 trigger's `NEW`/`OLD` row fails as an unknown column in a function called

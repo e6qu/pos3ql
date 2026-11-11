@@ -43,4 +43,15 @@ end $$;
 create trigger wt191_t before insert on wt191 for each row execute function wtrg191();
 insert into wt191 values (50, 0);
 select * from wlog191;
+create or replace function wtrg191() returns trigger language plpgsql as $$
+declare x int;
+begin
+  with s as (insert into wlog191 values (new.a) returning a) insert into wlog191 select a + 1 from s;
+  with d as (delete from wlog191 where a = new.a + 1 returning a) select count(*) into x from d;
+  with u as (update wlog191 set a = a + 100 where a = new.a returning a) select 1 into x;
+  raise notice 'deleted %', x;
+  return new;
+end $$;
+insert into wt191 values (60, 0), (70, 0);
+select * from wlog191 order by a;
 drop table wt191, wlog191; drop function w191(); drop function w191b(); drop function wtrg191();

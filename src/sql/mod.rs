@@ -14092,8 +14092,7 @@ impl Engine {
         })
     }
 
-    /// Expands one data-modifying `WITH` query against the queries before it
-    /// and describes its output relation, without running it.
+    /// [`analyze_dml_cte`] under this engine's storage and sequences.
     #[allow(clippy::too_many_arguments)]
     fn analyze_dml_cte<'a>(
         &mut self,
@@ -14105,85 +14104,16 @@ impl Engine {
         params: &[Datum<'a>],
         guc: &GucState,
     ) -> Result<(&'a Stmt<'a>, ast::MaterializedCte<'a>), SqlError> {
-        use crate::sql::exec::MAX_PROJ;
-        use crate::sql::types::ColDesc;
-        let cte = &with[cte_index];
-        let Some(dml) = cte.dml else {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "WITH query \"{}\" does not modify data",
-                cte.name
-            ));
-        };
-        // Earlier ordinary, recursive, and data-modifying CTEs are in scope
-        // inside this CTE body. Expansion finishes its immutable catalog work
-        // before the statement takes a mutable storage borrow.
-        let dml = query::expand_dml_ctes(
-            dml,
-            &with[..cte_index],
+        analyze_dml_cte(
             &self.storage,
+            with,
+            cte_index,
+            earlier,
             txn.txid,
             arena,
             params,
-            earlier,
-            Some(&sequence::SeqEval::new(
-                &self.storage,
-                guc.seq_session(),
-                txn.txid,
-            )),
-        )?;
-        if !matches!(
-            dml,
-            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)
-        ) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "a data-modifying WITH sub-statement must be INSERT, UPDATE, DELETE or MERGE"
-            ));
-        }
-        // Protocol and CTE outputs share view rewriting, target ownership,
-        // aliases, and catalog-derived result types.
-        let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let ncols = self.describe_data_modification_columns(
-            dml,
-            arena,
-            txn,
-            &mut descs,
-            crate::sql::exec::DescriptionTarget::Sql,
-        )?;
-        if cte.columns.len() > ncols {
-            return Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "WITH query \"{}\" has {} columns available but {} columns specified",
-                cte.name,
-                ncols,
-                cte.columns.len()
-            ));
-        }
-        let mut names: [&str; MAX_PROJ] = [""; MAX_PROJ];
-        let mut types = [(0i32, 0i16, -1i32); MAX_PROJ];
-        for i in 0..ncols {
-            // Materialized names outlive the local description and schema owner.
-            let nm = cte.columns.get(i).copied().unwrap_or(descs[i].name);
-            names[i] = arena.alloc_str(nm).map_err(|_| query::arena_full_pub())?;
-            types[i] = (descs[i].type_oid, descs[i].typlen, descs[i].type_mod);
-        }
-        Ok((
-            dml,
-            ast::MaterializedCte {
-                column_names: arena
-                    .alloc_slice_copy(&names[..ncols])
-                    .map_err(|_| query::arena_full_pub())?,
-                column_types: arena
-                    .alloc_slice_copy(&types[..ncols])
-                    .map_err(|_| query::arena_full_pub())?,
-                column_collations: arena
-                    .alloc_slice_with(ncols, |index| descs[index].collation)
-                    .map_err(|_| query::arena_full_pub())?,
-                definition: None,
-                source: ast::MaterializedCteSource::Inline(&[]),
-            },
-        ))
+            &sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
+        )
     }
 
     /// Runs one analysed data-modifying `WITH` query once and returns its
@@ -29292,3 +29222,94 @@ mod tests;
 
 #[cfg(all(test, not(miri)))]
 pub(crate) use tests::object_reads::HttpObjectServer;
+
+/// Expands one data-modifying `WITH` query against the queries before it
+/// and describes its output relation, without running it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analyze_dml_cte<'a>(
+    storage: &Storage,
+    with: &'a [ast::Cte<'a>],
+    cte_index: usize,
+    earlier: &[(&'a str, &'a ast::MaterializedCte<'a>)],
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    sequences: &dyn SequenceAccess,
+) -> Result<(&'a Stmt<'a>, ast::MaterializedCte<'a>), SqlError> {
+    use crate::sql::exec::MAX_PROJ;
+    use crate::sql::types::ColDesc;
+    let cte = &with[cte_index];
+    let Some(dml) = cte.dml else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "WITH query \"{}\" does not modify data",
+            cte.name
+        ));
+    };
+    // Earlier ordinary, recursive, and data-modifying CTEs are in scope
+    // inside this CTE body. Expansion finishes its immutable catalog work
+    // before the statement takes a mutable storage borrow.
+    let dml = query::expand_dml_ctes(
+        dml,
+        &with[..cte_index],
+        storage,
+        txid,
+        arena,
+        params,
+        earlier,
+        Some(sequences),
+    )?;
+    if !matches!(
+        dml,
+        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)
+    ) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "a data-modifying WITH sub-statement must be INSERT, UPDATE, DELETE or MERGE"
+        ));
+    }
+    // Protocol and CTE outputs share view rewriting, target ownership,
+    // aliases, and catalog-derived result types.
+    let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let ncols = exec::describe_data_modification_columns(
+        storage,
+        dml,
+        arena,
+        txid,
+        &mut descs,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )?;
+    if cte.columns.len() > ncols {
+        return Err(sql_err!(
+            sqlstate::INVALID_COLUMN_REFERENCE,
+            "WITH query \"{}\" has {} columns available but {} columns specified",
+            cte.name,
+            ncols,
+            cte.columns.len()
+        ));
+    }
+    let mut names: [&str; MAX_PROJ] = [""; MAX_PROJ];
+    let mut types = [(0i32, 0i16, -1i32); MAX_PROJ];
+    for i in 0..ncols {
+        // Materialized names outlive the local description and schema owner.
+        let nm = cte.columns.get(i).copied().unwrap_or(descs[i].name);
+        names[i] = arena.alloc_str(nm).map_err(|_| query::arena_full_pub())?;
+        types[i] = (descs[i].type_oid, descs[i].typlen, descs[i].type_mod);
+    }
+    Ok((
+        dml,
+        ast::MaterializedCte {
+            column_names: arena
+                .alloc_slice_copy(&names[..ncols])
+                .map_err(|_| query::arena_full_pub())?,
+            column_types: arena
+                .alloc_slice_copy(&types[..ncols])
+                .map_err(|_| query::arena_full_pub())?,
+            column_collations: arena
+                .alloc_slice_with(ncols, |index| descs[index].collation)
+                .map_err(|_| query::arena_full_pub())?,
+            definition: None,
+            source: ast::MaterializedCteSource::Inline(&[]),
+        },
+    ))
+}

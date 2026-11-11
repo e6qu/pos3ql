@@ -166,3 +166,33 @@ fn plpgsql_writes_run_with_queries_in_one_command() {
         );
     });
 }
+
+#[test]
+fn trigger_functions_run_data_modifying_with_queries() {
+    with_engine("trigger-write-with", |engine, budget| {
+        for sql in [
+            "CREATE TABLE t (a int)",
+            "CREATE TABLE log (a int)",
+            "CREATE FUNCTION audit() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             DECLARE x int; BEGIN \
+             WITH s AS (INSERT INTO log VALUES (NEW.a) RETURNING a) INSERT INTO log SELECT a + 1 FROM s; \
+             WITH d AS (DELETE FROM log WHERE a = NEW.a + 1 RETURNING a) SELECT count(*) INTO x FROM d; \
+             RAISE NOTICE 'deleted %', x; RETURN NEW; END $$",
+            "CREATE TRIGGER audited BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION audit()",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        assert_eq!(
+            diagnostics(&run_with(engine, budget, "INSERT INTO t VALUES (5), (7)")),
+            [
+                "NOTICE 00000 deleted 1",
+                "NOTICE 00000 deleted 1",
+                "INSERT 0 2"
+            ]
+        );
+        assert_eq!(
+            data_rows(&run_with(engine, budget, "SELECT a FROM log ORDER BY a")),
+            ["5", "7"]
+        );
+    });
+}

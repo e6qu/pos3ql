@@ -19410,23 +19410,23 @@ fn bind_plpgsql_dml_ctes<'a>(
     if !query.with.iter().any(|cte| cte.dml.is_some()) {
         return Ok((expand_plpgsql_with(context, query)?, &[]));
     }
-    let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "data-modifying WITH queries are not supported in trigger functions"
-        ));
+    let main = super::query::CteReader::Select(query);
+    let materialized = match &mut context.host {
+        PlpgsqlExecHost::Routine { engine, guc, .. } => engine
+            .bind_dml_ctes(
+                query.with,
+                main,
+                context.txn,
+                context.arena,
+                context.params,
+                guc,
+                context.responder,
+            )?
+            .unwrap_or(&[]),
+        PlpgsqlExecHost::Atomic { .. } => {
+            run_nested_dml_ctes(context, query.with, main, &[], false)?
+        }
     };
-    let materialized = engine
-        .bind_dml_ctes(
-            query.with,
-            super::query::CteReader::Select(query),
-            context.txn,
-            context.arena,
-            context.params,
-            guc,
-            context.responder,
-        )?
-        .unwrap_or(&[]);
     let arena = context.arena;
     let mut kept = ArenaList::new(arena);
     for cte in query.with.iter().filter(|cte| cte.dml.is_none()) {
@@ -19560,17 +19560,14 @@ fn bind_plpgsql_write_ctes<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     with: TriggerDmlWith<'a>,
 ) -> Result<(TriggerDml<'a>, MaterializedWithQueries<'a>), SqlError> {
-    let materialized = if with.writes() {
-        let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "data-modifying WITH queries are not supported in trigger functions"
-            ));
-        };
+    let main = super::query::CteReader::Statement(with.statement);
+    let materialized = if !with.writes() {
+        &[]
+    } else if let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host {
         engine
             .bind_dml_ctes(
                 with.ctes,
-                super::query::CteReader::Statement(with.statement),
+                main,
                 context.txn,
                 context.arena,
                 context.params,
@@ -19579,7 +19576,7 @@ fn bind_plpgsql_write_ctes<'a>(
             )?
             .unwrap_or(&[])
     } else {
-        &[]
+        run_nested_dml_ctes(context, with.ctes, main, &[], false)?
     };
     let sequences = crate::sql::sequence::SeqEval::new(
         context.storage(),
@@ -19610,6 +19607,85 @@ fn bind_plpgsql_write_ctes<'a>(
     Ok((statement, materialized))
 }
 
+/// Runs, outside a routine (in a trigger an ordinary statement fires), the
+/// data-modifying `WITH` queries `main` reads, in order, or with `after`
+/// those it does not, last written first, as nested writes that share the
+/// running command. Returns `earlier` with the rows each one returned.
+fn run_nested_dml_ctes<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    with: &'a [crate::sql::ast::Cte<'a>],
+    main: super::query::CteReader<'_>,
+    earlier: MaterializedWithQueries<'a>,
+    after: bool,
+) -> Result<MaterializedWithQueries<'a>, SqlError> {
+    let arena = context.arena;
+    let mut materialized = ArenaList::new(arena);
+    for written in earlier {
+        materialized
+            .push(*written)
+            .map_err(|_| super::query::arena_full_pub())?;
+    }
+    let order: &mut dyn Iterator<Item = usize> = if after {
+        &mut (0..with.len()).rev()
+    } else {
+        &mut (0..with.len())
+    };
+    for index in order {
+        if with[index].dml.is_none() || super::query::dml_cte_runs_after(with, index, main) != after
+        {
+            continue;
+        }
+        let sequences = crate::sql::sequence::SeqEval::new(
+            context.storage(),
+            context.seq_session(),
+            context.txn.txid,
+        );
+        let (statement, mut relation) = super::analyze_dml_cte(
+            context.storage(),
+            with,
+            index,
+            materialized.as_slice(),
+            context.txn.txid,
+            arena,
+            context.params,
+            &sequences,
+        )?;
+        let mut rows = ArenaList::new(arena);
+        let mut capture = |_: &Storage,
+                           _: u32,
+                           _: &dyn crate::sql::eval::SequenceAccess,
+                           values: &[Datum<'_>]| {
+            rows.push(encode_projected_pub(values, arena)?)
+                .map_err(|_| super::query::arena_full_pub())
+        };
+        let mut pending = None;
+        let written = execute_nested_write(
+            context,
+            statement,
+            context.params,
+            None,
+            Some(&mut capture),
+            &mut pending,
+            true,
+        );
+        if pending.take().is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a PL/pgSQL write with WITH queries cannot wait without retained write progress"
+            ));
+        }
+        written?;
+        relation.source = crate::sql::ast::MaterializedCteSource::Inline(rows.as_slice());
+        let relation = arena
+            .alloc(relation)
+            .map_err(|_| super::query::arena_full_pub())?;
+        materialized
+            .push((with[index].name, &*relation))
+            .map_err(|_| super::query::arena_full_pub())?;
+    }
+    Ok(materialized.as_slice())
+}
+
 /// Runs the data-modifying `WITH` queries that `main` did not read.
 fn finish_plpgsql_dml_ctes_of<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
@@ -19621,6 +19697,7 @@ fn finish_plpgsql_dml_ctes_of<'a>(
         return Ok(());
     }
     let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
+        run_nested_dml_ctes(context, with, main, materialized, true)?;
         return Ok(());
     };
     let output_mark = context.responder.mark();

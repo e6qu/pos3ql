@@ -120,6 +120,70 @@ pub(crate) fn for_each_dependency(
 
     relation_dependencies(storage, txid, arena, visit)?;
     policy_dependencies(storage, txid, arena, visit)?;
+    // PostgreSQL's foreign-data DDL: a wrapper uses its handler and validator,
+    // a server its wrapper, and user mappings and foreign tables their server.
+    for (_, entry) in storage.foreign_wrappers(txid) {
+        let wrapper = entry.definition_for(txid);
+        for routine in [
+            match wrapper.handler {
+                crate::storage::foreign::ForeignDataHandler::None => None,
+                crate::storage::foreign::ForeignDataHandler::Postgres => {
+                    Some("postgres_fdw_handler")
+                }
+            },
+            match wrapper.validator {
+                crate::storage::foreign::ForeignDataValidator::None => None,
+                crate::storage::foreign::ForeignDataValidator::Postgres => {
+                    Some("postgres_fdw_validator")
+                }
+            },
+        ]
+        .into_iter()
+        .flatten()
+        {
+            push!(
+                PG_FOREIGN_DATA_WRAPPER_OID,
+                entry.oid(),
+                PG_PROC_OID,
+                foreign_routine_oid(storage, txid, routine)?,
+                0,
+                "n",
+            )?;
+        }
+    }
+    for (_, entry) in storage.foreign_servers(txid) {
+        let server = entry.definition_for(txid);
+        push!(
+            PG_FOREIGN_SERVER_OID,
+            entry.oid(),
+            PG_FOREIGN_DATA_WRAPPER_OID,
+            storage.foreign_wrapper_entry(server.wrapper as usize).oid(),
+            0,
+            "n",
+        )?;
+    }
+    for (_, entry) in storage.foreign_user_mappings(txid) {
+        let mapping = entry.definition_for(txid);
+        push!(
+            PG_USER_MAPPING_OID,
+            entry.oid(),
+            PG_FOREIGN_SERVER_OID,
+            storage.foreign_server_entry(mapping.server as usize).oid(),
+            0,
+            "n",
+        )?;
+    }
+    for (_, entry) in storage.foreign_tables(txid) {
+        let table = entry.definition_for(txid);
+        push!(
+            PG_CLASS_OID,
+            user_table_oid(storage, table.table as usize),
+            PG_FOREIGN_SERVER_OID,
+            storage.foreign_server_entry(table.server as usize).oid(),
+            0,
+            "n",
+        )?;
+    }
     for (_, object) in storage.text_search_objects_visible_to(txid) {
         let class = match object.kind() {
             crate::sql::ast::TextSearchObjectKind::Parser => PG_TS_PARSER_OID,

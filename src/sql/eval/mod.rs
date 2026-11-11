@@ -2023,6 +2023,15 @@ pub trait CatalogAccess {
     ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
+    /// `user mapping for ROLE on server SERVER`, PostgreSQL's description of
+    /// a visible `pg_user_mapping` OID.
+    fn user_mapping_description<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a crate::mem::arena::Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
     /// The name of a visible database.
     fn database_name_by_oid(&self, _oid: i32) -> Option<crate::storage::SqlName> {
         None

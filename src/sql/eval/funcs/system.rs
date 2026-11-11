@@ -645,6 +645,12 @@ pub(crate) fn describe_object_text<'a>(
         }
         return catalog.default_acl_description(object_id, arena);
     }
+    if class_id == 1418 {
+        if sub_id != 0 {
+            return Ok(None);
+        }
+        return catalog.user_mapping_description(object_id, arena);
+    }
     if class_id == 1262 {
         let Some(name) = catalog
             .database_name_by_oid(object_id)

@@ -1757,7 +1757,11 @@ fn primary_object(
             base_object(
                 catalog::PG_CLASS_OID,
                 catalog::user_table_oid(storage, slot),
-                "table",
+                if table.kind == crate::storage::TableKind::Foreign {
+                    "foreign table"
+                } else {
+                    "table"
+                },
                 Some(table.schema.as_str()),
                 Some(table.name.as_str()),
                 qualified(table.schema.as_str(), table.name.as_str())?,

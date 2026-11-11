@@ -344,14 +344,12 @@ view, rule, trigger `WHEN` condition, policy or SQL-standard routine body
 reads, but not yet for a materialized view's columns or the target columns of
 a stored `INSERT` or `UPDATE`, whose `pg_depend` column rows are missing.
 `DROP` of casts, operator
-classes and families, collations, extensions, servers, policies, triggers,
-rules, indexes and `DROP OWNED` still describe their dependents with their own
-code instead of the `pg_depend` walk that `DROP TABLE`, `VIEW`, `MATERIALIZED
-VIEW`, `SEQUENCE`, `FUNCTION`, `TYPE`, `DOMAIN`, `SCHEMA`, `OPERATOR` and text
-search objects share (`DROP SERVER` names neither the server nor its
-dependents); `pg_depend` has no rows
-for foreign servers, foreign tables and user mappings, and still lacks
-PostgreSQL's rows for
+classes and families, collations, extensions, policies, triggers, rules,
+indexes and `DROP OWNED` still describe their dependents with their own code
+instead of the `pg_depend` walk that `DROP TABLE`, `VIEW`, `MATERIALIZED
+VIEW`, `SEQUENCE`, `FUNCTION`, `TYPE`, `DOMAIN`, `SCHEMA`, `OPERATOR`,
+`SERVER`, `FOREIGN DATA WRAPPER` and text search objects share; `pg_depend`
+still lacks PostgreSQL's rows for
 columns using a user-defined collation, TOAST tables, types named only inside
 expressions (a cast in a default or routine body), a materialized view's
 `_RETURN` rule and its column rows, the target columns of a rule's or

@@ -144,6 +144,7 @@ pub(crate) const PG_EXTENSION_OID: i32 = 3079;
 pub(crate) const PG_PUBLICATION_OID: i32 = 6104;
 pub(crate) const PG_SUBSCRIPTION_OID: i32 = 6100;
 pub(crate) const PG_FOREIGN_SERVER_OID: i32 = 1417;
+pub(crate) const PG_USER_MAPPING_OID: i32 = 1418;
 pub(crate) const PG_FOREIGN_DATA_WRAPPER_OID: i32 = 2328;
 
 const ACCESS_METHODS: [(&str, i32, i32, &str, &str); 7] = [

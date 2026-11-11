@@ -5519,6 +5519,46 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::relation_oid_visibility(self.storage, self.txid, oid)
     }
 
+    fn user_mapping_description<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        let Some((_, entry)) = self
+            .storage
+            .foreign_user_mappings(self.txid)
+            .find(|(_, entry)| entry.oid() == oid)
+        else {
+            return Ok(None);
+        };
+        let mapping = entry.definition_for(self.txid);
+        let server = self
+            .storage
+            .foreign_server_by_slot(mapping.server as usize, self.txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "user mapping server is not visible"
+                )
+            })?;
+        let user = match mapping.user {
+            crate::storage::foreign::ForeignMappingUser::Public => {
+                crate::storage::SqlName::parse("public")?
+            }
+            crate::storage::foreign::ForeignMappingUser::Role(slot) => {
+                self.storage.role_name(slot as usize, self.txid)
+            }
+        };
+        arena
+            .alloc_str_display(format_args!(
+                "user mapping for {} on server {}",
+                user.as_str(),
+                server.name.as_str()
+            ))
+            .map(Some)
+            .map_err(|_| arena_full())
+    }
+
     fn type_is_visible(&self, oid: i32) -> Option<bool> {
         super::catalog::type_oid_visibility(self.storage, self.txid, oid)
     }

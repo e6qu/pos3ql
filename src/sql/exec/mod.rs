@@ -2956,7 +2956,11 @@ fn mark_foreign_server_drop(
         {
             return sql_fail(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop server because other objects depend on it"
+                "cannot drop server {} because other objects depend on it",
+                storage
+                    .foreign_server_by_slot(slot, txn.txid)
+                    .map_or(SqlName::EMPTY, |server| server.name)
+                    .as_str()
             ));
         }
     } else {
@@ -3007,6 +3011,52 @@ pub fn drop_foreign_server(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
+    let report = (|| {
+        let originals = arena
+            .alloc_slice_with(names.len(), |_| DROPPED_NOTHING)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for name in names {
+            match storage.foreign_server(name, txn.txid) {
+                Some((slot, _)) => {
+                    originals[count] = ObjectAddress::new(
+                        super::catalog::PG_FOREIGN_SERVER_OID,
+                        storage.foreign_server_entry(slot).oid(),
+                        0,
+                    );
+                    count += 1;
+                }
+                None if if_exists => {}
+                None => return Ok(None),
+            }
+        }
+        dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &originals[..count],
+            cascade,
+            arena,
+            responder,
+        )
+    })();
+    run_reported_drop(report, responder, |responder| {
+        drop_foreign_servers(
+            storage, wal, txn, names, if_exists, cascade, arena, responder,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drop_foreign_servers(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[&str],
+    if_exists: bool,
+    cascade: bool,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
     for name in names {
         let Some((slot, _)) = storage.foreign_server(name, txn.txid) else {
             if if_exists {
@@ -3041,6 +3091,52 @@ pub fn drop_foreign_server(
 
 #[allow(clippy::too_many_arguments)]
 pub fn drop_foreign_data_wrapper(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[&str],
+    if_exists: bool,
+    cascade: bool,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    let report = (|| {
+        let originals = arena
+            .alloc_slice_with(names.len(), |_| DROPPED_NOTHING)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for name in names {
+            match storage.foreign_wrapper(name, txn.txid) {
+                Some((slot, _)) => {
+                    originals[count] = ObjectAddress::new(
+                        super::catalog::PG_FOREIGN_DATA_WRAPPER_OID,
+                        storage.foreign_wrapper_entry(slot).oid(),
+                        0,
+                    );
+                    count += 1;
+                }
+                None if if_exists => {}
+                None => return Ok(None),
+            }
+        }
+        dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &originals[..count],
+            cascade,
+            arena,
+            responder,
+        )
+    })();
+    run_reported_drop(report, responder, |responder| {
+        drop_foreign_data_wrappers(
+            storage, wal, txn, names, if_exists, cascade, arena, responder,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drop_foreign_data_wrappers(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -3095,7 +3191,8 @@ pub fn drop_foreign_data_wrapper(
         {
             return sql_fail(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop foreign-data wrapper because other objects depend on it"
+                "cannot drop foreign-data wrapper {} because other objects depend on it",
+                name
             ));
         }
         if cascade {

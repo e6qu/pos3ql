@@ -17816,6 +17816,10 @@ enum TriggerForSource<'a> {
         reverse: bool,
     },
     Query(&'a Select<'a>),
+    /// `INSERT`, `UPDATE`, `DELETE` or `MERGE` with `RETURNING`: its text,
+    /// run to completion before the first iteration, as PostgreSQL runs a
+    /// data-modifying portal.
+    Dml(&'a str),
     DynamicQuery(PlpgsqlDynamicQuery<'a>),
     Array {
         expression: &'a Expr<'a>,
@@ -20836,6 +20840,20 @@ fn parse_trigger_for_header<'a>(
             TriggerForSource::Query(parse_plpgsql_query(source, source, arena)?),
         )));
     }
+    if ["insert", "update", "delete", "merge"]
+        .iter()
+        .any(|keyword| strip_trigger_keyword(source, keyword).is_some())
+    {
+        parse_trigger_dml(source, arena)?;
+        super::plpgsql_inputs::record_rewritten(
+            super::plpgsql_inputs::Kind::Statement,
+            source.as_ptr() as usize,
+            source,
+            source,
+            arena,
+        )?;
+        return Ok(Some((target.name, TriggerForSource::Dml(source))));
+    }
     let reverse = if let Some(rest) = strip_trigger_keyword(source, "reverse") {
         source = rest.trim();
         true
@@ -23701,6 +23719,14 @@ impl<'a> TriggerLocalScope<'_, 'a> {
             .rposition(|local| local.name.as_str() == name)
     }
 
+    /// Whether `table` names a trigger's `NEW` or `OLD` row rather than a
+    /// variable; outside a trigger both are ordinary names.
+    fn transition_row(&self, table: &str) -> bool {
+        matches!(table, "new" | "old")
+            && (self.transition.new.is_some() || self.transition.old.is_some())
+            && self.local_index(table).is_none()
+    }
+
     /// PostgreSQL labels a function's parameters with its name, so `f.a` in
     /// function `f` is its parameter `a`: such a qualifier is dropped.
     fn parameter_qualifier<'q>(&self, qualifier: Option<&'q str>, name: &str) -> Option<&'q str> {
@@ -23808,6 +23834,42 @@ where
                 .is_some_and(|fields| fields.iter().any(|field| field.name == name)),
         };
         answers.then_some(self.invocation.variable_conflict)
+    }
+
+    /// A trigger's whole `NEW` or `OLD` row, unless a variable shadows it.
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.transition_row(table)
+            .then(|| self.transition.whole_row_type(table))
+            .flatten()
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'value Arena,
+    ) -> Result<Option<&'value [RecordField<'value>]>, SqlError> {
+        match self.transition_row(table) {
+            true => self.transition.whole_row_fields(table, arena),
+            false => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "whole-row reference to \"{}\" is not supported in this context",
+                table
+            )),
+        }
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::eval::CatalogAccess>,
+    ) -> Option<(StackStr<64>, StaticTypeMeta)> {
+        self.transition_row(table)
+            .then(|| {
+                self.transition
+                    .whole_row_field_metadata(table, index, catalog)
+            })
+            .flatten()
     }
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
@@ -27538,21 +27600,168 @@ fn rewritten_write_target(
     }
 }
 
-/// A static PL/pgSQL write reads the routine's variables through a scope the
-/// engine's rule and view rewriting cannot take yet; it fails loudly instead
-/// of skipping the rules or reporting the view missing.
-fn reject_static_rewritten_write(
-    context: &TriggerExecContext<'_, '_, '_>,
-    statement: &Stmt<'_>,
-) -> Result<(), SqlError> {
-    match rewritten_write_target(context.storage(), statement, context.txn) {
-        Some(command) => Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "static PL/pgSQL {} on a view or a table with rules is not supported",
-            command
-        )),
-        None => Ok(()),
+/// The routine's variables, and a trigger's `NEW` and `OLD` rows, as values
+/// a statement reparsed with named parameters reads.
+fn static_write_locals<'a>(
+    scope: &TriggerLocalScope<'_, 'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [super::cursor::CursorLocal<'a>], SqlError> {
+    let locals = scope.cursor_locals(storage, txid, arena)?;
+    let transition = scope.transition;
+    let rows = [("new", transition.new), ("old", transition.old)];
+    let rows = || {
+        rows.into_iter()
+            .filter(|(name, values)| values.is_some() && scope.local_index(name).is_none())
+    };
+    if rows().count() == 0 {
+        return Ok(locals);
     }
+    let captured = arena
+        .alloc_slice_with(locals.len() + rows().count(), |index| {
+            match locals.get(index) {
+                Some(local) => *local,
+                None => super::cursor::CursorLocal {
+                    name: SqlName::EMPTY,
+                    type_oid: 0,
+                    value: Datum::Null,
+                },
+            }
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let columns = transition.definition.columns();
+    for ((name, values), slot) in rows().zip(&mut captured[locals.len()..]) {
+        let values = values.expect("filtered transition row");
+        let fields = arena
+            .alloc_slice_with(columns.len(), |_| RecordField {
+                name: "",
+                type_oid: 0,
+                value: Datum::Null,
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        for ((field, column), value) in fields.iter_mut().zip(columns).zip(values) {
+            field.name = arena
+                .alloc_str(column.name.as_str())
+                .map_err(|_| super::query::arena_full_pub())?;
+            field.type_oid = storage
+                .routine_type_oid(column.ctype, column.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "type of column \"{}\" no longer exists",
+                        column.name.as_str()
+                    )
+                })?;
+            field.value = *value;
+        }
+        *slot = super::cursor::CursorLocal {
+            name: SqlName::parse(name).expect("static transition name"),
+            type_oid: ColType::Record.oid(),
+            value: Datum::Record(fields),
+        };
+    }
+    Ok(captured)
+}
+
+fn static_write_arena_full() -> SqlError {
+    super::query::arena_full_pub()
+}
+
+/// A static PL/pgSQL `INSERT`, `UPDATE` or `DELETE` on a view or a table with
+/// rules. The engine's rewriting reads only SQL parameters, so the statement
+/// is parsed again with the routine's variables bound as parameters, as
+/// PostgreSQL's PL/pgSQL parser hook binds them, and runs like `EXECUTE`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "INTO assignment needs the statement's variables and diagnostics"
+)]
+fn execute_static_rewritten_write<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    source: &'a str,
+    captured: &'a [super::cursor::CursorLocal<'a>],
+    transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
+    locals: &[TriggerLocalDecl],
+    local_values: &mut [Datum<'a>],
+    into: Option<PlpgsqlInto<'a>>,
+    status: &mut TriggerExecutionStatus<'a>,
+    progress: Option<&mut RowProgress>,
+) -> Result<(), SqlError> {
+    let arena = context.arena;
+    let txid = context.txn.txid;
+    let bound =
+        super::cursor::bind_locals(arena, context.params, captured, static_write_arena_full)?;
+    let inputs = super::type_inputs::bindings_for_active_source(source, arena)?.unwrap_or(&[]);
+    let statement =
+        super::parser::parse_cursor_command(source, arena, bound.bindings, inputs, |parser| {
+            super::type_inputs::validate_restored(parser, context.storage(), txid)
+        })?;
+    let returns = match statement {
+        Stmt::Insert(statement) => !statement.returning.is_empty(),
+        Stmt::Update(statement) => !statement.returning.is_empty(),
+        Stmt::Delete(statement) => !statement.returning.is_empty(),
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "PL/pgSQL data change statement changed kind"
+            ));
+        }
+    };
+    with_bound_parameter_types(bound.parameter_types, || {
+        let mut returning = StaticReturning::new(context, locals, into, *statement)?;
+        let mut capture =
+            |_: &Storage,
+             _: u32,
+             _: &dyn crate::sql::eval::SequenceAccess,
+             values: &[Datum<'_>]| { returning.capture(values, arena) };
+        let result = execute_nested_data_modification(
+            context,
+            statement,
+            bound.parameters,
+            transition_relations,
+            returns.then_some(&mut capture as &mut super::ReturningCapture<'_>),
+            &mut status.pending_write,
+            progress,
+        );
+        match result {
+            Ok(rows) => {
+                let selected = returning.values(arena)?;
+                finish_static_returning(
+                    context,
+                    locals,
+                    local_values,
+                    into,
+                    returns,
+                    selected,
+                    rows,
+                    status,
+                )
+            }
+            Err(_) if status.pending_write.is_some() => {
+                if into.is_some() && returns {
+                    let returned = returning.rows;
+                    let values = returning.values(arena)?;
+                    status
+                        .pending_write
+                        .as_mut()
+                        .expect("pending nested write")
+                        .save_output(Some(values), returned, &context.storage().row_work)?;
+                }
+                let (rows, output) = resume_nested_write(context, status)?;
+                finish_resumed_static_write(
+                    context,
+                    locals,
+                    local_values,
+                    into,
+                    returns,
+                    rows,
+                    output,
+                    status,
+                )
+            }
+            Err(error) => Err(error),
+        }
+    })
 }
 
 /// Runs a routine's write to a view or a ruled table through the engine's
@@ -28330,20 +28539,10 @@ where
 
 fn materialize_plpgsql_dynamic_for_query<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
-    query: PlpgsqlDynamicQuery<'a>,
-    scope: &TriggerLocalScope<'_, 'a>,
+    query: BoundPlpgsqlCommand<'a>,
     record_target: bool,
-    expressions: &mut StatementExpressions<'_>,
 ) -> Result<TriggerForRows<'a>, SqlError> {
     let arena = context.arena;
-    let query = bind_plpgsql_dynamic_query(
-        context,
-        query,
-        scope,
-        DynamicCommandKind::Statement,
-        expressions,
-    )?;
-    let query = resolve_plpgsql_dynamic_prepared(context, query)?;
     with_bound_parameter_types(query.parameter_types, || {
         let mut fields = [("", 0); MAX_PROJ];
         let width = {
@@ -28431,6 +28630,178 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
             empty,
         })
     })
+}
+
+/// Runs a `FOR` loop's `INSERT`, `UPDATE`, `DELETE` or `MERGE` to completion
+/// and keeps its `RETURNING` rows, as PostgreSQL fills a data-modifying
+/// portal before the first fetch. The statement reads the routine's
+/// variables as parameters and keeps its changed rows across routine calls
+/// like a static data change.
+fn materialize_trigger_for_dml<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    source: &'a str,
+    captured: &'a [super::cursor::CursorLocal<'a>],
+    transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
+    record_target: bool,
+    status: &mut TriggerExecutionStatus<'a>,
+    retained: bool,
+) -> Result<TriggerForRows<'a>, SqlError> {
+    let arena = context.arena;
+    let txid = context.txn.txid;
+    let bound =
+        super::cursor::bind_locals(arena, context.params, captured, static_write_arena_full)?;
+    let inputs = super::type_inputs::bindings_for_active_source(source, arena)?.unwrap_or(&[]);
+    let statement =
+        super::parser::parse_cursor_command(source, arena, bound.bindings, inputs, |parser| {
+            super::type_inputs::validate_restored(parser, context.storage(), txid)
+        })?;
+    let (command, returns) = match statement {
+        Stmt::Insert(statement) => ("INSERT", !statement.returning.is_empty()),
+        Stmt::Update(statement) => ("UPDATE", !statement.returning.is_empty()),
+        Stmt::Delete(statement) => ("DELETE", !statement.returning.is_empty()),
+        Stmt::Merge(statement) => ("MERGE", !statement.returning.is_empty()),
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "PL/pgSQL data change statement changed kind"
+            ));
+        }
+    };
+    if !returns {
+        return Err(sql_err!(
+            sqlstate::INVALID_CURSOR_DEFINITION,
+            "cannot open {} query as cursor",
+            command
+        ));
+    }
+    with_bound_parameter_types(bound.parameter_types, || {
+        for_dml_rows(
+            context,
+            statement,
+            command,
+            record_target,
+            status,
+            retained,
+            &mut |context, capture, pending, progress| {
+                execute_nested_data_modification(
+                    context,
+                    statement,
+                    bound.parameters,
+                    transition_relations,
+                    Some(capture),
+                    pending,
+                    progress,
+                )
+            },
+        )
+    })
+}
+
+/// One attempt of a `FOR` loop's data change, given its `RETURNING` capture.
+type ForDmlAttempt<'f, 'a> = dyn FnMut(
+        &mut TriggerExecContext<'_, 'a, '_>,
+        &mut super::ReturningCapture<'_>,
+        &mut Option<write_completion::PendingNestedWrite>,
+        Option<&mut RowProgress>,
+    ) -> Result<u64, SqlError>
+    + 'f;
+
+/// The `RETURNING` rows of a `FOR` loop's data change, static or dynamic,
+/// run through the procedural write attempts.
+fn for_dml_rows<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    statement: &'a Stmt<'a>,
+    command: &str,
+    record_target: bool,
+    status: &mut TriggerExecutionStatus<'a>,
+    retained: bool,
+    run: &mut ForDmlAttempt<'_, 'a>,
+) -> Result<TriggerForRows<'a>, SqlError> {
+    let arena = context.arena;
+    let txid = context.txn.txid;
+    {
+        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let width = describe_data_modification_columns(
+            context.storage(),
+            statement,
+            arena,
+            txid,
+            &mut columns,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?;
+        let fields = arena
+            .alloc_slice_with(width, |index| RecordField {
+                name: "",
+                type_oid: columns[index].type_oid,
+                value: Datum::Null,
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        for (field, column) in fields.iter_mut().zip(&columns[..width]) {
+            field.name = arena
+                .alloc_str(column.name)
+                .map_err(|_| super::query::arena_full_pub())?;
+        }
+        let fields = &*fields;
+        // Persistent: a restarted attempt rewinds the arena's front.
+        let mut rows = ArenaList::new_persistent(arena);
+        let mut attempt = |context: &mut TriggerExecContext<'_, 'a, '_>,
+                           status: &mut TriggerExecutionStatus<'a>,
+                           progress: Option<&mut RowProgress>| {
+            // Rows an earlier attempt returned stay only while that
+            // attempt's changed rows do.
+            if !progress.as_deref().is_some_and(RowProgress::resuming) {
+                rows.truncate(0);
+            }
+            let mut capture = |_: &Storage,
+                               _: u32,
+                               _: &dyn crate::sql::eval::SequenceAccess,
+                               values: &[Datum<'_>]| {
+                let value = if record_target {
+                    let row = arena
+                        .alloc_slice_copy(fields)
+                        .map_err(|_| super::query::arena_full_pub())?;
+                    for (field, value) in row.iter_mut().zip(values) {
+                        field.value = detached_trigger_datum(*value, arena)?;
+                    }
+                    Datum::Record(&*row)
+                } else {
+                    // A scalar target takes the first column.
+                    detached_trigger_datum(values.first().copied().unwrap_or(Datum::Null), arena)?
+                };
+                rows.push(value).map_err(|_| super::query::arena_full_pub())
+            };
+            run(context, &mut capture, &mut status.pending_write, progress)
+        };
+        let result = execute_procedural_write(context, status, retained, &mut attempt);
+        if let Err(error) = result {
+            if status.pending_write.is_none() {
+                return Err(error);
+            }
+            if let Err(error) = resume_nested_write(context, status) {
+                if status.pending_write.take().is_some() {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "FOR over {} cannot wait for its AFTER triggers",
+                        command
+                    ));
+                }
+                return Err(error);
+            }
+        }
+        let empty = if record_target && rows.is_empty() {
+            Datum::Record(
+                arena
+                    .alloc_slice_copy(fields)
+                    .map_err(|_| super::query::arena_full_pub())?,
+            )
+        } else {
+            Datum::Null
+        };
+        Ok(TriggerForRows {
+            values: rows.as_slice(),
+            empty,
+        })
+    }
 }
 
 #[expect(
@@ -28577,6 +28948,10 @@ fn prepare_static_plpgsql_statement<'a>(
         TriggerStatement::Utility { source, .. }
         | TriggerStatement::Call { source, .. }
         | TriggerStatement::Dml { source, .. }
+        | TriggerStatement::For(TriggerFor {
+            source: TriggerForSource::Dml(source),
+            ..
+        })
         | TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
             query: PlpgsqlCursorQuery::Static(source),
             ..
@@ -28685,6 +29060,12 @@ fn prepare_static_plpgsql_statement<'a>(
                 context.arena,
             )?,
         },
+        // The loop's data change is parsed again when it runs, under the
+        // prepared inputs.
+        TriggerStatement::For(TriggerFor {
+            source: TriggerForSource::Dml(_),
+            ..
+        }) => statement,
         TriggerStatement::Dml { into, .. } => {
             let restored = restore_plpgsql_statement(
                 site.text,
@@ -28765,9 +29146,12 @@ fn procedural_statement_query<'a>(
             .map(|site| site.text)
     };
     match statement {
-        TriggerStatement::Utility { source, .. } | TriggerStatement::Dml { source, .. } => {
-            Some(source)
-        }
+        TriggerStatement::Utility { source, .. }
+        | TriggerStatement::Dml { source, .. }
+        | TriggerStatement::For(TriggerFor {
+            source: TriggerForSource::Dml(source),
+            ..
+        }) => Some(source),
         TriggerStatement::Perform(query)
         | TriggerStatement::ReturnQuery(query)
         | TriggerStatement::SelectInto(TriggerSelectInto { query, .. })
@@ -28995,6 +29379,10 @@ fn execute_trigger_step_in<'a>(
         && matches!(
             statement,
             TriggerStatement::Dml { .. }
+                | TriggerStatement::For(TriggerFor {
+                    source: TriggerForSource::Dml(_),
+                    ..
+                })
                 | TriggerStatement::DynamicQuery(_)
                 | TriggerStatement::DynamicSelectInto(_)
         ))
@@ -30916,11 +31304,44 @@ fn execute_trigger_step_in<'a>(
                 Ok(control_flow::Step::protected(exception_block, boundary))
             }
             TriggerStatement::Dml {
+                source,
                 statement: TriggerDml::Insert(statement),
                 into,
-                ..
             } => execute_trigger_statement(|| {
-                reject_static_rewritten_write(context, &Stmt::Insert(statement))?;
+                if rewritten_write_target(context.storage(), &Stmt::Insert(statement), context.txn)
+                    .is_some()
+                {
+                    let transition = TriggerTransition {
+                        definition,
+                        old,
+                        new: new.as_deref(),
+                    };
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let captured = static_write_locals(
+                        &scope,
+                        context.storage(),
+                        context.txn.txid,
+                        context.arena,
+                    )?;
+                    execute_static_rewritten_write(
+                        context,
+                        source,
+                        captured,
+                        transition_relations,
+                        locals,
+                        local_values,
+                        into,
+                        status,
+                        progress.as_deref_mut(),
+                    )?;
+                    return Ok(None);
+                }
                 let statement = match transition_relations {
                     Some(relations) => Insert {
                         select: statement
@@ -31107,11 +31528,44 @@ fn execute_trigger_step_in<'a>(
                 Ok(None)
             }),
             TriggerStatement::Dml {
+                source,
                 statement: TriggerDml::Update(statement),
                 into,
-                ..
             } => execute_trigger_statement(|| {
-                reject_static_rewritten_write(context, &Stmt::Update(statement))?;
+                if rewritten_write_target(context.storage(), &Stmt::Update(statement), context.txn)
+                    .is_some()
+                {
+                    let transition = TriggerTransition {
+                        definition,
+                        old,
+                        new: new.as_deref(),
+                    };
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let captured = static_write_locals(
+                        &scope,
+                        context.storage(),
+                        context.txn.txid,
+                        context.arena,
+                    )?;
+                    execute_static_rewritten_write(
+                        context,
+                        source,
+                        captured,
+                        transition_relations,
+                        locals,
+                        local_values,
+                        into,
+                        status,
+                        progress.as_deref_mut(),
+                    )?;
+                    return Ok(None);
+                }
                 let statement = match transition_relations {
                     Some(relations) => {
                         let dml = context
@@ -31261,11 +31715,44 @@ fn execute_trigger_step_in<'a>(
                 Ok(None)
             }),
             TriggerStatement::Dml {
+                source,
                 statement: TriggerDml::Delete(statement),
                 into,
-                ..
             } => execute_trigger_statement(|| {
-                reject_static_rewritten_write(context, &Stmt::Delete(statement))?;
+                if rewritten_write_target(context.storage(), &Stmt::Delete(statement), context.txn)
+                    .is_some()
+                {
+                    let transition = TriggerTransition {
+                        definition,
+                        old,
+                        new: new.as_deref(),
+                    };
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let captured = static_write_locals(
+                        &scope,
+                        context.storage(),
+                        context.txn.txid,
+                        context.arena,
+                    )?;
+                    execute_static_rewritten_write(
+                        context,
+                        source,
+                        captured,
+                        transition_relations,
+                        locals,
+                        local_values,
+                        into,
+                        status,
+                        progress.as_deref_mut(),
+                    )?;
+                    return Ok(None);
+                }
                 let statement = match transition_relations {
                     Some(relations) => {
                         let dml = context
@@ -31631,8 +32118,108 @@ fn execute_trigger_step_in<'a>(
                     let target = trigger_local_index(locals, program.target)?;
                     let query_source = matches!(
                         program.source,
-                        TriggerForSource::Query(_) | TriggerForSource::DynamicQuery(_)
+                        TriggerForSource::Query(_)
+                            | TriggerForSource::Dml(_)
+                            | TriggerForSource::DynamicQuery(_)
                     );
+                    let record_target = locals[target].ctype == ColType::Record;
+                    let mut dynamic = None;
+                    let dml_rows = match program.source {
+                        TriggerForSource::DynamicQuery(query) => {
+                            let transition = TriggerTransition {
+                                definition,
+                                old,
+                                new: new.as_deref(),
+                            };
+                            let scope = TriggerLocalScope {
+                                locals,
+                                values: &local_values[..locals.len()],
+                                found: status.found,
+                                invocation,
+                                transition: &transition,
+                            };
+                            let query = bind_plpgsql_dynamic_query(
+                                context,
+                                query,
+                                &scope,
+                                DynamicCommandKind::Statement,
+                                &mut StatementExpressions::new(
+                                    retained_parent,
+                                    true,
+                                    &mut status.expressions,
+                                    &mut status.pending_query,
+                                ),
+                            )?;
+                            let query = resolve_plpgsql_dynamic_prepared(context, query)?;
+                            let command = match query.statement {
+                                Stmt::Insert(_) => Some("INSERT"),
+                                Stmt::Update(_) => Some("UPDATE"),
+                                Stmt::Delete(_) => Some("DELETE"),
+                                Stmt::Merge(_) => Some("MERGE"),
+                                _ => None,
+                            };
+                            match command {
+                                Some(command) => {
+                                    Some(with_bound_parameter_types(query.parameter_types, || {
+                                        for_dml_rows(
+                                            context,
+                                            query.statement,
+                                            command,
+                                            record_target,
+                                            status,
+                                            retained_parent,
+                                            &mut |context, capture, pending, progress| {
+                                                execute_bound_plpgsql_dynamic_dml(
+                                                    context,
+                                                    query,
+                                                    transition_relations,
+                                                    Some(capture),
+                                                    pending,
+                                                    progress,
+                                                )
+                                            },
+                                        )
+                                    })?)
+                                }
+                                None => {
+                                    dynamic = Some(query);
+                                    None
+                                }
+                            }
+                        }
+                        TriggerForSource::Dml(source) => {
+                            let captured = {
+                                let transition = TriggerTransition {
+                                    definition,
+                                    old,
+                                    new: new.as_deref(),
+                                };
+                                let scope = TriggerLocalScope {
+                                    locals,
+                                    values: &local_values[..locals.len()],
+                                    found: status.found,
+                                    invocation,
+                                    transition: &transition,
+                                };
+                                static_write_locals(
+                                    &scope,
+                                    context.storage(),
+                                    context.txn.txid,
+                                    context.arena,
+                                )?
+                            };
+                            Some(materialize_trigger_for_dml(
+                                context,
+                                source,
+                                captured,
+                                transition_relations,
+                                locals[target].ctype == ColType::Record,
+                                status,
+                                retained_parent,
+                            )?)
+                        }
+                        _ => None,
+                    };
                     let pool = std::sync::Arc::clone(&context.storage().row_work);
                     let values = context
                         .arena
@@ -31693,32 +32280,14 @@ fn execute_trigger_step_in<'a>(
                                         },
                                     )?
                                 }
-                                TriggerForSource::DynamicQuery(query) => {
-                                    let transition = TriggerTransition {
-                                        definition,
-                                        old,
-                                        new: new.as_deref(),
-                                    };
-                                    let scope = TriggerLocalScope {
-                                        locals,
-                                        values: &local_values[..locals.len()],
-                                        found: status.found,
-                                        invocation,
-                                        transition: &transition,
-                                    };
-                                    materialize_plpgsql_dynamic_for_query(
+                                TriggerForSource::DynamicQuery(_) => match dynamic {
+                                    Some(query) => materialize_plpgsql_dynamic_for_query(
                                         &mut context,
                                         query,
-                                        &scope,
-                                        locals[target].ctype == ColType::Record,
-                                        &mut StatementExpressions::new(
-                                            retained_parent,
-                                            true,
-                                            &mut status.expressions,
-                                            &mut status.pending_query,
-                                        ),
-                                    )?
-                                }
+                                        record_target,
+                                    )?,
+                                    None => dml_rows.expect("data change rows run before the loop"),
+                                },
                                 TriggerForSource::Array { expression, slice } => {
                                     let transition = TriggerTransition {
                                         definition,
@@ -31818,6 +32387,9 @@ fn execute_trigger_step_in<'a>(
                                         values: &*values,
                                         empty: Datum::Null,
                                     }
+                                }
+                                TriggerForSource::Dml(_) => {
+                                    dml_rows.expect("data change rows run before the loop")
                                 }
                                 TriggerForSource::Numeric { .. } => {
                                     unreachable!("numeric loop handled above")

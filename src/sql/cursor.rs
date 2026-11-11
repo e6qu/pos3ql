@@ -19,7 +19,7 @@ use crate::mem::arena::Arena;
 mod query;
 mod scroll;
 mod stream;
-pub(crate) use query::{CursorLocal, CursorQuery, CursorStatement};
+pub(crate) use query::{CursorLocal, CursorQuery, CursorStatement, bind_locals};
 pub(crate) use scroll::{Revisit, ScrollAction, ScrollInput, ScrollScan, VisitOutcome};
 pub(crate) use stream::{ResultStream, StreamProtocol, StreamState};
 

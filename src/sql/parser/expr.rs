@@ -776,6 +776,25 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::Field { base, field: "*" });
                     }
                     let field = self.any_ident("field name")?;
+                    // A field of a bound procedural record variable is
+                    // bound like `variable.field`, with the field's type.
+                    if let Expr::RoutineParam {
+                        qualifier: None,
+                        name,
+                        source: crate::sql::ast::ParameterSource::PlpgsqlCursor,
+                        ..
+                    } = base
+                        && let Some((index, source)) = self.qualified_routine_parameter(name, field)
+                    {
+                        self.max_param = self.max_param.max(index);
+                        base = self.arena_expr(Expr::RoutineParam {
+                            qualifier: Some(name),
+                            name: field,
+                            index,
+                            source,
+                        })?;
+                        continue;
+                    }
                     base = self.arena_expr(Expr::Field { base, field })?;
                 }
                 // An implicit row `(1, 2)` is not a parenthesized expression.

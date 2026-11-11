@@ -148,12 +148,12 @@ Syntax and errors:
   integer`, detail `Actual return type is text.`), with context `SQL function
   "f"`; an untyped literal there is text.
 - A routine's `INSERT`, `UPDATE` or `DELETE` on a view or on a table with
-  rules goes through the view's triggers and the rules, as at top level, when
-  it runs through `EXECUTE` or in a SQL-language function. A static PL/pgSQL
-  statement on such a target fails with `0A000` (`static PL/pgSQL INSERT on a
-  view or a table with rules is not supported`), where PostgreSQL runs it.
-  For example, `EXECUTE 'INSERT INTO active_orders VALUES ($1)' USING id`
-  works; `INSERT INTO active_orders VALUES (id)` in the same body does not.
+  rules goes through the view's triggers and the rules, as at top level:
+  static PL/pgSQL, `EXECUTE` and SQL-language functions alike. A static
+  statement reads the routine's variables and a trigger's `NEW` and `OLD`
+  rows, so `INSERT INTO active_orders VALUES (id)` works in a body. In a
+  `BEFORE` row trigger, or a trigger of a write that another trigger made,
+  it fails with `0A000`.
 - A rule on a data-modifying `WITH` sub-statement's target must leave one
   statement, as in PostgreSQL: `DO ALSO`, conditional, multi-statement,
   `NOTHING` and `NOTIFY` `INSTEAD` rules fail with `0A000` before anything
@@ -169,6 +169,13 @@ Syntax and errors:
   result data`, and `INTO` without `RETURNING` with `INTO used with a command
   that cannot return data`. As in PostgreSQL, extra result columns are
   ignored and targets without a column become NULL.
+- `FOR target IN INSERT | UPDATE | DELETE | MERGE ... RETURNING ... LOOP`
+  and the same through `FOR ... IN EXECUTE` run the statement to completion
+  before the first iteration, as PostgreSQL does, so the loop body sees
+  every changed row. Without `RETURNING` the loop fails with `42P11`
+  (`cannot open INSERT query as cursor`). A scalar target takes the first
+  returned column. For example, `FOR r IN DELETE FROM jobs WHERE done
+  RETURNING id LOOP ... END LOOP` visits each deleted job once.
 - A function's name qualifies its parameters, as in PostgreSQL: in
   `CREATE FUNCTION f(a int)`, `f.a` is the parameter `a` in SQL and
   PL/pgSQL bodies, even when a table in the query has a column `a`.

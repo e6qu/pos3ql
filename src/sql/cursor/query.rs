@@ -39,20 +39,111 @@ fn query_full() -> SqlError {
     )
 }
 
-fn copy_values<'a>(arena: &'a Arena, values: &[Datum]) -> Result<&'a [Datum<'a>], SqlError> {
+fn copy_values<'a>(
+    arena: &'a Arena,
+    values: &[Datum],
+    full: fn() -> SqlError,
+) -> Result<&'a [Datum<'a>], SqlError> {
     let length = crate::sql::exec::projected_row_len(values)?;
     let encoded = arena
         .alloc_slice_with(length, |_| 0u8)
-        .map_err(|_| query_full())?;
+        .map_err(|_| full())?;
     crate::sql::exec::encode_projected_into(values, encoded)?;
     let copied = arena
         .alloc_slice_with(values.len(), |_| Datum::Null)
-        .map_err(|_| query_full())?;
+        .map_err(|_| full())?;
     // Width and tags were written above; the remaining decode failure is
     // insufficient arena space for a nested record's field descriptors.
-    crate::sql::exec::decode_projected_row_into(encoded, arena, copied)
-        .map_err(|_| query_full())?;
+    crate::sql::exec::decode_projected_row_into(encoded, arena, copied).map_err(|_| full())?;
     Ok(copied)
+}
+
+/// Positional parameters followed by routine variables bound as parameters:
+/// each local by name, then each field of a record local qualified by the
+/// local's name, as PostgreSQL's PL/pgSQL parser hook resolves them.
+pub(crate) struct BoundLocals<'a> {
+    pub parameters: &'a [Datum<'a>],
+    pub parameter_types: &'a [i32],
+    pub bindings: &'a [crate::sql::parser::NamedParameter<'a>],
+}
+
+/// Copies `params` and `locals` into `arena` and numbers each local after
+/// the positional parameters. `full` names the arena that ran out.
+pub(crate) fn bind_locals<'a>(
+    arena: &'a Arena,
+    params: &[Datum],
+    locals: &[CursorLocal],
+    full: fn() -> SqlError,
+) -> Result<BoundLocals<'a>, SqlError> {
+    let values = copy_values(arena, params, full)?;
+    let field_count = |value| match value {
+        Datum::Record(fields) | Datum::Composite { fields, .. } => fields.len(),
+        _ => 0,
+    };
+    let count = locals.iter().try_fold(params.len(), |count, local| {
+        count
+            .checked_add(1 + field_count(local.value))
+            .ok_or_else(full)
+    })?;
+    if count > u16::MAX as usize {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "captured routine variables exceed 65535 parameters"
+        ));
+    }
+    let parameters = arena
+        .alloc_slice_with(count, |index| {
+            values.get(index).copied().unwrap_or(Datum::Null)
+        })
+        .map_err(|_| full())?;
+    let parameter_types = arena
+        .alloc_slice_with(count, |index| {
+            if index < params.len() {
+                crate::sql::exec::bound_parameter_type_oid((index + 1) as u32).unwrap_or(0)
+            } else {
+                0
+            }
+        })
+        .map_err(|_| full())?;
+    let bindings = arena
+        .alloc_slice_with(count - params.len(), |_| {
+            crate::sql::parser::NamedParameter {
+                qualifier: None,
+                name: "",
+                index: 0,
+            }
+        })
+        .map_err(|_| full())?;
+    let mut at = params.len();
+    for local in locals {
+        let name = arena.alloc_str(local.name.as_str()).map_err(|_| full())?;
+        let copied = copy_values(arena, &[local.value], full)?[0];
+        parameters[at] = copied;
+        parameter_types[at] = local.type_oid;
+        bindings[at - params.len()] = crate::sql::parser::NamedParameter {
+            qualifier: None,
+            name,
+            index: at as u32 + 1,
+        };
+        at += 1;
+        if let Datum::Record(fields) | Datum::Composite { fields, .. } = copied {
+            for field in fields {
+                parameters[at] = field.value;
+                parameter_types[at] = field.type_oid;
+                bindings[at - params.len()] = crate::sql::parser::NamedParameter {
+                    qualifier: Some(name),
+                    name: field.name,
+                    index: at as u32 + 1,
+                };
+                at += 1;
+            }
+        }
+    }
+    Ok(BoundLocals {
+        parameters,
+        parameter_types,
+        bindings,
+    })
 }
 
 impl CursorQuery {
@@ -117,76 +208,11 @@ impl CursorQuery {
         self.owner = owner;
         let full = query_full;
         let source = self.arena.alloc_str(sql).map_err(|_| full())?;
-        let values = copy_values(&self.arena, params)?;
-        let field_count = |value| match value {
-            Datum::Record(fields) | Datum::Composite { fields, .. } => fields.len(),
-            _ => 0,
-        };
-        let count = locals.iter().try_fold(params.len(), |count, local| {
-            count
-                .checked_add(1 + field_count(local.value))
-                .ok_or_else(full)
-        })?;
-        if count > u16::MAX as usize {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "cursor captured parameters exceed 65535 values"
-            ));
-        }
-        let parameters = self
-            .arena
-            .alloc_slice_with(count, |index| {
-                values.get(index).copied().unwrap_or(Datum::Null)
-            })
-            .map_err(|_| full())?;
-        let parameter_types = self
-            .arena
-            .alloc_slice_with(count, |index| {
-                if index < params.len() {
-                    crate::sql::exec::bound_parameter_type_oid((index + 1) as u32).unwrap_or(0)
-                } else {
-                    0
-                }
-            })
-            .map_err(|_| full())?;
-        let bindings = self
-            .arena
-            .alloc_slice_with(count - params.len(), |_| {
-                crate::sql::parser::NamedParameter {
-                    qualifier: None,
-                    name: "",
-                    index: 0,
-                }
-            })
-            .map_err(|_| full())?;
-        let mut at = params.len();
-        for local in locals {
-            let name = self
-                .arena
-                .alloc_str(local.name.as_str())
-                .map_err(|_| full())?;
-            let copied = copy_values(&self.arena, &[local.value])?[0];
-            parameters[at] = copied;
-            parameter_types[at] = local.type_oid;
-            bindings[at - params.len()] = crate::sql::parser::NamedParameter {
-                qualifier: None,
-                name,
-                index: at as u32 + 1,
-            };
-            at += 1;
-            if let Datum::Record(fields) | Datum::Composite { fields, .. } = copied {
-                for field in fields {
-                    parameters[at] = field.value;
-                    parameter_types[at] = field.type_oid;
-                    bindings[at - params.len()] = crate::sql::parser::NamedParameter {
-                        qualifier: Some(name),
-                        name: field.name,
-                        index: at as u32 + 1,
-                    };
-                    at += 1;
-                }
-            }
-        }
+        let BoundLocals {
+            parameters,
+            parameter_types,
+            bindings,
+        } = bind_locals(&self.arena, params, locals, full)?;
         let bytes = self
             .arena
             .alloc_slice_with(crate::sql::type_inputs::encoded_len(inputs)?, |_| 0u8)

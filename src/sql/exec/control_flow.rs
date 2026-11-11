@@ -185,7 +185,7 @@ pub(super) fn statement_name(statement: TriggerStatement<'_>) -> &'static str {
         TriggerStatement::Case(_) => "CASE",
         TriggerStatement::For(program) => match program.source {
             TriggerForSource::Numeric { .. } => "FOR with integer loop variable",
-            TriggerForSource::Query(_) => "FOR over SELECT rows",
+            TriggerForSource::Query(_) | TriggerForSource::Dml(_) => "FOR over SELECT rows",
             TriggerForSource::DynamicQuery(_) => "FOR over EXECUTE statement",
             TriggerForSource::Array { .. } => "FOREACH over array",
         },
@@ -1545,6 +1545,7 @@ fn bind_exception_variables<'a>(
             TriggerForSource::Query(query) => {
                 site(Kind::Query, core::ptr::from_ref(query) as usize)
             }
+            TriggerForSource::Dml(source) => site(Kind::Statement, source.as_ptr() as usize),
             TriggerForSource::DynamicQuery(query) => dynamic(query),
             TriggerForSource::Array {
                 expression: value, ..

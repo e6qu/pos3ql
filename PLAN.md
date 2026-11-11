@@ -116,14 +116,19 @@ is owned.
   `VALUES` over several rows). A data-modifying `WITH` sub-statement runs
   to completion before the main statement reads it, where PostgreSQL
   interleaves them, so a call in the main statement sees all of its rows.
-  PL/pgSQL rejects statements that start with `WITH` (`0A000`), and a
-  static PL/pgSQL `INSERT`, `UPDATE` or `DELETE` on a view or a table with
-  rules fails with `0A000`: the rewriter does not yet read routine
-  variables (`EXECUTE` and SQL-language functions work). A static PL/pgSQL `MERGE` source subquery cannot read routine
-  variables (`42703`). Triggers fired inside a write run
+  PL/pgSQL rejects statements that start with `WITH` (`0A000`). A `FOR`
+  loop over a data change fails with `0A000` when an `AFTER` trigger of
+  that change waits, since the loop has no owner for its returned rows. A derived table in a static PL/pgSQL statement (a `FROM`
+  subquery, `UPDATE ... FROM`, or a `MERGE` source) cannot read routine
+  variables (`42703`): input preparation describes it without the routine's
+  scope. Binding variables as parameters when the statement is parsed, as
+  PostgreSQL's parser hook does and as static writes to views already do,
+  fixes the class. In a trigger, `(new).f` fails in an `UPDATE` (`42703`),
+  and `(r).f` fails after `r := new` because the record loses its row type. Triggers fired inside a write run
   without the engine's utility
   executor, so DDL there (PL/pgSQL `CREATE TABLE`, or a SQL procedure that a
-  BEFORE trigger calls) fails with `0A000`.
+  BEFORE trigger calls) and writes to views or tables with rules fail with
+  `0A000`.
 - **Results and cursors:** resume more large results row by row; only
   single-table `SELECT` from a simple Query or an unpaged `Execute` does today.
   Remaining: paged and named portals (`Execute` with a row limit still buffers

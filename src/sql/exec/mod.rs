@@ -18700,10 +18700,13 @@ fn execute_atomic_procedure_call<'a>(
     };
     let mut declared = context.storage().routine_for(slot, txid);
     outputs.bind(&declared, argument_names, parameters.len(), variadic)?;
-    if declared.language != crate::storage::RoutineLanguage::PlPgSql {
+    if !matches!(
+        declared.language,
+        crate::storage::RoutineLanguage::PlPgSql | crate::storage::RoutineLanguage::Sql
+    ) {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "a trigger fired during a write can call only PL/pgSQL procedures"
+            "procedure language is not executable"
         ));
     }
     let mapping = declared
@@ -18777,18 +18780,29 @@ fn execute_atomic_procedure_call<'a>(
     }
     let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
     let host = context.host.reborrow();
-    let output_count = run_plpgsql_procedure(
-        &mut TriggerExecContext {
-            host,
-            txn: context.txn,
-            arena,
-            params: &completed.values[..routine.argument_count],
-            responder: context.responder,
-        },
-        routine,
-        completed.input_collation,
-        &mut output_values,
-    )?;
+    let mut procedure_context = TriggerExecContext {
+        host,
+        txn: context.txn,
+        arena,
+        params: &completed.values[..routine.argument_count],
+        responder: context.responder,
+    };
+    let output_count = if routine.language == crate::storage::RoutineLanguage::Sql {
+        run_atomic_sql_procedure(
+            &mut procedure_context,
+            slot,
+            routine,
+            completed.input_collation,
+            &mut output_values,
+        )?
+    } else {
+        run_plpgsql_procedure(
+            &mut procedure_context,
+            routine,
+            completed.input_collation,
+            &mut output_values,
+        )?
+    };
     if let Some((total, own)) = timed.finish() {
         super::statistics::record_completed_call(
             context.storage(),
@@ -18804,6 +18818,322 @@ fn execute_atomic_procedure_call<'a>(
         context.storage(),
         txid,
         arena,
+    )
+}
+
+/// Runs a SQL-language procedure body for a `CALL` inside a write, statement
+/// by statement on the write's own storage, as PostgreSQL's SQL function
+/// executor does. Each statement is a new command that sees the earlier ones;
+/// the final statement's first row supplies the output parameters.
+fn run_atomic_sql_procedure<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    slot: usize,
+    routine: &crate::storage::RoutineDef,
+    input_collation: crate::sql::ast::Collation,
+    outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+) -> Result<usize, SqlError> {
+    let arena = context.arena;
+    let txid = context.txn.txid;
+    let inputs = context.params;
+    let _formal_scope = enter_routine_parameter_types(
+        routine.arguments(),
+        Some(&super::query::storage_catalog(
+            context.storage(),
+            arena,
+            txid,
+        )),
+        input_collation,
+    )?;
+    let dependencies = context
+        .storage()
+        .snapshot_routine_dependencies_for(slot, txid, arena)?;
+    let bindings = if routine.body_kind == crate::storage::RoutineBodyKind::String {
+        &[][..]
+    } else {
+        dependencies
+            .type_inputs()
+            .detached_bindings(crate::storage::StoredInputSection::RoutineBody, arena)?
+    };
+    let body = arena
+        .alloc_str(routine.body.as_str())
+        .map_err(|_| super::query::arena_full_pub())?;
+    let routine_name = arena
+        .alloc_str(routine.name.as_str())
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut parser = super::parser::Parser::new(body, arena)
+        .and_then(|parser| parser.with_routine_parameters(routine_name, routine.arguments()))
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.set_type_inputs(bindings);
+    let statements = arena
+        .alloc_slice_with(super::parser::statement_capacity(body), |_| None)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut statement_count = 0usize;
+    while let Some(statement) = parser
+        .next_stmt()
+        .map_err(|error| super::parse_error_to_sql(&error))?
+    {
+        statements[statement_count] = Some(statement);
+        statement_count += 1;
+    }
+    super::query::validate_stored_type_inputs(
+        &parser,
+        context.storage(),
+        txid,
+        dependencies.view(),
+    )?;
+    let output_count = routine
+        .parameters()
+        .iter()
+        .filter(|parameter| parameter.mode.is_output())
+        .count();
+    let statements = arena
+        .alloc_slice_with(statement_count, |index| {
+            statements[index]
+                .take()
+                .expect("parsed procedure statement")
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    // Output parameters form a `record` the final statement must produce;
+    // PostgreSQL checks it before running the body.
+    if output_count != 0
+        && !statements.last().is_some_and(|statement| {
+            matches!(statement, Stmt::Select(_) | Stmt::SetQuery(_))
+                || super::query::statement_returns_rows(statement)
+        })
+    {
+        return Err(super::query::routine_result_mismatch(
+            "record",
+            super::query::ROUTINE_RESULT_STATEMENT_DETAIL,
+        ));
+    }
+    let mut output_rows = 0usize;
+    let mut store_output = |values: &[Datum<'_>]| -> Result<(), SqlError> {
+        if output_rows != 0 {
+            return Ok(());
+        }
+        if values.len() != output_count {
+            return Err(super::query::routine_result_mismatch(
+                "record",
+                if values.len() > output_count {
+                    "Final statement returns too many columns."
+                } else {
+                    "Final statement returns too few columns."
+                },
+            ));
+        }
+        let encoded = encode_projected_pub(values, arena)?;
+        for (column, output) in outputs[..output_count].iter_mut().enumerate() {
+            *output = decode_projected_col_record(encoded, column, arena)?;
+        }
+        output_rows = 1;
+        Ok(())
+    };
+    for (index, statement) in statements.iter().enumerate() {
+        if let Some(name) = super::query::routine_statement_forbidden(statement) {
+            return Err(super::query::routine_forbidden_statement_error(name));
+        }
+        let statement = super::query::bind_stored_routine_statement(
+            statement,
+            context.storage(),
+            slot,
+            routine,
+            txid,
+            arena,
+            inputs,
+        )?;
+        let final_output = output_count != 0 && index + 1 == statements.len();
+        let query = match statement {
+            Stmt::Select(select) => Some(super::query::RoutineQuery::Select(select)),
+            Stmt::SetQuery(set) => Some(super::query::RoutineQuery::Set(set)),
+            _ => None,
+        };
+        if let Some(query) = query {
+            let sequences =
+                crate::sql::sequence::SeqEval::new(context.storage(), context.seq_session(), txid);
+            super::query::execute_bound_routine_query(
+                &query,
+                context.storage(),
+                slot,
+                routine,
+                txid,
+                arena,
+                inputs,
+                false,
+                Some(&sequences),
+                &mut |values| {
+                    if final_output {
+                        store_output(values)
+                    } else {
+                        Ok(())
+                    }
+                },
+            )?;
+            continue;
+        }
+        if let Stmt::Call {
+            name,
+            arguments,
+            argument_names,
+            variadic,
+        } = statement
+        {
+            run_atomic_sql_procedure_call(context, *name, arguments, argument_names, *variadic)?;
+            continue;
+        }
+        if !matches!(
+            statement,
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
+        ) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a SQL procedure called during a write cannot run {}",
+                match statement {
+                    Stmt::Merge(_) => "MERGE",
+                    Stmt::With { .. } => "WITH",
+                    other =>
+                        super::unquoted_body_unsupported_tag(other).unwrap_or("this statement"),
+                }
+            ));
+        }
+        let mut capture = |_: &Storage,
+                           _: u32,
+                           _: &dyn crate::sql::eval::SequenceAccess,
+                           values: &[Datum<'_>]| store_output(values);
+        let capture = final_output.then_some(&mut capture as &mut super::ReturningCapture<'_>);
+        let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
+        let mut command = txn.enter_trigger_sql(storage)?;
+        let txn = &mut *command;
+        let mut scratch = storage.row_work.lease(0).map_err(|error| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "nested DML selection: {}",
+                error
+            )
+        })?;
+        let outcome = responder.without_query_output(|responder| match statement {
+            Stmt::Insert(insert_statement) => insert(
+                storage,
+                txn,
+                insert_statement,
+                DmlAuthorization::Invoker,
+                None,
+                arena,
+                inputs,
+                seq_session,
+                responder,
+                capture,
+                None,
+                None,
+                None,
+                InsertSource::Statement,
+            ),
+            Stmt::Update(update_statement) => update(
+                storage,
+                txn,
+                &mut scratch,
+                update_statement,
+                DmlAuthorization::Invoker,
+                None,
+                arena,
+                inputs,
+                seq_session,
+                responder,
+                capture,
+                None,
+            ),
+            Stmt::Delete(delete_statement) => delete(
+                storage,
+                txn,
+                &mut scratch,
+                delete_statement,
+                DmlAuthorization::Invoker,
+                arena,
+                inputs,
+                seq_session,
+                responder,
+                capture,
+                None,
+            ),
+            _ => unreachable!("procedure write statement was checked above"),
+        });
+        drop(command);
+        match outcome {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "procedure write response exceeded the output buffer"
+                ));
+            }
+        }
+    }
+    if output_count != 0 && output_rows == 0 {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "procedure returned null record"
+        ));
+    }
+    Ok(output_count)
+}
+
+/// A `CALL` inside a SQL procedure body run during a write. PostgreSQL
+/// rejects output arguments in SQL routine bodies, so no values return.
+fn run_atomic_sql_procedure_call<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    name: crate::sql::ast::QualName<'_>,
+    arguments: &'a [&'a Expr<'a>],
+    argument_names: &[Option<&str>],
+    variadic: bool,
+) -> Result<(), SqlError> {
+    if arguments.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many procedure arguments"
+        ));
+    }
+    let arena = context.arena;
+    let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let mut types = [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    {
+        let catalog = super::query::storage_catalog(context.storage(), arena, context.txn.txid);
+        let sequences = crate::sql::sequence::SeqEval::new(
+            context.storage(),
+            context.seq_session(),
+            context.txn.txid,
+        );
+        let hooks = crate::sql::eval::EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequences),
+            ..crate::sql::eval::NO_HOOKS
+        };
+        for (index, argument) in arguments.iter().enumerate() {
+            types[index] =
+                crate::sql::eval::expression_type_identity(argument, &NoColumns, &hooks)?
+                    .routine_argument_oid();
+            values[index] = eval_full(argument, arena, context.params, &NoColumns, &hooks)?;
+        }
+    }
+    let values = arena
+        .alloc_slice_copy(&values[..arguments.len()])
+        .map_err(|_| super::query::arena_full_pub())?;
+    let parameters = arena
+        .alloc_slice_with(arguments.len(), |index| {
+            Expr::Param(u32::try_from(index + 1).expect("bounded by MAX_ROUTINE_ARGUMENTS"))
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let parameters = arena
+        .alloc_slice_with(arguments.len(), |index| &parameters[index])
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut outputs = ProcedureOutputs::new([false; crate::storage::MAX_ROUTINE_ARGUMENTS]);
+    execute_atomic_procedure_call(
+        context,
+        name,
+        parameters,
+        argument_names,
+        variadic,
+        values,
+        &types[..arguments.len()],
+        &mut outputs,
     )
 }
 
@@ -23834,38 +24164,6 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
     for argument in *args {
         reject_parameters(argument)?;
     }
-    let values = context
-        .arena
-        .alloc_slice_with(args.len(), |_| Datum::Null)
-        .map_err(|_| super::query::arena_full_pub())?;
-    let parameter_types = context
-        .arena
-        .alloc_slice_with(args.len(), |_| 0)
-        .map_err(|_| super::query::arena_full_pub())?;
-    with_bound_parameter_types(&[], || -> Result<(), SqlError> {
-        let catalog =
-            super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
-        let sequence = crate::sql::sequence::SeqEval::new(
-            context.storage(),
-            context.seq_session(),
-            context.txn.txid,
-        );
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            sequences: Some(&sequence),
-            ..NO_HOOKS
-        };
-        for (index, argument) in args.iter().copied().enumerate() {
-            parameter_types[index] =
-                super::eval::expression_type_identity(argument, &NoColumns, &hooks)?
-                    .record_field_oid();
-            values[index] = detached_trigger_datum(
-                eval_full(argument, context.arena, &[], &NoColumns, &hooks)?,
-                context.arena,
-            )?;
-        }
-        Ok(())
-    })?;
     let PlpgsqlExecHost::Routine {
         engine, sqlprep, ..
     } = &context.host
@@ -23885,26 +24183,23 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
     let owner = sqlprep
         .plan_owner(name)
         .expect("a live SQL prepared statement owns its routine input plans");
-    let declared =
-        crate::sql::prep::decode_types(sqlprep.get_type_codes(name).unwrap_or(&[]), context.arena)?;
-    let declared_count = declared.len();
-    if declared_count != 0 && values.len() != declared_count {
-        return Err(sql_err!(
-            sqlstate::PROTOCOL_VIOLATION,
-            "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
+    let (values, parameter_types) = with_bound_parameter_types(&[], || {
+        engine.prepared_arguments(
             name,
-            declared_count,
-            values.len()
-        ));
-    }
-    for (index, value) in values.iter_mut().enumerate() {
-        if index < declared_count {
-            parameter_types[index] = declared[index].oid();
-            *value = detached_trigger_datum(
-                crate::sql::eval::cast(*value, declared[index].internal_name(), context.arena)?,
-                context.arena,
-            )?;
-        }
+            args,
+            &[],
+            sqlprep,
+            context.arena,
+            context.txn.txid,
+            context.seq_session(),
+        )
+    })?;
+    let values = context
+        .arena
+        .alloc_slice_copy(values)
+        .map_err(|_| super::query::arena_full_pub())?;
+    for value in values.iter_mut() {
+        *value = detached_trigger_datum(*value, context.arena)?;
     }
     let text = context
         .arena

@@ -4432,13 +4432,93 @@ fn trigger_functions_call_procedures_atomically() {
                  FOR EACH ROW EXECUTE FUNCTION trigger_sql_caller()",
             NONE,
         ),
+        ("INSERT INTO trigger_sql_rows VALUES (1)", NONE),
         (
-            "INSERT INTO trigger_sql_rows VALUES (1)",
-            &[(
-                'E',
-                "0A000",
-                "a trigger fired during a write can call only PL/pgSQL procedures",
-            )],
+            "DO $$DECLARE logged text; BEGIN \
+             SELECT string_agg(msg || v, ',' ORDER BY msg, v) INTO logged \
+               FROM trigger_call_log; RAISE NOTICE '%', logged; END$$",
+            &[('N', "00000", "INSERT1,INSERT2,sql1")],
+        ),
+    ]);
+}
+
+/// SQL-language procedures called from a BEFORE row trigger or a deferred
+/// constraint trigger run statement by statement on the write's storage:
+/// each statement sees the earlier ones, the final row fills INOUT
+/// arguments (also from `RETURNING`), nested `CALL` works and errors abort
+/// the write. Expected notices and errors come from PostgreSQL 18.6, except
+/// that PostgreSQL also runs DDL there, which pos3ql rejects with `0A000`.
+#[test]
+fn trigger_functions_call_sql_procedures_atomically() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    check(&[
+        (
+            "CREATE TABLE sql_call_rows(a integer, b integer); \
+             CREATE TABLE sql_call_log(msg text, n integer); \
+             CREATE PROCEDURE sql_call_in(x integer) LANGUAGE sql AS \
+                 $$INSERT INTO sql_call_log VALUES ('in', x)$$; \
+             CREATE PROCEDURE sql_call_out(x integer, INOUT r integer) LANGUAGE sql AS \
+                 $$CALL sql_call_in(x); SELECT x * 2$$; \
+             CREATE PROCEDURE sql_call_ret(x integer, INOUT r integer) LANGUAGE sql AS \
+                 $$INSERT INTO sql_call_log VALUES ('ret', x) RETURNING n * 3$$; \
+             CREATE PROCEDURE sql_call_seen(INOUT r text) LANGUAGE sql AS \
+                 $$SELECT string_agg(msg || n, ',' ORDER BY msg, n) FROM sql_call_log$$; \
+             CREATE PROCEDURE sql_call_fails() LANGUAGE sql AS \
+                 $$INSERT INTO sql_call_log VALUES ('bad', 1 / 0)$$; \
+             CREATE PROCEDURE sql_call_ddl() LANGUAGE sql AS $$CREATE TABLE sql_call_made(a int)$$; \
+             CREATE FUNCTION sql_call_trigger() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$DECLARE v integer; seen text; BEGIN \
+                 CALL sql_call_ret(NEW.a, v); NEW.b := v; CALL sql_call_out(NEW.a, v); \
+                 CALL sql_call_seen(seen); RAISE NOTICE '% %', v, seen; \
+                 IF NEW.a < 0 THEN CALL sql_call_fails(); END IF; \
+                 IF NEW.a = 0 THEN CALL sql_call_ddl(); END IF; RETURN NEW; END$$; \
+             CREATE TRIGGER sql_call_trigger BEFORE INSERT ON sql_call_rows \
+                 FOR EACH ROW EXECUTE FUNCTION sql_call_trigger()",
+            NONE,
+        ),
+        (
+            "INSERT INTO sql_call_rows(a) VALUES (7), (8)",
+            &[
+                ('N', "00000", "14 in7,ret7"),
+                ('N', "00000", "16 in7,in8,ret7,ret8"),
+            ],
+        ),
+        (
+            "INSERT INTO sql_call_rows(a) VALUES (-1)",
+            &[
+                ('N', "00000", "-2 in-1,in7,in8,ret-1,ret7,ret8"),
+                ('E', "22012", "division by zero"),
+            ],
+        ),
+        (
+            "INSERT INTO sql_call_rows(a) VALUES (0)",
+            &[
+                ('N', "00000", "0 in0,in7,in8,ret0,ret7,ret8"),
+                (
+                    'E',
+                    "0A000",
+                    "a SQL procedure called during a write cannot run CREATE TABLE",
+                ),
+            ],
+        ),
+        (
+            "CREATE TABLE sql_call_deferred(a integer); \
+             CREATE FUNCTION sql_call_constraint() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$DECLARE v integer; BEGIN CALL sql_call_out(NEW.a * 7, v); \
+                 RAISE NOTICE 'v=%', v; RETURN NULL; END$$; \
+             CREATE CONSTRAINT TRIGGER sql_call_constraint AFTER INSERT ON sql_call_deferred \
+                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+                 EXECUTE FUNCTION sql_call_constraint(); \
+             BEGIN; INSERT INTO sql_call_deferred VALUES (3)",
+            NONE,
+        ),
+        ("COMMIT", &[('N', "00000", "v=42")]),
+        (
+            "DO $$DECLARE rows text; logged text; BEGIN \
+             SELECT string_agg(a || ':' || b, ',' ORDER BY a) INTO rows FROM sql_call_rows; \
+             SELECT string_agg(msg || n, ',' ORDER BY msg, n) INTO logged FROM sql_call_log; \
+             RAISE NOTICE '% %', rows, logged; END$$",
+            &[('N', "00000", "7:21,8:24 in7,in8,in21,ret7,ret8")],
         ),
     ]);
 }

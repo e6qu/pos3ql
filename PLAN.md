@@ -266,11 +266,7 @@ Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: `ALTER`, `COMMENT ON`
 and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
 with `0A000` where PostgreSQL changes the catalog entry; `information_schema`
-domains such as `cardinal_number` do not exist. SQL-level `PREPARE` records
-parameter types by representation: a parameter whose use selects a domain is
-listed in `pg_prepared_statements` as the domain's base type, one cast to an
-enum or composite type (`$1::mood`) as `text`, and `PREPARE q(positive)` with
-a user-defined type fails with `42704`; PostgreSQL records the user type. A SQL function whose earlier
+domains such as `cardinal_number` do not exist. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final
@@ -301,10 +297,10 @@ still fail with `42601` and `syntax error: <description>`: type modifiers
 role and large-object values, and SQL/JSON result types. An unsupported cast
 reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
 `42846` `cannot cast type integer to timestamp without time zone`.
-A trigger fired inside a write (a BEFORE row trigger, a deferred constraint
-trigger at `COMMIT`) can `CALL` only PL/pgSQL procedures; a SQL-language
-procedure fails with `0A000` because that trigger runs without the engine's
-statement executor. A procedure that waits for storage or a lock, at the
+A SQL-language procedure called from a trigger fired inside a write (a BEFORE
+row trigger, a deferred constraint trigger at `COMMIT`) runs queries, data
+changes and nested `CALL`, but rejects DDL and other utility statements with
+`0A000` because that trigger runs without the engine's utility executor. A procedure that waits for storage or a lock, at the
 top level or called from PL/pgSQL, runs again from its start when its
 statement resumes (finished effects replay from the statement journal)
 instead of resuming at a saved position, so a wait after the procedure's own

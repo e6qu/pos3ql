@@ -11,40 +11,11 @@ use crate::sql_err;
 use crate::storage::SqlName;
 
 use super::eval::SqlError;
-use super::types::ColType;
 use core::cell::Cell;
 
 /// PostgreSQL's unsigned 16-bit prepared-parameter boundary.
 pub const MAX_PREP_PARAMS: usize = u16::MAX as usize;
 const MAX_PREP_RESULTS: usize = super::exec::MAX_PROJ;
-
-fn type_from_code(code: u8) -> Option<ColType> {
-    if code == ColType::Record.code() {
-        Some(ColType::Record)
-    } else {
-        ColType::from_code(code)
-    }
-}
-
-pub(crate) fn decode_types<'a>(codes: &[u8], arena: &'a Arena) -> Result<&'a [ColType], SqlError> {
-    let types = arena
-        .alloc_slice_with(codes.len(), |_| ColType::Bool)
-        .map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "prepared parameter types exceed the statement arena"
-            )
-        })?;
-    for (target, code) in types.iter_mut().zip(codes.iter().copied()) {
-        *target = type_from_code(code).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "prepared statement contains an invalid parameter type"
-            )
-        })?;
-    }
-    Ok(types)
-}
 
 pub struct SqlPreparedPool {
     slots: Vec<Slot>,
@@ -83,7 +54,7 @@ pub(crate) struct PendingTypeInput {
 struct Slot {
     active: bool,
     name: SqlName,
-    /// Query text, parameter codes, result OIDs, then bound type inputs.
+    /// Query text, parameter type OIDs, result OIDs, then bound type inputs.
     /// All metadata shares the slot's configured `prepared_bytes` reservation.
     data: FixedBuf,
     text_len: usize,
@@ -124,18 +95,21 @@ pub(crate) fn with_active<R>(f: impl FnOnce(Option<&SqlPreparedPool>) -> R) -> R
 pub(crate) struct PreparedInfo<'a> {
     pub(crate) name: &'a str,
     pub(crate) statement: &'a str,
-    pub(crate) parameter_type_codes: &'a [u8],
+    pub(crate) parameter_types: PreparedTypeOids<'a>,
     pub(crate) prepared_at: i64,
     pub(crate) custom_plans: i64,
-    pub(crate) result_types: PreparedResultTypes<'a>,
+    pub(crate) result_types: PreparedTypeOids<'a>,
 }
 
+/// Type OIDs stored big-endian in a prepared statement's slot. Parameters
+/// keep their exact type, including domains, enums and composites, as
+/// PostgreSQL records them.
 #[derive(Clone, Copy)]
-pub(crate) struct PreparedResultTypes<'a> {
+pub(crate) struct PreparedTypeOids<'a> {
     bytes: &'a [u8],
 }
 
-impl PreparedResultTypes<'_> {
+impl PreparedTypeOids<'_> {
     pub(crate) fn len(self) -> usize {
         self.bytes.len() / 4
     }
@@ -146,6 +120,20 @@ impl PreparedResultTypes<'_> {
             .0
             .iter()
             .map(|bytes| i32::from_be_bytes(*bytes))
+    }
+
+    /// Copies the OIDs into the statement arena, ending the pool borrow.
+    pub(crate) fn copy_into(self, arena: &Arena) -> Result<&[i32], SqlError> {
+        let mut oids = self.iter();
+        let copied = arena
+            .alloc_slice_with(self.len(), |_| oids.next().expect("counted prepared OIDs"))
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "prepared parameter types exceed the statement arena"
+                )
+            })?;
+        Ok(copied)
     }
 }
 
@@ -201,7 +189,7 @@ impl SqlPreparedPool {
         &mut self,
         name: &str,
         sql: &str,
-        param_types: &[ColType],
+        param_types: &[i32],
         result_types: &[i32],
         type_inputs: &[u8],
     ) -> Result<(), SqlError> {
@@ -236,7 +224,7 @@ impl SqlPreparedPool {
         let result_bytes = result_types.len().saturating_mul(4);
         if sql
             .len()
-            .saturating_add(param_types.len())
+            .saturating_add(param_types.len().saturating_mul(4))
             .saturating_add(result_bytes)
             .saturating_add(type_inputs.len())
             > slot.data.capacity()
@@ -247,10 +235,7 @@ impl SqlPreparedPool {
             ));
         }
         assert!(slot.data.append(sql.as_bytes()), "capacity checked above");
-        for ctype in param_types {
-            assert!(slot.data.append(&[ctype.code()]), "capacity checked above");
-        }
-        for type_oid in result_types {
+        for type_oid in param_types.iter().chain(result_types) {
             assert!(
                 slot.data.append(&type_oid.to_be_bytes()),
                 "capacity checked above"
@@ -279,13 +264,15 @@ impl SqlPreparedPool {
             })
     }
 
-    /// The declared `$n` parameter types for a prepared statement (empty slice
-    /// when none were declared), or None if the statement does not exist.
-    pub fn get_type_codes(&self, name: &str) -> Option<&[u8]> {
+    /// Every `$n` parameter type a prepared statement recorded at PREPARE,
+    /// or None if the statement does not exist.
+    pub(crate) fn parameter_types(&self, name: &str) -> Option<PreparedTypeOids<'_>> {
         self.slots
             .iter()
             .find(|s| s.active && s.name.as_str() == name)
-            .map(|s| &s.data.readable()[s.text_len..s.text_len + s.n_params])
+            .map(|s| PreparedTypeOids {
+                bytes: &s.data.readable()[s.text_len..s.text_len + s.n_params * 4],
+            })
     }
 
     pub(crate) fn type_inputs(&self, name: &str) -> Option<&[u8]> {
@@ -293,7 +280,7 @@ impl SqlPreparedPool {
             .iter()
             .find(|slot| slot.active && slot.name.as_str() == name)
             .map(|slot| {
-                let start = slot.text_len + slot.n_params + slot.n_results * 4;
+                let start = slot.text_len + (slot.n_params + slot.n_results) * 4;
                 &slot.data.readable()[start..start + slot.input_bytes]
             })
     }
@@ -527,17 +514,18 @@ impl SqlPreparedPool {
 
     pub(crate) fn visit(&self, mut visitor: impl FnMut(PreparedInfo<'_>)) {
         for slot in self.slots.iter().filter(|slot| slot.active) {
-            let result_start = slot.text_len + slot.n_params;
+            let result_start = slot.text_len + slot.n_params * 4;
             let result_end = result_start + slot.n_results * 4;
             visitor(PreparedInfo {
                 name: slot.name.as_str(),
                 statement: core::str::from_utf8(&slot.data.readable()[..slot.text_len])
                     .expect("prepared SQL was validated as UTF-8"),
-                parameter_type_codes: &slot.data.readable()
-                    [slot.text_len..slot.text_len + slot.n_params],
+                parameter_types: PreparedTypeOids {
+                    bytes: &slot.data.readable()[slot.text_len..result_start],
+                },
                 prepared_at: slot.prepared_at,
                 custom_plans: slot.custom_plans,
-                result_types: PreparedResultTypes {
+                result_types: PreparedTypeOids {
                     bytes: &slot.data.readable()[result_start..result_end],
                 },
             });
@@ -552,4 +540,143 @@ impl SqlPreparedPool {
             .expect("prepared statement was resolved before execution");
         slot.custom_plans = slot.custom_plans.saturating_add(1);
     }
+}
+
+/// PostgreSQL's assignment coercion test for an `EXECUTE` argument
+/// (`coerce_to_target_type` with `COERCION_ASSIGNMENT`): unknown literals and
+/// equal types always pass; otherwise domains compare by base type, a `pg_cast`
+/// entry must permit assignment, any type converts to a string type by I/O,
+/// arrays coerce element-wise and an anonymous record becomes a composite.
+fn assignment_coercible(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    source: i32,
+    target: i32,
+) -> bool {
+    use super::types::{ColType, oid};
+    if source == target || source == oid::UNKNOWN {
+        return true;
+    }
+    let base = |type_oid| {
+        storage
+            .domain_base_type_for_oid(type_oid, txid)
+            .and_then(ColType::try_oid)
+            .unwrap_or(type_oid)
+    };
+    let (source, target) = (base(source), base(target));
+    if source == target {
+        return true;
+    }
+    let declared = super::catalog::builtin_cast_context(source, target).or_else(|| {
+        storage
+            .cast_for_oids(source, target, txid)
+            .map(|(_, cast)| cast.context)
+    });
+    if declared.is_some_and(crate::storage::CastContext::permits_assignment) {
+        return true;
+    }
+    let target_type = storage
+        .routine_result_for_oid(target, txid)
+        .map(|result| result.ctype);
+    if matches!(
+        target_type,
+        Some(ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name)
+    ) {
+        return true;
+    }
+    if source == oid::RECORD && matches!(target_type, Some(ColType::Composite(_))) {
+        return true;
+    }
+    let source_type = storage
+        .routine_result_for_oid(source, txid)
+        .map(|result| result.ctype);
+    match (source_type, target_type) {
+        (Some(ColType::Array(source)), Some(ColType::Array(target))) => {
+            assignment_coercible(storage, txid, source.element_oid(), target.element_oid())
+        }
+        _ => false,
+    }
+}
+
+/// Converts one `EXECUTE` argument to the type its parameter recorded at
+/// PREPARE. Unknown literals use the target's input function, so domains,
+/// enums and composites receive their own checks.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "argument coercion names the prepared position, value, both types and its catalog context"
+)]
+pub(crate) fn coerce_argument<'a>(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    position: usize,
+    value: super::types::Datum<'a>,
+    source: i32,
+    target: i32,
+    arena: &'a Arena,
+    sequences: Option<&dyn super::eval::SequenceAccess>,
+) -> Result<super::types::Datum<'a>, SqlError> {
+    use super::types::{Datum, oid};
+    if !assignment_coercible(storage, txid, source, target) {
+        let name = |type_oid| {
+            super::catalog::user_type_name_fixed(storage, txid, type_oid).map(|name| {
+                name.or_else(|| super::exec::builtin_type_name_fixed(type_oid))
+                    .unwrap_or_else(|| crate::util::StackStr::from_str("unknown"))
+            })
+        };
+        super::eval::stash_diagnostic(
+            None,
+            Some(crate::util::StackStr::from_str(
+                "You will need to rewrite or cast the expression.",
+            )),
+        );
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "parameter ${} of type {} cannot be coerced to the expected type {}",
+            position + 1,
+            name(source)?.as_str(),
+            name(target)?.as_str()
+        ));
+    }
+    if value.is_null() {
+        return super::exec::coerce_binary_input_null(storage, target, arena, txid, sequences);
+    }
+    if source == oid::UNKNOWN
+        && let Datum::Text(text) = value
+    {
+        return super::exec::decode_text_input(
+            storage,
+            target,
+            text.as_bytes(),
+            arena,
+            txid,
+            sequences,
+        );
+    }
+    if source == target {
+        return Ok(value);
+    }
+    let declared = storage
+        .routine_result_for_oid(target, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "prepared parameter type {} is unavailable",
+                target
+            )
+        })?;
+    if declared.user_type.is_none() {
+        return super::eval::cast(value, declared.ctype.internal_name(), arena);
+    }
+    super::exec::coerce_routine_argument(
+        value,
+        crate::storage::RoutineArgumentDef {
+            name: crate::storage::SqlName::EMPTY,
+            ctype: declared.ctype,
+            user_type: declared.user_type,
+        },
+        storage,
+        txid,
+        arena,
+        sequences,
+    )
 }

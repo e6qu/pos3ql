@@ -3426,6 +3426,44 @@ impl Conn {
             }
             Err(WireFull) => return Step::Close,
         };
+        // PostgreSQL fixes every parameter type at Parse and reports one it
+        // cannot determine (`42P18`) there; Bind and Describe reuse the types.
+        let param_oid_bytes = match engine
+            .infer_param_types(
+                query,
+                &self.arena,
+                &self.txn,
+                n_params as usize,
+                param_oid_bytes,
+                bound_inputs,
+            )
+            .and_then(|oids| {
+                let bytes = self
+                    .arena
+                    .alloc_slice_with(oids.len() * 4, |_| 0u8)
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                for (target, oid) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(oids.iter()) {
+                    *target = oid.to_be_bytes();
+                }
+                Ok(&*bytes)
+            }) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.sqlprep.clear_request_type_inputs();
+                if self.txn.is_explicit() {
+                    self.txn.failed = true;
+                } else {
+                    engine.rollback_txn(&mut self.txn, &self.guc);
+                    self.cursors.on_rollback();
+                }
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    error.sqlstate,
+                    error.message.as_str(),
+                );
+            }
+        };
         let entry = &mut self.prepared[slot];
         self.sqlprep
             .routine_inputs

@@ -109,8 +109,11 @@ Functions and expressions:
   termination`). A trigger function may `CALL` a procedure; the call is
   atomic, so its `COMMIT` fails with `2D000`. A trigger fired inside a write
   (a BEFORE row trigger, or a deferred constraint trigger at `COMMIT`) can
-  call only PL/pgSQL procedures; a SQL-language procedure fails there with
-  `0A000`.
+  call PL/pgSQL and SQL-language procedures. A SQL procedure called there
+  runs its queries, `INSERT`, `UPDATE`, `DELETE` and nested `CALL`
+  statements; any other statement in its body, such as `CREATE TABLE`, fails
+  with `0A000` (`a SQL procedure called during a write cannot run CREATE
+  TABLE`) where PostgreSQL runs it.
 - A built-in function cannot implement `CREATE CAST` or `CREATE OPERATOR`
   (`0A000`). Aggregate support functions can name supported built-ins.
 - A missing-function message that does not fit the fixed 192-byte error
@@ -181,10 +184,14 @@ Domains and checked inputs:
   `double precision` in `pg_prepared_statements`, so `EXECUTE q(2.5)` returns
   2. A parameter that is never used (`SELECT $2::int` leaves `$1` unused) or
   only passed where any type is accepted (`pg_typeof($1)`) fails with `42P18`;
-  an otherwise untyped one is `text`. A parameter whose use selects a domain
-  is recorded as the domain's base type, one cast to an enum or composite
-  type (`$1::mood`) as `text`, and a declared user-defined type
-  (`PREPARE q(positive)`) fails with `42704`.
+  an otherwise untyped one is `text`. User-defined types are recorded exactly:
+  `PREPARE q(positive)` and `PREPARE q AS SELECT $1::mood` list `positive`
+  and `mood`. `EXECUTE` converts each argument with PostgreSQL's assignment
+  rules, so `EXECUTE q(2.7)` passes 3 to an integer domain and
+  `EXECUTE q('happy'::text)` fails with `42804` (`parameter $1 of type text
+  cannot be coerced to the expected type mood`). A protocol Parse fixes its
+  parameter types and reports an undeterminable one with `42P18` at Parse;
+  later Bind and Describe messages reuse those types.
 - SQL functions are validated at `CREATE`, then each backend checks and keeps
   the first call's inputs for that definition and argument types. PL/pgSQL keeps
   one instance per resolved argument types and collation. Views, rules,

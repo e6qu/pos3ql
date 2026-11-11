@@ -30053,7 +30053,27 @@ fn pg_prepared_statements<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_prepared_statements", false);
-    let catalog_types = pg_type(storage, txid, Materialization::Query, arena)?;
+    // Parameters and results show their exact types, including user-defined
+    // ones, the way `format_type` names them.
+    let type_datum = |oid: i32| -> Result<Datum<'a>, SqlError> {
+        let name = match intrinsic_type_name(oid) {
+            Some(name) => name,
+            None => {
+                let name = user_type_name_fixed(storage, txid, oid)?.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "prepared statement type {} has no catalog name",
+                        oid
+                    )
+                })?;
+                arena.alloc_str(name.as_str()).map_err(|_| arena_full())?
+            }
+        };
+        Ok(Datum::Regtype {
+            referenced_oid: oid,
+            name,
+        })
+    };
     crate::sql::prep::with_active(|pool| {
         let rows = arena
             .alloc_slice_with(
@@ -30068,36 +30088,21 @@ fn pg_prepared_statements<'a>(
                 if found_error.is_some() {
                     return;
                 }
-                let parameters = match arena
-                    .alloc_slice_with(prepared.parameter_type_codes.len(), |_| Datum::Null)
-                {
-                    Ok(parameters) => parameters,
-                    Err(_) => {
-                        found_error = Some(arena_full());
-                        return;
-                    }
-                };
-                let parameter_types =
-                    match crate::sql::prep::decode_types(prepared.parameter_type_codes, arena) {
-                        Ok(types) => types,
+                let parameters =
+                    match arena.alloc_slice_with(prepared.parameter_types.len(), |_| Datum::Null) {
+                        Ok(parameters) => parameters,
+                        Err(_) => {
+                            found_error = Some(arena_full());
+                            return;
+                        }
+                    };
+                for (target, oid) in parameters.iter_mut().zip(prepared.parameter_types.iter()) {
+                    *target = match type_datum(oid) {
+                        Ok(value) => value,
                         Err(error) => {
                             found_error = Some(error);
                             return;
                         }
-                    };
-                for (target, ctype) in parameters.iter_mut().zip(parameter_types) {
-                    let oid = ctype.oid();
-                    let Some(name) = intrinsic_type_name(oid) else {
-                        found_error = Some(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "prepared parameter type {} has no catalog name",
-                            oid
-                        ));
-                        return;
-                    };
-                    *target = Datum::Regtype {
-                        referenced_oid: oid,
-                        name,
                     };
                 }
                 let parameter_types = match super::array::build(parameters, arena) {
@@ -30112,27 +30117,12 @@ fn pg_prepared_statements<'a>(
                 };
                 let mut results = [Datum::Null; super::exec::MAX_PROJ];
                 for (target, oid) in results.iter_mut().zip(prepared.result_types.iter()) {
-                    let name = intrinsic_type_name(oid).or_else(|| {
-                        catalog_types.rows.iter().find_map(|row| {
-                            let matches = matches!(row[0], Datum::Int4(value) if value == oid)
-                                || matches!(row[0], Datum::Oid(value) if value == oid as u32);
-                            matches.then(|| match row[1] {
-                                Datum::Text(name) => Some(name),
-                                _ => None,
-                            })?
-                        })
-                    });
-                    let Some(name) = name else {
-                        found_error = Some(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "prepared result type {} has no catalog name",
-                            oid
-                        ));
-                        return;
-                    };
-                    *target = Datum::Regtype {
-                        referenced_oid: oid,
-                        name,
+                    *target = match type_datum(oid) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            found_error = Some(error);
+                            return;
+                        }
                     };
                 }
                 let result_types =

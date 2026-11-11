@@ -57,7 +57,7 @@ DO $$BEGIN
   MERGE INTO items t USING source s ON t.id = s.id
     WHEN MATCHED THEN UPDATE SET a = total()
     WHEN NOT MATCHED THEN INSERT VALUES (s.id, total());
-  EXECUTE 'MERGE INTO items t USING items s ON t.id = s.id
+  EXECUTE 'MERGE INTO items t USING source s ON t.id = s.id
            WHEN MATCHED THEN UPDATE SET a = total()';
 END$$;
 SELECT * FROM items ORDER BY id;

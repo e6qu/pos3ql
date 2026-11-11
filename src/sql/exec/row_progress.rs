@@ -8,11 +8,17 @@
 //! snapshot, skips the changed rows without evaluating them, and continues at
 //! the unfinished row. The call therefore sees the earlier rows' changes, as
 //! in PostgreSQL, and every row, trigger and `RETURNING` row happens once.
+//!
+//! A statement made of several steps (the sub-statements of a data-modifying
+//! `WITH` and its main statement; a rule's original statement and actions)
+//! also keeps its finished steps: the next attempt skips them, using their
+//! saved output rows and row counts, and runs the unfinished step at its
+//! row, or from the step's start when no row was unfinished.
 
 use super::*;
 use crate::sql::query::{self, InvocationPosition};
 use crate::sql::sequence::{self, StatementReplayStart};
-use crate::sql::txn::{StatementMark, SuspendedTriggerSql};
+use crate::sql::txn::{StatementMark, SuspendedTriggerSql, TransactionEffectMark};
 
 /// Where an attempt's replay of routine results and sequence values stands.
 #[derive(Clone, Copy)]
@@ -98,6 +104,45 @@ pub(crate) struct UnfinishedRow {
     pub(crate) output: crate::pg::overflow::OutputMark,
 }
 
+/// Where the unfinished step of a multi-step statement started.
+#[derive(Clone, Copy)]
+struct StepStart {
+    mark: StatementMark,
+    output: crate::pg::overflow::OutputMark,
+    point: ReplayPoint,
+    effects: TransactionEffectMark,
+    /// The command the step runs as; a resumed step runs as it again so its
+    /// rows are selected under the same command.
+    command: u32,
+}
+
+/// The finished steps of a multi-step statement.
+struct StepProgress {
+    /// Whether a statement claimed the steps in the running attempt; a
+    /// multi-step statement nested in a step keeps no steps of its own.
+    claimed: bool,
+    finished: usize,
+    start: Option<StepStart>,
+    /// The finished steps' output rows and row counts, then the unfinished
+    /// step's captured output rows: rows in `old`, one count row per step
+    /// in `new`.
+    saved: Option<transition_rows::SavedTransitionRows>,
+}
+
+/// A finished step's output, as a multi-step statement keeps it.
+#[derive(Clone, Copy)]
+pub(crate) struct StepRecord<'r> {
+    pub(crate) rows: &'r [&'r [u8]],
+    pub(crate) affected: u64,
+}
+
+/// The steps an interrupted attempt kept, decoded in the statement arena.
+pub(crate) struct ResumedSteps<'a> {
+    pub(crate) finished: &'a [StepRecord<'a>],
+    /// Output rows the unfinished step had captured from its kept rows.
+    pub(crate) captured: &'a [&'a [u8]],
+}
+
 pub(crate) struct RowProgress {
     journal: Option<(usize, u64)>,
     selection: Option<ReplayPoint>,
@@ -108,6 +153,7 @@ pub(crate) struct RowProgress {
     state: Option<transition_rows::SavedTransitionRows>,
     started: bool,
     unrestartable: bool,
+    steps: StepProgress,
 }
 
 impl RowProgress {
@@ -122,6 +168,12 @@ impl RowProgress {
             state: None,
             started: false,
             unrestartable: false,
+            steps: StepProgress {
+                claimed: false,
+                finished: 0,
+                start: None,
+                saved: None,
+            },
         }
     }
 
@@ -130,10 +182,204 @@ impl RowProgress {
     pub(crate) fn begin_attempt(&mut self, wal: usize, lock: u64) {
         self.journal = Some((wal, lock));
         self.running = None;
+        self.steps.claimed = false;
+    }
+
+    /// Claims step progress for a multi-step statement. `false` when an
+    /// enclosing statement already keeps steps: the nested statement then
+    /// runs its steps without progress, and a call after its first change
+    /// fails loudly instead of hiding that change.
+    pub(crate) fn claim_steps(&mut self) -> bool {
+        !core::mem::replace(&mut self.steps.claimed, true)
+    }
+
+    /// Before step `index` of the claimed statement: `false` when an earlier
+    /// attempt finished it. An unfinished step resumed by this attempt
+    /// replays its calls from its start; a new step records its start. With
+    /// `separate`, each step after the first is its own command, which sees
+    /// the earlier steps' changes (a rule's actions); otherwise all steps
+    /// share the statement's snapshot (data-modifying `WITH`).
+    pub(crate) fn begin_step(
+        &mut self,
+        index: usize,
+        separate: bool,
+        txn: &mut TxnState,
+        responder: &Responder<'_>,
+    ) -> Result<bool, SqlError> {
+        if index < self.steps.finished {
+            return Ok(false);
+        }
+        if index != self.steps.finished {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a write step started before the previous one finished"
+            ));
+        }
+        match self.steps.start {
+            Some(start) => {
+                txn.resume_command(start.command);
+                start.point.seek()?;
+            }
+            None => {
+                if separate && index != 0 {
+                    txn.begin_command()?;
+                }
+                let (wal, lock) = self.journal.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "write step progress has no attempt journal position"
+                    )
+                })?;
+                self.steps.start = Some(StepStart {
+                    mark: txn.statement_mark(wal, lock),
+                    output: responder.mark(),
+                    point: ReplayPoint::capture()?,
+                    effects: txn.transaction_effect_mark(),
+                    command: txn.command_id(),
+                });
+            }
+        }
+        Ok(true)
+    }
+
+    /// The running step finished; the next one starts with no row progress.
+    pub(crate) fn finish_step(&mut self) {
+        self.steps.finished += 1;
+        self.steps.start = None;
+        self.selection = None;
+        self.running = None;
+        self.resume = None;
+        self.returning = None;
+        self.state = None;
+    }
+
+    /// Saves the finished steps' outputs, and the rows the unfinished step
+    /// captured, when an attempt stops for a routine call.
+    pub(crate) fn keep_steps(
+        &mut self,
+        finished: &[StepRecord<'_>],
+        captured: &[&[u8]],
+        arena: &Arena,
+        pool: &std::sync::Arc<LeasePool>,
+    ) -> Result<(), SqlError> {
+        if finished.len() != self.steps.finished {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a write kept a different number of finished steps"
+            ));
+        }
+        // Captured rows belong to rows the unfinished step keeps; a step that
+        // runs again from its start captures them again.
+        let captured = if self.resume.is_some() { captured } else { &[] };
+        let mark = arena.mark();
+        let saved = (|| {
+            let full = |_| crate::sql::query::arena_full_pub();
+            let total = finished
+                .iter()
+                .map(|step| step.rows.len())
+                .sum::<usize>()
+                .checked_add(captured.len())
+                .ok_or_else(crate::sql::query::arena_full_pub)?;
+            let mut rows = arena.alloc_slice_with(total, |_| &[][..]).map_err(full)?;
+            let mut at = 0;
+            for step in finished
+                .iter()
+                .map(|step| step.rows)
+                .chain(core::iter::once(captured))
+            {
+                rows[at..at + step.len()].copy_from_slice(step);
+                at += step.len();
+            }
+            let counts = arena
+                .alloc_slice_with(finished.len() + 1, |_| &[][..])
+                .map_err(full)?;
+            for (count, step) in
+                counts
+                    .iter_mut()
+                    .zip(finished.iter().copied().chain(core::iter::once(StepRecord {
+                        rows: captured,
+                        affected: 0,
+                    })))
+            {
+                *count = encode_projected_pub(
+                    &[
+                        Datum::Int8(
+                            i64::try_from(step.rows.len())
+                                .map_err(|_| crate::sql::query::arena_full_pub())?,
+                        ),
+                        Datum::Int8(i64::try_from(step.affected).unwrap_or(i64::MAX)),
+                    ],
+                    arena,
+                )?;
+            }
+            let rows: &[&[u8]] = &*core::mem::take(&mut rows);
+            transition_rows::SavedTransitionRows::capture(
+                TransitionRows {
+                    old: rows,
+                    new: counts,
+                },
+                pool,
+            )
+        })();
+        // SAFETY: the rows and counts were copied into the saved owner.
+        unsafe { arena.rewind_to(mark) };
+        self.steps.saved = Some(saved?);
+        Ok(())
+    }
+
+    /// The steps an interrupted attempt kept, copied into `arena`; `None`
+    /// before any attempt stopped after a finished step or kept rows.
+    pub(crate) fn resumed_steps<'a>(
+        &self,
+        arena: &'a Arena,
+    ) -> Result<Option<ResumedSteps<'a>>, SqlError> {
+        let Some(saved) = &self.steps.saved else {
+            return Ok(None);
+        };
+        let full = |_| crate::sql::query::arena_full_pub();
+        let rows = saved.restore(arena)?;
+        let copied = arena
+            .alloc_slice_with(rows.old.len(), |_| &[][..])
+            .map_err(full)?;
+        for (copy, row) in copied.iter_mut().zip(rows.old) {
+            *copy = &*arena.alloc_slice_copy(row).map_err(full)?;
+        }
+        let copied: &'a [&'a [u8]] = copied;
+        let count = |row: &[u8], column| -> Result<usize, SqlError> {
+            match decode_projected_col_record(row, column, arena)? {
+                Datum::Int8(value) => usize::try_from(value).map_err(|_| changed_steps()),
+                _ => Err(changed_steps()),
+            }
+        };
+        let (captured_counts, finished_counts) = rows.new.split_last().ok_or_else(changed_steps)?;
+        let records = arena
+            .alloc_slice_with(finished_counts.len(), |_| StepRecord {
+                rows: &[],
+                affected: 0,
+            })
+            .map_err(full)?;
+        let mut at = 0;
+        for (record, counts) in records.iter_mut().zip(finished_counts) {
+            let length = count(counts, 0)?;
+            record.rows = copied.get(at..at + length).ok_or_else(changed_steps)?;
+            record.affected = count(counts, 1)? as u64;
+            at += length;
+        }
+        let captured_length = count(captured_counts, 0)?;
+        let captured = copied
+            .get(at..at + captured_length)
+            .ok_or_else(changed_steps)?;
+        if at + captured_length != copied.len() || records.len() > self.steps.finished {
+            return Err(changed_steps());
+        }
+        Ok(Some(ResumedSteps {
+            finished: records,
+            captured,
+        }))
     }
 
     /// Whether this attempt continues rows an earlier attempt changed.
-    pub(super) fn resuming(&self) -> bool {
+    pub(crate) fn resuming(&self) -> bool {
         self.resume.is_some()
     }
 
@@ -407,7 +653,7 @@ impl RowProgress {
     /// Whether an attempt has started changing rows, so running the write
     /// again from its start would repeat them.
     pub(crate) fn changed_rows(&self) -> bool {
-        self.started
+        self.started || self.steps.finished != 0
     }
 
     /// The write changed rows a rollback cannot undo, such as a foreign
@@ -456,18 +702,91 @@ impl RowProgress {
     }
 
     /// For the caller after an attempt ended with a routine call: the row to
-    /// roll back while earlier rows stay changed, or `None` to roll back the
-    /// whole attempt. `Err` when that rollback could not undo remote rows.
-    pub(crate) fn unfinished_row(&self) -> Result<Option<UnfinishedRow>, SqlError> {
-        match &self.resume {
-            Some(resume) => Ok(Some(UnfinishedRow {
+    /// roll back while earlier rows stay changed, the start of the unfinished
+    /// step when no row was unfinished, or `None` to roll back the whole
+    /// attempt. `Err` when that rollback could not undo remote rows, or would
+    /// hide changes the unfinished step made without row progress.
+    pub(crate) fn unfinished_row(&self, txn: &TxnState) -> Result<Option<UnfinishedRow>, SqlError> {
+        match (&self.resume, self.steps.start) {
+            (Some(resume), _) => Ok(Some(UnfinishedRow {
                 mark: resume.start.mark,
                 output: resume.start.output,
             })),
-            None if self.unrestartable => Err(super::write_attempts::retained_progress_required()),
-            None => Ok(None),
+            _ if self.unrestartable => Err(super::write_attempts::retained_progress_required()),
+            (None, Some(start)) if txn.transaction_effect_mark() != start.effects => {
+                Err(super::write_attempts::retained_progress_required())
+            }
+            (None, Some(start)) => Ok(Some(UnfinishedRow {
+                mark: start.mark,
+                output: start.output,
+            })),
+            (None, None) => Ok(None),
         }
     }
+}
+
+/// Starts the main statement of a `WITH` whose `steps` sub-statements
+/// modify data, as the step after them.
+pub(crate) fn begin_main_step<'p>(
+    progress: &'p mut RowProgress,
+    steps: usize,
+    txn: &mut TxnState,
+    responder: &Responder<'_>,
+) -> Result<Option<&'p mut RowProgress>, SqlError> {
+    if steps != 0 && !progress.begin_step(steps, false, txn, responder)? {
+        return Err(changed_steps());
+    }
+    Ok(Some(progress))
+}
+
+/// After the main statement of a `WITH`: a stop for a routine call keeps
+/// the sub-statements' output rows for the next attempt.
+pub(crate) fn settle_main_step<'a, T>(
+    progress: Option<&mut RowProgress>,
+    outcome: Result<Result<(), SqlError>, T>,
+    materialized: &[(&str, &'a crate::sql::ast::MaterializedCte<'a>)],
+    arena: &'a Arena,
+    pool: &std::sync::Arc<LeasePool>,
+) -> Result<Result<(), SqlError>, T> {
+    if let Ok(Err(error)) = &outcome
+        && error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
+        && !materialized.is_empty()
+        && let Some(progress) = progress
+    {
+        let kept = cte_step_records(materialized, arena)
+            .and_then(|records| progress.keep_steps(records, &[], arena, pool));
+        if let Err(error) = kept {
+            return Ok(Err(error));
+        }
+    }
+    outcome
+}
+
+/// The finished data-modifying `WITH` sub-statements, as steps.
+pub(crate) fn cte_step_records<'a>(
+    materialized: &[(&str, &'a crate::sql::ast::MaterializedCte<'a>)],
+    arena: &'a Arena,
+) -> Result<&'a [StepRecord<'a>], SqlError> {
+    let records = arena
+        .alloc_slice_with(materialized.len(), |_| StepRecord {
+            rows: &[],
+            affected: 0,
+        })
+        .map_err(|_| crate::sql::query::arena_full_pub())?;
+    for (record, (_, cte)) in records.iter_mut().zip(materialized) {
+        let crate::sql::ast::MaterializedCteSource::Inline(rows) = cte.source else {
+            return Err(changed_steps());
+        };
+        record.rows = rows;
+    }
+    Ok(records)
+}
+
+fn changed_steps() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "a resumed write lost its finished steps"
+    )
 }
 
 fn same_row(left: Option<PhysicalRow>, right: Option<PhysicalRow>) -> bool {

@@ -169,3 +169,28 @@ fn routine_errors_after_kept_rows_roll_back_the_statement() {
         std::fs::remove_dir_all(config.data_dir).unwrap();
     }
 }
+
+/// Dropping a schema whose view has an INSTEAD OF trigger commits the
+/// trigger's own drop after the view's.
+#[test]
+fn schema_drop_commits_view_trigger_once() {
+    let config = test_config("drop-schema-view-trigger");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    writer.success(
+        &mut engine,
+        "CREATE SCHEMA sp; SET search_path = sp, public; CREATE TABLE items(id int); \
+         CREATE VIEW v AS SELECT id FROM items; \
+         CREATE FUNCTION v_write() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN new; END$$; \
+         CREATE TRIGGER v_write INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION v_write()",
+        true,
+    );
+    writer.success(&mut engine, "DROP SCHEMA sp CASCADE", true);
+    assert_eq!(
+        data_rows(&writer.success(&mut engine, "SELECT count(*) FROM pg_trigger", true)),
+        ["0"]
+    );
+    drop((writer, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
+}

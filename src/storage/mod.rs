@@ -48164,7 +48164,12 @@ impl Storage {
         let capacity = self.trigger_capacity();
         for slot in 0..capacity {
             let trigger = self.trigger(slot);
-            if trigger.ddl_state != CatalogDdlState::Absent && trigger.target == target {
+            // A trigger the transaction dropped commits through its own drop
+            // record, which may come after the view's.
+            if trigger.ddl_state != CatalogDdlState::Absent
+                && trigger.ddl_state.pending_drop_txid().is_none()
+                && trigger.target == target
+            {
                 self.clear_trigger_slot(slot);
                 self.clear_trigger_dependents(slot, trigger);
             }

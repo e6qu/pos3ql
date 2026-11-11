@@ -1688,6 +1688,13 @@ impl TxnState {
         self.checkpoint_request = None;
     }
 
+    /// Runs as `command` again, an earlier command of the running statement
+    /// that a resumed write step continues.
+    pub(crate) fn resume_command(&mut self, command: u32) {
+        debug_assert!(command <= self.command_counter);
+        self.command_id = command;
+    }
+
     pub fn begin_command(&mut self) -> Result<(), SqlError> {
         let command = self.next_command_identity()?;
         self.command_counter = command;

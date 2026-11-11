@@ -870,7 +870,7 @@ impl SqlExecution {
                         }
                         break result;
                     }
-                    let unfinished = match progress.unfinished_row() {
+                    let unfinished = match progress.unfinished_row(context.txn) {
                         Ok(unfinished) => unfinished,
                         Err(error) => break Err(error),
                     };

@@ -105,13 +105,18 @@ is owned.
   the next attempt selects the rows again under the original command and
   continues at the unfinished row). Move that progress into a startup-reserved
   owner so a storage or lock wait in the row phase also resumes at its row
-  instead of restarting the statement. Extend row progress to rules,
-  data-modifying `WITH`, `INSTEAD OF` view triggers and foreign tables: a
-  routine call after their first row change fails with `0A000` (`SQL row
-  expression requires retained write progress`), at top level and inside a
-  routine, because restarting would hide the earlier rows from the call. `INSERT ... SELECT` evaluates its whole source before writing, so a
-  volatile call in the source does not see rows inserted earlier by the same
-  statement. A static PL/pgSQL `MERGE` source subquery cannot read routine
+  instead of restarting the statement. Extend row progress to foreign tables,
+  to rules and data-modifying `WITH` inside PL/pgSQL and SQL-language
+  bodies, and to a multi-step statement inside another's step: a routine
+  call after their first row change fails with `0A000` (`SQL row expression
+  requires retained write progress`), because restarting would hide the
+  earlier rows from the call. `INSERT ... SELECT` evaluates its whole source
+  before writing, so a volatile call in the source does not see rows
+  inserted earlier by the same statement (this includes a rule action's
+  `VALUES` over several rows). A data-modifying `WITH` sub-statement runs
+  to completion before the main statement reads it, where PostgreSQL
+  interleaves them, so a call in the main statement sees all of its rows.
+  PL/pgSQL rejects statements that start with `WITH` (`0A000`). A static PL/pgSQL `MERGE` source subquery cannot read routine
   variables (`42703`). Triggers fired inside a write run
   without the engine's utility
   executor, so DDL there (PL/pgSQL `CREATE TABLE`, or a SQL procedure that a

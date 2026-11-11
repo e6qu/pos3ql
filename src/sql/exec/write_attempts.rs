@@ -155,7 +155,7 @@ pub(super) fn execute_procedural_write<'a, T>(
             Err(error)
                 if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION && !handed_off =>
             {
-                let unfinished = match progress.unfinished_row() {
+                let unfinished = match progress.unfinished_row(context.txn) {
                     Ok(unfinished) => unfinished,
                     Err(error) => break Err(error),
                 };

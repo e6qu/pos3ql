@@ -823,7 +823,9 @@ pub(super) use sql_function_execution::execute_sql_function;
 mod row_progress;
 mod trigger_firing;
 mod write_attempts;
-pub(crate) use row_progress::RowProgress;
+pub(crate) use row_progress::{
+    RowProgress, StepRecord, begin_main_step, cte_step_records, settle_main_step,
+};
 mod write_completion;
 use write_attempts::execute_procedural_write;
 pub(crate) use write_attempts::retained_progress_required;
@@ -68578,6 +68580,7 @@ pub(crate) fn instead_of_view_dml<'a>(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     mut capture: Option<&mut super::ReturningCapture<'_>>,
+    mut progress: Option<&mut RowProgress>,
 ) -> Outcome {
     let coercion_txid = txn.txid;
     let assignment_casts =
@@ -68642,6 +68645,16 @@ pub(crate) fn instead_of_view_dml<'a>(
         ));
     }
     let capturing = capture.is_some();
+    // A resumed attempt continues rows an earlier attempt passed to the
+    // trigger; it selects them again under the original command.
+    let resuming = progress
+        .as_ref()
+        .is_some_and(|progress| progress.resuming());
+    if let Some(progress) = progress.as_deref_mut()
+        && let Err(error) = progress.enter_selection()
+    {
+        return sql_fail(error);
+    }
     let returning = match statement {
         Stmt::Insert(s) => s.returning,
         Stmt::Update(s) => s.returning,
@@ -68653,7 +68666,7 @@ pub(crate) fn instead_of_view_dml<'a>(
         Stmt::Delete(s) => s.alias,
         _ => None,
     };
-    if !returning.is_empty() && !capturing {
+    if !returning.is_empty() && !capturing && !resuming {
         let mut description = [ColDesc::new("", 0, 0); MAX_PROJ];
         let count = match super::query::describe_catalog_items_as(
             returning.items,
@@ -68673,8 +68686,10 @@ pub(crate) fn instead_of_view_dml<'a>(
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let schema = &schema[..def.n_columns];
-    let mut affected = 0u64;
-    match statement {
+    let mut affected: u64;
+    let no_transitions = row_progress::capture_lengths([None; row_progress::CAPTURES]);
+    let selected: usize;
+    let outcome = match statement {
         Stmt::Insert(insert) => {
             if insert.on_conflict.is_some() || !matches!(insert.overriding, Overriding::None) {
                 return sql_fail(sql_err!(
@@ -68734,6 +68749,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         ));
                     }
                 };
+                let snapshot = storage.dml_expression_snapshot(txn.command_id());
                 if let Err(error) = super::query::select_into_rows(
                     storage,
                     txn.txid,
@@ -68774,44 +68790,106 @@ pub(crate) fn instead_of_view_dml<'a>(
                 ) {
                     return sql_fail(error);
                 }
-                for bytes in rows.as_slice() {
-                    let mut selected = [Datum::Null; MAX_COLUMNS];
-                    for (index, value) in selected[..source_count].iter_mut().enumerate() {
-                        *value = decode_projected_pub(bytes, index);
+                drop(snapshot);
+                selected = rows.len();
+                let first = match view_rows_resumed(progress.as_deref(), selected) {
+                    Ok((first, changed)) => {
+                        affected = changed;
+                        first
                     }
-                    let mut values = [Datum::Null; MAX_COLUMNS];
-                    for (source, value) in selected[..target_count].iter().enumerate() {
-                        let column = if insert.columns.is_empty() {
-                            source
-                        } else {
-                            match def.column_index(insert.columns[source]) {
-                                Some(column) => column,
-                                None => return sql_fail(undefined_column(insert.columns[source])),
+                    Err(error) => return sql_fail(error),
+                };
+                (|| -> Outcome {
+                    for (row_index, bytes) in rows.as_slice().iter().enumerate().skip(first) {
+                        match row_progress::start_row(
+                            progress.as_deref_mut(),
+                            row_index,
+                            None,
+                            affected,
+                            no_transitions,
+                            txn,
+                            responder,
+                            arena,
+                        ) {
+                            Ok(None) => {}
+                            Ok(Some(saved)) => {
+                                match emit_row_returning(
+                                    progress.as_deref_mut(),
+                                    ChangedRow {
+                                        index: row_index,
+                                        row: None,
+                                        changed: affected,
+                                        transitions: no_transitions,
+                                    },
+                                    storage,
+                                    txn,
+                                    &def,
+                                    None,
+                                    returning,
+                                    None,
+                                    saved.new,
+                                    arena,
+                                    params,
+                                    responder,
+                                    &mut capture,
+                                    seq_session,
+                                )? {
+                                    Ok(()) => {}
+                                    Err(error) => return sql_fail(error),
+                                }
+                                affected += 1;
+                                continue;
                             }
-                        };
-                        values[column] = *value;
+                            Err(error) => return sql_fail(error),
+                        }
+                        let mut selected = [Datum::Null; MAX_COLUMNS];
+                        for (index, value) in selected[..source_count].iter_mut().enumerate() {
+                            *value = decode_projected_pub(bytes, index);
+                        }
+                        let mut values = [Datum::Null; MAX_COLUMNS];
+                        for (source, value) in selected[..target_count].iter().enumerate() {
+                            let column = if insert.columns.is_empty() {
+                                source
+                            } else {
+                                match def.column_index(insert.columns[source]) {
+                                    Some(column) => column,
+                                    None => {
+                                        return sql_fail(undefined_column(insert.columns[source]));
+                                    }
+                                }
+                            };
+                            values[column] = *value;
+                        }
+                        match finish_instead_of_view_new_row(
+                            storage,
+                            txn,
+                            arena,
+                            seq_session,
+                            responder,
+                            target,
+                            &def,
+                            event,
+                            &mut values[..def.n_columns],
+                            returning,
+                            params,
+                            &mut capture,
+                            progress.as_deref_mut(),
+                            ChangedRow {
+                                index: row_index,
+                                row: None,
+                                changed: affected,
+                                transitions: no_transitions,
+                            },
+                        ) {
+                            Ok(Ok(true)) => {}
+                            Ok(Ok(false)) => continue,
+                            Ok(Err(error)) => return sql_fail(error),
+                            Err(wire) => return Err(wire),
+                        }
+                        affected += 1;
                     }
-                    match finish_instead_of_view_new_row(
-                        storage,
-                        txn,
-                        arena,
-                        seq_session,
-                        responder,
-                        target,
-                        &def,
-                        event,
-                        &mut values[..def.n_columns],
-                        returning,
-                        params,
-                        &mut capture,
-                    ) {
-                        Ok(Ok(true)) => {}
-                        Ok(Ok(false)) => continue,
-                        Ok(Err(error)) => return sql_fail(error),
-                        Err(wire) => return Err(wire),
-                    }
-                    affected += 1;
-                }
+                    sql_ok()
+                })()
             } else {
                 if let Err(error) = check_insert_values_shape(
                     insert,
@@ -68823,76 +68901,138 @@ pub(crate) fn instead_of_view_dml<'a>(
                 ) {
                     return sql_fail(error);
                 }
-                for row in insert.rows {
-                    let mut values = [Datum::Null; MAX_COLUMNS];
-                    if row.len()
-                        != if insert.columns.is_empty() {
-                            def.n_columns
-                        } else {
-                            insert.columns.len()
-                        }
-                    {
-                        return sql_fail(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "INSERT through an INSTEAD OF trigger requires a value for every view column"
-                        ));
+                selected = insert.rows.len();
+                let first = match view_rows_resumed(progress.as_deref(), selected) {
+                    Ok((first, changed)) => {
+                        affected = changed;
+                        first
                     }
-                    let sequences =
-                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                    let hooks = EvalHooks {
-                        catalog: Some(&catalog),
-                        sequences: Some(&sequences),
-                        ..NO_HOOKS
-                    };
-                    for (index, expression) in row.iter().enumerate() {
-                        let column = if insert.columns.is_empty() {
-                            index
-                        } else {
-                            match def.column_index(insert.columns[index]) {
-                                Some(column) => column,
-                                None => return sql_fail(undefined_column(insert.columns[index])),
-                            }
-                        };
-                        values[column] = match eval_prepared_assignment(
-                            assignment_casts,
-                            expression,
-                            &def.columns[column],
-                            storage,
-                            txn.txid,
+                    Err(error) => return sql_fail(error),
+                };
+                (|| -> Outcome {
+                    for (row_index, row) in insert.rows.iter().enumerate().skip(first) {
+                        match row_progress::start_row(
+                            progress.as_deref_mut(),
+                            row_index,
+                            None,
+                            affected,
+                            no_transitions,
+                            txn,
+                            responder,
                             arena,
-                            params,
-                            &NoColumns,
-                            &hooks,
                         ) {
-                            Ok(value) => value,
+                            Ok(None) => {}
+                            Ok(Some(saved)) => {
+                                match emit_row_returning(
+                                    progress.as_deref_mut(),
+                                    ChangedRow {
+                                        index: row_index,
+                                        row: None,
+                                        changed: affected,
+                                        transitions: no_transitions,
+                                    },
+                                    storage,
+                                    txn,
+                                    &def,
+                                    None,
+                                    returning,
+                                    None,
+                                    saved.new,
+                                    arena,
+                                    params,
+                                    responder,
+                                    &mut capture,
+                                    seq_session,
+                                )? {
+                                    Ok(()) => {}
+                                    Err(error) => return sql_fail(error),
+                                }
+                                affected += 1;
+                                continue;
+                            }
                             Err(error) => return sql_fail(error),
+                        }
+                        let mut values = [Datum::Null; MAX_COLUMNS];
+                        if row.len()
+                            != if insert.columns.is_empty() {
+                                def.n_columns
+                            } else {
+                                insert.columns.len()
+                            }
+                        {
+                            return sql_fail(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "INSERT through an INSTEAD OF trigger requires a value for every view column"
+                            ));
+                        }
+                        let sequences =
+                            crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                        let hooks = EvalHooks {
+                            catalog: Some(&catalog),
+                            sequences: Some(&sequences),
+                            ..NO_HOOKS
                         };
+                        for (index, expression) in row.iter().enumerate() {
+                            let column = if insert.columns.is_empty() {
+                                index
+                            } else {
+                                match def.column_index(insert.columns[index]) {
+                                    Some(column) => column,
+                                    None => {
+                                        return sql_fail(undefined_column(insert.columns[index]));
+                                    }
+                                }
+                            };
+                            values[column] = match eval_prepared_assignment(
+                                assignment_casts,
+                                expression,
+                                &def.columns[column],
+                                storage,
+                                txn.txid,
+                                arena,
+                                params,
+                                &NoColumns,
+                                &hooks,
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => return sql_fail(error),
+                            };
+                        }
+                        match finish_instead_of_view_new_row(
+                            storage,
+                            txn,
+                            arena,
+                            seq_session,
+                            responder,
+                            target,
+                            &def,
+                            event,
+                            &mut values[..def.n_columns],
+                            returning,
+                            params,
+                            &mut capture,
+                            progress.as_deref_mut(),
+                            ChangedRow {
+                                index: row_index,
+                                row: None,
+                                changed: affected,
+                                transitions: no_transitions,
+                            },
+                        ) {
+                            Ok(Ok(true)) => {}
+                            Ok(Ok(false)) => continue,
+                            Ok(Err(error)) => return sql_fail(error),
+                            Err(wire) => return Err(wire),
+                        }
+                        affected += 1;
                     }
-                    match finish_instead_of_view_new_row(
-                        storage,
-                        txn,
-                        arena,
-                        seq_session,
-                        responder,
-                        target,
-                        &def,
-                        event,
-                        &mut values[..def.n_columns],
-                        returning,
-                        params,
-                        &mut capture,
-                    ) {
-                        Ok(Ok(true)) => {}
-                        Ok(Ok(false)) => continue,
-                        Ok(Err(error)) => return sql_fail(error),
-                        Err(wire) => return Err(wire),
-                    }
-                    affected += 1;
-                }
+                    sql_ok()
+                })()
             }
         }
         Stmt::Update(update) => {
+            let snapshot = storage.dml_expression_snapshot(txn.command_id());
             let (rows, predicate) = match materialize_view_rows(
                 storage,
                 txn.txid,
@@ -68912,165 +69052,224 @@ pub(crate) fn instead_of_view_dml<'a>(
                 Ok(rows) => rows,
                 Err(error) => return sql_fail(error),
             };
-            for bytes in rows.as_slice() {
-                let mut old = [Datum::Null; MAX_COLUMNS];
-                if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
-                    return sql_fail(error);
+            drop(snapshot);
+            selected = rows.len();
+            let first = match view_rows_resumed(progress.as_deref(), selected) {
+                Ok((first, changed)) => {
+                    affected = changed;
+                    first
                 }
-                let context = RowCtx {
-                    def: crate::storage::RelationDefinition::from_definition(&def),
-                    values: &old[..def.n_columns],
-                    alias: update.alias,
-                };
-                let mut new = old;
-                if let Some(from) = update.from {
-                    let mut expressions = [&Expr::Null; MAX_COLUMNS];
-                    for (index, (_, expression)) in update.assignments.iter().enumerate() {
-                        expressions[index] = expression;
-                    }
-                    let sequences =
-                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                    let hooks = super::eval::EvalHooks {
-                        catalog: Some(&catalog),
-                        sequences: Some(&sequences),
-                        ..super::eval::NO_HOOKS
-                    };
-                    let matched = match super::query::first_from_match(
-                        storage,
-                        from,
-                        txn.txid,
-                        update.where_clause,
-                        &expressions[..update.assignments.len()],
+                Err(error) => return sql_fail(error),
+            };
+            (|| -> Outcome {
+                for (row_index, bytes) in rows.as_slice().iter().enumerate().skip(first) {
+                    match row_progress::start_row(
+                        progress.as_deref_mut(),
+                        row_index,
+                        None,
+                        affected,
+                        no_transitions,
+                        txn,
+                        responder,
                         arena,
-                        params,
-                        &context,
-                        &mut |combined| {
-                            for (name, expression) in update.assignments {
-                                let Some(column) = def.column_index(name) else {
-                                    return Err(undefined_column(name));
-                                };
-                                new[column] = eval_prepared_assignment(
-                                    assignment_casts,
-                                    expression,
-                                    &def.columns[column],
-                                    storage,
-                                    txn.txid,
-                                    arena,
-                                    params,
-                                    &combined,
-                                    &hooks,
-                                )?;
-                            }
-                            Ok(())
-                        },
-                        Some(&crate::sql::sequence::SeqEval::new(
-                            storage,
-                            seq_session,
-                            txn.txid,
-                        )),
                     ) {
-                        Ok(matched) => matched,
-                        Err(error) => return sql_fail(error),
-                    };
-                    if !matched {
-                        continue;
-                    }
-                } else {
-                    let sequences =
-                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                    let hooks = EvalHooks {
-                        catalog: Some(&catalog),
-                        sequences: Some(&sequences),
-                        ..NO_HOOKS
-                    };
-                    if let Some(predicate) = predicate {
-                        match row_matches_values(
-                            storage,
-                            txn.txid,
-                            &def,
-                            update.alias,
-                            &old[..def.n_columns],
-                            Some(predicate),
-                            arena,
-                            params,
-                            &hooks,
-                            None,
-                            None,
-                        ) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(error) => return sql_fail(error),
+                        Ok(None) => {}
+                        Ok(Some(saved)) => {
+                            match emit_row_returning(
+                                progress.as_deref_mut(),
+                                ChangedRow {
+                                    index: row_index,
+                                    row: None,
+                                    changed: affected,
+                                    transitions: no_transitions,
+                                },
+                                storage,
+                                txn,
+                                &def,
+                                update.alias,
+                                returning,
+                                saved.old,
+                                saved.new,
+                                arena,
+                                params,
+                                responder,
+                                &mut capture,
+                                seq_session,
+                            )? {
+                                Ok(()) => {}
+                                Err(error) => return sql_fail(error),
+                            }
+                            affected += 1;
+                            continue;
                         }
+                        Err(error) => return sql_fail(error),
                     }
-                    for (name, expression) in update.assignments {
-                        let Some(column) = def.column_index(name) else {
-                            return sql_fail(undefined_column(name));
+                    let mut old = [Datum::Null; MAX_COLUMNS];
+                    if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
+                        return sql_fail(error);
+                    }
+                    let context = RowCtx {
+                        def: crate::storage::RelationDefinition::from_definition(&def),
+                        values: &old[..def.n_columns],
+                        alias: update.alias,
+                    };
+                    let mut new = old;
+                    if let Some(from) = update.from {
+                        let mut expressions = [&Expr::Null; MAX_COLUMNS];
+                        for (index, (_, expression)) in update.assignments.iter().enumerate() {
+                            expressions[index] = expression;
+                        }
+                        let sequences =
+                            crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                        let hooks = super::eval::EvalHooks {
+                            catalog: Some(&catalog),
+                            sequences: Some(&sequences),
+                            ..super::eval::NO_HOOKS
                         };
-                        new[column] = match eval_prepared_assignment(
-                            assignment_casts,
-                            expression,
-                            &def.columns[column],
+                        let matched = match super::query::first_from_match(
                             storage,
+                            from,
                             txn.txid,
+                            update.where_clause,
+                            &expressions[..update.assignments.len()],
                             arena,
                             params,
                             &context,
-                            &hooks,
+                            &mut |combined| {
+                                for (name, expression) in update.assignments {
+                                    let Some(column) = def.column_index(name) else {
+                                        return Err(undefined_column(name));
+                                    };
+                                    new[column] = eval_prepared_assignment(
+                                        assignment_casts,
+                                        expression,
+                                        &def.columns[column],
+                                        storage,
+                                        txn.txid,
+                                        arena,
+                                        params,
+                                        &combined,
+                                        &hooks,
+                                    )?;
+                                }
+                                Ok(())
+                            },
+                            Some(&crate::sql::sequence::SeqEval::new(
+                                storage,
+                                seq_session,
+                                txn.txid,
+                            )),
                         ) {
-                            Ok(value) => value,
+                            Ok(matched) => matched,
                             Err(error) => return sql_fail(error),
                         };
+                        if !matched {
+                            continue;
+                        }
+                    } else {
+                        let sequences =
+                            crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                        let hooks = EvalHooks {
+                            catalog: Some(&catalog),
+                            sequences: Some(&sequences),
+                            ..NO_HOOKS
+                        };
+                        if let Some(predicate) = predicate {
+                            match row_matches_values(
+                                storage,
+                                txn.txid,
+                                &def,
+                                update.alias,
+                                &old[..def.n_columns],
+                                Some(predicate),
+                                arena,
+                                params,
+                                &hooks,
+                                None,
+                                None,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(error) => return sql_fail(error),
+                            }
+                        }
+                        for (name, expression) in update.assignments {
+                            let Some(column) = def.column_index(name) else {
+                                return sql_fail(undefined_column(name));
+                            };
+                            new[column] = match eval_prepared_assignment(
+                                assignment_casts,
+                                expression,
+                                &def.columns[column],
+                                storage,
+                                txn.txid,
+                                arena,
+                                params,
+                                &context,
+                                &hooks,
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => return sql_fail(error),
+                            };
+                        }
                     }
-                }
-                // A joined source can expose storage-backed datums. Detach the
-                // completed NEW image before the trigger body mutates storage.
-                let new = match detached_trigger_row(&new[..def.n_columns], arena) {
-                    Ok(values) => values,
-                    Err(error) => return sql_fail(error),
-                };
-                match fire_view_row_trigger(
-                    storage,
-                    txn,
-                    arena,
-                    seq_session,
-                    responder,
-                    target,
-                    &def,
-                    event,
-                    Some(&old[..def.n_columns]),
-                    Some(new),
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(error) => return sql_fail(error),
-                }
-                if !returning.is_empty() {
-                    match emit_projected(
+                    // A joined source can expose storage-backed datums. Detach the
+                    // completed NEW image before the trigger body mutates storage.
+                    let new = match detached_trigger_row(&new[..def.n_columns], arena) {
+                        Ok(values) => values,
+                        Err(error) => return sql_fail(error),
+                    };
+                    match fire_view_row_trigger(
                         storage,
                         txn,
+                        arena,
+                        seq_session,
+                        responder,
+                        target,
                         &def,
-                        update.alias,
-                        new,
-                        returning,
+                        event,
                         Some(&old[..def.n_columns]),
                         Some(new),
-                        arena,
-                        params,
-                        responder,
-                        &mut capture,
-                        seq_session,
                     ) {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => return sql_fail(error),
-                        Err(wire) => return Err(wire),
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => return sql_fail(error),
                     }
+                    if !returning.is_empty() {
+                        match emit_row_returning(
+                            progress.as_deref_mut(),
+                            ChangedRow {
+                                index: row_index,
+                                row: None,
+                                changed: affected,
+                                transitions: no_transitions,
+                            },
+                            storage,
+                            txn,
+                            &def,
+                            update.alias,
+                            returning,
+                            Some(&old[..def.n_columns]),
+                            Some(new),
+                            arena,
+                            params,
+                            responder,
+                            &mut capture,
+                            seq_session,
+                        )? {
+                            Ok(()) => {}
+                            Err(error) => return sql_fail(error),
+                        }
+                    }
+                    affected += 1;
                 }
-                affected += 1;
-            }
+                sql_ok()
+            })()
         }
         Stmt::Delete(delete) => {
+            let snapshot = storage.dml_expression_snapshot(txn.command_id());
             let (rows, predicate) = match materialize_view_rows(
                 storage,
                 txn.txid,
@@ -69090,108 +69289,180 @@ pub(crate) fn instead_of_view_dml<'a>(
                 Ok(rows) => rows,
                 Err(error) => return sql_fail(error),
             };
-            for bytes in rows.as_slice() {
-                let mut old = [Datum::Null; MAX_COLUMNS];
-                if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
-                    return sql_fail(error);
+            drop(snapshot);
+            selected = rows.len();
+            let first = match view_rows_resumed(progress.as_deref(), selected) {
+                Ok((first, changed)) => {
+                    affected = changed;
+                    first
                 }
-                let context = RowCtx {
-                    def: crate::storage::RelationDefinition::from_definition(&def),
-                    values: &old[..def.n_columns],
-                    alias: delete.alias,
-                };
-                let matched = if let Some(using) = delete.using {
-                    match super::query::first_from_match(
-                        storage,
-                        using,
-                        txn.txid,
-                        delete.where_clause,
-                        &[],
+                Err(error) => return sql_fail(error),
+            };
+            (|| -> Outcome {
+                for (row_index, bytes) in rows.as_slice().iter().enumerate().skip(first) {
+                    match row_progress::start_row(
+                        progress.as_deref_mut(),
+                        row_index,
+                        None,
+                        affected,
+                        no_transitions,
+                        txn,
+                        responder,
                         arena,
-                        params,
-                        &context,
-                        &mut |_| Ok(()),
-                        Some(&crate::sql::sequence::SeqEval::new(
-                            storage,
-                            seq_session,
-                            txn.txid,
-                        )),
                     ) {
-                        Ok(matched) => matched,
+                        Ok(None) => {}
+                        Ok(Some(saved)) => {
+                            match emit_row_returning(
+                                progress.as_deref_mut(),
+                                ChangedRow {
+                                    index: row_index,
+                                    row: None,
+                                    changed: affected,
+                                    transitions: no_transitions,
+                                },
+                                storage,
+                                txn,
+                                &def,
+                                delete.alias,
+                                returning,
+                                saved.old,
+                                saved.new,
+                                arena,
+                                params,
+                                responder,
+                                &mut capture,
+                                seq_session,
+                            )? {
+                                Ok(()) => {}
+                                Err(error) => return sql_fail(error),
+                            }
+                            affected += 1;
+                            continue;
+                        }
                         Err(error) => return sql_fail(error),
                     }
-                } else if let Some(predicate) = predicate {
-                    let sequences =
-                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                    let hooks = EvalHooks {
-                        catalog: Some(&catalog),
-                        sequences: Some(&sequences),
-                        ..NO_HOOKS
+                    let mut old = [Datum::Null; MAX_COLUMNS];
+                    if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
+                        return sql_fail(error);
+                    }
+                    let context = RowCtx {
+                        def: crate::storage::RelationDefinition::from_definition(&def),
+                        values: &old[..def.n_columns],
+                        alias: delete.alias,
                     };
-                    match row_matches_values(
-                        storage,
-                        txn.txid,
-                        &def,
-                        delete.alias,
-                        &old[..def.n_columns],
-                        Some(predicate),
-                        arena,
-                        params,
-                        &hooks,
-                        None,
-                        None,
-                    ) {
-                        Ok(matched) => matched,
-                        Err(error) => return sql_fail(error),
+                    let matched = if let Some(using) = delete.using {
+                        match super::query::first_from_match(
+                            storage,
+                            using,
+                            txn.txid,
+                            delete.where_clause,
+                            &[],
+                            arena,
+                            params,
+                            &context,
+                            &mut |_| Ok(()),
+                            Some(&crate::sql::sequence::SeqEval::new(
+                                storage,
+                                seq_session,
+                                txn.txid,
+                            )),
+                        ) {
+                            Ok(matched) => matched,
+                            Err(error) => return sql_fail(error),
+                        }
+                    } else if let Some(predicate) = predicate {
+                        let sequences =
+                            crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                        let hooks = EvalHooks {
+                            catalog: Some(&catalog),
+                            sequences: Some(&sequences),
+                            ..NO_HOOKS
+                        };
+                        match row_matches_values(
+                            storage,
+                            txn.txid,
+                            &def,
+                            delete.alias,
+                            &old[..def.n_columns],
+                            Some(predicate),
+                            arena,
+                            params,
+                            &hooks,
+                            None,
+                            None,
+                        ) {
+                            Ok(matched) => matched,
+                            Err(error) => return sql_fail(error),
+                        }
+                    } else {
+                        true
+                    };
+                    if !matched {
+                        continue;
                     }
-                } else {
-                    true
-                };
-                if !matched {
-                    continue;
-                }
-                match fire_view_row_trigger(
-                    storage,
-                    txn,
-                    arena,
-                    seq_session,
-                    responder,
-                    target,
-                    &def,
-                    event,
-                    Some(&old[..def.n_columns]),
-                    None,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(error) => return sql_fail(error),
-                }
-                if !returning.is_empty() {
-                    match emit_projected(
+                    match fire_view_row_trigger(
                         storage,
                         txn,
+                        arena,
+                        seq_session,
+                        responder,
+                        target,
                         &def,
-                        delete.alias,
-                        &old[..def.n_columns],
-                        returning,
+                        event,
                         Some(&old[..def.n_columns]),
                         None,
-                        arena,
-                        params,
-                        responder,
-                        &mut capture,
-                        seq_session,
                     ) {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => return sql_fail(error),
-                        Err(wire) => return Err(wire),
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => return sql_fail(error),
                     }
+                    if !returning.is_empty() {
+                        match emit_row_returning(
+                            progress.as_deref_mut(),
+                            ChangedRow {
+                                index: row_index,
+                                row: None,
+                                changed: affected,
+                                transitions: no_transitions,
+                            },
+                            storage,
+                            txn,
+                            &def,
+                            delete.alias,
+                            returning,
+                            Some(&old[..def.n_columns]),
+                            None,
+                            arena,
+                            params,
+                            responder,
+                            &mut capture,
+                            seq_session,
+                        )? {
+                            Ok(()) => {}
+                            Err(error) => return sql_fail(error),
+                        }
+                    }
+                    affected += 1;
                 }
-                affected += 1;
-            }
+                sql_ok()
+            })()
         }
         _ => unreachable!(),
+    };
+    if let Err(error) = row_progress::settle_rows(
+        progress,
+        &outcome,
+        txn,
+        selected,
+        [None; row_progress::CAPTURES],
+        &storage.row_work,
+    ) {
+        return sql_fail(error);
+    }
+    match outcome {
+        Ok(Ok(())) => {}
+        outcome => return outcome,
     }
     let tag = if event == TriggerEvents::INSERT {
         stack_format!(48, "INSERT 0 {}", affected)
@@ -69212,6 +69483,20 @@ struct ViewRowSelection<'definition, 'a> {
     definition: crate::storage::RelationDefinition<'definition>,
     predicate: Option<&'a Expr<'a>>,
     alias: Option<&'a str>,
+}
+
+/// Where a view write's row phase starts: the first row to run and the
+/// count of rows earlier attempts passed to the trigger.
+fn view_rows_resumed(
+    progress: Option<&RowProgress>,
+    selected: usize,
+) -> Result<(usize, u64), SqlError> {
+    match progress {
+        Some(progress) => progress
+            .resume_rows(selected, |_| None)
+            .map(|resumed| (resumed.first, resumed.changed)),
+        None => Ok((0, 0)),
+    }
 }
 
 fn materialize_view_rows<'a>(
@@ -69341,6 +69626,8 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
     returning: crate::sql::ast::Returning<'a>,
     params: &[Datum<'a>],
     capture: &mut Option<&mut super::ReturningCapture<'_>>,
+    progress: Option<&mut RowProgress>,
+    position: ChangedRow,
 ) -> Result<Result<bool, SqlError>, WireFull> {
     let fired = match fire_view_row_trigger(
         storage,
@@ -69361,12 +69648,13 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
         return Ok(Ok(false));
     }
     if !returning.is_empty() {
-        match emit_projected(
+        match emit_row_returning(
+            progress,
+            position,
             storage,
             txn,
             definition,
             None,
-            values,
             returning,
             None,
             Some(values),
@@ -69375,10 +69663,9 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
             responder,
             capture,
             seq_session,
-        ) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Ok(Err(error)),
-            Err(wire) => return Err(wire),
+        )? {
+            Ok(()) => {}
+            Err(error) => return Ok(Err(error)),
         }
     }
     Ok(Ok(true))

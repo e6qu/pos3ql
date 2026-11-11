@@ -95,10 +95,16 @@ changes, and the next attempt selects its rows again under the same command,
 skips the changed ones and continues at that row, or at its `RETURNING`
 values when the call was there. Statement triggers, transition rows,
 sequence values and returned rows each happen once. A wait or error inside
-such a call still rolls the whole statement back. Where a write cannot keep
-its rows yet (rules, data-modifying `WITH`, `INSTEAD OF` view triggers,
-foreign tables), a call after its first change fails with `0A000` instead of
-running after a rollback that would hide those changes.
+such a call still rolls the whole statement back. `INSTEAD OF` view triggers
+keep their rows the same way. A statement made of several steps (the
+sub-statements of a data-modifying `WITH` and its main statement; a rule's
+original statement and actions) also keeps the steps it finished: their
+output rows and row counts are saved, the next attempt skips them, and the
+unfinished step continues at its row, or runs again from its own start.
+Where a write cannot keep its rows (a foreign table, a multi-step statement
+inside another's step, or a step that changed rows without row progress), a
+call after its first change fails with `0A000` instead of running after a
+rollback that would hide those changes.
 
 **Example:** `UPDATE items SET total = running_total()`, where
 `running_total()` sums `items`, gives each row the sum including the rows
@@ -162,7 +168,7 @@ BY id` sorts first, so its output queues in the spool instead.
 | Result streams (see above): each row before its first effect | Yields; delivered rows are kept |
 | Writes (`INSERT ... SELECT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`), also in a `CALL` or `DO` body: selecting and locking rows before the first row change, `VALUES` row or trigger body | Yields; the statement restarts from its start (see above) |
 | Writes after their first row change, `VALUES` row or trigger body: index maintenance, constraint checks, triggers, `RETURNING` | Blocks until the statement ends |
-| Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`): row expressions, row triggers, `RETURNING` | Run on the engine between attempts; the write keeps its changed rows and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
+| Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, rule actions, `INSTEAD OF` view triggers): row expressions, row triggers, `RETURNING` | Run on the engine between attempts; the write keeps its changed rows and finished steps and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
 | DDL and `COPY FROM` | Blocks for the whole statement |
 | Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |
 | Statements after the first effect inside a `CALL` or `DO` body | Blocks |

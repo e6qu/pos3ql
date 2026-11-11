@@ -303,9 +303,6 @@ still fail with `42601` and `syntax error: <description>`: type modifiers
 role and large-object values, and SQL/JSON result types. An unsupported cast
 reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
 `42846` `cannot cast type integer to timestamp without time zone`.
-A field of an unassigned PL/pgSQL record (`RAISE NOTICE '%', rec.a`) fails
-with `42P01` (`missing FROM-clause entry for table "rec"`) where PostgreSQL
-reports `55000` (`record "rec" is not assigned yet`).
 PL/pgSQL `CALL` in a trigger function fails with `0A000`, and a procedure
 called from PL/pgSQL that waits for storage or a lock runs again from its
 start when its statement resumes (finished effects replay from the statement

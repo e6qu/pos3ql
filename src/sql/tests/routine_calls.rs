@@ -4362,3 +4362,25 @@ fn procedure_calls_are_counted_in_function_statistics() {
     );
     assert_eq!(data_rows(&output)[1..], ["counted|3", "counted_sql|1"]);
 }
+
+/// A field of an unassigned `record` variable fails with PostgreSQL's 55000.
+#[test]
+fn unassigned_record_fields_report_postgresql_state() {
+    use super::routine_identity_diagnostics::check;
+    let unassigned = &[('E', "55000", "record \"rec\" is not assigned yet")][..];
+    check(&[
+        (
+            "DO $$DECLARE rec record; BEGIN RAISE NOTICE '%', rec.a; END$$",
+            unassigned,
+        ),
+        (
+            "CREATE PROCEDURE takes(x int) LANGUAGE sql AS 'SELECT 1'; \
+             DO $$DECLARE rec record; BEGIN CALL takes(rec.a); END$$",
+            unassigned,
+        ),
+        (
+            "DO $$DECLARE rec record; BEGIN SELECT 1 AS a INTO rec; RAISE NOTICE '%', rec.b; END$$",
+            &[('E', "42703", "record \"rec\" has no field \"b\"")],
+        ),
+    ]);
+}

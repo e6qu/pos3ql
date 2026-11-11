@@ -22579,6 +22579,24 @@ where
         {
             let fields = match self.values[index] {
                 Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+                // An unassigned `record` has no field list yet; a NULL row of a
+                // declared row type reads its fields as NULL.
+                Datum::Null if self.locals[index].ctype == ColType::Record => {
+                    crate::sql::eval::stash_diagnostic(
+                        Some(StackStr::from_str(
+                            "The tuple structure of a not-yet-assigned record is indeterminate.",
+                        )),
+                        None,
+                    );
+                    return Err(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "record \"{}\" is not assigned yet",
+                        qualifier
+                    ));
+                }
+                Datum::Null if matches!(self.locals[index].ctype, ColType::Composite(_)) => {
+                    return Ok(Datum::Null);
+                }
                 _ => {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,

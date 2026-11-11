@@ -104,6 +104,16 @@ impl SqlSource {
                 None => type_inputs::validate_restored(parser, storage, transaction),
             },
         )?;
+        super::check_called_sql_routine_result(
+            storage,
+            transaction,
+            &program,
+            self.kind,
+            &self.columns,
+            &self.parameters,
+            self.result_contract(storage, transaction, arena)?,
+            arena,
+        )?;
         Ok(ParsedSource {
             text,
             inputs,

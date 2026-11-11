@@ -10,7 +10,7 @@ use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 
 use super::super::{
-    ColumnLookup, EvalHooks, SqlError, arity_err, eval_full, sqlstate, static_type,
+    ColumnLookup, EvalHooks, SqlError, arity_err, cast_to, eval_full, sqlstate, static_type,
 };
 
 /// Handles the conditional/null-handling family. Returns `None` if `name` is not
@@ -65,10 +65,17 @@ pub(crate) fn dispatch<'a>(
                 }
             }
             "coalesce" => {
-                for arg in args {
+                let (common, declared) =
+                    super::array::common_argument_type(args, arena, row, hooks)?;
+                for (arg, declared) in args.iter().zip(declared) {
                     let v = eval_full(arg, arena, params, row, hooks)?;
                     if !v.is_null() {
-                        return Ok(v);
+                        return match common {
+                            Some(common) if *declared == crate::sql::types::oid::UNKNOWN => {
+                                cast_to(v, common, arena)
+                            }
+                            _ => Ok(v),
+                        };
                     }
                 }
                 Ok(Datum::Null)
@@ -118,11 +125,19 @@ pub(crate) fn dispatch<'a>(
                 };
                 let mut best: Option<Datum> = None;
                 let mut widest = 0u8;
-                for a in args {
+                let (common, declared) =
+                    super::array::common_argument_type(args, arena, row, hooks)?;
+                for (a, declared) in args.iter().zip(declared) {
                     if let Some(t) = static_type(a, row) {
                         widest = widest.max(static_rank(t));
                     }
-                    let v = eval_full(a, arena, params, row, hooks)?;
+                    let mut v = eval_full(a, arena, params, row, hooks)?;
+                    if let Some(common) = common
+                        && *declared == crate::sql::types::oid::UNKNOWN
+                        && !v.is_null()
+                    {
+                        v = cast_to(v, common, arena)?;
+                    }
                     widest = widest.max(rank(&v));
                     if v.is_null() {
                         continue;

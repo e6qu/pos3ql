@@ -2607,6 +2607,11 @@ pub trait CatalogAccess {
     fn domain_base_type(&self, _type_oid: i32) -> Option<ColType> {
         None
     }
+    /// The common element type of one call's `anycompatible` inputs, each
+    /// `(is_array, type_oid)`, or `None` when PostgreSQL finds none.
+    fn compatible_element_oid(&self, inputs: &[(bool, i32)]) -> Option<i32> {
+        crate::storage::builtin_compatible_element_oid(inputs)
+    }
     /// Resolves a durable schema-qualified identity without reparsing it as
     /// SQL text.
     fn user_type_identity_oid(
@@ -10586,6 +10591,15 @@ pub(crate) fn reg_array_cast<'a>(
             crate::sql::array::parse_literal(text.trim_end_matches(' '), ArrElem::Text, arena)?,
         ),
         Datum::Null => return Ok(Datum::Null),
+        // oidvector is binary coercible to oid[] (`proargtypes::regtype[]`).
+        Datum::OidVector { .. } => {
+            return reg_array_cast(
+                cast_to(value, ColType::Array(ArrElem::Oid), arena)?,
+                target,
+                catalog,
+                arena,
+            );
+        }
         other => return Err(cast_unsupported(&other, target.array_name())),
     };
     let shape = crate::sql::array::shape(raw).expect("array datum carries a valid shape");

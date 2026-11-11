@@ -3587,6 +3587,25 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 validate_stored_type_inputs(parser, self.storage, self.txid, dependencies.view())
             },
         )?;
+        super::exec::check_called_sql_routine_result(
+            self.storage,
+            self.txid,
+            &function_program,
+            routine.kind,
+            super::exec::record_columns(
+                routine.table_columns().unwrap_or(&[]),
+                routine.parameters(),
+                self.routine_workspace,
+            )?,
+            routine.arguments(),
+            RoutineResultContract::stored(
+                self.storage,
+                self.txid,
+                routine,
+                self.routine_workspace,
+            )?,
+            self.routine_workspace,
+        )?;
         let program_access = routine_program_access(&function_program);
         if program_access == RoutineProgramAccess::Engine {
             return Err(sql_err!(
@@ -3738,11 +3757,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if let Some((total, own)) = timed.finish()
             && output.is_ok()
         {
-            self.storage.record_function_call(
+            super::statistics::record_completed_call(
+                self.storage,
                 self.txid,
                 crate::storage::routine_oid(routine),
-                total,
-                own,
+                (total, own),
+                self.routine_workspace,
             )?;
         }
         output
@@ -6565,6 +6585,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
     }
 
+    fn compatible_element_oid(&self, inputs: &[(bool, i32)]) -> Option<i32> {
+        self.storage.compatible_element_oid(inputs, self.txid)
+    }
+
     fn user_type_identity_oid(
         &self,
         identity: crate::storage::UserTypeName,
@@ -7040,13 +7064,17 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
     let states = arena
         .alloc_slice_with(agg_nodes.len(), |_| AggState::default())
         .map_err(|_| arena_full())?;
-    let columns = super::exec::CatalogCols {
-        definition: None,
-        alias: None,
-        output_aliases: &[],
-        storage,
-        txid,
-        arena,
+    let columns = subquery::SubqueryColumns {
+        scope: None,
+        outer: Some(row),
+        catalog: super::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
     };
     for (i, (_, node)) in agg_nodes.iter().enumerate() {
         states[i].init(node, storage, txid, &columns, arena)?;
@@ -7466,15 +7494,29 @@ fn check_key_types<'a>(
         infer_scope_type(e, scope)
             .ok()
             .and_then(|(oid, _)| ColType::from_oid(oid))
-            .filter(|ctype| !ctype.has_builtin_equality())
+            .filter(|ctype| !ctype.has_default_equality())
     };
     let unordered_cid = |e: &Expr<'a>| {
         infer_scope_type(e, scope)
             .ok()
             .and_then(|(oid, _)| ColType::from_oid(oid))
-            .is_some_and(|ctype| ctype.has_builtin_equality() && !ctype.has_builtin_ordering())
+            .is_some_and(|ctype| ctype.has_default_equality() && !ctype.has_builtin_ordering())
     };
-    for key in statement.group_by.iter().chain(statement.distinct_on) {
+    let distinct_items = statement
+        .items
+        .iter()
+        .filter(|_| statement.distinct && statement.distinct_on.is_empty())
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        });
+    for key in statement
+        .group_by
+        .iter()
+        .copied()
+        .chain(statement.distinct_on.iter().copied())
+        .chain(distinct_items)
+    {
         if let Some(ctype) = noncomparable(key) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
@@ -8884,15 +8926,13 @@ fn rewrite_grouped_expr<'a>(
             Ok(e)
         }
         Expr::Column { qualifier, name } => {
-            // An unknown column errors as such; a known one is ungrouped.
+            // A name outside the query's sources is an outer reference, such as
+            // a PL/pgSQL variable, and stays constant in every group; evaluation
+            // reports it if nothing defines it. A known one is ungrouped.
             if let Some(scope) = context.scope
                 && scope.find_column(*qualifier, name).is_err()
             {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
-                ));
+                return Ok(e);
             }
             Err(sql_err!(
                 sqlstate::GROUPING_ERROR,
@@ -10239,6 +10279,20 @@ pub(crate) fn constant_select_resumable<'a>(
     if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
     }
+    // DISTINCT compares whole rows with each type's default equality.
+    if statement.distinct
+        && statement.distinct_on.is_empty()
+        && let Some(ctype) = columns[..n]
+            .iter()
+            .filter_map(|column| ColType::from_oid(column.type_oid))
+            .find(|ctype| !ctype.has_default_equality())
+    {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "could not identify an equality operator for type {}",
+            ctype.name()
+        ));
+    }
     // A window function needs rows to compute over, and this path has no scan
     // to give it. A FROM-less SELECT is exactly one row, though, so it can be
     // written as a one-row derived table and handed to the ordinary path —
@@ -11085,6 +11139,11 @@ fn select_into_rows_mode<'a>(
                 project_sets: None,
                 merge_action: None,
             };
+            // PL/pgSQL variables are outer references of the virtual row.
+            let row = Chained {
+                inner: &super::eval::NoColumns,
+                outer,
+            };
             let Some((ptrs, values)) = fromless_aggregate_hooks(
                 statement,
                 agg_nodes.as_slice(),
@@ -11092,7 +11151,7 @@ fn select_into_rows_mode<'a>(
                 txid,
                 arena,
                 params,
-                &super::eval::NoColumns,
+                &row,
                 &hooks,
             )?
             else {
@@ -11113,23 +11172,13 @@ fn select_into_rows_mode<'a>(
             for item in statement.items {
                 match item {
                     SelectItem::Expr { expression, .. } => {
-                        vals[n] = eval_full(
-                            expression,
-                            arena,
-                            params,
-                            &super::eval::NoColumns,
-                            &agg_hooks,
-                        )?;
+                        vals[n] = eval_full(expression, arena, params, &row, &agg_hooks)?;
                         n += 1;
                     }
                     SelectItem::RecordStar(base) => {
-                        for field in super::eval::record_star_expand(
-                            base,
-                            arena,
-                            params,
-                            &super::eval::NoColumns,
-                            &agg_hooks,
-                        )? {
+                        for field in
+                            super::eval::record_star_expand(base, arena, params, &row, &agg_hooks)?
+                        {
                             vals[n] = field.value;
                             n += 1;
                         }
@@ -13263,6 +13312,30 @@ fn describe_scope_record_star<'q>(
 }
 
 /// Resolves column types across all tables in a join scope.
+/// Aggregate argument types inside a query that has outer references, such
+/// as PL/pgSQL variables: the query's own columns first, then the outer ones.
+/// Without outer references the query's columns alone resolve them.
+fn aggregate_outer_columns<'s, 'd, 'o, 'r, 'c>(
+    scope: Option<&'s QueryScope<'d>>,
+    outer: Option<&'o dyn ColumnLookup<'r>>,
+    storage: &'c Storage,
+    txid: u32,
+    arena: &'c Arena,
+) -> Option<subquery::SubqueryColumns<'s, 'd, 'o, 'r, 'c>> {
+    outer.map(|outer| subquery::SubqueryColumns {
+        scope,
+        outer: Some(outer),
+        catalog: super::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+    })
+}
+
 pub(super) struct ScopeCols<'s, 'd>(pub(super) &'s QueryScope<'d>);
 impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     fn is_empty_scope(&self) -> bool {

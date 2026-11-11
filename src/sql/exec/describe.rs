@@ -1869,13 +1869,52 @@ pub(crate) fn builtin_type_name_fixed(type_oid: i32) -> Option<crate::util::Stac
     Some(crate::util::StackStr::from_str(name))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FunctionLookupFailure {
     Missing,
     Ambiguous,
+    /// `CALL` selected a function: `f(integer) is not a procedure`.
+    NotProcedure,
 }
 
 pub(crate) fn function_lookup_error(
+    name: &str,
+    argument_oids: &[i32],
+    argument_names: &[Option<&str>],
+    failure: FunctionLookupFailure,
+    columns: &dyn ColTypeResolver,
+) -> SqlError {
+    routine_lookup_error(
+        "function ",
+        name,
+        argument_oids,
+        argument_names,
+        failure,
+        columns,
+    )
+}
+
+/// `CALL` lookup failures name the procedure and its argument types, as
+/// PostgreSQL's `ParseFuncOrColumn` does.
+pub(crate) fn procedure_lookup_error(
+    name: &str,
+    argument_oids: &[i32],
+    argument_names: &[Option<&str>],
+    failure: FunctionLookupFailure,
+    columns: &dyn ColTypeResolver,
+) -> SqlError {
+    routine_lookup_error(
+        "procedure ",
+        name,
+        argument_oids,
+        argument_names,
+        failure,
+        columns,
+    )
+}
+
+fn routine_lookup_error(
+    noun: &str,
     name: &str,
     argument_oids: &[i32],
     argument_names: &[Option<&str>],
@@ -1888,12 +1927,13 @@ pub(crate) fn function_lookup_error(
             "function diagnostic argument mapping changed"
         );
     }
-    let state = match failure {
-        FunctionLookupFailure::Missing => sqlstate::UNDEFINED_FUNCTION,
-        FunctionLookupFailure::Ambiguous => sqlstate::AMBIGUOUS_FUNCTION,
+    let (state, noun) = match failure {
+        FunctionLookupFailure::Missing => (sqlstate::UNDEFINED_FUNCTION, noun),
+        FunctionLookupFailure::Ambiguous => (sqlstate::AMBIGUOUS_FUNCTION, noun),
+        FunctionLookupFailure::NotProcedure => (sqlstate::WRONG_OBJECT_TYPE, ""),
     };
     crate::sql::error_position::full_message_error(state, |message| {
-        let _ = write!(message, "function {}(", name);
+        let _ = write!(message, "{}{}(", noun, name);
         for (index, type_oid) in argument_oids.iter().copied().enumerate() {
             if index != 0 {
                 let _ = message.write_str(", ");
@@ -1913,6 +1953,7 @@ pub(crate) fn function_lookup_error(
         let _ = message.write_str(match failure {
             FunctionLookupFailure::Missing => ") does not exist",
             FunctionLookupFailure::Ambiguous => ") is not unique",
+            FunctionLookupFailure::NotProcedure => ") is not a procedure",
         });
         Ok(())
     })
@@ -4709,6 +4750,40 @@ pub(crate) fn builtin_binary_type(
             }
         }
         Add | Sub | Mul | Div | Mod => {
+            // An untyped operand takes the other operand's type, except that
+            // `+` beside a timestamp or time can only add an interval.
+            let resolve = |unknown: i32, known: i32| {
+                if unknown != oid::UNKNOWN || known == oid::UNKNOWN {
+                    unknown
+                } else if *operator == Add
+                    && matches!(known, oid::TIMESTAMP | oid::TIMESTAMPTZ | oid::TIME)
+                {
+                    oid::INTERVAL
+                } else {
+                    known
+                }
+            };
+            if *operator == Add {
+                for (left, unknown, known) in [(true, lo, ro), (false, ro, lo)] {
+                    let name = match known {
+                        oid::DATE => "date",
+                        oid::TIMETZ => "time with time zone",
+                        _ => continue,
+                    };
+                    if unknown == oid::UNKNOWN {
+                        return Err(sql_err!(
+                            sqlstate::AMBIGUOUS_FUNCTION,
+                            "operator is not unique: {}",
+                            if left {
+                                crate::stack_format!(64, "unknown + {}", name)
+                            } else {
+                                crate::stack_format!(64, "{} + unknown", name)
+                            }
+                        ));
+                    }
+                }
+            }
+            let (lo, ro) = (resolve(lo, ro), resolve(ro, lo));
             if matches!(operator, Add | Sub) && lo == oid::ACLITEM_ARRAY && ro == oid::ACLITEM {
                 return Ok((oid::ACLITEM_ARRAY, -1));
             }

@@ -510,6 +510,10 @@ pub struct SeqSession {
     caches: [Cell<SequenceCache>; INLINE_SEQUENCE_SLOTS],
     overflow_currvals: Option<FixedVec<Cell<(u64, i64)>>>,
     overflow_caches: Option<FixedVec<Cell<SequenceCache>>>,
+    /// The wake time (microseconds since the Unix epoch) of the `pg_sleep`
+    /// call that the current statement is parked on. The statement's effect
+    /// journal replays the sleeps that already finished.
+    sleep_until: Cell<Option<i64>>,
 }
 
 const INLINE_SEQUENCE_SLOTS: usize = 64;
@@ -560,7 +564,17 @@ impl SeqSession {
             caches: [const { Cell::new(SequenceCache::EMPTY) }; INLINE_SEQUENCE_SLOTS],
             overflow_currvals: None,
             overflow_caches: None,
+            sleep_until: Cell::new(None),
         }
+    }
+
+    /// The wake time of the sleep the current statement waits for.
+    pub(crate) fn sleep_until(&self) -> Option<i64> {
+        self.sleep_until.get()
+    }
+
+    pub(super) fn set_sleep_until(&self, deadline: Option<i64>) {
+        self.sleep_until.set(deadline);
     }
 
     pub(crate) const fn extra_budget_bytes(sequence_capacity: usize) -> usize {
@@ -730,11 +744,15 @@ struct GucValues {
     default_tablespace: StackStr<64>,
     default_text_search_config: StackStr<128>,
     client_min_messages: MessageLevel,
-    extra_float_digits: StackStr<8>,
-    lock_timeout: StackStr<24>,
-    /// statement_timeout in milliseconds (0 = disabled), enforced at scan
-    /// boundaries during execution.
-    statement_timeout: StackStr<24>,
+    extra_float_digits: i32,
+    /// Milliseconds; 0 disables the timeout.
+    lock_timeout: i32,
+    /// Milliseconds (0 disables it), enforced at scan boundaries during
+    /// execution.
+    statement_timeout: i32,
+    /// Kilobytes. Reported and saved like PostgreSQL's `work_mem`; the fixed
+    /// startup `work_arena_bytes` workspace bounds actual query memory.
+    work_mem: i32,
     row_security: StackStr<4>,
     event_triggers: bool,
     /// bytea_output = escape (false = hex, the default).
@@ -863,6 +881,7 @@ impl GucValues {
             extra_float_digits,
             lock_timeout,
             statement_timeout,
+            work_mem,
             row_security,
             event_triggers,
             bytea_escape,
@@ -892,9 +911,10 @@ impl GucValues {
             default_tablespace: StackStr::new(),
             default_text_search_config: StackStr::new(),
             client_min_messages: MessageLevel::Notice,
-            extra_float_digits: StackStr::new(),
-            lock_timeout: StackStr::new(),
-            statement_timeout: StackStr::new(),
+            extra_float_digits: 1,
+            lock_timeout: 0,
+            statement_timeout: 0,
+            work_mem: 4096,
             row_security: StackStr::new(),
             event_triggers: true,
             bytea_escape: false,
@@ -912,9 +932,6 @@ impl GucValues {
         let _ = write!(values.client_encoding, "UTF8");
         let _ = write!(values.search_path, "\"$user\", public");
         let _ = write!(values.default_text_search_config, "pg_catalog.english");
-        let _ = write!(values.extra_float_digits, "1");
-        let _ = write!(values.lock_timeout, "0");
-        let _ = write!(values.statement_timeout, "0");
         let _ = write!(values.row_security, "on");
         values
     }
@@ -949,7 +966,8 @@ const GUC_PASSWORD_ENCRYPTION: u32 = 1 << 25;
 const GUC_LC_MONETARY: u32 = 1 << 26;
 const GUC_TRACK_FUNCTIONS: u32 = 1 << 27;
 const GUC_PLPGSQL_VARIABLE_CONFLICT: u32 = 1 << 28;
-const GUC_SETTING_COUNT: usize = 29;
+const GUC_WORK_MEM: u32 = 1 << 29;
+const GUC_SETTING_COUNT: usize = 30;
 const GUC_ALL: u32 = (1 << GUC_SETTING_COUNT) - 1;
 
 #[derive(Clone, Copy)]
@@ -1053,6 +1071,8 @@ fn guc_bit(name: &str) -> u32 {
         GUC_TRACK_FUNCTIONS
     } else if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
         GUC_PLPGSQL_VARIABLE_CONFLICT
+    } else if name.eq_ignore_ascii_case("work_mem") {
+        GUC_WORK_MEM
     } else {
         0
     }
@@ -1092,6 +1112,7 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
     copy!(GUC_EXTRA_FLOAT_DIGITS, extra_float_digits);
     copy!(GUC_LOCK_TIMEOUT, lock_timeout);
     copy!(GUC_STATEMENT_TIMEOUT, statement_timeout);
+    copy!(GUC_WORK_MEM, work_mem);
     copy!(GUC_ROW_SECURITY, row_security);
     copy!(GUC_EVENT_TRIGGERS, event_triggers);
     copy!(GUC_BYTEA_OUTPUT, bytea_escape);
@@ -1729,12 +1750,12 @@ impl GucState {
     }
 
     pub fn statement_timeout_ms(&self) -> u64 {
-        parse_timeout_ms(self.store.borrow().current.statement_timeout.as_str())
+        u64::try_from(self.store.borrow().current.statement_timeout)
             .expect("stored statement_timeout is validated")
     }
 
     pub fn lock_timeout_ms(&self) -> u64 {
-        parse_timeout_ms(self.store.borrow().current.lock_timeout.as_str())
+        u64::try_from(self.store.borrow().current.lock_timeout)
             .expect("stored lock_timeout is validated")
     }
 
@@ -2339,6 +2360,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.lock_timeout = defaults.lock_timeout;
     } else if name.eq_ignore_ascii_case("statement_timeout") {
         values.statement_timeout = defaults.statement_timeout;
+    } else if name.eq_ignore_ascii_case("work_mem") {
+        values.work_mem = defaults.work_mem;
     } else if name.eq_ignore_ascii_case("row_security") {
         values.row_security = defaults.row_security;
     } else if name.eq_ignore_ascii_case("event_triggers") {
@@ -2537,58 +2560,34 @@ fn apply_setting(
         // Floats already render at their shortest exact round-trip form —
         // the extra_float_digits >= 0 behavior — so the value is validated
         // to PostgreSQL's range and retained for SHOW.
-        let n: i32 = v.parse().map_err(|_| {
-            sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid value for parameter \"extra_float_digits\": \"{}\"",
-                v
-            )
-        })?;
-        if !(-15..=3).contains(&n) {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "{} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)",
-                n
-            ));
-        }
-        values.extra_float_digits.clear();
-        let _ = write!(values.extra_float_digits, "{n}");
+        values.extra_float_digits = parse_int_setting(EXTRA_FLOAT_DIGITS, v)?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("lock_timeout") {
-        if parse_timeout_ms(v).is_none() {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid value for parameter \"lock_timeout\": \"{}\"",
-                v
-            ));
-        }
-        return store(&mut values.lock_timeout, v);
+        values.lock_timeout = parse_int_setting(LOCK_TIMEOUT, v)?;
+        return Ok(());
     }
     if name.eq_ignore_ascii_case("statement_timeout") {
-        // Enforced at scan boundaries during execution.
-
-        if parse_timeout_ms(v).is_none() {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid value for parameter \"statement_timeout\": \"{}\"",
-                v
-            ));
-        }
-        return store(&mut values.statement_timeout, v);
+        values.statement_timeout = parse_int_setting(STATEMENT_TIMEOUT, v)?;
+        return Ok(());
     }
-    if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
-        || name.eq_ignore_ascii_case("transaction_timeout")
+    if name.eq_ignore_ascii_case("work_mem") {
+        values.work_mem = parse_int_setting(WORK_MEM, v)?;
+        return Ok(());
+    }
+    if let Some(setting) = [IDLE_IN_TRANSACTION_SESSION_TIMEOUT, TRANSACTION_TIMEOUT]
+        .into_iter()
+        .find(|setting| setting.name.eq_ignore_ascii_case(name))
     {
         // These timeout mechanisms do not run yet, so only the disabled value
         // is honored; a non-zero value would be a silent no-operator.
-        if parse_timeout_ms(v).ok_or_else(|| invalid_setting_value(name, v))? == 0 {
+        if parse_int_setting(setting, v)? == 0 {
             return Ok(());
         }
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "{} is not enforced yet; only 0 (disabled) is accepted",
-            name
+            setting.name
         ));
     }
     if name.eq_ignore_ascii_case("bytea_output") {
@@ -2711,10 +2710,7 @@ impl GucState {
             min_message_level: values.client_min_messages,
             bytea_escape: values.bytea_escape,
             xml_document: values.xml_document,
-            extra_float_digits: values
-                .extra_float_digits
-                .as_str()
-                .parse()
+            extra_float_digits: i8::try_from(values.extra_float_digits)
                 .expect("stored extra_float_digits is validated"),
         }
     }
@@ -2736,9 +2732,13 @@ fn owned_setting(values: &GucValues, name: &str) -> Option<StackStr<256>> {
     } else if name.eq_ignore_ascii_case("client_min_messages") {
         Some(StackStr::from_str(values.client_min_messages.as_str()))
     } else if name.eq_ignore_ascii_case("extra_float_digits") {
-        Some(StackStr::from_str(values.extra_float_digits.as_str()))
+        Some(StackStr::from_str(
+            show_int_setting(EXTRA_FLOAT_DIGITS, values.extra_float_digits).as_str(),
+        ))
     } else if name.eq_ignore_ascii_case("lock_timeout") {
-        Some(StackStr::from_str(values.lock_timeout.as_str()))
+        Some(StackStr::from_str(
+            show_int_setting(LOCK_TIMEOUT, values.lock_timeout).as_str(),
+        ))
     } else if name.eq_ignore_ascii_case("row_security") {
         Some(StackStr::from_str(values.row_security.as_str()))
     } else if name.eq_ignore_ascii_case("event_triggers") {
@@ -2748,7 +2748,13 @@ fn owned_setting(values: &GucValues, name: &str) -> Option<StackStr<256>> {
             "off"
         }))
     } else if name.eq_ignore_ascii_case("statement_timeout") {
-        Some(StackStr::from_str(values.statement_timeout.as_str()))
+        Some(StackStr::from_str(
+            show_int_setting(STATEMENT_TIMEOUT, values.statement_timeout).as_str(),
+        ))
+    } else if name.eq_ignore_ascii_case("work_mem") {
+        Some(StackStr::from_str(
+            show_int_setting(WORK_MEM, values.work_mem).as_str(),
+        ))
     } else if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
         || name.eq_ignore_ascii_case("transaction_timeout")
     {
@@ -2855,30 +2861,332 @@ pub(crate) fn parse_transaction_isolation(v: &str) -> Option<TransactionIsolatio
     }
 }
 
-/// Parses a `statement_timeout` value into milliseconds: a bare integer is
-/// milliseconds, or a `ms`/`s`/`min`/`h`/`d` unit suffix scales it (matching
-/// PostgreSQL). Returns None for malformed values or values above i32::MAX.
-fn parse_timeout_ms(v: &str) -> Option<u64> {
-    let t = v.trim();
-    let (num_part, mult) = if let Some(n) = t.strip_suffix("ms") {
-        (n, 1u64)
-    } else if let Some(n) = t.strip_suffix("min") {
-        (n, 60_000)
-    } else if let Some(n) = t.strip_suffix('s') {
-        (n, 1000)
-    } else if let Some(n) = t.strip_suffix('h') {
-        (n, 3_600_000)
-    } else if let Some(n) = t.strip_suffix('d') {
-        (n, 86_400_000)
-    } else {
-        (t, 1)
+/// Base unit of an integer setting, as PostgreSQL's `GUC_UNIT_KB` and
+/// `GUC_UNIT_MS` flags define it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingUnit {
+    None,
+    Kilobytes,
+    Milliseconds,
+}
+
+/// One integer setting's name, unit and accepted range.
+#[derive(Clone, Copy)]
+struct IntSetting {
+    name: &'static str,
+    unit: SettingUnit,
+    min: i32,
+    max: i32,
+}
+
+const WORK_MEM: IntSetting = IntSetting {
+    name: "work_mem",
+    unit: SettingUnit::Kilobytes,
+    min: 64,
+    max: i32::MAX,
+};
+const LOCK_TIMEOUT: IntSetting = IntSetting {
+    name: "lock_timeout",
+    unit: SettingUnit::Milliseconds,
+    min: 0,
+    max: i32::MAX,
+};
+const STATEMENT_TIMEOUT: IntSetting = IntSetting {
+    name: "statement_timeout",
+    unit: SettingUnit::Milliseconds,
+    min: 0,
+    max: i32::MAX,
+};
+const IDLE_IN_TRANSACTION_SESSION_TIMEOUT: IntSetting = IntSetting {
+    name: "idle_in_transaction_session_timeout",
+    unit: SettingUnit::Milliseconds,
+    min: 0,
+    max: i32::MAX,
+};
+const TRANSACTION_TIMEOUT: IntSetting = IntSetting {
+    name: "transaction_timeout",
+    unit: SettingUnit::Milliseconds,
+    min: 0,
+    max: i32::MAX,
+};
+const EXTRA_FLOAT_DIGITS: IntSetting = IntSetting {
+    name: "extra_float_digits",
+    unit: SettingUnit::None,
+    min: -15,
+    max: 3,
+};
+
+/// Unit names and multipliers into each base unit, largest first, as in
+/// PostgreSQL's `memory_unit_conversion_table` and
+/// `time_unit_conversion_table`.
+/// https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/misc/guc.c#L1022
+const KILOBYTE_UNITS: [(&str, f64); 5] = [
+    ("TB", 1024.0 * 1024.0 * 1024.0),
+    ("GB", 1024.0 * 1024.0),
+    ("MB", 1024.0),
+    ("kB", 1.0),
+    ("B", 1.0 / 1024.0),
+];
+const MILLISECOND_UNITS: [(&str, f64); 6] = [
+    ("d", 86_400_000.0),
+    ("h", 3_600_000.0),
+    ("min", 60_000.0),
+    ("s", 1000.0),
+    ("ms", 1.0),
+    ("us", 1.0 / 1000.0),
+];
+
+impl SettingUnit {
+    fn table(self) -> &'static [(&'static str, f64)] {
+        match self {
+            Self::None => &[],
+            Self::Kilobytes => &KILOBYTE_UNITS,
+            Self::Milliseconds => &MILLISECOND_UNITS,
+        }
+    }
+
+    fn base_name(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Kilobytes => " kB",
+            Self::Milliseconds => " ms",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Kilobytes => {
+                "Valid units for this parameter are \"B\", \"kB\", \"MB\", \"GB\", and \"TB\"."
+            }
+            Self::Milliseconds => {
+                "Valid units for this parameter are \"us\", \"ms\", \"s\", \"min\", \"h\", and \"d\"."
+            }
+        }
+    }
+}
+
+/// Parses an integer setting as PostgreSQL's `parse_int` and
+/// `parse_and_validate_value` do: decimal, octal or hexadecimal integers,
+/// fractional or exponent values rounded to the nearest integer, and an
+/// optional case-sensitive unit converted to the base unit.
+/// https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/misc/guc.c#L2780
+fn parse_int_setting(setting: IntSetting, value: &str) -> Result<i32, SqlError> {
+    let invalid = |hint: &'static str| {
+        if !hint.is_empty() {
+            super::eval::stash_diagnostic(None, Some(StackStr::from_str(hint)));
+        }
+        invalid_setting_value(setting.name, value)
     };
-    num_part
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(mult))
-        .filter(|milliseconds| *milliseconds <= i32::MAX as u64)
+    let bytes = value.as_bytes();
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let (integer, integer_end) = parse_c_long(value, start);
+    let mut number;
+    let mut end;
+    let reparse = integer_end.is_none_or(|end| matches!(bytes.get(end), Some(b'.' | b'e' | b'E')));
+    if reparse {
+        let (parsed, parsed_end) = parse_c_double(value, start).ok_or_else(|| invalid(""))?;
+        number = parsed;
+        end = parsed_end;
+    } else {
+        number = integer as f64;
+        end = integer_end.expect("integer parse consumed digits");
+    }
+    if number.is_nan() {
+        return Err(invalid(""));
+    }
+    while bytes.get(end).is_some_and(u8::is_ascii_whitespace) {
+        end += 1;
+    }
+    if end < bytes.len() {
+        if setting.unit == SettingUnit::None {
+            return Err(invalid(""));
+        }
+        let rest = &value[end..];
+        let unit_length = rest
+            .bytes()
+            .position(|byte| byte.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        let (unit, trailing) = rest.split_at(unit_length);
+        let table = setting.unit.table();
+        let index = (unit_length <= 9 && trailing.trim_start().is_empty())
+            .then(|| table.iter().position(|(name, _)| *name == unit))
+            .flatten()
+            .ok_or_else(|| invalid(setting.unit.hint()))?;
+        number *= table[index].1;
+        // A fractional value rounds to the next smaller unit, if there is one.
+        if let Some(&(_, smaller)) = table.get(index + 1) {
+            number = (number / smaller).round_ties_even() * smaller;
+        }
+    }
+    let number = number.round_ties_even();
+    if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&number) {
+        return Err(invalid("Value exceeds integer range."));
+    }
+    let number = number as i32;
+    if !(setting.min..=setting.max).contains(&number) {
+        let unit = setting.unit.base_name();
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "{}{} is outside the valid range for parameter \"{}\" ({}{} .. {}{})",
+            number,
+            unit,
+            setting.name,
+            setting.min,
+            unit,
+            setting.max,
+            unit
+        ));
+    }
+    Ok(number)
+}
+
+/// Parses C `strtol(value, &end, 0)` from `start`: optional sign, then a
+/// `0x` hexadecimal, `0` octal or decimal integer. Returns the end offset,
+/// or None when no digits were read or the value overflows.
+fn parse_c_long(value: &str, start: usize) -> (i64, Option<usize>) {
+    let bytes = value.as_bytes();
+    let mut index = start;
+    let negative = match bytes.get(index) {
+        Some(b'-') => {
+            index += 1;
+            true
+        }
+        Some(b'+') => {
+            index += 1;
+            false
+        }
+        _ => false,
+    };
+    let mut radix = 10;
+    if bytes.get(index) == Some(&b'0') {
+        if matches!(bytes.get(index + 1), Some(b'x' | b'X'))
+            && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit)
+        {
+            radix = 16;
+            index += 2;
+        } else {
+            radix = 8;
+        }
+    }
+    let digits = index;
+    let mut magnitude: i64 = 0;
+    let mut overflow = false;
+    while let Some(digit) = bytes
+        .get(index)
+        .and_then(|byte| (*byte as char).to_digit(radix))
+    {
+        match magnitude
+            .checked_mul(i64::from(radix))
+            .and_then(|value| value.checked_add(i64::from(digit)))
+        {
+            Some(value) => magnitude = value,
+            None => overflow = true,
+        }
+        index += 1;
+    }
+    if index == digits || overflow {
+        return (0, None);
+    }
+    (if negative { -magnitude } else { magnitude }, Some(index))
+}
+
+/// Parses the longest C `strtod` decimal prefix from `start`, returning the
+/// value and its end offset. None when no number was read or it overflows.
+fn parse_c_double(value: &str, start: usize) -> Option<(f64, usize)> {
+    let bytes = value.as_bytes();
+    let mut index = start;
+    if matches!(bytes.get(index), Some(b'+' | b'-')) {
+        index += 1;
+    }
+    let mantissa = index;
+    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+        index += 1;
+    }
+    let mut digits = index - mantissa;
+    if bytes.get(index) == Some(&b'.') {
+        let fraction = index + 1;
+        let mut end = fraction;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        digits += end - fraction;
+        if digits > 0 {
+            index = end;
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        let mut exponent = index + 1;
+        if matches!(bytes.get(exponent), Some(b'+' | b'-')) {
+            exponent += 1;
+        }
+        if bytes.get(exponent).is_some_and(u8::is_ascii_digit) {
+            while bytes.get(exponent).is_some_and(u8::is_ascii_digit) {
+                exponent += 1;
+            }
+            index = exponent;
+        }
+    }
+    let number: f64 = value[start..index].parse().ok()?;
+    number.is_finite().then_some((number, index))
+}
+
+/// Shows an integer setting as PostgreSQL's `ShowGUCOption` does: a positive
+/// value uses the largest unit that divides it evenly.
+fn show_int_setting(setting: IntSetting, value: i32) -> StackStr<24> {
+    let mut shown = StackStr::new();
+    if value <= 0 || setting.unit == SettingUnit::None {
+        let _ = write!(shown, "{value}");
+        return shown;
+    }
+    let base = i64::from(value);
+    for &(name, multiplier) in setting.unit.table() {
+        if multiplier <= 1.0 || base % multiplier as i64 == 0 {
+            let _ = write!(
+                shown,
+                "{}{name}",
+                (base as f64 / multiplier).round_ties_even() as i64
+            );
+            break;
+        }
+    }
+    shown
+}
+
+/// The base-unit integer `pg_settings.setting` reports for a shown integer
+/// setting, or None for settings without a unit.
+pub(crate) fn int_setting_base_value(name: &str, shown: &str) -> Option<i32> {
+    let setting = int_setting(name).filter(|setting| setting.unit != SettingUnit::None)?;
+    Some(parse_int_setting(setting, shown).expect("shown integer settings parse"))
+}
+
+/// The unit, minimum and maximum `pg_settings` reports for an integer setting.
+pub(crate) fn int_setting_metadata(name: &str) -> Option<(&'static str, i32, i32)> {
+    let setting = int_setting(name)?;
+    Some((
+        setting.unit.base_name().trim_start(),
+        setting.min,
+        setting.max,
+    ))
+}
+
+fn int_setting(name: &str) -> Option<IntSetting> {
+    [
+        WORK_MEM,
+        LOCK_TIMEOUT,
+        STATEMENT_TIMEOUT,
+        IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+        TRANSACTION_TIMEOUT,
+        EXTRA_FLOAT_DIGITS,
+    ]
+    .into_iter()
+    .find(|setting| setting.name.eq_ignore_ascii_case(name))
 }
 
 // PostgreSQL escapes each non-printable UTF-8 byte, preserving ASCII backslashes.

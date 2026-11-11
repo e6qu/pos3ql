@@ -4451,6 +4451,41 @@ pub(crate) fn validate_explicit_cast(
     super::eval::validate_catalog_reference_cast(source, target)
 }
 
+/// PostgreSQL's `can_coerce_type` in assignment context: equal types,
+/// domains through their base types, `pg_cast` entries marked implicit or
+/// assignment, element-wise array conversion, and type I/O into the string
+/// category.
+pub(crate) fn assignment_coercible(storage: &Storage, txid: u32, source: i32, target: i32) -> bool {
+    use super::types::oid;
+    if source == target || source == oid::UNKNOWN || target == oid::ANY {
+        return true;
+    }
+    let base = |type_oid: i32| {
+        storage
+            .domain_base_type_for_oid(type_oid, txid)
+            .map_or(type_oid, ColType::oid)
+    };
+    let (source, target) = (base(source), base(target));
+    if source == target {
+        return true;
+    }
+    if storage
+        .cast_for_oids(source, target, txid)
+        .is_some_and(|(_, cast)| cast.context.permits_assignment())
+        || builtin_cast_context(source, target)
+            .is_some_and(crate::storage::CastContext::permits_assignment)
+    {
+        return true;
+    }
+    match (ColType::from_oid(source), ColType::from_oid(target)) {
+        (Some(ColType::Array(source)), Some(ColType::Array(target))) => {
+            assignment_coercible(storage, txid, source.element_oid(), target.element_oid())
+        }
+        (_, Some(target)) => super::types::type_category(target) == "S",
+        _ => false,
+    }
+}
+
 pub(crate) fn builtin_cast_context(
     source: i32,
     target: i32,
@@ -30018,7 +30053,27 @@ fn pg_prepared_statements<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_prepared_statements", false);
-    let catalog_types = pg_type(storage, txid, Materialization::Query, arena)?;
+    // Parameters and results show their exact types, including user-defined
+    // ones, the way `format_type` names them.
+    let type_datum = |oid: i32| -> Result<Datum<'a>, SqlError> {
+        let name = match intrinsic_type_name(oid) {
+            Some(name) => name,
+            None => {
+                let name = user_type_name_fixed(storage, txid, oid)?.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "prepared statement type {} has no catalog name",
+                        oid
+                    )
+                })?;
+                arena.alloc_str(name.as_str()).map_err(|_| arena_full())?
+            }
+        };
+        Ok(Datum::Regtype {
+            referenced_oid: oid,
+            name,
+        })
+    };
     crate::sql::prep::with_active(|pool| {
         let rows = arena
             .alloc_slice_with(
@@ -30033,36 +30088,21 @@ fn pg_prepared_statements<'a>(
                 if found_error.is_some() {
                     return;
                 }
-                let parameters = match arena
-                    .alloc_slice_with(prepared.parameter_type_codes.len(), |_| Datum::Null)
-                {
-                    Ok(parameters) => parameters,
-                    Err(_) => {
-                        found_error = Some(arena_full());
-                        return;
-                    }
-                };
-                let parameter_types =
-                    match crate::sql::prep::decode_types(prepared.parameter_type_codes, arena) {
-                        Ok(types) => types,
+                let parameters =
+                    match arena.alloc_slice_with(prepared.parameter_types.len(), |_| Datum::Null) {
+                        Ok(parameters) => parameters,
+                        Err(_) => {
+                            found_error = Some(arena_full());
+                            return;
+                        }
+                    };
+                for (target, oid) in parameters.iter_mut().zip(prepared.parameter_types.iter()) {
+                    *target = match type_datum(oid) {
+                        Ok(value) => value,
                         Err(error) => {
                             found_error = Some(error);
                             return;
                         }
-                    };
-                for (target, ctype) in parameters.iter_mut().zip(parameter_types) {
-                    let oid = ctype.oid();
-                    let Some(name) = intrinsic_type_name(oid) else {
-                        found_error = Some(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "prepared parameter type {} has no catalog name",
-                            oid
-                        ));
-                        return;
-                    };
-                    *target = Datum::Regtype {
-                        referenced_oid: oid,
-                        name,
                     };
                 }
                 let parameter_types = match super::array::build(parameters, arena) {
@@ -30077,27 +30117,12 @@ fn pg_prepared_statements<'a>(
                 };
                 let mut results = [Datum::Null; super::exec::MAX_PROJ];
                 for (target, oid) in results.iter_mut().zip(prepared.result_types.iter()) {
-                    let name = intrinsic_type_name(oid).or_else(|| {
-                        catalog_types.rows.iter().find_map(|row| {
-                            let matches = matches!(row[0], Datum::Int4(value) if value == oid)
-                                || matches!(row[0], Datum::Oid(value) if value == oid as u32);
-                            matches.then(|| match row[1] {
-                                Datum::Text(name) => Some(name),
-                                _ => None,
-                            })?
-                        })
-                    });
-                    let Some(name) = name else {
-                        found_error = Some(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "prepared result type {} has no catalog name",
-                            oid
-                        ));
-                        return;
-                    };
-                    *target = Datum::Regtype {
-                        referenced_oid: oid,
-                        name,
+                    *target = match type_datum(oid) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            found_error = Some(error);
+                            return;
+                        }
                     };
                 }
                 let result_types =
@@ -31746,6 +31771,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "track_functions" => "none",
             "plpgsql.variable_conflict" => "error",
             "TimeZone" => "UTC",
+            "work_mem" => "4096",
             "transaction_isolation" => "read committed",
             "transaction_deferrable" | "transaction_read_only" => "off",
             "xmloption" => "content",
@@ -31784,7 +31810,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "max_connections"
                 | "max_locks_per_transaction"
                 | "max_prepared_transactions"
-        ) {
+        ) || crate::sql::guc::int_setting_metadata(name).is_some()
+        {
             "integer"
         } else {
             "string"
@@ -31812,7 +31839,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         } else {
             "user"
         };
-        let unit = if name.ends_with("timeout") { "ms" } else { "" };
+        let unit = crate::sql::guc::int_setting_metadata(name).map_or("", |(unit, ..)| unit);
         (boot, vartype, context, unit)
     }
     let mut count = 0;
@@ -31851,6 +31878,29 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         let (reset_value, source) = crate::sql::eval::funcs::system::session_setting_metadata(name)
             .unwrap_or((value, "default"));
         let (boot, vartype, context, unit) = metadata(name);
+        let base_value = |shown: &str| {
+            crate::sql::guc::int_setting_base_value(name, shown).map_or_else(
+                || crate::util::StackStr::<256>::from_str(shown),
+                |base| {
+                    let mut value = crate::util::StackStr::<256>::new();
+                    let _ = core::fmt::Write::write_fmt(&mut value, format_args!("{base}"));
+                    value
+                },
+            )
+        };
+        let (value, reset_value) = (base_value(value.as_str()), base_value(reset_value.as_str()));
+        let (min_value, max_value) = match crate::sql::guc::int_setting_metadata(name) {
+            Some((_, min, max)) => {
+                let mut bounds = [crate::util::StackStr::<16>::new(); 2];
+                let _ = core::fmt::Write::write_fmt(&mut bounds[0], format_args!("{min}"));
+                let _ = core::fmt::Write::write_fmt(&mut bounds[1], format_args!("{max}"));
+                (
+                    text(bounds[0].as_str(), arena)?,
+                    text(bounds[1].as_str(), arena)?,
+                )
+            }
+            None => (Datum::Null, Datum::Null),
+        };
         let enum_names: &[&str] = match name {
             "track_functions" => &["none", "pl", "all"],
             "plpgsql.variable_conflict" => &crate::sql::guc::VariableConflict::NAMES,
@@ -31881,6 +31931,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                     match name {
                         "track_functions" => "Statistics / Monitoring",
                         "plpgsql.variable_conflict" => "Customized Options",
+                        "work_mem" => "Resource Usage / Memory",
                         _ => "Client Connection Defaults",
                     },
                     arena,
@@ -31897,8 +31948,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 text(context, arena)?,
                 text(vartype, arena)?,
                 text(source, arena)?,
-                Datum::Null,
-                Datum::Null,
+                min_value,
+                max_value,
                 enum_values,
                 text(boot, arena)?,
                 text(reset_value.as_str(), arena)?,

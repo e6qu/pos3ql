@@ -89,6 +89,11 @@ python3 tools/generate-pg18-planner-properties.py \
   --type-io-source src/sql/catalog_builtin_properties.rs \
   --output src/sql/catalog_planner_properties.rs
 
+# Callable contracts: add OIDs (none re-verifies digests and the OID index).
+python3 tools/generate-pg18-callable-signatures.py \
+  --dsn 'host=127.0.0.1 port=5432 user=postgres' \
+  src/sql/catalog_callable_signatures.rs 6381 6388
+
 # Built-in view SQL from retained catalog-metadata.json evidence (--mode check compares).
 python3 tools/generate-pg18-view-definitions.py --mode write \
   --metadata /path/to/catalog-metadata.json --source https://example/evidence \

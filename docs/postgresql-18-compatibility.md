@@ -164,15 +164,48 @@ Functions and expressions:
   renames, schema moves, or new overloads; `nextval('order_numbers'::text)`
   looks the name up at each call.
 - A SQL function or procedure with a result must end with a `SELECT` or a
-  data-modifying statement with `RETURNING`. Otherwise `CREATE` fails with
-  `42P13` (`return type mismatch in function declared to return integer`);
-  with `check_function_bodies = off` the error comes from the first call.
+  data-modifying statement with `RETURNING` whose columns fit the declared
+  result. Otherwise `CREATE` fails with `42P13` (`return type mismatch in
+  function declared to return integer`) and PostgreSQL's detail, such as
+  `Final statement must return exactly one column.` for `RETURNS integer AS
+  'SELECT 1, 2'` or `Actual return type is text.` for `AS 'SELECT ''a''::text'`.
+  Conversions allowed in assignment pass (`SELECT 1::bigint` for `integer`).
+  With `check_function_bodies = off`, or with polymorphic arguments, the check
+  runs at the call and names the resolved type (`declared to return boolean`).
   Procedure output parameters take the final statement's first row.
   Transaction control in a quoted SQL body (`AS 'COMMIT'`) is stored, and a
   call that reaches it fails with `0A000`, as in PostgreSQL. A `BEGIN ATOMIC`
-  body accepts only queries, data changes and `CALL`; anything else fails at
-  `CREATE` (`0A000`, `COMMIT is not yet supported in unquoted SQL function
-  body`).
+  body accepts only queries and data changes; anything else, `CALL` included,
+  fails at `CREATE` (`0A000`, `COMMIT is not yet supported in unquoted SQL
+  function body`). A quoted SQL body cannot `CALL` a procedure with output
+  parameters (`0A000`, `calling procedures with output arguments is not
+  supported in SQL functions`).
+- PL/pgSQL `CALL` assigns output parameters to the variables written as
+  their arguments: `CALL doubled(x, y)` updates `x` and `y`, and a constant in
+  an output position fails with `42601` (`procedure parameter "b" is an output
+  parameter but corresponding argument is not writable`). `EXECUTE 'CALL ...'`
+  returns the outputs only through `INTO`. A called procedure may `COMMIT`
+  when every caller up to the top-level `CALL` or `DO` could; from a function,
+  an explicit transaction block, an exception block, or a `SECURITY DEFINER`
+  or `SET` procedure it fails with `2D000` (`invalid transaction
+  termination`). A trigger function may `CALL` a procedure; the call is
+  atomic, so its `COMMIT` fails with `2D000`. A trigger fired inside a write
+  (a BEFORE row trigger, or a deferred constraint trigger at `COMMIT`) can
+  call PL/pgSQL and SQL-language procedures. A SQL procedure called there
+  runs its queries, `INSERT`, `UPDATE`, `DELETE` and nested `CALL`
+  statements; any other statement in its body, such as `CREATE TABLE`, fails
+  with `0A000` (`a SQL procedure called during a write cannot run CREATE
+  TABLE`) where PostgreSQL runs it.
+- A procedure or `DO` block that waits for a lock or storage, before or after
+  its own `COMMIT`, continues at the waiting statement as in PostgreSQL. A
+  PL/pgSQL statement whose function call waits continues at that call,
+  including statements with several expressions (`FOR` bounds, `CASE`,
+  `RAISE` arguments and `USING` options, `IF ... ELSIF`, `ASSERT`, `CALL`
+  arguments, `EXECUTE` command and `USING` values): expressions that finished
+  before the wait are not evaluated again. For example, in
+  `FOR i IN next_batch()..last_batch() LOOP`, `next_batch()` runs once even
+  when `last_batch()` waits for a lock. A dynamic `EXECUTE` that writes rolls
+  back to its own start and evaluates its expressions again.
 - A built-in function cannot implement `CREATE CAST` or `CREATE OPERATOR`
   (`0A000`). Aggregate support functions can name supported built-ins.
 - A missing-function message names the whole signature however long it is,
@@ -189,6 +222,23 @@ Functions and expressions:
   gives `bigint[]`; an empty constructor needs a type (`ARRAY[]::integer[]`).
   `pg_typeof(nextval('order_numbers'))` still issues one number. `OFFSET` is
   evaluated before `LIMIT`.
+- Polymorphic built-ins choose their argument types before running, as
+  PostgreSQL's parse analysis does. An untyped literal takes the type of the
+  other arguments: `array_append(ARRAY['2020-01-01'::date], '2020-01-02')`,
+  `greatest(1, '2')` and `int4range(1,5) @> '[2,3)'` work, and typed inputs
+  of `anycompatible` functions convert to one common type
+  (`array_replace(ARRAY[1], 1, 2.5)` is `numeric[]`). `timestamp + '1 day'`
+  adds an interval; `date + '1'` fails with `42725` (`operator is not unique`).
+- `DISTINCT`, `GROUP BY`, set operations and array search need a type's
+  default equality: `SELECT DISTINCT '(1,2)'::point` fails with `42883`
+  (`could not identify an equality operator for type point`), as for `xml`
+  and `json`, even though `box = box` (area equality) works.
+- `pg_sleep`, `pg_sleep_for` and `pg_sleep_until` do not hold the SQL worker:
+  the statement waits on a timer (`pg_stat_activity` shows `Timeout` /
+  `PgSleep`) while other connections run, and resumes without repeating work
+  it already did, so `SELECT nextval('s'), pg_sleep(1), nextval('s')` returns
+  consecutive numbers. `statement_timeout` and a cancel request end the wait
+  with `57014`.
 - Enum literals are checked before rows are chosen: `'missing'::order_status`
   raises `22P02` even in an unused `CASE` arm, while
   `'missing'::text::order_status` converts only when run.
@@ -229,6 +279,19 @@ Domains and checked inputs:
   integer parameter fails at Bind. `PREPARE saved AS SELECT
   '{paid}'::checked_status[]` checks the literal once at `PREPARE`;
   `ARRAY['paid']::checked_status[]` checks when executed.
+- `PREPARE` types every parameter as PostgreSQL does: declared types first,
+  then the type its use selects. `PREPARE q AS SELECT round($1)` records
+  `double precision` in `pg_prepared_statements`, so `EXECUTE q(2.5)` returns
+  2. A parameter that is never used (`SELECT $2::int` leaves `$1` unused) or
+  only passed where any type is accepted (`pg_typeof($1)`) fails with `42P18`;
+  an otherwise untyped one is `text`. User-defined types are recorded exactly:
+  `PREPARE q(positive)` and `PREPARE q AS SELECT $1::mood` list `positive`
+  and `mood`. `EXECUTE` converts each argument with PostgreSQL's assignment
+  rules, so `EXECUTE q(2.7)` passes 3 to an integer domain and
+  `EXECUTE q('happy'::text)` fails with `42804` (`parameter $1 of type text
+  cannot be coerced to the expected type mood`). A protocol Parse fixes its
+  parameter types and reports an undeterminable one with `42P18` at Parse;
+  later Bind and Describe messages reuse those types.
 - SQL functions are validated at `CREATE`, then each backend checks and keeps
   the first call's inputs for that definition and argument types. PL/pgSQL keeps
   one instance per resolved argument types and collation. Views, rules,
@@ -261,7 +324,7 @@ PostgreSQL). Current `0A000` messages:
 
 | Message | Example cause |
 |---|---|
-| `expression wait requires an owned invocation log` | A wait inside an assignment, `RETURN`, loop bound, or message expression of a PL/pgSQL function running in retained AFTER-trigger work |
+| `expression wait requires an owned invocation log` | A routine call that waits inside an expression that no saved statement owns, such as a SQL-language function body replayed by its caller in retained AFTER-trigger work |
 | `SQL row expression requires retained write progress` | A multirow UPDATE that changes one row, then calls a function for the next row that must wait |
 | `expression restart requires owned volatile values` | Restarting would repeat an unsaved `random()` or clock value |
 
@@ -363,7 +426,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 
 | Setting(s) | Bounds |
 |---|---|
-| `sql_arena_bytes` (per-connection statement memory), `work_arena_bytes` (per query workspace, like PostgreSQL's `work_mem`) | Row images, joins, lists, programs, JSON/XML work, table-function rows, sorts and aggregates, retained scan/COPY/validation records (32 bytes per resident row) |
+| `sql_arena_bytes` (per-connection statement memory), `work_arena_bytes` (per query workspace; see [`work_mem`](#work_mem)) | Row images, joins, lists, programs, JSON/XML work, table-function rows, sorts and aggregates, retained scan/COPY/validation records (32 bytes per resident row) |
 | `max_tables`, `max_extended_statistics`, other catalog `max_*` | One capacity per catalog family; omitting `max_extended_statistics` derives it from `max_tables`, so set it explicitly |
 | `max_connections`, `max_prepared_transactions`, `max_subscriptions` | Transaction identity registry has `max_connections + max_prepared_transactions` entries |
 | `max_catalog_versions_per_object`, `max_ddl_per_transaction` | Retained definition/undo versions. Enum label images use `max_enums + P` slots, `P = min(max_enums * max_catalog_versions_per_object, (max_connections + max_prepared_transactions + max_subscriptions) * max_ddl_per_transaction)`, each holding `max_enum_labels_per_type` labels |
@@ -392,6 +455,22 @@ Fixed per-query-workspace limits: 1,024 snapshot and file-owner slots, 64 scan
 sources, 64 point-read sources, and 64 copied point reads. At 85% heap use,
 writing commands wait for cache reclamation before taking effect; reads,
 commits, and cancellation proceed.
+
+### `work_mem`
+
+PostgreSQL's `work_mem` is a per-session hint: how much memory a sort or hash
+may use before it spills to temporary files. It never changes query results.
+pos3ql accepts and reports it exactly like PostgreSQL 18, with the same units
+(`B`, `kB`, `MB`, `GB`, `TB`), rounding, range (64 kB to 2,147,483,647 kB),
+default (`4MB`), errors, `SHOW`, `pg_settings` row and routine `SET` clause.
+For example, `CREATE PROCEDURE nightly() ... SET work_mem = '256MB'` works,
+and `SHOW work_mem` inside it reports `256MB`.
+
+The value does not size memory in pos3ql. Each query runs in a workspace of
+`work_arena_bytes`, fixed at startup, and pos3ql never spills to temporary
+files: a sort, grouping or hash table that outgrows the workspace fails with
+`54000` whatever `work_mem` says. Raise `work_arena_bytes` in the configuration
+file and restart to let larger sorts run.
 
 ### Cursor capacity
 

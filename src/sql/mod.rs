@@ -912,6 +912,8 @@ pub enum StatementWait {
     CacheCapacity,
     /// Queued output must reach the client before the connection continues.
     ClientOutput,
+    /// `pg_sleep` waits until the session's recorded wake time.
+    Timer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1397,7 +1399,8 @@ fn statement_tag(statement: &Stmt<'_>) -> &'static str {
 }
 
 /// PostgreSQL's command tag for a statement that a `BEGIN ATOMIC` body cannot
-/// hold; `None` for the queries, data changes and `CALL` it accepts.
+/// hold; `None` for the queries and data changes it accepts. `CALL` is a
+/// utility there too.
 pub(crate) fn unquoted_body_unsupported_tag(statement: &Stmt<'_>) -> Option<&'static str> {
     use ast::DiscardTarget;
     Some(match statement {
@@ -1406,8 +1409,8 @@ pub(crate) fn unquoted_body_unsupported_tag(statement: &Stmt<'_>) -> Option<&'st
         | Stmt::Insert(_)
         | Stmt::Update(_)
         | Stmt::Delete(_)
-        | Stmt::Merge(_)
-        | Stmt::Call { .. } => return None,
+        | Stmt::Merge(_) => return None,
+        Stmt::Call { .. } => "CALL",
         Stmt::With { statement, .. } => return unquoted_body_unsupported_tag(statement),
         Stmt::Begin(_, start) => start.command_name(),
         Stmt::Commit => "COMMIT",
@@ -8666,6 +8669,12 @@ impl Engine {
 
     pub fn rollback_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
         sequence::finish_statement(guc.seq_session());
+        self.rollback_txn_within_statement(txn, guc);
+    }
+
+    /// Rolls back the transaction a procedure's `ROLLBACK` ends. The calling
+    /// statement continues, so its effect journal stays for later waits.
+    pub(crate) fn rollback_txn_within_statement(&mut self, txn: &mut TxnState, guc: &GucState) {
         if txn.staged_commit().is_some() || self.transaction_publication.owns(txn.txid) {
             crate::logging::error_args(
                 "rollback_after_commit_boundary",
@@ -9912,18 +9921,25 @@ impl Engine {
                 ),
             }));
         }
-        let types = match arena.alloc_slice_with(param_types.len(), |_| ColType::Bool) {
+        if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+            return Ok(Err(error));
+        }
+        let types = match arena.alloc_slice_with(param_types.len(), |_| types::oid::UNKNOWN) {
             Ok(types) => types,
             Err(_) => return Ok(Err(eval::arena_full())),
         };
+        // Declared types may be user-defined; PostgreSQL records them exactly.
         for (index, type_name) in param_types.iter().enumerate() {
-            let Some(ctype) = ColType::from_sql_name(type_name) else {
+            let Some(type_oid) = ColType::from_sql_name(type_name)
+                .map(ColType::oid)
+                .or_else(|| catalog::user_type_oid(&self.storage, txn.txid, type_name))
+            else {
                 return Ok(Err(SqlError {
                     sqlstate: SqlState::known(sqlstate::UNDEFINED_OBJECT),
                     message: stack_format!(192, "type \"{}\" does not exist", type_name),
                 }));
             };
-            types[index] = ctype;
+            types[index] = type_oid;
         }
         let inherited = match type_inputs::bindings_for_active_source(sql, arena) {
             Ok(bindings) => bindings.unwrap_or(&[]),
@@ -9953,9 +9969,6 @@ impl Engine {
                 )));
             }
             Err(error) => return Ok(Err(parse_error_to_sql(&error))),
-        }
-        if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
-            return Ok(Err(error));
         }
         if let Err(error) = query::capture_contextual_type_inputs(
             &parser,
@@ -10070,53 +10083,91 @@ impl Engine {
                 )));
             }
         };
-        let mut result_columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let described = type_inputs::with_source(
+        // PostgreSQL types every parameter at PREPARE: declared types first,
+        // then the types the statement's analysis infers for the rest.
+        let parameter_count = types.len().max(parser.max_param() as usize);
+        if parameter_count > prep::MAX_PREP_PARAMS {
+            return Ok(Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "PREPARE parameters exceed the prepared-statement boundary of {}",
+                prep::MAX_PREP_PARAMS
+            )));
+        }
+        let parameter_oids = match arena.alloc_slice_with(parameter_count, |index| {
+            types.get(index).copied().unwrap_or(types::oid::UNKNOWN)
+        }) {
+            Ok(oids) => oids,
+            Err(_) => return Ok(Err(eval::arena_full())),
+        };
+        // Parameters record their exact types, including domains, enums and
+        // composites, as PostgreSQL lists them in `pg_prepared_statements`.
+        let inferred = type_inputs::with_source(
             type_inputs::Source::RootCommand { statement: 0 },
             sql,
             bindings,
-            || match statement {
-                Stmt::Select(select) => query::expand_ctes(select, &self.storage, txn.txid, arena)
-                    .and_then(|select| {
-                        query::describe_select(
-                            select,
-                            &self.storage,
-                            txn.txid,
-                            arena,
-                            &mut result_columns,
-                            crate::sql::exec::DescriptionTarget::Wire,
-                            None,
+            || -> Result<(), SqlError> {
+                param_types::infer(&self.storage, statement, txn.txid, arena, parameter_oids);
+                parameter_oids[..types.len()].copy_from_slice(types);
+                param_types::finish_unresolved(sql, arena, parameter_oids)
+            },
+        );
+        if let Err(error) = inferred {
+            return Ok(Err(error));
+        }
+        // `pg_prepared_statements` lists result types as the query produces
+        // them, keeping domains that the wire description reduces to base types.
+        let mut result_columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let described = exec::with_bound_parameter_types(parameter_oids, || {
+            type_inputs::with_source(
+                type_inputs::Source::RootCommand { statement: 0 },
+                sql,
+                bindings,
+                || match statement {
+                    Stmt::Select(select) => {
+                        query::expand_ctes(select, &self.storage, txn.txid, arena).and_then(
+                            |select| {
+                                query::describe_select(
+                                    select,
+                                    &self.storage,
+                                    txn.txid,
+                                    arena,
+                                    &mut result_columns,
+                                    crate::sql::exec::DescriptionTarget::Sql,
+                                    None,
+                                )
+                            },
                         )
-                    }),
-                Stmt::SetQuery(query) => query::describe_set_query(
-                    &self.storage,
-                    txn.txid,
-                    query,
-                    &mut result_columns,
-                    arena,
-                    crate::sql::exec::DescriptionTarget::Wire,
-                ),
-                Stmt::With { statement, .. } => self.describe_data_modification_columns(
-                    statement,
-                    arena,
-                    txn,
-                    &mut result_columns,
-                    crate::sql::exec::DescriptionTarget::Wire,
-                ),
-                Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => self
-                    .describe_data_modification_columns(
+                    }
+                    Stmt::SetQuery(query) => query::describe_set_query(
+                        &self.storage,
+                        txn.txid,
+                        query,
+                        &mut result_columns,
+                        arena,
+                        crate::sql::exec::DescriptionTarget::Sql,
+                    ),
+                    Stmt::With { statement, .. } => self.describe_data_modification_columns(
                         statement,
                         arena,
                         txn,
                         &mut result_columns,
-                        crate::sql::exec::DescriptionTarget::Wire,
+                        crate::sql::exec::DescriptionTarget::Sql,
                     ),
-                _ => Err(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "utility statements cannot be prepared"
-                )),
-            },
-        );
+                    Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => self
+                        .describe_data_modification_columns(
+                            statement,
+                            arena,
+                            txn,
+                            &mut result_columns,
+                            crate::sql::exec::DescriptionTarget::Sql,
+                        ),
+                    _ => Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "utility statements cannot be prepared"
+                    )),
+                },
+            )
+        });
         let result_count = match described {
             Ok(count) => count,
             Err(error) => return Ok(Err(error)),
@@ -10128,7 +10179,7 @@ impl Engine {
         match sqlprep.store(
             name,
             sql,
-            types,
+            parameter_oids,
             &result_types[..result_count],
             bound_inputs,
         ) {
@@ -10517,7 +10568,7 @@ impl Engine {
             StatementWait::Lock => self.storage.lock_wait_generation(connection),
             StatementWait::ObjectIo => self.lock_generation(),
             StatementWait::CacheCapacity => self.cache_capacity_generation(),
-            StatementWait::ClientOutput => 0,
+            StatementWait::ClientOutput | StatementWait::Timer => 0,
         }
     }
 
@@ -12007,6 +12058,7 @@ impl Engine {
                         && txn.staged_commit().is_none()
                         && txn.commit_admission().is_none()
                         && txn.pending_write_completion.is_none()
+                        && txn.pending_procedure.is_none()
                         && let Err(error) = sequence::ensure_statement_effects_replayable()
                     {
                         e = error;
@@ -12021,7 +12073,34 @@ impl Engine {
                     if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                         || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                     {
-                        if txn.pending_write_completion.is_some() && !lock_timeout_expired {
+                        let mut procedure_timed_out = false;
+                        if txn.pending_procedure.is_some() {
+                            // The saved body keeps its finished statements and
+                            // their output; only the waiting one runs again.
+                            if !lock_timeout_expired {
+                                if txn.suspended_statement_context().is_none() {
+                                    txn.suspend_statement(
+                                        None,
+                                        datetime::statement_clock(),
+                                        query::statement_deadline(),
+                                        routine_transaction_context,
+                                    );
+                                }
+                                self.storage.preserve_advisory_statement();
+                                return Ok(ExecutionStatus::Blocked {
+                                    completed_statements: statement_index,
+                                    output_mark: responder.mark(),
+                                    wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                        StatementWait::ObjectIo
+                                    } else {
+                                        StatementWait::Lock
+                                    },
+                                });
+                            }
+                            txn.pending_procedure = None;
+                            txn.release_suspended_statement();
+                            procedure_timed_out = true;
+                        } else if txn.pending_write_completion.is_some() && !lock_timeout_expired {
                             self.storage.preserve_advisory_statement();
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
@@ -12063,12 +12142,15 @@ impl Engine {
                                 },
                             });
                         }
-                        if txn.concurrent_index.is_some() {
+                        if procedure_timed_out || txn.concurrent_index.is_some() {
+                            // A procedure's earlier transactions stay committed;
+                            // the error path ends only the current one.
                             e = sql_err!(
                                 sqlstate::LOCK_NOT_AVAILABLE,
                                 "canceling statement due to lock timeout"
                             );
                         } else if txn.owns_statement_mark(statement_mark) {
+                            txn.procedure_restart = false;
                             if txn.suspended_statement_context().is_none() {
                                 txn.suspend_statement(
                                     None,
@@ -12097,6 +12179,7 @@ impl Engine {
                                 "canceling statement due to lock timeout"
                             );
                         } else {
+                            txn.procedure_restart = false;
                             e = sql_err!(
                                 sqlstate::FEATURE_NOT_SUPPORTED,
                                 "a non-atomic routine cannot suspend after transaction control"
@@ -12754,6 +12837,7 @@ impl Engine {
                                     && txn.staged_commit().is_none()
                                     && txn.commit_admission().is_none()
                                     && txn.pending_write_completion.is_none()
+                                    && txn.pending_procedure.is_none()
                                     && let Err(error) =
                                         sequence::ensure_statement_effects_replayable()
                                 {
@@ -12770,7 +12854,30 @@ impl Engine {
                                 if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                                 {
-                                    if txn.pending_write_completion.is_some()
+                                    let mut procedure_timed_out = false;
+                                    if txn.pending_procedure.is_some() {
+                                        if !lock_timeout_expired {
+                                            if txn.suspended_statement_context().is_none() {
+                                                txn.suspend_statement(
+                                                    None,
+                                                    datetime::statement_clock(),
+                                                    query::statement_deadline(),
+                                                    routine_transaction_context,
+                                                );
+                                            }
+                                            self.storage.preserve_advisory_statement();
+                                            return Ok(ExtendedExecutionStatus::Blocked {
+                                                wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                                    StatementWait::ObjectIo
+                                                } else {
+                                                    StatementWait::Lock
+                                                },
+                                            });
+                                        }
+                                        txn.pending_procedure = None;
+                                        txn.release_suspended_statement();
+                                        procedure_timed_out = true;
+                                    } else if txn.pending_write_completion.is_some()
                                         && !lock_timeout_expired
                                     {
                                         self.storage.preserve_advisory_statement();
@@ -12810,12 +12917,13 @@ impl Engine {
                                             },
                                         });
                                     }
-                                    if txn.concurrent_index.is_some() {
+                                    if procedure_timed_out || txn.concurrent_index.is_some() {
                                         e = sql_err!(
                                             sqlstate::LOCK_NOT_AVAILABLE,
                                             "canceling statement due to lock timeout"
                                         );
                                     } else if txn.owns_statement_mark(statement_mark) {
+                                        txn.procedure_restart = false;
                                         if txn.suspended_statement_context().is_none() {
                                             txn.suspend_statement(
                                                 None,
@@ -12842,6 +12950,7 @@ impl Engine {
                                             "canceling statement due to lock timeout"
                                         );
                                     } else {
+                                        txn.procedure_restart = false;
                                         e = sql_err!(
                                             sqlstate::FEATURE_NOT_SUPPORTED,
                                             "a non-atomic routine cannot suspend after transaction control"
@@ -13727,11 +13836,27 @@ impl Engine {
         bound_inputs: &[u8],
     ) -> Result<&'a mut [i32], SqlError> {
         let oids = arena
-            .alloc_slice_with(parameter_count, |_| types::oid::TEXT)
+            .alloc_slice_with(parameter_count, |_| types::oid::UNKNOWN)
             .map_err(|_| eval::arena_full())?;
+        // Parse records every type; Bind and Describe reuse that complete list.
+        if client_oid_bytes.len() == parameter_count * 4
+            && client_oid_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|bytes| i32::from_be_bytes(*bytes) != 0)
+        {
+            for (target, bytes) in oids.iter_mut().zip(client_oid_bytes.as_chunks::<4>().0) {
+                *target = i32::from_be_bytes(*bytes);
+            }
+            return Ok(oids);
+        }
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
-            Err(_) => return Ok(oids),
+            Err(_) => {
+                oids.fill(types::oid::TEXT);
+                return Ok(oids);
+            }
         };
         parser.set_type_inputs(type_inputs::decode(bound_inputs, arena)?);
         if let Ok(Some(statement)) = parser.next_stmt() {
@@ -13745,6 +13870,7 @@ impl Engine {
                 oids[i] = c;
             }
         }
+        param_types::finish_unresolved(text, arena, oids)?;
         Ok(oids)
     }
 
@@ -15736,10 +15862,16 @@ impl Engine {
                 })
             })
         {
-            return Ok(Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "expression wait requires an owned invocation log"
-            )));
+            if txn.running_procedures == 0 {
+                return Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "expression wait requires an owned invocation log"
+                )));
+            }
+            // A procedure statement whose calls no saved frame owns makes the
+            // whole statement roll back and run again, which is possible
+            // only before the procedure's first transaction control.
+            txn.procedure_restart = true;
         }
         if result.as_ref().is_ok_and(|outcome| {
             outcome.as_ref().is_err_and(|error| {
@@ -16299,11 +16431,12 @@ impl Engine {
             let succeeded = executed.is_ok();
             if let Some((total, own)) = timed.finish()
                 && succeeded
-                && let Err(error) = self.storage.record_function_call(
+                && let Err(error) = statistics::record_completed_call(
+                    &self.storage,
                     txn.txid,
                     crate::storage::routine_oid(&routine),
-                    total,
-                    own,
+                    (total, own),
+                    work,
                 )
             {
                 return Ok(Err(error));
@@ -16403,9 +16536,13 @@ impl Engine {
             }
             if let Some((total, own)) = timed.finish()
                 && retained.is_ok()
-                && let Err(error) =
-                    self.storage
-                        .record_function_call(transaction.txid, oid, total, own)
+                && let Err(error) = statistics::record_completed_call(
+                    &self.storage,
+                    transaction.txid,
+                    oid,
+                    (total, own),
+                    work,
+                )
             {
                 return Ok(Err(error));
             }
@@ -17724,21 +17861,37 @@ impl Engine {
         guc: &GucState,
         transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
+        retention: Option<&mut Option<exec::SuspendedProcedure>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) = self.storage.require_language_usage("plpgsql", txn.txid) {
             return Ok(Err(error));
         }
-        match exec::execute_anonymous_plpgsql(
-            self,
-            txn,
-            sqlprep,
-            cursors,
-            guc,
-            transaction_context,
-            body,
-            arena,
-            responder,
-        ) {
+        let executed = match retention {
+            Some(retention) => exec::execute_retained_anonymous_plpgsql(
+                self,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                transaction_context,
+                body,
+                arena,
+                responder,
+                retention,
+            ),
+            None => exec::execute_anonymous_plpgsql(
+                self,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                transaction_context,
+                body,
+                arena,
+                responder,
+            ),
+        };
+        match executed {
             Ok(()) => responder.command_complete("DO").map(|_| Ok(())),
             Err(error) => Ok(Err(error)),
         }
@@ -17772,21 +17925,33 @@ impl Engine {
             crate::storage::RoutineCallKind::Procedure,
         ) {
             crate::storage::RoutineCallSelection::Stored(slot) => Ok((slot, types)),
-            crate::storage::RoutineCallSelection::Ambiguous => Err(sql_err!(
-                sqlstate::AMBIGUOUS_FUNCTION,
-                "procedure {} is not unique",
-                qualified
-            )),
-            crate::storage::RoutineCallSelection::WrongKind { .. } => Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "{} is not a procedure",
-                qualified
-            )),
-            crate::storage::RoutineCallSelection::Absent => Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "procedure {} does not exist",
-                qualified
-            )),
+            failure @ (crate::storage::RoutineCallSelection::Ambiguous
+            | crate::storage::RoutineCallSelection::WrongKind { .. }
+            | crate::storage::RoutineCallSelection::Absent) => {
+                let columns = exec::CatalogCols {
+                    definition: None,
+                    alias: None,
+                    output_aliases: &[],
+                    storage: &self.storage,
+                    txid,
+                    arena,
+                };
+                Err(exec::procedure_lookup_error(
+                    qualified,
+                    &types[..arguments.len()],
+                    argument_names,
+                    match failure {
+                        crate::storage::RoutineCallSelection::Ambiguous => {
+                            exec::FunctionLookupFailure::Ambiguous
+                        }
+                        crate::storage::RoutineCallSelection::WrongKind { .. } => {
+                            exec::FunctionLookupFailure::NotProcedure
+                        }
+                        _ => exec::FunctionLookupFailure::Missing,
+                    },
+                    &columns,
+                ))
+            }
             crate::storage::RoutineCallSelection::Builtin { .. } => Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "builtin procedure {} is not implemented",
@@ -17796,13 +17961,15 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_call(
+    /// Runs `CALL`. A top-level call sends the output parameters as one row;
+    /// a call from PL/pgSQL passes `capture` and receives them instead.
+    pub(crate) fn execute_call<'a>(
         &mut self,
         name: ast::QualName<'_>,
         arguments: &[&Expr<'_>],
         argument_names: &[Option<&str>],
         variadic: bool,
-        arena: &Arena,
+        arena: &'a Arena,
         params: &[Datum],
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
@@ -17810,12 +17977,27 @@ impl Engine {
         guc: &GucState,
         transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
+        mut capture: Option<&mut exec::ProcedureOutputs<'a>>,
+        mut retention: Option<&mut Option<exec::SuspendedProcedure>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        // A saved body resumes in place of a new call: its settings, timer and
+        // statistics entry already belong to the first attempt.
+        let resuming = retention.as_ref().is_some_and(|saved| saved.is_some());
         let outcome = (|| {
             if arguments.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
                 return Ok(Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many procedure arguments"
+                )));
+            }
+            // PostgreSQL's parse analysis of a CALL argument rejects subqueries.
+            if arguments
+                .iter()
+                .any(|argument| argument.contains_subquery())
+            {
+                return Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot use subquery in CALL argument"
                 )));
             }
             let qualified = match name.schema {
@@ -17841,6 +18023,12 @@ impl Engine {
                 ..NO_HOOKS
             };
             let mut declared = self.storage.routine_for(slot, txn.txid);
+            if let Some(capture) = capture.as_deref_mut()
+                && let Err(error) =
+                    capture.bind(&declared, argument_names, arguments.len(), variadic)
+            {
+                return Ok(Err(error));
+            }
             let mapping = declared
                 .procedure_call_mapping(argument_names, arguments.len(), variadic)
                 .expect("selected procedure has a complete CALL parameter mapping");
@@ -17879,335 +18067,115 @@ impl Engine {
                 Ok(role) => crate::storage::SessionIdentity::bound(role),
                 Err(error) => return Ok(Err(error)),
             };
-            let _security = routine
+            let security = routine
                 .attributes
                 .security_definer
                 .then(|| eval::funcs::system::enter_current_user(owner));
-            let _config = match guc.enter_routine_configs(routine.configs()) {
-                Ok(scope) => scope,
-                Err(error) => return Ok(Err(error)),
+            let config = if resuming {
+                None
+            } else {
+                match guc.enter_routine_configs(routine.configs()) {
+                    Ok(scope) => Some(scope),
+                    Err(error) => return Ok(Err(error)),
+                }
             };
+            let environment = exec::CallEnvironment::new(config, security);
             let role = eval::funcs::system::current_user_owned();
             if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
                 return Ok(Err(error));
             }
             timezone::set_session(guc.timezone());
-            if routine.language == crate::storage::RoutineLanguage::PlPgSql {
-                let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-                let (instance, conflict) = match self.plpgsql_instance_owner(
-                    routine,
-                    input_collation,
-                    txn,
-                    sqlprep,
-                    guc,
-                    arena,
-                ) {
-                    Ok(owner) => owner,
+            // pg_stat_user_functions counts each completed procedure call.
+            let track = match guc.track_functions() {
+                guc::TrackFunctions::None => false,
+                guc::TrackFunctions::Pl => {
+                    routine.language == crate::storage::RoutineLanguage::PlPgSql
+                }
+                guc::TrackFunctions::All => true,
+            };
+            let procedure_oid = crate::storage::routine_oid(routine);
+            let mut timed = if resuming {
+                None
+            } else {
+                match statistics::begin_function_timing(track) {
+                    Ok(timed) => Some(timed),
                     Err(error) => return Ok(Err(error)),
-                };
-                let output_count = match type_input_plans::with_owner(instance, || {
-                    exec::execute_plpgsql_procedure(
-                        self,
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        if transaction_context == exec::PlpgsqlTransactionContext::NonAtomic
-                            && !routine.attributes.security_definer
-                            && routine.configs().is_empty()
-                        {
-                            exec::PlpgsqlTransactionContext::NonAtomic
-                        } else {
-                            exec::PlpgsqlTransactionContext::Atomic
-                        },
+                }
+            };
+            if track
+                && !resuming
+                && let Err(error) = self.storage.ensure_function_statistics(procedure_oid)
+            {
+                return Ok(Err(error));
+            }
+            let executed = (|| {
+                if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+                    let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                    let (instance, conflict) = match self.plpgsql_instance_owner(
                         routine,
                         input_collation,
-                        &completed[..declared.argument_count],
+                        txn,
+                        sqlprep,
+                        guc,
                         arena,
-                        responder,
-                        &mut output_values,
-                        conflict,
-                    )
-                }) {
-                    Ok(count) => count,
-                    Err(error) => return Ok(Err(error)),
-                };
-                if output_count != 0 {
-                    let mut description = [ColDesc::new("", types::oid::TEXT, -1);
-                        crate::storage::MAX_ROUTINE_ARGUMENTS];
-                    let mut output_index = 0usize;
-                    for parameter in routine.parameters() {
-                        if !parameter.mode.is_output() {
-                            continue;
-                        }
-                        let type_oid = match self.storage.routine_type_oid(
-                            parameter.ctype,
-                            parameter.user_type,
-                            txn.txid,
-                        ) {
-                            Some(oid) => oid,
-                            None => {
-                                return Ok(Err(sql_err!(
-                                    sqlstate::INTERNAL_ERROR,
-                                    "procedure output type identity is unavailable"
-                                )));
-                            }
-                        };
-                        description[output_index] = ColDesc::new(
-                            match arena.alloc_str(parameter.name.as_str()) {
-                                Ok(name) => name,
-                                Err(_) => return Ok(Err(eval::arena_full())),
-                            },
-                            type_oid,
-                            parameter.ctype.typlen(),
-                        );
-                        output_values[output_index] = match eval::cast_to(
-                            output_values[output_index],
-                            parameter.ctype,
-                            arena,
-                        ) {
-                            Ok(value) => value,
-                            Err(error) => return Ok(Err(error)),
-                        };
-                        output_index += 1;
-                    }
-                    responder.row_description(&description[..output_count])?;
-                    responder.data_row(&output_values[..output_count])?;
-                }
-                return responder.command_complete("CALL").map(|_| Ok(()));
-            }
-            if routine.language != crate::storage::RoutineLanguage::Sql {
-                return Ok(Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "procedure language is not executable"
-                )));
-            }
-            let body = match arena.alloc_str(routine.body.as_str()) {
-                Ok(body) => body,
-                Err(_) => return Ok(Err(eval::arena_full())),
-            };
-            let routine_name = match arena.alloc_str(routine.name.as_str()) {
-                Ok(name) => name,
-                Err(_) => return Ok(Err(eval::arena_full())),
-            };
-            let _formal_scope = match exec::enter_routine_parameter_types(
-                routine.arguments(),
-                Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
-                input_collation,
-            ) {
-                Ok(scope) => scope,
-                Err(error) => return Ok(Err(error)),
-            };
-            let body_inputs = match self.prepare_routine_body_inputs(
-                RoutineBodyInputOrigin::Procedure,
-                slot,
-                routine,
-                input_collation,
-                body,
-                arena,
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                responder,
-            )? {
-                Ok(inputs) => inputs,
-                Err(error) => return Ok(Err(error)),
-            };
-            type_input_plans::with_owner(body_inputs.owner, || {
-                type_inputs::with_source(body_inputs.source, body, body_inputs.bindings, || {
-                    let mut parser = match Parser::new(body, arena).and_then(|parser| {
-                        parser.with_routine_parameters(routine_name, routine.arguments())
-                    }) {
-                        Ok(parser) => parser,
-                        Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+                    ) {
+                        Ok(owner) => owner,
+                        Err(error) => return Ok(Err(error)),
                     };
-                    parser.set_type_inputs(body_inputs.bindings);
-                    let output_mark = responder.mark();
-                    let statements =
-                        match arena.alloc_slice_with(parser::statement_capacity(body), |_| None) {
-                            Ok(statements) => statements,
-                            Err(_) => return Ok(Err(eval::arena_full())),
-                        };
-                    let mut statement_count = 0usize;
-                    loop {
-                        let statement = match parser.next_stmt() {
-                            Ok(Some(statement)) => statement,
-                            Ok(None) => break,
-                            Err(error) => {
-                                // An error replaces only output the client has not received.
-                                let _ = responder.truncate_to(output_mark);
-                                return Ok(Err(parse_error_to_sql(&error)));
-                            }
-                        };
-                        debug_assert!(statement_count < statements.len());
-                        statements[statement_count] = Some(statement);
-                        statement_count += 1;
-                    }
-                    let validated = if routine.body_kind == crate::storage::RoutineBodyKind::String
-                    {
-                        type_inputs::validate_restored(&parser, &self.storage, txn.txid)
-                    } else {
-                        query::validate_stored_type_inputs(
-                            &parser,
-                            &self.storage,
-                            txn.txid,
-                            self.storage.routine_dependencies_for(slot, txn.txid).view(),
-                        )
-                    };
-                    if let Err(error) = validated {
-                        return Ok(Err(error));
-                    }
-                    let mut output_parameters = [crate::storage::RoutineParameterDef::EMPTY;
-                        crate::storage::MAX_ROUTINE_ARGUMENTS];
-                    let mut output_count = 0usize;
-                    for parameter in routine.parameters() {
-                        if parameter.mode.is_output() {
-                            output_parameters[output_count] = *parameter;
-                            output_count += 1;
-                        }
-                    }
-                    // Output parameters form a `record` that the final statement
-                    // must produce; PostgreSQL checks it before running the body.
-                    if output_count != 0
-                        && !statement_count
-                            .checked_sub(1)
-                            .and_then(|last| statements[last].as_ref())
-                            .is_some_and(|statement| {
-                                matches!(statement, Stmt::Select(_) | Stmt::SetQuery(_))
-                                    || query::statement_returns_rows(statement)
-                            })
-                    {
-                        return Ok(Err(query::routine_result_mismatch(
-                            "record",
-                            query::ROUTINE_RESULT_STATEMENT_DETAIL,
-                        )));
-                    }
-                    let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-                    let mut output_rows = 0usize;
-                    // The final statement's first row supplies the outputs.
-                    let mut store_output = |values: &[Datum<'_>]| -> Result<(), SqlError> {
-                        if output_rows != 0 {
-                            return Ok(());
-                        }
-                        if values.len() != output_count {
-                            return Err(query::routine_result_mismatch(
-                                "record",
-                                if values.len() > output_count {
-                                    "Final statement returns too many columns."
-                                } else {
-                                    "Final statement returns too few columns."
-                                },
-                            ));
-                        }
-                        let encoded = exec::encode_projected_pub(values, arena)?;
-                        for (column, output) in output_values[..output_count].iter_mut().enumerate()
-                        {
-                            *output = exec::decode_projected_col_record(encoded, column, arena)?;
-                        }
-                        output_rows = 1;
-                        Ok(())
-                    };
-                    for (index, statement) in statements[..statement_count]
-                        .iter()
-                        .map(|statement| statement.as_ref().expect("parsed procedure statement"))
-                        .enumerate()
-                    {
-                        if let Some(name) = query::routine_statement_forbidden(statement) {
-                            // An error replaces only output the client has not received.
-                            let _ = responder.truncate_to(output_mark);
-                            return Ok(Err(query::routine_forbidden_statement_error(name)));
-                        }
-                        let statement = match query::bind_stored_routine_statement(
-                            statement,
-                            &self.storage,
-                            slot,
-                            routine,
-                            txn.txid,
-                            arena,
-                            &completed[..declared.argument_count],
-                        ) {
-                            Ok(statement) => statement,
-                            Err(error) => return Ok(Err(error)),
-                        };
-                        // A top-level CALL has no enclosing query workspace; reclaim each
-                        // suppressed internal result exactly as the ordinary dispatcher
-                        // did before routine dispatch gained a non-resetting mode.
-                        self.work.reset();
-                        let final_output = output_count != 0 && index + 1 == statement_count;
-                        let output_query = match statement {
-                            Stmt::Select(select) if final_output => {
-                                Some(query::RoutineQuery::Select(select))
-                            }
-                            Stmt::SetQuery(set) if final_output => {
-                                Some(query::RoutineQuery::Set(set))
-                            }
-                            _ => None,
-                        };
-                        if let Some(output_query) = output_query {
-                            let sequence =
-                                sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
-                            if let Err(error) = query::execute_bound_routine_query(
-                                &output_query,
-                                &self.storage,
-                                slot,
-                                routine,
-                                txn.txid,
-                                arena,
-                                &completed[..declared.argument_count],
-                                false,
-                                Some(&sequence),
-                                &mut |values| store_output(values),
-                            ) {
-                                // An error replaces only output the client has not received.
-                                let _ = responder.truncate_to(output_mark);
-                                return Ok(Err(error));
-                            }
-                            continue;
-                        }
-                        let mut capture =
-                            |_: &Storage, _: u32, _: &dyn SequenceAccess, values: &[Datum<'_>]| {
-                                store_output(values)
-                            };
-                        match self.execute_routine_stmt(
-                            statement,
-                            arena,
-                            &completed[..declared.argument_count],
+                    let executed = type_input_plans::with_owner(instance, || {
+                        exec::execute_plpgsql_procedure(
+                            self,
                             txn,
                             sqlprep,
                             cursors,
                             guc,
+                            if transaction_context == exec::PlpgsqlTransactionContext::NonAtomic
+                                && !routine.attributes.security_definer
+                                && routine.configs().is_empty()
+                            {
+                                exec::PlpgsqlTransactionContext::NonAtomic
+                            } else {
+                                exec::PlpgsqlTransactionContext::Atomic
+                            },
+                            routine,
+                            input_collation,
+                            &completed[..declared.argument_count],
+                            arena,
                             responder,
-                            final_output.then_some(&mut capture as &mut ReturningCapture<'_>),
-                        ) {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                // An error replaces only output the client has not received.
-                                let _ = responder.truncate_to(output_mark);
-                                return Ok(Err(error));
-                            }
-                            Err(error) => {
-                                // An error replaces only output the client has not received.
-                                let _ = responder.truncate_to(output_mark);
-                                return Err(error);
-                            }
+                            &mut output_values,
+                            conflict,
+                            &environment,
+                            timed.take(),
+                            retention.as_deref_mut(),
+                        )
+                    });
+                    let output_count = match executed {
+                        Ok((count, timing)) => {
+                            timed = Some(timing);
+                            count
                         }
-                    }
-                    if output_count != 0 && output_rows == 0 {
-                        let _ = responder.truncate_to(output_mark);
-                        return Ok(Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "procedure returned null record"
-                        )));
-                    }
-                    if let Err(error) = responder.truncate_to(output_mark) {
-                        return Ok(Err(error));
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    if let Some(capture) = capture.as_deref_mut() {
+                        if let Err(error) = capture.record(
+                            routine,
+                            &output_values[..output_count],
+                            &self.storage,
+                            txn.txid,
+                            arena,
+                        ) {
+                            return Ok(Err(error));
+                        }
+                        return Ok(Ok(()));
                     }
                     if output_count != 0 {
                         let mut description = [ColDesc::new("", types::oid::TEXT, -1);
                             crate::storage::MAX_ROUTINE_ARGUMENTS];
-                        for index in 0..output_count {
-                            let parameter = output_parameters[index];
+                        let mut output_index = 0usize;
+                        for parameter in routine.parameters() {
+                            if !parameter.mode.is_output() {
+                                continue;
+                            }
                             let type_oid = match self.storage.routine_type_oid(
                                 parameter.ctype,
                                 parameter.user_type,
@@ -18221,7 +18189,7 @@ impl Engine {
                                     )));
                                 }
                             };
-                            description[index] = ColDesc::new(
+                            description[output_index] = ColDesc::new(
                                 match arena.alloc_str(parameter.name.as_str()) {
                                     Ok(name) => name,
                                     Err(_) => return Ok(Err(eval::arena_full())),
@@ -18229,18 +18197,327 @@ impl Engine {
                                 type_oid,
                                 parameter.ctype.typlen(),
                             );
-                            output_values[index] =
-                                match eval::cast_to(output_values[index], parameter.ctype, arena) {
-                                    Ok(value) => value,
-                                    Err(error) => return Ok(Err(error)),
-                                };
+                            output_values[output_index] = match eval::cast_to(
+                                output_values[output_index],
+                                parameter.ctype,
+                                arena,
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            output_index += 1;
                         }
                         responder.row_description(&description[..output_count])?;
                         responder.data_row(&output_values[..output_count])?;
                     }
-                    responder.command_complete("CALL").map(|_| Ok(()))
+                    return responder.command_complete("CALL").map(|_| Ok(()));
+                }
+                if routine.language != crate::storage::RoutineLanguage::Sql {
+                    return Ok(Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "procedure language is not executable"
+                    )));
+                }
+                let body = match arena.alloc_str(routine.body.as_str()) {
+                    Ok(body) => body,
+                    Err(_) => return Ok(Err(eval::arena_full())),
+                };
+                let routine_name = match arena.alloc_str(routine.name.as_str()) {
+                    Ok(name) => name,
+                    Err(_) => return Ok(Err(eval::arena_full())),
+                };
+                let _formal_scope = match exec::enter_routine_parameter_types(
+                    routine.arguments(),
+                    Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+                    input_collation,
+                ) {
+                    Ok(scope) => scope,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let body_inputs = match self.prepare_routine_body_inputs(
+                    RoutineBodyInputOrigin::Procedure,
+                    slot,
+                    routine,
+                    input_collation,
+                    body,
+                    arena,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                )? {
+                    Ok(inputs) => inputs,
+                    Err(error) => return Ok(Err(error)),
+                };
+                type_input_plans::with_owner(body_inputs.owner, || {
+                    type_inputs::with_source(body_inputs.source, body, body_inputs.bindings, || {
+                        let mut parser = match Parser::new(body, arena).and_then(|parser| {
+                            parser.with_routine_parameters(routine_name, routine.arguments())
+                        }) {
+                            Ok(parser) => parser,
+                            Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+                        };
+                        parser.set_type_inputs(body_inputs.bindings);
+                        let output_mark = responder.mark();
+                        let statements = match arena
+                            .alloc_slice_with(parser::statement_capacity(body), |_| None)
+                        {
+                            Ok(statements) => statements,
+                            Err(_) => return Ok(Err(eval::arena_full())),
+                        };
+                        let mut statement_count = 0usize;
+                        loop {
+                            let statement = match parser.next_stmt() {
+                                Ok(Some(statement)) => statement,
+                                Ok(None) => break,
+                                Err(error) => {
+                                    // An error replaces only output the client has not received.
+                                    let _ = responder.truncate_to(output_mark);
+                                    return Ok(Err(parse_error_to_sql(&error)));
+                                }
+                            };
+                            debug_assert!(statement_count < statements.len());
+                            statements[statement_count] = Some(statement);
+                            statement_count += 1;
+                        }
+                        let validated =
+                            if routine.body_kind == crate::storage::RoutineBodyKind::String {
+                                type_inputs::validate_restored(&parser, &self.storage, txn.txid)
+                            } else {
+                                query::validate_stored_type_inputs(
+                                    &parser,
+                                    &self.storage,
+                                    txn.txid,
+                                    self.storage.routine_dependencies_for(slot, txn.txid).view(),
+                                )
+                            };
+                        if let Err(error) = validated {
+                            return Ok(Err(error));
+                        }
+                        let mut output_parameters = [crate::storage::RoutineParameterDef::EMPTY;
+                            crate::storage::MAX_ROUTINE_ARGUMENTS];
+                        let mut output_count = 0usize;
+                        for parameter in routine.parameters() {
+                            if parameter.mode.is_output() {
+                                output_parameters[output_count] = *parameter;
+                                output_count += 1;
+                            }
+                        }
+                        // Output parameters form a `record` that the final statement
+                        // must produce; PostgreSQL checks it before running the body.
+                        if output_count != 0
+                            && !statement_count
+                                .checked_sub(1)
+                                .and_then(|last| statements[last].as_ref())
+                                .is_some_and(|statement| {
+                                    matches!(statement, Stmt::Select(_) | Stmt::SetQuery(_))
+                                        || query::statement_returns_rows(statement)
+                                })
+                        {
+                            return Ok(Err(query::routine_result_mismatch(
+                                "record",
+                                query::ROUTINE_RESULT_STATEMENT_DETAIL,
+                            )));
+                        }
+                        let mut output_values =
+                            [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                        let mut output_rows = 0usize;
+                        // The final statement's first row supplies the outputs.
+                        let mut store_output = |values: &[Datum<'_>]| -> Result<(), SqlError> {
+                            if output_rows != 0 {
+                                return Ok(());
+                            }
+                            if values.len() != output_count {
+                                return Err(query::routine_result_mismatch(
+                                    "record",
+                                    if values.len() > output_count {
+                                        "Final statement returns too many columns."
+                                    } else {
+                                        "Final statement returns too few columns."
+                                    },
+                                ));
+                            }
+                            let encoded = exec::encode_projected_pub(values, arena)?;
+                            for (column, output) in
+                                output_values[..output_count].iter_mut().enumerate()
+                            {
+                                *output =
+                                    exec::decode_projected_col_record(encoded, column, arena)?;
+                            }
+                            output_rows = 1;
+                            Ok(())
+                        };
+                        for (index, statement) in statements[..statement_count]
+                            .iter()
+                            .map(|statement| {
+                                statement.as_ref().expect("parsed procedure statement")
+                            })
+                            .enumerate()
+                        {
+                            if let Some(name) = query::routine_statement_forbidden(statement) {
+                                // An error replaces only output the client has not received.
+                                let _ = responder.truncate_to(output_mark);
+                                return Ok(Err(query::routine_forbidden_statement_error(name)));
+                            }
+                            let statement = match query::bind_stored_routine_statement(
+                                statement,
+                                &self.storage,
+                                slot,
+                                routine,
+                                txn.txid,
+                                arena,
+                                &completed[..declared.argument_count],
+                            ) {
+                                Ok(statement) => statement,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            // A top-level CALL has no enclosing query workspace; reclaim each
+                            // suppressed internal result exactly as the ordinary dispatcher
+                            // did before routine dispatch gained a non-resetting mode.
+                            self.work.reset();
+                            let final_output = output_count != 0 && index + 1 == statement_count;
+                            let output_query = match statement {
+                                Stmt::Select(select) if final_output => {
+                                    Some(query::RoutineQuery::Select(select))
+                                }
+                                Stmt::SetQuery(set) if final_output => {
+                                    Some(query::RoutineQuery::Set(set))
+                                }
+                                _ => None,
+                            };
+                            if let Some(output_query) = output_query {
+                                let sequence = sequence::SeqEval::new(
+                                    &self.storage,
+                                    guc.seq_session(),
+                                    txn.txid,
+                                );
+                                if let Err(error) = query::execute_bound_routine_query(
+                                    &output_query,
+                                    &self.storage,
+                                    slot,
+                                    routine,
+                                    txn.txid,
+                                    arena,
+                                    &completed[..declared.argument_count],
+                                    false,
+                                    Some(&sequence),
+                                    &mut |values| store_output(values),
+                                ) {
+                                    // An error replaces only output the client has not received.
+                                    let _ = responder.truncate_to(output_mark);
+                                    return Ok(Err(error));
+                                }
+                                continue;
+                            }
+                            let mut capture =
+                                |_: &Storage,
+                                 _: u32,
+                                 _: &dyn SequenceAccess,
+                                 values: &[Datum<'_>]| {
+                                    store_output(values)
+                                };
+                            match self.execute_routine_stmt(
+                                statement,
+                                arena,
+                                &completed[..declared.argument_count],
+                                txn,
+                                sqlprep,
+                                cursors,
+                                guc,
+                                responder,
+                                final_output.then_some(&mut capture as &mut ReturningCapture<'_>),
+                            ) {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => {
+                                    // An error replaces only output the client has not received.
+                                    let _ = responder.truncate_to(output_mark);
+                                    return Ok(Err(error));
+                                }
+                                Err(error) => {
+                                    // An error replaces only output the client has not received.
+                                    let _ = responder.truncate_to(output_mark);
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        if output_count != 0 && output_rows == 0 {
+                            let _ = responder.truncate_to(output_mark);
+                            return Ok(Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "procedure returned null record"
+                            )));
+                        }
+                        if let Err(error) = responder.truncate_to(output_mark) {
+                            return Ok(Err(error));
+                        }
+                        if let Some(capture) = capture.as_deref_mut() {
+                            if let Err(error) = capture.record(
+                                routine,
+                                &output_values[..output_count],
+                                &self.storage,
+                                txn.txid,
+                                arena,
+                            ) {
+                                return Ok(Err(error));
+                            }
+                            return Ok(Ok(()));
+                        }
+                        if output_count != 0 {
+                            let mut description = [ColDesc::new("", types::oid::TEXT, -1);
+                                crate::storage::MAX_ROUTINE_ARGUMENTS];
+                            for index in 0..output_count {
+                                let parameter = output_parameters[index];
+                                let type_oid = match self.storage.routine_type_oid(
+                                    parameter.ctype,
+                                    parameter.user_type,
+                                    txn.txid,
+                                ) {
+                                    Some(oid) => oid,
+                                    None => {
+                                        return Ok(Err(sql_err!(
+                                            sqlstate::INTERNAL_ERROR,
+                                            "procedure output type identity is unavailable"
+                                        )));
+                                    }
+                                };
+                                description[index] = ColDesc::new(
+                                    match arena.alloc_str(parameter.name.as_str()) {
+                                        Ok(name) => name,
+                                        Err(_) => return Ok(Err(eval::arena_full())),
+                                    },
+                                    type_oid,
+                                    parameter.ctype.typlen(),
+                                );
+                                output_values[index] = match eval::cast_to(
+                                    output_values[index],
+                                    parameter.ctype,
+                                    arena,
+                                ) {
+                                    Ok(value) => value,
+                                    Err(error) => return Ok(Err(error)),
+                                };
+                            }
+                            responder.row_description(&description[..output_count])?;
+                            responder.data_row(&output_values[..output_count])?;
+                        }
+                        responder.command_complete("CALL").map(|_| Ok(()))
+                    })
                 })
-            })
+            })();
+            if let Some((total, own)) = timed.and_then(statistics::FunctionTiming::finish)
+                && matches!(executed, Ok(Ok(())))
+                && let Err(error) = statistics::record_completed_call(
+                    &self.storage,
+                    txn.txid,
+                    procedure_oid,
+                    (total, own),
+                    arena,
+                )
+            {
+                return Ok(Err(error));
+            }
+            executed
         })();
         let role = eval::funcs::system::current_identity();
         let role = if matches!(outcome, Ok(Ok(()))) {
@@ -18419,23 +18696,13 @@ impl Engine {
         arena: &'a Arena,
         txid: u32,
     ) -> Result<&'a Stmt<'a>, SqlError> {
-        let text = sqlprep.get(name).ok_or_else(|| SqlError {
-            sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
-            message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
-        })?;
-        let declared = sqlprep.get_type_codes(name).map_or(0, <[u8]>::len);
-        if declared != 0 && argument_count != declared {
-            return Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::PROTOCOL_VIOLATION),
-                message: stack_format!(
-                    192,
-                    "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
-                    name,
-                    declared,
-                    argument_count
-                ),
-            });
-        }
+        let text = sqlprep
+            .get(name)
+            .ok_or_else(|| prepared_statement_missing(name))?;
+        let declared = sqlprep
+            .parameter_types(name)
+            .map_or(0, prep::PreparedTypeOids::len);
+        check_prepared_argument_count(name, declared, argument_count)?;
         let text = arena.alloc_str(text).map_err(|_| SqlError {
             sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
             message: stack_format!(192, "statement too large for SQL arena"),
@@ -18476,46 +18743,56 @@ impl Engine {
             })
     }
 
-    /// Evaluates SQL-level EXECUTE arguments once for an analyzed prepared
-    /// statement.  Planning and execution therefore use the same declared
-    /// parameter contract instead of treating EXPLAIN as a second protocol.
-    fn prepared_explain_arguments<'a>(
+    /// Evaluates SQL-level `EXECUTE` arguments once and converts each to the
+    /// type its parameter recorded at PREPARE, returning the values and those
+    /// types. `EXECUTE`, `EXPLAIN ANALYZE EXECUTE` and PL/pgSQL share this
+    /// contract.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "argument evaluation names the statement, caller values and execution context"
+    )]
+    pub(crate) fn prepared_arguments<'a>(
         &self,
         name: &str,
         arguments: &[&'a Expr<'a>],
         outer_params: &[Datum<'a>],
         sqlprep: &SqlPreparedPool,
         arena: &'a Arena,
-    ) -> Result<&'a [Datum<'a>], SqlError> {
-        let declared_codes = sqlprep.get_type_codes(name).ok_or_else(|| SqlError {
-            sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
-            message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
-        })?;
-        let declared = prep::decode_types(declared_codes, arena)?;
-        if !declared.is_empty() && arguments.len() != declared.len() {
-            return Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::PROTOCOL_VIOLATION),
-                message: stack_format!(
-                    192,
-                    "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
-                    name,
-                    declared.len(),
-                    arguments.len()
-                ),
-            });
-        }
+        txid: u32,
+        sequence_session: &guc::SeqSession,
+    ) -> Result<(&'a [Datum<'a>], &'a [i32]), SqlError> {
+        let declared = sqlprep
+            .parameter_types(name)
+            .ok_or_else(|| prepared_statement_missing(name))?
+            .copy_into(arena)?;
+        check_prepared_argument_count(name, declared.len(), arguments.len())?;
+        // A statement without parameters ignores EXECUTE arguments, as in PostgreSQL.
+        let arguments = &arguments[..declared.len()];
         let values = arena
             .alloc_slice_with(arguments.len(), |_| Datum::Null)
             .map_err(|_| eval::arena_full())?;
+        let catalog = query::storage_catalog(&self.storage, arena, txid);
+        let sequences = sequence::SeqEval::new(&self.storage, sequence_session, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequences),
+            ..NO_HOOKS
+        };
         for (index, argument) in arguments.iter().enumerate() {
-            let value = eval(argument, arena, outer_params, &NoColumns)?;
-            values[index] = if index < declared.len() {
-                eval::cast(value, declared[index].internal_name(), arena)?
-            } else {
-                value
-            };
+            let source = exec::infer_type_catalog(argument, None, &self.storage, txid, arena)?.0;
+            let value = eval::eval_full(argument, arena, outer_params, &NoColumns, &hooks)?;
+            values[index] = prep::coerce_argument(
+                &self.storage,
+                txid,
+                index,
+                value,
+                source,
+                declared[index],
+                arena,
+                Some(&sequences),
+            )?;
         }
-        Ok(values)
+        Ok((values, declared))
     }
 
     /// Outer Result: wire-level trouble. Inner Result: SQL-level error.
@@ -18906,7 +19183,11 @@ impl Engine {
         {
             return Ok(Err(error));
         }
-        let _atomic_reads = if statement_writes(statement) {
+        // A top-level procedure body owns its waits: its queries may yield on
+        // storage reads before an effect, while its writes block.
+        let retained_body =
+            reset_workspace && matches!(statement, Stmt::Call { .. } | Stmt::Do { .. });
+        let _atomic_reads = if statement_writes(statement) && !retained_body {
             self.ckpt
                 .as_ref()
                 .map(Checkpointer::atomic_block_read_scope)
@@ -19068,8 +19349,11 @@ impl Engine {
         {
             // Transfer ownership before returning to the reactor. The next
             // attempt resumes this command and view; it is not a new statement.
+            // A saved procedure body resumes at a later statement, possibly in
+            // a transaction it started, so it takes a new snapshot instead.
+            let lease = txn.pending_procedure.is_none().then_some(lease);
             txn.suspend_statement(
-                Some(lease),
+                lease,
                 statement_clock,
                 query::statement_deadline(),
                 routine_transaction_context,
@@ -19239,11 +19523,18 @@ impl Engine {
                 if options.analyze
                     && let Stmt::ExecutePrepared { name, args } = statement
                 {
-                    prepared_params =
-                        match self.prepared_explain_arguments(name, args, params, sqlprep, arena) {
-                            Ok(values) => values,
-                            Err(error) => return Ok(Err(error)),
-                        };
+                    prepared_params = match self.prepared_arguments(
+                        name,
+                        args,
+                        params,
+                        sqlprep,
+                        arena,
+                        txn.txid,
+                        guc.seq_session(),
+                    ) {
+                        Ok((values, _)) => values,
+                        Err(error) => return Ok(Err(error)),
+                    };
                 }
                 let actual = if options.analyze {
                     let before = self.storage.block_io_stats();
@@ -19623,30 +19914,52 @@ impl Engine {
                 arguments,
                 argument_names,
                 variadic,
-            } => self.execute_call(
-                *name,
-                arguments,
-                argument_names,
-                *variadic,
-                arena,
-                params,
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                routine_transaction_context,
-                responder,
-            ),
-            Stmt::Do { body } => self.execute_do(
-                body,
-                arena,
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                routine_transaction_context,
-                responder,
-            ),
+            } => {
+                // A top-level statement owns its waiting procedure body.
+                let mut saved = if reset_workspace {
+                    txn.pending_procedure.take()
+                } else {
+                    None
+                };
+                let outcome = self.execute_call(
+                    *name,
+                    arguments,
+                    argument_names,
+                    *variadic,
+                    arena,
+                    params,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    routine_transaction_context,
+                    responder,
+                    None,
+                    reset_workspace.then_some(&mut saved),
+                );
+                txn.pending_procedure = saved;
+                outcome
+            }
+            Stmt::Do { body } => {
+                let mut saved = if reset_workspace {
+                    txn.pending_procedure.take()
+                } else {
+                    None
+                };
+                let outcome = self.execute_do(
+                    body,
+                    arena,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    routine_transaction_context,
+                    responder,
+                    reset_workspace.then_some(&mut saved),
+                );
+                txn.pending_procedure = saved;
+                outcome
+            }
             Stmt::CreateLanguage(language) => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "{}",
@@ -21439,16 +21752,6 @@ impl Engine {
                         ),
                     }));
                 };
-                // Snapshot the declared parameter types into the arena before
-                // releasing the pool borrow.
-                let decl: &[ColType] = match sqlprep.get_type_codes(name) {
-                    Some(codes) => match prep::decode_types(codes, arena) {
-                        Ok(types) => types,
-                        Err(error) => return Ok(Err(error)),
-                    },
-                    None => &[],
-                };
-                let n_decl = decl.len();
                 let bound_inputs = match sqlprep
                     .type_inputs(name)
                     .ok_or_else(|| {
@@ -21476,45 +21779,18 @@ impl Engine {
                         }));
                     }
                 };
-                // If the statement declared parameter types, the argument count
-                // must match and each argument is coerced to its declared type.
-                if n_decl > 0 && args.len() != n_decl {
-                    return Ok(Err(SqlError {
-                        sqlstate: SqlState::known(sqlstate::PROTOCOL_VIOLATION),
-                        message: stack_format!(
-                            192,
-                            "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
-                            name,
-                            n_decl,
-                            args.len()
-                        ),
-                    }));
-                }
-                // Argument expressions become the inner statement's $n
-                // parameters, coerced to the declared types when present.
-                let inner_params = match arena.alloc_slice_with(args.len(), |_| Datum::Null) {
-                    Ok(values) => values,
-                    Err(_) => return Ok(Err(eval::arena_full())),
+                let (inner_params, parameter_oids) = match self.prepared_arguments(
+                    name,
+                    args,
+                    params,
+                    sqlprep,
+                    arena,
+                    txn.txid,
+                    guc.seq_session(),
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Ok(Err(error)),
                 };
-                for (i, a) in args.iter().enumerate() {
-                    let v = match eval(a, arena, params, &NoColumns) {
-                        Ok(v) => v,
-                        Err(e) => return Ok(Err(e)),
-                    };
-                    inner_params[i] = if i < n_decl {
-                        match eval::cast(v, decl[i].internal_name(), arena) {
-                            Ok(v) => v,
-                            Err(e) => return Ok(Err(e)),
-                        }
-                    } else {
-                        v
-                    };
-                }
-                let parameter_oids =
-                    match arena.alloc_slice_with(decl.len(), |index| decl[index].oid()) {
-                        Ok(oids) => oids,
-                        Err(_) => return Ok(Err(eval::arena_full())),
-                    };
                 let mut inner = match Parser::new(text, arena) {
                     Ok(p) => p,
                     Err(e) => {
@@ -21549,7 +21825,7 @@ impl Engine {
                                     self.execute_stmt(
                                         &statement,
                                         arena,
-                                        &inner_params[..args.len()],
+                                        inner_params,
                                         txn,
                                         sqlprep,
                                         cursors,
@@ -24247,6 +24523,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "transaction_read_only",
     "transaction_timeout",
     "track_functions",
+    "work_mem",
     "xmloption",
 ];
 
@@ -29021,3 +29298,34 @@ mod tests;
 
 #[cfg(all(test, not(miri)))]
 pub(crate) use tests::object_reads::HttpObjectServer;
+
+fn prepared_statement_missing(name: &str) -> SqlError {
+    sql_err!(
+        sqlstate::INVALID_SQL_STATEMENT_NAME,
+        "prepared statement \"{}\" does not exist",
+        name
+    )
+}
+
+/// PostgreSQL types every parameter at PREPARE, so `EXECUTE` must supply each
+/// one; a statement without parameters ignores any arguments.
+fn check_prepared_argument_count(
+    name: &str,
+    declared: usize,
+    supplied: usize,
+) -> Result<(), SqlError> {
+    if declared == 0 || supplied == declared {
+        return Ok(());
+    }
+    let mut detail = crate::util::StackStr::<{ eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let _ = core::fmt::Write::write_fmt(
+        &mut detail,
+        format_args!("Expected {declared} parameters but got {supplied}."),
+    );
+    eval::stash_diagnostic(Some(detail), None);
+    Err(sql_err!(
+        sqlstate::SYNTAX_ERROR,
+        "wrong number of parameters for prepared statement \"{}\"",
+        name
+    ))
+}

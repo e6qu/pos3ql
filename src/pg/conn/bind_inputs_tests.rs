@@ -3200,3 +3200,79 @@ fn extended_write_type_descriptions_restore_the_owning_sessions_search_path() {
         }
     }
 }
+
+fn parameter_description(mut bytes: &[u8]) -> Vec<i32> {
+    while bytes.len() >= 5 {
+        let total = 1 + i32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+        if bytes[0] == wire::MSG_PARAMETER_DESCRIPTION {
+            let count = u16::from_be_bytes(bytes[5..7].try_into().unwrap()) as usize;
+            return (0..count)
+                .map(|index| {
+                    i32::from_be_bytes(bytes[7 + index * 4..11 + index * 4].try_into().unwrap())
+                })
+                .collect();
+        }
+        bytes = &bytes[total..];
+    }
+    panic!("missing ParameterDescription")
+}
+
+/// PostgreSQL fixes parameter types at Parse: an undeterminable type fails
+/// there with `42P18`, and Describe reports the types Parse chose even after
+/// the schema that selected them changes.
+#[test]
+fn parse_fixes_parameter_types_and_reports_undeterminable_ones() {
+    let mut config = config(
+        "parse-parameter-types",
+        crate::config::TransactionMode::Mvcc,
+    );
+    config.max_prepared = 3;
+    let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut conn = Conn::new(&config, &mut budget).unwrap();
+    conn.id = 1;
+    conn.phase = Phase::Ready;
+    query(
+        &mut conn,
+        &mut engine,
+        "CREATE TYPE parse_mood AS ENUM ('sad', 'happy'); \
+         CREATE TABLE parse_typed(id bigint)",
+    );
+    let mut payload = b"undetermined\0SELECT pg_typeof($1)\0".to_vec();
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    let response = message(&mut conn, &mut engine, wire::FMSG_PARSE, &payload, true);
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.contains("42P18"), "{text}");
+    assert!(
+        text.contains("could not determine data type of parameter $1"),
+        "{text}"
+    );
+    message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+    parse(
+        &mut conn,
+        &mut engine,
+        "SELECT $1::parse_mood, $2 FROM parse_typed WHERE id = $2",
+        &[],
+    );
+    query(
+        &mut conn,
+        &mut engine,
+        "ALTER TABLE parse_typed ALTER COLUMN id TYPE integer",
+    );
+    let response = message(
+        &mut conn,
+        &mut engine,
+        wire::FMSG_DESCRIBE,
+        b"Sbound\0",
+        false,
+    );
+    let mood = first_row(&query(
+        &mut conn,
+        &mut engine,
+        "SELECT 'parse_mood'::regtype::oid",
+    ));
+    assert_eq!(
+        parameter_description(&response),
+        [mood.parse::<i32>().unwrap(), crate::sql::types::oid::INT8]
+    );
+}

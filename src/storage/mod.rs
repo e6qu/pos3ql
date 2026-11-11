@@ -52,6 +52,7 @@ pub(crate) use matview_lifecycles::MatviewQueryUndo;
 pub(crate) use schema_names::{FIRST_TEMP_NAMESPACE_OID, SchemaIdentity, SchemaNameUndo};
 mod routine_resolution;
 pub(crate) use crate::sql::eval::RoutineCallSelection;
+pub(crate) use routine_resolution::builtin_compatible_element_oid;
 mod sequence_lifecycles;
 mod table_lifecycles;
 pub(crate) use query_lifecycles::{
@@ -7578,8 +7579,22 @@ impl PolymorphicType {
     }
 }
 
+/// Collects one call's polymorphic inputs. The `anycompatible` family is
+/// resolved only after every input is seen, because PostgreSQL chooses its
+/// common type from the whole input list (`select_common_type`).
 #[derive(Debug, Clone, Copy)]
 struct PolymorphicBinding {
+    simple: Option<i32>,
+    simple_array: Option<i32>,
+    compatible_inputs: [i32; MAX_ROUTINE_ARGUMENTS],
+    compatible_count: usize,
+    /// A compatible range fixes the common type to its subtype.
+    compatible_range_element: Option<i32>,
+}
+
+/// A binding whose common `anycompatible` type has been selected.
+#[derive(Debug, Clone, Copy)]
+struct ResolvedPolymorphicBinding {
     simple: Option<i32>,
     simple_array: Option<i32>,
     compatible: Option<i32>,
@@ -7589,7 +7604,9 @@ impl PolymorphicBinding {
     const EMPTY: Self = Self {
         simple: None,
         simple_array: None,
-        compatible: None,
+        compatible_inputs: [0; MAX_ROUTINE_ARGUMENTS],
+        compatible_count: 0,
+        compatible_range_element: None,
     };
 
     fn bind(&mut self, kind: PolymorphicType, actual_oid: i32) -> Option<()> {
@@ -7600,37 +7617,103 @@ impl PolymorphicBinding {
             }
             self.simple_array = Some(actual_oid);
         }
-        let compatible = matches!(
-            kind,
-            PolymorphicType::Compatible
-                | PolymorphicType::CompatibleArray
-                | PolymorphicType::CompatibleNonArray
-                | PolymorphicType::CompatibleRange
-                | PolymorphicType::CompatibleMultirange
-        );
-        let target = if compatible {
-            &mut self.compatible
-        } else {
-            &mut self.simple
-        };
-        *target = Some(match *target {
+        if kind.compatible_family() {
+            if matches!(
+                kind,
+                PolymorphicType::CompatibleRange | PolymorphicType::CompatibleMultirange
+            ) {
+                if self
+                    .compatible_range_element
+                    .is_some_and(|prior| prior != key)
+                {
+                    return None;
+                }
+                self.compatible_range_element = Some(key);
+            }
+            *self.compatible_inputs.get_mut(self.compatible_count)? = key;
+            self.compatible_count += 1;
+            return Some(());
+        }
+        self.simple = Some(match self.simple {
             None => key,
             Some(bound) if bound == key => bound,
-            Some(bound) if compatible => compatible_type_oid(bound, key)?,
             Some(_) => return None,
         });
         Some(())
     }
 
+    /// PostgreSQL's `select_common_type_from_oids` followed by
+    /// `verify_common_type_from_oids`: inputs share one type category, a
+    /// later type replaces the choice only when the current choice is not
+    /// preferred and converts to it implicitly but not back, and every input
+    /// must then convert implicitly to the selected type.
+    fn resolve(self, storage: &Storage, txid: u32) -> Option<ResolvedPolymorphicBinding> {
+        self.resolve_with(
+            |oid| {
+                storage
+                    .domain_base_type_for_oid(oid, txid)
+                    .map_or(oid, ColType::oid)
+            },
+            |oid| {
+                storage
+                    .routine_result_for_oid(oid, txid)
+                    .map(|result| crate::sql::types::type_category(result.ctype))
+            },
+            |from, to| storage.routine_implicit_cast(from, to, txid),
+        )
+    }
+
+    fn resolve_with(
+        self,
+        base: impl Fn(i32) -> i32,
+        category: impl Fn(i32) -> Option<&'static str>,
+        implicit: impl Fn(i32, i32) -> bool,
+    ) -> Option<ResolvedPolymorphicBinding> {
+        let inputs = &self.compatible_inputs[..self.compatible_count];
+        let compatible = match inputs.split_first() {
+            None => None,
+            Some((first, rest)) if rest.iter().all(|oid| oid == first) => Some(*first),
+            Some(_) => {
+                let mut selected = base(inputs[0]);
+                let mut selected_category = category(selected)?;
+                for input in &inputs[1..] {
+                    let input = base(*input);
+                    if input == selected {
+                        continue;
+                    }
+                    if category(input)? != selected_category {
+                        return None;
+                    }
+                    if !crate::sql::types::preferred_type_oid(selected)
+                        && implicit(selected, input)
+                        && !implicit(input, selected)
+                    {
+                        selected = input;
+                        selected_category = category(selected)?;
+                    }
+                }
+                inputs
+                    .iter()
+                    .all(|input| implicit(*input, selected))
+                    .then_some(selected)
+            }
+        };
+        if let (Some(range), Some(selected)) = (self.compatible_range_element, compatible)
+            && range != selected
+        {
+            return None;
+        }
+        Some(ResolvedPolymorphicBinding {
+            simple: self.simple,
+            simple_array: self.simple_array,
+            compatible,
+        })
+    }
+}
+
+impl ResolvedPolymorphicBinding {
     fn concrete_oid(self, kind: PolymorphicType) -> Option<i32> {
-        let key = if matches!(
-            kind,
-            PolymorphicType::Compatible
-                | PolymorphicType::CompatibleArray
-                | PolymorphicType::CompatibleNonArray
-                | PolymorphicType::CompatibleRange
-                | PolymorphicType::CompatibleMultirange
-        ) {
+        let key = if kind.compatible_family() {
             self.compatible?
         } else {
             self.simple?
@@ -7651,28 +7734,6 @@ impl PolymorphicBinding {
             }
         })
     }
-}
-
-fn compatible_type_oid(left: i32, right: i32) -> Option<i32> {
-    let left = ColType::from_oid(left)?;
-    let right = ColType::from_oid(right)?;
-    let rank = |value: ColType| match value {
-        ColType::Int2 => 1,
-        ColType::Int4 => 2,
-        ColType::Int8 => 3,
-        ColType::Numeric => 4,
-        ColType::Float4 => 5,
-        ColType::Float8 => 6,
-        _ => 0,
-    };
-    let (left_rank, right_rank) = (rank(left), rank(right));
-    (left_rank > 0 && right_rank > 0).then(|| {
-        if left_rank >= right_rank {
-            left.oid()
-        } else {
-            right.oid()
-        }
-    })
 }
 
 fn array_oid_for_element(element_oid: i32) -> Option<i32> {
@@ -9867,6 +9928,22 @@ impl RoutineDef {
     /// CALL syntax includes OUT placeholders even though overload identity and
     /// execution inputs do not. This mapping marks those positions with
     /// `u8::MAX` and maps IN/INOUT positions to the callable signature.
+    /// The parameter each written CALL argument binds, including output
+    /// parameters, which a procedure call names explicitly.
+    pub(crate) fn procedure_argument_parameters(
+        &self,
+        argument_names: &[Option<&str>],
+        argument_count: usize,
+        explicit_variadic: bool,
+    ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
+        Self::map_parameter_positions(
+            self.parameters().iter(),
+            argument_names,
+            argument_count,
+            explicit_variadic,
+        )
+    }
+
     pub(crate) fn procedure_call_mapping(
         &self,
         argument_names: &[Option<&str>],
@@ -18778,6 +18855,7 @@ impl Storage {
             crate::sql::StatementWait::ObjectIo => (Some("Extension"), Some("ObjectStorageRead")),
             crate::sql::StatementWait::CacheCapacity => (Some("Extension"), Some("CacheCapacity")),
             crate::sql::StatementWait::ClientOutput => (Some("Client"), Some("ClientWrite")),
+            crate::sql::StatementWait::Timer => (Some("Timeout"), Some("PgSleep")),
             crate::sql::StatementWait::Lock => {
                 lock_wait.map_or((None, None), |event| (Some("Lock"), Some(event)))
             }
@@ -46108,19 +46186,39 @@ impl Storage {
             }
             found.map(|(_, expected)| expected)
         };
-        if let Some((schema, routine_name)) = name.split_once('.') {
-            return resolve(schema, routine_name);
+        let stored = if let Some((schema, routine_name)) = name.split_once('.') {
+            resolve(schema, routine_name)
+        } else {
+            self.path().entries().iter().find_map(|entry| {
+                let PathEntry::Schema(schema_slot) = entry else {
+                    return None;
+                };
+                let schema = self.schema_def_for(*schema_slot as usize, txid).name;
+                resolve(schema.as_str(), name)
+            })
+        };
+        if stored.is_some() {
+            return stored;
         }
-        for entry in self.path().entries() {
-            let PathEntry::Schema(schema_slot) = entry else {
-                continue;
-            };
-            let schema = self.schema_def_for(*schema_slot as usize, txid).name;
-            if let Some(expected) = resolve(schema.as_str(), name) {
-                return Some(expected);
-            }
+        // A built-in call types its parameters from the overload PostgreSQL
+        // selects for the known inputs (`abs($1)` takes double precision).
+        match self.select_routine_call(
+            name,
+            argument_names,
+            actual_oids,
+            explicit_variadic,
+            txid,
+            RoutineCallKind::Function,
+        ) {
+            RoutineCallSelection::Builtin { oid, .. } => self.builtin_call_parameter_oids(
+                oid,
+                argument_names,
+                actual_oids,
+                explicit_variadic,
+                txid,
+            ),
+            _ => None,
         }
-        None
     }
 
     pub(crate) fn routine_for_bound_call(
@@ -46411,6 +46509,7 @@ impl Storage {
                 }
             }
             polymorphic == saw_polymorphic
+                && (!saw_polymorphic || binding.resolve(self, txid).is_some())
         };
         let score = |definition: &RoutineInputSignature| {
             let mapping = definition
@@ -46489,7 +46588,7 @@ impl Storage {
         arguments: &[RoutineArgumentDef],
         argument_type_oids: &[i32],
         txid: u32,
-    ) -> Option<PolymorphicBinding> {
+    ) -> Option<ResolvedPolymorphicBinding> {
         let mut binding = PolymorphicBinding::EMPTY;
         let mut saw_polymorphic = false;
         for (argument, actual_oid) in arguments.iter().zip(argument_type_oids) {
@@ -46505,7 +46604,9 @@ impl Storage {
             saw_polymorphic = true;
             binding.bind(polymorphic, *actual_oid)?;
         }
-        saw_polymorphic.then_some(binding)
+        saw_polymorphic
+            .then(|| binding.resolve(self, txid))
+            .flatten()
     }
 
     fn routine_argument_oid(&self, argument: &RoutineArgumentDef, txid: u32) -> Option<i32> {

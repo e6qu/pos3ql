@@ -453,6 +453,19 @@ Evaluation order follows PostgreSQL:
   handler sees the original table. Cursors opened inside the failed block close;
   older cursors keep their position. See the
   [PostgreSQL reference results](https://github.com/e6qu/pos3ql/tree/854feb372391d1c87f3d5b261e85a78430d96449/tests/external/reference/2026-11-05-procedural-subtransactions).
+- `CALL` works inside `DO` blocks, procedures, functions and trigger
+  functions, assigning output parameters to the argument variables. A
+  procedure called from a `DO` block may `COMMIT`. A PL/pgSQL procedure or
+  `DO` block that waits for a lock, storage or `pg_sleep` resumes at the
+  waiting statement, also after its own `COMMIT` or `ROLLBACK`: finished
+  statements, inserts, sequence values and `pg_stat_user_functions` calls are
+  not repeated, and a write that was waiting runs again from its own start.
+  For example, `CALL import_batches()` that commits each batch keeps the
+  committed batches when a later batch waits for a row lock, and continues
+  with that batch once the lock is free. A lock timeout or cancel while it
+  waits ends only the current transaction; earlier commits stay.
+- `pg_sleep(1)` releases the SQL worker while it waits, so other connections
+  keep running; `statement_timeout` and cancel requests end the sleep.
 - DDL succeeds only after its end-of-command event triggers. A failing hook for
   `DO 'BEGIN CREATE TABLE orders(id integer); END'` leaves no `orders` table and
   sends no `DO` success tag. Static DDL in routines uses the same path as

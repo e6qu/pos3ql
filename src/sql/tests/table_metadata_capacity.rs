@@ -698,7 +698,7 @@ fn prepared_resolution_installs_admitted_metadata_with_no_free_lease() {
 fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let name = format!("commit-cold-wal-prefix-{}", std::process::id());
     let mut config = test_config(&name);
     config.object_store_on = true;
@@ -822,7 +822,7 @@ fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
         assert_eq!(engine.wal.stage_stats(session.transaction.txid).0, 2);
         assert!(session.transaction.staged_commit().is_none());
         if attempt == 0 {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::test_wait::deadline();
             while server.requests.load(Ordering::Acquire) == requests_before {
                 let _ = engine.advance_pending_block_read(0).unwrap();
                 assert!(Instant::now() < deadline, "cold old-row GET was not issued");
@@ -832,7 +832,7 @@ fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
     }
     assert!(server.requests.load(Ordering::Acquire) > requests_before);
     server.hold_response.store(false, Ordering::Release);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     loop {
         let _ = engine.advance_pending_block_read(0).unwrap();
         match crate::mem::guard::forbid_alloc(|| {
@@ -857,7 +857,7 @@ fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
     assert!(session.transaction.commit_admission().is_none());
     let query = "SELECT id FROM cold_commit_rows";
     let mut status = session.execute_status(&mut engine, query, true);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     while let ExecutionStatus::Blocked {
         completed_statements,
         output_mark,

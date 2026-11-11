@@ -763,6 +763,18 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::OidVector { raw, lower_bound } if element == ArrElem::Oid => {
                 oidvector_as_array(raw, lower_bound, arena)?
             }
+            // oidvector is binary coercible to oid[], whose elements then
+            // convert like any array (`proargtypes::regtype[]`).
+            Datum::Int2Vector { raw, lower_bound } => cast_to(
+                int2vector_as_array(raw, lower_bound, arena)?,
+                ColType::Array(element),
+                arena,
+            )?,
+            Datum::OidVector { raw, lower_bound } => cast_to(
+                oidvector_as_array(raw, lower_bound, arena)?,
+                ColType::Array(element),
+                arena,
+            )?,
             Datum::Array { element: e, .. } if e == element => v,
             // A different element type: re-encode each element cast to it.
             Datum::Array { element: e, raw } => {

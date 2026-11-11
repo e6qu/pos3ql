@@ -1337,6 +1337,9 @@ impl Conn {
                     self.parked_generation != engine.cache_capacity_generation()
                 }
                 crate::sql::StatementWait::ClientOutput => self.transport_output_empty(),
+                crate::sql::StatementWait::Timer => self
+                    .sleep_remaining()
+                    .is_none_or(|remaining| remaining.is_zero()),
             };
         if !ready {
             return None;
@@ -1382,10 +1385,26 @@ impl Conn {
         } else {
             None
         };
-        [lock, self.statement_wait_remaining()]
+        let sleep = if self.parked_wait == crate::sql::StatementWait::Timer {
+            self.sleep_remaining()
+        } else {
+            None
+        };
+        [lock, sleep, self.statement_wait_remaining()]
             .into_iter()
             .flatten()
             .min()
+    }
+
+    /// Time until the parked `pg_sleep` call's wake time.
+    fn sleep_remaining(&self) -> Option<Duration> {
+        self.guc.seq_session().sleep_until().map(|deadline| {
+            Duration::from_micros(
+                deadline
+                    .saturating_sub(crate::sql::datetime::now_micros())
+                    .max(0) as u64,
+            )
+        })
     }
 
     fn statement_wait_remaining(&self) -> Option<Duration> {
@@ -1410,6 +1429,15 @@ impl Conn {
     }
 
     fn park(&mut self, wait: crate::sql::StatementWait, generation: u64) {
+        // `pg_sleep` reports a lock-style wait; its recorded wake time makes
+        // the connection wait on a timer, outside lock_timeout.
+        let wait = if wait == crate::sql::StatementWait::Lock
+            && self.guc.seq_session().sleep_until().is_some()
+        {
+            crate::sql::StatementWait::Timer
+        } else {
+            wait
+        };
         self.parked = true;
         self.parked_generation = generation;
         self.parked_wait = wait;
@@ -2289,7 +2317,7 @@ impl Conn {
                                 crate::sql::StatementWait::Lock
                             };
                             self.park(wait, engine.statement_wait_generation(wait, self.id));
-                            engine.park_backend_statement(self.id, wait);
+                            engine.park_backend_statement(self.id, self.parked_wait);
                             return Step::Parked;
                         }
                         self.cursors.on_rollback();
@@ -2397,7 +2425,7 @@ impl Conn {
                         crate::sql::StatementWait::Lock
                     };
                     self.park(wait, engine.statement_wait_generation(wait, self.id));
-                    engine.park_backend_statement(self.id, wait);
+                    engine.park_backend_statement(self.id, self.parked_wait);
                     return Step::Parked;
                 }
                 Err(error) => {
@@ -2550,7 +2578,7 @@ impl Conn {
             }
             Ok(crate::sql::ExtendedExecutionStatus::Blocked { wait }) => {
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
-                engine.park_backend_statement(self.id, wait);
+                engine.park_backend_statement(self.id, self.parked_wait);
                 Step::Parked
             }
             Err(WireFull) => Step::Close,
@@ -3185,7 +3213,7 @@ impl Conn {
             };
             self.copy = Some(copy);
             self.park(wait, engine.statement_wait_generation(wait, self.id));
-            engine.park_backend_statement(self.id, wait);
+            engine.park_backend_statement(self.id, self.parked_wait);
             return Step::Parked;
         }
         self.copy_transition_scratch.clear();
@@ -3440,6 +3468,44 @@ impl Conn {
                 );
             }
             Err(WireFull) => return Step::Close,
+        };
+        // PostgreSQL fixes every parameter type at Parse and reports one it
+        // cannot determine (`42P18`) there; Bind and Describe reuse the types.
+        let param_oid_bytes = match engine
+            .infer_param_types(
+                query,
+                &self.arena,
+                &self.txn,
+                n_params as usize,
+                param_oid_bytes,
+                bound_inputs,
+            )
+            .and_then(|oids| {
+                let bytes = self
+                    .arena
+                    .alloc_slice_with(oids.len() * 4, |_| 0u8)
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                for (target, oid) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(oids.iter()) {
+                    *target = oid.to_be_bytes();
+                }
+                Ok(&*bytes)
+            }) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.sqlprep.clear_request_type_inputs();
+                if self.txn.is_explicit() {
+                    self.txn.failed = true;
+                } else {
+                    engine.rollback_txn(&mut self.txn, &self.guc);
+                    self.cursors.on_rollback();
+                }
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    error.sqlstate,
+                    error.message.as_str(),
+                );
+            }
         };
         let entry = &mut self.prepared[slot];
         self.sqlprep
@@ -3845,7 +3911,7 @@ impl Conn {
                     crate::sql::StatementWait::Lock
                 };
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
-                engine.park_backend_statement(self.id, wait);
+                engine.park_backend_statement(self.id, self.parked_wait);
                 return Step::Parked;
             }
             Ok(Err(error)) => {
@@ -4291,7 +4357,7 @@ impl Conn {
                 }
                 Ok(crate::sql::ExtendedExecutionStatus::Blocked { wait }) => {
                     self.park(wait, engine.statement_wait_generation(wait, self.id));
-                    engine.park_backend_statement(self.id, wait);
+                    engine.park_backend_statement(self.id, self.parked_wait);
                     if !self.txn.has_pending_write_completion() {
                         if paged {
                             self.portals[portal_slot].result.clear();
@@ -4616,7 +4682,7 @@ impl Conn {
             }) => {
                 self.resume_statement = completed_statements;
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
-                engine.park_backend_statement(self.id, wait);
+                engine.park_backend_statement(self.id, self.parked_wait);
                 self.arena.recycle_front();
                 if !self.truncate_output(output_mark) {
                     // A restart would repeat rows the client already has.
@@ -4778,7 +4844,7 @@ impl Conn {
             }
             Ok(crate::sql::StreamStep::Wait(wait)) => {
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
-                engine.park_backend_statement(self.id, wait);
+                engine.park_backend_statement(self.id, self.parked_wait);
                 self.arena.recycle_front();
                 Step::Parked
             }
@@ -4936,7 +5002,7 @@ impl Conn {
             Ok(crate::sql::StreamStep::Wait(wait)) => {
                 self.resume_statement = statement;
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
-                engine.park_backend_statement(self.id, wait);
+                engine.park_backend_statement(self.id, self.parked_wait);
                 self.arena.recycle_front();
                 Some(Step::Parked)
             }
@@ -6757,6 +6823,9 @@ mod bind_inputs_tests;
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 #[path = "conn/result_output_tests.rs"]
 mod result_output_tests;
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[path = "conn/sleep_tests.rs"]
+mod sleep_tests;
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
@@ -10769,7 +10838,7 @@ mod tests {
             0
         );
         client
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(crate::test_wait::HANG))
             .unwrap();
         let config = Config::default_dev();
         let mut budget = Budget::new(256 << 20);
@@ -10818,7 +10887,7 @@ mod tests {
             assert!(scratch[..length].iter().all(|byte| *byte == 0));
             prefix -= length;
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         while !connection.transport_output_empty() {
             assert!(Instant::now() < deadline, "terminal response did not flush");
             assert_eq!(

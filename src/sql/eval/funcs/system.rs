@@ -764,6 +764,9 @@ pub(crate) fn dispatch<'a>(
         && !matches!(
             name,
             "version"
+                | "pg_sleep"
+                | "pg_sleep_for"
+                | "pg_sleep_until"
                 | "pg_backend_pid"
                 | "pg_blocking_pids"
                 | "pg_cancel_backend"
@@ -1134,6 +1137,51 @@ pub(crate) fn dispatch<'a>(
                         arena,
                     )
                 })
+            }
+            // `pg_sleep_for` and `pg_sleep_until` are SQL functions over
+            // `pg_sleep` in PostgreSQL; each computes its delay from
+            // `clock_timestamp()` when the sleep starts.
+            "pg_sleep" | "pg_sleep_for" | "pg_sleep_until" => {
+                arity(1)?;
+                let value = eval_full(args[0], arena, params, row, hooks)?;
+                if value.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let value = match name {
+                    "pg_sleep" => cast_to(value, ColType::Float8, arena)?,
+                    "pg_sleep_for" => cast_to(value, ColType::Interval, arena)?,
+                    _ => cast_to(value, ColType::Timestamptz, arena)?,
+                };
+                // The journal identifies a sleep by its position: a volatile
+                // argument such as clock_timestamp() changes when the
+                // statement resumes, but the sleep's end time does not.
+                crate::sql::sequence::sleep(
+                    &[Datum::Text(name)],
+                    || {
+                        let now = crate::sql::datetime::now_micros();
+                        let epoch = |micros: i64| micros as f64 / 1_000_000.0;
+                        Ok(match value {
+                            Datum::Float8(seconds) => seconds,
+                            Datum::Interval(interval) => {
+                                let end =
+                                    crate::sql::datetime::checked_add_timestamptz(now, interval)
+                                        .ok_or_else(|| {
+                                            sql_err!(
+                                                sqlstate::DATETIME_FIELD_OVERFLOW,
+                                                "timestamp out of range"
+                                            )
+                                        })?;
+                                epoch(end) - epoch(crate::sql::datetime::now_micros())
+                            }
+                            Datum::Timestamptz(end) => {
+                                epoch(end) - epoch(crate::sql::datetime::now_micros())
+                            }
+                            _ => unreachable!("sleep input was converted"),
+                        })
+                    },
+                    arena,
+                )?;
+                Ok(Datum::Text(""))
             }
             "pg_advisory_unlock_all" => {
                 arity(0)?;

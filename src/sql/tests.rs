@@ -27,10 +27,13 @@ mod nested_planner_inputs;
 pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
+mod polymorphic_resolution;
 mod prepared_object_capacity;
+mod prepared_parameter_types;
 mod procedural_expression_calls;
 mod procedural_progress;
 mod procedural_subtransactions;
+mod procedure_progress;
 mod query_execution;
 mod result_streams;
 mod routine_calls;
@@ -44,6 +47,7 @@ mod sequence_inheritance;
 mod shared_row_capacity;
 mod shared_row_work;
 mod shared_statistics;
+mod sql_function_results;
 mod stored_relation_sources;
 mod table_metadata_capacity;
 mod table_publication;
@@ -34256,7 +34260,7 @@ fn session_gucs_honored_or_rejected_faithfully() {
     }
     // SET then SHOW within one message (GUC state is per session/message).
     assert!(run("SET extra_float_digits = 2; SHOW extra_float_digits").contains('2'));
-    assert!(run("SET lock_timeout = 5000; SHOW lock_timeout").contains("5000"));
+    assert!(run("SET lock_timeout = 5000; SHOW lock_timeout").contains("5s"));
     assert!(run("SET lock_timeout = '50ms'; SHOW lock_timeout").contains("50ms"));
     assert!(run("SET row_security = off; SHOW row_security").contains("off"));
     for style in ["postgres", "postgres_verbose", "sql_standard", "iso_8601"] {
@@ -34280,7 +34284,7 @@ fn session_gucs_honored_or_rejected_faithfully() {
     );
     // statement_timeout is now accepted (enforced at scan boundaries); a
     // malformed value is still rejected loudly.
-    assert!(run("SET statement_timeout = 5000; SHOW statement_timeout").contains("5000"));
+    assert!(run("SET statement_timeout = 5000; SHOW statement_timeout").contains("5s"));
     assert!(
         run("SET lock_timeout = 'bogus'").contains("22023"),
         "bad lock timeout"
@@ -34312,6 +34316,128 @@ fn session_gucs_honored_or_rejected_faithfully() {
         run("SET default_table_access_method = columnar").contains("0A000"),
         "unsupported table access method"
     );
+}
+
+/// Integer settings parse, round, range-check and show as PostgreSQL 18's
+/// `parse_int` and `ShowGUCOption` do; `pg_settings` reports base units.
+#[test]
+fn integer_settings_parse_and_show_like_postgresql() {
+    let (mut e, mut b) = test_engine();
+    let mut t = TxnState::new(&mut b, 256).unwrap();
+    let mut run = |sql: &str| run_txn(&mut e, &mut b, &mut t, sql);
+    for (value, shown) in [
+        ("'1.5MB'", "1536kB"),
+        ("'65537B'", "64kB"),
+        ("2048", "2MB"),
+        ("'3000kB'", "3000kB"),
+        ("'2GB'", "2GB"),
+        ("'1TB'", "1TB"),
+        ("'2147483647kB'", "2147483647kB"),
+        ("' 64 kB '", "64kB"),
+        ("'1048576kB'", "1GB"),
+        ("'64.4'", "64kB"),
+        ("'1e3'", "1000kB"),
+        ("'0x100'", "256kB"),
+        ("'1 MB'", "1MB"),
+        ("default", "4MB"),
+    ] {
+        let out = run(&format!("SET work_mem = {value}; SHOW work_mem"));
+        assert!(
+            out.contains(&format!("D{shown}")) || out.contains(shown),
+            "{value}: {out}"
+        );
+        assert!(!out.contains("ERROR"), "{value}: {out}");
+    }
+    for (value, message) in [
+        (
+            "'10'",
+            "10 kB is outside the valid range for parameter \"work_mem\" (64 kB .. 2147483647 kB)",
+        ),
+        ("'100B'", "0 kB is outside the valid range"),
+        ("1.5", "2 kB is outside the valid range"),
+        ("'-1'", "-1 kB is outside the valid range"),
+        ("'1mb'", "invalid value for parameter \"work_mem\": \"1mb\""),
+        (
+            "'2147483648kB'",
+            "invalid value for parameter \"work_mem\": \"2147483648kB\"",
+        ),
+        (
+            "'1e10'",
+            "invalid value for parameter \"work_mem\": \"1e10\"",
+        ),
+        ("'abc'", "invalid value for parameter \"work_mem\": \"abc\""),
+    ] {
+        let out = run(&format!("SET work_mem = {value}"));
+        assert!(
+            out.contains("22023") && out.contains(message),
+            "{value}: {out}"
+        );
+    }
+    let out = run("SET work_mem = '1mb'");
+    assert!(
+        out.contains(
+            "Valid units for this parameter are \"B\", \"kB\", \"MB\", \"GB\", and \"TB\"."
+        ),
+        "{out}"
+    );
+    let out = run("SET work_mem = '2147483648kB'");
+    assert!(out.contains("Value exceeds integer range."), "{out}");
+    for (value, shown) in [
+        ("5000", "5s"),
+        ("'60000ms'", "1min"),
+        ("'1.5s'", "1500ms"),
+        ("'100us'", "0"),
+        ("'1500us'", "2ms"),
+        ("'3d'", "3d"),
+        ("'1 h'", "1h"),
+        ("'1e2'", "100ms"),
+        ("'+5'", "5ms"),
+    ] {
+        let out = run(&format!(
+            "SET statement_timeout = {value}; SHOW statement_timeout"
+        ));
+        assert!(
+            out.contains(shown) && !out.contains("ERROR"),
+            "{value}: {out}"
+        );
+    }
+    let out = run("SET statement_timeout = '1H'");
+    assert!(
+        out.contains(
+            "Valid units for this parameter are \"us\", \"ms\", \"s\", \"min\", \"h\", and \"d\"."
+        ),
+        "{out}"
+    );
+    let out = run("SET statement_timeout = '-1'");
+    assert!(
+        out.contains("-1 ms is outside the valid range for parameter \"statement_timeout\" (0 ms .. 2147483647 ms)"),
+        "{out}"
+    );
+    let out = run("SET extra_float_digits = '2.6'; SHOW extra_float_digits");
+    assert!(out.contains('3') && !out.contains("ERROR"), "{out}");
+    let out = run("SET extra_float_digits = '2kB'");
+    assert!(
+        out.contains("invalid value for parameter \"extra_float_digits\""),
+        "{out}"
+    );
+    let out = run(
+        "SET statement_timeout = '1.5s'; SET work_mem = '8MB'; SELECT name || '=' || setting || '/' || unit || '/' || vartype || '/' || min_val || '/' || max_val || '/' || boot_val || '/' || category FROM pg_settings WHERE name IN ('work_mem', 'statement_timeout') ORDER BY name",
+    );
+    assert!(
+        out.contains("statement_timeout=1500/ms/integer/0/2147483647/0/")
+            && out.contains("work_mem=8192/kB/integer/64/2147483647/4096/Resource Usage / Memory"),
+        "{out}"
+    );
+    let out = run("BEGIN; SET LOCAL work_mem = '8MB'; SHOW work_mem; ROLLBACK; SHOW work_mem");
+    assert!(out.contains("8MB") && out.contains("4MB"), "{out}");
+    let out = run(
+        "CREATE FUNCTION configured_work_mem() RETURNS text LANGUAGE sql SET work_mem = '64MB' AS 'SELECT current_setting(''work_mem'')'; SELECT configured_work_mem() || ',' || current_setting('work_mem') || ',' || array_to_string(proconfig, ';') FROM pg_proc WHERE proname = 'configured_work_mem'",
+    );
+    assert!(out.contains("64MB,4MB,work_mem=64MB"), "{out}");
+    let out = run(
+        "CREATE PROCEDURE bad_work_mem() LANGUAGE plpgsql SET work_mem = '1mb' AS $$BEGIN END$$",
+    );
+    assert!(out.contains("22023") && out.contains("\"1mb\""), "{out}");
 }
 
 #[test]
@@ -42089,7 +42215,7 @@ fn plpgsql_call_and_do_own_real_non_atomic_transaction_boundaries() {
 }
 
 #[test]
-fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
+fn plpgsql_non_atomic_call_resumes_after_a_committed_boundary() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
         &mut engine,
@@ -42125,12 +42251,12 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
 
     let mut caller = TxnState::new(&mut budget, 256).unwrap();
     let mut send = crate::mem::FixedBuf::new(&mut budget, "procedure wait send", 1 << 18).unwrap();
-    let arena = Arena::new(&mut budget, "procedure wait SQL", 1 << 18).unwrap();
+    let mut arena = Arena::new(&mut budget, "procedure wait SQL", 1 << 18).unwrap();
     let mut pool = test_pool(&mut budget);
     let guc = GucState::new();
     let mut cursors = test_cursors(&mut budget);
     let call = "CALL procedure_wait()";
-    let rejected = engine
+    let status = engine
         .execute_simple(
             call,
             &arena,
@@ -42142,15 +42268,49 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
             2,
         )
         .unwrap();
-    assert_eq!(rejected, ExecutionStatus::Complete);
-    let error = String::from_utf8_lossy(send.readable());
-    assert!(error.contains("0A000"), "{error}");
-    assert!(
-        error.contains("cannot suspend after transaction control"),
-        "{error}"
+    let ExecutionStatus::Blocked {
+        completed_statements,
+        output_mark,
+        wait: StatementWait::Lock,
+    } = status
+    else {
+        panic!(
+            "procedure did not wait after COMMIT: {status:?}: {}",
+            String::from_utf8_lossy(send.readable())
+        );
+    };
+    // The committed first transaction is visible while the call waits.
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT phase FROM procedure_wait_log",
+        )),
+        ["before"]
     );
-
     assert!(run_txn(&mut engine, &mut budget, &mut blocker, "COMMIT").contains("COMMIT"));
+    output_mark.truncate_unsent(&mut send);
+    arena.recycle_front();
+    let status = engine
+        .execute_simple_from(
+            call,
+            completed_statements,
+            &arena,
+            &mut caller,
+            &mut pool,
+            &mut cursors,
+            &guc,
+            &mut Responder::new(&mut send),
+            2,
+            false,
+        )
+        .unwrap();
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert!(
+        error_sqlstates(send.readable()).is_empty(),
+        "{}",
+        String::from_utf8_lossy(send.readable())
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -42158,7 +42318,7 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
             "SELECT phase, count(*) FROM procedure_wait_log GROUP BY phase ORDER BY phase; \
              SELECT value FROM procedure_wait_target",
         )),
-        ["before|1", "20"]
+        ["after|1", "before|1", "21"]
     );
 }
 
@@ -64899,7 +65059,7 @@ fn index_validation_uniqueness_reuses_own_changed_cached_keys_without_object_ree
         let start = &start;
         let completed = &completed;
         let writer = scope.spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             while !start.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
                 std::thread::yield_now();
             }
@@ -64928,8 +65088,7 @@ fn index_validation_uniqueness_reuses_own_changed_cached_keys_without_object_ree
                         assert!(encoded.is_some());
                         visits += 1;
                         start.store(true, Ordering::Release);
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        let deadline = crate::test_wait::deadline();
                         while !completed.load(Ordering::Acquire)
                             && std::time::Instant::now() < deadline
                         {
@@ -88843,14 +89002,14 @@ fn prepare_coerces_args_to_declared_types() {
         "{:?}",
         String::from_utf8_lossy(&bad)
     );
-    // Wrong argument count is rejected.
+    // Wrong argument count is rejected with PostgreSQL 18.6's 42601.
     let count = run_with(
         &mut e,
         &mut b,
         "PREPARE p3 (int) AS SELECT $1; EXECUTE p3(1, 2)",
     );
     assert!(
-        String::from_utf8_lossy(&count).contains("08P01"),
+        String::from_utf8_lossy(&count).contains("42601"),
         "{:?}",
         String::from_utf8_lossy(&count)
     );
@@ -94392,7 +94551,7 @@ fn finish_sliced_cleanup(engine: &mut Engine) -> usize {
 fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     let (mut engine, mut budget, mut config) =
         sliced_cleanup_fixture("metadata-cleanup-cached-orders", false);
@@ -94424,7 +94583,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
     );
     let mut stream = None;
     for (method, response) in [("GET ", empty), ("GET ", orphan.as_str()), ("DELETE ", "")] {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         loop {
             assert!(
                 Instant::now() < deadline,
@@ -94454,7 +94613,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
             };
             accepted.set_nonblocking(false).unwrap();
             accepted
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(crate::test_wait::HANG))
                 .unwrap();
             stream = Some(accepted);
         }
@@ -94516,7 +94675,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
 fn maintenance_metadata_waits_leave_cached_sql_runnable_through_file_deletion() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     let (mut engine, mut budget, mut config) =
         sliced_cleanup_fixture("file-cleanup-cached-orders", false);
@@ -94548,7 +94707,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_file_deletion() 
     );
     let mut stream = None;
     for (method, response) in [("GET ", empty), ("GET ", orphan.as_str()), ("DELETE ", "")] {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         loop {
             assert!(
                 Instant::now() < deadline,
@@ -94578,7 +94737,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_file_deletion() 
             };
             accepted.set_nonblocking(false).unwrap();
             accepted
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(crate::test_wait::HANG))
                 .unwrap();
             stream = Some(accepted);
         }
@@ -95391,7 +95550,7 @@ fn check_cleanup_during_download(
     );
     let _ = engine.replace_read_owner(foreground_owner);
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     let (mut stream, _) = loop {
         engine.advance_pending_block_read(0).unwrap();
         match listener.accept() {
@@ -95406,7 +95565,7 @@ fn check_cleanup_during_download(
     stream.set_nonblocking(false).unwrap();
     engine.advance_pending_block_read(0).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(crate::test_wait::HANG))
         .unwrap();
     let mut request = [0u8; 4096];
     let mut received = 0;
@@ -95474,7 +95633,7 @@ fn check_cleanup_during_download(
     crate::storage::rowenc::decode(&current, &[ColType::Int4, ColType::Text], &mut values).unwrap();
     assert!(matches!(values[1], Datum::Text(value) if value.len() == 8192));
     stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
+        .set_write_timeout(Some(crate::test_wait::HANG))
         .unwrap();
     if fail_read {
         stream
@@ -95488,7 +95647,7 @@ fn check_cleanup_during_download(
         .unwrap();
         stream.write_all(&framed[..framed_len]).unwrap();
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     crate::mem::guard::forbid_alloc(|| {
         loop {
             assert!(Instant::now() < deadline, "released GET did not complete");
@@ -98377,7 +98536,7 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
 fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
     use crate::store::BlockStore;
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use object_reads::{accept, advance, read_request, replace_uncached_blocks, reply};
 
@@ -98509,7 +98668,7 @@ fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
             break;
         }
         reply(&mut stream, &request, &body);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         while engine.block_reads_pending() {
             advance(&mut engine);
             assert!(
@@ -98672,7 +98831,7 @@ fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
         &foreground_request,
         &foreground_body,
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     loop {
         advance(&mut engine);
         let prior = engine.replace_read_owner(Some(foreground_owner));
@@ -98705,7 +98864,7 @@ fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
         assert!(!engine.checkpoint_can_progress());
         reply(stream.as_mut().unwrap(), &request, &body);
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     while engine.ckpt.as_ref().unwrap().retained_output_pending() {
         advance(&mut engine);
         if !engine.ckpt.as_ref().unwrap().retained_output_pending() {
@@ -99828,7 +99987,6 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
     use crate::store::BlockStore;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use std::time::Duration;
 
     for extended in [false, true] {
         let mut config = test_config(if extended {
@@ -100079,7 +100237,7 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
         );
         assert!(engine.pending_block_read_fd(0).is_some());
         hold_response.store(false, Ordering::Release);
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         while !engine.advance_pending_block_read(0).unwrap() {
             assert!(
                 std::time::Instant::now() < deadline,

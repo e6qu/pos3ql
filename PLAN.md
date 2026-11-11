@@ -64,9 +64,15 @@ run. On resumption the same order keeps the same local values, audit row and
 number.
 
 **Done today:** ordered AFTER-trigger work; nested INSERT/UPDATE/DELETE;
-trigger frames; PL/pgSQL calls inside `PERFORM`, `SELECT ... INTO` and
-declaration initializers; SQL-language function bodies, child calls and return
-checks; SQL cursors executing from retained query state, including row locks
+trigger frames; PL/pgSQL calls inside `PERFORM`, `SELECT ... INTO`,
+declaration initializers and every PL/pgSQL statement's expressions,
+including statements with several (`FOR` bounds, `CASE`, `RAISE` arguments
+and options, `IF ... ELSIF`, `ASSERT`, `CALL` arguments, dynamic `EXECUTE`
+values), which keep finished values across a wait; SQL-language function
+bodies, child calls and return checks; domain `CHECK`s on a PL/pgSQL
+function's result, which keep the finished result and the check's calls; PL/pgSQL procedures and `DO` blocks,
+including nested `CALL`, resuming at the waiting statement after their own
+`COMMIT` or `ROLLBACK`, with queries yielding on storage reads; SQL cursors executing from retained query state, including row locks
 taken per `FETCH` and scrollable cursors that evaluate revisited rows again;
 client output that never blocks the worker on a slow reader; large
 single-table and generated-series results, and paged portals over them,
@@ -76,18 +82,16 @@ is owned.
 
 **Remaining:**
 
-- **Functions:** callers and expression positions that have no owning query;
-  PL/pgSQL return conversion that can wait; one timing count per completed call.
-  A top-level `SELECT` that the retained reader cannot hold (grouping,
-  subqueries, sorts in object-store mode or over non-volatile routine
-  output, joins it would probe through an index)
-  restarts once for each first call of a SQL-language routine, so its work
-  grows with the square of those calls; single-table, `VALUES` and
-  `generate_series` sources, retained nested-loop and hash joins, local-mode
-  sorts (volatile output runs after the sort), and cursors ordered by source
-  columns, hand each call off on its row. Removing the
-  restart needs those shapes retained (above): the general executor cannot run
-  a routine body inside expression evaluation.
+- **Functions:** writes inside a procedure body still read storage
+  synchronously. A top-level `SELECT` that the retained reader cannot hold
+  (grouping, subqueries, sorts in object-store mode or over non-volatile
+  routine output, joins it would probe through an index) restarts once for
+  each first call of a SQL-language routine, so its work grows with the square
+  of those calls; single-table, `VALUES` and `generate_series` sources,
+  retained nested-loop and hash joins, local-mode sorts (volatile output runs
+  after the sort), and cursors ordered by source columns, hand each call off
+  on its row. Removing the restart needs those shapes retained (above): the
+  general executor cannot run a routine body inside expression evaluation.
 - **Write phases:** BEFORE/INSTEAD triggers, source scans, row locks, partitions,
   constraints, transition tables, rules, data-modifying common table
   expressions (CTEs), COPY, replication apply and deferred triggers. Keep the
@@ -297,17 +301,12 @@ behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: `ALTER`, `COMMENT ON`
 and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
-with `0A000` where PostgreSQL changes the catalog entry; `array_replace` takes
-the replacement's runtime type, so `array_replace('{a}'::refcursor[], 'a',
-'b')` fails with `42804` where PostgreSQL returns `{b}`; `information_schema`
-domains such as `cardinal_number` do not exist. `CREATE FUNCTION` checks that
-a SQL body ends with a result statement but not its column count or types, so
-`RETURNS integer AS 'SELECT 1, 2'` fails only when called (`42P13`, `Final
-statement must return exactly one column.`) and `RETURNS integer AS 'SELECT
-''a''::text'` converts at the call where PostgreSQL rejects the definition
-(`Actual return type is text.`). A polymorphic SQL function's runtime result
-mismatch names the declared type (`anyelement`) where PostgreSQL names the
-resolved one. Expressions are shown as stored, not deparsed: `pg_get_expr`,
+with `0A000` where PostgreSQL changes the catalog entry; `information_schema`
+domains such as `cardinal_number` do not exist. A SQL function whose earlier
+statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
+SELECT a FROM t`) has its result converted value by value at the call instead
+of being type-checked like PostgreSQL's analysis just before the final
+statement runs. Expressions are shown as stored, not deparsed: `pg_get_expr`,
 `pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
 `text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
 the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
@@ -341,8 +340,7 @@ on an empty table succeeds and `INSERT INTO t (m[1:2]) SELECT '{1,2}' UNION
 ALL SELECT '{3,4}'` stores the text where PostgreSQL reports `42804`
 (`subscripted assignment to "m" requires type integer[] but expression is of
 type text`); fixing it needs PostgreSQL's assignment-cast rules for every
-target type. `pg_sleep` and its
-variants are catalog entries only: calling them fails as an unknown function.
+target type.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,
 SQL/JSON result types) are reported when the statement would run. In a
@@ -352,11 +350,11 @@ analysis order finds them; in other statements the modifier error comes first.
 COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
-PL/pgSQL `CALL`, written directly or run with `EXECUTE`, fails with `0A000`
-(`CALL is not supported in PL/pgSQL`); supporting it needs output parameters
-assigned to the caller's variables, PostgreSQL's transaction-control rules for
-the calling chain, and a saved call position so the called procedure can pause
-and resume like other nested routines. A table's or view's row type cannot
+A SQL-language procedure called from a trigger fired inside a write (a BEFORE
+row trigger, a deferred constraint trigger at `COMMIT`) runs queries, data
+changes and nested `CALL`, but rejects DDL and other utility statements with
+`0A000` because that trigger runs without the engine's utility executor. A
+table's or view's row type cannot
 appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
 where PostgreSQL accepts it. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current

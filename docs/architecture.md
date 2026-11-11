@@ -180,7 +180,9 @@ BY id` sorts first, so its output queues in the spool instead.
 | A statement after its first effect (volatile function, routine body, sequence change, first output byte reaching the client) | Blocks until the statement ends |
 | Output queued for a slow client | Never blocks; the connection waits for the client between messages |
 | Result streams (see above), including `COPY ... TO STDOUT` and a streamed `FETCH`: each row before its first effect | Yields; delivered rows are kept |
-| Writing statements: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, DDL, `CALL`, `DO`, `COPY FROM` | Blocks for the whole statement |
+| Writing statements: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, DDL, `COPY FROM` | Blocks for the whole statement |
+| Top-level `CALL` and `DO` bodies: queries before the statement's first effect | Yields; the body resumes at its waiting statement |
+| Writes and statements after the first effect inside a `CALL` or `DO` body | Blocks |
 | Commit processing, deferred constraint triggers, `SET CONSTRAINTS`, `PREPARE TRANSACTION`, `COMMIT PREPARED`/`ROLLBACK PREPARED` | Blocks |
 | `COPY FROM` rows and completion; a `COPY TO` that cannot stream once its first byte reaches the client; logical-replication apply and initial copy | Blocks |
 | Large-object fast-path calls, login event triggers, manual `CHECKPOINT` | Blocks |
@@ -310,7 +312,7 @@ replays instead of running the effect again.
 | Saved state | Owner |
 |---|---|
 | Procedural positions, lexical frames, source images, resolved local declarations, loop scopes, named-output bindings, caught error text | `execution_control_bytes` / `execution_control_leases` |
-| Saved local values, trigger `OLD`/`NEW` rows and arguments, transition tables, loop inputs, set-returning results, `EXECUTE ... INTO` results | `row_work_bytes` / `row_work_leases` |
+| Saved local values, trigger `OLD`/`NEW` rows and arguments, transition tables, loop inputs, set-returning results, `EXECUTE ... INTO` results, finished expression values of a waiting statement | `row_work_bytes` / `row_work_leases` |
 | Completed function results, argument values, selected functions and casts, sequence and advisory-lock receipts | The statement arena's retained region (the invocation log), within existing statement capacity |
 | Checked literal inputs saved with routines and stored definitions | `table_metadata_bytes` / `table_metadata_leases`, with `routine_input_slots` control records |
 | Execution schemas | `definition_image_slots` |
@@ -344,6 +346,16 @@ Further rules that apply to every saved owner:
 - **Exhaustion.** A full pool returns `54000` naming its settings. Growing a
   saved buffer reserves its replacement first, so failure keeps the previous
   value readable.
+
+A top-level `CALL` or `DO` keeps its waiting PL/pgSQL body on the
+transaction: lexical position, local values, settings, timer and journal
+position, in the same pools as a saved function. A nested `CALL` keeps the
+callee's body in its caller's saved frame. Each body statement is its own
+rollback boundary: a write that waits for a row lock rolls back only itself
+and runs again on resume, so the body can wait after its own `COMMIT` or
+`ROLLBACK`, which start new transactions without ending the statement or its
+effect journal. Ending the statement by error, timeout, cancel or disconnect
+releases the saved body.
 
 Write completion follows PostgreSQL's
 [write executor](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/nodeModifyTable.c):

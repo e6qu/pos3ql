@@ -118,25 +118,32 @@ pub(super) fn at_routine_exit<T>(
     invocation: TriggerInvocation<'_>,
     run: impl FnOnce() -> Result<T, SqlError>,
 ) -> Result<T, SqlError> {
-    run().map_err(|error| {
-        if error.sqlstate.internal_control().is_some() {
-            return error;
+    run().map_err(|error| routine_exit_error(context, invocation, error))
+}
+
+/// Adds the function-exit context line of [`at_routine_exit`] to `error`.
+pub(super) fn routine_exit_error(
+    context: &TriggerExecContext<'_, '_, '_>,
+    invocation: TriggerInvocation<'_>,
+    error: SqlError,
+) -> SqlError {
+    if error.sqlstate.internal_control().is_some() {
+        return error;
+    }
+    let signature = match procedural_signature(context, invocation) {
+        Ok(signature) => signature,
+        Err(signature_error) => return signature_error,
+    };
+    let activity = if error.sqlstate == sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT {
+        ProceduralActivity::Routine
+    } else {
+        ProceduralActivity::Phase {
+            source: None,
+            text: "while casting return value to function's return type",
         }
-        let signature = match procedural_signature(context, invocation) {
-            Ok(signature) => signature,
-            Err(signature_error) => return signature_error,
-        };
-        let activity = if error.sqlstate == sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT {
-            ProceduralActivity::Routine
-        } else {
-            ProceduralActivity::Phase {
-                source: None,
-                text: "while casting return value to function's return type",
-            }
-        };
-        let frame = ProceduralFrame::new(signature, None, activity);
-        crate::sql::error_context::with_frame(&frame, || crate::sql::error_context::capture(error))
-    })
+    };
+    let frame = ProceduralFrame::new(signature, None, activity);
+    crate::sql::error_context::with_frame(&frame, || crate::sql::error_context::capture(error))
 }
 
 /// PostgreSQL's name for a statement in a context line (`plpgsql_stmt_typename`).
@@ -149,6 +156,7 @@ pub(super) fn statement_name(statement: TriggerStatement<'_>) -> &'static str {
         TriggerStatement::SelectInto(_)
         | TriggerStatement::Utility { .. }
         | TriggerStatement::Dml { .. } => "SQL statement",
+        TriggerStatement::Call { .. } => "CALL",
         TriggerStatement::DynamicQuery(_) | TriggerStatement::DynamicSelectInto(_) => "EXECUTE",
         TriggerStatement::CursorOpen(_) => "OPEN",
         TriggerStatement::CursorMotion(motion) if motion.move_only => "MOVE",
@@ -1321,17 +1329,22 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             context.arena,
                         )?;
                         let (scope, scope_values, _) = frames.scope(locals, values);
-                        if trigger_condition(
-                            context,
-                            condition,
-                            definition,
-                            invocation,
-                            old,
-                            new.as_deref(),
-                            scope,
-                            scope_values,
-                            status.found,
-                        )? {
+                        let found = status.found;
+                        // The repeated check is its own statement boundary.
+                        if initialize_phase(status, context, |context, continuation| {
+                            trigger_condition(
+                                context,
+                                condition,
+                                definition,
+                                invocation,
+                                old,
+                                new.as_deref(),
+                                scope,
+                                scope_values,
+                                found,
+                                continuation,
+                            )
+                        })? {
                             frames.last_mut().next = 0;
                         } else {
                             let frame = frames.pop();
@@ -1492,9 +1505,9 @@ fn bind_exception_variables<'a>(
         | TriggerStatement::SelectInto(TriggerSelectInto { query, .. }) => {
             site(Kind::Query, core::ptr::from_ref(query) as usize)
         }
-        TriggerStatement::Utility { source, .. } | TriggerStatement::Dml { source, .. } => {
-            site(Kind::Statement, source.as_ptr() as usize)
-        }
+        TriggerStatement::Utility { source, .. }
+        | TriggerStatement::Call { source, .. }
+        | TriggerStatement::Dml { source, .. } => site(Kind::Statement, source.as_ptr() as usize),
         TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
             query: PlpgsqlCursorQuery::Static(source),
             arguments,

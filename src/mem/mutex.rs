@@ -248,7 +248,7 @@ mod tests {
     use crate::mem::guard::forbid_alloc;
     use std::sync::TryLockError;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     #[test]
     fn core_mutex_first_use_replacement_and_unlocked_moves_do_not_allocate() {
@@ -324,7 +324,7 @@ mod tests {
                     *mutex.lock().unwrap() += 1;
                 })
             });
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             while !waiting.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::yield_now();
             }

@@ -17,6 +17,77 @@ use super::super::{
     text_arg,
 };
 
+/// What one input of a two-argument range built-in holds, read from the
+/// PostgreSQL function name (`multirange_contains_range`, `elem_contained_by_range`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RangeInput {
+    Range,
+    Multirange,
+    Element,
+}
+
+fn range_inputs(name: &str) -> [RangeInput; 2] {
+    let left = if name.starts_with("multirange_") {
+        RangeInput::Multirange
+    } else if name.starts_with("elem_") {
+        RangeInput::Element
+    } else {
+        RangeInput::Range
+    };
+    let right = if name.ends_with("_multirange") {
+        RangeInput::Multirange
+    } else if name.ends_with("_elem") {
+        RangeInput::Element
+    } else if name.ends_with("_range") {
+        RangeInput::Range
+    } else {
+        left
+    };
+    [left, right]
+}
+
+/// Evaluates both inputs of a two-argument range built-in. An untyped literal
+/// takes its type from the other input's range type, as PostgreSQL's
+/// polymorphic resolution does at parse time.
+#[allow(clippy::too_many_arguments)]
+fn range_pair<'a>(
+    name: &str,
+    args: &[&Expr<'a>],
+    arena: &'a crate::mem::arena::Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<[Datum<'a>; 2], SqlError> {
+    let mut values = [
+        eval_full(args[0], arena, params, row, hooks)?,
+        eval_full(args[1], arena, params, row, hooks)?,
+    ];
+    let inputs = range_inputs(name);
+    let kind = values.iter().find_map(|value| match value {
+        Datum::Range { kind, .. } | Datum::Multirange { kind, .. } => Some(*kind),
+        _ => None,
+    });
+    let Some(kind) = kind else {
+        return Ok(values);
+    };
+    for (index, value) in values.iter_mut().enumerate() {
+        if value.is_null()
+            || super::super::expression_type_identity(args[index], row, hooks)?
+                .routine_argument_oid()
+                != crate::sql::types::oid::UNKNOWN
+        {
+            continue;
+        }
+        let target = match inputs[index] {
+            RangeInput::Range => crate::sql::types::ColType::Range(kind),
+            RangeInput::Multirange => crate::sql::types::ColType::Multirange(kind),
+            RangeInput::Element => kind.elem_type(),
+        };
+        *value = super::super::cast_to(*value, target, arena)?;
+    }
+    Ok(values)
+}
+
 /// Handles the range/multirange family. Returns `None` if `name` is not one of
 /// these functions, leaving the router to keep matching.
 #[allow(clippy::too_many_arguments)]
@@ -397,8 +468,7 @@ pub(crate) fn dispatch<'a>(
                     };
                 }
                 arity(2)?;
-                let a = eval_full(args[0], arena, params, row, hooks)?;
-                let b = eval_full(args[1], arena, params, row, hooks)?;
+                let [a, b] = range_pair(name, args, arena, params, row, hooks)?;
                 if a.is_null() || b.is_null() {
                     return Ok(Datum::Null);
                 }
@@ -419,8 +489,7 @@ pub(crate) fn dispatch<'a>(
             | "multirange_eq" | "multirange_ne" | "multirange_lt" | "multirange_le"
             | "multirange_ge" | "multirange_gt" => {
                 arity(2)?;
-                let left = eval_full(args[0], arena, params, row, hooks)?;
-                let right = eval_full(args[1], arena, params, row, hooks)?;
+                let [left, right] = range_pair(name, args, arena, params, row, hooks)?;
                 let operator = if name.ends_with("_eq") {
                     crate::sql::ast::BinaryOp::Eq
                 } else if name.ends_with("_ne") {
@@ -438,8 +507,7 @@ pub(crate) fn dispatch<'a>(
             }
             "range_cmp" | "multirange_cmp" => {
                 arity(2)?;
-                let left = eval_full(args[0], arena, params, row, hooks)?;
-                let right = eval_full(args[1], arena, params, row, hooks)?;
+                let [left, right] = range_pair(name, args, arena, params, row, hooks)?;
                 if left.is_null() || right.is_null() {
                     return Ok(Datum::Null);
                 }
@@ -498,8 +566,7 @@ pub(crate) fn dispatch<'a>(
             | "multirange_overright_range"
             | "multirange_overright_multirange" => {
                 arity(2)?;
-                let left = eval_full(args[0], arena, params, row, hooks)?;
-                let right = eval_full(args[1], arena, params, row, hooks)?;
+                let [left, right] = range_pair(name, args, arena, params, row, hooks)?;
                 let operator = if name.contains("overlaps") {
                     crate::sql::ast::BinaryOp::Overlaps
                 } else if name.contains("contained_by") || name.starts_with("elem_contained") {
@@ -527,8 +594,7 @@ pub(crate) fn dispatch<'a>(
             }
             "range_union" | "range_intersect" | "range_minus" => {
                 arity(2)?;
-                let left = eval_full(args[0], arena, params, row, hooks)?;
-                let right = eval_full(args[1], arena, params, row, hooks)?;
+                let [left, right] = range_pair(name, args, arena, params, row, hooks)?;
                 let operator = match name {
                     "range_union" => crate::sql::ast::BinaryOp::Add,
                     "range_intersect" => crate::sql::ast::BinaryOp::Mul,
@@ -538,8 +604,7 @@ pub(crate) fn dispatch<'a>(
             }
             "multirange_union" | "multirange_intersect" | "multirange_minus" => {
                 arity(2)?;
-                let left = eval_full(args[0], arena, params, row, hooks)?;
-                let right = eval_full(args[1], arena, params, row, hooks)?;
+                let [left, right] = range_pair(name, args, arena, params, row, hooks)?;
                 let operator = match name {
                     "multirange_union" => crate::sql::ast::BinaryOp::Add,
                     "multirange_intersect" => crate::sql::ast::BinaryOp::Mul,
@@ -595,8 +660,7 @@ pub(crate) fn dispatch<'a>(
             "int4range_subdiff" | "int8range_subdiff" | "numrange_subdiff"
             | "daterange_subdiff" | "tsrange_subdiff" | "tstzrange_subdiff" => {
                 arity(2)?;
-                let left = eval_full(args[0], arena, params, row, hooks)?;
-                let right = eval_full(args[1], arena, params, row, hooks)?;
+                let [left, right] = range_pair(name, args, arena, params, row, hooks)?;
                 if left.is_null() || right.is_null() {
                     return Ok(Datum::Null);
                 }

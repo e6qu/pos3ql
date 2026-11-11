@@ -351,6 +351,9 @@ pub(super) fn groups_for_mask<'a>(
                         };
                         &row_hooks_store
                     };
+                    // Outer references, such as PL/pgSQL variables, read
+                    // the caller's row.
+                    let row = &super::scan::Chained { inner: row, outer };
                     let mut key_vals = [Datum::Null; crate::sql::parser::MAX_GROUP_TERMS];
                     for (k, g) in statement.group_by.iter().enumerate() {
                         if mask.contains(k) {
@@ -443,18 +446,18 @@ pub(super) fn groups_for_mask<'a>(
     let group_correlated = group_correlated_list.as_slice();
 
     let n_aggs = agg_nodes.len();
+    let scope_columns = super::ScopeCols(scope);
+    let outer_columns = super::aggregate_outer_columns(Some(scope), outer, storage, txid, arena);
+    let aggregate_columns: &dyn crate::sql::exec::ColTypeResolver = match &outer_columns {
+        Some(columns) => columns,
+        None => &scope_columns,
+    };
     let states: &mut [AggState] = arena
         .alloc_slice_with(n_groups * n_aggs.max(1), |_| AggState::default())
         .map_err(|_| arena_full())?;
     for g in 0..n_groups {
         for (i, (_, node)) in agg_nodes.iter().enumerate() {
-            states[g * n_aggs.max(1) + i].init(
-                node,
-                storage,
-                txid,
-                &super::ScopeCols(scope),
-                arena,
-            )?;
+            states[g * n_aggs.max(1) + i].init(node, storage, txid, aggregate_columns, arena)?;
         }
     }
     let partial_execution = storage.spill_attached()
@@ -478,7 +481,7 @@ pub(super) fn groups_for_mask<'a>(
                     node,
                     storage,
                     txid,
-                    &super::ScopeCols(scope),
+                    aggregate_columns,
                     arena,
                 )?;
             }
@@ -540,6 +543,7 @@ pub(super) fn groups_for_mask<'a>(
                     )
                 })? as usize
             };
+            let row = &super::scan::Chained { inner: row, outer };
             for (i, (_, node)) in agg_nodes.iter().enumerate() {
                 let index = g * n_aggs + i;
                 if partial_execution && states[index].supports_partial() {
@@ -567,7 +571,7 @@ pub(super) fn groups_for_mask<'a>(
                             node,
                             storage,
                             txid,
-                            &super::ScopeCols(scope),
+                            aggregate_columns,
                             arena,
                         )?;
                     }
@@ -628,7 +632,10 @@ pub(super) fn groups_for_mask<'a>(
                 node,
                 arena,
                 params,
-                &ScopeSchema(scope),
+                &super::scan::Chained {
+                    inner: &ScopeSchema(scope),
+                    outer,
+                },
                 &direct_hooks,
             )?;
             agg_vals[i] = state.finish(arena, hooks.catalog)?;
@@ -669,7 +676,12 @@ pub(super) fn groups_for_mask<'a>(
             sequences: hooks.sequences,
             merge_action: hooks.merge_action,
         };
-        let schema = ScopeSchema(scope);
+        // Outer references, such as PL/pgSQL variables, read the caller's row.
+        let scope_schema = ScopeSchema(scope);
+        let schema = super::scan::Chained {
+            inner: &scope_schema,
+            outer,
+        };
         if let Some(h) = statement.having {
             match eval_full(h, arena, params, &schema, &group_hooks)? {
                 Datum::Bool(true) => {}
@@ -1334,11 +1346,13 @@ fn ungrouped_column<'e, 'a>(
             .find_map(|e| ungrouped_column(e, group_by, scope, agg_nodes))
     };
     match expression {
-        Expr::Column { .. }
-        | Expr::WholeRow(_)
-        | Expr::SchemaColumn { .. }
-        | Expr::RecursiveState { .. } => Some(expression),
-        Expr::RoutineParam {
+        Expr::WholeRow(_) | Expr::SchemaColumn { .. } | Expr::RecursiveState { .. } => {
+            Some(expression)
+        }
+        // A name outside the query's own sources is an outer reference, such
+        // as a PL/pgSQL variable: constant within every group.
+        Expr::Column { qualifier, name }
+        | Expr::RoutineParam {
             qualifier, name, ..
         } => scope.find_column(*qualifier, name).ok().map(|_| expression),
         Expr::Null

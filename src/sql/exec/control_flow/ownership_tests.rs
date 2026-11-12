@@ -1452,12 +1452,18 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                     let parsed =
                         parse_plpgsql_program(source, scratch, PlpgsqlProgramKind::Anonymous)
                             .unwrap();
-                    // This pass uses names and mutability, independently of catalog types.
+                    // This pass uses names and mutability, and whether a
+                    // cursor variable is a refcursor; `c` is the only one.
                     let locals = scratch
                         .alloc_slice_with(parsed.locals.len(), |index| TriggerLocalDecl {
                             label: None,
                             name: parsed.locals[index].name,
                             constant: parsed.locals[index].constant,
+                            ctype: if parsed.locals[index].name.as_str() == "c" {
+                                ColType::Refcursor
+                            } else {
+                                empty_plpgsql_local().ctype
+                            },
                             ..empty_plpgsql_local()
                         })
                         .unwrap();

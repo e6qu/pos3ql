@@ -133,9 +133,7 @@ is owned.
   sub-statement as the main statement reads its rows (their events
   interleave) and an unreferenced one after the main statement, last one
   first. Matching that order needs sub-statements that run as their rows are
-  read. A referential action that the end of a `WITH` statement whose main
-  statement is a `SELECT` runs fails with `0A000` when the referencing table
-  has rules, because that end runs without the engine's executor.
+  read.
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written

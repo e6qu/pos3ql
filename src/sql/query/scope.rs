@@ -889,13 +889,9 @@ impl<'d> QueryScope<'d> {
         enclosing: Option<&dyn ColumnLookup<'_>>,
     ) -> Result<RelationDefinition<'a>, SqlError> {
         let lateral = tref.lateral.then_some(self);
-        let contextual = match enclosing {
-            Some(_) => {
-                sub.set_body.is_some()
-                    || super::subquery::select_reads_enclosing(sub, lateral, storage, txid, arena)?
-            }
-            None => lateral.is_some() && sub.set_body.is_some(),
-        };
+        let contextual = (lateral.is_some() && sub.set_body.is_some())
+            || (enclosing.is_some()
+                && super::subquery::select_reads_enclosing(sub, lateral, storage, txid, arena)?);
         if !contextual {
             return super::srf::describe_derived_definition(
                 storage,

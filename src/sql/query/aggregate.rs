@@ -96,14 +96,25 @@ pub(crate) fn fold_aggregates<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     outer_arg: Option<&dyn ColumnLookup<'a>>,
+    // States initialized once per statement for these nodes, copied here.
+    prototypes: Option<&[AggState<'a>]>,
 ) -> Result<&'a mut [Datum<'a>], SqlError> {
     let states: &mut [AggState] = arena
         .alloc_slice_with(agg_nodes.len(), |_| AggState::default())
         .map_err(|_| arena_full())?;
-    let columns_resolver = super::aggregate_columns(scope, outer_arg, storage, txid, arena);
-    let columns: &dyn crate::sql::exec::ColTypeResolver = &columns_resolver;
-    for (i, (_, node)) in agg_nodes.iter().enumerate() {
-        states[i].init(node, storage, txid, columns, arena)?;
+    match prototypes {
+        Some(prototypes) => {
+            for (state, prototype) in states.iter_mut().zip(prototypes) {
+                *state = prototype.fresh_copy(arena)?;
+            }
+        }
+        None => {
+            let columns_resolver = super::aggregate_columns(scope, outer_arg, storage, txid, arena);
+            let columns: &dyn crate::sql::exec::ColTypeResolver = &columns_resolver;
+            for (i, (_, node)) in agg_nodes.iter().enumerate() {
+                states[i].init(node, storage, txid, columns, arena)?;
+            }
+        }
     }
     let recycling_safe = states[..agg_nodes.len()]
         .iter()

@@ -118,12 +118,15 @@ is owned.
     and uncorrelated scalar, `EXISTS`, `ARRAY` and row subqueries of unsorted,
     ungrouped streams (correlated ones, `IN`/`ANY`/`ALL` lists, subqueries
     under a sort or grouping, grouped or bounded derived tables, and scans of
-    CTEs that run once). A correlated subquery is analysed again for each
-    outer row: the general executor resolves its FROM scope, aggregate calls
-    and output type, and evaluates its operators without binding them first
-    (about 1 ms per outer row for a 50-row inner scan in a debug build).
-    Binding the subquery once per statement and rewinding a retained child
-    tree per row removes that,
+    CTEs that run once). A correlated scalar subquery that is not grouped,
+    windowed or a set operation binds its output type and aggregate calls
+    once per statement, but still resolves its FROM scope and evaluates its
+    operators unbound for each outer row; correlated `EXISTS`, `ARRAY`, row,
+    `IN`, `ANY` and `ALL` subqueries and the other scalar ones are analysed
+    again for each outer row. Over 2000 outer rows and a 50-row inner table
+    in a debug build, `sum((SELECT max(v) ... WHERE v <= o.id))` takes 2.6 s
+    (27 s unbound) and the matching `EXISTS` 2.4 s, where PostgreSQL takes
+    about 4 ms. Rewinding a retained child tree per outer row removes that,
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs

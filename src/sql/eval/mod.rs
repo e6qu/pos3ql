@@ -2805,6 +2805,8 @@ pub struct SubqueryValues<'h, 'a> {
     pub lists: &'h [SubqueryList<'a>],
     /// Uncorrelated scalar subqueries that run when first read.
     pub initplans: Option<InitPlans<'a>>,
+    /// Correlated scalar subqueries analysed once for the statement.
+    pub(crate) bindings: &'h [crate::sql::query::SubqueryBinding<'a>],
 }
 
 /// Uncorrelated scalar subqueries that run when an expression first reads
@@ -4389,6 +4391,7 @@ fn eval_full_inner<'a>(
                     scalars: &scalars,
                     lists: subs.lists,
                     initplans: subs.initplans,
+                    bindings: subs.bindings,
                 }),
                 ..*hooks
             },
@@ -4433,6 +4436,7 @@ fn eval_full_inner<'a>(
                     scalars: &scalars,
                     lists: &[],
                     initplans: hooks.subs.and_then(|subs| subs.initplans),
+                    bindings: hooks.subs.map_or(&[], |subs| subs.bindings),
                 }
             }
             SubqueryResult::List(list) => {
@@ -4444,6 +4448,7 @@ fn eval_full_inner<'a>(
                     scalars: &[],
                     lists: &lists,
                     initplans: hooks.subs.and_then(|subs| subs.initplans),
+                    bindings: hooks.subs.map_or(&[], |subs| subs.bindings),
                 }
             }
         };

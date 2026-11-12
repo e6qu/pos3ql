@@ -306,7 +306,14 @@ the scan, as PostgreSQL's one-time filter: `SELECT id, payload FROM orders
 WHERE id > (SELECT max(id) - 1000 FROM orders)` streams, and a false one
 returns no rows without reading any. A wait inside a subquery runs it again. Correlated subqueries, `IN` and `ANY`/`ALL`
 lists, subqueries in a sorted or grouped stream, in a `UNION ALL` query or
-in a declared cursor still spool or save their rows.
+in a declared cursor still spool or save their rows. In the general executor
+a correlated subquery reads the enclosing row from its derived tables, set
+operation branches, `LIMIT`, `OFFSET` and `JOIN ... ON` conditions, as
+PostgreSQL's outer references do; a correlated subquery in a join condition
+runs for each pair of rows it compares. A correlated scalar subquery binds
+its result type and aggregate calls once per statement, before any outer
+row, and copies the bound aggregate states for each outer row
+(`bind_correlated_subqueries` in `src/sql/query/subquery.rs`).
 
 Every other shape runs in the general executor, which materializes in the
 statement arena and cannot pause after its first byte. New node kinds are the

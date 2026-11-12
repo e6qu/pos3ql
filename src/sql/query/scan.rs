@@ -5797,6 +5797,11 @@ pub(super) fn one_time_filter_passes<'a>(
     let Some(predicate) = where_clause else {
         return Ok(true);
     };
+    // PostgreSQL folds a condition with a constant-false conjunct to false
+    // before planning, so none of its other conjuncts runs.
+    if super::plan::plan_time_bool(predicate, arena) == Some(false) {
+        return Ok(false);
+    }
     let mut conjuncts = [&Expr::Null; MAX_ONE_TIME_CONJUNCTS];
     let mut count = 0;
     if !super::plan::flatten_and(predicate, &mut conjuncts, &mut count) {

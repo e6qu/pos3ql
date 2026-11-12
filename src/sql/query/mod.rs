@@ -836,7 +836,9 @@ pub(crate) use plan::join_order;
 use plan::{postpone_cost, reorder_qual, simplify_qual, where_passes};
 
 mod subquery;
-pub(crate) use subquery::{ProceduralSubqueries, subquery_expression_type};
+#[cfg(test)]
+pub(crate) use subquery::subquery_analyses;
+pub(crate) use subquery::{ProceduralSubqueries, SubqueryBinding, subquery_expression_type};
 use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
     prepare_outer_subqueries, subquery_witness,
@@ -10000,10 +10002,16 @@ pub(crate) fn select_query_resumable<'a>(
     collect_table_sample_expressions(from, &mut sub_exprs[sample_start..]);
     // Uncorrelated subqueries are evaluated once; correlated ones are deferred
     // and re-evaluated per outer row during the scan.
+    let row_schema = ScopeSchema(&scope);
+    let row_types = Chained {
+        inner: &row_schema,
+        outer: None,
+    };
     let join_subqueries = ProceduralSubqueries { storage, txid };
     let outer_subs = match prepare_outer_subqueries(
         sub_exprs,
         statement.from.as_ref(),
+        &row_types,
         storage,
         txid,
         arena,
@@ -11557,10 +11565,16 @@ fn select_into_rows_mode<'a>(
             }
         }
         collect_table_sample_expressions(from, &mut sub_exprs[2 + statement.items.len()..]);
+        let row_schema = ScopeSchema(&scope);
+        let row_types = Chained {
+            inner: &row_schema,
+            outer,
+        };
         let join_subqueries = ProceduralSubqueries { storage, txid };
         let outer_subs = prepare_outer_subqueries(
             sub_exprs,
             statement.from.as_ref(),
+            &row_types,
             storage,
             txid,
             arena,
@@ -11770,10 +11784,16 @@ fn select_into_rows_mode<'a>(
             arena,
         },
     };
+    let row_schema = ScopeSchema(&scope);
+    let row_types = Chained {
+        inner: &row_schema,
+        outer,
+    };
     let join_subqueries = ProceduralSubqueries { storage, txid };
     let outer_subs = prepare_outer_subqueries(
         sub_exprs,
         statement.from.as_ref(),
+        &row_types,
         storage,
         txid,
         arena,

@@ -62486,6 +62486,43 @@ fn correlated_scalar_subquery_in_projection() {
 }
 
 #[test]
+fn correlated_scalar_subquery_analyses_once_per_statement() {
+    let (mut e, mut b) = test_engine();
+    run_with(&mut e, &mut b, "CREATE TABLE outer_rows (id int)");
+    run_with(&mut e, &mut b, "CREATE TABLE inner_rows (v int)");
+    run_with(
+        &mut e,
+        &mut b,
+        "INSERT INTO inner_rows SELECT g FROM generate_series(1, 50) g",
+    );
+    let analyses = |e: &mut Engine, b: &mut Budget, rows: i32| {
+        run_with(e, b, "DELETE FROM outer_rows");
+        run_with(
+            e,
+            b,
+            &format!("INSERT INTO outer_rows SELECT g FROM generate_series(1, {rows}) g"),
+        );
+        let before = crate::sql::query::subquery_analyses();
+        let bytes = run_with(
+            e,
+            b,
+            "SELECT sum((SELECT max(v) FROM inner_rows WHERE inner_rows.v <= outer_rows.id)), \
+             count((SELECT 1 WHERE outer_rows.id > 0)), \
+             sum(cardinality(ARRAY(SELECT v FROM inner_rows WHERE v <= outer_rows.id))) \
+             FROM outer_rows",
+        );
+        let expected = (1..=rows).map(|id| id.min(50)).sum::<i32>();
+        assert_eq!(data_rows(&bytes), [format!("{expected}|{rows}|{expected}")]);
+        crate::sql::query::subquery_analyses() - before
+    };
+    // Binding happens once per statement, not once per outer row.
+    let few = analyses(&mut e, &mut b, 3);
+    let many = analyses(&mut e, &mut b, 200);
+    assert_eq!(few, 3);
+    assert_eq!(many, few);
+}
+
+#[test]
 fn correlated_scalar_subquery_streaming() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (a int, b int)");

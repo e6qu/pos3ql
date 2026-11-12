@@ -3116,6 +3116,7 @@ impl<'a> RetainedSelect<'a> {
             scalars: &[],
             lists: &[],
             initplans: None,
+            bindings: &[],
         };
         patch_subquery_column_types(
             statement.items,
@@ -3478,6 +3479,7 @@ impl<'a> RetainedSelect<'a> {
             scalars: &[],
             lists: &[],
             initplans: None,
+            bindings: &[],
         };
         patch_subquery_column_types(
             statement.items,
@@ -3715,6 +3717,7 @@ impl<'a> RetainedSelect<'a> {
                 scalars: &[],
                 lists: &[],
                 initplans,
+                bindings: &[],
             });
         }
         // A grouping still returns its one row over no input, so it filters

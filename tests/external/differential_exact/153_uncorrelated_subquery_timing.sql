@@ -25,3 +25,6 @@ BEGIN;
 DECLARE ip_c CURSOR FOR SELECT (SELECT 1/x FROM ip_z) FROM ip_e;
 FETCH ALL FROM ip_c;
 COMMIT;
+SELECT id FROM ip_t WHERE (SELECT 1/x FROM ip_z) = 1 AND false;
+SELECT id FROM ip_t WHERE false AND (SELECT 1/x FROM ip_z) = 1;
+SELECT id FROM ip_t WHERE (SELECT 1/x FROM ip_z) = 1 AND id > 0;

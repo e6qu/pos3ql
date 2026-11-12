@@ -2635,6 +2635,9 @@ pub(crate) fn describe_contextual_derived_definition<'a>(
         crate::sql::exec::DescriptionTarget::Sql,
         Some(visible),
     )?;
+    if let Some(tree) = sub.set_body {
+        register_set_record_shapes(storage, tree, txid, arena, &mut descriptors[..n_cols])?;
+    }
     let mut type_oids = [0_i32; MAX_PROJ];
     for (output, description) in type_oids.iter_mut().zip(&descriptors[..n_cols]) {
         *output = description.type_oid;

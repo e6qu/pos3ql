@@ -669,12 +669,6 @@ pub struct Engine {
     max_spill_generations_per_table: usize,
     result_streams_opened: u64,
     result_streams_spooled: [u64; 3],
-    /// Cold-read restarts after which a statement attempt reads the rest
-    /// synchronously: more than the block caches and read slots hold, so
-    /// the next attempt could not find every block the last one read.
-    restart_read_bound: u32,
-    /// The current attempt is past that bound.
-    complete_reads: bool,
     ckpt: Option<Checkpointer>,
     temporary_spiller: Option<TemporarySpiller>,
     /// Shared overflow file for connections' queued AFTER trigger events.
@@ -3554,18 +3548,6 @@ impl Engine {
         let _ = self.replace_read_owner(Some(identity.read_owner()));
     }
 
-    /// See `restart_read_bound`.
-    pub(crate) fn restart_read_bound(&self) -> u32 {
-        self.restart_read_bound
-    }
-
-    /// Makes the next statement attempt read synchronously: it restarted
-    /// after more cold reads than the caches hold, so restarting again could
-    /// evict the blocks it needs and never finish.
-    pub(crate) fn set_complete_reads(&mut self, complete: bool) {
-        self.complete_reads = complete;
-    }
-
     pub(crate) fn bind_query_connection(&mut self, connection_id: i32) {
         self.work.bind_connection(connection_id);
         let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
@@ -3581,17 +3563,23 @@ impl Engine {
         core::mem::replace(&mut self.read_owner, owner)
     }
 
-    pub(crate) fn cancel_read_owner(&mut self, owner: crate::store::ReadOwner) {
-        if let Some(checkpointer) = &mut self.ckpt {
-            checkpointer.cancel_read_owner(owner);
+    /// The running statement kept progress across waits (a delivered row).
+    pub(crate) fn statement_progressed(&mut self) {
+        if let (Some(checkpointer), Some(owner)) = (&mut self.ckpt, self.read_owner) {
+            checkpointer.statement_progressed(owner);
         }
     }
 
-    /// See [`crate::store::FetchHistory`]; without object storage nothing is
-    /// recorded.
-    pub(crate) fn exchange_fetch_history(&mut self, history: &mut crate::store::FetchHistory) {
+    /// The owner's session ended: its statement's download history is freed.
+    pub(crate) fn forget_statement_reads(&mut self, owner: crate::store::ReadOwner) {
         if let Some(checkpointer) = &mut self.ckpt {
-            checkpointer.exchange_fetch_history(history);
+            checkpointer.forget_statement_reads(owner);
+        }
+    }
+
+    pub(crate) fn cancel_read_owner(&mut self, owner: crate::store::ReadOwner) {
+        if let Some(checkpointer) = &mut self.ckpt {
+            checkpointer.cancel_read_owner(owner);
         }
     }
 
@@ -5059,20 +5047,6 @@ impl Engine {
             max_spill_generations_per_table: config.max_spill_generations_per_table,
             result_streams_opened: 0,
             result_streams_spooled: [0; 3],
-            restart_read_bound: {
-                let plan = crate::store::StackPlan::resolve(
-                    config.block_cache_bytes,
-                    config.disk_cache_bytes,
-                );
-                u32::try_from(
-                    plan.ram
-                        .units
-                        .saturating_add(plan.disk.units)
-                        .saturating_add(config.object_store_get_slots),
-                )
-                .unwrap_or(u32::MAX)
-            },
-            complete_reads: false,
             commit_progress: CommitProgressMode::Inline,
             inflight_publication: None,
             publication_failed: false,
@@ -6515,6 +6489,16 @@ impl Engine {
         if resume_statement && resumed.is_none() {
             // A write's progress belongs to the statement that waited.
             txn.release_retained_write();
+        }
+        if resume_statement
+            && let (Some(checkpointer), Some(owner)) = (&mut self.ckpt, self.read_owner)
+        {
+            // Rows a resumed write kept move its journal position.
+            checkpointer.begin_statement_reads(
+                owner,
+                resumed.is_some(),
+                self.wal.stage_mark(txn.txid),
+            )?;
         }
         if let Some(lease) = resumed.as_ref().and_then(|state| state.lease.as_ref()) {
             lease.validate_storage(&self.storage)?;
@@ -21422,10 +21406,7 @@ impl Engine {
                     | Stmt::Merge(_)
                     | Stmt::With { .. }
             );
-        let _atomic_reads = if (statement_writes(statement)
-            || reset_workspace && self.complete_reads)
-            && !yields_before_effects
-        {
+        let _atomic_reads = if statement_writes(statement) && !yields_before_effects {
             self.ckpt
                 .as_ref()
                 .map(Checkpointer::atomic_block_read_scope)

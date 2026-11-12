@@ -136,14 +136,13 @@ is owned.
   selection of a rule action after the rule's earlier steps yields and rolls
   back to the step's start (a data-modifying `WITH` main statement after its
   sub-statements still reads synchronously); a
-  statement whose restarts download evicted blocks again falls back to
-  synchronous reads (see the
-  [execution model](docs/architecture.md#execution-model)), so it finishes
-  with empty caches. The `AFTER` work (foreign key checks included) of those steps and
+  statement whose restarts repeat downloads without progress reads the rest
+  synchronously (`statement_restart_waits`), so it finishes with empty
+  caches. The `AFTER` work (foreign key checks included) of those steps and
   of writes inside functions called from a restartable statement still reads
   synchronously: a step's foreign key check that waited resumed the step at a
   completion position past its last row and then waited again without a new
-  GET, a loop the refetch fallback does not see. `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and
+  GET, a loop the download bound does not see. `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and
   `SET DEFAULT` run as queued events at the statement's end, as
   PostgreSQL 18.6's `RI_ConstraintTrigger_a_*` events (never deferred), but
   rewrite the referencing rows directly. PostgreSQL runs each as a `DELETE`

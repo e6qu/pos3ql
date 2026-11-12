@@ -3094,6 +3094,7 @@ impl Server {
     fn release(&mut self, index: usize) {
         let owner = self.slots[index].conn.execution_identity().read_owner();
         self.engine.cancel_read_owner(owner);
+        self.engine.forget_statement_reads(owner);
         if self.slots[index].conn.txn.staged_commit().is_some() {
             assert!(!self.slots[index].query_dispatch_pending);
             let handoff = self.query_workspaces.cancel(index);

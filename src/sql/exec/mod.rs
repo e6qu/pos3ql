@@ -79635,7 +79635,13 @@ where
                     }
                     None => None,
                 };
-                let (n_src, defaults) = match rule_values_row_defaults(statement, bytes) {
+                // A deferred source row holds hidden call columns past its
+                // written ones; its converted row has the written shape.
+                let shape = match converted {
+                    Some(row) => rule_values_defaults_of(statement, row.len(), |last| row[last]),
+                    None => rule_values_row_defaults(statement, bytes),
+                };
+                let (n_src, defaults) = match shape {
                     Ok(row) => row,
                     Err(error) => return sql_fail(error),
                 };
@@ -91790,14 +91796,22 @@ fn rule_values_row_defaults(
     statement: &Insert<'_>,
     bytes: &[u8],
 ) -> Result<(usize, ColumnSet), SqlError> {
-    let width = projected_row_width(bytes);
+    rule_values_defaults_of(statement, projected_row_width(bytes), |last| {
+        decode_projected_pub(bytes, last)
+    })
+}
+
+/// [`rule_values_row_defaults`] for a row of `width` values, reading its
+/// value at an index with `value`.
+fn rule_values_defaults_of<'v>(
+    statement: &Insert<'_>,
+    width: usize,
+    value: impl FnOnce(usize) -> Datum<'v>,
+) -> Result<(usize, ColumnSet), SqlError> {
     if statement.values_defaults.is_empty() {
         return Ok((width, ColumnSet::EMPTY));
     }
-    let number = match width
-        .checked_sub(1)
-        .map(|last| decode_projected_pub(bytes, last))
-    {
+    let number = match width.checked_sub(1).map(value) {
         Some(Datum::Int4(number)) => usize::try_from(number).ok(),
         Some(Datum::Int8(number)) => usize::try_from(number).ok(),
         _ => None,

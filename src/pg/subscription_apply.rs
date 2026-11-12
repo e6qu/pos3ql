@@ -730,6 +730,7 @@ impl SubscriptionApply {
                 | self.stream.slot() as u128,
         );
         engine.cancel_read_owner(owner);
+        engine.forget_statement_reads(owner);
         if self.txn.staged_commit().is_some() {
             // The commit boundary is irreversible. Its startup queue owner
             // survives a disconnected publisher until publication resolves.

@@ -64,6 +64,18 @@ worker. Completion or failure releases unused read-ahead requests. Commit does
 so as soon as its row images are in the journal, so an abandoned speculative
 download cannot hold up the next checkpoint.
 
+**Restarts always finish.** A statement that restarts after a wait reads its
+blocks again; a block it already consumed survives only in the block or disk
+cache. When the caches are off or smaller than the statement's blocks, every
+attempt could download them again and wait again, so the read path counts,
+per statement, how often it downloaded each block since the statement last
+kept progress (rows a resumed write kept, a delivered result row). An attempt
+after a wait that would download a block a third time, or one more distinct
+block than `statement_restart_waits` (default 64), reads the rest of the
+statement synchronously. With `block_cache_bytes = 0` and `disk_cache_bytes =
+0`, `SELECT ... UNION ALL ...` over three cold tables therefore waits a few
+times and then finishes, where it used to restart forever.
+
 The rule for statements: a statement can yield until it performs its first
 **effect** — something a restart could not undo or repeat. Effects are calling
 a volatile function or a user routine body, issuing `nextval`/`setval`, and
@@ -290,17 +302,8 @@ A statement that does not stream restarts from its start after each cold
 read, finding the objects its earlier attempts read only in the block
 caches. It reruns only once one of its own reads has completed: while every
 read it waits on is still in flight, another session's completed read does
-not wake it. Each message records the objects its attempts request in a
-fixed Bloom filter. A rerun counts as a restart only after an attempt
-requested an object again, which means the caches evicted it before the
-message finished. Once it has restarted that way more times than the caches
-and the object read slots hold blocks (`block_cache_bytes`,
-`disk_cache_bytes` and `object_store_get_slots`), its next attempt reads
-storage synchronously, blocking the worker, instead of restarting again:
-each attempt could evict blocks the next one needs, so it would never
-finish. Barring a Bloom false positive, a statement whose objects all fit
-the caches never reads this way, so it does not block other sessions while
-the provider holds one of its reads.
+not wake it. Restarts that repeat downloads without progress are bounded as
+described above (`statement_restart_waits`).
 A result stream resumes from its read position and never restarts this way.
 
 A forward `FETCH n` or `FETCH ALL` (simple Query or unpaged `Execute`) from

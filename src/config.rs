@@ -391,6 +391,10 @@ pub struct Config {
     pub object_store_put_slots: usize,
     /// Physical-block upload clients, independent of journal publication.
     pub object_store_block_put_slots: usize,
+    /// Distinct durable blocks one statement may download while it restarts
+    /// after waits. A restarted attempt that downloads a block again or one
+    /// more block reads the rest of its statement synchronously.
+    pub statement_restart_waits: usize,
     /// Deadline after which a pending durable-block GET may use one spare
     /// fixed slot for a duplicate request. Zero disables hedging.
     pub object_store_hedge_after_ms: u64,
@@ -601,6 +605,7 @@ impl Config {
             object_store_put_slots: 4,
             object_store_block_put_slots: 4,
             object_store_hedge_after_ms: 0,
+            statement_restart_waits: 64,
             object_store_tls: false,
             object_store_tls_ca_file: String::new(),
             tls_pool_bytes: 4 * MIB,
@@ -1298,6 +1303,10 @@ impl Config {
                 }
                 "object_store_get_slots" => {
                     config.object_store_get_slots =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "statement_restart_waits" => {
+                    config.statement_restart_waits =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "object_store_hedge_after_ms" => {
@@ -3036,6 +3045,20 @@ sql_arena_bytes = 4096
                 .message
                 .contains("object_store_block_put_slots must be at least 1")
         );
+    }
+
+    #[test]
+    fn statement_restart_waits_default_and_parse() {
+        let c = Config::parse(
+            "object_store = sim\nstatement_restart_waits = 3\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\ntrigger_event_spill_bytes = 0\n",
+        )
+        .unwrap();
+        assert_eq!(c.statement_restart_waits, 3);
+        let c = Config::parse(
+            "object_store = sim\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\ntrigger_event_spill_bytes = 0\n",
+        )
+        .unwrap();
+        assert_eq!(c.statement_restart_waits, 64);
     }
 
     #[test]

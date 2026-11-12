@@ -14980,35 +14980,52 @@ impl Engine {
                         Ok(action) => action,
                         Err(error) => return Ok(Err(error)),
                     };
-                    let action = match query::attach_rule_source(
+                    let actions = match query::split_rule_insert_defaults(
                         action,
-                        transition.source,
-                        condition,
+                        || rule_insert_target_columns(storage, action, txn.txid, arena),
                         arena,
                     ) {
-                        Ok(action) => action,
+                        Ok(actions) => actions,
                         Err(error) => return Ok(Err(error)),
                     };
                     let use_returning = outer_returns_rows
                         && definition.returning_action == Some(action_index as u8);
-                    let outcome = Self::execute_rule_action(
-                        storage,
-                        scratch,
-                        arena,
-                        action,
-                        rule_authorization,
-                        txn,
-                        params,
-                        guc,
-                        responder,
-                        if use_returning { capture.take() } else { None },
-                        use_returning,
-                        connection_id,
-                    )?;
-                    if let Err(error) = outcome {
-                        return Ok(Err(error));
+                    if use_returning && actions.len() > 1 {
+                        return Ok(Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "RETURNING from a rule INSERT whose VALUES rows write DEFAULT in different columns is not supported"
+                        )));
                     }
-                    affected = affected.saturating_add(responder.take_affected_rows().unwrap_or(0));
+                    for action in actions {
+                        let action = match query::attach_rule_source(
+                            action,
+                            transition.source,
+                            condition,
+                            arena,
+                        ) {
+                            Ok(action) => action,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let outcome = Self::execute_rule_action(
+                            storage,
+                            scratch,
+                            arena,
+                            action,
+                            rule_authorization,
+                            txn,
+                            params,
+                            guc,
+                            responder,
+                            if use_returning { capture.take() } else { None },
+                            use_returning,
+                            connection_id,
+                        )?;
+                        if let Err(error) = outcome {
+                            return Ok(Err(error));
+                        }
+                        affected =
+                            affected.saturating_add(responder.take_affected_rows().unwrap_or(0));
+                    }
                 }
                 Ok(Ok(affected))
             })();
@@ -29485,4 +29502,31 @@ pub(crate) fn analyze_dml_cte<'a>(
             source: ast::MaterializedCteSource::Inline(&[]),
         },
     ))
+}
+
+/// The column names, in order, of the table a rule's INSERT action writes.
+fn rule_insert_target_columns<'a>(
+    storage: &Storage,
+    action: &Stmt<'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [&'a str], SqlError> {
+    let Stmt::Insert(insert) = action else {
+        return Ok(&[]);
+    };
+    let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(insert.table.schema, insert.table.name, txid)
+    else {
+        return Ok(&[]);
+    };
+    let definition = storage.table_def(slot, txid);
+    let names = arena
+        .alloc_slice_with(definition.columns().len(), |_| "")
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for (name, column) in names.iter_mut().zip(definition.columns()) {
+        *name = arena
+            .alloc_str(column.name.as_str())
+            .map_err(|_| crate::sql::eval::arena_full())?;
+    }
+    Ok(names)
 }

@@ -4205,22 +4205,27 @@ impl ColumnStatisticsOptionNames {
     };
 }
 
-/// A table-level constraint, or a column-level CHECK/REFERENCES desugared to
-/// name its single column.
+/// A table-level constraint, or a column-level constraint desugared to name
+/// its single column. `source_position` is where the constraint was written
+/// (its `CONSTRAINT name` prefix when named), which PostgreSQL's errors about
+/// the constraint point at.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TableConstraint<'a> {
     PrimaryKey {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
         timing: ConstraintTiming,
     },
     Unique {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
         timing: ConstraintTiming,
         nulls_not_distinct: bool,
     },
     Check {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         expression: &'a Expr<'a>,
         /// Source text of the predicate, stored durably and re-parsed at
@@ -4229,6 +4234,7 @@ pub enum TableConstraint<'a> {
         validation: ConstraintValidation,
     },
     ForeignKey {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
         parent: QualName<'a>,
@@ -4240,6 +4246,7 @@ pub enum TableConstraint<'a> {
         validation: ConstraintValidation,
     },
     Exclusion {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
         operators: &'a [ExclusionOperator],
@@ -4247,6 +4254,28 @@ pub enum TableConstraint<'a> {
         predicate_text: Option<&'a str>,
         timing: ConstraintTiming,
     },
+}
+
+impl TableConstraint<'_> {
+    pub const fn source_position(&self) -> SourcePosition {
+        match self {
+            Self::PrimaryKey {
+                source_position, ..
+            }
+            | Self::Unique {
+                source_position, ..
+            }
+            | Self::Check {
+                source_position, ..
+            }
+            | Self::ForeignKey {
+                source_position, ..
+            }
+            | Self::Exclusion {
+                source_position, ..
+            } => *source_position,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

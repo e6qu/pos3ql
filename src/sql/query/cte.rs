@@ -1440,6 +1440,109 @@ pub(crate) fn rule_transition_source<'a>(
 /// Attaches the original statement's transition-row source to one rebound
 /// action. OLD/NEW have already become columns of `source`; this step keeps
 /// the action set-oriented, so its statement triggers still fire once.
+/// A rule's `INSERT ... VALUES` action whose rows write `DEFAULT`, split
+/// into one INSERT per pattern of `DEFAULT` positions that names only the
+/// columns its rows give values for. The omitted columns take their defaults
+/// (including identity and generated values) as PostgreSQL's rewriter
+/// substitutes them; the action runs over the rule's source rows as an
+/// `INSERT ... SELECT`, which has no `DEFAULT` marker. `table_columns`
+/// names the target's columns in order for an action without a column list.
+pub(crate) fn split_rule_insert_defaults<'a>(
+    statement: &'a Stmt<'a>,
+    table_columns: impl FnOnce() -> Result<&'a [&'a str], SqlError>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Stmt<'a>], SqlError> {
+    let single = |statement: &'a Stmt<'a>| {
+        arena
+            .alloc_slice_with(1, |_| statement)
+            .map(|statements| &*statements)
+            .map_err(|_| arena_full())
+    };
+    let Stmt::Insert(insert) = statement else {
+        return single(statement);
+    };
+    let is_default = |expression: &&Expr<'_>| matches!(expression, Expr::DefaultMarker);
+    if !insert
+        .rows
+        .iter()
+        .any(|row| !row.is_empty() && row.iter().any(is_default))
+    {
+        return single(statement);
+    }
+    let width = insert.rows.iter().map(|row| row.len()).max().unwrap_or(0);
+    let columns = if insert.columns.is_empty() {
+        let columns = table_columns()?;
+        if width > columns.len() || insert.rows.iter().any(|row| row.len() != width) {
+            // The executor reports the arity error as PostgreSQL does.
+            return single(statement);
+        }
+        &columns[..width]
+    } else {
+        insert.columns
+    };
+    if columns.len() > crate::storage::MAX_COLUMNS
+        || insert.rows.iter().any(|row| row.len() != columns.len())
+    {
+        return single(statement);
+    }
+    let pattern = |row: &[&Expr<'_>]| {
+        let mut defaults = crate::storage::ColumnSet::EMPTY;
+        for (position, expression) in row.iter().enumerate() {
+            if is_default(expression) {
+                defaults.insert(position);
+            }
+        }
+        defaults
+    };
+    let mut statements: ArenaList<'a, &'a Stmt<'a>> = ArenaList::new(arena);
+    for (first, row) in insert.rows.iter().enumerate() {
+        let defaults = pattern(row);
+        if insert.rows[..first]
+            .iter()
+            .any(|earlier| pattern(earlier) == defaults)
+        {
+            continue;
+        }
+        let kept = (0..columns.len())
+            .filter(|position| !defaults.contains(*position))
+            .count();
+        let group_columns = arena
+            .alloc_slice_with(kept, |_| "")
+            .map_err(|_| arena_full())?;
+        for (slot, position) in (0..columns.len())
+            .filter(|position| !defaults.contains(*position))
+            .enumerate()
+        {
+            group_columns[slot] = columns[position];
+        }
+        let mut rows: ArenaList<'a, &'a [&'a Expr<'a>]> = ArenaList::new(arena);
+        for row in insert.rows[first..]
+            .iter()
+            .filter(|row| pattern(row) == defaults)
+        {
+            let values = arena
+                .alloc_slice_with(kept, |_| row[0])
+                .map_err(|_| arena_full())?;
+            for (slot, position) in (0..columns.len())
+                .filter(|position| !defaults.contains(*position))
+                .enumerate()
+            {
+                values[slot] = row[position];
+            }
+            rows.push(&*values).map_err(|_| arena_full())?;
+        }
+        let split = arena
+            .alloc(Stmt::Insert(Insert {
+                columns: group_columns,
+                rows: rows.as_slice(),
+                ..*insert
+            }))
+            .map_err(|_| arena_full())?;
+        statements.push(&*split).map_err(|_| arena_full())?;
+    }
+    Ok(statements.as_slice())
+}
+
 pub(crate) fn attach_rule_source<'a>(
     statement: &'a Stmt<'a>,
     source: TableRef<'a>,

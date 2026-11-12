@@ -92,7 +92,7 @@ pub(crate) use cte::{
     RuleTransitionType, attach_rule_source, expand_set_tree, expand_stored_query,
     expand_stored_query_exec, expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
     expand_stored_statement_exec, restrict_rule_original, rule_original_transition,
-    rule_transition_source,
+    rule_transition_source, split_rule_insert_defaults,
 };
 pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,

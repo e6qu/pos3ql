@@ -296,18 +296,15 @@ constraint cannot be named by `CLUSTER ON`, `CLUSTER ... USING` or `REPLICA
 IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 `reloptions` lists its options in a fixed order (`security_invoker`,
 `security_barrier`, `check_option`) where PostgreSQL keeps the order they were
-set, and omits an explicit `security_invoker=false`. A row compared with a subquery
-whose matching column is an untyped literal (`(1, 'a') = (SELECT 1, 2)`) fails
-with `42883` (`operator does not exist: text = integer`) where PostgreSQL
-converts the literal and reports its invalid input. Foreign tables accept
-`UNIQUE`, `PRIMARY KEY` and `FOREIGN KEY` constraints written in `CREATE
-FOREIGN TABLE` or `ALTER TABLE ... ADD`, and reject identity columns, where
-PostgreSQL rejects the constraints (`unique constraints are not supported on
-foreign tables`) and accepts identity columns. A rewrite rule whose `INSERT` action writes `DEFAULT`
-(`DO ALSO INSERT INTO log VALUES (NEW.a, DEFAULT)`) fails with `42601`
-(`DEFAULT is not allowed in this context`) when it fires: the action runs as an
-`INSERT ... SELECT` over the rule's source rows, which has no column-default
-marker. A cursor whose query
+set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
+marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
+GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
+`pg_constraint` omits the system catalogs' own not-null constraints. A
+misplaced column constraint attribute (`a int NOT NULL DEFERRABLE`) is
+reported before a later syntax error in the same statement, where PostgreSQL
+reports the syntax error first. A rewrite rule `INSERT` action whose `VALUES` rows write
+`DEFAULT` in different columns runs as one insert per pattern, so `RETURNING`
+from such an action fails with `0A000`. A cursor whose query
 cannot stream runs it at `DECLARE` or `OPEN`, so a volatile function's side
 effects happen before the first `FETCH` rather than at it. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1

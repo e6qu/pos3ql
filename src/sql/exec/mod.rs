@@ -1314,6 +1314,9 @@ fn create_table_kind(
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = notify_inherited_column_merges(storage, statement, txn.txid, responder)? {
+        return sql_fail(error);
+    }
     if let Err(error) = capture_created_table_inputs(storage, &mut def, statement, txn.txid, arena)
     {
         return sql_fail(error);
@@ -1398,8 +1401,7 @@ fn create_table_kind(
     if let Err(e) = validate_partitioned_unique_keys(&def) {
         return sql_fail(e);
     }
-    let creates_owned_sequences =
-        foreign.is_none() && !matches!(statement.partition, PartitionClause::Of { .. });
+    let creates_owned_sequences = !matches!(statement.partition, PartitionClause::Of { .. });
     let sequence_count = if creates_owned_sequences {
         def.columns()
             .iter()
@@ -1608,6 +1610,14 @@ pub fn create_foreign_table(
             "LIKE is not allowed in CREATE FOREIGN TABLE"
         ));
     }
+    // PostgreSQL rejects these while transforming the statement, before it
+    // resolves the server or any column type. The parser keeps every key
+    // written on a foreign table's column in `constraints`.
+    for constraint in statement.relation.constraints {
+        if let Err(error) = ddl::reject_foreign_table_constraint(constraint) {
+            return sql_fail(error);
+        }
+    }
     let Some((server, server_definition)) = storage.foreign_server(statement.server, txn.txid)
     else {
         return sql_fail(sql_err!(
@@ -1665,12 +1675,6 @@ pub fn create_foreign_table(
             validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Column)
         {
             return sql_fail(error);
-        }
-        if definition.identity.is_some() || definition.unique || definition.primary {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "identity and unique constraints are not supported on foreign tables"
-            ));
         }
     }
     create_table_kind(
@@ -1830,11 +1834,8 @@ pub fn import_foreign_schema(
             "foreign-data wrapper for server does not exist"
         ));
     };
-    if wrapper.handler != crate::storage::foreign::ForeignDataHandler::Postgres {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "foreign-data wrapper has no executable PostgreSQL handler"
-        ));
+    if let Err(error) = wrapper.require_handler() {
+        return sql_fail(error);
     }
     let options = match crate::storage::foreign::ForeignOptions::parse(command.options) {
         Ok(options) => options,
@@ -3424,13 +3425,19 @@ fn build_partitioned_table_def(
                 txid,
                 crate::storage::SchemaObjectKind::Relation,
             )?;
-            def.not_null_names = [None; MAX_COLUMNS];
-            for column in def.columns.iter_mut().take(def.n_columns) {
-                column.not_null = if column.not_null.is_required() {
-                    crate::storage::NotNullOrigin::Inherited
+            // A partition's not-null constraints keep their parent's names.
+            for (column, name) in def
+                .columns
+                .iter_mut()
+                .zip(def.not_null_names.iter_mut())
+                .take(def.n_columns)
+            {
+                if column.not_null.is_required() {
+                    column.not_null = crate::storage::NotNullOrigin::Inherited;
                 } else {
-                    crate::storage::NotNullOrigin::Nullable
-                };
+                    column.not_null = crate::storage::NotNullOrigin::Nullable;
+                    *name = None;
+                }
             }
             for index in 0..def.n_uniques {
                 let constraint = def.uniques[index];
@@ -3490,6 +3497,69 @@ fn build_partitioned_table_def(
     }
 }
 
+/// PostgreSQL's notices for a column that several parents, or a parent and
+/// the new table itself, define.
+fn notify_inherited_column_merges(
+    storage: &Storage,
+    statement: &CreateTable,
+    txid: u32,
+    responder: &mut Responder,
+) -> Result<Result<(), SqlError>, WireFull> {
+    let crate::sql::ast::TableMembership::Inherits(parents) = statement.membership else {
+        return Ok(Ok(()));
+    };
+    let parent_slot = |position: usize| resolve_dml_table(storage, &parents[position], txid);
+    let defined_by_earlier_parent = |position: usize, column: &str| -> Result<bool, SqlError> {
+        for earlier in 0..position {
+            if storage
+                .table_def(parent_slot(earlier)?, txid)
+                .column_index(column)
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    for position in 0..parents.len() {
+        let parent = match parent_slot(position) {
+            Ok(parent) => storage.table_def(parent, txid),
+            Err(error) => return Ok(Err(error)),
+        };
+        for column in parent.columns() {
+            match defined_by_earlier_parent(position, column.name.as_str()) {
+                Ok(true) => responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        160,
+                        "merging multiple inherited definitions of column \"{}\"",
+                        column.name.as_str()
+                    )
+                    .as_str(),
+                )?,
+                Ok(false) => {}
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+    }
+    for column in statement.columns {
+        match defined_by_earlier_parent(parents.len(), column.name) {
+            Ok(true) => responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(
+                    160,
+                    "merging column \"{}\" with inherited definition",
+                    column.name
+                )
+                .as_str(),
+            )?,
+            Ok(false) => {}
+            Err(error) => return Ok(Err(error)),
+        }
+    }
+    Ok(Ok(()))
+}
+
 /// Builds the physical child row layout from its direct parents before adding
 /// child-local columns.  Parent slots are recorded in the same durable image as
 /// the copied layout, so a scan never infers inheritance from matching names.
@@ -3506,6 +3576,7 @@ fn build_inherited_table_def(
     let mut definition = own.clone();
     definition.n_columns = 0;
     definition.columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
+    definition.not_null_names = [None; MAX_COLUMNS];
     definition.inheritance = crate::storage::TableInheritance::NONE;
     for parent_name in parents {
         let parent = resolve_dml_table(storage, parent_name, txid)?;
@@ -3533,7 +3604,7 @@ fn build_inherited_table_def(
                 parent_definition.name.as_str()
             ));
         }
-        for parent_column in parent_definition.columns() {
+        for (parent_index, parent_column) in parent_definition.columns().iter().enumerate() {
             let mut inherited = *parent_column;
             inherited.not_null =
                 if inherited.not_null.is_required() && inherited.not_null_inheritable {
@@ -3563,16 +3634,28 @@ fn build_inherited_table_def(
                         inherited.name.as_str()
                     ));
                 }
+                if inherited.not_null.is_required() {
+                    definition.columns[existing].not_null = inherited.not_null;
+                    if definition.not_null_names[existing].is_none() {
+                        definition.not_null_names[existing] =
+                            parent_definition.not_null_names[parent_index];
+                    }
+                }
             } else {
                 let mut count = definition.n_columns;
                 push_column(&mut definition, &mut count, inherited)?;
                 definition.n_columns = count;
+                // An inherited not-null constraint keeps its parent's name.
+                if inherited.not_null.is_required() {
+                    definition.not_null_names[count - 1] =
+                        parent_definition.not_null_names[parent_index];
+                }
             }
         }
         inherit_table_checks(&parent_definition, &mut definition, false)?;
         definition.inheritance.append(parent)?;
     }
-    for column in own.columns() {
+    for (own_index, column) in own.columns().iter().enumerate() {
         if let Some(existing) = definition.column_index(column.name.as_str()) {
             let inherited = definition.columns[existing];
             if inherited.ctype != column.ctype
@@ -3606,11 +3689,14 @@ fn build_inherited_table_def(
                 definition.columns[existing].not_null =
                     definition.columns[existing].not_null.add_local();
                 definition.columns[existing].not_null_inheritable = column.not_null_inheritable;
+                // The child's own declaration names the merged constraint.
+                definition.not_null_names[existing] = own.not_null_names[own_index];
             }
         } else {
             let mut count = definition.n_columns;
             push_column(&mut definition, &mut count, *column)?;
             definition.n_columns = count;
+            definition.not_null_names[count - 1] = own.not_null_names[own_index];
         }
     }
     for index in 0..definition.n_uniques {
@@ -56984,10 +57070,13 @@ pub fn create_index(
                     (crate::storage::RoutineResult { ctype, user_type }, type_oid)
                 }
                 None => {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "data type unknown has no default operator class for access method \"{}\"",
-                        command.method.name()
+                    return sql_fail(crate::sql::error_position::with_hint(
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "data type unknown has no default operator class for access method \"{}\"",
+                            command.method.name()
+                        ),
+                        crate::sql::error_position::DEFAULT_OPERATOR_CLASS_HINT,
                     ));
                 }
             }
@@ -57825,6 +57914,18 @@ enum IndexRowValidation {
 }
 
 fn validate_index_rows(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    validation: IndexRowValidation,
+    arena: &Arena,
+) -> Result<crate::storage::TableStatistics, SqlError> {
+    constraints::building_index(|| {
+        validate_index_rows_unscoped(storage, table_index, txid, validation, arena)
+    })
+}
+
+fn validate_index_rows_unscoped(
     storage: &Storage,
     table_index: usize,
     txid: u32,
@@ -74128,13 +74229,17 @@ fn drop_column_constraints(
 
 /// Rewritten rows use the same collations and NULL equality modes as ordinary
 /// writes. Comparison errors must stop the rewrite before it is journaled.
-fn rewritten_dup_name<Definition0: crate::storage::DefinitionBacking>(
+/// PostgreSQL's index-build error when two rewritten rows `a` and `b`
+/// conflict under a unique key or exclusion constraint of `new_def`.
+fn rewritten_key_conflict<Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     transaction: u32,
     new_def: &crate::storage::TableDefinition<Definition0>,
+    expressions: &ParsedChecks,
     a: &[Datum],
     b: &[Datum],
-) -> Result<Option<SqlName>, SqlError> {
+    arena: &Arena,
+) -> Result<(), SqlError> {
     let matches_key = |columns: &[u16], nulls_not_distinct: bool| -> Result<bool, SqlError> {
         if columns.len() > crate::storage::MAX_INDEX_COLS {
             return Err(sql_err!(
@@ -74168,32 +74273,31 @@ fn rewritten_dup_name<Definition0: crate::storage::DefinitionBacking>(
     };
     for (i, c) in new_def.columns().iter().enumerate() {
         if c.unique && matches_key(&[i as u16], false)? {
-            return new_def.column_key_name(i).map(Some).ok_or_else(|| {
+            let name = new_def.column_key_name(i).ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "rewritten inline key has no admitted name"
                 )
-            });
+            })?;
+            return Err(constraints::index_build_unique_violation(
+                name,
+                new_def,
+                &[i as u16],
+                b,
+            ));
         }
     }
     for uk in new_def.uniques() {
         if matches_key(uk.columns(), uk.kind.nulls_not_distinct())? {
-            return Ok(Some(uk.name));
+            return Err(constraints::index_build_unique_violation(
+                uk.name,
+                new_def,
+                uk.columns(),
+                b,
+            ));
         }
     }
-    Ok(None)
-}
-
-fn rewritten_exclusion_name<Definition0: crate::storage::DefinitionBacking>(
-    storage: &Storage,
-    new_def: &crate::storage::TableDefinition<Definition0>,
-    expressions: &ParsedChecks,
-    a: &[Datum],
-    b: &[Datum],
-    txid: u32,
-    arena: &Arena,
-) -> Result<Option<SqlName>, SqlError> {
-    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let catalog = super::query::storage_catalog(storage, arena, transaction);
     let hooks = EvalHooks {
         catalog: Some(&catalog),
         ..super::eval::NO_HOOKS
@@ -74238,10 +74342,12 @@ fn rewritten_exclusion_name<Definition0: crate::storage::DefinitionBacking>(
             }
         }
         if conflict {
-            return Ok(Some(exclusion.name));
+            return Err(constraints::index_build_exclusion_violation(
+                new_def, exclusion, b, a,
+            ));
         }
     }
-    Ok(None)
+    Ok(())
 }
 
 /// How each column of a rewritten row is produced from the old row, composed
@@ -74653,6 +74759,32 @@ fn alter_table_trigger_enabled(
     sql_ok()
 }
 
+/// The name of the not-null constraint on `column` that `definition`
+/// inherits from its first parent declaring one.
+fn inherited_not_null_name(
+    storage: &Storage,
+    definition: &TableDefBuilder,
+    column: &str,
+    txid: u32,
+) -> Option<SqlName> {
+    let partition_parent = definition
+        .partition
+        .attachment
+        .map(|attachment| attachment.parent);
+    partition_parent
+        .iter()
+        .chain(definition.inheritance.parents_ref())
+        .find_map(|parent| {
+            let parent = storage.table_def(usize::from(*parent), txid);
+            let index = parent.column_index(column)?;
+            if parent.columns()[index].not_null.is_required() {
+                parent.not_null_names.as_ref()[index]
+            } else {
+                None
+            }
+        })
+}
+
 #[derive(Clone, Copy)]
 enum PartitionInheritance {
     Attach,
@@ -74674,7 +74806,7 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
             child.name.as_str()
         ));
     }
-    for expected in parent.columns() {
+    for (parent_index, expected) in parent.columns().iter().enumerate() {
         let index = child.column_index(expected.name.as_str()).ok_or_else(|| {
             sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
@@ -74714,6 +74846,13 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
                     expected.name.as_str(),
                     child.name.as_str()
                 ));
+            }
+            // A constraint the partition gains from its parent keeps the
+            // parent's name; one it already had keeps its own.
+            if !child.columns[index].not_null.is_required()
+                && let Some(name) = parent.not_null_names.as_ref()[parent_index]
+            {
+                child.set_not_null_constraint_name(index, name);
             }
             child.columns[index].not_null = match mode {
                 PartitionInheritance::Attach => child.columns[index].not_null.attach_inherited(),
@@ -78004,12 +78143,18 @@ fn alter_table_relation(
                 // A NULL is caught by the content validation below, against the
                 // rewritten image so it composes with a type change in the same
                 // statement.
-                new_def.columns[i].not_null =
-                    if inheritance_scope == AlterInheritanceScope::Propagated {
-                        new_def.columns[i].not_null.add_inherited()
-                    } else {
-                        new_def.columns[i].not_null.add_local()
-                    };
+                if inheritance_scope == AlterInheritanceScope::Propagated {
+                    // A constraint gained from a parent keeps the parent's name.
+                    if !new_def.columns[i].not_null.is_required()
+                        && let Some(name) =
+                            inherited_not_null_name(storage, &new_def, column, txn.txid)
+                    {
+                        new_def.set_not_null_constraint_name(i, name);
+                    }
+                    new_def.columns[i].not_null = new_def.columns[i].not_null.add_inherited();
+                } else {
+                    new_def.columns[i].not_null = new_def.columns[i].not_null.add_local();
+                }
                 validate_definition = true;
             }
             AlterAction::DropNotNull { column } => {
@@ -78666,7 +78811,9 @@ fn alter_table_relation(
     // journaled. A rewrite validates each transformed image instead, below.
     if !has_rewrite
         && validate_definition
-        && let Err(e) = validate_all_rows(storage, table_index, &new_def, txn.txid, arena, false)
+        && let Err(e) = constraints::building_index(|| {
+            validate_all_rows(storage, table_index, &new_def, txn.txid, arena, false)
+        })
     {
         return sql_fail(e);
     }
@@ -78895,41 +79042,16 @@ fn alter_table_relation(
                 if let Err(e) = rowenc::decode(bbytes, new_schema, &mut bvals) {
                     return sql_fail(e);
                 }
-                let duplicate_name = match rewritten_dup_name(
+                if let Err(error) = rewritten_key_conflict(
                     storage,
                     txn.txid,
-                    &new_def,
-                    &avals[..new_def.n_columns],
-                    &bvals[..new_def.n_columns],
-                ) {
-                    Ok(name) => name,
-                    Err(error) => return sql_fail(error),
-                };
-                if let Some(name) = duplicate_name {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNIQUE_VIOLATION,
-                        "duplicate key value violates unique constraint \"{}\"",
-                        name.as_str()
-                    ));
-                }
-                match rewritten_exclusion_name(
-                    storage,
                     &new_def,
                     &checks,
                     &avals[..new_def.n_columns],
                     &bvals[..new_def.n_columns],
-                    txn.txid,
                     arena,
                 ) {
-                    Ok(Some(name)) => {
-                        return sql_fail(sql_err!(
-                            sqlstate::EXCLUSION_VIOLATION,
-                            "conflicting key value violates exclusion constraint \"{}\"",
-                            name.as_str()
-                        ));
-                    }
-                    Ok(None) => {}
-                    Err(error) => return sql_fail(error),
+                    return sql_fail(error);
                 }
             }
         }
@@ -79400,25 +79522,28 @@ fn alter_table_relation(
                                 return sql_fail(undefined_column(column));
                             };
                             let prior = dependent.columns[column].not_null;
-                            dependent.columns[column].not_null = if direct_parent.columns
-                                [match direct_parent
-                                    .column_index(dependent.columns[column].name.as_str())
-                                {
-                                    Some(column) => column,
-                                    None => {
-                                        return sql_fail(sql_err!(
-                                            sqlstate::SERIALIZATION_FAILURE,
-                                            "partition parent is missing a column"
-                                        ));
-                                    }
-                                }]
-                            .not_null
-                            .is_required()
-                            {
-                                prior.add_inherited()
-                            } else {
-                                prior.drop_inherited()
+                            let Some(parent_column) =
+                                direct_parent.column_index(dependent.columns[column].name.as_str())
+                            else {
+                                return sql_fail(sql_err!(
+                                    sqlstate::SERIALIZATION_FAILURE,
+                                    "partition parent is missing a column"
+                                ));
                             };
+                            dependent.columns[column].not_null =
+                                if direct_parent.columns[parent_column].not_null.is_required() {
+                                    // A constraint gained from the parent keeps
+                                    // the parent's name.
+                                    if !prior.is_required()
+                                        && let Some(name) =
+                                            direct_parent.not_null_names.as_ref()[parent_column]
+                                    {
+                                        dependent.set_not_null_constraint_name(column, name);
+                                    }
+                                    prior.add_inherited()
+                                } else {
+                                    prior.drop_inherited()
+                                };
                             changed |= dependent.columns[column].not_null != prior;
                         }
                         _ => {}

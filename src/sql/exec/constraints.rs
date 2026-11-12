@@ -493,7 +493,19 @@ fn described_unique_violation<'v>(
     names: &mut dyn Iterator<Item = &str>,
     keys: &mut dyn Iterator<Item = Datum<'v>>,
 ) -> SqlError {
-    let detail = match key_detail(names, keys, format_args!(" already exists.")) {
+    let building = INDEX_BUILD.with(core::cell::Cell::get);
+    let detail = match key_detail(
+        names,
+        keys,
+        format_args!(
+            "{}",
+            if building {
+                " is duplicated."
+            } else {
+                " already exists."
+            }
+        ),
+    ) {
         Ok(detail) => detail,
         Err(error) => return error,
     };
@@ -505,11 +517,129 @@ fn described_unique_violation<'v>(
             name.as_str(),
         ),
     );
-    sql_err!(
-        sqlstate::UNIQUE_VIOLATION,
-        "duplicate key value violates unique constraint \"{}\"",
-        name.as_str()
+    if building {
+        sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "could not create unique index \"{}\"",
+            name.as_str()
+        )
+    } else {
+        sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "duplicate key value violates unique constraint \"{}\"",
+            name.as_str()
+        )
+    }
+}
+
+/// Stashes PostgreSQL's DETAIL and constraint fields for a conflict between
+/// `values` and `other` under `exclusion`.
+fn stash_exclusion_conflict(
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    exclusion: &crate::storage::ExclusionConstraint,
+    values: &[Datum],
+    other: &[Datum],
+) -> Result<(), SqlError> {
+    let names = || {
+        exclusion.columns[..exclusion.n_cols]
+            .iter()
+            .map(|column| def.columns()[*column as usize].name.as_str())
+    };
+    let mut existing_text = DetailText::new();
+    write_key_description(
+        &mut existing_text,
+        "key",
+        &mut names(),
+        &mut exclusion.columns[..exclusion.n_cols]
+            .iter()
+            .map(|column| other[*column as usize]),
+    );
+    let detail = key_detail(
+        &mut names(),
+        &mut exclusion.columns[..exclusion.n_cols]
+            .iter()
+            .map(|column| values[*column as usize]),
+        format_args!(
+            " conflicts with {}{}.",
+            if INDEX_BUILD.with(core::cell::Cell::get) {
+                ""
+            } else {
+                "existing "
+            },
+            existing_text.as_str()
+        ),
+    )?;
+    crate::sql::eval::stash_object_diagnostic(
+        Some(detail.as_str()),
+        crate::sql::eval::ErrorObjects::table_constraint(
+            def.schema.as_str(),
+            def.name.as_str(),
+            exclusion.name.as_str(),
+        ),
+    );
+    Ok(())
+}
+
+/// The index-build exclusion violation between rows `values` and `other`.
+pub(crate) fn index_build_exclusion_violation(
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    exclusion: &crate::storage::ExclusionConstraint,
+    values: &[Datum],
+    other: &[Datum],
+) -> SqlError {
+    building_index(
+        || match stash_exclusion_conflict(def, exclusion, values, other) {
+            Ok(()) => exclusion_violation(exclusion.name),
+            Err(error) => error,
+        },
     )
+}
+
+/// The 23P01 error for a conflict with exclusion constraint `name`.
+pub(crate) fn exclusion_violation(name: SqlName) -> SqlError {
+    if INDEX_BUILD.with(core::cell::Cell::get) {
+        sql_err!(
+            sqlstate::EXCLUSION_VIOLATION,
+            "could not create exclusion constraint \"{}\"",
+            name.as_str()
+        )
+    } else {
+        sql_err!(
+            sqlstate::EXCLUSION_VIOLATION,
+            "conflicting key value violates exclusion constraint \"{}\"",
+            name.as_str()
+        )
+    }
+}
+
+std::thread_local! {
+    /// Whether existing rows are being checked against an index being built.
+    static INDEX_BUILD: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Runs `build`, which checks existing rows against a unique or exclusion
+/// index being built (CREATE INDEX, REINDEX, an added constraint or a table
+/// rewrite), so a conflict reports PostgreSQL's index-build error rather
+/// than the one an inserted row gets.
+pub(crate) fn building_index<R>(build: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INDEX_BUILD.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(INDEX_BUILD.with(|flag| flag.replace(true)));
+    build()
+}
+
+/// The index-build unique violation for `values`' key `columns`.
+pub(crate) fn index_build_unique_violation(
+    name: SqlName,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    columns: &[u16],
+    values: &[Datum],
+) -> SqlError {
+    building_index(|| unique_violation(name, def, columns, values))
 }
 
 /// Whether the row `rowid`'s committed key equals `values` under this index's
@@ -2431,43 +2561,11 @@ fn enforce_exclusion_constraint(
                     return Ok(false);
                 }
             }
-            let names = || {
-                exclusion.columns[..exclusion.n_cols]
-                    .iter()
-                    .map(|column| def.columns()[*column as usize].name.as_str())
-            };
-            let mut existing_text = DetailText::new();
-            write_key_description(
-                &mut existing_text,
-                "key",
-                &mut names(),
-                &mut exclusion.columns[..exclusion.n_cols]
-                    .iter()
-                    .map(|column| other[*column as usize]),
-            );
-            let detail = key_detail(
-                &mut names(),
-                &mut exclusion.columns[..exclusion.n_cols]
-                    .iter()
-                    .map(|column| values[*column as usize]),
-                format_args!(" conflicts with existing {}.", existing_text.as_str()),
-            )?;
-            crate::sql::eval::stash_object_diagnostic(
-                Some(detail.as_str()),
-                crate::sql::eval::ErrorObjects::table_constraint(
-                    def.schema.as_str(),
-                    def.name.as_str(),
-                    exclusion.name.as_str(),
-                ),
-            );
+            stash_exclusion_conflict(def, exclusion, values, other)?;
             Ok(true)
         })?;
         if conflicts {
-            return Err(sql_err!(
-                sqlstate::EXCLUSION_VIOLATION,
-                "conflicting key value violates exclusion constraint \"{}\"",
-                exclusion.name.as_str()
-            ));
+            return Err(exclusion_violation(exclusion.name));
         }
         Ok(ControlFlow::Continue(()))
     };

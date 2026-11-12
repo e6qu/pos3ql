@@ -6825,7 +6825,8 @@ impl<'a> Parser<'a> {
                 ));
             }
         } else if matches!(self.peeked, Tok::Ident("attach" | "detach")) {
-            let action = self.alter_table_cmd(foreign, table.name)?;
+            let mut column_constraints = ArenaList::new(self.arena);
+            let action = self.alter_table_cmd(foreign, table.name, &mut column_constraints)?;
             return Ok(Self::alter_table_statement(
                 foreign,
                 AlterTable {
@@ -6866,8 +6867,12 @@ impl<'a> Parser<'a> {
             if matches!(self.peeked, Tok::Ident("attach" | "detach" | "rename")) {
                 return Err(self.syntax_error_here());
             }
-            let action = self.alter_table_cmd(foreign, table.name)?;
+            let mut column_constraints = ArenaList::new(self.arena);
+            let action = self.alter_table_cmd(foreign, table.name, &mut column_constraints)?;
             self.push(&mut buffer, action)?;
+            for constraint in column_constraints.as_slice() {
+                self.push(&mut buffer, AlterAction::AddConstraint(*constraint))?;
+            }
             if !self.eat_op(",")? {
                 break;
             }
@@ -7272,10 +7277,14 @@ impl<'a> Parser<'a> {
 
     /// One ADD / DROP / ALTER subcommand of an ALTER TABLE (the comma-listable
     /// forms; RENAME and SET SCHEMA are handled by the caller).
+    /// One ALTER TABLE subcommand. The constraints written on an added
+    /// column are appended to `column_constraints`; PostgreSQL adds them as
+    /// separate constraint subcommands once the column exists.
     fn alter_table_cmd(
         &mut self,
         foreign: bool,
         table: &str,
+        column_constraints: &mut ArenaList<'a, TableConstraint<'a>>,
     ) -> Result<AlterAction<'a>, ParseError> {
         if let Some(action) = self.alter_table_relation_cmd()? {
             return Ok(action);
@@ -7332,9 +7341,10 @@ impl<'a> Parser<'a> {
             Ok(AlterAction::ResetStorageOptions(names))
         } else if self.eat_ident("add")? {
             // ADD [CONSTRAINT name] <table constraint> vs ADD [COLUMN] <def>.
+            let constraint_at = SourcePosition::new(Some(self.peek_at));
             if self.eat_ident("constraint")? {
                 let cname = self.col_ident("constraint name")?;
-                return self.alter_table_add_constraint(Some(cname));
+                return self.alter_table_add_constraint(Some(cname), constraint_at);
             }
             if matches!(
                 self.peeked,
@@ -7342,8 +7352,9 @@ impl<'a> Parser<'a> {
                     | Tok::Ident("unique")
                     | Tok::Ident("check")
                     | Tok::Ident("foreign")
+                    | Tok::Ident("exclude")
             ) {
-                return self.alter_table_add_constraint(None);
+                return self.alter_table_add_constraint(None, constraint_at);
             }
             let _ = self.eat_ident("column")?;
             let if_not_exists = if self.eat_ident("if")? {
@@ -7381,63 +7392,7 @@ impl<'a> Parser<'a> {
             } else {
                 crate::sql::ast::ParsedCollation::DEFAULT
             };
-            let mut not_null = false;
-            let mut not_null_name = None;
-            let mut null_clause = None;
-            let mut not_null_inheritable = true;
-            let mut unique = false;
-            let mut default = None;
-            let mut default_text = None;
-            let mut generated_text = None;
-            let mut identity = None;
-            loop {
-                let constraint_at = self.peek_at;
-                let constraint_name = if self.eat_ident("constraint")? {
-                    Some(self.col_ident("constraint name")?)
-                } else {
-                    None
-                };
-                if constraint_name.is_some() && !matches!(self.peeked, Tok::Ident("not")) {
-                    return Err(self.err_here("ADD COLUMN supports a named NOT NULL clause here"));
-                }
-                if self.eat_ident("not")? {
-                    self.expect_ident("null")?;
-                    if null_clause == Some(false) {
-                        return Err(self.conflicting_null_declarations(constraint_at, name, table));
-                    }
-                    null_clause = Some(true);
-                    not_null = true;
-                    if let Some(name) = constraint_name {
-                        if not_null_name.is_some_and(|previous| previous != name) {
-                            return Err(self.err_here("conflicting not-null constraint names"));
-                        }
-                        not_null_name = Some(name);
-                    }
-                    if self.eat_ident("no")? {
-                        self.expect_ident("inherit")?;
-                        not_null_inheritable = false;
-                    }
-                } else if self.eat_ident("null")? {
-                    if null_clause == Some(true) {
-                        return Err(self.conflicting_null_declarations(constraint_at, name, table));
-                    }
-                    null_clause = Some(false);
-                    not_null = false;
-                } else if self.eat_ident("default")? {
-                    let start = self.peek_at;
-                    default = Some(self.column_default_expression()?);
-                    default_text = Some(self.text[start..self.peek_at].trim_end());
-                } else if self.eat_ident("generated")? {
-                    match self.generated_clause()? {
-                        crate::sql::ast::ColGen::Generated(text) => generated_text = Some(text),
-                        crate::sql::ast::ColGen::Identity(spec) => identity = Some(spec),
-                    }
-                } else if self.eat_ident("unique")? {
-                    unique = true;
-                } else {
-                    break;
-                }
-            }
+            let clauses = self.column_clauses(name, table, false, column_constraints)?;
             Ok(AlterAction::AddColumn {
                 definition: ColumnDef {
                     name,
@@ -7447,15 +7402,15 @@ impl<'a> Parser<'a> {
                     foreign_options,
                     storage,
                     compression,
-                    not_null,
-                    not_null_name,
-                    not_null_inheritable,
-                    unique,
-                    primary: false,
-                    default,
-                    default_text,
-                    generated_text,
-                    identity,
+                    not_null: clauses.not_null,
+                    not_null_name: clauses.not_null_name,
+                    not_null_inheritable: clauses.not_null_inheritable,
+                    unique: clauses.unique,
+                    primary: clauses.primary,
+                    default: clauses.default,
+                    default_text: clauses.default_text,
+                    generated_text: clauses.generated_text,
+                    identity: clauses.identity,
                 },
                 if_not_exists,
             })
@@ -7832,6 +7787,7 @@ impl<'a> Parser<'a> {
     fn alter_table_add_constraint(
         &mut self,
         name: Option<&'a str>,
+        source_position: SourcePosition,
     ) -> Result<AlterAction<'a>, ParseError> {
         let primary = if self.eat_ident("primary")? {
             self.expect_ident("key")?;
@@ -7842,14 +7798,20 @@ impl<'a> Parser<'a> {
             None
         };
         let Some(primary) = primary else {
-            return Ok(AlterAction::AddConstraint(
-                self.table_constraint(name, true)?,
-            ));
+            return Ok(AlterAction::AddConstraint(self.table_constraint(
+                name,
+                source_position,
+                ddl::ConstraintSite::AlterTable,
+            )?));
         };
         if self.eat_ident("using")? {
             self.expect_ident("index")?;
             let index = self.qual_name("index name")?;
-            let timing = self.constraint_timing(false)?;
+            let timing = self.constraint_timing(if primary {
+                ddl::ConstraintAttributeRules::PRIMARY_KEY
+            } else {
+                ddl::ConstraintAttributeRules::UNIQUE
+            })?;
             return Ok(AlterAction::AttachIndexConstraint {
                 name,
                 index,
@@ -7863,15 +7825,21 @@ impl<'a> Parser<'a> {
             self.unique_nulls_not_distinct()?
         };
         let columns = self.column_name_list()?;
-        let timing = self.constraint_timing(false)?;
+        let timing = self.constraint_timing(if primary {
+            ddl::ConstraintAttributeRules::PRIMARY_KEY
+        } else {
+            ddl::ConstraintAttributeRules::UNIQUE
+        })?;
         Ok(AlterAction::AddConstraint(if primary {
             TableConstraint::PrimaryKey {
+                source_position,
                 name,
                 columns,
                 timing,
             }
         } else {
             TableConstraint::Unique {
+                source_position,
                 name,
                 columns,
                 timing,
@@ -13033,17 +13001,81 @@ mod tests {
 
     #[test]
     fn constraint_attributes_reject_unrepresentable_states_at_parse_time() {
-        for sql in [
-            "CREATE TABLE t (id integer UNIQUE ENFORCED)",
-            "CREATE TABLE t (id integer CHECK (id > 0) DEFERRABLE)",
-            "CREATE TABLE t (id integer UNIQUE INITIALLY DEFERRED)",
-            "CREATE TABLE t (id integer, CHECK (id > 0) NOT VALID)",
-            "CREATE TABLE t (id integer, EXCLUDE USING btree (id WITH =))",
+        for (sql, message, sqlstate, cursor) in [
+            (
+                "CREATE TABLE t (id integer UNIQUE ENFORCED)",
+                "misplaced ENFORCED clause",
+                "42601",
+                34,
+            ),
+            (
+                "CREATE TABLE t (id integer CHECK (id > 0) DEFERRABLE)",
+                "misplaced DEFERRABLE clause",
+                "42601",
+                42,
+            ),
+            (
+                "CREATE TABLE t (id integer REFERENCES r DEFERRABLE NOT DEFERRABLE)",
+                "multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed",
+                "42601",
+                51,
+            ),
+            (
+                "CREATE TABLE t (id integer REFERENCES r INITIALLY DEFERRED NOT DEFERRABLE)",
+                "constraint declared INITIALLY DEFERRED must be DEFERRABLE",
+                "42601",
+                59,
+            ),
+            (
+                "CREATE TABLE t (id integer, CHECK (id > 0) NOT VALID NO INHERIT DEFERRABLE)",
+                "CHECK constraints cannot be marked DEFERRABLE",
+                "0A000",
+                43,
+            ),
+            (
+                "CREATE TABLE t (id integer, UNIQUE (id) DEFERRABLE NOT DEFERRABLE)",
+                "conflicting constraint properties",
+                "42601",
+                51,
+            ),
+            (
+                "CREATE TABLE t (id integer, EXCLUDE USING gist (id WITH &&) NOT VALID)",
+                "EXCLUDE constraints cannot be marked NOT VALID",
+                "0A000",
+                60,
+            ),
         ] {
             with_parser(sql, |parser| {
-                assert!(parser.next_stmt().is_err(), "accepted {sql}")
+                let error = parser.next_stmt().expect_err(sql);
+                assert_eq!(error.message.as_str(), message, "{sql}");
+                assert_eq!(error.sqlstate, sqlstate, "{sql}");
+                assert_eq!(error.cursor, Some(cursor), "{sql}");
             });
         }
+        // INITIALLY DEFERRED implies DEFERRABLE, and a new ordinary table
+        // marks a NOT VALID check valid, as PostgreSQL does.
+        with_parser(
+            "CREATE TABLE t (id integer UNIQUE INITIALLY DEFERRED, \
+             CHECK (id > 0) NOT VALID)",
+            |parser| {
+                let Stmt::CreateTable(table) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("CREATE TABLE did not parse");
+                };
+                assert!(matches!(
+                    table.constraints,
+                    [
+                        TableConstraint::Unique {
+                            timing: ConstraintTiming::Deferrable(ConstraintMode::Deferred),
+                            ..
+                        },
+                        TableConstraint::Check {
+                            validation: ConstraintValidation::EnforcedValidated,
+                            ..
+                        },
+                    ]
+                ));
+            },
+        );
         with_parser(
             "ALTER TABLE t ADD CONSTRAINT positive CHECK (id > 0) NOT VALID",
             |parser| assert!(parser.next_stmt().unwrap().is_some()),

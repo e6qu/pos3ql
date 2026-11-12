@@ -954,7 +954,7 @@ pub(super) use function_execution::{FunctionOutput, SuspendedFunction};
 pub(super) use sql_function_execution::execute_sql_function;
 pub(crate) use sql_function_execution::sql_function_inlining;
 mod trigger_firing;
-use trigger_firing::{TriggerRecordName, TriggerRows};
+use trigger_firing::{TriggerRecordName, TriggerRecordValue, TriggerRows};
 mod write_completion;
 pub(super) use write_completion::SuspendedWriteCompletion;
 pub(super) use write_completion::resume as resume_write_completion;
@@ -4143,8 +4143,8 @@ fn row_trigger_when_passes<'a>(
         context.txn.txid,
         &TriggerTransition {
             definition,
-            old,
-            new,
+            old: TriggerRecordValue::of_row(old),
+            new: TriggerRecordValue::of_row(new),
         },
         None,
         context.arena,
@@ -4154,8 +4154,8 @@ fn row_trigger_when_passes<'a>(
         condition,
         &TriggerTransition {
             definition,
-            old,
-            new,
+            old: TriggerRecordValue::of_row(old),
+            new: TriggerRecordValue::of_row(new),
         },
     )? {
         Datum::Bool(value) => Ok(value),
@@ -18503,13 +18503,13 @@ impl TriggerExceptionVariable {
 /// expressions instead of text substituted into a nested SQL statement.
 pub(crate) struct TriggerTransition<'d, 's, 'v> {
     definition: crate::storage::RelationDefinition<'d>,
-    old: Option<&'s [Datum<'v>]>,
-    new: Option<&'s [Datum<'v>]>,
+    old: TriggerRecordValue<'s, 'v>,
+    new: TriggerRecordValue<'s, 'v>,
 }
 
-impl<'v> TriggerTransition<'_, '_, 'v> {
-    /// `OLD` or `NEW` by its folded name, `None` while it is NULL.
-    fn record(&self, name: &str) -> Result<Option<&[Datum<'v>]>, SqlError> {
+impl<'s, 'v> TriggerTransition<'_, 's, 'v> {
+    /// `OLD` or `NEW` by its folded name.
+    fn record(&self, name: &str) -> Result<TriggerRecordValue<'s, 'v>, SqlError> {
         match TriggerRecordName::parse(name) {
             Some(TriggerRecordName::Old) if self.definition.n_columns > 0 => Ok(self.old),
             Some(TriggerRecordName::New) if self.definition.n_columns > 0 => Ok(self.new),
@@ -18544,6 +18544,60 @@ impl<'v> TriggerTransition<'_, '_, 'v> {
         }
         Ok(&*fields)
     }
+
+    /// The fields of a record of another structure.
+    fn foreign_fields(value: Datum<'v>) -> &'v [RecordField<'v>] {
+        match value {
+            Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+            _ => &[],
+        }
+    }
+
+    /// The fields a record's structure has, as `record.*` expands them.
+    fn structure_fields<'value>(
+        &self,
+        record: TriggerRecordValue<'s, 'v>,
+        name: &str,
+        arena: &'value Arena,
+    ) -> Result<&'value [RecordField<'value>], SqlError>
+    where
+        'v: 'value,
+    {
+        match record {
+            TriggerRecordValue::Empty => self.record_fields(None, arena),
+            TriggerRecordValue::Row(values) => self.record_fields(Some(values), arena),
+            TriggerRecordValue::Foreign(value) => Ok(Self::foreign_fields(value)),
+            TriggerRecordValue::Unassigned => Err(unassigned_record(name)),
+        }
+    }
+
+    /// The type of `record.name` when the record does not have the
+    /// relation's structure; `None` keeps the relation's column.
+    fn foreign_field_type(&self, qualifier: Option<&str>, name: &str) -> Option<Option<i32>> {
+        let record = self.record(qualifier?).ok()?;
+        match record {
+            TriggerRecordValue::Foreign(value) => Some(
+                Self::foreign_fields(value)
+                    .iter()
+                    .find(|field| field.name == name)
+                    .map(|field| field.type_oid),
+            ),
+            TriggerRecordValue::Unassigned => Some(None),
+            TriggerRecordValue::Empty | TriggerRecordValue::Row(_) => None,
+        }
+    }
+}
+
+/// PostgreSQL's error for a field of a record assigned NULL.
+fn unassigned_record(name: &str) -> SqlError {
+    crate::sql::error_position::with_detail(
+        sql_err!(
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            "record \"{}\" is not assigned yet",
+            name
+        ),
+        format_args!("The tuple structure of a not-yet-assigned record is indeterminate."),
+    )
 }
 
 impl<'d, 's, 'stored, 'value> ColumnLookup<'value> for TriggerTransition<'d, 's, 'stored>
@@ -18557,6 +18611,11 @@ where
         catalog: Option<&dyn super::eval::CatalogAccess>,
     ) -> Option<(StackStr<64>, StaticTypeMeta)> {
         self.whole_row_type(table)?;
+        if let Ok(TriggerRecordValue::Foreign(_) | TriggerRecordValue::Unassigned) =
+            self.record(table)
+        {
+            return None;
+        }
         super::eval::stored_row_field_metadata(self.definition.columns().get(index)?, catalog)
     }
 
@@ -18575,16 +18634,26 @@ where
                 name
             ));
         };
-        let values = self.record(qualifier)?;
-        let Some(column) = self.definition.column_index(name) else {
-            return Err(sql_err!(
+        let no_field = || {
+            sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "record \"{}\" has no field \"{}\"",
                 qualifier,
                 name
-            ));
+            )
         };
-        Ok(values.map_or(Datum::Null, |values| values[column]))
+        match self.record(qualifier)? {
+            TriggerRecordValue::Foreign(value) => Self::foreign_fields(value)
+                .iter()
+                .find(|field| field.name == name)
+                .map(|field| field.value)
+                .ok_or_else(no_field),
+            TriggerRecordValue::Unassigned => Err(unassigned_record(qualifier)),
+            record => {
+                let column = self.definition.column_index(name).ok_or_else(no_field)?;
+                Ok(record.row().map_or(Datum::Null, |values| values[column]))
+            }
+        }
     }
 
     fn whole_row_fields(
@@ -18593,8 +18662,9 @@ where
         arena: &'value Arena,
     ) -> Result<Option<&'value [RecordField<'value>]>, SqlError> {
         match self.record(table)? {
-            Some(values) => self.record_fields(Some(values), arena).map(Some),
-            None => Ok(None),
+            TriggerRecordValue::Row(values) => self.record_fields(Some(values), arena).map(Some),
+            TriggerRecordValue::Foreign(value) => Ok(Some(Self::foreign_fields(value))),
+            TriggerRecordValue::Empty | TriggerRecordValue::Unassigned => Ok(None),
         }
     }
 
@@ -18603,15 +18673,21 @@ where
         table: &str,
         arena: &'value Arena,
     ) -> Result<&'value [RecordField<'value>], SqlError> {
-        let values = self.record(table)?;
-        self.record_fields(values, arena)
+        let record = self.record(table)?;
+        self.structure_fields(record, table, arena)
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
-        Ok(self.record(table)?.is_some())
+        Ok(matches!(
+            self.record(table)?,
+            TriggerRecordValue::Row(_) | TriggerRecordValue::Foreign(_)
+        ))
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        if let Some(foreign) = self.foreign_field_type(qualifier, name) {
+            return foreign.and_then(ColType::from_oid);
+        }
         matches!(qualifier, Some("old" | "new"))
             .then(|| self.definition.column_index(name))
             .flatten()
@@ -18619,6 +18695,9 @@ where
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        if self.foreign_field_type(qualifier, name).is_some() {
+            return crate::sql::ast::Collation::None;
+        }
         matches!(qualifier, Some("old" | "new"))
             .then(|| self.definition.column_index(name))
             .flatten()
@@ -18631,6 +18710,9 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
+        if self.foreign_field_type(qualifier, name).is_some() {
+            return None;
+        }
         matches!(qualifier, Some("old" | "new"))
             .then(|| self.definition.column_index(name))
             .flatten()
@@ -18736,8 +18818,8 @@ fn validate_trigger_when(
             expression,
             &TriggerTransition {
                 definition,
-                old: None,
-                new: None,
+                old: TriggerRecordValue::Empty,
+                new: TriggerRecordValue::Empty,
             },
             &hooks,
         )?
@@ -23100,8 +23182,8 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         invocation,
         TriggerTransition {
             definition,
-            old: None,
-            new: None,
+            old: TriggerRecordValue::Empty,
+            new: TriggerRecordValue::Empty,
         },
         &code,
         &[],
@@ -23188,8 +23270,8 @@ pub(crate) fn execute_event_trigger<'a>(
         invocation,
         TriggerTransition {
             definition,
-            old: None,
-            new: None,
+            old: TriggerRecordValue::Empty,
+            new: TriggerRecordValue::Empty,
         },
         &code,
         &[],
@@ -23350,8 +23432,8 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         invocation,
         TriggerTransition {
             definition,
-            old: None,
-            new: None,
+            old: TriggerRecordValue::Empty,
+            new: TriggerRecordValue::Empty,
         },
         &code,
         &seeded[..seeded_count],
@@ -24516,8 +24598,8 @@ pub(crate) struct TriggerDmlSnapshot<'a> {
     values: &'a [Datum<'a>],
     invocation: TriggerInvocation<'a>,
     found: Option<bool>,
-    old: Option<&'a [Datum<'a>]>,
-    new: Option<&'a [Datum<'a>]>,
+    old: TriggerRecordValue<'a, 'a>,
+    new: TriggerRecordValue<'a, 'a>,
 }
 
 impl<'a> TriggerDmlSnapshot<'a> {
@@ -24659,18 +24741,25 @@ fn snapshot_trigger_dml_scope<'a>(
     for (index, value) in values.iter_mut().enumerate() {
         *value = detached_trigger_datum(scope.values[index], arena)?;
     }
-    let copy_record = |record: Option<&[Datum<'a>]>| -> Result<Option<&'a [Datum<'a>]>, SqlError> {
-        let Some(record) = record else {
-            return Ok(None);
+    let copy_record =
+        |record: TriggerRecordValue<'_, 'a>| -> Result<TriggerRecordValue<'a, 'a>, SqlError> {
+            Ok(match record {
+                TriggerRecordValue::Row(record) => {
+                    let copy = arena
+                        .alloc_slice_with(record.len(), |_| Datum::Null)
+                        .map_err(|_| super::query::arena_full_pub())?;
+                    for (index, value) in copy.iter_mut().enumerate() {
+                        *value = detached_trigger_datum(record[index], arena)?;
+                    }
+                    TriggerRecordValue::Row(&*copy)
+                }
+                TriggerRecordValue::Foreign(value) => {
+                    TriggerRecordValue::Foreign(detached_trigger_datum(value, arena)?)
+                }
+                TriggerRecordValue::Empty => TriggerRecordValue::Empty,
+                TriggerRecordValue::Unassigned => TriggerRecordValue::Unassigned,
+            })
         };
-        let copy = arena
-            .alloc_slice_with(record.len(), |_| Datum::Null)
-            .map_err(|_| super::query::arena_full_pub())?;
-        for (index, value) in copy.iter_mut().enumerate() {
-            *value = detached_trigger_datum(record[index], arena)?;
-        }
-        Ok(Some(&*copy))
-    };
     let old = copy_record(scope.transition.old)?;
     let new = copy_record(scope.transition.new)?;
     arena
@@ -28727,16 +28816,26 @@ fn assign_plpgsql_into_target<'a>(
             return assign_trigger_local(context, locals, values, target, value);
         }
         PlpgsqlIntoTarget::TriggerRecord(record) => {
-            let row = trigger_record_row(
+            // A query that returns no row leaves the record's structure.
+            return assign_trigger_record(
+                context,
                 definition,
+                records,
+                record,
                 value,
-                TriggerRowSource::Assignment,
-                context.storage(),
-                context.txn.txid,
-                context.arena,
-            )?;
-            records.record_mut(record).set_row(row);
-            return Ok(());
+                RecordNullAssignment::KeepStructure,
+            );
+        }
+        PlpgsqlIntoTarget::TriggerField(record, _)
+            if !records.record_mut(record).has_relation_structure() =>
+        {
+            return assign_foreign_record_field(
+                context,
+                records,
+                record,
+                target.name.as_str(),
+                value,
+            );
         }
         PlpgsqlIntoTarget::TriggerField(record, column) => (record, column),
     };
@@ -28800,6 +28899,49 @@ fn assign_trigger_record_column<'a>(
     record: TriggerRecordName,
     assignment: TriggerLocalAssignment<'a>,
 ) -> Result<(), SqlError> {
+    if !records.record_mut(record).has_relation_structure() {
+        // PostgreSQL resolves the field while planning the assignment.
+        let name = assignment.name.name.as_str();
+        let resolved = match records.record_mut(record).value() {
+            TriggerRecordValue::Foreign(
+                Datum::Record(fields) | Datum::Composite { fields, .. },
+            ) if fields.iter().any(|field| field.name == name) => Ok(()),
+            TriggerRecordValue::Unassigned => Err(unassigned_record(record.as_str())),
+            _ => Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "record \"{}\" has no field \"{}\"",
+                record.as_str(),
+                name
+            )),
+        };
+        if let Err(error) = resolved {
+            return match crate::sql::error_context::innermost_assignment() {
+                Some(statement) => in_procedural_query(
+                    statement,
+                    crate::sql::error_context::QueryMode::Assignment,
+                    false,
+                    || Err(error),
+                ),
+                None => Err(error),
+            };
+        }
+        let transition = records.transition(definition);
+        let scope = TriggerLocalScope {
+            locals,
+            values: &local_values[..locals.len()],
+            found,
+            invocation,
+            transition: &transition,
+        };
+        let value = eval_procedural_expression(context, assignment.expression, &scope, None)?;
+        return assign_foreign_record_field(
+            context,
+            records,
+            record,
+            assignment.name.name.as_str(),
+            value,
+        );
+    }
     let Some(column) = definition.column_index(assignment.name.name.as_str()) else {
         // PostgreSQL resolves the target while planning the assignment.
         let error = || {
@@ -28864,6 +29006,129 @@ fn assign_trigger_record_column<'a>(
     )?;
     records.record_mut(record).set_field(column, value);
 
+    Ok(())
+}
+
+/// Assigns field `name` of a trigger record that does not have the
+/// relation's structure, converting the value to the field's type.
+fn assign_foreign_record_field<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    records: &mut TriggerRows<'_, 'a>,
+    record: TriggerRecordName,
+    name: &str,
+    value: Datum<'a>,
+) -> Result<(), SqlError> {
+    let target = records.record_mut(record);
+    let current = match target.value() {
+        TriggerRecordValue::Foreign(current) => current,
+        TriggerRecordValue::Unassigned => {
+            return Err(unassigned_record(record.as_str()));
+        }
+        TriggerRecordValue::Empty | TriggerRecordValue::Row(_) => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "trigger record field assignment lost its structure"
+            ));
+        }
+    };
+    let (Datum::Record(fields) | Datum::Composite { fields, .. }) = current else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "trigger record holds a value that is not a row"
+        ));
+    };
+    let Some(index) = fields.iter().position(|field| field.name == name) else {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "record \"{}\" has no field \"{}\"",
+            record.as_str(),
+            name
+        ));
+    };
+    let value = match ColType::from_oid(fields[index].type_oid) {
+        Some(ctype) if !value.is_null() => cast_to(value, ctype, context.arena)?,
+        _ => value,
+    };
+    let updated = context
+        .arena
+        .alloc_slice_copy(fields)
+        .map_err(|_| super::query::arena_full_pub())?;
+    updated[index].value = value;
+    target.set_foreign(match current {
+        Datum::Composite { slot, .. } => Datum::Composite {
+            slot,
+            fields: updated,
+        },
+        _ => Datum::Record(updated),
+    });
+    Ok(())
+}
+
+/// What a NULL assigned to a whole trigger record leaves: a query's empty
+/// result keeps a structure, while `NEW := NULL` leaves none.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordNullAssignment {
+    KeepStructure,
+    DropStructure,
+}
+
+/// Assigns a whole `OLD` or `NEW` record. Like any PostgreSQL record
+/// variable it takes the structure of the row assigned: a row with the
+/// relation's column names and types stays relation-shaped, and any other
+/// row is kept as it is until a row trigger returns it.
+fn assign_trigger_record<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    definition: crate::storage::RelationDefinition<'_>,
+    records: &mut TriggerRows<'_, 'a>,
+    record: TriggerRecordName,
+    value: Datum<'a>,
+    null: RecordNullAssignment,
+) -> Result<(), SqlError> {
+    let target = records.record_mut(record);
+    let fields = match value {
+        Datum::Null if null == RecordNullAssignment::DropStructure => {
+            target.set_unassigned();
+            return Ok(());
+        }
+        Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+        // NULL and values that are not rows convert, or fail, as before.
+        _ => {
+            let row = trigger_record_row(
+                definition,
+                value,
+                TriggerRowSource::Assignment,
+                context.storage(),
+                context.txn.txid,
+                context.arena,
+            )?;
+            target.set_row(row);
+            return Ok(());
+        }
+    };
+    let columns = definition.columns();
+    let relation_shaped = fields.len() == columns.len()
+        && fields.iter().zip(columns).all(|(field, column)| {
+            field.name == column.name.as_str()
+                && (field.type_oid == column.ctype.oid()
+                    || context.storage().routine_type_oid(
+                        column.ctype,
+                        column.user_type,
+                        context.txn.txid,
+                    ) == Some(field.type_oid))
+        });
+    if relation_shaped {
+        let row = trigger_record_row(
+            definition,
+            value,
+            TriggerRowSource::Assignment,
+            context.storage(),
+            context.txn.txid,
+            context.arena,
+        )?;
+        target.set_row(row);
+    } else {
+        target.set_foreign(value);
+    }
     Ok(())
 }
 
@@ -29230,8 +29495,8 @@ fn trigger_condition<'a>(
     expression: &'a Expr<'a>,
     definition: crate::storage::RelationDefinition<'_>,
     invocation: TriggerInvocation<'a>,
-    old: Option<&[Datum<'a>]>,
-    new: Option<&[Datum<'a>]>,
+    old: TriggerRecordValue<'_, 'a>,
+    new: TriggerRecordValue<'_, 'a>,
     locals: &[TriggerLocalDecl],
     values: &[Datum<'a>],
     found: Option<bool>,
@@ -30311,15 +30576,14 @@ fn execute_trigger_step_in<'a>(
                 && definition.n_columns > 0
                 && let Some(record) = TriggerRecordName::parse(assignment.name.name.as_str())
             {
-                let row = trigger_record_row(
+                assign_trigger_record(
+                    context,
                     definition,
+                    records,
+                    record,
                     value,
-                    TriggerRowSource::Assignment,
-                    context.storage(),
-                    context.txn.txid,
-                    context.arena,
+                    RecordNullAssignment::DropStructure,
                 )?;
-                records.record_mut(record).set_row(row);
             } else {
                 assign_trigger_local(context, locals, local_values, assignment.name, value)?;
             }
@@ -30877,8 +31141,8 @@ fn execute_trigger_step_in<'a>(
                     condition,
                     definition,
                     invocation,
-                    records.old.row(),
-                    records.new.row(),
+                    records.old.value(),
+                    records.new.value(),
                     locals,
                     &local_values[..locals.len()],
                     status.found,
@@ -31599,8 +31863,8 @@ fn execute_trigger_step_in<'a>(
                 assertion.condition,
                 definition,
                 invocation,
-                records.old.row(),
-                records.new.row(),
+                records.old.value(),
+                records.new.value(),
                 locals,
                 &local_values[..locals.len()],
                 status.found,
@@ -32569,8 +32833,8 @@ fn execute_trigger_step_in<'a>(
                 program.condition,
                 definition,
                 invocation,
-                records.old.row(),
-                records.new.row(),
+                records.old.value(),
+                records.new.value(),
                 locals,
                 &local_values[..locals.len()],
                 status.found,

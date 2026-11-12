@@ -312,11 +312,7 @@ PostgreSQL types it as the table's row type `t`. A row constructor casts to a ta
 (`ROW(1, 'a')::t`) but not to a view's, and an array of a table's row type
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
-`r v%ROWTYPE`) fails with `0A000`; a table's works. In a trigger function, `OLD` and `NEW` are
-assignable records with the table's row structure, as in PostgreSQL;
-assigning a row of another structure to one fails at the assignment with
-PostgreSQL's `returned row structure does not match` error, where PostgreSQL
-accepts it and fails only if a BEFORE trigger returns it. A trigger fired
+`r v%ROWTYPE`) fails with `0A000`; a table's works. A trigger fired
 inside a writing statement runs a cursor's `OPEN` query whole at `OPEN`, so a
 cursor it leaves open for the caller does not see the row its BEFORE trigger
 was inserting, where PostgreSQL's cursor reads it at the first `FETCH`; it

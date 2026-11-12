@@ -511,8 +511,8 @@ fn run_body<'a>(
             invocation,
             TriggerTransition {
                 definition,
-                old: None,
-                new: None,
+                old: TriggerRecordValue::Empty,
+                new: TriggerRecordValue::Empty,
             },
             code,
             seeded,

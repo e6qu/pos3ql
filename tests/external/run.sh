@@ -262,6 +262,7 @@ max_extended_statistics = 512
 max_views = 64
 max_materialized_views = 64
 max_routines = 64
+max_cursors = 24
 max_casts = 64
 max_operators = 64
 max_operator_families = 64

@@ -93,6 +93,31 @@ Schemas and catalogs:
   binary input with `0A000`, as PostgreSQL does. Copying non-null statistics
   values, including `pg_statistic[]`, into user tables fails with `0A000`.
 
+- A `LATERAL` item, or a function's arguments in `FROM`, read only the items
+  to its left, never their own or later items' columns: in `SELECT * FROM t,
+  LATERAL (SELECT v) s`, `v` is `t.v`. On the right of a `RIGHT` or `FULL`
+  join such an item reads none of them; naming one fails with `42P10` and
+  PostgreSQL's detail, and a body that names none runs once.
+- A comma starts a new join tree: in `FROM x, a JOIN b USING (id)` the
+  `USING` and `NATURAL` columns come from `a` and `b` only, and lead their
+  tree's columns after `x`'s. A `RIGHT` or `FULL` join after a comma (`FROM x,
+  a RIGHT JOIN b ON ...`) fails with `0A000`: joins run left to right over
+  the whole list, which PostgreSQL's `x` crossed with `a RIGHT JOIN b` does
+  not match. A join condition may still name items before the comma, which
+  PostgreSQL rejects with `42P01`.
+
+Data-modifying statements:
+
+- A `FROM`, `USING` or `MERGE` source item cannot refer to the statement's
+  target, as in PostgreSQL. `UPDATE orders o SET n = 0 FROM generate_series(1,
+  o.n) g` and `FROM LATERAL (SELECT o.n)` fail with `42P10`; a plain subquery,
+  a join condition or a `MERGE` source fails with `42P01` (`invalid reference
+  to FROM-clause entry for table "o"`). An unqualified target column in a plain
+  subquery reports `42703` without PostgreSQL's detail line.
+- Correlated subqueries in `WHERE` and `WHEN` conditions run for every
+  candidate row: `DELETE FROM orders WHERE EXISTS (SELECT 1 FROM refunds r
+  WHERE r.order_id = orders.id)`.
+
 Identity, inheritance, and partitions:
 
 - `CREATE TABLE ... (LIKE ... INCLUDING IDENTITY)` creates independently owned
@@ -849,6 +874,9 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
 - Heap layout, `ctid`, system columns (`xmin`, `xmax`, `cmin`, `cmax`), HOT,
   physical vacuum, physical/streaming replication, hot standby, and binary-WAL
   tools are not provided. Row identities are not exposed as fake heap addresses.
+  A query naming one of these columns of a table fails with `0A000` (`system
+  column "ctid" is not supported`); as in PostgreSQL, a table column cannot
+  take a system column's name (`42701`).
 - PostgreSQL parallel query, JIT, and planner/executor hooks do not exist.
   Cost estimates and `EXPLAIN` text differ from PostgreSQL.
 - Logical copies are separate durable databases updated asynchronously; there

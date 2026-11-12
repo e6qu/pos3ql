@@ -26688,6 +26688,24 @@ fn command_tags(bytes: &[u8]) -> Vec<String> {
 }
 
 /// Extracts text values from DataRow messages, '|'-joined per row.
+/// The message text of each `NoticeResponse` in `bytes`.
+fn notice_messages(bytes: &[u8]) -> Vec<String> {
+    let mut messages = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let length = u32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        if bytes[offset] == b'N'
+            && let Some(message) = bytes[offset + 5..offset + 1 + length]
+                .split(|byte| *byte == 0)
+                .find(|field| field.first() == Some(&b'M'))
+        {
+            messages.push(String::from_utf8(message[1..].to_vec()).unwrap());
+        }
+        offset += 1 + length;
+    }
+    messages
+}
+
 fn data_rows(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;

@@ -108,6 +108,11 @@ Field-width changes use new kind bytes. Kinds with special rules:
 
 Other payload rules:
 
+- **Row deletion (kind 4)** has a flags byte after the schema name: bit 0
+  means the removed image follows, bit 1 means the deletion moved the row to
+  another partition. Other bits are rejected. Recovery and restored prepared
+  transactions keep the move flag, so a statement that waited for the row
+  fails with PostgreSQL's `40001` instead of skipping it.
 - **Table definition payload** is version 17: version byte, ten-byte catalog
   position, name, then the definition. Other versions are rejected.
 - **Domain payload** uses marker 251; earlier layouts are rejected. A mandatory

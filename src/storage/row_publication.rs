@@ -117,6 +117,26 @@ impl Storage {
             cid,
             image,
             matches!(statistics, RowWriteStatistics::Tracked),
+            false,
+        )
+    }
+
+    /// Deletes the row an `UPDATE` or `MERGE` moves to another partition and
+    /// marks the deletion as that move.
+    pub(crate) fn write_pending_move_out(
+        &self,
+        target: TableDefinitionTarget,
+        rowid: u64,
+        cid: u32,
+        statistics: RowWriteStatistics,
+    ) -> Result<PendingWriteUndo, SqlError> {
+        self.write_pending_image_inner(
+            target,
+            rowid,
+            cid,
+            None,
+            matches!(statistics, RowWriteStatistics::Tracked),
+            true,
         )
     }
 
@@ -163,6 +183,7 @@ impl Storage {
             cid,
             image,
             track_statistics,
+            false,
         )
     }
 
@@ -173,6 +194,7 @@ impl Storage {
         cid: u32,
         mut image: Option<super::row_heap::HeapRowRead>,
         track_statistics: bool,
+        moved_out: bool,
     ) -> Result<PendingWriteUndo, SqlError> {
         let table_index = target.table();
         if table_index >= self.tables.len() {
@@ -197,6 +219,7 @@ impl Storage {
                 cid,
                 image.as_ref(),
                 track_statistics,
+                moved_out,
             )?;
             match self.publish_pending_write(prepared)? {
                 PendingPublication::Written(undo) => return Ok(undo),
@@ -266,7 +289,7 @@ impl Storage {
         let definition = self.table_def(table, txid);
         let target = self.table_definition_target(table, txid, &definition);
         drop(definition);
-        self.prepare_pending_write_image_for(target, rowid, cid, image, track_statistics)
+        self.prepare_pending_write_image_for(target, rowid, cid, image, track_statistics, false)
     }
 
     fn prepare_pending_write_image_for(
@@ -276,7 +299,14 @@ impl Storage {
         cid: u32,
         image: Option<&super::row_heap::HeapRowRead>,
         track_statistics: bool,
+        moved_out: bool,
     ) -> Result<PreparedPendingWrite, SqlError> {
+        if moved_out && image.is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a partition move's deletion cannot carry a row image"
+            ));
+        }
         let table = target.table();
         let txid = target.transaction();
         // Copy the decoding schema under the same owner as its version. Cold
@@ -373,6 +403,7 @@ impl Storage {
                 loc,
                 changed_columns,
                 changes_existence,
+                moved_out,
             },
             existed: existed || (expected.is_none() && committed.is_some()),
             track_statistics,
@@ -480,6 +511,7 @@ impl Storage {
             checkpoint_change_lsn: 0,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
+            committed_moved_out: false,
         });
         if publication.row_layout.obsolete(&state) {
             prune_committed_history(&mut versions.committed_row_versions, &mut state, None);
@@ -906,14 +938,14 @@ mod tests {
             storage.compact_heap(&mut scratch).unwrap();
             let change = rename_definition(&storage, table, 7, "after_wait");
             let error = storage
-                .prepare_pending_write_image_for(target, 1, 1, Some(&input), true)
+                .prepare_pending_write_image_for(target, 1, 1, Some(&input), true, false)
                 .err()
                 .unwrap();
             assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
             assert!(storage.tables[table].rows.is_empty());
             storage.rollback_table_def(change);
             let prepared = storage
-                .prepare_pending_write_image_for(target, 1, 1, Some(&input), true)
+                .prepare_pending_write_image_for(target, 1, 1, Some(&input), true, false)
                 .unwrap();
             assert!(matches!(
                 storage.publish_pending_write(prepared).unwrap(),
@@ -921,7 +953,7 @@ mod tests {
             ));
             let image = storage.heap.retain_for_publication(&input).unwrap();
             let prepared = storage
-                .prepare_pending_write_image_for(target, 1, 1, Some(&image), true)
+                .prepare_pending_write_image_for(target, 1, 1, Some(&image), true, false)
                 .unwrap();
             let PendingPublication::Written(undo) =
                 storage.publish_pending_write(prepared).unwrap()
@@ -1273,6 +1305,7 @@ mod tests {
                 checkpoint_change_lsn: 0,
                 history: CommittedHistory::empty(),
                 pending: PendingVersions::empty(),
+                committed_moved_out: false,
             };
             let mut retained = [spilled; 5];
             retained[0].checkpoint_change_lsn = 7;
@@ -1300,6 +1333,7 @@ mod tests {
                         loc: Some(location),
                         changed_columns: ColumnSet::EMPTY,
                         changes_existence: false,
+                        moved_out: false,
                     },
                 )
                 .unwrap();
@@ -1498,6 +1532,7 @@ mod tests {
                     1,
                     Some(input.clone()),
                     true,
+                    false,
                 )
                 .unwrap();
             let row = storage.resident_row_state(table, 1).unwrap().unwrap();
@@ -1546,6 +1581,7 @@ mod tests {
                     1,
                     Some(input.clone()),
                     true,
+                    false,
                 )
                 .unwrap();
             let row = storage.resident_row_state(table, 1).unwrap().unwrap();
@@ -1595,6 +1631,7 @@ mod tests {
                     1,
                     Some(input),
                     true,
+                    false,
                 )
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
@@ -2123,6 +2160,7 @@ mod tests {
             checkpoint_change_lsn: 9,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
+            committed_moved_out: false,
         };
         storage.tables[table].rows.insert(1, marker).unwrap();
         crate::mem::guard::forbid_alloc(|| {

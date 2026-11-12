@@ -317,6 +317,7 @@ fn visible_row_heap_ownership_deferred_snapshot_survives_relocation_and_rejects_
             loc: Some(original),
             changed_columns: ColumnSet::EMPTY,
             changes_existence: false,
+            moved_out: false,
         },
     )
     .unwrap();
@@ -344,6 +345,7 @@ fn visible_row_heap_ownership_deferred_snapshot_survives_relocation_and_rejects_
                 loc: Some(later),
                 changed_columns: ColumnSet::EMPTY,
                 changes_existence: false,
+                moved_out: false,
             },
         )
         .unwrap();
@@ -745,6 +747,7 @@ fn committed_image_obeys_an_lsn_snapshot() {
             loc: Some(RowLoc::test(20, 4)),
             changed_columns: ColumnSet::all(MAX_COLUMNS),
             changes_existence: false,
+            moved_out: false,
         },
     )
     .unwrap();
@@ -792,6 +795,7 @@ fn unpublished_spilled_row_state_is_not_redundant() {
         checkpoint_change_lsn: 42,
         history: CommittedHistory::empty(),
         pending: PendingVersions::empty(),
+        committed_moved_out: false,
     };
     assert!(!Storage::redundant_spilled_row_state(&state));
     state.checkpoint_change_lsn = 0;
@@ -9871,6 +9875,7 @@ fn shared_table_creation_wait_does_not_reserve_row_reads_or_publication() {
             loc: Some(next),
             changed_columns: ColumnSet::EMPTY,
             changes_existence: false,
+            moved_out: false,
         },
     )
     .unwrap();
@@ -10199,6 +10204,7 @@ fn table_retirement_batches_keep_maps_valid_and_preserve_retained_versions_throu
                         loc: Some(pending),
                         changed_columns: ColumnSet::EMPTY,
                         changes_existence: false,
+                        moved_out: false,
                     },
                 )
                 .unwrap();
@@ -10283,6 +10289,7 @@ fn table_retirement_batches_keep_maps_valid_and_preserve_retained_versions_throu
                         loc: Some(pending),
                         changed_columns: ColumnSet::EMPTY,
                         changes_existence: false,
+                        moved_out: false,
                     },
                 )
                 .unwrap();
@@ -10342,6 +10349,7 @@ fn owned_row_lookup_selects_pending_history_and_current_after_retirement() {
                     loc: Some(pending),
                     changed_columns: ColumnSet::EMPTY,
                     changes_existence: false,
+                    moved_out: false,
                 },
             )
             .unwrap();
@@ -10797,6 +10805,7 @@ fn row_heap_generation_compaction_updates_every_visibility_chain_and_rejects_sta
                 loc: Some(pending),
                 changed_columns: ColumnSet::EMPTY,
                 changes_existence: false,
+                moved_out: false,
             },
         )
         .unwrap();
@@ -10956,6 +10965,7 @@ fn heap_compaction_preserves_rows_of_a_pending_create() {
         checkpoint_change_lsn: 0,
         history: CommittedHistory::empty(),
         pending: PendingVersions::empty(),
+        committed_moved_out: false,
     };
     let row_versions = storage.row_versions.exclusive();
     push_pending_version(
@@ -10968,6 +10978,7 @@ fn heap_compaction_preserves_rows_of_a_pending_create() {
             loc: Some(location),
             changed_columns: ColumnSet::all(MAX_COLUMNS),
             changes_existence: true,
+            moved_out: false,
         },
     )
     .unwrap();

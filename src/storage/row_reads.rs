@@ -38,6 +38,9 @@ pub(crate) enum LockedRowRecheck {
     OwnChange,
     /// Another transaction deleted the row and committed.
     Deleted,
+    /// Another transaction's `UPDATE` or `MERGE` moved the row to another
+    /// partition and committed.
+    MovedOut,
     /// Another transaction replaced the row and committed.
     Updated(super::VisibleRowHome),
 }
@@ -53,12 +56,19 @@ impl super::Storage {
         txid: u32,
         seen: super::RowVersion,
     ) -> Result<LockedRowRecheck, SqlError> {
-        let latest = match self.row_state(table, rowid)? {
-            Some(state) => self.uniqueness_row_home(table, rowid, state, txid)?,
-            None => None,
+        let (latest, moved_out) = match self.row_state(table, rowid)? {
+            Some(state) => {
+                let moved_out = state.pending.is_none() && state.committed_moved_out;
+                (
+                    self.uniqueness_row_home(table, rowid, state, txid)?,
+                    moved_out,
+                )
+            }
+            None => (None, false),
         };
         Ok(match latest {
             None if self.row_has_own_pending(table, rowid, txid) => LockedRowRecheck::OwnChange,
+            None if moved_out => LockedRowRecheck::MovedOut,
             None => LockedRowRecheck::Deleted,
             Some(home) if home.snapshot().row_version() == seen => LockedRowRecheck::Unchanged,
             Some(home) if home.snapshot().row_version().is_pending() => LockedRowRecheck::OwnChange,
@@ -844,6 +854,7 @@ mod tests {
                 loc: Some(location),
                 changed_columns: ColumnSet::EMPTY,
                 changes_existence: false,
+                moved_out: false,
             },
         )
         .unwrap();

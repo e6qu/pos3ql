@@ -43,8 +43,12 @@ pub use setops::set_query;
 pub(crate) use setops::set_query_into_rows;
 
 pub(crate) mod generator;
+mod joined_from;
+pub(crate) use joined_from::{
+    JoinedFromRow, joined_from_match, recheck_joined_from_match, with_joined_from_row,
+};
 mod materialize;
-pub(crate) use materialize::ScopeSchema;
+pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
 use materialize::{external_materialized_into, materialized_rows, materialized_select};
 
 mod scan;
@@ -1738,6 +1742,14 @@ pub(crate) fn set_resumable_row(running: bool) {
 /// until its own first effect that a rollback cannot undo.
 pub(crate) fn reopen_statement_reads() {
     set_resumable_row(true);
+    reopen_reads_after_kept_work();
+}
+
+/// A write's post-row work starts a unit that a wait reruns or resumes on
+/// its own (an AFTER event, the immediate constraint checks): the work
+/// before it finished and is kept, so reads yield until that unit's own
+/// first effect.
+pub(crate) fn reopen_reads_after_kept_work() {
     ACTIVE_READ_EFFECTS.with(|active| {
         if let Some(reads) = active.get() {
             // As in `protect_statement_effects`, the scope's borrow pins it.
@@ -15368,10 +15380,96 @@ fn expr_contains_node<'a>(e: &'a Expr<'a>, target: *const Expr<'a>) -> bool {
     found
 }
 
+/// A semi-join's recheck in PostgreSQL's EvalPlanQual: the subquery row the
+/// version `first` matched first, in scan order, must also satisfy the
+/// subquery's `WHERE` with the locked row's `latest` version. The match
+/// order follows pos3ql's scan, which PostgreSQL's choice equals for a
+/// sequential scan of one relation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn semi_join_first_match_passes<'a>(
+    storage: &'a Storage,
+    select: &'a Select<'a>,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    first: &dyn ColumnLookup<'a>,
+    latest: &dyn ColumnLookup<'a>,
+    sequences: Option<&dyn SequenceAccess>,
+) -> Result<bool, SqlError> {
+    let from = select.from.as_ref().ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a semi-join recheck has no FROM clause"
+        )
+    })?;
+    let where_clause = select.where_clause;
+    let scope = QueryScope::resolve_exec_outer(
+        storage,
+        from,
+        where_clause,
+        txid,
+        arena,
+        params,
+        sequences,
+        Some(first),
+    )?;
+    let subs = uncorrelated_subquery_hooks(
+        &[where_clause],
+        storage,
+        txid,
+        arena,
+        params,
+        Some(first),
+        sequences,
+    )?;
+    let correlated_subqueries = ProceduralSubqueries { storage, txid };
+    let catalog = storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        subs: Some(&subs),
+        subquery_executor: Some(&correlated_subqueries),
+        catalog: Some(&catalog),
+        sequences,
+        ..super::eval::NO_HOOKS
+    };
+    let expressions: &[&Expr<'a>] = match where_clause {
+        Some(predicate) => &[predicate],
+        None => &[],
+    };
+    let pax_columns = pax_column_demand(&scope, from, expressions);
+    let retain_match = core::cell::Cell::new(false);
+    let mut passes = None;
+    scan_source_recycling_retaining_match_with_pax_columns(
+        storage,
+        &scope,
+        from,
+        txid,
+        where_clause,
+        arena,
+        params,
+        &hooks,
+        Some(first),
+        pax_columns,
+        &retain_match,
+        &mut |inner| {
+            let again = Chained {
+                inner,
+                outer: Some(latest),
+            };
+            passes = Some(match where_clause {
+                Some(predicate) => plan::where_passes(predicate, arena, params, &again, &hooks)?,
+                None => true,
+            });
+            Ok(false)
+        },
+    )?;
+    Ok(passes.unwrap_or(false))
+}
+
 /// For `UPDATE ... FROM` / `DELETE ... USING`: enumerates the extra tables in
 /// `from`, resolving the target row's columns through `target` (as the outer
 /// scope), and invokes `on_match` with a combined lookup for the FIRST joined
 /// row that satisfies `where_clause`. Returns whether any match was found.
+/// `matched_row` receives that row's FROM item values.
 #[allow(clippy::too_many_arguments)]
 pub fn first_from_match<'a, 'r>(
     storage: &'a Storage,
@@ -15386,87 +15484,24 @@ pub fn first_from_match<'a, 'r>(
     sequences: Option<&dyn SequenceAccess>,
     matched_row: Option<MatchedFromRow<'_, 'r>>,
 ) -> Result<bool, SqlError> {
-    let scope = QueryScope::resolve_exec_outer(
-        storage,
-        from,
-        where_clause,
-        txid,
-        arena,
-        params,
-        sequences,
-        Some(target),
-    )?;
-    let subquery_expressions = arena
-        .alloc_slice_with(1 + 2 * scope.n, |_| None)
-        .map_err(|_| arena_full())?;
-    subquery_expressions[0] = where_clause;
-    collect_table_sample_expressions(from, &mut subquery_expressions[1..]);
-    // A subquery reading the target or a FROM row runs for each joined row.
-    let subs = uncorrelated_subquery_hooks(
-        subquery_expressions,
-        storage,
-        txid,
-        arena,
-        params,
-        None,
-        sequences,
-    )?;
-    let correlated_subqueries = ProceduralSubqueries { storage, txid };
-    let catalog = StorageCatalog {
-        storage,
-        routine_workspace: arena,
-        txid,
-        invocations: None,
-        statement_arena: None,
-    };
-    let hooks = EvalHooks {
-        group: None,
-        aggs: None,
-        subs: Some(&subs),
-        subquery_executor: Some(&correlated_subqueries),
-        windows: None,
-        catalog: Some(&catalog),
-        srf_index: None,
-        project_sets: None,
-        sequences,
-        merge_action: None,
-    };
     let mut found = false;
-    let mut expressions = [&Expr::Null; MAX_PROJ + 1];
-    let mut expression_count = 0usize;
-    if let Some(predicate) = where_clause {
-        expressions[expression_count] = predicate;
-        expression_count += 1;
-    }
-    for &expression in observed {
-        expressions[expression_count] = expression;
-        expression_count += 1;
-    }
-    let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
-    let retain_match = core::cell::Cell::new(false);
     let mut matched_row = matched_row;
-    scan_source_recycling_retaining_match_with_pax_columns(
+    joined_from::scan_from_matches(
         storage,
-        &scope,
         from,
         txid,
         where_clause,
+        observed,
+        false,
         arena,
         params,
-        &hooks,
-        Some(target),
-        pax_columns,
-        &retain_match,
-        &mut |jr| {
+        target,
+        sequences,
+        &mut |row, joined, _| {
             if let Some(matched_row) = matched_row.as_mut() {
-                *matched_row.values = detached_join_values(jr, arena, matched_row.arena)?;
+                *matched_row.values = detached_join_values(row, arena, matched_row.arena)?;
             }
-            let chained_row = Chained {
-                inner: jr,
-                outer: Some(target),
-            };
-            on_match(&chained_row)?;
-            retain_match.set(true);
+            on_match(joined)?;
             found = true;
             Ok(false) // stop at the first match (PostgreSQL uses one arbitrary row)
         },

@@ -126,6 +126,9 @@ impl DmlTableLayout<'_> {
 pub(super) struct DmlRowImages<'arena> {
     rows: ArenaList<'arena, DmlRowImage<'arena>>,
     tables: ArenaList<'arena, DmlTableLayout<'arena>>,
+    /// The FROM row each selected target row of `UPDATE ... FROM` joined,
+    /// keyed by the target row's `PhysicalRow::sort_key`.
+    joined: ArenaList<'arena, ((usize, u64), super::query::JoinedFromRow<'arena>)>,
 }
 
 impl<'arena> DmlRowImages<'arena> {
@@ -133,7 +136,47 @@ impl<'arena> DmlRowImages<'arena> {
         Self {
             rows: ArenaList::new(arena),
             tables: ArenaList::new(arena),
+            joined: ArenaList::new(arena),
         }
+    }
+
+    fn push_joined(
+        &mut self,
+        row: PhysicalRow,
+        joined: super::query::JoinedFromRow<'arena>,
+    ) -> Result<(), SqlError> {
+        self.joined.push((row.sort_key(), joined)).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "joined FROM rows exceed the statement arena"
+            )
+        })
+    }
+
+    /// A read committed recheck continues with the FROM row that still meets
+    /// the statement's conditions for the target row's latest version.
+    fn replace_joined(
+        &mut self,
+        row: PhysicalRow,
+        joined: super::query::JoinedFromRow<'arena>,
+    ) -> Result<(), SqlError> {
+        let rows = self.joined.as_mut_slice().map_err(|_| arena_full())?;
+        if let Ok(index) = rows.binary_search_by_key(&row.sort_key(), |(key, _)| *key) {
+            rows[index].1 = joined;
+        }
+        Ok(())
+    }
+
+    fn joined(&self, row: PhysicalRow) -> Result<super::query::JoinedFromRow<'arena>, SqlError> {
+        let rows = self.joined.as_slice();
+        rows.binary_search_by_key(&row.sort_key(), |(key, _)| *key)
+            .map(|index| rows[index].1)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "selected DML row has no retained FROM row"
+                )
+            })
     }
 
     #[expect(
@@ -238,6 +281,10 @@ impl<'arena> DmlRowImages<'arena> {
             .as_mut_slice()
             .map_err(|_| arena_full())?
             .sort_unstable_by_key(|row| (row.table, row.rowid));
+        self.joined
+            .as_mut_slice()
+            .map_err(|_| arena_full())?
+            .sort_unstable_by_key(|(key, _)| *key);
         Ok(self)
     }
 
@@ -273,6 +320,11 @@ pub(super) enum DmlCapture {
 }
 
 impl DmlCapture {
+    /// `UPDATE ... FROM` assignments read the FROM row each target row joined.
+    fn retains_joined(self) -> bool {
+        matches!(self, Self::Update { .. })
+    }
+
     fn command(self) -> u32 {
         match self {
             Self::Update { command } | Self::Delete { command, .. } => command,
@@ -372,29 +424,81 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
         layout: DmlTableLayout<'a>,
         table: usize,
         rowid: u64,
+        seen: crate::storage::RowSnapshot,
         latest: crate::storage::VisibleRowHome,
         arena: &'a Arena,
-    ) -> Result<Option<&'a [u8]>, SqlError> {
+    ) -> Result<Option<RequalifiedRow<'a>>, SqlError> {
         let bytes = storage.row_bytes(table, rowid, latest, arena)?;
         let mut physical = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, layout.schema, &mut physical)?;
         let mut values = [Datum::Null; MAX_COLUMNS];
         layout.project(&physical, &mut values);
         let Some(from) = self.from else {
-            let matched = row_matches_values(
+            if !row_matches_values(
                 storage,
                 txid,
                 self.def,
                 self.alias,
                 &values,
-                self.where_clause,
+                None,
                 arena,
                 self.params,
                 self.hooks,
                 self.row_security,
                 self.outer,
+            )? {
+                return Ok(None);
+            }
+            let unjoined = RequalifiedRow {
+                bytes,
+                joined: None,
+            };
+            let Some(predicate) = self.where_clause else {
+                return Ok(Some(unjoined));
+            };
+            // The version the statement selected, for the semi-joins whose
+            // recheck keeps the subquery row it first matched.
+            let first_bytes = storage.row_bytes(table, rowid, seen, arena)?;
+            let mut first_physical = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(first_bytes, layout.schema, &mut first_physical)?;
+            let mut first_values = [Datum::Null; MAX_COLUMNS];
+            layout.project(&first_physical, &mut first_values);
+            let relation = crate::storage::RelationDefinition::from_definition(self.def);
+            let first_row = RowCtx {
+                def: relation,
+                values: &first_values[..self.def.n_columns],
+                alias: self.alias,
+            };
+            let latest_row = RowCtx {
+                def: relation,
+                values: &values[..self.def.n_columns],
+                alias: self.alias,
+            };
+            let first_scope = self.outer.map(|outer| TriggerDmlScope {
+                row: &first_row,
+                outer,
+            });
+            let latest_scope = self.outer.map(|outer| TriggerDmlScope {
+                row: &latest_row,
+                outer,
+            });
+            let matched = super::query::locked_row_where_passes(
+                storage,
+                txid,
+                predicate,
+                match first_scope.as_ref() {
+                    Some(scope) => scope,
+                    None => &first_row,
+                },
+                match latest_scope.as_ref() {
+                    Some(scope) => scope,
+                    None => &latest_row,
+                },
+                arena,
+                self.params,
+                self.hooks,
             )?;
-            return Ok(matched.then_some(bytes));
+            return Ok(matched.then_some(unjoined));
         };
         let context = RowCtx {
             def: crate::storage::RelationDefinition::from_definition(self.def),
@@ -414,29 +518,54 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
         {
             return Ok(None);
         }
-        let joined = self.outer.map(|outer| JoinedTriggerDmlScope {
+        let first_bytes = storage.row_bytes(table, rowid, seen, arena)?;
+        let mut first_physical = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(first_bytes, layout.schema, &mut first_physical)?;
+        let mut first_values = [Datum::Null; MAX_COLUMNS];
+        layout.project(&first_physical, &mut first_values);
+        let first_row = RowCtx {
+            values: &first_values[..self.def.n_columns],
+            ..context
+        };
+        let first_joined = self.outer.map(|outer| JoinedTriggerDmlScope {
+            row: &first_row,
+            outer,
+        });
+        let latest_joined = self.outer.map(|outer| JoinedTriggerDmlScope {
             row: &context,
             outer,
         });
-        let target: &dyn ColumnLookup<'_> = match joined.as_ref() {
-            Some(joined) => joined,
-            None => &context,
-        };
-        let matched = super::query::first_from_match(
+        let joined = super::query::recheck_joined_from_match(
             storage,
             from,
             txid,
             self.where_clause,
-            &[],
             arena,
             self.params,
-            target,
-            &mut |_| Ok(()),
+            match first_joined.as_ref() {
+                Some(joined) => joined,
+                None => &first_row,
+            },
+            match latest_joined.as_ref() {
+                Some(joined) => joined,
+                None => &context,
+            },
             self.sequences,
-            None,
+            arena,
         )?;
-        Ok(matched.then_some(bytes))
+        Ok(joined.map(|joined| RequalifiedRow {
+            bytes,
+            joined: Some(joined),
+        }))
     }
+}
+
+/// A selected row's latest version that still meets the statement's
+/// conditions, with the FROM row an `UPDATE ... FROM` or `DELETE ... USING`
+/// recheck joined it to.
+struct RequalifiedRow<'a> {
+    bytes: &'a [u8],
+    joined: Option<super::query::JoinedFromRow<'a>>,
 }
 
 /// Locks every selected row before any row changes, as PostgreSQL does. A
@@ -495,10 +624,16 @@ fn lock_selected_dml_rows<'a, Definition: crate::storage::DefinitionBacking>(
             row_conflicts::LockedVersion::Updated(latest) => {
                 let snapshot = latest.snapshot();
                 let layout = retained_rows.layout(table)?;
-                match requalify.latest(storage, txn.txid, layout, table, rowid, latest, arena)? {
-                    Some(bytes) => {
-                        retained_rows.replace(table, rowid, bytes)?;
-                        Some(PhysicalRow::local(table, rowid, snapshot))
+                match requalify
+                    .latest(storage, txn.txid, layout, table, rowid, home, latest, arena)?
+                {
+                    Some(requalified) => {
+                        retained_rows.replace(table, rowid, requalified.bytes)?;
+                        let row = PhysicalRow::local(table, rowid, snapshot);
+                        if let Some(joined) = requalified.joined {
+                            retained_rows.replace_joined(row, joined)?;
+                        }
+                        Some(row)
                     }
                     None => None,
                 }
@@ -1254,7 +1389,7 @@ mod trigger_firing;
 use trigger_firing::{TriggerRecordName, TriggerRows};
 mod write_attempts;
 pub(crate) use row_conflicts::{
-    LockedVersion, concurrent_change, lock_selected_row, locked_result_row_current,
+    LockedVersion, concurrent_change, lock_selected_row, locked_result_row_current, moved_out,
 };
 pub(crate) use row_progress::{RetainedWrite, RowProgress, StepRecord, is_wait};
 mod write_completion;
@@ -28011,6 +28146,7 @@ impl PlpgsqlExecHost<'_> {
                 command: txn.command_id(),
                 depth: txn.trigger_depth(),
                 retained: true,
+                statement_end: false,
             });
         }
         Ok(())
@@ -29235,6 +29371,7 @@ fn execute_nested_write<'a>(
                     command: txn.command_id(),
                     depth: txn.trigger_depth(),
                     retained,
+                    statement_end: false,
                 });
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
@@ -29297,6 +29434,7 @@ fn execute_nested_write<'a>(
                     command: txn.command_id(),
                     depth: txn.trigger_depth(),
                     retained,
+                    statement_end: false,
                 });
             let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
@@ -29358,6 +29496,7 @@ fn execute_nested_write<'a>(
                     command: txn.command_id(),
                     depth: txn.trigger_depth(),
                     retained,
+                    statement_end: false,
                 });
             let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
@@ -29436,6 +29575,7 @@ fn execute_nested_write<'a>(
                     command: txn.command_id(),
                     depth: txn.trigger_depth(),
                     retained,
+                    statement_end: false,
                 });
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
@@ -31646,6 +31786,7 @@ fn execute_rewritten_nested_write<'a>(
             command: txn.command_id(),
             depth: txn.trigger_depth(),
             retained,
+            statement_end: false,
         });
     let responder = &mut *context.responder;
     responder.clear_affected_rows();
@@ -36065,6 +36206,7 @@ fn execute_trigger_step_in<'a>(
                         command: txn.command_id(),
                         depth: txn.trigger_depth(),
                         retained,
+                        statement_end: false,
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
@@ -36265,6 +36407,7 @@ fn execute_trigger_step_in<'a>(
                         command: txn.command_id(),
                         depth: txn.trigger_depth(),
                         retained,
+                        statement_end: false,
                     });
                 let mut scratch = storage.row_work.lease(0).map_err(|error| {
                     sql_err!(
@@ -36464,6 +36607,7 @@ fn execute_trigger_step_in<'a>(
                         command: txn.command_id(),
                         depth: txn.trigger_depth(),
                         retained,
+                        statement_end: false,
                     });
                 let mut scratch = storage.row_work.lease(0).map_err(|error| {
                     sql_err!(
@@ -36639,6 +36783,7 @@ fn execute_trigger_step_in<'a>(
                         command: txn.command_id(),
                         depth: txn.trigger_depth(),
                         retained,
+                        statement_end: false,
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
@@ -72931,6 +73076,23 @@ pub(crate) fn merge<'a>(
 ) -> Outcome {
     let coercion_txid = txn.txid;
     use crate::sql::ast::MergeActionRef as MergeAction;
+    let source_from = crate::sql::ast::FromClause {
+        base: statement.source,
+        joins: &[],
+    };
+    if let Err(error) = reject_target_references_of(
+        storage,
+        txn.txid,
+        &crate::sql::ast::QualName {
+            schema: statement.target.schema,
+            name: statement.target.name,
+        },
+        Some(&source_from),
+        statement.target_alias.unwrap_or(statement.target.name),
+        true,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = super::query::validate_dml_assignment_casts(
         &Stmt::Merge(*statement),
         storage,
@@ -73843,10 +74005,11 @@ pub(crate) fn merge<'a>(
     drop(selection_snapshot);
     // Row changes start here; a wait before them restarts the statement.
     row_progress::enter_rows(progress.as_deref_mut());
-    // Row progress counts one position per source row and target row pair,
-    // plus each source row's NOT MATCHED stage; the last source position is
-    // the NOT MATCHED BY SOURCE pass.
-    let stride = n_target + 1;
+    // Row progress counts, per source row, one position for each target row
+    // pair, one for the NOT MATCHED stage a lost pair runs, and one for the
+    // stage of a source row that matched nothing; the last source position
+    // is the NOT MATCHED BY SOURCE pass.
+    let stride = 2 * n_target + 1;
     let positions = (source_rows.len() + 1).saturating_mul(stride);
     let (first_position, mut affected_count, mut resumed_match) = match progress.as_deref() {
         Some(progress) => {
@@ -73891,11 +74054,18 @@ pub(crate) fn merge<'a>(
         )
     });
     let mut source_index = first_position / stride;
-    let mut first_target = first_position % stride;
-    // Whether the running source row matched a target row, and whether a
-    // concurrent change took a match away; kept with an unfinished row.
+    // A resumed position past the pairs continues a lost pair's NOT MATCHED
+    // stage, or the stage of a source row that matched nothing.
+    let mut first_target = match first_position % stride {
+        pair if pair < 2 * n_target => pair % n_target.max(1),
+        _ => n_target,
+    };
+    let mut resumed_lost_pair = (n_target..2 * n_target)
+        .contains(&(first_position % stride))
+        .then_some(first_target);
+    // Whether the running source row matched a target row; kept with an
+    // unfinished row.
     let mut matched = false;
-    let mut match_lost = false;
     let rows_outcome = (|| -> Outcome {
         loop {
             let by_source = source_index == source_rows.len();
@@ -73914,10 +74084,193 @@ pub(crate) fn merge<'a>(
                 width
             };
             let sv = &sv[..source_def.n_columns.min(n_src_cols)];
+            // A source row runs its NOT MATCHED [BY TARGET] stage when it
+            // matched nothing, and right after each pair a concurrent change
+            // took away, as PostgreSQL's ExecMerge does. A deleted NOT
+            // MATCHED BY SOURCE row runs it with a NULL source row.
+            macro_rules! run_not_matched {
+                ($position:expr) => {
+                    'not_matched: {
+                        let position = $position;
+                        match row_progress::start_row(
+                            progress.as_deref_mut(),
+                            position,
+                            None,
+                            affected_count,
+                            row_progress::capture_lengths([
+                                insert_transitions.as_ref(),
+                                update_transitions.as_ref(),
+                                delete_transitions.as_ref(),
+                            ]),
+                            txn,
+                            responder,
+                            arena,
+                        ) {
+                            Ok(None) => {}
+                            Ok(Some(resumed)) => {
+                                match emit_merge_progress_returning(
+                                    progress.as_deref_mut(),
+                                    ChangedRow {
+                                        index: position,
+                                        row: None,
+                                        changed: affected_count,
+                                        transitions: row_progress::capture_lengths([
+                                            insert_transitions.as_ref(),
+                                            update_transitions.as_ref(),
+                                            delete_transitions.as_ref(),
+                                        ]),
+                                    },
+                                    storage,
+                                    txn,
+                                    def,
+                                    target_alias,
+                                    source_def,
+                                    source_alias,
+                                    source_members,
+                                    Some(sv),
+                                    statement.returning,
+                                    None,
+                                    resumed.new,
+                                    "INSERT",
+                                    arena,
+                                    params,
+                                    responder,
+                                    &mut capture,
+                                    seq_session,
+                                )? {
+                                    Ok(()) => {}
+                                    Err(error) => return sql_fail(error),
+                                }
+                                affected_count += 1;
+                                break 'not_matched;
+                            }
+                            Err(error) => return sql_fail(error),
+                        }
+                        // First satisfied WHEN NOT MATCHED clause (source columns only).
+                        let source_ctx = RowCtx {
+                            def: *source_def,
+                            values: sv,
+                            alias: None,
+                        };
+                        for when in statement.whens.iter().filter(|w| {
+                            matches!(
+                                w.kind(),
+                                crate::sql::ast::MergeMatchKind::NotMatchedByTarget
+                            )
+                        }) {
+                            if let Some(cond) = when.condition() {
+                                match eval_merge_expression(
+                                    cond,
+                                    storage,
+                                    txn.txid,
+                                    seq_session,
+                                    arena,
+                                    params,
+                                    &ProceduralMergeScope {
+                                        row: &source_ctx,
+                                        outer,
+                                    },
+                                    None,
+                                ) {
+                                    Ok(Datum::Bool(true)) => {}
+                                    Ok(_) => continue,
+                                    Err(e) => return sql_fail(e),
+                                }
+                            }
+                            match when.action() {
+                                MergeAction::DoNothing => {}
+                                MergeAction::Insert {
+                                    columns,
+                                    values,
+                                    default_values,
+                                    overriding,
+                                } => {
+                                    match merge_insert(
+                                        storage,
+                                        txn,
+                                        assignment_casts,
+                                        table_target,
+                                        def,
+                                        columns,
+                                        values,
+                                        default_values,
+                                        overriding,
+                                        &ProceduralMergeScope {
+                                            row: &source_ctx,
+                                            outer,
+                                        },
+                                        &generated,
+                                        &defaults,
+                                        seq_session,
+                                        arena,
+                                        params,
+                                        &checks,
+                                        insert_check,
+                                        responder,
+                                        insert_transitions.as_mut(),
+                                    ) {
+                                        Ok(Some(inserted)) => {
+                                            if !statement.returning.is_empty() {
+                                                match emit_merge_progress_returning(
+                                                    progress.as_deref_mut(),
+                                                    ChangedRow {
+                                                        index: position,
+                                                        row: None,
+                                                        changed: affected_count,
+                                                        transitions: row_progress::capture_lengths([
+                                                            insert_transitions.as_ref(),
+                                                            update_transitions.as_ref(),
+                                                            delete_transitions.as_ref(),
+                                                        ]),
+                                                    },
+                                                    storage,
+                                                    txn,
+                                                    def,
+                                                    target_alias,
+                                                    source_def,
+                                                    source_alias,
+                                                    source_members,
+                                                    Some(sv),
+                                                    statement.returning,
+                                                    None,
+                                                    Some(inserted),
+                                                    "INSERT",
+                                                    arena,
+                                                    params,
+                                                    responder,
+                                                    &mut capture,
+                                                    seq_session,
+                                                ) {
+                                                    Ok(Ok(())) => {}
+                                                    Ok(Err(error)) => return sql_fail(error),
+                                                    Err(wire) => return Err(wire),
+                                                }
+                                            }
+                                            affected_count += 1;
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => return sql_fail(error),
+                                    }
+                                }
+                                _ => {
+                                    return sql_fail(sql_err!(
+                                        sqlstate::SYNTAX_ERROR,
+                                        "only INSERT / DO NOTHING is allowed in a WHEN NOT MATCHED clause"
+                                    ));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                };
+            }
             let resumed = core::mem::take(&mut resumed_match);
             matched = by_source || resumed.matched;
-            match_lost = resumed.lost;
             for j in core::mem::take(&mut first_target)..n_target {
+                if core::mem::take(&mut resumed_lost_pair) == Some(j) {
+                    run_not_matched!(source_index * stride + n_target + j);
+                    continue;
+                }
                 if by_source && matched_by_source[j] {
                     continue;
                 }
@@ -74038,6 +74391,7 @@ pub(crate) fn merge<'a>(
                 let mut pair_physical = target_physical[j];
                 let mut pair_row = selected_rows[j];
                 let mut by_source_actions = by_source;
+                let mut pair_lost = false;
                 let mut choose_again = true;
                 while core::mem::take(&mut choose_again) {
                     let lookup = MergeLookup {
@@ -74059,7 +74413,7 @@ pub(crate) fn merge<'a>(
                             match $lock {
                                 Ok(MergeRowLock::Current) => {}
                                 Ok(MergeRowLock::Deleted) => {
-                                    match_lost = true;
+                                    pair_lost = true;
                                     break;
                                 }
                                 Ok(MergeRowLock::Updated {
@@ -74091,7 +74445,7 @@ pub(crate) fn merge<'a>(
                                             Ok(Datum::Bool(true)) => {}
                                             Ok(_) => {
                                                 by_source_actions = true;
-                                                match_lost = true;
+                                                pair_lost = true;
                                             }
                                             Err(error) => return sql_fail(error),
                                         }
@@ -74881,195 +75235,12 @@ pub(crate) fn merge<'a>(
                         break;
                     }
                 }
-            }
-            // A source row runs its NOT MATCHED [BY TARGET] stage when it
-            // matched nothing, or when a concurrent change took a match
-            // away. PostgreSQL runs the stage once per lost pair; one source
-            // row losing several matches runs it once here. A deleted
-            // NOT MATCHED BY SOURCE row runs it with a NULL source row, as
-            // PostgreSQL's ExecMerge does.
-            let not_matched = !matched || match_lost;
-            if by_source && !not_matched {
-                break;
-            }
-            if not_matched {
-                let position = source_index * stride + n_target;
-                match row_progress::start_row(
-                    progress.as_deref_mut(),
-                    position,
-                    None,
-                    affected_count,
-                    row_progress::capture_lengths([
-                        insert_transitions.as_ref(),
-                        update_transitions.as_ref(),
-                        delete_transitions.as_ref(),
-                    ]),
-                    txn,
-                    responder,
-                    arena,
-                ) {
-                    Ok(None) => {}
-                    Ok(Some(resumed)) => {
-                        match emit_merge_progress_returning(
-                            progress.as_deref_mut(),
-                            ChangedRow {
-                                index: position,
-                                row: None,
-                                changed: affected_count,
-                                transitions: row_progress::capture_lengths([
-                                    insert_transitions.as_ref(),
-                                    update_transitions.as_ref(),
-                                    delete_transitions.as_ref(),
-                                ]),
-                            },
-                            storage,
-                            txn,
-                            def,
-                            target_alias,
-                            source_def,
-                            source_alias,
-                            source_members,
-                            Some(sv),
-                            statement.returning,
-                            None,
-                            resumed.new,
-                            "INSERT",
-                            arena,
-                            params,
-                            responder,
-                            &mut capture,
-                            seq_session,
-                        )? {
-                            Ok(()) => {}
-                            Err(error) => return sql_fail(error),
-                        }
-                        affected_count += 1;
-                        if by_source {
-                            break;
-                        }
-                        source_index += 1;
-                        continue;
-                    }
-                    Err(error) => return sql_fail(error),
+                if pair_lost {
+                    run_not_matched!(source_index * stride + n_target + j);
                 }
             }
-            if not_matched {
-                let position = source_index * stride + n_target;
-                // First satisfied WHEN NOT MATCHED clause (source columns only).
-                let source_ctx = RowCtx {
-                    def: *source_def,
-                    values: sv,
-                    alias: None,
-                };
-                for when in statement.whens.iter().filter(|w| {
-                    matches!(
-                        w.kind(),
-                        crate::sql::ast::MergeMatchKind::NotMatchedByTarget
-                    )
-                }) {
-                    if let Some(cond) = when.condition() {
-                        match eval_merge_expression(
-                            cond,
-                            storage,
-                            txn.txid,
-                            seq_session,
-                            arena,
-                            params,
-                            &ProceduralMergeScope {
-                                row: &source_ctx,
-                                outer,
-                            },
-                            None,
-                        ) {
-                            Ok(Datum::Bool(true)) => {}
-                            Ok(_) => continue,
-                            Err(e) => return sql_fail(e),
-                        }
-                    }
-                    match when.action() {
-                        MergeAction::DoNothing => {}
-                        MergeAction::Insert {
-                            columns,
-                            values,
-                            default_values,
-                            overriding,
-                        } => {
-                            match merge_insert(
-                                storage,
-                                txn,
-                                assignment_casts,
-                                table_target,
-                                def,
-                                columns,
-                                values,
-                                default_values,
-                                overriding,
-                                &ProceduralMergeScope {
-                                    row: &source_ctx,
-                                    outer,
-                                },
-                                &generated,
-                                &defaults,
-                                seq_session,
-                                arena,
-                                params,
-                                &checks,
-                                insert_check,
-                                responder,
-                                insert_transitions.as_mut(),
-                            ) {
-                                Ok(Some(inserted)) => {
-                                    if !statement.returning.is_empty() {
-                                        match emit_merge_progress_returning(
-                                            progress.as_deref_mut(),
-                                            ChangedRow {
-                                                index: position,
-                                                row: None,
-                                                changed: affected_count,
-                                                transitions: row_progress::capture_lengths([
-                                                    insert_transitions.as_ref(),
-                                                    update_transitions.as_ref(),
-                                                    delete_transitions.as_ref(),
-                                                ]),
-                                            },
-                                            storage,
-                                            txn,
-                                            def,
-                                            target_alias,
-                                            source_def,
-                                            source_alias,
-                                            source_members,
-                                            Some(sv),
-                                            statement.returning,
-                                            None,
-                                            Some(inserted),
-                                            "INSERT",
-                                            arena,
-                                            params,
-                                            responder,
-                                            &mut capture,
-                                            seq_session,
-                                        ) {
-                                            Ok(Ok(())) => {}
-                                            Ok(Err(error)) => return sql_fail(error),
-                                            Err(wire) => return Err(wire),
-                                        }
-                                    }
-                                    affected_count += 1;
-                                }
-                                Ok(None) => {}
-                                Err(error) => return sql_fail(error),
-                            }
-                        }
-                        _ => {
-                            return sql_fail(sql_err!(
-                                sqlstate::SYNTAX_ERROR,
-                                "only INSERT / DO NOTHING is allowed in a WHEN NOT MATCHED clause"
-                            ));
-                        }
-                    }
-                    break;
-                }
+            if !matched {
+                run_not_matched!(source_index * stride + 2 * n_target);
             }
             if by_source {
                 break;
@@ -75084,10 +75255,7 @@ pub(crate) fn merge<'a>(
                 progress,
                 affected,
                 matched_by_source,
-                SourceRowMatch {
-                    matched,
-                    lost: match_lost,
-                },
+                SourceRowMatch { matched },
                 arena,
                 &storage.row_work,
             )
@@ -75150,43 +75318,28 @@ pub(crate) fn merge<'a>(
 #[derive(Clone, Copy, Default)]
 struct SourceRowMatch {
     matched: bool,
-    /// A concurrent change took one of its matches away.
-    lost: bool,
 }
 
 impl SourceRowMatch {
     fn flag(self) -> u8 {
-        match (self.matched, self.lost) {
-            (_, true) => b'2',
-            (true, false) => b'1',
-            (false, false) => b'0',
-        }
+        if self.matched { b'1' } else { b'0' }
     }
 
     fn from_flag(flag: &[u8]) -> Result<Self, SqlError> {
-        Ok(match flag {
-            b"0" => Self::default(),
-            b"1" => Self {
-                matched: true,
-                lost: false,
-            },
-            b"2" => Self {
-                matched: true,
-                lost: true,
-            },
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "a resumed MERGE row has an invalid match state"
-                ));
-            }
-        })
+        match flag {
+            b"0" => Ok(Self { matched: false }),
+            b"1" => Ok(Self { matched: true }),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a resumed MERGE row has an invalid match state"
+            )),
+        }
     }
 }
 
 /// Saves `MERGE`'s per-target flags and the running source row's match with
 /// an unfinished row: `1` or `0` per target row for `affected` and
-/// `matched_by_source`, then the running row's [`SourceRowMatch`].
+/// `matched_by_source`, then the running row's [`SourceRowMatch`] flag.
 fn save_merge_state(
     progress: &mut RowProgress,
     affected: &[bool],
@@ -79092,6 +79245,16 @@ pub(crate) fn update<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     mut progress: Option<&mut RowProgress>,
 ) -> Outcome {
+    if let Err(error) = reject_target_references_of(
+        storage,
+        txn.txid,
+        &statement.table,
+        statement.from,
+        statement.alias.unwrap_or(statement.table.name),
+        false,
+    ) {
+        return sql_fail(error);
+    }
     let coercion_txid = txn.txid;
     if let Err(error) = super::query::validate_dml_assignment_casts(
         &Stmt::Update(*statement),
@@ -79283,10 +79446,6 @@ pub(crate) fn update<'a>(
         subquery_expression_count += 1;
     }
     // A correlated WHERE subquery runs for each target row.
-    let correlated_subqueries = super::query::ProceduralSubqueries {
-        storage,
-        txid: txn.txid,
-    };
     let mut assignment_correlated = [false; MAX_COLUMNS];
     for (index, (_, expression)) in statement.assignments.iter().enumerate() {
         assignment_correlated[index] = match super::query::expression_has_correlated_subquery(
@@ -79318,6 +79477,10 @@ pub(crate) fn update<'a>(
     };
     let catalog = super::query::storage_catalog(storage, arena, txn.txid);
     let effect_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+    let correlated_subqueries = super::query::ProceduralSubqueries {
+        storage,
+        txid: txn.txid,
+    };
     let hooks = super::eval::EvalHooks {
         group: None,
         aggs: None,
@@ -79664,11 +79827,7 @@ pub(crate) fn update<'a>(
                 let expression_snapshot = storage.dml_expression_snapshot(txn.command_id());
                 if let Some(from) = statement.from {
                     // UPDATE ... FROM: evaluate the assignments against the target
-                    // row joined with the first matching FROM row.
-                    let mut observed = [&Expr::Null; MAX_COLUMNS];
-                    for (index, (_, expression)) in statement.assignments.iter().enumerate() {
-                        observed[index] = expression;
-                    }
+                    // row joined with the FROM row its selection retained.
                     let joined_scope = outer.map(|outer| JoinedTriggerDmlScope {
                         row: &context,
                         outer,
@@ -79698,17 +79857,26 @@ pub(crate) fn update<'a>(
                             };
                         }
                     }
-                    let matched = {
-                        let r = super::query::first_from_match(
+                    let joined_row = match retained_rows.joined(scratch[i]) {
+                        Ok(joined) => joined,
+                        Err(error) => return sql_fail(error),
+                    };
+                    {
+                        let r = super::query::with_joined_from_row(
                             storage,
                             from,
                             txn.txid,
                             statement.where_clause,
-                            &observed[..statement.assignments.len()],
                             arena,
                             params,
+                            Some(&crate::sql::sequence::SeqEval::new(
+                                storage,
+                                seq_session,
+                                txn.txid,
+                            )),
                             joined_target,
-                            &mut |combined| {
+                            joined_row,
+                            |combined| {
                                 for (a, (_, expression)) in statement.assignments.iter().enumerate()
                                 {
                                     // A generated target's `= DEFAULT` is a no-op here; it
@@ -79780,22 +79948,15 @@ pub(crate) fn update<'a>(
                                 }
                                 Ok(())
                             },
-                            Some(&crate::sql::sequence::SeqEval::new(
-                                storage,
-                                seq_session,
-                                txn.txid,
-                            )),
                             returning_from.map(|_| super::query::MatchedFromRow {
                                 arena,
                                 values: &mut matched_from,
                             }),
                         );
-                        match r {
-                            Ok(matched) => matched,
-                            Err(error) => return sql_fail(error),
+                        if let Err(error) = r {
+                            return sql_fail(error);
                         }
-                    };
-                    debug_assert!(matched, "the joined row collector selected this target");
+                    }
                 } else {
                     // `nextval`/`setval` in a SET expression advance once per updated
                     // row; a scoped sequence evaluator (shared `&storage`) supplies
@@ -80541,6 +80702,16 @@ pub(crate) fn delete<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     mut progress: Option<&mut RowProgress>,
 ) -> Outcome {
+    if let Err(error) = reject_target_references_of(
+        storage,
+        txn.txid,
+        &statement.table,
+        statement.using,
+        statement.alias.unwrap_or(statement.table.name),
+        false,
+    ) {
+        return sql_fail(error);
+    }
     let coercion_txid = txn.txid;
     let outer_lookup = outer;
     let capturing = capture.is_some();
@@ -80659,17 +80830,13 @@ pub(crate) fn delete<'a>(
     }
 
     // A correlated WHERE subquery runs for each target row.
-    let correlated_subqueries = super::query::ProceduralSubqueries {
-        storage,
-        txid: txn.txid,
-    };
     let subs = match super::query::uncorrelated_subquery_hooks(
         &[statement.where_clause],
         storage,
         txn.txid,
         arena,
         params,
-        None,
+        outer,
         Some(&crate::sql::sequence::SeqEval::new(
             storage,
             seq_session,
@@ -80681,6 +80848,10 @@ pub(crate) fn delete<'a>(
     };
     let catalog = super::query::storage_catalog(storage, arena, txn.txid);
     let effect_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+    let correlated_subqueries = super::query::ProceduralSubqueries {
+        storage,
+        txid: txn.txid,
+    };
     let hooks = super::eval::EvalHooks {
         group: None,
         aggs: None,
@@ -85877,6 +86048,9 @@ fn alter_table_relation(
                 let Some(i) = new_def.column_index(from) else {
                     return sql_fail(undefined_column(from));
                 };
+                if let Err(error) = crate::storage::reject_system_column_name(to) {
+                    return sql_fail(error);
+                }
                 if new_def.column_index(to).is_some() {
                     return sql_fail(sql_err!(
                         sqlstate::DUPLICATE_COLUMN,
@@ -85900,6 +86074,9 @@ fn alter_table_relation(
                 definition: c,
                 if_not_exists,
             } => {
+                if let Err(error) = crate::storage::reject_system_column_name(c.name) {
+                    return sql_fail(error);
+                }
                 if new_def.column_index(c.name).is_some() {
                     if *if_not_exists {
                         responder.notice(
@@ -89010,31 +89187,51 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                 {
                     return Ok(());
                 }
-                if super::query::first_from_match(
-                    storage,
-                    from,
-                    txid,
-                    where_clause,
-                    &[],
-                    arena,
-                    params,
-                    &context,
-                    &mut |_| Ok(()),
-                    None,
-                    None,
-                )? {
-                    scratch
-                        .push(PhysicalRow::Foreign {
-                            table_index,
-                            tuple_id,
-                        })
-                        .map_err(|error| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement row selection: {}",
-                                error
-                            )
-                        })?;
+                let row = PhysicalRow::Foreign {
+                    table_index,
+                    tuple_id,
+                };
+                let matched = if capture.retains_joined() {
+                    match super::query::joined_from_match(
+                        storage,
+                        from,
+                        txid,
+                        where_clause,
+                        arena,
+                        params,
+                        &context,
+                        None,
+                        arena,
+                    )? {
+                        Some(joined) => {
+                            images.push_joined(row, joined)?;
+                            true
+                        }
+                        None => false,
+                    }
+                } else {
+                    super::query::first_from_match(
+                        storage,
+                        from,
+                        txid,
+                        where_clause,
+                        &[],
+                        arena,
+                        params,
+                        &context,
+                        &mut |_| Ok(()),
+                        None,
+                        None,
+                    )?
+                };
+                if matched {
+                    scratch.push(row).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement row selection: {}",
+                            error
+                        )
+                    })?;
                 }
                 Ok(())
             },
@@ -89060,6 +89257,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                 // Consume-in-place, as in row_matches: the joined-row probe reads
                 // this row's values only while it runs.
                 let snapshot = loc.snapshot();
+                let mut joined = None;
                 let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
                     let mark = arena.mark();
                     let found = (|| -> Result<bool, SqlError> {
@@ -89079,19 +89277,34 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                         {
                             return Ok(false);
                         }
-                        super::query::first_from_match(
-                            storage,
-                            from,
-                            txid,
-                            where_clause,
-                            &[],
-                            arena,
-                            params,
-                            &context,
-                            &mut |_| Ok(()),
-                            None,
-                            None,
-                        )
+                        if capture.retains_joined() {
+                            joined = super::query::joined_from_match(
+                                storage,
+                                from,
+                                txid,
+                                where_clause,
+                                arena,
+                                params,
+                                &context,
+                                None,
+                                arena,
+                            )?;
+                            Ok(joined.is_some())
+                        } else {
+                            super::query::first_from_match(
+                                storage,
+                                from,
+                                txid,
+                                where_clause,
+                                &[],
+                                arena,
+                                params,
+                                &context,
+                                &mut |_| Ok(()),
+                                None,
+                                None,
+                            )
+                        }
                     })();
                     // SAFETY: joined predicates retain no decoded values or front scratch.
                     unsafe { arena.rewind_to(mark) };
@@ -89108,15 +89321,17 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                     if let MatchedDmlRow::Bytes(bytes) = image {
                         images.push(leaf, rowid, bytes)?;
                     }
-                    scratch
-                        .push(PhysicalRow::local(leaf, rowid, snapshot))
-                        .map_err(|error| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement row selection: {}",
-                                error
-                            )
-                        })?;
+                    let row = PhysicalRow::local(leaf, rowid, snapshot);
+                    if let Some(joined) = joined {
+                        images.push_joined(row, joined)?;
+                    }
+                    scratch.push(row).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement row selection: {}",
+                            error
+                        )
+                    })?;
                 }
                 Ok(ControlFlow::Continue(()))
             },
@@ -89181,31 +89396,51 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                     row: &context,
                     outer,
                 };
-                if super::query::first_from_match(
-                    storage,
-                    from,
-                    txid,
-                    where_clause,
-                    &[],
-                    arena,
-                    params,
-                    &scope,
-                    &mut |_| Ok(()),
-                    None,
-                    None,
-                )? {
-                    scratch
-                        .push(PhysicalRow::Foreign {
-                            table_index,
-                            tuple_id,
-                        })
-                        .map_err(|error| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement row selection: {}",
-                                error
-                            )
-                        })?;
+                let row = PhysicalRow::Foreign {
+                    table_index,
+                    tuple_id,
+                };
+                let matched = if capture.retains_joined() {
+                    match super::query::joined_from_match(
+                        storage,
+                        from,
+                        txid,
+                        where_clause,
+                        arena,
+                        params,
+                        &scope,
+                        None,
+                        arena,
+                    )? {
+                        Some(joined) => {
+                            images.push_joined(row, joined)?;
+                            true
+                        }
+                        None => false,
+                    }
+                } else {
+                    super::query::first_from_match(
+                        storage,
+                        from,
+                        txid,
+                        where_clause,
+                        &[],
+                        arena,
+                        params,
+                        &scope,
+                        &mut |_| Ok(()),
+                        None,
+                        None,
+                    )?
+                };
+                if matched {
+                    scratch.push(row).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement row selection: {}",
+                            error
+                        )
+                    })?;
                 }
                 Ok(())
             },
@@ -89229,6 +89464,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                 };
                 storage.record_relation_tuple_read(txid, leaf, None)?;
                 let snapshot = loc.snapshot();
+                let mut joined = None;
                 let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
                     let mark = arena.mark();
                     let found = (|| -> Result<bool, SqlError> {
@@ -89252,19 +89488,34 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                             row: &context,
                             outer,
                         };
-                        super::query::first_from_match(
-                            storage,
-                            from,
-                            txid,
-                            where_clause,
-                            &[],
-                            arena,
-                            params,
-                            &scope,
-                            &mut |_| Ok(()),
-                            None,
-                            None,
-                        )
+                        if capture.retains_joined() {
+                            joined = super::query::joined_from_match(
+                                storage,
+                                from,
+                                txid,
+                                where_clause,
+                                arena,
+                                params,
+                                &scope,
+                                None,
+                                arena,
+                            )?;
+                            Ok(joined.is_some())
+                        } else {
+                            super::query::first_from_match(
+                                storage,
+                                from,
+                                txid,
+                                where_clause,
+                                &[],
+                                arena,
+                                params,
+                                &scope,
+                                &mut |_| Ok(()),
+                                None,
+                                None,
+                            )
+                        }
                     })();
                     // SAFETY: joined predicates retain no decoded values or front scratch.
                     unsafe { arena.rewind_to(mark) };
@@ -89281,15 +89532,17 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                     if let MatchedDmlRow::Bytes(bytes) = image {
                         images.push(leaf, rowid, bytes)?;
                     }
-                    scratch
-                        .push(PhysicalRow::local(leaf, rowid, snapshot))
-                        .map_err(|error| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement row selection: {}",
-                                error
-                            )
-                        })?;
+                    let row = PhysicalRow::local(leaf, rowid, snapshot);
+                    if let Some(joined) = joined {
+                        images.push_joined(row, joined)?;
+                    }
+                    scratch.push(row).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement row selection: {}",
+                            error
+                        )
+                    })?;
                 }
                 Ok(ControlFlow::Continue(()))
             },
@@ -92880,4 +93133,407 @@ mod tests {
             assert_eq!(error.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
         }
     }
+}
+
+/// Where a data-modifying statement's `FROM`, `USING` or `MERGE` source item
+/// referred to its target, which PostgreSQL does not let those items see.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetReference {
+    /// A function source or `LATERAL` subquery of `UPDATE`/`DELETE`
+    /// (`check_lateral_ref_ok`: `42P10` with a hint).
+    Lateral,
+    /// Any other item (`errorMissingRTE`: `42P01` with a detail).
+    Hidden,
+}
+
+/// Rejects a `FROM`/`USING`/`MERGE` source item that names the target, as
+/// PostgreSQL's parse analysis does before reading any row:
+/// `UPDATE orders o SET total = 0 FROM generate_series(1, o.n) g` fails with
+/// `42P10`. `exposed` is the target's alias or table name; `merge` marks a
+/// `MERGE` source, whose items are never lateral to the target.
+/// [`reject_target_references`] for a data-modifying statement, before its
+/// planner inputs are analysed.
+pub(crate) fn reject_dml_target_references(
+    storage: &Storage,
+    txid: u32,
+    statement: &Stmt<'_>,
+) -> Result<(), SqlError> {
+    match statement {
+        Stmt::Update(update) => reject_target_references_of(
+            storage,
+            txid,
+            &update.table,
+            update.from,
+            update.alias.unwrap_or(update.table.name),
+            false,
+        ),
+        Stmt::Delete(delete) => reject_target_references_of(
+            storage,
+            txid,
+            &delete.table,
+            delete.using,
+            delete.alias.unwrap_or(delete.table.name),
+            false,
+        ),
+        Stmt::Merge(merge) => reject_target_references_of(
+            storage,
+            txid,
+            &crate::sql::ast::QualName {
+                schema: merge.target.schema,
+                name: merge.target.name,
+            },
+            Some(&crate::sql::ast::FromClause {
+                base: merge.source,
+                joins: &[],
+            }),
+            merge.target_alias.unwrap_or(merge.target.name),
+            true,
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn reject_target_references_of(
+    storage: &Storage,
+    txid: u32,
+    target: &crate::sql::ast::QualName<'_>,
+    from: Option<&crate::sql::ast::FromClause<'_>>,
+    exposed: &str,
+    merge: bool,
+) -> Result<(), SqlError> {
+    let Some(from) = from else {
+        return Ok(());
+    };
+    // A view target (written through rules or INSTEAD OF triggers) has no
+    // table definition here; its qualified references are still checked,
+    // and unqualified argument columns resolve where the view is expanded.
+    let Ok(table) = resolve_dml_table(storage, target, txid) else {
+        return reject_target_references(storage, txid, from, exposed, &[], merge);
+    };
+    let def = storage.table_def(table, txid);
+    let mut names = [""; MAX_COLUMNS];
+    for (name, column) in names.iter_mut().zip(def.columns()) {
+        *name = column.name.as_str();
+    }
+    reject_target_references(storage, txid, from, exposed, &names[..def.n_columns], merge)
+}
+
+/// Whether `table` may have a column `name`. Only an ordinary relation's
+/// columns are known here; any other item may.
+fn item_may_answer(
+    storage: &Storage,
+    txid: u32,
+    table: &crate::sql::ast::TableRef<'_>,
+    name: &str,
+) -> bool {
+    if table.subquery.is_some() || table.is_function_source() || table.cte.is_some() {
+        return true;
+    }
+    let relation = crate::sql::ast::QualName {
+        schema: table.schema,
+        name: table.table,
+    };
+    match resolve_dml_table(storage, &relation, txid) {
+        Ok(index) => storage.table_def(index, txid).column_index(name).is_some(),
+        Err(_) => true,
+    }
+}
+
+fn from_may_answer(
+    storage: &Storage,
+    txid: u32,
+    from: &crate::sql::ast::FromClause<'_>,
+    name: &str,
+) -> bool {
+    core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .any(|table| item_may_answer(storage, txid, table, name))
+}
+
+fn reject_target_references(
+    storage: &Storage,
+    txid: u32,
+    from: &crate::sql::ast::FromClause<'_>,
+    exposed: &str,
+    target_columns: &[&str],
+    merge: bool,
+) -> Result<(), SqlError> {
+    for (index, table) in core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .enumerate()
+    {
+        let lateral = !merge && (table.lateral || table.is_function_source());
+        let kind = if lateral {
+            TargetReference::Lateral
+        } else {
+            TargetReference::Hidden
+        };
+        let mut found = None;
+        if let Some(arguments) = table.func_args {
+            for argument in arguments {
+                found = found.or(expression_names_target(argument, exposed, &mut |name| {
+                    // An unqualified argument column the items to its left
+                    // cannot answer is the target's.
+                    !merge
+                        && target_columns.contains(&name)
+                        && !left_may_answer(storage, txid, from, index, name)
+                }));
+            }
+        }
+        if let Some(rows_from) = table.rows_from {
+            for function in rows_from {
+                for argument in function.func_args.unwrap_or(&[]) {
+                    found = found.or(expression_names_target(argument, exposed, &mut |_| false));
+                }
+            }
+        }
+        let mut hidden_column = None;
+        if let Some(select) = table.subquery {
+            found = found.or(select_names_target(
+                select,
+                exposed,
+                &mut |inner: &Select<'_>, name| {
+                    // An unqualified column that the body's own FROM does not
+                    // answer is the target's when a LATERAL body cannot find it
+                    // in the items to its left either. Any other body cannot
+                    // see the target (`errorMissingColumn`).
+                    if !target_columns.contains(&name)
+                        || inner.from.is_some_and(|inner_from| {
+                            from_may_answer(storage, txid, &inner_from, name)
+                        })
+                    {
+                        return false;
+                    }
+                    if !lateral {
+                        hidden_column.get_or_insert_with(|| hidden_column_error(exposed, name));
+                        return false;
+                    }
+                    !left_may_answer(storage, txid, from, index, name)
+                },
+            ));
+        }
+        if let Some(error) = hidden_column {
+            return Err(error);
+        }
+        if index > 0
+            && let Some(condition) = from.joins[index - 1].on
+            && let Some(reference) = expression_names_target(condition, exposed, &mut |_| false)
+        {
+            return Err(target_reference_error(
+                exposed,
+                reference,
+                TargetReference::Hidden,
+            ));
+        }
+        if let Some(reference) = found {
+            return Err(target_reference_error(exposed, reference, kind));
+        }
+    }
+    Ok(())
+}
+
+/// Whether an item left of `index` in `from` may have a column `name`.
+fn left_may_answer(
+    storage: &Storage,
+    txid: u32,
+    from: &crate::sql::ast::FromClause<'_>,
+    index: usize,
+    name: &str,
+) -> bool {
+    core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .take(index)
+        .any(|table| item_may_answer(storage, txid, table, name))
+}
+
+/// PostgreSQL's `errorMissingColumn` for an unqualified column of the target
+/// that a FROM item's body names but cannot see.
+fn hidden_column_error(exposed: &str, name: &str) -> SqlError {
+    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+        detail: Some(crate::stack_format!(
+            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+            "There is a column named \"{}\" in table \"{}\", but it cannot be referenced from this part of the query.",
+            name,
+            exposed
+        )),
+        hint: None,
+        objects: crate::sql::eval::ErrorObjects::default(),
+    });
+    crate::sql::error_position::column_reference(
+        sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" does not exist",
+            name
+        ),
+        None,
+        name,
+    )
+}
+
+/// `reference` is the qualifier or column in the statement text that names
+/// the target, where PostgreSQL places the error's cursor.
+fn target_reference_error(exposed: &str, reference: &str, kind: TargetReference) -> SqlError {
+    let explanation = crate::stack_format!(
+        crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+        "There is an entry for table \"{}\", but it cannot be referenced from this part of the query.",
+        exposed
+    );
+    let (state, detail, hint) = match kind {
+        TargetReference::Lateral => (sqlstate::INVALID_COLUMN_REFERENCE, None, Some(explanation)),
+        TargetReference::Hidden => (sqlstate::UNDEFINED_TABLE, Some(explanation), None),
+    };
+    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+        detail,
+        hint,
+        objects: crate::sql::eval::ErrorObjects::default(),
+    });
+    crate::sql::error_position::at_reference(
+        sql_err!(
+            state,
+            "invalid reference to FROM-clause entry for table \"{}\"",
+            exposed
+        ),
+        reference,
+    )
+}
+
+/// The qualifier or column through which `select` refers to `exposed`, when
+/// its own `FROM` does not answer it.
+fn select_names_target<'a>(
+    select: &Select<'a>,
+    exposed: &str,
+    unqualified: &mut dyn FnMut(&Select<'_>, &str) -> bool,
+) -> Option<&'a str> {
+    let shadows = |table: &crate::sql::ast::TableRef<'_>| {
+        table
+            .alias
+            .unwrap_or(table.table)
+            .eq_ignore_ascii_case(exposed)
+    };
+    if select.from.is_some_and(|from| {
+        shadows(&from.base) || from.joins.iter().any(|join| shadows(&join.table))
+    }) {
+        return None;
+    }
+    let mut names = |expression: &Expr<'a>| {
+        expression_names_target(expression, exposed, &mut |name| unqualified(select, name))
+    };
+    let mut found = None;
+    if let Some(from) = select.from {
+        for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+            found = found
+                .or_else(|| {
+                    table
+                        .subquery
+                        .and_then(|query| select_names_target(query, exposed, &mut |_, _| false))
+                })
+                .or_else(|| {
+                    table
+                        .func_args
+                        .and_then(|arguments| arguments.iter().find_map(|argument| names(argument)))
+                });
+        }
+        for join in from.joins {
+            found = found.or_else(|| join.on.and_then(&mut names));
+        }
+    }
+    for item in select.items {
+        found = found.or_else(|| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                names(expression)
+            }
+            SelectItem::Wildcard(_) => None,
+            SelectItem::TableWildcard(qualifier) => qualifier
+                .eq_ignore_ascii_case(exposed)
+                .then_some(*qualifier),
+        });
+    }
+    found
+        .or_else(|| select.where_clause.and_then(&mut names))
+        .or_else(|| select.having.and_then(&mut names))
+        .or_else(|| {
+            select
+                .group_by
+                .iter()
+                .find_map(|expression| names(expression))
+        })
+        .or_else(|| {
+            select
+                .distinct_on
+                .iter()
+                .find_map(|expression| names(expression))
+        })
+        .or_else(|| {
+            select
+                .order_by
+                .iter()
+                .find_map(|order| names(order.expression))
+        })
+        .or_else(|| select.limit.and_then(&mut names))
+        .or_else(|| select.offset.and_then(&mut names))
+        .or_else(|| {
+            select
+                .set_body
+                .and_then(|tree| set_tree_names_target(tree, exposed))
+        })
+}
+
+fn set_tree_names_target<'a>(
+    tree: &crate::sql::ast::SetTree<'a>,
+    exposed: &str,
+) -> Option<&'a str> {
+    match tree {
+        crate::sql::ast::SetTree::Select(select) => {
+            select_names_target(select, exposed, &mut |_, _| false)
+        }
+        crate::sql::ast::SetTree::Op { left, right, .. } => {
+            set_tree_names_target(left, exposed).or_else(|| set_tree_names_target(right, exposed))
+        }
+    }
+}
+
+/// The qualifier or column through which `expression` refers to `exposed`:
+/// a column it qualifies, or an unqualified column `unqualified` assigns to
+/// the target.
+fn expression_names_target<'a>(
+    expression: &Expr<'a>,
+    exposed: &str,
+    unqualified: &mut dyn FnMut(&str) -> bool,
+) -> Option<&'a str> {
+    match expression {
+        Expr::Column {
+            qualifier: Some(qualifier),
+            ..
+        } => {
+            return qualifier
+                .eq_ignore_ascii_case(exposed)
+                .then_some(*qualifier);
+        }
+        Expr::Column {
+            qualifier: None,
+            name,
+        } => return unqualified(name).then_some(*name),
+        Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::RowSubquery { select, .. } => {
+            return select_names_target(select, exposed, &mut |_, _| false);
+        }
+        Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
+        } => {
+            return expression_names_target(operand, exposed, unqualified)
+                .or_else(|| select_names_target(select, exposed, &mut |_, _| false));
+        }
+        _ => {}
+    }
+    let mut found = None;
+    let _ = super::query::walk_children(expression, &mut |child| {
+        found = found.or_else(|| expression_names_target(child, exposed, unqualified));
+        Ok(())
+    });
+    found
 }

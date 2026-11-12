@@ -3323,11 +3323,37 @@ impl<'d> QueryScope<'d> {
                     ),
                 )
             }
-            None => sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "missing FROM-clause entry for table \"{}\"",
-                name
-            ),
+            // A table named by its relation name while an alias hides it.
+            None => match (0..self.n).find(|&index| {
+                self.derived[index].is_none()
+                    && self.names[index] != name
+                    && self
+                        .defs
+                        .get(index)
+                        .is_some_and(|definition| definition.name.as_str() == name)
+            }) {
+                Some(aliased) => {
+                    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+                        detail: None,
+                        hint: Some(crate::stack_format!(
+                            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+                            "Perhaps you meant to reference the table alias \"{}\".",
+                            self.names[aliased]
+                        )),
+                        objects: crate::sql::eval::ErrorObjects::default(),
+                    });
+                    sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "invalid reference to FROM-clause entry for table \"{}\"",
+                        name
+                    )
+                }
+                None => sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    name
+                ),
+            },
         })
     }
 
@@ -3431,6 +3457,49 @@ impl<'d> QueryScope<'d> {
     }
 
     fn find_column_unpositioned(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_relation_column(qualifier, name).map_err(|error| {
+            if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                && self.names_system_column(qualifier, name)
+            {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "system column \"{}\" is not supported",
+                    name
+                )
+            } else {
+                error
+            }
+        })
+    }
+
+    /// Whether `name` is a PostgreSQL system column of a relation the
+    /// reference can name: a table, foreign table or catalog, but not a view,
+    /// subquery or function. Only a catalog's `tableoid` is exposed.
+    fn names_system_column(&self, qualifier: Option<&str>, name: &str) -> bool {
+        if !crate::storage::SYSTEM_COLUMN_NAMES.contains(&name) {
+            return false;
+        }
+        let has_system_columns = |table: usize| {
+            self.derived[table].is_none()
+                || matches!(
+                    self.defs.sources[table],
+                    Some(ScopeDefinition::Relation { .. })
+                )
+        };
+        match qualifier {
+            Some(qualifier) if self.using_alias(qualifier).is_some() => false,
+            Some(qualifier) => self
+                .source(qualifier)
+                .is_ok_and(|source| has_system_columns(source.table)),
+            None => (0..self.n).any(has_system_columns),
+        }
+    }
+
+    fn find_relation_column(
         &self,
         qualifier: Option<&str>,
         name: &str,

@@ -51,9 +51,27 @@ pub(crate) fn lock_selected_row(
         match storage.recheck_locked_row(table, rowid, txid, seen.row_version())? {
             LockedRowRecheck::Unchanged | LockedRowRecheck::OwnChange => LockedVersion::Selected,
             LockedRowRecheck::Deleted => LockedVersion::Deleted,
+            LockedRowRecheck::MovedOut => {
+                return Err(moved_out(storage.keeps_transaction_snapshot(txid)));
+            }
             LockedRowRecheck::Updated(home) => LockedVersion::Updated(home),
         },
     ))
+}
+
+/// PostgreSQL's `40001` for a selected row another transaction moved to a
+/// different partition. Read committed cannot follow the row into its new
+/// partition (`heapam_tuple_lock`); repeatable read and serializable report
+/// the move as an update, whichever statement locked the row.
+pub(crate) fn moved_out(repeatable: bool) -> SqlError {
+    if repeatable {
+        concurrent_change(false)
+    } else {
+        sql_err!(
+            sqlstate::SERIALIZATION_FAILURE,
+            "tuple to be locked was already moved to another partition due to concurrent update"
+        )
+    }
 }
 
 /// Whether a transaction keeps one snapshot, so a concurrent change to a row

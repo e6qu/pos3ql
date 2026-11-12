@@ -100,10 +100,20 @@ happens once. An effect a rerun would not repeat identically (a volatile
 built-in such as `random()`, an advisory lock, output that reached the
 client) makes the rest of its row read synchronously; one before the rows,
 in the scan, would select different rows, so such a write reads its rows
-synchronously and a lock wait runs it again from its first start. Reads
-after a write's last row block until the next step's rows start
-(statement-level and `AFTER` triggers, the next step's selection). A wait inside a routine body run for a row keeps the body's progress
-and continues it. Cancellation, a statement or lock timeout, an error and
+synchronously and a lock wait runs it again from its first start. A wait inside a routine body run for a row keeps the body's progress
+and continues it.
+
+**Work after a write's last row resumes too.** A top-level `INSERT`,
+`UPDATE`, `DELETE` or `MERGE` keeps its finished `AFTER` work across a
+wait: queued `AFTER ROW` events, then the transaction's immediate
+constraint checks (deferrable foreign key, unique and exclusion
+constraints in `IMMEDIATE` mode), then `AFTER STATEMENT` triggers. An event
+stays selected until it completes. A wait inside a PL/pgSQL trigger body
+keeps the body and continues at its waiting statement; a wait before the
+body starts runs the same event again, replaying its sequence values from
+the event's start. Each event's reads yield until its own first effect
+(a write, sequence call or routine call in its body), after which the rest
+of that event reads synchronously; the next event yields again. Cancellation, a statement or lock timeout, an error and
 the end of the transaction release the kept progress.
 
 **Routine calls keep a write's changed rows.** A row expression, row trigger
@@ -296,7 +306,9 @@ BY id` sorts first, so its output queues in the spool instead.
 | Result streams (see above), including `COPY ... TO STDOUT` and a streamed `FETCH`: each row before its first effect | Yields; delivered rows are kept |
 | Writes (`INSERT ... SELECT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`), also in a `CALL` or `DO` body: selecting and locking rows before the first row change, `VALUES` row or trigger body | Yields; the statement restarts from its start (see above) |
 | Writes after their first row change, also in a `CALL` or `DO` body: each row's index maintenance, constraint checks, trigger bodies and `RETURNING`, until an effect a rerun would not repeat identically | Yields; only the unfinished row rolls back (see above) |
-| A write's row after an effect a rerun would not repeat, or every row when such an effect ran in its scan; reads after a write's last row (statement-level and `AFTER` triggers, the next step's selection) | Blocks until the next step's rows or the statement's end |
+| A write's row after an effect a rerun would not repeat, or every row when such an effect ran in its scan | Blocks until the next step's rows or the statement's end |
+| A top-level write's `AFTER ROW` events, immediate constraint checks and `AFTER STATEMENT` triggers | Yields; finished events are kept (see above). An event's reads after its first effect block until that event ends |
+| The next step's row selection in a multi-step write; `AFTER` triggers between the steps of a rule-rewritten write, and `AFTER` work of writes inside routine bodies | Blocks until the next step's rows or that work ends |
 | Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, rule actions, `INSTEAD OF` view triggers): row expressions, row triggers, `RETURNING`; `BEFORE` and `INSTEAD OF` trigger bodies that need the engine | Run on the engine between attempts; the write keeps its changed rows and finished steps and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
 | DDL and `COPY FROM` | Blocks for the whole statement |
 | Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |

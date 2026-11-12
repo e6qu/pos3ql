@@ -6175,6 +6175,7 @@ impl Engine {
                                     rowid,
                                     old_row: Some(old_row),
                                     command_id: p.cid,
+                                    moved_out: p.moved_out,
                                 },
                             )
                         })
@@ -10054,6 +10055,7 @@ impl Engine {
                             obligation.rowid,
                             txn.txid,
                             txn.isolation,
+                            self.storage.validation_read(),
                             arena,
                         ) {
                             return Ok(Err(error));
@@ -13190,7 +13192,10 @@ impl Engine {
                                         }
                                         self.storage.preserve_advisory_statement();
                                         self.rollback_waiting_statement(txn, statement_mark);
-                                        if !lock_timeout_expired {
+                                        // The statement runs again from its start, so
+                                        // its earlier attempt's output is withdrawn.
+                                        let withdrawn = responder.truncate_to(output_mark);
+                                        if withdrawn.is_ok() && !lock_timeout_expired {
                                             return Ok(ExtendedExecutionStatus::Blocked {
                                                 wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
                                                     StatementWait::ObjectIo
@@ -13201,10 +13206,12 @@ impl Engine {
                                         }
                                         self.storage
                                             .rollback_locks_to(txn.txid, statement_mark.lock);
-                                        e = sql_err!(
-                                            sqlstate::LOCK_NOT_AVAILABLE,
-                                            "canceling statement due to lock timeout"
-                                        );
+                                        e = withdrawn.err().unwrap_or_else(|| {
+                                            sql_err!(
+                                                sqlstate::LOCK_NOT_AVAILABLE,
+                                                "canceling statement due to lock timeout"
+                                            )
+                                        });
                                     } else {
                                         txn.procedure_restart = false;
                                         e = sql_err!(
@@ -16969,6 +16976,7 @@ impl Engine {
                 command: txn.command_id(),
                 depth: txn.trigger_depth(),
                 retained: true,
+                statement_end: true,
             });
             let prior_handoff = core::mem::replace(&mut txn.write_completion_boundary, boundary);
             let outcome = {
@@ -19080,6 +19088,7 @@ impl Engine {
                     rowid,
                     old_row: None,
                     command_id: pending.cid,
+                    moved_out: pending.moved_out,
                 },
             };
             records = records.saturating_add(1);
@@ -20675,6 +20684,11 @@ impl Engine {
                 | Stmt::Delete(_)
                 | Stmt::Merge(_)
         ) {
+            if let Err(error) =
+                exec::reject_dml_target_references(&self.storage, txn.txid, statement)
+            {
+                return Ok(Err(error));
+            }
             let planned = planner_inputs::with_parameters(Some(params), || {
                 self.prepare_planner_inputs(
                     statement, None, arena, txn, sqlprep, cursors, guc, responder,
@@ -27746,6 +27760,7 @@ fn replay_transaction_batches(
                             table,
                             rowid,
                             command_id,
+                            moved_out,
                             ..
                         } => {
                             let Some(table_slot) =
@@ -27756,14 +27771,25 @@ fn replay_transaction_batches(
                             let row_target = storage
                                 .select_table_definition(table_slot, transaction_id)
                                 .0;
-                            prepared.slot_mut(slot).transaction.write_row(
-                                storage,
-                                row_target,
-                                rowid,
-                                command_id,
-                                None,
-                                crate::storage::RowWriteStatistics::Untracked,
-                            )?;
+                            let transaction = &mut prepared.slot_mut(slot).transaction;
+                            if moved_out {
+                                transaction.move_row_out(
+                                    storage,
+                                    row_target,
+                                    rowid,
+                                    command_id,
+                                    crate::storage::RowWriteStatistics::Untracked,
+                                )?;
+                            } else {
+                                transaction.write_row(
+                                    storage,
+                                    row_target,
+                                    rowid,
+                                    command_id,
+                                    None,
+                                    crate::storage::RowWriteStatistics::Untracked,
+                                )?;
+                            }
                         }
                         WalOp::SequenceAdvance {
                             identity,
@@ -28773,12 +28799,13 @@ fn apply_wal_op(
             };
             let loc = storage.heap.append_bytes(row)?;
             storage.observe_rowid(rowid);
-            storage.replay_committed_row(index, rowid, Some(loc), lsn)?;
+            storage.replay_committed_row(index, rowid, Some(loc), false, lsn)?;
         }
         WalOp::Delete {
             schema,
             table,
             rowid,
+            moved_out,
             ..
         } => {
             let Some(index) = storage.wal_table_slot(schema, table, 0) else {
@@ -28787,7 +28814,7 @@ fn apply_wal_op(
                     message: stack_format!(192, "journal deletes from unknown table \"{}\"", table),
                 });
             };
-            storage.replay_committed_row(index, rowid, None, lsn)?;
+            storage.replay_committed_row(index, rowid, None, moved_out, lsn)?;
         }
         WalOp::CreateView {
             identity,

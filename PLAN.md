@@ -129,11 +129,26 @@ is owned.
   `DO` bodies (see the
   [execution model](docs/architecture.md#execution-model)). Remaining: a
   write whose scan ran a volatile built-in reads its rows synchronously.
-  Reads after a write's last row (statement-level and `AFTER` triggers,
-  foreign key checks queued as constraint events, transition tables, the
-  next step's selection) read synchronously. The write completion already
-  runs an event that waited again instead of skipping it; those reads still
-  need to leave the statement's effect protection so they can wait.
+  A top-level write's `AFTER` events and immediate constraint checks
+  yield; reads after an event's first effect block until that event ends,
+  so a trigger body that writes and then reads cold data still blocks.
+  The next step's selection in a multi-step write, `AFTER` triggers between
+  the steps of a rule-rewritten write, and `AFTER` work of writes inside
+  routine bodies read synchronously. Letting the next step's selection
+  yield and roll back to the step's start is not enough: with empty caches
+  each retried selection issued a new GET and never finished (a rule action
+  joining a cold table), so the step must keep the blocks it downloaded
+  across its attempts. Deferrable foreign key checks in `IMMEDIATE` mode run
+  after all of the statement's `AFTER ROW` triggers, where PostgreSQL runs
+  them among each row's triggers in name order, so a failing check can
+  follow notices and writes PostgreSQL never reaches. A non-deferrable
+  foreign key is checked as each row is written, where PostgreSQL checks it
+  in that same AFTER order at the statement's end: `INSERT INTO tree VALUES
+  (2, 1), (1, NULL)` on a self-referencing table, or a row whose parent an
+  `AFTER` trigger inserts, fails with `23503` where PostgreSQL succeeds.
+  Queuing every check as an AFTER event needs an event queue that spills,
+  because the fixed deferred-constraint capacity would otherwise limit how
+  many rows one statement may write.
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written
@@ -476,7 +491,9 @@ the expression in `CONTEXT`. Selecting a field of a named composite cast to
 `record` (`(ROW(1, 2)::t::record).id`) fails as an unknown field. Reading a
 field of a NULL `record` parameter names the expression in `CONTEXT`, which
 PostgreSQL omits because it raises the error while evaluating, not planning.
-COPY to or from a server file or program,
+A user table's `tableoid` system column fails with `0A000`
+(`SELECT tableoid::regclass FROM partitioned` names no partition); catalogs
+expose it. COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
 A view
@@ -512,13 +529,22 @@ expression (`PARTITION BY LIST ((k + v))`, `PARTITION BY RANGE (lower(a))`)
 fails with `0A000`; PostgreSQL routes rows by the evaluated key and lists it
 in `pg_partitioned_table.partexprs`. A table's or view's row type cannot
 appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
-where PostgreSQL accepts it. Under `READ COMMITTED`, a locked row's recheck runs a correlated `EXISTS
-(subquery)` again, where PostgreSQL's semi-join recheck keeps the subquery row
-it first matched (which row depends on its join plan), and a row another transaction moved to a different partition is
-skipped where PostgreSQL fails with `40001` (`tuple to be locked was already
-moved to another partition due to concurrent update`); storage does not yet
-mark a version deleted by a partition move. A query with a `LATERAL` source
-fails that recheck with `0A000` instead of running the source again. The
+where PostgreSQL accepts it. Under `READ COMMITTED`, a locked row's recheck
+fails with `0A000` for a simple `LATERAL` subquery that reads tables when
+several of its source rows produced the values the statement read but
+recheck differently, or when it is a `UNION ALL` branch that reads tables
+(PostgreSQL keeps the rows it first joined). `RETURNING`
+of `UPDATE ... FROM` and `DELETE ... USING` cannot read the `FROM`/`USING`
+items (`42P01`; `RETURNING *` fails with `0A000`). A parameter used inside a
+`FROM` subquery of `PREPARE` (`PREPARE p AS SELECT * FROM (SELECT 1 + $1) s`)
+is typed `text` before the subquery is described, so the statement fails
+with `42883`. Joins run left to right over the whole FROM list, so a `RIGHT`
+or `FULL` join after a comma-separated item fails with `0A000`, and a join
+condition naming an item before the comma is accepted where PostgreSQL
+fails with `42P01`; both need nested join trees. A subquery's `t.*` naming an
+enclosing query's item (`FROM t, LATERAL (SELECT t.*) s`, `SELECT (SELECT
+t.*) FROM t`) fails with `42601` or `42P01`; PostgreSQL expands the outer
+row's columns. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

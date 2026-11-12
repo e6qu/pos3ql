@@ -232,6 +232,7 @@ fn for_each_materialized_projection<'a>(
             base,
             statement.where_clause,
             row,
+            outer,
             storage,
             txid,
             arena,
@@ -251,7 +252,7 @@ fn for_each_materialized_projection<'a>(
         row_subqueries = merge_correlated(
             correlated,
             base,
-            row,
+            &Chained { inner: row, outer },
             storage,
             txid,
             arena,

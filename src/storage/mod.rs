@@ -9608,7 +9608,11 @@ impl RoutineAttributes {
         rows_bits: None,
     };
 
-    pub(crate) const AGGREGATE: Self = Self::DEFAULT;
+    /// PostgreSQL's AggregateCreate records every aggregate as immutable.
+    pub(crate) const AGGREGATE: Self = Self {
+        volatility: RoutineVolatility::Immutable,
+        ..Self::DEFAULT
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

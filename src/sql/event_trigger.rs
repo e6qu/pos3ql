@@ -502,6 +502,8 @@ enum ObjectRef {
     Role(usize),
     AccessMethod(i32),
     ProceduralLanguage(i32),
+    /// The plpgsql extension initdb installs; it has no stored slot.
+    BuiltinExtension,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2377,6 +2379,15 @@ fn primary_object(
                 false,
             )
         }
+        ObjectRef::BuiltinExtension => base_object(
+            catalog::PG_EXTENSION_OID,
+            catalog::PLPGSQL_EXTENSION_OID,
+            "extension",
+            None,
+            Some("plpgsql"),
+            StackStr::from_str("plpgsql"),
+            false,
+        ),
         ObjectRef::ProceduralLanguage(oid) => {
             let name = catalog::procedural_language_name(oid).ok_or_else(graph_full)?;
             base_object(
@@ -3222,6 +3233,9 @@ fn existing_catalog_object(
                 .find_map(|(slot, subscription)| (subscription.oid() == object_id).then_some(slot))
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
+        catalog::PG_EXTENSION_OID if object_id == catalog::PLPGSQL_EXTENSION_OID => {
+            EventObjectRef::Primary(ObjectRef::BuiltinExtension)
+        }
         catalog::PG_EXTENSION_OID => EventObjectRef::Primary(ObjectRef::Extension(
             storage
                 .extensions_visible_to(txid)

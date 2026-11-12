@@ -4,7 +4,6 @@
 pub mod acl;
 pub mod array;
 pub mod ast;
-mod brin_catalog;
 pub mod catalog;
 mod catalog_image;
 mod catalog_metadata;
@@ -19720,6 +19719,32 @@ impl Engine {
             Stmt::CreateExtension {
                 name,
                 if_not_exists,
+                ..
+            } if *name == BUILTIN_EXTENSION => {
+                if !*if_not_exists {
+                    return Ok(Err(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "extension \"{}\" already exists",
+                        name
+                    )));
+                }
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(128, "extension \"{}\" already exists, skipping", name).as_str(),
+                )?;
+                responder.command_complete("CREATE EXTENSION")?;
+                Ok(Ok(()))
+            }
+            Stmt::AlterExtension { name, .. }
+            | Stmt::AlterMaterializedViewExtensionDependency {
+                extension: name, ..
+            } if *name == BUILTIN_EXTENSION => Ok(Err(builtin_extension_change())),
+            Stmt::DropExtension { names, .. } if names.contains(&BUILTIN_EXTENSION) => {
+                Ok(Err(builtin_extension_change()))
+            }
+            Stmt::CreateExtension {
+                name,
+                if_not_exists,
                 schema,
                 version,
                 cascade,
@@ -29006,3 +29031,15 @@ mod tests;
 
 #[cfg(all(test, not(miri)))]
 pub(crate) use tests::object_reads::HttpObjectServer;
+
+/// The extension initdb installs; its members are built in, so it cannot be
+/// altered, dropped or commented on.
+pub(crate) const BUILTIN_EXTENSION: &str = "plpgsql";
+
+pub(crate) fn builtin_extension_change() -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "changing built-in extension \"{}\" is not supported",
+        BUILTIN_EXTENSION
+    )
+}

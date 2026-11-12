@@ -277,7 +277,17 @@ Functions and expressions:
   each built-in routine
   (`obj_description('lower(text)'::regprocedure)` is `lowercase`);
   `COMMENT ON FUNCTION` replaces it and `COMMENT ... IS NULL` removes it in
-  the current database. Changes survive restart and
+  the current database. Built-in schemas, languages, access methods, types,
+  operators and text search objects carry their shipped descriptions the same
+  way (`obj_description('public'::regnamespace, 'pg_namespace')` is
+  `standard public schema`), and so does the `plpgsql` extension that initdb
+  installs: it is listed in `pg_extension`, owns its language and handlers in
+  `pg_depend`, and psql's `\dx` and `\dx+` show it. `CREATE EXTENSION plpgsql`
+  reports that it already exists; altering, dropping or commenting on it fails
+  with `0A000`. `pg_available_extensions()` and
+  `pg_available_extension_versions()` run as table functions, and
+  `pg_relation_size`, `pg_total_relation_size` and `pg_indexes_size` report the
+  bytes of a relation's stored rows (indexes and sequences have none). Changes survive restart and
   are copied by `CREATE DATABASE ... TEMPLATE`. Each changed routine uses one
   of the `max_builtin_routine_entries` rows (default 64); running out fails
   with `54000`. A signature may name a pseudo-type, as in PostgreSQL:

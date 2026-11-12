@@ -159,7 +159,18 @@ const ACCESS_METHODS: [(&str, i32, i32, &str, &str); 7] = [
 const INTERNAL_LANGUAGE_OID: i32 = 12;
 const C_LANGUAGE_OID: i32 = 13;
 const SQL_LANGUAGE_OID: i32 = 14;
-const PLPGSQL_LANGUAGE_OID: i32 = 13_563;
+/// The `plpgsql` extension, language and handler OIDs of the PostgreSQL 18.6
+/// reference initdb whose routine rows `catalog_callable_signatures` records.
+pub(crate) const PLPGSQL_EXTENSION_OID: i32 = 14_049;
+const PLPGSQL_CALL_HANDLER_OID: i32 = 14_050;
+const PLPGSQL_INLINE_HANDLER_OID: i32 = 14_051;
+const PLPGSQL_VALIDATOR_OID: i32 = 14_052;
+pub(crate) const PLPGSQL_HANDLER_OIDS: [i32; 3] = [
+    PLPGSQL_CALL_HANDLER_OID,
+    PLPGSQL_INLINE_HANDLER_OID,
+    PLPGSQL_VALIDATOR_OID,
+];
+pub(crate) const PLPGSQL_LANGUAGE_OID: i32 = 14_053;
 /// `pg_proc.prolang` of a stored routine.
 pub(crate) const fn routine_language_oid(language: crate::storage::RoutineLanguage) -> i32 {
     match language {
@@ -257,6 +268,126 @@ macro_rules! intrinsic {
 mod callable_signatures;
 #[path = "catalog_routine_descriptions.rs"]
 mod routine_descriptions;
+
+#[path = "catalog_access_method_members.rs"]
+mod access_method_members;
+#[path = "catalog_object_descriptions.rs"]
+mod object_descriptions;
+
+/// The `pg_description` text PostgreSQL 18.6 ships for a built-in object of
+/// catalog `classoid` (any catalog when `None`; the lowest catalog OID wins, as
+/// one-argument `obj_description` reads the first matching row).
+pub(crate) fn builtin_object_description(
+    storage: &Storage,
+    txid: u32,
+    classoid: Option<i32>,
+    oid: i32,
+) -> Option<&'static str> {
+    let mut found: Option<(i32, &'static str)> = None;
+    let mut consider = |class: i32, description: &'static str| {
+        if classoid.is_none_or(|wanted| wanted == class)
+            && found.is_none_or(|(best, _)| class < best)
+        {
+            found = Some((class, description));
+        }
+    };
+    if let Some(description) = builtin_routine_description(oid) {
+        consider(PG_PROC_OID, description);
+    }
+    for &(class, object, description) in object_descriptions::OBJECT_DESCRIPTIONS {
+        if object == oid {
+            consider(class, description);
+        }
+    }
+    if classoid.is_none_or(|class| {
+        matches!(
+            class,
+            PG_TS_PARSER_OID | PG_TS_TEMPLATE_OID | PG_TS_DICT_OID | PG_TS_CONFIG_OID
+        )
+    }) {
+        for (_, object) in storage.text_search_objects_visible_to(txid) {
+            if let Some((class, object, description)) = builtin_text_search_description(&object)
+                && object == oid
+            {
+                consider(class, description);
+            }
+        }
+    }
+    found.map(|(_, description)| description)
+}
+
+/// Whether a comment target is a built-in object with a shipped description,
+/// which removing the comment must hide rather than restore.
+pub(crate) fn comment_target_has_shipped_description(
+    storage: &Storage,
+    txid: u32,
+    class: crate::storage::CommentClass,
+    schema: &str,
+    name: &str,
+    subid: u32,
+) -> bool {
+    use crate::storage::CommentClass;
+    let shipped = |classoid: i32, oid: Option<i32>| {
+        oid.is_some_and(|oid| {
+            object_descriptions::OBJECT_DESCRIPTIONS
+                .iter()
+                .any(|&(class, object, _)| class == classoid && object == oid)
+        })
+    };
+    let text_search = |classoid: i32| {
+        schema == "pg_catalog"
+            && object_descriptions::TEXT_SEARCH_DESCRIPTIONS
+                .binary_search_by(|&(class, candidate, _)| {
+                    (class, candidate).cmp(&(classoid, name))
+                })
+                .is_ok()
+    };
+    match class {
+        CommentClass::Routine => builtin_routine_description(subid as i32).is_some(),
+        CommentClass::Schema => shipped(PG_NAMESPACE_OID, Some(namespace_oid(storage, name, txid))),
+        CommentClass::Type => shipped(PG_TYPE_OID, type_oid_of(storage, schema, name, txid)),
+        CommentClass::Operator => shipped(PG_OPERATOR_OID, i32::try_from(subid).ok()),
+        CommentClass::AccessMethod => shipped(PG_AM_OID, i32::try_from(subid).ok()),
+        CommentClass::ProceduralLanguage => shipped(PG_LANGUAGE_OID, i32::try_from(subid).ok()),
+        CommentClass::TextSearchParser => text_search(PG_TS_PARSER_OID),
+        CommentClass::TextSearchTemplate => text_search(PG_TS_TEMPLATE_OID),
+        CommentClass::TextSearchDictionary => text_search(PG_TS_DICT_OID),
+        CommentClass::TextSearchConfiguration => text_search(PG_TS_CONFIG_OID),
+        _ => false,
+    }
+}
+
+/// The shipped description of a `pg_catalog` text search object, keyed by name
+/// because initdb numbers the snowball objects after the platform's collations.
+fn builtin_text_search_description(
+    object: &crate::storage::TextSearchDefinition,
+) -> Option<(i32, i32, &'static str)> {
+    use crate::storage::TextSearchDefinition;
+    let (classoid, schema, name, oid) = match object {
+        TextSearchDefinition::Parser {
+            schema, name, oid, ..
+        } => (PG_TS_PARSER_OID, schema, name, *oid),
+        TextSearchDefinition::Template {
+            schema, name, oid, ..
+        } => (PG_TS_TEMPLATE_OID, schema, name, *oid),
+        TextSearchDefinition::Dictionary {
+            schema, name, oid, ..
+        } => (PG_TS_DICT_OID, schema, name, *oid),
+        TextSearchDefinition::Configuration {
+            schema, name, oid, ..
+        } => (PG_TS_CONFIG_OID, schema, name, *oid),
+    };
+    if schema.as_str() != "pg_catalog" {
+        return None;
+    }
+    let descriptions = object_descriptions::TEXT_SEARCH_DESCRIPTIONS;
+    descriptions
+        .binary_search_by(|&(class, candidate, _)| {
+            (class, candidate).cmp(&(classoid, name.as_str()))
+        })
+        .ok()
+        .map(|index| (classoid, oid, descriptions[index].2))
+}
 
 /// The `pg_description` text PostgreSQL 18.6 ships for a built-in routine.
 pub(crate) fn builtin_routine_description(oid: i32) -> Option<&'static str> {
@@ -4497,12 +4628,16 @@ pub(crate) fn builtin_operator_of_procedure(procedure: i32) -> Option<(&'static 
         .or_else(|| {
             builtin_properties::OPERATORS
                 .iter()
-                .find(|(_, _, _, candidate)| {
-                    builtin_callable_by_oid(*candidate).is_some_and(|operator| {
-                        operator.catalog.language == signature.catalog.language
-                            && operator.catalog.source == signature.catalog.source
-                            && operator.arguments == signature.arguments
-                    })
+                .find(|&&(_, left, right, candidate)| {
+                    // Compare operand types first: the routine lookup is the
+                    // costly part, and catalog queries call this per row.
+                    let operands: &[i32] = if left == 0 { &[right] } else { &[left, right] };
+                    operands == signature.arguments
+                        && builtin_callable_by_oid(candidate).is_some_and(|operator| {
+                            operator.catalog.language == signature.catalog.language
+                                && operator.catalog.source == signature.catalog.source
+                                && operator.arguments == signature.arguments
+                        })
                 })
         })
         .map(|&(name, left, right, _)| (name, left, right))
@@ -5928,7 +6063,6 @@ fn builtin_regproc(entry: Option<(i32, &'static str)>) -> Datum<'static> {
 
 const XID8_BTREE_OPERATOR_FAMILY_OID: i32 = 5067;
 const XID8_BTREE_OPERATOR_CLASS_OID: i32 = 10053;
-const XID8_CMP_OID: i32 = 5096;
 const MONEY_BTREE_OPERATOR_FAMILY_OID: i32 = 2099;
 const MONEY_BTREE_OPERATOR_CLASS_OID: i32 = 10047;
 const PG_LSN_BTREE_OPERATOR_FAMILY_OID: i32 = 3253;
@@ -5973,8 +6107,6 @@ const MACADDR_BTREE_OPERATOR_CLASS_OID: i32 = 10024;
 const MACADDR_HASH_OPERATOR_CLASS_OID: i32 = 10025;
 const MACADDR8_BTREE_OPERATOR_CLASS_OID: i32 = 10026;
 const MACADDR8_HASH_OPERATOR_CLASS_OID: i32 = 10027;
-const MONEY_CMP_OID: i32 = 377;
-const BT_EQUAL_IMAGE_OID: i32 = 5051;
 
 #[cfg(test)]
 pub(super) const CATALOG_RELATIONS: &[&str] = &[
@@ -12946,9 +13078,9 @@ pub fn rule_def_text<'a>(
     rewrite::rule_definition(storage, txid, oid, pretty, arena)
 }
 
-/// The bytes occupied by a relation's visible encoded row images. Plain views
-/// and indexes have no physical row store in pos3ql, so their exact size is
-/// zero; tables and materialized views share the table row store.
+/// The bytes occupied by a relation's visible encoded row images. Plain views,
+/// indexes and sequences have no physical row store in pos3ql, so their exact
+/// size is zero; tables and materialized views share the table row store.
 pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i64>, SqlError> {
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
@@ -12966,6 +13098,11 @@ pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i6
         return Ok(Some(0));
     }
     if has_index_oid(storage, txid, oid) {
+        return Ok(Some(0));
+    }
+    if (0..storage.sequence_count()).any(|slot| {
+        storage.sequence_slot_visible_to(slot, txid) && sequence_oid(storage, slot) == oid
+    }) {
         return Ok(Some(0));
     }
     Ok(None)
@@ -13038,53 +13175,29 @@ fn pg_description<'a>(
     let def = schema::require("pg_description", false);
     // Shipped descriptions never change, so history keeps only stored rows;
     // a reader without a stored row falls back to the shipped text.
-    let shipped = match purpose {
-        Materialization::Query => routine_descriptions::ROUTINE_DESCRIPTIONS,
-        Materialization::History => &[],
+    let query = matches!(purpose, Materialization::Query);
+    let shipped_capacity = if query {
+        routine_descriptions::ROUTINE_DESCRIPTIONS.len()
+            + object_descriptions::OBJECT_DESCRIPTIONS.len()
+            + object_descriptions::TEXT_SEARCH_DESCRIPTIONS.len()
+    } else {
+        0
     };
     let out = arena
-        .alloc_slice_with(storage.comment_capacity() + shipped.len(), |_| {
+        .alloc_slice_with(storage.comment_capacity() + shipped_capacity, |_| {
             &[] as &[Datum]
         })
         .map_err(|_| arena_full())?;
-    let mut n = 0;
-    // Shipped built-in routine descriptions, unless a comment replaced or
-    // removed one in this database.
-    let commented = arena
-        .alloc_slice_with(storage.comment_capacity(), |_| u32::MAX)
+    // Stored rows, including the empty ones that hide a shipped description.
+    let stored = arena
+        .alloc_slice_with(storage.comment_capacity(), |_| (0i32, 0i32, 0i32, None))
         .map_err(|_| arena_full())?;
-    let mut commented_count = 0;
-    for (class, _, _, subid, _) in storage.comments_visible(txid) {
-        if class == crate::storage::CommentClass::Routine && commented_count < commented.len() {
-            commented[commented_count] = subid;
-            commented_count += 1;
-        }
-    }
-    let commented = &mut commented[..commented_count];
-    commented.sort_unstable();
-    for &(oid, description) in shipped {
-        if commented.binary_search(&(oid as u32)).is_ok() {
-            continue;
-        }
-        out[n] = row(
-            &[
-                Datum::Oid(oid as u32),
-                Datum::Oid(PG_PROC_OID as u32),
-                Datum::Int4(0),
-                text(description, arena)?,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
+    let mut stored_count = 0;
     for (class, schema, name, subid, description) in storage.comments_visible(txid) {
         let schema = schema.as_str();
         let name = name.as_str();
         let description = description.as_str();
-        if description.is_empty() {
-            continue;
-        }
-        if n == out.len() {
+        if stored_count == stored.len() {
             return Err(catalog_capacity_exceeded("pg_description"));
         }
         let (objoid, classoid) = match class {
@@ -13358,12 +13471,58 @@ fn pg_description<'a>(
         } else {
             subid as i32
         };
+        let description = if description.is_empty() {
+            None
+        } else {
+            Some(text(description, arena)?)
+        };
+        stored[stored_count] = (objoid, classoid, catalog_subid, description);
+        stored_count += 1;
+    }
+    let stored = &stored[..stored_count];
+    let mut n = 0;
+    if query {
+        let mut ship = |objoid: i32, classoid: i32, description: &str| -> Result<(), SqlError> {
+            if stored
+                .iter()
+                .any(|&(oid, class, subid, _)| oid == objoid && class == classoid && subid == 0)
+            {
+                return Ok(());
+            }
+            out[n] = row(
+                &[
+                    Datum::Oid(objoid as u32),
+                    Datum::Oid(classoid as u32),
+                    Datum::Int4(0),
+                    text(description, arena)?,
+                ],
+                arena,
+            )?;
+            n += 1;
+            Ok(())
+        };
+        for &(oid, description) in routine_descriptions::ROUTINE_DESCRIPTIONS {
+            ship(oid, PG_PROC_OID, description)?;
+        }
+        for &(classoid, oid, description) in object_descriptions::OBJECT_DESCRIPTIONS {
+            ship(oid, classoid, description)?;
+        }
+        for (_, object) in storage.text_search_objects_visible_to(txid) {
+            if let Some((classoid, oid, description)) = builtin_text_search_description(&object) {
+                ship(oid, classoid, description)?;
+            }
+        }
+    }
+    for &(objoid, classoid, subid, description) in stored {
+        let Some(description) = description else {
+            continue;
+        };
         out[n] = row(
             &[
                 Datum::Oid(objoid as u32),
                 Datum::Oid(classoid as u32),
-                Datum::Int4(catalog_subid),
-                text(description, arena)?,
+                Datum::Int4(subid),
+                description,
             ],
             arena,
         )?;
@@ -13812,16 +13971,15 @@ pub fn comment_text_for<'a>(
         }
     }
     Ok(match found {
-        // An empty row hides a built-in routine's shipped description.
+        // An empty row hides a built-in object's shipped description.
         Some("") => None,
         Some(text) => Some(text),
         None => match target {
-            super::eval::DescriptionTarget::Local {
-                catalog: None | Some("pg_proc"),
-                column: 0,
-            } => i32::try_from(oid)
-                .ok()
-                .and_then(builtin_routine_description),
+            super::eval::DescriptionTarget::Local { column: 0, .. } => {
+                i32::try_from(oid).ok().and_then(|oid| {
+                    builtin_object_description(storage, txid, classoid.map(|c| c as i32), oid)
+                })
+            }
             _ => None,
         },
     })
@@ -14548,8 +14706,12 @@ pub fn constraint_def_text<'a>(
             write_identifier(&mut s, child.columns()[c as usize].name.as_str());
         }
         let _ = s.write_str(") REFERENCES ");
-        write_identifier(&mut s, parent.schema.as_str());
-        let _ = s.write_char('.');
+        // Like PostgreSQL's generate_relation_name, qualify the referenced
+        // table only when the search path does not find it by its bare name.
+        if relation_oid_visibility(storage, txid, user_table_oid(storage, pslot)) != Some(true) {
+            write_identifier(&mut s, parent.schema.as_str());
+            let _ = s.write_char('.');
+        }
         write_identifier(&mut s, parent.name.as_str());
         let _ = s.write_char('(');
         for (k, &c) in fk.parent_cols[..fk.n_parent_cols].iter().enumerate() {
@@ -18640,7 +18802,9 @@ fn pg_class<'a>(
                 Datum::Int4(i32::from(table_def.attributes.count)),
                 Datum::Float8(reltuples),
                 Datum::Int4(relpages),
+                // A foreign table has no table access method.
                 Datum::Int4(match table_def.access_method {
+                    _ if relkind == "f" => 0,
                     crate::storage::TableAccessMethod::Heap => 2,
                     crate::storage::TableAccessMethod::Catalog(oid) => oid.get(),
                 }),
@@ -20130,6 +20294,10 @@ fn available_extension_requires<'a>(
     package: &crate::storage::ExtensionPackage,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    // A control file without `requires` lists NULL, not an empty array.
+    if package.requires().is_empty() {
+        return Ok(Datum::Null);
+    }
     let mut values = [Datum::Null; crate::storage::MAX_EXTENSION_REQUIRES];
     for (index, required) in package.requires().iter().enumerate() {
         values[index] = text(required.as_str(), arena)?;
@@ -20138,6 +20306,59 @@ fn available_extension_requires<'a>(
         element: super::types::ArrElem::Name,
         raw: super::array::build(&values[..package.requires().len()], arena)?,
     })
+}
+
+/// Rows of the `pg_available_extensions()` and
+/// `pg_available_extension_versions()` functions: their views' rows without
+/// the `installed_version` or `installed` column the views add.
+pub(crate) fn available_extension_function_rows<'a>(
+    storage: &Storage,
+    txid: u32,
+    versions: bool,
+    arena: &'a Arena,
+) -> Result<&'a [&'a [Datum<'a>]], SqlError> {
+    let (table, installed) = if versions {
+        (pg_available_extension_versions(storage, txid, arena)?, 2)
+    } else {
+        (pg_available_extensions(storage, txid, arena)?, 2)
+    };
+    let rows = arena
+        .alloc_slice_with(table.rows.len(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (output, input) in rows.iter_mut().zip(table.rows) {
+        let values = arena
+            .alloc_slice_with(input.len() - 1, |index| {
+                input[if index < installed { index } else { index + 1 }]
+            })
+            .map_err(|_| arena_full())?;
+        *output = values;
+    }
+    Ok(rows)
+}
+
+/// Output columns of `pg_available_extensions()` or
+/// `pg_available_extension_versions()`, in order.
+pub(crate) fn available_extension_function_columns(
+    versions: bool,
+) -> &'static [(&'static str, ColType)] {
+    if versions {
+        &[
+            ("name", ColType::Name),
+            ("version", ColType::Text),
+            ("superuser", ColType::Bool),
+            ("trusted", ColType::Bool),
+            ("relocatable", ColType::Bool),
+            ("schema", ColType::Name),
+            ("requires", ColType::Array(super::types::ArrElem::Name)),
+            ("comment", ColType::Text),
+        ]
+    } else {
+        &[
+            ("name", ColType::Name),
+            ("default_version", ColType::Text),
+            ("comment", ColType::Text),
+        ]
+    }
 }
 
 fn pg_available_extensions<'a>(
@@ -20234,9 +20455,25 @@ fn pg_extension<'a>(
     let def = schema::require("pg_extension", false);
     let count = storage.extensions_visible_to(txid).count();
     let out = arena
-        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .alloc_slice_with(count + 1, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
+    // initdb installs plpgsql as an extension owned by the bootstrap superuser.
+    out[0] = row(
+        &[
+            Datum::Int4(3079),
+            Datum::Int4(PLPGSQL_EXTENSION_OID),
+            text("plpgsql", arena)?,
+            Datum::Int4(10),
+            Datum::Int4(PG_CATALOG_NS_OID),
+            Datum::Bool(false),
+            text("1.0", arena)?,
+            Datum::Null,
+            Datum::Null,
+        ],
+        arena,
+    )?;
     for (index, (slot, extension)) in storage.extensions_visible_to(txid).enumerate() {
+        let index = index + 1;
         let (namespace, relocatable, version) = extension.definition_to(txid);
         let mut config_oids = [Datum::Null; crate::storage::MAX_EXTENSION_CONFIG_RELATIONS];
         let mut config_conditions = [Datum::Null; crate::storage::MAX_EXTENSION_CONFIG_RELATIONS];
@@ -22448,6 +22685,26 @@ fn pg_opclass<'a>(
         )?;
         count += 1;
     }
+    // Built-in rows in a fresh cluster's physical order, which an unordered
+    // aggregate such as psql's `\dAf` type list observes.
+    let builtin_count = count;
+    let position = |oid: i32| {
+        access_method_members::OPERATOR_CLASS_ORDER
+            .iter()
+            .position(|candidate| *candidate == oid)
+            .unwrap_or(usize::MAX)
+    };
+    let row_oid = |values: &[Datum]| match values[1] {
+        Datum::Int4(oid) => oid,
+        _ => 0,
+    };
+    for index in 1..builtin_count {
+        let mut slot = index;
+        while slot > 0 && position(row_oid(rows[slot - 1])) > position(row_oid(rows[slot])) {
+            rows.swap(slot - 1, slot);
+            slot -= 1;
+        }
+    }
     for (slot, class) in storage.operator_classes_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opclass"));
@@ -22492,658 +22749,10 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         .operator_families_visible_to(txid)
         .map(|(_, family)| family.operators.iter().filter(|member| member.used).count())
         .sum::<usize>();
-    let rows = catalog_rows(arena, 1024 + user_rows)?;
-    const XID8_BTREE_OPERATORS: [(i32, i16, i32); 5] = [
-        (10050, 1, 5073),
-        (10051, 2, 5075),
-        (10052, 3, 5068),
-        (10053, 4, 5076),
-        (10054, 5, 5074),
-    ];
-    const MONEY_BTREE_OPERATORS: [(i32, i16, i32); 5] = [
-        (10225, 1, 902),
-        (10226, 2, 904),
-        (10227, 3, 900),
-        (10228, 4, 905),
-        (10229, 5, 903),
-    ];
-    const TID_BTREE_OPERATORS: [(i32, i16, i32); 5] = [
-        (10055, 1, 2799),
-        (10056, 2, 2801),
-        (10057, 3, 387),
-        (10058, 4, 2802),
-        (10059, 5, 2800),
-    ];
+    let builtin = access_method_members::OPERATORS;
+    let rows = catalog_rows(arena, builtin.len() + user_rows)?;
     let mut count = 0usize;
-    for (oid, strategy, operator) in XID8_BTREE_OPERATORS {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
-                Datum::Int4(super::types::oid::XID8),
-                Datum::Int4(super::types::oid::XID8),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(403),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, strategy, operator) in MONEY_BTREE_OPERATORS {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
-                Datum::Int4(super::types::oid::MONEY),
-                Datum::Int4(super::types::oid::MONEY),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(403),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, strategy, operator) in TID_BTREE_OPERATORS {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(TID_BTREE_OPERATOR_FAMILY_OID),
-                Datum::Int4(super::types::oid::TID),
-                Datum::Int4(super::types::oid::TID),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(403),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, input, operator) in [
-        (
-            10290,
-            CID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::CID,
-            385,
-        ),
-        (
-            10291,
-            TID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-            387,
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(1),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(405),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, input, strategy, operator, method) in [
-        (
-            10205,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            1,
-            1786,
-            403,
-        ),
-        (
-            10206,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            2,
-            1788,
-            403,
-        ),
-        (
-            10207,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            3,
-            1784,
-            403,
-        ),
-        (
-            10208,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            4,
-            1789,
-            403,
-        ),
-        (
-            10209,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            5,
-            1787,
-            403,
-        ),
-        (
-            10115,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            1,
-            1957,
-            403,
-        ),
-        (
-            10116,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            2,
-            1958,
-            403,
-        ),
-        (
-            10117,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            3,
-            1955,
-            403,
-        ),
-        (
-            10118,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            4,
-            1960,
-            403,
-        ),
-        (
-            10119,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            5,
-            1959,
-            403,
-        ),
-        (
-            10210,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            1,
-            1806,
-            403,
-        ),
-        (
-            10211,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            2,
-            1808,
-            403,
-        ),
-        (
-            10212,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            3,
-            1804,
-            403,
-        ),
-        (
-            10213,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            4,
-            1809,
-            403,
-        ),
-        (
-            10214,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            5,
-            1807,
-            403,
-        ),
-        (
-            10287,
-            BYTEA_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            1,
-            1955,
-            405,
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(method),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, input, strategy, operator, method) in [
-        (
-            10190,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            1,
-            1203,
-            403,
-        ),
-        (
-            10191,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            2,
-            1204,
-            403,
-        ),
-        (
-            10192,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            3,
-            1201,
-            403,
-        ),
-        (
-            10193,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            4,
-            1206,
-            403,
-        ),
-        (
-            10194,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            5,
-            1205,
-            403,
-        ),
-        (
-            10262,
-            NETWORK_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            1,
-            1201,
-            405,
-        ),
-        (
-            10180,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            1,
-            1222,
-            403,
-        ),
-        (
-            10181,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            2,
-            1223,
-            403,
-        ),
-        (
-            10182,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            3,
-            1220,
-            403,
-        ),
-        (
-            10183,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            4,
-            1225,
-            403,
-        ),
-        (
-            10184,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            5,
-            1224,
-            403,
-        ),
-        (
-            10273,
-            MACADDR_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            1,
-            1220,
-            405,
-        ),
-        (
-            10185,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            1,
-            3364,
-            403,
-        ),
-        (
-            10186,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            2,
-            3365,
-            403,
-        ),
-        (
-            10187,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            3,
-            3362,
-            403,
-        ),
-        (
-            10188,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            4,
-            3367,
-            403,
-        ),
-        (
-            10189,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            5,
-            3366,
-            403,
-        ),
-        (
-            10274,
-            MACADDR8_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            1,
-            3362,
-            405,
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(method),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, input, strategy, operator, method) in [
-        (
-            10374,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            1,
-            3884,
-            403,
-        ),
-        (
-            10375,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            2,
-            3885,
-            403,
-        ),
-        (
-            10376,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            3,
-            3882,
-            403,
-        ),
-        (
-            10377,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            4,
-            3886,
-            403,
-        ),
-        (
-            10378,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            5,
-            3887,
-            403,
-        ),
-        (
-            10379,
-            RANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            1,
-            3882,
-            405,
-        ),
-        (
-            10416,
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            1,
-            2862,
-            403,
-        ),
-        (
-            10417,
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            2,
-            2863,
-            403,
-        ),
-        (
-            10418,
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            3,
-            2860,
-            403,
-        ),
-        (
-            10419,
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            4,
-            2864,
-            403,
-        ),
-        (
-            10420,
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            5,
-            2865,
-            403,
-        ),
-        (
-            10421,
-            MULTIRANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            1,
-            2860,
-            405,
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(method),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, strategy, operator, method) in [
-        (10250, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 1, 3224, 403),
-        (10251, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 2, 3226, 403),
-        (10252, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 3, 3222, 403),
-        (10253, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 4, 3227, 403),
-        (10254, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 5, 3225, 403),
-        (10296, PG_LSN_HASH_OPERATOR_FAMILY_OID, 1, 3222, 405),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(super::types::oid::PG_LSN),
-                Datum::Int4(super::types::oid::PG_LSN),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(method),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    rows[count] = row(
-        &[
-            Datum::Int4(2602),
-            Datum::Int4(10294),
-            Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::ACLITEM),
-            Datum::Int4(super::types::oid::ACLITEM),
-            Datum::Int2(1),
-            Datum::Bpchar("s"),
-            Datum::Int4(974),
-            Datum::Int4(405),
-            Datum::Int4(0),
-        ],
-        arena,
-    )?;
-    count += 1;
-    for (oid, family, left, right, operator) in [
-        (10255, 427, 1042, 1042, 1054),
-        (10256, 431, 18, 18, 92),
-        (10257, 435, 1082, 1082, 1093),
-        (10258, 1971, 700, 700, 620),
-        (10259, 1971, 701, 701, 670),
-        (10260, 1971, 700, 701, 1120),
-        (10261, 1971, 701, 700, 1130),
-        (10263, 1977, 21, 21, 94),
-        (10264, 1977, 23, 23, 96),
-        (10265, 1977, 20, 20, 410),
-        (10266, 1977, 21, 23, 532),
-        (10267, 1977, 21, 20, 1862),
-        (10268, 1977, 23, 21, 533),
-        (10269, 1977, 23, 20, 15),
-        (10270, 1977, 20, 21, 1868),
-        (10271, 1977, 20, 23, 416),
-        (10272, 1983, 1186, 1186, 1330),
-        (10275, 1990, 26, 26, 607),
-        (10276, 1992, 30, 30, 649),
-        (10277, 6194, 2249, 2249, 2988),
-        (10278, 1995, 25, 25, 98),
-        (10279, 1995, 19, 19, 93),
-        (10280, 1995, 19, 25, 254),
-        (10281, 1995, 25, 19, 260),
-        (10282, 1997, 1083, 1083, 1108),
-        (10283, 1999, 1184, 1184, 1320),
-        (10284, 2001, 1266, 1266, 1550),
-        (10285, 2040, 1114, 1114, 2060),
-        (10286, 2222, 16, 16, 91),
-        (10288, 2225, 28, 28, 352),
-        (10289, 5032, 5069, 5069, 5068),
-        (10292, 2229, 25, 25, 98),
-        (10293, 2231, 1042, 1042, 1054),
-        (10295, 2969, 2950, 2950, 2972),
-        (10297, 1998, 1700, 1700, 1752),
-        (10298, 627, 2277, 2277, 1070),
-        (10358, 3523, 3500, 3500, 3516),
-        (10455, 4034, 3802, 3802, 3240),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(1),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(405),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, left, right, strategy, operator) in super::brin_catalog::OPERATORS {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(3580),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for &(oid, family, left, right, strategy, purpose, operator, sort_family) in
-        super::gist_catalog::OPERATORS
-    {
+    for &(oid, family, left, right, strategy, purpose, operator, method, sort_family) in builtin {
         rows[count] = row(
             &[
                 Datum::Int4(2602),
@@ -23154,47 +22763,7 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int2(strategy),
                 Datum::Bpchar(purpose),
                 Datum::Int4(operator),
-                Datum::Int4(783),
-                Datum::Int4(sort_family),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for &(oid, family, left, right, strategy, purpose, operator, sort_family) in
-        super::gin_catalog::OPERATORS
-    {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(strategy),
-                Datum::Bpchar(purpose),
-                Datum::Int4(operator),
-                Datum::Int4(2742),
-                Datum::Int4(sort_family),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for &(oid, family, left, right, strategy, purpose, operator, sort_family) in
-        super::spgist_catalog::OPERATORS
-    {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(strategy),
-                Datum::Bpchar(purpose),
-                Datum::Int4(operator),
-                Datum::Int4(4000),
+                Datum::Int4(method),
                 Datum::Int4(sort_family),
             ],
             arena,
@@ -23245,592 +22814,10 @@ fn pg_amproc<'a>(
         .operator_families_visible_to(txid)
         .map(|(_, family)| family.functions.iter().filter(|member| member.used).count())
         .sum::<usize>();
-    let rows = catalog_rows(arena, 1024 + user_rows)?;
-    rows[0] = row(
-        &[
-            Datum::Int4(2603),
-            Datum::Int4(10130),
-            Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::XID8),
-            Datum::Int4(super::types::oid::XID8),
-            Datum::Int2(1),
-            builtin_regproc(Some((XID8_CMP_OID, "xid8cmp"))),
-        ],
-        arena,
-    )?;
-    rows[1] = row(
-        &[
-            Datum::Int4(2603),
-            Datum::Int4(10131),
-            Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::XID8),
-            Datum::Int4(super::types::oid::XID8),
-            Datum::Int2(4),
-            builtin_regproc(Some((BT_EQUAL_IMAGE_OID, "btequalimage"))),
-        ],
-        arena,
-    )?;
-    rows[2] = row(
-        &[
-            Datum::Int4(2603),
-            Datum::Int4(10108),
-            Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::MONEY),
-            Datum::Int4(super::types::oid::MONEY),
-            Datum::Int2(1),
-            builtin_regproc(Some((MONEY_CMP_OID, "cash_cmp"))),
-        ],
-        arena,
-    )?;
-    rows[3] = row(
-        &[
-            Datum::Int4(2603),
-            Datum::Int4(10109),
-            Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::MONEY),
-            Datum::Int4(super::types::oid::MONEY),
-            Datum::Int2(4),
-            builtin_regproc(Some((BT_EQUAL_IMAGE_OID, "btequalimage"))),
-        ],
-        arena,
-    )?;
-    for (index, (oid, family, input, number, procedure, name)) in [
-        (
-            10110,
-            TID_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-            1,
-            2794,
-            "bttidcmp",
-        ),
-        (
-            10111,
-            TID_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10182,
-            CID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::CID,
-            1,
-            6423,
-            "hashcid",
-        ),
-        (
-            10183,
-            CID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::CID,
-            2,
-            6424,
-            "hashcidextended",
-        ),
-        (
-            10184,
-            TID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-            1,
-            2233,
-            "hashtid",
-        ),
-        (
-            10185,
-            TID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-            2,
-            2234,
-            "hashtidextended",
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 4] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, family, input, number, procedure, name)) in [
-        (
-            10001,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            1,
-            1596,
-            "bitcmp",
-        ),
-        (
-            10002,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10009,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            1,
-            1954,
-            "byteacmp",
-        ),
-        (
-            10010,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            2,
-            3331,
-            "bytea_sortsupport",
-        ),
-        (
-            10011,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10100,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            1,
-            1672,
-            "varbitcmp",
-        ),
-        (
-            10101,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10176,
-            BYTEA_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            1,
-            6413,
-            "hashbytea",
-        ),
-        (
-            10177,
-            BYTEA_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            2,
-            6414,
-            "hashbyteaextended",
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 10] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-    }
-    let mut count = 19usize;
-    for (oid, family, input, number, procedure, name) in [
-        (
-            10044,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            1,
-            926,
-            "network_cmp",
-        ),
-        (
-            10045,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            2,
-            5033,
-            "network_sortsupport",
-        ),
-        (
-            10046,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10144,
-            NETWORK_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            1,
-            422,
-            "hashinet",
-        ),
-        (
-            10145,
-            NETWORK_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            2,
-            779,
-            "hashinetextended",
-        ),
-        (
-            10074,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            1,
-            836,
-            "macaddr_cmp",
-        ),
-        (
-            10075,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            2,
-            3359,
-            "macaddr_sortsupport",
-        ),
-        (
-            10076,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10154,
-            MACADDR_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            1,
-            399,
-            "hashmacaddr",
-        ),
-        (
-            10155,
-            MACADDR_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            2,
-            778,
-            "hashmacaddrextended",
-        ),
-        (
-            10120,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            1,
-            4119,
-            "macaddr8_cmp",
-        ),
-        (
-            10121,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10198,
-            MACADDR8_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            1,
-            328,
-            "hashmacaddr8",
-        ),
-        (
-            10199,
-            MACADDR8_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            2,
-            781,
-            "hashmacaddr8extended",
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, input, number, procedure, name) in [
-        (
-            10126,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            1,
-            3870,
-            "range_cmp",
-        ),
-        (
-            10127,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            2,
-            6391,
-            "range_sortsupport",
-        ),
-        (
-            10202,
-            RANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            1,
-            3902,
-            "hash_range",
-        ),
-        (
-            10203,
-            RANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            2,
-            3417,
-            "hash_range_extended",
-        ),
-        (
-            10128,
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            1,
-            4273,
-            "multirange_cmp",
-        ),
-        (
-            10204,
-            MULTIRANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            1,
-            4278,
-            "hash_multirange",
-        ),
-        (
-            10205,
-            MULTIRANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            2,
-            4279,
-            "hash_multirange_extended",
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, number, procedure, name) in [
-        (
-            10118,
-            PG_LSN_BTREE_OPERATOR_FAMILY_OID,
-            1,
-            3251,
-            "pg_lsn_cmp",
-        ),
-        (
-            10119,
-            PG_LSN_BTREE_OPERATOR_FAMILY_OID,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10196,
-            PG_LSN_HASH_OPERATOR_FAMILY_OID,
-            1,
-            3252,
-            "pg_lsn_hash",
-        ),
-        (
-            10197,
-            PG_LSN_HASH_OPERATOR_FAMILY_OID,
-            2,
-            3413,
-            "pg_lsn_hash_extended",
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(super::types::oid::PG_LSN),
-                Datum::Int4(super::types::oid::PG_LSN),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, number, procedure, name) in [
-        (10190, 1, 329, "hash_aclitem"),
-        (10191, 2, 777, "hash_aclitem_extended"),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
-                Datum::Int4(super::types::oid::ACLITEM),
-                Datum::Int4(super::types::oid::ACLITEM),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, input, number, procedure, name) in [
-        (10132, 427, 1042, 1, 1080, "hashbpchar"),
-        (10133, 427, 1042, 2, 972, "hashbpcharextended"),
-        (10134, 431, 18, 1, 454, "hashchar"),
-        (10135, 431, 18, 2, 446, "hashcharextended"),
-        (10136, 435, 1082, 1, 6415, "hashdate"),
-        (10137, 435, 1082, 2, 6416, "hashdateextended"),
-        (10138, 627, 2277, 1, 626, "hash_array"),
-        (10139, 627, 2277, 2, 782, "hash_array_extended"),
-        (10140, 1971, 700, 1, 451, "hashfloat4"),
-        (10141, 1971, 700, 2, 443, "hashfloat4extended"),
-        (10142, 1971, 701, 1, 452, "hashfloat8"),
-        (10143, 1971, 701, 2, 444, "hashfloat8extended"),
-        (10146, 1977, 21, 1, 449, "hashint2"),
-        (10147, 1977, 21, 2, 441, "hashint2extended"),
-        (10148, 1977, 23, 1, 450, "hashint4"),
-        (10149, 1977, 23, 2, 425, "hashint4extended"),
-        (10150, 1977, 20, 1, 949, "hashint8"),
-        (10151, 1977, 20, 2, 442, "hashint8extended"),
-        (10152, 1983, 1186, 1, 1697, "interval_hash"),
-        (10153, 1983, 1186, 2, 3418, "interval_hash_extended"),
-        (10156, 1990, 26, 1, 453, "hashoid"),
-        (10157, 1990, 26, 2, 445, "hashoidextended"),
-        (10158, 1992, 30, 1, 457, "hashoidvector"),
-        (10159, 1992, 30, 2, 776, "hashoidvectorextended"),
-        (10160, 1995, 25, 1, 400, "hashtext"),
-        (10161, 1995, 25, 2, 448, "hashtextextended"),
-        (10162, 1995, 19, 1, 455, "hashname"),
-        (10163, 1995, 19, 2, 447, "hashnameextended"),
-        (10164, 1997, 1083, 1, 1688, "time_hash"),
-        (10165, 1997, 1083, 2, 3409, "time_hash_extended"),
-        (10166, 1998, 1700, 1, 432, "hash_numeric"),
-        (10167, 1998, 1700, 2, 780, "hash_numeric_extended"),
-        (10168, 1999, 1184, 1, 6425, "timestamptz_hash"),
-        (10169, 1999, 1184, 2, 6426, "timestamptz_hash_extended"),
-        (10170, 2001, 1266, 1, 1696, "timetz_hash"),
-        (10171, 2001, 1266, 2, 3410, "timetz_hash_extended"),
-        (10172, 2040, 1114, 1, 2039, "timestamp_hash"),
-        (10173, 2040, 1114, 2, 3411, "timestamp_hash_extended"),
-        (10174, 2222, 16, 1, 6417, "hashbool"),
-        (10175, 2222, 16, 2, 6418, "hashboolextended"),
-        (10178, 2225, 28, 1, 6419, "hashxid"),
-        (10179, 2225, 28, 2, 6420, "hashxidextended"),
-        (10180, 5032, 5069, 1, 6421, "hashxid8"),
-        (10181, 5032, 5069, 2, 6422, "hashxid8extended"),
-        (10186, 2229, 25, 1, 400, "hashtext"),
-        (10187, 2229, 25, 2, 448, "hashtextextended"),
-        (10188, 2231, 1042, 1, 1080, "hashbpchar"),
-        (10189, 2231, 1042, 2, 972, "hashbpcharextended"),
-        (10192, 2969, 2950, 1, 2963, "uuid_hash"),
-        (10193, 2969, 2950, 2, 3412, "uuid_hash_extended"),
-        (10194, 6194, 2249, 1, 6192, "hash_record"),
-        (10195, 6194, 2249, 2, 6193, "hash_record_extended"),
-        (10200, 3523, 3500, 1, 3515, "hashenum"),
-        (10201, 3523, 3500, 2, 3414, "hashenumextended"),
-        (10206, 4034, 3802, 1, 4045, "jsonb_hash"),
-        (10207, 4034, 3802, 2, 3416, "jsonb_hash_extended"),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, left, right, number, procedure, name) in super::brin_catalog::PROCEDURES {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for &(oid, family, left, right, number, procedure, name) in super::gist_catalog::PROCEDURES {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for &(oid, family, left, right, number, procedure, name) in super::gin_catalog::PROCEDURES {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for &(oid, family, left, right, number, procedure, name) in super::spgist_catalog::PROCEDURES {
+    let builtin = access_method_members::PROCEDURES;
+    let rows = catalog_rows(arena, builtin.len() + user_rows)?;
+    let mut count = 0usize;
+    for &(oid, family, left, right, number, procedure, name) in builtin {
         rows[count] = row(
             &[
                 Datum::Int4(2603),
@@ -24331,8 +23318,8 @@ fn pg_language<'a>(
             Datum::Bool(false),
             Datum::Bool(false),
             Datum::Int4(0),
-            Datum::Int4(2246),
             Datum::Int4(0),
+            Datum::Int4(2246),
             acl(
                 storage,
                 crate::storage::AccessObject {
@@ -24354,8 +23341,8 @@ fn pg_language<'a>(
             Datum::Bool(false),
             Datum::Bool(false),
             Datum::Int4(0),
-            Datum::Int4(2247),
             Datum::Int4(0),
+            Datum::Int4(2247),
             acl(
                 storage,
                 crate::storage::AccessObject {
@@ -24374,11 +23361,11 @@ fn pg_language<'a>(
             Datum::Int4(SQL_LANGUAGE_OID),
             text("sql", arena)?,
             Datum::Int4(10),
-            Datum::Bool(true),
             Datum::Bool(false),
+            Datum::Bool(true),
+            Datum::Int4(0),
             Datum::Int4(0),
             Datum::Int4(2248),
-            Datum::Int4(0),
             acl(
                 storage,
                 crate::storage::AccessObject {
@@ -24399,9 +23386,9 @@ fn pg_language<'a>(
             Datum::Int4(10),
             Datum::Bool(true),
             Datum::Bool(true),
-            Datum::Int4(13644),
-            Datum::Int4(13646),
-            Datum::Int4(13645),
+            Datum::Int4(PLPGSQL_CALL_HANDLER_OID),
+            Datum::Int4(PLPGSQL_INLINE_HANDLER_OID),
+            Datum::Int4(PLPGSQL_VALIDATOR_OID),
             acl(
                 storage,
                 crate::storage::AccessObject {

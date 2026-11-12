@@ -6141,15 +6141,9 @@ impl<'a> Parser<'a> {
             let at = self.peek_at;
             let option = self.any_ident("view option name")?;
             let (index, parsed) = if option.eq_ignore_ascii_case("security_invoker") {
-                (
-                    0,
-                    ViewOption::SecurityInvoker(self.subscription_bool_option(option)?),
-                )
+                (0, ViewOption::SecurityInvoker(self.reloption_bool(option)?))
             } else if option.eq_ignore_ascii_case("security_barrier") {
-                (
-                    1,
-                    ViewOption::SecurityBarrier(self.subscription_bool_option(option)?),
-                )
+                (1, ViewOption::SecurityBarrier(self.reloption_bool(option)?))
             } else if option.eq_ignore_ascii_case("check_option") {
                 self.expect_op("=")?;
                 let value_at = self.peek_at;
@@ -6186,6 +6180,37 @@ impl<'a> Parser<'a> {
         }
         self.expect_op(")")?;
         self.arena_slice(&options[..count])
+    }
+
+    /// A boolean reloption: absent means `true`; otherwise any spelling
+    /// PostgreSQL's `parse_bool` accepts (`on`, `yes`, `1`, `t`, `of`, ...).
+    fn reloption_bool(&mut self, option: &str) -> Result<bool, ParseError> {
+        if !self.eat_op("=")? {
+            return Ok(true);
+        }
+        let at = self.peek_at;
+        let value = match self.peeked {
+            Tok::Ident(value) | Tok::QuotedIdent(value) | Tok::Str(value) | Tok::Num(value) => {
+                value
+            }
+            _ => return Err(self.err_here("syntax error")),
+        };
+        self.advance()?;
+        // Unlike boolean input, reloption parsing does not trim whitespace.
+        (value.trim() == value)
+            .then(|| crate::sql::eval::parse_bool(value).ok())
+            .flatten()
+            .ok_or_else(|| {
+                Self::invalid_reloption(
+                    at,
+                    stack_format!(
+                        96,
+                        "invalid value for boolean option \"{}\": {}",
+                        option,
+                        value
+                    ),
+                )
+            })
     }
 
     /// PostgreSQL validates reloptions after parsing, as `22023`.

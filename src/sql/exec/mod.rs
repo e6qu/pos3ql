@@ -45304,6 +45304,9 @@ pub fn comment(
             )
         }
         CommentTarget::Extension(extension_name) => {
+            if extension_name == crate::sql::BUILTIN_EXTENSION {
+                return sql_fail(crate::sql::builtin_extension_change());
+            }
             let Some(slot) = storage.extension_slot(extension_name, txid) else {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -45951,12 +45954,18 @@ fn stage_comment(
     identity: CommentIdentity,
     text: Option<&str>,
 ) -> Result<(), SqlError> {
-    // Removing the description PostgreSQL ships for a built-in routine keeps
+    // Removing the description PostgreSQL ships for a built-in object keeps
     // an empty row that hides it; every other removal deletes the row.
     let text = match text {
         Some("") | None
-            if identity.class == crate::storage::CommentClass::Routine
-                && super::catalog::builtin_routine_description(identity.subid as i32).is_some() =>
+            if super::catalog::comment_target_has_shipped_description(
+                storage,
+                txn.txid,
+                identity.class,
+                identity.schema.as_str(),
+                identity.name.as_str(),
+                identity.subid,
+            ) =>
         {
             Some("")
         }
@@ -57250,6 +57259,10 @@ pub fn create_index(
                 type_oid,
             )
         } else {
+            // Names resolve before the key's type is judged (`(zz.*)` is 42P01).
+            if let Err(error) = ddl::check_referenced_columns(index_column.expression, &tdef) {
+                return sql_fail(error);
+            }
             let (type_oid, _) = match infer_type_catalog(
                 index_column.expression,
                 Some(&tdef),

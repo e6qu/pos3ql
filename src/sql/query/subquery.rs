@@ -1582,9 +1582,14 @@ fn subquery_exists<'a>(
             run_set_subquery(tree, select, storage, txid, arena, params, 1, sequences)?;
         return Ok(!vals.is_empty());
     }
-    if !select.group_by.is_empty() || select.having.is_some() || select.distinct {
-        // Grouped/DISTINCT EXISTS: the row-source executor already handles
-        // grouping, HAVING, and DISTINCT — existence is whether it emits.
+    if !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || inner_subquery_correlated(&[select.where_clause], storage, txid, arena)?
+    {
+        // Grouped/DISTINCT EXISTS, or one whose filter has a subquery reading
+        // its rows: the row-source executor already handles grouping, HAVING,
+        // DISTINCT and per-row subqueries — existence is whether it emits.
         let mut found = false;
         select_into_rows(
             storage,
@@ -1781,6 +1786,20 @@ fn subquery_node_correlated<'a>(
         parent: None,
     };
     select_has_outer_ref(select, &chain, storage, txid, arena)
+}
+
+fn inner_subquery_correlated<'a>(
+    expressions: &[Option<&'a Expr<'a>>],
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    for expression in expressions.iter().flatten() {
+        if expression_has_correlated_subquery(expression, storage, txid, arena)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn expression_has_correlated_subquery<'a>(
@@ -2316,7 +2335,8 @@ pub(super) fn correlated_where_passes<'a>(
     correlated: &[&'a Expr<'a>],
     base: &SubqueryValues<'a, 'a>,
     predicate: Option<&'a Expr<'a>>,
-    row: &impl ColumnLookup<'a>,
+    row: &dyn ColumnLookup<'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
@@ -2328,6 +2348,7 @@ pub(super) fn correlated_where_passes<'a>(
     let Some(predicate) = predicate else {
         return Ok(true);
     };
+    let row = &super::Chained { inner: row, outer };
     let values = merge_correlated(
         correlated,
         base,
@@ -3206,11 +3227,15 @@ fn run_subquery<'a>(
     // rows, so its body belongs to the row-source executor too (which handles
     // SRF expansion) — just like a grouped or windowed subquery.
     let has_srf = super::srf::has_project_set(select.items, storage, txid);
+    // Pre-evaluating inner subqueries below has no row of this subquery's own
+    // source, so one that reads that row belongs to the row-source executor,
+    // which evaluates correlated subqueries per row.
     if !select.group_by.is_empty()
         || select.having.is_some()
         || select.distinct
         || has_window
         || has_srf
+        || inner_subquery_correlated(&[Some(item), select.where_clause], storage, txid, arena)?
     {
         // Grouped/DISTINCT/windowed/SRF subquery: the row-source executor
         // already handles grouping, HAVING, DISTINCT, windows, and SRF

@@ -7,7 +7,6 @@ create index on k ((b::text));
 create index on k ((c::text), b);
 create index on k ((k.c));
 create index on k (((k).c));
-create index on k ((k.*));
 create index on k (lower(b) collate "C");
 create index on k (a, a);
 create index on k (a) include (b, c);

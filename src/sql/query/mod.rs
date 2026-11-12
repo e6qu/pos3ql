@@ -4000,6 +4000,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .listening_channel_count(self.storage.current_connection_id())
     }
 
+    fn available_extension_rows<'a>(
+        &self,
+        versions: bool,
+        arena: &'a Arena,
+    ) -> Result<&'a [&'a [Datum<'a>]], SqlError> {
+        super::catalog::available_extension_function_rows(self.storage, self.txid, versions, arena)
+    }
+
     fn listening_channel_at(&self, index: usize) -> Option<crate::sql::notify::Channel> {
         self.storage
             .listening_channel_at(self.storage.current_connection_id(), index)
@@ -4879,8 +4887,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         let routine = self.storage.routine_for(slot, self.txid);
         Ok(Some(input_progress::evaluation(
             oid,
+            // An aggregate's recorded immutability says nothing about its
+            // transition functions, so its calls are evaluated at run time.
             if routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable
                 && !routine.kind.is_set_returning()
+                && !matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_))
             {
                 super::eval::ExpressionEvaluation::Immutable
             } else {
@@ -7611,6 +7622,7 @@ fn correlated_row_subqueries<'a, 'scratch>(
     correlated: &[&'a Expr<'a>],
     base: &SubqueryValues<'a, 'a>,
     row: &dyn ColumnLookup<'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
@@ -7625,7 +7637,7 @@ fn correlated_row_subqueries<'a, 'scratch>(
         merge_correlated(
             correlated,
             base,
-            row,
+            &Chained { inner: row, outer },
             storage,
             txid,
             arena,
@@ -10316,6 +10328,7 @@ pub(crate) fn select_query_resumable<'a>(
                         &outer_subs.base,
                         statement.where_clause,
                         row,
+                        None,
                         storage,
                         txid,
                         arena,
@@ -10332,6 +10345,7 @@ pub(crate) fn select_query_resumable<'a>(
                     correlated,
                     &outer_subs.base,
                     row,
+                    None,
                     storage,
                     txid,
                     arena,
@@ -12013,6 +12027,7 @@ fn select_into_rows_mode<'a>(
                 &outer_subs.base,
                 statement.where_clause,
                 row,
+                outer,
                 storage,
                 txid,
                 arena,
@@ -12028,6 +12043,7 @@ fn select_into_rows_mode<'a>(
             correlated,
             &outer_subs.base,
             row,
+            outer,
             storage,
             txid,
             arena,

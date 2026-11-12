@@ -24,7 +24,7 @@ use crate::{sql_err, stack_format};
 use super::group::row_passes_correlated_where;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
-    AggState, GroupedRewrite, Outcome, QueryScope, arena_full, collect_grouped_aggs,
+    AggState, Chained, GroupedRewrite, Outcome, QueryScope, arena_full, collect_grouped_aggs,
     merge_correlated, pax_column_demand, project_row, record_star_width, rewrite_grouped_expr,
     scan_source_recycling_with_pax_columns, scan_source_with_pax_columns, sql_fail, sql_ok,
     window_row,
@@ -1162,7 +1162,19 @@ fn compute_window<'a>(
             // frame aggregates zero rows — count 0, sum NULL).
             if frame.exclusion == crate::sql::ast::FrameExclusion::NoOthers {
                 let mut moving_state = AggState::default();
-                if moving_state.init_moving(node, storage, txid, &super::ScopeCols(scope), arena)? {
+                if moving_state.init_moving(
+                    node,
+                    storage,
+                    txid,
+                    &super::CatalogScopeCols {
+                        scope,
+                        outer_scope: None,
+                        storage,
+                        txid,
+                        arena,
+                    },
+                    arena,
+                )? {
                     let mut active: Option<(usize, usize)> = None;
                     for j in 0..m {
                         let range = frame_range(
@@ -1185,7 +1197,13 @@ fn compute_window<'a>(
                                 node,
                                 storage,
                                 txid,
-                                &super::ScopeCols(scope),
+                                &super::CatalogScopeCols {
+                                    scope,
+                                    outer_scope: None,
+                                    storage,
+                                    txid,
+                                    arena,
+                                },
                                 arena,
                             )?;
                             debug_assert!(selected);
@@ -1232,7 +1250,13 @@ fn compute_window<'a>(
                                 node,
                                 storage,
                                 txid,
-                                &super::ScopeCols(scope),
+                                &super::CatalogScopeCols {
+                                    scope,
+                                    outer_scope: None,
+                                    storage,
+                                    txid,
+                                    arena,
+                                },
                                 arena,
                             )?;
                             debug_assert!(selected);
@@ -1280,7 +1304,19 @@ fn compute_window<'a>(
                     )?
                 };
                 let mut st = AggState::default();
-                st.init(node, storage, txid, &super::ScopeCols(scope), arena)?;
+                st.init(
+                    node,
+                    storage,
+                    txid,
+                    &super::CatalogScopeCols {
+                        scope,
+                        outer_scope: None,
+                        storage,
+                        txid,
+                        arena,
+                    },
+                    arena,
+                )?;
                 if let Some((fs, fe)) = range {
                     for i in fs..=fe {
                         if frame_excludes(frame.exclusion, j, peers, i) {
@@ -1300,7 +1336,19 @@ fn compute_window<'a>(
             //    value at the end of their peer group.
             if spec.order_by.is_empty() {
                 let mut st = AggState::default();
-                st.init(node, storage, txid, &super::ScopeCols(scope), arena)?;
+                st.init(
+                    node,
+                    storage,
+                    txid,
+                    &super::CatalogScopeCols {
+                        scope,
+                        outer_scope: None,
+                        storage,
+                        txid,
+                        arena,
+                    },
+                    arena,
+                )?;
                 for &ri in p {
                     let r = window_row(scope, rows[ri], offs);
                     st.update(node, arena, params, &r, hooks)?;
@@ -1350,7 +1398,19 @@ fn compute_window<'a>(
                     }
                     // Frame is p[0..=e]; aggregate and assign to peers p[j..=e].
                     let mut st = AggState::default();
-                    st.init(node, storage, txid, &super::ScopeCols(scope), arena)?;
+                    st.init(
+                        node,
+                        storage,
+                        txid,
+                        &super::CatalogScopeCols {
+                            scope,
+                            outer_scope: None,
+                            storage,
+                            txid,
+                            arena,
+                        },
+                        arena,
+                    )?;
                     for &ri in &p[..=e] {
                         let r = window_row(scope, rows[ri], offs);
                         st.update(node, arena, params, &r, hooks)?;
@@ -1503,6 +1563,7 @@ pub(crate) fn project_window_rows<'a>(
                 params,
                 hooks,
                 row,
+                outer,
                 &mut *where_scalars,
                 &mut *where_lists,
             )? {
@@ -1539,6 +1600,7 @@ pub(crate) fn project_window_rows<'a>(
                 params,
                 hooks,
                 row,
+                outer,
                 &mut *where_scalars,
                 &mut *where_lists,
             )? {
@@ -1912,6 +1974,7 @@ pub(crate) fn external_window_into<'a>(
                     params,
                     hooks,
                     row,
+                    outer,
                     &mut *where_scalars,
                     &mut *where_lists,
                 )? {
@@ -2166,6 +2229,7 @@ pub(crate) fn external_window_into<'a>(
                 params,
                 hooks,
                 row,
+                outer,
                 &mut *where_scalars,
                 &mut *where_lists,
             )? {
@@ -2208,7 +2272,7 @@ pub(crate) fn external_window_into<'a>(
                 row_subs = merge_correlated(
                     correlated,
                     base,
-                    row,
+                    &Chained { inner: row, outer },
                     storage,
                     txid,
                     arena,

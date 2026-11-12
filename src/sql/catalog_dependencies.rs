@@ -49,6 +49,43 @@ pub(crate) fn for_each_dependency(
             "constraint dependency row has an unexpected identity"
         )),
     };
+    macro_rules! push {
+        ($class:expr, $object:expr, $referenced_class:expr, $referenced_object:expr, $referenced_sub:expr, $kind:expr $(,)?) => {
+            visit(DependencyEdge {
+                dependent: ObjectAddress::new($class, $object, 0),
+                referenced: ObjectAddress::new(
+                    $referenced_class,
+                    $referenced_object,
+                    $referenced_sub,
+                ),
+                kind: $kind.as_bytes()[0],
+            })
+        };
+    }
+
+    // initdb's plpgsql extension owns its language and handlers; the language
+    // depends on its handlers.
+    for handler in PLPGSQL_HANDLER_OIDS {
+        push!(PG_PROC_OID, handler, 3079, PLPGSQL_EXTENSION_OID, 0, "e")?;
+    }
+    push!(
+        PG_LANGUAGE_OID,
+        PLPGSQL_LANGUAGE_OID,
+        3079,
+        PLPGSQL_EXTENSION_OID,
+        0,
+        "e"
+    )?;
+    for handler in PLPGSQL_HANDLER_OIDS.into_iter().rev() {
+        push!(
+            PG_LANGUAGE_OID,
+            PLPGSQL_LANGUAGE_OID,
+            PG_PROC_OID,
+            handler,
+            0,
+            "n"
+        )?;
+    }
     for values in constraints::dependencies(storage, txid, arena)? {
         let Datum::Char(kind) = values[6] else {
             return Err(sql_err!(
@@ -69,19 +106,6 @@ pub(crate) fn for_each_dependency(
             ),
             kind,
         })?;
-    }
-    macro_rules! push {
-        ($class:expr, $object:expr, $referenced_class:expr, $referenced_object:expr, $referenced_sub:expr, $kind:expr $(,)?) => {
-            visit(DependencyEdge {
-                dependent: ObjectAddress::new($class, $object, 0),
-                referenced: ObjectAddress::new(
-                    $referenced_class,
-                    $referenced_object,
-                    $referenced_sub,
-                ),
-                kind: $kind.as_bytes()[0],
-            })
-        };
     }
 
     // Sequence ownership is how pg_dump distinguishes serial/identity

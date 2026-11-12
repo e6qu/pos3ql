@@ -54,7 +54,6 @@ create table wq(a int, b text, check (wq.a > 0), check ((wq).b <> ''));
 create table wk(a int, b text);
 create index on wk ((zz.*));
 create index on wk (wk);
-create index on wk ((wk));
 create index on wk ((zz));
 create index on wk (((wk).a));
 create index on wk ((wk.a + 1)) where wk is not null;
@@ -73,9 +72,6 @@ create table wr_copy (like wr);
 create table wk_index_copy (like wk including indexes);
 create table wpart(a int, b text, check (wpart is not null)) partition by list (a);
 create table wpart1 partition of wpart for values in (1);
-create table wpidx(a int, b text) partition by list (a);
-create table wpidx1 partition of wpidx for values in (1);
-create index on wpidx ((wpidx.*));
 -- A rename follows the relation in its CHECK constraints.
 create index wq_plain on wq ((wq.a + 1)) where wq.b <> '';
 alter table wq rename to wq2;

@@ -277,9 +277,25 @@ function fails with `0A000` when called; `DROP ROLE`'s `DETAIL` lists
 owners by OID and privileges by grant order, where PostgreSQL lists
 `pg_shdepend` rows in their physical order (insertion order in a fresh
 catalog), which needs a durable stamp for each owner change;
-built-in operators, types and other
-catalog objects have no shipped `pg_description` text (built-in routines
-do). Parameter inference walks a statement in its own order rather than
+built-in conversions and collations have no
+shipped `pg_description` text and `pg_conversion` lists no built-in rows (the
+other shipped descriptions are listed); `pg_type`, `pg_operator` and
+`pg_opfamily` return built-in rows in OID order rather than a fresh cluster's
+physical order (`pg_opclass`, `pg_amop` and `pg_amproc` match it). psql's
+describe commands match PostgreSQL 18.6 except: `\d+` of a partitioned table
+prints `Access method: heap` (pos3ql records no unset access method for
+partitioned tables; PostgreSQL leaves `relam` 0 unless `USING` names one);
+`\dD` prints domain `CHECK` text as stored inside doubled parentheses
+(`CHECK ((VALUE > 0))`) instead of deparsing it; `\l` lists no ACL on
+`template0` and `template1`, which initdb sets to `=c/postgres` plus the
+owner's `CTc` (so `PUBLIC` keeps `TEMPORARY` there); `\dF`, `\dFd` and `\dFt`
+list only the `simple` and `english` text search objects; and `\dfS+` takes
+about ten seconds in a debug build over 3,400 routines because each row's
+calls repeat overload resolution and expression typing that PostgreSQL does
+once while planning. A subquery nested in a grouped subquery that reads the
+grouped subquery's rows (`SELECT (SELECT (SELECT p.x) FROM (VALUES (1)) p(x)
+GROUP BY p.x)`) fails with `42703`, and a window function over rows filtered
+by a subquery that reads an enclosing query's row fails with `42P01`. Parameter inference walks a statement in its own order rather than
 PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
 untyped to an `"any"` argument by another can be accepted where PostgreSQL
 reports `42P18`, and a user-defined polymorphic argument left untyped becomes
@@ -320,15 +336,18 @@ names from the stored query text. A
 partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
 its parent's plain unique index, so attaching such a partition builds a
 separate copy where PostgreSQL reuses the constraint's index; constraint
-indexes need a durable link to a parent index first. A partitioned table's
-A table's key indexes and constraints take their OIDs column keys first
-(`CREATE TABLE t (a int, b int, c int UNIQUE, UNIQUE (a, b), UNIQUE (b),
-PRIMARY KEY (c, a))` numbers `t_b_key`, `t_c_key`, `t_a_b_key`, `t_pkey`),
-where PostgreSQL numbers the primary key first and the rest in declaration
-order, so catalog queries ordered by OID list them differently; the
-declaration order of a single-column table `UNIQUE` is not retained.
-An exclusion constraint over a B-tree index fails
-with `42601`, and `box` has no default GiST operator class. `ALTER TABLE ...
+indexes need a durable link to a parent index first.
+`CREATE TABLE` numbers its constraints and key indexes as PostgreSQL does
+(defaults, `CHECK`, `NOT NULL`, the primary key, the other keys, exclusion
+constraints, foreign keys) except where declaration order is not retained:
+column keys are numbered before table-level keys, so a key on a column declared
+after a table constraint (`CREATE TABLE t (a int, b int, UNIQUE (a, b), c int
+UNIQUE)`) and an unnamed single-column table `UNIQUE` come out of order; and an
+explicit `NOT NULL` on a primary key column is numbered with the key's columns
+instead of in column order. An exclusion constraint accepts only range columns
+with `=`, `&&` and `-|-`: one over a B-tree index fails with `42601`, and one
+over `box` (`EXCLUDE USING gist (b WITH &&)`) with `42704`; the stored
+constraint needs its index method and operator OIDs first. `ALTER TABLE ...
 CLUSTER ON` and `REPLICA IDENTITY USING INDEX` reject an index that backs a
 `PRIMARY KEY` or `UNIQUE` constraint (`42704`), since those indexes have no
 separate index slot to mark. A view's `reloptions` spell boolean values

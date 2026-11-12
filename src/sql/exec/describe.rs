@@ -3125,6 +3125,15 @@ fn builtin_record_srf_field(name: &str, index: usize) -> Option<(&'static str, C
             _ => None,
         };
     }
+    if name.eq_ignore_ascii_case("pg_available_extensions")
+        || name.eq_ignore_ascii_case("pg_available_extension_versions")
+    {
+        return crate::sql::catalog::available_extension_function_columns(
+            name.eq_ignore_ascii_case("pg_available_extension_versions"),
+        )
+        .get(index)
+        .copied();
+    }
     if name.eq_ignore_ascii_case("pg_options_to_table") {
         return match index {
             0 => Some(("option_name", ColType::Text)),
@@ -6104,7 +6113,12 @@ pub fn infer_type_res(
             "json_strip_nulls" => of(ColType::Json),
             "jsonb_pretty" => of(ColType::Text),
             "pg_char_to_encoding" => of(ColType::Int4),
-            "pg_table_size" | "pg_database_size" | "pg_tablespace_size" => of(ColType::Int8),
+            "pg_table_size"
+            | "pg_relation_size"
+            | "pg_total_relation_size"
+            | "pg_indexes_size"
+            | "pg_database_size"
+            | "pg_tablespace_size" => of(ColType::Int8),
             // Array-manipulation functions keep the array argument's type, but
             // promote its element type to hold a wider new/replacement element
             // (PostgreSQL's polymorphic anyarray/anyelement resolution).
@@ -6698,6 +6712,8 @@ pub fn infer_type_res(
             | "pg_get_sequence_data"
             | "pg_get_publication_tables"
             | "pg_input_error_info"
+            | "pg_available_extensions"
+            | "pg_available_extension_versions"
             | "_pg_expandarray" => (oid::RECORD, -1),
             "grouping" => of(ColType::Int4),
             "make_date" => of(ColType::Date),

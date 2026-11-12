@@ -22,9 +22,9 @@ use super::aggregate::AggState;
 use super::plan::where_passes;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts, merge_correlated};
 use super::{
-    JoinRow, Outcome, QueryScope, ScopeSchema, arena_full, expr_contains_node, pax_column_demand,
-    resolve_order_target, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
-    sql_fail, sql_ok,
+    Chained, JoinRow, Outcome, QueryScope, ScopeSchema, arena_full, expr_contains_node,
+    pax_column_demand, resolve_order_target, scan_source_recycling_with_pax_columns,
+    scan_source_with_pax_columns, sql_fail, sql_ok,
 };
 use crate::storage::Storage;
 
@@ -65,6 +65,7 @@ pub(super) fn row_passes_correlated_where<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     row: &JoinRow<'_, 'a, '_>,
+    outer: Option<&dyn ColumnLookup<'a>>,
     scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
     lists: &mut [SubqueryList<'a>],
 ) -> Result<bool, SqlError> {
@@ -75,10 +76,11 @@ pub(super) fn row_passes_correlated_where<'a>(
         return Ok(true);
     };
     let base = hooks.subs.expect("outer subqueries prepared");
+    let row = &Chained { inner: row, outer };
     let row_subs = merge_correlated(
         correlated,
         base,
-        row,
+        &Chained { inner: row, outer },
         storage,
         txid,
         arena,
@@ -97,8 +99,10 @@ pub(super) fn row_passes_correlated_where<'a>(
 /// The outer-row lookup for a correlated subquery re-evaluated per GROUP:
 /// a reference resolves to a grouping key's value for this group (a key
 /// collapsed by the current grouping set reads NULL). Anything else is
-/// PostgreSQL's ungrouped-column error (42803).
+/// PostgreSQL's ungrouped-column error (42803); a name this query's sources
+/// do not define stays undefined so a chained outer row can supply it.
 struct GroupRow<'g, 'a> {
+    scope: &'g QueryScope<'a>,
     group_by: &'a [&'a Expr<'a>],
     keys: &'g [Datum<'a>],
 }
@@ -116,6 +120,7 @@ impl<'a> ColumnLookup<'a> for GroupRow<'_, 'a> {
                 return Ok(*v);
             }
         }
+        self.scope.find_column(qualifier, name)?;
         Err(sql_err!(
             sqlstate::GROUPING_ERROR,
             "subquery uses ungrouped column \"{}{}{}\" from outer query",
@@ -195,6 +200,7 @@ pub(super) fn groups_for_mask<'a>(
                     params,
                     hooks,
                     row,
+                    outer,
                     &mut *where_scalars,
                     &mut *where_lists,
                 )? {
@@ -208,7 +214,7 @@ pub(super) fn groups_for_mask<'a>(
                     row_subs = merge_correlated(
                         correlated,
                         hooks.subs.expect("outer subqueries prepared"),
-                        row,
+                        &Chained { inner: row, outer },
                         storage,
                         txid,
                         arena,
@@ -323,6 +329,7 @@ pub(super) fn groups_for_mask<'a>(
                         params,
                         hooks,
                         row,
+                        outer,
                         &mut *where_scalars,
                         &mut *where_lists,
                     )? {
@@ -336,7 +343,7 @@ pub(super) fn groups_for_mask<'a>(
                         row_subs = merge_correlated(
                             correlated,
                             hooks.subs.expect("outer subqueries prepared"),
-                            row,
+                            &Chained { inner: row, outer },
                             storage,
                             txid,
                             arena,
@@ -424,9 +431,16 @@ pub(super) fn groups_for_mask<'a>(
 
     // Correlated subquery nodes appearing in the select list, HAVING, or the
     // ORDER BY keys re-evaluate per group (their outer references resolve to
-    // the group's keys); the rest were WHERE-level and already applied.
+    // the group's keys); the rest were WHERE-level and already applied. One
+    // inside an aggregate's arguments runs per input row instead.
     let mut group_correlated_list = ArenaList::new(arena);
     for &node in correlated {
+        if agg_nodes
+            .iter()
+            .any(|(_, aggregate)| expr_contains_node(aggregate, node as *const Expr))
+        {
+            continue;
+        }
         let in_group_clauses = statement.items.iter().any(|item| {
             matches!(item, SelectItem::Expr { expression, .. }
                 if expr_contains_node(expression, node as *const Expr))
@@ -452,7 +466,13 @@ pub(super) fn groups_for_mask<'a>(
                 node,
                 storage,
                 txid,
-                &super::ScopeCols(scope),
+                &super::CatalogScopeCols {
+                    scope,
+                    outer_scope: None,
+                    storage,
+                    txid,
+                    arena,
+                },
                 arena,
             )?;
         }
@@ -478,7 +498,13 @@ pub(super) fn groups_for_mask<'a>(
                     node,
                     storage,
                     txid,
-                    &super::ScopeCols(scope),
+                    &super::CatalogScopeCols {
+                        scope,
+                        outer_scope: None,
+                        storage,
+                        txid,
+                        arena,
+                    },
                     arena,
                 )?;
             }
@@ -500,6 +526,7 @@ pub(super) fn groups_for_mask<'a>(
                 params,
                 hooks,
                 row,
+                outer,
                 &mut *where_scalars,
                 &mut *where_lists,
             )? {
@@ -515,7 +542,7 @@ pub(super) fn groups_for_mask<'a>(
                 row_subs = merge_correlated(
                     correlated,
                     hooks.subs.expect("outer subqueries prepared"),
-                    row,
+                    &Chained { inner: row, outer },
                     storage,
                     txid,
                     arena,
@@ -567,7 +594,13 @@ pub(super) fn groups_for_mask<'a>(
                             node,
                             storage,
                             txid,
-                            &super::ScopeCols(scope),
+                            &super::CatalogScopeCols {
+                                scope,
+                                outer_scope: None,
+                                storage,
+                                txid,
+                                arena,
+                            },
                             arena,
                         )?;
                     }
@@ -638,13 +671,17 @@ pub(super) fn groups_for_mask<'a>(
             hooks.subs
         } else {
             let group_row = GroupRow {
+                scope,
                 group_by: statement.group_by,
                 keys: &key_vals[..n_keys],
             };
             merged_subs = merge_correlated(
                 group_correlated,
                 hooks.subs.expect("outer subqueries prepared"),
-                &group_row,
+                &Chained {
+                    inner: &group_row,
+                    outer,
+                },
                 storage,
                 txid,
                 arena,
@@ -853,6 +890,7 @@ pub(super) fn grouped_rows<'a>(
                     params,
                     hooks,
                     row,
+                    outer,
                     &mut *where_scalars,
                     &mut *where_lists,
                 )? {

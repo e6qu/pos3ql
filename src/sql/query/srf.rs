@@ -46,7 +46,14 @@ fn srf_arity_unqualified(name: &str) -> Option<SrfArity> {
             .iter()
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
     };
-    if is_event_trigger_introspection(name) || named(&["pg_cursor", "pg_listening_channels"]) {
+    if is_event_trigger_introspection(name)
+        || named(&[
+            "pg_cursor",
+            "pg_listening_channels",
+            "pg_available_extensions",
+            "pg_available_extension_versions",
+        ])
+    {
         Some(SrfArity::Exact(0))
     } else if is_json_each_name(name)
         || named(&[
@@ -122,6 +129,18 @@ fn srf_arity(name: &str) -> Option<SrfArity> {
 /// Whether `name` is one of the supported set-returning functions.
 pub(crate) fn is_srf_name(name: &str) -> bool {
     srf_arity(name).is_some()
+}
+
+/// `Some(versions)` for `pg_available_extension_versions` (`true`) and
+/// `pg_available_extensions` (`false`).
+fn available_extensions_function(name: &str) -> Option<bool> {
+    if name.eq_ignore_ascii_case("pg_available_extensions") {
+        Some(false)
+    } else if name.eq_ignore_ascii_case("pg_available_extension_versions") {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 fn is_object_address_record_function(name: &str) -> bool {
@@ -1801,6 +1820,13 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             .catalog
             .map_or(0, crate::sql::eval::CatalogAccess::listening_channel_count));
     }
+    if let Some(versions) = available_extensions_function(name) {
+        require_no_arguments(name, args)?;
+        let Some(catalog) = hooks.catalog else {
+            return Ok(0);
+        };
+        return Ok(catalog.available_extension_rows(versions, arena)?.len());
+    }
     let as_i64 = |d: &Datum| -> Option<i64> {
         match d {
             Datum::Int4(v) => Some(*v as i64),
@@ -3218,6 +3244,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_event_introspection = is_event_trigger_introspection(builtin_name);
     let is_cursor_introspection = builtin_name.eq_ignore_ascii_case("pg_cursor");
     let is_listening_channels = builtin_name.eq_ignore_ascii_case("pg_listening_channels");
+    let available_extensions = available_extensions_function(builtin_name);
     let is_logical_slot_record = is_logical_slot_record_function(builtin_name);
     let is_object_address_record = is_object_address_record_function(builtin_name);
     let built_in = is_expand_array
@@ -3251,6 +3278,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_event_introspection
         || is_cursor_introspection
         || is_listening_channels
+        || available_extensions.is_some()
         || is_logical_slot_record
         || is_object_address_record;
     if !built_in && routine.is_none() {
@@ -3369,6 +3397,23 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             );
         }
         6
+    } else if let Some(versions) = available_extensions {
+        require_no_arguments(tref.table, tref.func_args.unwrap_or(&[]))?;
+        let columns = crate::sql::catalog::available_extension_function_columns(versions);
+        for (index, &(name, ctype)) in columns.iter().enumerate() {
+            default_cols[index] = table_function_column(
+                SqlName::parse(name)?,
+                ctype,
+                None,
+                -1,
+                if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
+            );
+        }
+        columns.len()
     } else if is_listening_channels {
         require_no_arguments(tref.table, tref.func_args.unwrap_or(&[]))?;
         default_cols[0] = table_function_column(
@@ -4551,6 +4596,20 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             }
             if is_event_trigger_introspection(tref.table) {
                 return event_trigger_rows(tref.table, args, storage, txid, arena);
+            }
+            if let Some(versions) = available_extensions_function(tref.table) {
+                require_no_arguments(tref.table, args)?;
+                let values = crate::sql::catalog::available_extension_function_rows(
+                    storage, txid, versions, arena,
+                )?;
+                const EMPTY: &[u8] = &[];
+                let rows = arena
+                    .alloc_slice_with(values.len(), |_| EMPTY)
+                    .map_err(|_| arena_full())?;
+                for (output, values) in rows.iter_mut().zip(values) {
+                    *output = crate::sql::exec::encode_projected_pub(values, arena)?;
+                }
+                return Ok(rows);
             }
             if tref.table.eq_ignore_ascii_case("pg_listening_channels") {
                 require_no_arguments(tref.table, args)?;

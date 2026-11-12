@@ -26,7 +26,7 @@ schema changes follow a different procedure; see
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
 | Checkpoint manifest | `pos3ql-manifest-v39` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
-| Journal record | Version `28` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
+| Journal record | Version `29` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process's writer token. |

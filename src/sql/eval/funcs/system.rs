@@ -1170,6 +1170,8 @@ pub(crate) fn dispatch<'a>(
                 | "pg_terminate_backend"
                 | "pg_log_backend_memory_contexts"
                 | "pg_listening_channels"
+                | "pg_available_extensions"
+                | "pg_available_extension_versions"
                 | "pg_notification_queue_usage"
                 | "pg_advisory_lock"
                 | "pg_advisory_lock_shared"
@@ -1224,6 +1226,9 @@ pub(crate) fn dispatch<'a>(
                 | "pg_get_viewdef"
                 | "pg_get_ruledef"
                 | "pg_table_size"
+                | "pg_relation_size"
+                | "pg_total_relation_size"
+                | "pg_indexes_size"
                 | "pg_database_size"
                 | "pg_tablespace_location"
                 | "pg_tablespace_size"
@@ -1465,6 +1470,32 @@ pub(crate) fn dispatch<'a>(
                     )),
                     None => Ok(Datum::Null),
                 }
+            }
+            "pg_available_extensions" | "pg_available_extension_versions" => {
+                arity(0)?;
+                let versions = name == "pg_available_extension_versions";
+                let Some(index) = hooks.srf_index.and_then(|index| index.checked_sub(1)) else {
+                    return Ok(Datum::Null);
+                };
+                let Some(catalog) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let Some(values) = catalog
+                    .available_extension_rows(versions, arena)?
+                    .get(index)
+                    .copied()
+                else {
+                    return Ok(Datum::Null);
+                };
+                let columns = crate::sql::catalog::available_extension_function_columns(versions);
+                let fields = arena
+                    .alloc_slice_with(columns.len(), |field| crate::sql::types::RecordField {
+                        name: columns[field].0,
+                        type_oid: columns[field].1.oid(),
+                        value: values[field],
+                    })
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                Ok(Datum::Record(fields))
             }
             "pg_notification_queue_usage" => {
                 arity(0)?;
@@ -2663,6 +2694,7 @@ pub(crate) fn dispatch<'a>(
                     None => return Ok(Datum::Null),
                 };
                 let col = match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Int2(v) => i32::from(v),
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
                     _ => return Ok(Datum::Null),
@@ -2851,17 +2883,62 @@ pub(crate) fn dispatch<'a>(
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
-            "pg_table_size" => {
-                arity(1)?;
+            "pg_table_size" | "pg_relation_size" | "pg_total_relation_size" | "pg_indexes_size" => {
+                if name == "pg_relation_size" {
+                    if !(1..=2).contains(&args.len()) {
+                        arity(1)?;
+                    }
+                } else {
+                    arity(1)?;
+                }
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                // The `regclass` argument: an untyped literal names the relation.
+                let relation = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Text(name) => super::super::regobject_cast(
+                        Datum::Text(name),
+                        ColType::Regclass,
+                        hooks.catalog,
+                        arena,
+                    )?,
+                    value => value,
+                };
+                let oid = match CatalogOid::parse(relation)? {
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                // Only the main fork holds rows; pos3ql keeps no free-space,
+                // visibility or init forks.
+                let main_fork = match args.get(1) {
+                    None => true,
+                    Some(fork) => match eval_full(fork, arena, params, row, hooks)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Text("main") => true,
+                        Datum::Text("fsm" | "vm" | "init") => false,
+                        Datum::Text(_) => {
+                            crate::sql::eval::stash_diagnostic(
+                                None,
+                                Some(crate::util::StackStr::from_str(
+                                    "Valid fork names are \"main\", \"fsm\", \"vm\", and \"init\".",
+                                )),
+                            );
+                            return Err(sql_err!(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "invalid fork name"
+                            ));
+                        }
+                        other => return Err(type_mismatch(name, &other)),
+                    },
+                };
+                // Indexes have no physical store, so their sizes are zero.
                 Ok(cat
                     .relation_size(oid)?
+                    .map(|size| match name {
+                        "pg_indexes_size" => 0,
+                        _ if !main_fork => 0,
+                        _ => size,
+                    })
                     .map(Datum::Int8)
                     .unwrap_or(Datum::Null))
             }

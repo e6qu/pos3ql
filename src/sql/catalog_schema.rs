@@ -693,11 +693,11 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("oid", ColType::Oid),
             ("lanname", ColType::Name),
             ("lanowner", ColType::Oid),
-            ("lanpltrusted", ColType::Bool),
             ("lanispl", ColType::Bool),
+            ("lanpltrusted", ColType::Bool),
             ("lanplcallfoid", ColType::Oid),
-            ("lanvalidator", ColType::Oid),
             ("laninline", ColType::Oid),
+            ("lanvalidator", ColType::Oid),
             (
                 "lanacl",
                 ColType::Array(crate::sql::types::ArrElem::AclItem),

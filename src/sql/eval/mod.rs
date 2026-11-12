@@ -1848,6 +1848,15 @@ pub trait CatalogAccess {
     fn listening_channel_count(&self) -> usize {
         0
     }
+    /// Rows of `pg_available_extensions()` (or, with `versions`,
+    /// `pg_available_extension_versions()`).
+    fn available_extension_rows<'a>(
+        &self,
+        _versions: bool,
+        _arena: &'a crate::mem::arena::Arena,
+    ) -> Result<&'a [&'a [Datum<'a>]], SqlError> {
+        Ok(&[])
+    }
     fn listening_channel_at(&self, _index: usize) -> Option<crate::sql::notify::Channel> {
         None
     }

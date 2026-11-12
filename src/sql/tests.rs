@@ -16432,7 +16432,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         [
             "base_ext|1.0|NULL",
             "typed_ext|1.0|NULL",
-            "base_ext|1.0|f|t|{}|NULL",
+            "base_ext|1.0|f|t|NULL|NULL",
             "typed_ext|1.0|f|t|{base_ext}|typed extension fixture",
             "typed_ext|2.0|f|t|{base_ext}|typed extension v2",
             "typed_ext|3.0|f|t|{base_ext}|typed extension v3",
@@ -16475,8 +16475,9 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         data_rows(&output),
         [
             "base_ext|1.0|extensions|t",
+            "plpgsql|1.0|pg_catalog|f",
             "typed_ext|1.0|extensions|t",
-            "15",
+            "19",
             "t|{\"WHERE NOT built_in\",\"\"}",
             "5",
             "kept|t",
@@ -16513,6 +16514,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         )),
         [
             "base_ext|1.0",
+            "plpgsql|1.0",
             "typed_ext|2.0",
             "5",
             "kept|t",
@@ -16556,6 +16558,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         )),
         [
             "base_ext|1.0",
+            "plpgsql|1.0",
             "typed_ext|2.0",
             "5",
             "kept|t",
@@ -16606,7 +16609,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         &mut recovered,
         &mut recovered_budget,
         "DROP EXTENSION base_ext CASCADE; \
-         SELECT count(*) FROM pg_extension; \
+         SELECT count(*) FROM pg_extension WHERE extname <> 'plpgsql'; \
          SELECT count(*) FROM pg_class WHERE relname='typed_values'; \
          SELECT count(*) FROM pg_proc WHERE proname='typed_identity'; \
          SELECT count(*) FROM pg_proc WHERE proname='aggregate_dependency_total'; \
@@ -16628,12 +16631,13 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         data_rows(&run_with(
             &mut replayed,
             &mut replay_budget,
-            "SELECT count(*) FROM pg_extension; \
+            "SELECT count(*) FROM pg_extension WHERE extname <> 'plpgsql'; \
              SELECT count(*) FROM pg_class WHERE relname='typed_values'; \
              SELECT count(*) FROM pg_depend \
              WHERE classid = 'pg_extension'::regclass OR refclassid = 'pg_extension'::regclass",
         )),
-        ["0", "0", "0"]
+        // Only initdb's plpgsql extension and its four members remain.
+        ["0", "0", "4"]
     );
     drop(replayed);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -16767,7 +16771,7 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT count(*) FROM pg_extension",
+            "SELECT count(*) FROM pg_extension WHERE extname <> 'plpgsql'",
         )),
         ["0"]
     );
@@ -16777,7 +16781,7 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
             &mut engine,
             &mut budget,
             "BEGIN; CREATE EXTENSION empty_ext; ROLLBACK; \
-             SELECT count(*) FROM pg_extension",
+             SELECT count(*) FROM pg_extension WHERE extname <> 'plpgsql'",
         )),
         ["0"]
     );
@@ -34111,7 +34115,7 @@ fn transactional_alter_table_savepoint_and_rename_visibility() {
     assert_eq!(
         data_rows(&owner_dependencies),
         [
-            "FOREIGN KEY (parent_id) REFERENCES public.renamed(id)",
+            "FOREIGN KEY (parent_id) REFERENCES renamed(id)",
             "original_id_idx",
             "stable identity"
         ],
@@ -34127,7 +34131,7 @@ fn transactional_alter_table_savepoint_and_rename_visibility() {
                FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
               WHERE r.relname = 'child' AND c.contype = 'f'",
         )),
-        ["FOREIGN KEY (parent_id) REFERENCES public.original(id)"]
+        ["FOREIGN KEY (parent_id) REFERENCES original(id)"]
     );
     let observer_new = run_txn(
         &mut engine,
@@ -38051,7 +38055,7 @@ fn catalog_indexes_and_constraints_for_psql_d() {
     ));
     assert_eq!(
         fk,
-        ["parent|FOREIGN KEY (pa, pb) REFERENCES public.parent(a, b)"],
+        ["parent|FOREIGN KEY (pa, pb) REFERENCES parent(a, b)"],
         "fk: {fk:?}"
     );
     // A UNIQUE constraint is backed by an index (conindid links them).
@@ -62577,6 +62581,39 @@ fn correlated_scalar_subquery_in_projection() {
 }
 
 #[test]
+fn nested_subquery_reads_enclosing_subquery_row() {
+    let (mut e, mut b) = test_engine();
+    for (sql, expected) in [
+        (
+            "SELECT (SELECT (SELECT p.x) FROM (VALUES (1)) p(x))",
+            ["1"].as_slice(),
+        ),
+        (
+            "SELECT (SELECT array(SELECT p.x + o.y) FROM (VALUES (1), (3)) p(x) \
+             ORDER BY 1 DESC LIMIT 1) FROM (VALUES (2)) o(y)",
+            &["{5}"],
+        ),
+        (
+            "SELECT EXISTS (SELECT 1 FROM (VALUES (1)) p(x) WHERE (SELECT p.x) = 1)",
+            &["t"],
+        ),
+        (
+            "SELECT (SELECT (SELECT o.y) FROM (VALUES (1)) p(x) GROUP BY p.x) \
+             FROM (VALUES (2)) o(y)",
+            &["2"],
+        ),
+        (
+            "SELECT (SELECT array_agg(p.x) FROM (VALUES (1), (5)) p(x) \
+             WHERE (SELECT o.y + p.x) > 4) FROM (VALUES (2)) o(y)",
+            &["{5}"],
+        ),
+    ] {
+        let bytes = run_with(&mut e, &mut b, sql);
+        assert_eq!(data_rows(&bytes), expected, "{sql}");
+    }
+}
+
+#[test]
 fn correlated_scalar_subquery_streaming() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (a int, b int)");
@@ -80213,7 +80250,8 @@ fn pg_dump_bootstrap_surface() {
             "SELECT count(*) FROM pg_extension x \
              JOIN pg_namespace n ON n.oid=x.extnamespace"
         )),
-        ["0"]
+        // initdb's plpgsql, which pg_dump skips as a built-in object.
+        ["1"]
     );
     run_with(
         &mut engine,

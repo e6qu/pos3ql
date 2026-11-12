@@ -159,6 +159,34 @@ impl Storage {
                 *identity = None;
             }
         }
+        // PostgreSQL creates the primary key's index first, then the other
+        // key and exclusion indexes.
+        let next = || {
+            RelationIdentity::parse(
+                self.catalog_sequence
+                    .next_bounded(MAX_RELATION_GENERATION, "relation")?,
+            )
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "bounded creation stamp is not a relation identity"
+                )
+            })
+        };
+        for attribute in 0..usize::from(definition.attributes.count) {
+            if let super::column_attributes::AttributeSlot::Live(column) =
+                definition.attributes.slots[attribute]
+                && definition.columns[usize::from(column)].primary
+                && definition.inline_index_identities[attribute].is_none()
+            {
+                definition.inline_index_identities[attribute] = Some(next()?);
+            }
+        }
+        for key in &mut definition.uniques[..definition.n_uniques] {
+            if key.kind.is_primary() && key.index_identity.is_none() {
+                key.index_identity = Some(next()?);
+            }
+        }
         for identity in definition.table_index_identities_mut() {
             if identity.is_none() {
                 *identity = Some(

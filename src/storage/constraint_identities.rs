@@ -414,12 +414,119 @@ impl Storage {
                 *identity = None;
             }
         }
-        for identity in definition.constraint_identities_mut() {
+        self.reserve_table_constraints_in_creation_order(definition)?;
+        validate_constraint_identities(definition.constraint_identities())
+    }
+
+    /// Stamps new table constraints in the order PostgreSQL's CREATE TABLE
+    /// assigns their OIDs: column defaults, CHECK constraints, NOT NULL
+    /// constraints (primary key columns last, in key order), the primary key,
+    /// the other keys and exclusion constraints, then foreign keys.
+    fn reserve_table_constraints_in_creation_order(
+        &self,
+        definition: &mut super::TableDefBuilder,
+    ) -> Result<(), SqlError> {
+        let reserve = |identity: &mut Option<ConstraintIdentity>| -> Result<(), SqlError> {
             if identity.is_none() {
                 *identity = Some(ConstraintIdentity::reserve(self)?);
             }
+            Ok(())
+        };
+        let live_column = |definition: &super::TableDefBuilder, attribute: usize| match definition
+            .attributes
+            .slots[attribute]
+        {
+            super::column_attributes::AttributeSlot::Live(column) => Some(usize::from(column)),
+            _ => None,
+        };
+        let attributes = usize::from(definition.attributes.count);
+        for attribute in 0..attributes {
+            if live_column(definition, attribute)
+                .is_some_and(|column| definition.columns[column].default.expression().is_some())
+            {
+                reserve(&mut definition.attribute_identities[attribute].default)?;
+            }
         }
-        validate_constraint_identities(definition.constraint_identities())
+        for check in &mut definition.checks[..definition.n_checks] {
+            reserve(&mut check.identity)?;
+        }
+        // The primary key's columns, in key order.
+        let mut primary = [0u16; super::MAX_INDEX_COLS];
+        let mut primary_count = 0;
+        if let Some(key) = definition
+            .uniques()
+            .iter()
+            .find(|key| key.kind.is_primary())
+        {
+            primary[..key.n_cols].copy_from_slice(key.columns());
+            primary_count = key.n_cols;
+        } else if let Some(column) = definition
+            .columns()
+            .iter()
+            .position(|column| column.primary)
+        {
+            primary[0] = column as u16;
+            primary_count = 1;
+        }
+        let primary = &primary[..primary_count];
+        let not_null = |definition: &super::TableDefBuilder, attribute: usize| {
+            live_column(definition, attribute)
+                .filter(|&column| definition.columns[column].not_null.is_required())
+        };
+        for attribute in 0..attributes {
+            if not_null(definition, attribute)
+                .is_some_and(|column| !primary.contains(&(column as u16)))
+            {
+                reserve(&mut definition.attribute_identities[attribute].not_null)?;
+            }
+        }
+        for &column in primary {
+            if let Some(attribute) = (0..attributes)
+                .find(|&attribute| not_null(definition, attribute) == Some(usize::from(column)))
+            {
+                reserve(&mut definition.attribute_identities[attribute].not_null)?;
+            }
+        }
+        let inline_key = |definition: &super::TableDefBuilder, attribute: usize, primary: bool| {
+            live_column(definition, attribute).is_some_and(|column| {
+                let column = &definition.columns[column];
+                if primary {
+                    column.primary
+                } else {
+                    column.unique && !column.primary
+                }
+            })
+        };
+        for attribute in 0..attributes {
+            if inline_key(definition, attribute, true) {
+                reserve(&mut definition.inline_constraint_identities[attribute])?;
+            }
+        }
+        for key in &mut definition.uniques[..definition.n_uniques] {
+            if key.kind.is_primary() {
+                reserve(&mut key.identity)?;
+            }
+        }
+        for attribute in 0..attributes {
+            if inline_key(definition, attribute, false) {
+                reserve(&mut definition.inline_constraint_identities[attribute])?;
+            }
+        }
+        for key in &mut definition.uniques[..definition.n_uniques] {
+            reserve(&mut key.identity)?;
+        }
+        for exclusion in &mut definition.exclusions[..definition.n_exclusions] {
+            reserve(&mut exclusion.identity)?;
+        }
+        for key in &mut definition.fkeys[..definition.n_fkeys] {
+            reserve(&mut key.identity)?;
+        }
+        // Anything the creation order above does not name keeps the
+        // definition's own order.
+        for identity in definition.constraint_identities_mut() {
+            reserve(identity)?;
+        }
+        Ok(())
     }
 
     /// Reserves a stamp for every view column default that lacks one. A

@@ -100,6 +100,17 @@ python3 tools/generate-pg18-routine-descriptions.py --mode write \
   --signatures src/sql/catalog_callable_signatures.rs \
   --output src/sql/catalog_routine_descriptions.rs
 
+# Shipped pg_description text of built-in schemas, languages, access methods,
+# types, operators, text search objects and the plpgsql extension.
+python3 tools/generate-pg18-object-descriptions.py --mode write \
+  --dsn 'host=127.0.0.1 port=5432 user=postgres dbname=template1' \
+  --output src/sql/catalog_object_descriptions.rs
+
+# Built-in pg_amop and pg_amproc rows and pg_opclass's physical order.
+python3 tools/generate-pg18-access-method-members.py --psql psql \
+  --dsn 'host=127.0.0.1 port=5432 user=postgres dbname=template1' \
+  --output src/sql/catalog_access_method_members.rs
+
 # Every pg_catalog pg_type row, all 32 columns (--mode check compares).
 python3 tools/generate-pg18-type-rows.py --mode write \
   --dsn 'host=127.0.0.1 port=5432 user=postgres dbname=template1' \

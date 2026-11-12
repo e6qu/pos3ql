@@ -339,7 +339,7 @@ pub(super) fn join_shape<'a>(
     let catalog = storage_catalog(storage, arena, txid);
     let columns = CatalogScopeCols {
         scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,

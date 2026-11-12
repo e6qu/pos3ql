@@ -103,15 +103,10 @@ pub(crate) fn fold_aggregates<'a>(
     let states: &mut [AggState] = arena
         .alloc_slice_with(agg_nodes.len(), |_| AggState::default())
         .map_err(|_| arena_full())?;
-    let scope_columns = super::ScopeCols(scope);
-    let outer_columns =
-        super::aggregate_outer_columns(Some(scope), outer_arg, storage, txid, arena);
-    let columns: &dyn crate::sql::exec::ColTypeResolver = match &outer_columns {
-        Some(columns) => columns,
-        None => &scope_columns,
-    };
     for (i, (_, node)) in agg_nodes.iter().enumerate() {
-        states[i].init(node, storage, txid, columns, arena)?;
+        let columns =
+            super::subquery::SubqueryColumns::of_scope(scope, outer_arg, storage, txid, arena);
+        states[i].init(node, storage, txid, &columns, arena)?;
     }
     let recycling_safe = states[..agg_nodes.len()]
         .iter()

@@ -1,0 +1,23 @@
+-- A derived table that is not LATERAL cannot read the FROM items before it.
+create table a195(x int); create table b195(y int);
+insert into a195 values (1), (2); insert into b195 values (1), (2);
+select * from a195, (select * from b195 where b195.y = a195.x) s;
+select * from a195, (select a195.x) s;
+select * from a195 join (select * from b195 where y = a195.x) s on true;
+select * from a195, (with q as (select a195.x) select * from q) s;
+select * from a195, (select * from b195 where y = x) s;
+select * from a195, (select y from b195) s(x), (select x) q;
+select (select y from b195, (select x) s limit 1) from a195 order by 1;
+select (select s.x from b195, (select y) s(x)) from a195;
+select (select count(*) from b195, (select * from a195 where a195.x = b195.y) s) from a195;
+select * from a195, (select * from b195, lateral (select a195.x) q) d;
+select * from (select a195.x) s, a195;
+update a195 set x = s.v from (select a195.x as v) s;
+update a195 set x = s.v from lateral (select a195.x as v) s;
+update a195 set x = s.v from lateral (select x as v) s;
+delete from a195 using (select a195.x) s;
+update a195 set x = x from b195, (select b195.y) s;
+update a195 set x = x from b195, lateral (select b195.y + 1 as w) s where s.w = a195.x + 1 returning x, s.w;
+select * from a195 right join lateral (select a195.x) s on true;
+select * from a195 full join lateral (select x) s on true;
+drop table a195, b195;

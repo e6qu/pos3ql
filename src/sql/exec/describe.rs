@@ -499,7 +499,11 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
                     }
                     if let Some(description) = super::super::query::subquery_result_type(
                         expression,
-                        scope.as_ref(),
+                        scope
+                            .as_ref()
+                            .map(super::super::query::ScopeSchema)
+                            .as_ref()
+                            .map(|schema| schema as &dyn ColumnLookup<'_>),
                         storage,
                         txid,
                         arena,

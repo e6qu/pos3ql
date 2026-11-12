@@ -143,3 +143,31 @@ fn record_literals_follow_record_input() {
         );
     });
 }
+
+#[test]
+fn before_triggers_select_into_new_fields() {
+    with_engine("plpgsql-into-new-fields", |engine, budget| {
+        for sql in [
+            "CREATE TABLE marked (a int, b text)",
+            "CREATE FUNCTION mark() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+             SELECT 42, 'x' || NEW.b INTO NEW.a, NEW.b; \
+             EXECUTE 'SELECT $1 * 2' INTO NEW.a USING NEW.a; \
+             SELECT NEW.a + 1.6 INTO NEW.a; RETURN NEW; END $$",
+            "CREATE TRIGGER mark BEFORE INSERT ON marked FOR EACH ROW EXECUTE FUNCTION mark()",
+            "INSERT INTO marked VALUES (1, 'q')",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let output = run_with(engine, budget, "SELECT * FROM marked");
+        assert_eq!(data_rows(&output), ["86|xq"]);
+        assert_eq!(
+            notices(
+                engine,
+                budget,
+                "CREATE FUNCTION not_trigger() RETURNS int LANGUAGE plpgsql AS \
+                 $$ BEGIN SELECT 1 INTO NEW.a; RETURN 1; END $$",
+            ),
+            ["ERROR 42601 \"new.a\" is not a known variable @86"]
+        );
+    });
+}

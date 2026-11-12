@@ -2341,7 +2341,7 @@ fn register_set_record_shapes<'a>(
         .transpose()?;
     let scoped = scope.as_ref().map(|scope| super::CatalogScopeCols {
         scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,
@@ -2386,11 +2386,9 @@ fn register_set_record_shapes<'a>(
 }
 
 /// Describes a derived table without retaining a maximum-width arena image.
-/// FROM-less LATERAL projections use the preceding tables' column types.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a derived table's description carries its alias list and enclosing row"
-)]
+/// `outer` resolves the names the derived table may read from outside
+/// itself: the enclosing queries, and for a `LATERAL` item first the FROM
+/// items before it.
 pub(crate) fn describe_derived_definition<'a>(
     storage: &Storage,
     sub: &Select<'_>,
@@ -2398,8 +2396,7 @@ pub(crate) fn describe_derived_definition<'a>(
     col_alias: Option<&[&str]>,
     txid: u32,
     arena: &'a Arena,
-    outer: Option<&QueryScope<'_>>,
-    enclosing: Option<&dyn ColumnLookup<'_>>,
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<RelationDefinition<'a>, SqlError> {
     let sub = if sub.with.is_empty() {
         sub
@@ -2408,14 +2405,12 @@ pub(crate) fn describe_derived_definition<'a>(
         // columns, including during procedural input/dependency analysis.
         super::expand_ctes(sub, storage, txid, arena)?
     };
-    let outer_schema = outer.map(super::ScopeSchema);
-    let outer_columns = outer_schema
-        .as_ref()
-        .map(|schema| schema as &dyn ColumnLookup<'_>);
+    let outer_columns = outer;
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let mut type_oids = [0_i32; MAX_PROJ];
     let n_cols = match sub.set_body {
         Some(tree) => {
+            let outer_types = outer.map(super::scope::OuterColumnTypes);
             let n = describe_set_body(
                 storage,
                 tree,
@@ -2424,20 +2419,21 @@ pub(crate) fn describe_derived_definition<'a>(
                 arena,
                 Some(&mut type_oids),
                 crate::sql::exec::DescriptionTarget::Sql,
-                None,
+                outer_types
+                    .as_ref()
+                    .map(|types| types as &dyn ColumnLookup<'_>),
             )?;
             register_set_record_shapes(storage, tree, txid, arena, &mut descriptors[..n])?;
             n
         }
         None => match &sub.from {
-            Some(f) => {
-                let ss = QueryScope::resolve_schema(
-                    storage,
-                    f,
-                    txid,
-                    arena,
-                    outer_columns.or(enclosing),
-                )?;
+            // A FROM-less body may still read the enclosing queries
+            // (`LATERAL (SELECT t.a * 2)` sees the enclosing `t`).
+            from if from.is_some() || outer.is_some() => {
+                let ss = match from {
+                    Some(f) => QueryScope::resolve_schema(storage, f, txid, arena, outer_columns)?,
+                    None => QueryScope::singleton(storage, txid, arena)?,
+                };
                 let n = describe_scope_items(
                     sub.items,
                     &ss,
@@ -2472,7 +2468,7 @@ pub(crate) fn describe_derived_definition<'a>(
                                     expression,
                                     &super::CatalogScopeCols {
                                         scope: &ss,
-                                        outer_scope: outer,
+                                        outer,
                                         storage,
                                         txid,
                                         arena,
@@ -2531,7 +2527,7 @@ pub(crate) fn describe_derived_definition<'a>(
                     Some(&ss),
                     &super::CatalogScopeCols {
                         scope: &ss,
-                        outer_scope: outer,
+                        outer,
                         storage,
                         txid,
                         arena,
@@ -2541,36 +2537,7 @@ pub(crate) fn describe_derived_definition<'a>(
                 )?;
                 n
             }
-            // A FROM-less lateral body types its projection against the outer
-            // scope (`SELECT t.a * 2` sees the enclosing `t`).
-            None if outer.is_some() => {
-                let outer = outer.expect("checked");
-                let n = describe_scope_items(
-                    sub.items,
-                    outer,
-                    None,
-                    storage,
-                    txid,
-                    arena,
-                    &mut descriptors,
-                    crate::sql::exec::DescriptionTarget::Sql,
-                )?;
-                preserve_projection_type_identities(
-                    sub.items,
-                    Some(outer),
-                    &super::CatalogScopeCols {
-                        scope: outer,
-                        outer_scope: None,
-                        storage,
-                        txid,
-                        arena,
-                    },
-                    &descriptors[..n],
-                    &mut type_oids[..n],
-                )?;
-                n
-            }
-            None => {
+            _ => {
                 let n = super::describe_catalog_items(
                     sub.items,
                     None,
@@ -2628,127 +2595,6 @@ pub(crate) fn describe_derived_definition<'a>(
         txid,
         arena,
         &mut descriptors[..n_cols],
-        &type_oids[..n_cols],
-    )
-}
-
-/// Describes a derived table of a query that has an enclosing row, such as a
-/// routine's variables or an outer query level: a plain derived table cannot
-/// see the tables beside it, but it reads every enclosing level, as in
-/// PostgreSQL.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a derived table's description carries its alias list and enclosing row"
-)]
-pub(crate) fn describe_enclosed_derived_definition<'a>(
-    storage: &'a Storage,
-    sub: &'a Select<'a>,
-    exposed: &str,
-    col_alias: Option<&[&str]>,
-    txid: u32,
-    arena: &'a Arena,
-    lateral: Option<&QueryScope<'_>>,
-    enclosing: Option<&dyn ColumnLookup<'a>>,
-) -> Result<RelationDefinition<'a>, SqlError> {
-    let Some(enclosing) = enclosing else {
-        return describe_derived_definition(
-            storage, sub, exposed, col_alias, txid, arena, lateral, None,
-        );
-    };
-    // A LATERAL body also reads the tables to its left, nearer than the
-    // enclosing levels.
-    let lateral_schema = lateral.map(super::ScopeSchema);
-    let chained;
-    let outer_row: &dyn ColumnLookup<'a> = match &lateral_schema {
-        Some(schema) => {
-            chained = super::Chained {
-                inner: schema,
-                outer: Some(enclosing),
-            };
-            &chained
-        }
-        None => enclosing,
-    };
-    let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n_cols = super::describe_select(
-        sub,
-        storage,
-        txid,
-        arena,
-        &mut descriptors,
-        crate::sql::exec::DescriptionTarget::Sql,
-        Some(outer_row),
-    )?;
-    // A record-valued column registers its field shape, as the derived
-    // table's own description does, so `(alias.column).field` is typed.
-    if sub.set_body.is_none()
-        && descriptors[..n_cols]
-            .iter()
-            .any(|description| description.type_oid == crate::sql::types::oid::RECORD)
-    {
-        let sub = super::expand_ctes(sub, storage, txid, arena)?;
-        let scope = sub
-            .from
-            .as_ref()
-            .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, Some(outer_row)))
-            .transpose()?;
-        let columns = super::subquery::SubqueryColumns {
-            scope: scope.as_ref(),
-            outer: Some(outer_row),
-            catalog: crate::sql::exec::CatalogCols {
-                definition: None,
-                alias: None,
-                output_aliases: &[],
-                storage,
-                txid,
-                arena,
-            },
-        };
-        let mut slot = 0usize;
-        for item in sub.items {
-            match item {
-                SelectItem::Expr { expression, .. } => {
-                    if slot < n_cols
-                        && descriptors[slot].type_oid == crate::sql::types::oid::RECORD
-                        && let Some(handle) =
-                            crate::sql::exec::register_shape_for(expression, &columns, arena)?
-                    {
-                        descriptors[slot].type_mod = handle;
-                    }
-                    slot += 1;
-                }
-                SelectItem::Wildcard(_) => {
-                    slot += scope.as_ref().map_or(0, |scope| scope.star_columns());
-                }
-                SelectItem::TableWildcard(name) => {
-                    slot += match scope.as_ref() {
-                        Some(scope) => scope.qualified_star_columns(name)?,
-                        None => 0,
-                    };
-                }
-                SelectItem::RecordStar(base) => {
-                    slot += record_star_width(base, scope.as_ref(), storage, txid, arena)?;
-                }
-            }
-        }
-    }
-    let mut type_oids = [0_i32; MAX_PROJ];
-    let mut renamed = [ColDesc::new("", 0, 0); MAX_PROJ];
-    for ((type_oid, copy), description) in type_oids
-        .iter_mut()
-        .zip(&mut renamed)
-        .zip(&descriptors[..n_cols])
-    {
-        *type_oid = description.type_oid;
-        *copy = *description;
-    }
-    finish_derived_definition(
-        storage,
-        exposed,
-        col_alias,
-        txid,
-        arena,
-        &mut renamed[..n_cols],
         &type_oids[..n_cols],
     )
 }

@@ -1467,7 +1467,7 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                         print_strict_params: parsed.print_strict_params,
                     };
                     let result =
-                        validate_plpgsql_constant_assignments(&program, &|_| false, scratch);
+                        validate_plpgsql_constant_assignments(&program, false, &|_| false, scratch);
                     match expected {
                         Some(state) => assert_eq!(result.unwrap_err().sqlstate, state, "{source}"),
                         None => result.unwrap(),

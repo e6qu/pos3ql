@@ -1344,7 +1344,7 @@ fn retained_join_scope<'a>(
     let scope = QueryScope::resolve_schema_with_join_conditions(storage, from, txid, arena)?;
     let columns = CatalogScopeCols {
         scope: &scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,
@@ -1584,7 +1584,7 @@ fn branch_admitted<'a>(
     };
     let columns = CatalogScopeCols {
         scope: &scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,
@@ -2446,7 +2446,7 @@ impl<'a> RetainedSelect<'a> {
         }
         let columns = CatalogScopeCols {
             scope: &scope,
-            outer_scope: None,
+            outer: None,
             storage,
             txid,
             arena,
@@ -2562,7 +2562,7 @@ impl<'a> RetainedSelect<'a> {
         )?;
         let columns = CatalogScopeCols {
             scope: &scope,
-            outer_scope: None,
+            outer: None,
             storage,
             txid,
             arena,
@@ -2775,7 +2775,7 @@ impl<'a> RetainedSelect<'a> {
         };
         let columns = CatalogScopeCols {
             scope: &scope,
-            outer_scope: None,
+            outer: None,
             storage,
             txid,
             arena,
@@ -3133,7 +3133,7 @@ impl<'a> RetainedSelect<'a> {
                 &scope,
                 &CatalogScopeCols {
                     scope: &scope,
-                    outer_scope: None,
+                    outer: None,
                     storage,
                     txid,
                     arena,
@@ -3156,7 +3156,7 @@ impl<'a> RetainedSelect<'a> {
             statement,
             &CatalogScopeCols {
                 scope: &scope,
-                outer_scope: None,
+                outer: None,
                 storage,
                 txid,
                 arena,
@@ -3224,7 +3224,7 @@ impl<'a> RetainedSelect<'a> {
         let catalog = storage_catalog(storage, arena, txid);
         let columns = CatalogScopeCols {
             scope: &scope,
-            outer_scope: None,
+            outer: None,
             storage,
             txid,
             arena,

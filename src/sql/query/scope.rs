@@ -430,6 +430,12 @@ pub struct QueryScope<'d> {
     /// columns comes from (`None` for a merged `USING` column), which
     /// PostgreSQL names in an ungrouped-column error.
     hidden_origins: &'d [(usize, &'d [Option<&'d str>])],
+    /// The first entry a `LATERAL` FROM item may read. A data-modifying
+    /// statement's target (entry 0) is out of reach of its FROM items.
+    pub(crate) lateral_from: usize,
+    /// Set while adding the right side of a `RIGHT` or `FULL` join, which
+    /// may not read the join's other side even when `LATERAL`.
+    right_of_outer_join: bool,
 }
 
 /// A table (or `USING` alias) inside an unaliased parenthesized join. Its
@@ -468,6 +474,379 @@ pub(crate) fn unreachable_entry(name: &str) -> SqlError {
     )
 }
 
+/// What a derived table sees outside itself. Of the FROM items before it
+/// (`siblings[..preceding]`), only those from `visible_from` on are in reach:
+/// all of them for a `LATERAL` item, none for any other. Beyond them are the
+/// enclosing queries. A name only an out-of-reach item answers fails with
+/// PostgreSQL's invalid-reference diagnostics, with its `LATERAL` hint when
+/// marking the item `LATERAL` would reach it.
+pub(crate) struct DerivedTableOuter<'s, 'd, 'o, 'a> {
+    pub(crate) siblings: &'s QueryScope<'d>,
+    /// How many of `siblings`' entries precede the derived table; later
+    /// ones are not in the query yet when PostgreSQL analyses it.
+    pub(crate) preceding: usize,
+    pub(crate) visible_from: usize,
+    /// Whether the derived table is `LATERAL`.
+    pub(crate) lateral: bool,
+    pub(crate) enclosing: Option<&'o dyn ColumnLookup<'a>>,
+}
+
+impl<'a> DerivedTableOuter<'_, '_, '_, 'a> {
+    /// A derived table at the end of `siblings`, `LATERAL` or not.
+    pub(crate) fn after<'s, 'd, 'o>(
+        siblings: &'s QueryScope<'d>,
+        lateral: bool,
+        enclosing: Option<&'o dyn ColumnLookup<'a>>,
+    ) -> DerivedTableOuter<'s, 'd, 'o, 'a> {
+        DerivedTableOuter {
+            siblings,
+            preceding: siblings.n,
+            visible_from: if lateral && !siblings.right_of_outer_join {
+                siblings.lateral_from
+            } else {
+                siblings.n
+            },
+            lateral,
+            enclosing,
+        }
+    }
+
+    fn target(&self) -> &dyn ColumnLookup<'a> {
+        self.enclosing.unwrap_or(&crate::sql::eval::NoColumns)
+    }
+
+    fn reachable(&self, table: usize) -> bool {
+        (self.visible_from..self.preceding).contains(&table)
+    }
+
+    /// Whether an earlier FROM item in reach answers `qualifier.name`.
+    fn sibling_column(&self, qualifier: Option<&str>, name: &str) -> bool {
+        if self.visible_from >= self.preceding {
+            return false;
+        }
+        match self.siblings.find_column_unpositioned(qualifier, name) {
+            Ok(ResolvedColumn::Table(table, _)) => self.reachable(table),
+            Ok(ResolvedColumn::Merged(_)) => {
+                self.visible_from == 0 && self.preceding == self.siblings.n
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn sibling_table(&self, table: &str) -> bool {
+        self.visible_from < self.preceding
+            && self
+                .siblings
+                .source(table)
+                .is_ok_and(|source| self.reachable(source.table))
+    }
+
+    /// PostgreSQL's error when only an out-of-reach FROM item answers
+    /// `qualifier.name`.
+    fn unreachable(&self, qualifier: Option<&str>, name: &str) -> Option<SqlError> {
+        let scope = self.siblings;
+        let hidden = |table: usize| table < self.preceding && !self.reachable(table);
+        // A `LATERAL` item finds the statement's target, or the other side
+        // of its `RIGHT`/`FULL` join, but may not read it.
+        let lateral_target = |table: usize| {
+            (self.lateral && table < self.visible_from).then(|| {
+                sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    scope.names[table]
+                )
+            })
+        };
+        let lateral_reason = |error: SqlError, table: usize| {
+            if table < scope.lateral_from {
+                target_hint(error, scope.names[table], qualifier, name)
+            } else {
+                crate::sql::error_position::at_reference(
+                    crate::sql::error_position::with_detail(
+                        error,
+                        format_args!(
+                            "The combining JOIN type must be INNER or LEFT for a LATERAL reference."
+                        ),
+                    ),
+                    qualifier.unwrap_or(name),
+                )
+            }
+        };
+        let error = match qualifier {
+            Some(qualifier) => {
+                let table = scope.source(qualifier).ok()?.table;
+                if !hidden(table) {
+                    return None;
+                }
+                if let Some(error) = lateral_target(table) {
+                    return Some(lateral_reason(error, table));
+                }
+                let error = unreachable_entry(qualifier);
+                if table >= scope.lateral_from {
+                    crate::sql::error_position::with_hint(
+                        error,
+                        "To reference that table, you must mark this subquery with LATERAL.",
+                    )
+                } else {
+                    error
+                }
+            }
+            None => {
+                let mut owners = (0..self.preceding.min(scope.n))
+                    .filter(|table| hidden(*table))
+                    .filter_map(|table| Some((table, scope.visible_column_owner(table, name)?)));
+                let (table, first) = owners.next()?;
+                if let Some(error) = lateral_target(table) {
+                    return Some(lateral_reason(error, table));
+                }
+                let error = sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                );
+                if owners.next().is_some() {
+                    crate::sql::error_position::with_hint(
+                        crate::sql::error_position::with_detail(
+                            error,
+                            format_args!(
+                                "There are columns named \"{}\", but they are in tables that cannot be referenced from this part of the query.",
+                                name
+                            ),
+                        ),
+                        "Try using a table-qualified name.",
+                    )
+                } else {
+                    let error = crate::sql::error_position::with_detail(
+                        error,
+                        format_args!(
+                            "There is a column named \"{}\" in table \"{}\", but it cannot be referenced from this part of the query.",
+                            name, first
+                        ),
+                    );
+                    if table >= scope.lateral_from {
+                        crate::sql::error_position::with_hint(
+                            error,
+                            "To reference that column, you must mark this subquery with LATERAL.",
+                        )
+                    } else {
+                        error
+                    }
+                }
+            }
+        };
+        Some(crate::sql::error_position::column_reference(
+            error, qualifier, name,
+        ))
+    }
+
+    /// The enclosing queries' answer, or the out-of-reach diagnostics when
+    /// they have none. An earlier FROM item is searched before the enclosing
+    /// queries' own out-of-reach items, as PostgreSQL searches outward.
+    fn answer<T>(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+        enclosing: Result<T, SqlError>,
+    ) -> Result<T, SqlError> {
+        match enclosing {
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) =>
+            {
+                Err(self.unreachable(qualifier, name).unwrap_or(error))
+            }
+            answer => answer,
+        }
+    }
+}
+
+/// PostgreSQL's hint naming a statement's target that a `LATERAL` item
+/// found but may not read.
+fn target_hint(error: SqlError, table: &str, qualifier: Option<&str>, name: &str) -> SqlError {
+    crate::sql::error_position::at_reference(
+        crate::sql::error_position::with_computed_hint(
+            error,
+            format_args!(
+                "There is an entry for table \"{}\", but it cannot be referenced from this part of the query.",
+                table
+            ),
+        ),
+        qualifier.unwrap_or(name),
+    )
+}
+
+impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        if self.sibling_column(qualifier, name) {
+            return super::ScopeSchema(self.siblings).lookup(qualifier, name);
+        }
+        self.answer(qualifier, name, self.target().lookup(qualifier, name))
+    }
+
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        self.target().procedural_variable(qualifier, name)
+    }
+
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        if self.sibling_column(qualifier, name) {
+            return super::ScopeSchema(self.siblings).column_type_mod(qualifier, name);
+        }
+        self.target().column_type_mod(qualifier, name)
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        if self.sibling_column(qualifier, name) {
+            return super::ScopeSchema(self.siblings).resolve_column_type(qualifier, name);
+        }
+        let enclosing = match self.enclosing {
+            Some(enclosing) if !enclosing.is_empty_scope() => {
+                enclosing.resolve_column_type(qualifier, name)
+            }
+            _ => Err(crate::sql::error_position::column_reference(
+                crate::sql::eval::empty_scope_column_error(qualifier, name),
+                qualifier,
+                name,
+            )),
+        };
+        self.answer(qualifier, name, enclosing)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.preceding == 0
+            && self
+                .enclosing
+                .is_none_or(|enclosing| enclosing.is_empty_scope())
+    }
+
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'a>, SqlError> {
+        self.target().recursive_state(qualifier, index)
+    }
+
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        if self.sibling_column(qualifier, name) {
+            return super::ScopeSchema(self.siblings).column_identity(qualifier, name);
+        }
+        self.target().column_identity(qualifier, name)
+    }
+
+    fn check_unassigned_row_field(
+        &self,
+        qualifier: &str,
+        name: &str,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        if self.sibling_table(qualifier) {
+            return Ok(());
+        }
+        self.target()
+            .check_unassigned_row_field(qualifier, name, catalog, arena)
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [crate::sql::types::RecordField<'a>]>, SqlError> {
+        if self.sibling_table(table) {
+            return super::ScopeSchema(self.siblings).whole_row_fields(table, arena);
+        }
+        self.target().whole_row_fields(table, arena)
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        if self.sibling_table(table) {
+            return super::ScopeSchema(self.siblings)
+                .whole_row_field_metadata(table, index, catalog);
+        }
+        self.target()
+            .whole_row_field_metadata(table, index, catalog)
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<&'a [crate::sql::types::RecordField<'a>], SqlError> {
+        if self.sibling_table(table) {
+            return super::ScopeSchema(self.siblings).whole_row_expansion_fields(table, arena);
+        }
+        self.target().whole_row_expansion_fields(table, arena)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        if self.sibling_table(table) {
+            return super::ScopeSchema(self.siblings).whole_row_present(table);
+        }
+        self.target().whole_row_present(table)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        if self.sibling_column(qualifier, name) {
+            return super::ScopeSchema(self.siblings).col_type(qualifier, name);
+        }
+        self.target().col_type(qualifier, name)
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        if self.sibling_column(qualifier, name) {
+            return super::ScopeSchema(self.siblings).column_type_oid(qualifier, name);
+        }
+        self.target().column_type_oid(qualifier, name)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        if self.sibling_column(qualifier, name) {
+            return super::ScopeSchema(self.siblings).collation(qualifier, name);
+        }
+        self.target().collation(qualifier, name)
+    }
+
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
+        let own = super::ScopeSchema(self.siblings).record_field_collation(base, field);
+        if own != crate::sql::ast::Collation::None && self.visible_from < self.preceding {
+            return own;
+        }
+        self.target().record_field_collation(base, field)
+    }
+
+    fn column_user_type(&self, qualifier: Option<&str>, name: &str) -> Option<UserTypeName> {
+        if self.sibling_column(qualifier, name) {
+            return super::ScopeSchema(self.siblings).column_user_type(qualifier, name);
+        }
+        self.target().column_user_type(qualifier, name)
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        if self.sibling_table(table) {
+            return super::ScopeSchema(self.siblings).whole_row_is_scalar(table);
+        }
+        self.target().whole_row_is_scalar(table)
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        if self.sibling_table(table) {
+            return super::ScopeSchema(self.siblings).whole_row_type(table);
+        }
+        self.target().whole_row_type(table)
+    }
+}
+
 /// Reads a member's `num_nulls(member)` presence column.
 pub(crate) fn member_present(value: Datum<'_>) -> Result<bool, SqlError> {
     match value {
@@ -500,7 +879,7 @@ struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
 
 /// Schema construction can inspect a caller's columns without retaining values
 /// whose lifetime belongs to that caller's row scratch.
-struct OuterColumnTypes<'s, 'row>(&'s dyn ColumnLookup<'row>);
+pub(crate) struct OuterColumnTypes<'s, 'row>(pub(crate) &'s dyn ColumnLookup<'row>);
 
 /// The declared types of an enclosing level known only by type, such as a
 /// routine's variables during input and dependency analysis, as a row whose
@@ -847,6 +1226,8 @@ impl<'d> QueryScope<'d> {
             positional_names: &[],
             hidden_members: &[],
             hidden_origins: &[],
+            lateral_from: 0,
+            right_of_outer_join: false,
         })
     }
 
@@ -963,8 +1344,42 @@ impl<'d> QueryScope<'d> {
         Ok(())
     }
 
+    /// Describes the derived table `tref` about to join this scope. A
+    /// `LATERAL` item reads the FROM items before it, then the enclosing
+    /// queries; any other derived table reads only the enclosing queries.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "description carries the derived table's explicit context"
+    )]
+    fn describe_derived<'a>(
+        &self,
+        storage: &Storage,
+        tref: &TableRef<'_>,
+        sub: &crate::sql::ast::Select<'_>,
+        exposed: &str,
+        col_alias: Option<&[&str]>,
+        txid: u32,
+        arena: &'a Arena,
+        outer: Option<&dyn ColumnLookup<'_>>,
+    ) -> Result<RelationDefinition<'a>, SqlError> {
+        let derived_outer = DerivedTableOuter::after(self, tref.lateral, outer);
+        super::srf::describe_derived_definition(
+            storage,
+            sub,
+            exposed,
+            col_alias,
+            txid,
+            arena,
+            Some(&derived_outer),
+        )
+    }
+
     /// An aliased parenthesized join's column aliases are checked against
     /// the join's columns, which PostgreSQL calls a join expression.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the check describes the join with its enclosing queries"
+    )]
     fn check_join_alias_width(
         &self,
         storage: &Storage,
@@ -973,20 +1388,13 @@ impl<'d> QueryScope<'d> {
         exposed: &str,
         txid: u32,
         arena: &'d Arena,
+        outer: Option<&dyn ColumnLookup<'_>>,
     ) -> Result<(), SqlError> {
         let (Some(_), Some(aliases)) = (tref.join_members, tref.col_alias) else {
             return Ok(());
         };
-        let definition = super::srf::describe_derived_definition(
-            storage,
-            sub,
-            exposed,
-            None,
-            txid,
-            arena,
-            tref.lateral.then_some(self),
-            None,
-        )?;
+        let definition =
+            self.describe_derived(storage, tref, sub, exposed, None, txid, arena, outer)?;
         if aliases.len() > definition.n_columns {
             return Err(sql_err!(
                 sqlstate::INVALID_COLUMN_REFERENCE,
@@ -1302,10 +1710,7 @@ impl<'d> QueryScope<'d> {
             catalog_scan(&from.base, predicate, from.joins.is_empty()),
         )?;
         for j in from.joins {
-            scope.implicit_lateral = !matches!(
-                j.kind,
-                crate::sql::ast::JoinKind::Right | crate::sql::ast::JoinKind::Full
-            );
+            scope.right_of_outer_join = j.kind.is_right_or_full();
             scope.add_exec(
                 storage,
                 &j.table,
@@ -1317,6 +1722,7 @@ impl<'d> QueryScope<'d> {
                 catalog_scan(&j.table, predicate, false),
             )?;
         }
+        scope.right_of_outer_join = false;
         scope.check_join_conditions(from, outer, None)?;
         scope.build_merges(from, arena, Some(arena))?;
         scope.name_repeated_columns(arena)?;
@@ -1654,15 +2060,15 @@ impl<'d> QueryScope<'d> {
         // (a body may project an outer column); a plain derived table is typed
         // on its own. Its rows are materialized per outer row by the scan, so
         // register an empty placeholder here rather than running it now.
-        self.check_join_alias_width(storage, tref, sub, exposed, txid, arena)?;
-        let mut definition = super::srf::describe_enclosed_derived_definition(
+        self.check_join_alias_width(storage, tref, sub, exposed, txid, arena, outer)?;
+        let mut definition = self.describe_derived(
             storage,
+            tref,
             sub,
             exposed,
             tref.col_alias,
             txid,
             arena,
-            tref.lateral.then_some(&*self),
             outer,
         )?;
         if let Some(slot) = tref.view_access {
@@ -1783,38 +2189,49 @@ impl<'d> QueryScope<'d> {
         arena: &'a Arena,
         outer: Option<&dyn ColumnLookup<'_>>,
     ) -> Result<QueryScope<'a>, SqlError> {
-        Self::resolve_schema_joins(storage, from, txid, arena, outer, false)
+        Self::resolve_schema_from(storage, from, txid, arena, outer, 0, false)
+    }
+
+    /// Schema of a data-modifying statement's target (`from.base`) joined
+    /// with its `FROM`/`USING` items, which cannot read the target.
+    pub(crate) fn resolve_dml_schema<'a>(
+        storage: &'a Storage,
+        from: &'a FromClause<'a>,
+        txid: u32,
+        arena: &'a Arena,
+        outer: Option<&dyn ColumnLookup<'_>>,
+    ) -> Result<QueryScope<'a>, SqlError> {
+        Self::resolve_schema_from(storage, from, txid, arena, outer, 1, false)
     }
 
     /// [`Self::resolve_schema`] that also synthesizes the `USING` and
-    /// `NATURAL` join conditions, for a reader that evaluates its joins
-    /// without executing the general executor's scope.
+    /// `NATURAL` join conditions, for rewrites that spell those joins out.
     pub(super) fn resolve_schema_with_join_conditions<'a>(
         storage: &'a Storage,
         from: &'a FromClause<'a>,
         txid: u32,
         arena: &'a Arena,
     ) -> Result<QueryScope<'a>, SqlError> {
-        Self::resolve_schema_joins(storage, from, txid, arena, None, true)
+        Self::resolve_schema_from(storage, from, txid, arena, None, 0, true)
     }
 
-    fn resolve_schema_joins<'a>(
+    fn resolve_schema_from<'a>(
         storage: &'a Storage,
         from: &'a FromClause<'a>,
         txid: u32,
         arena: &'a Arena,
         outer: Option<&dyn ColumnLookup<'_>>,
+        lateral_from: usize,
         join_conditions: bool,
     ) -> Result<QueryScope<'a>, SqlError> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
         scope.add_schema(storage, &from.base, txid, arena, outer)?;
+        scope.lateral_from = lateral_from;
         for j in from.joins {
-            scope.implicit_lateral = !matches!(
-                j.kind,
-                crate::sql::ast::JoinKind::Right | crate::sql::ast::JoinKind::Full
-            );
+            scope.right_of_outer_join = j.kind.is_right_or_full();
             scope.add_schema(storage, &j.table, txid, arena, outer)?;
         }
+        scope.right_of_outer_join = false;
         scope.check_join_conditions(from, outer, None)?;
         scope.build_merges(from, arena, join_conditions.then_some(arena))?;
         scope.name_repeated_columns(arena)?;
@@ -1894,19 +2311,16 @@ impl<'d> QueryScope<'d> {
             }
             None => self.unnamed_entry(tref, arena)?,
         };
-        self.check_join_alias_width(storage, tref, sub, exposed, txid, arena)?;
-        let outer_types = outer.map(OuterColumnTypes);
-        let mut definition = super::srf::describe_enclosed_derived_definition(
+        self.check_join_alias_width(storage, tref, sub, exposed, txid, arena, outer)?;
+        let mut definition = self.describe_derived(
             storage,
+            tref,
             sub,
             exposed,
             tref.col_alias,
             txid,
             arena,
-            tref.lateral.then_some(&*self),
-            outer_types
-                .as_ref()
-                .map(|columns| columns as &dyn ColumnLookup<'a>),
+            outer,
         )?;
         if let Some(slot) = tref.view_access {
             let view = storage.view(usize::from(slot));

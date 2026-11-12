@@ -125,7 +125,7 @@ fn move_having_to_where<'a>(
         .transpose()?;
     let scoped = scope.as_ref().map(|scope| CatalogScopeCols {
         scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,
@@ -632,7 +632,7 @@ fn pull_up_one<'a>(
     }
     let scoped_columns = inner.map(|scope| CatalogScopeCols {
         scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,

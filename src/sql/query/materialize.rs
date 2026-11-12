@@ -641,7 +641,7 @@ fn projected_collations<'a>(
                     base,
                     &super::CatalogScopeCols {
                         scope,
-                        outer_scope: None,
+                        outer: None,
                         storage,
                         txid,
                         arena,

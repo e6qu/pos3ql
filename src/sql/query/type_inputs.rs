@@ -1026,12 +1026,15 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         Ok(())
     }
 
+    /// Visits a FROM item. Its function arguments read `row`; a derived
+    /// table reads `lateral` when marked `LATERAL`, otherwise `hidden`.
     fn table_ref<'a>(
         &mut self,
         table: &ast::TableRef<'a>,
         columns: &dyn ColTypeResolver,
         row: &dyn ColumnLookup<'a>,
-        enclosing: Option<&dyn ColumnLookup<'a>>,
+        lateral: &dyn ColumnLookup<'a>,
+        hidden: &dyn ColumnLookup<'a>,
     ) -> Result<(), SqlError>
     where
         'storage: 'a,
@@ -1039,12 +1042,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         // A plain derived table reads only the levels around its query; a
         // LATERAL one also reads the tables beside it.
         if let Some(query) = table.subquery {
-            let unenclosed = crate::sql::eval::NoColumns;
-            let outer = match (table.lateral, enclosing) {
-                (true, _) => row,
-                (false, Some(enclosing)) => enclosing,
-                (false, None) => &unenclosed,
-            };
+            let outer = if table.lateral { lateral } else { hidden };
             self.select(query, Some(outer), None)?;
         }
         if let Some(arguments) = table.func_args {
@@ -1092,7 +1090,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         }
         if let Some(group) = table.rows_from {
             for table in group {
-                self.table_ref(table, columns, row, enclosing)?;
+                self.table_ref(table, columns, row, lateral, hidden)?;
             }
         }
         Ok(())
@@ -1137,7 +1135,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 let mark = arena.mark();
                 let result: Result<(), SqlError> = (|| {
                     let output = super::srf::describe_derived_definition(
-                        storage, select, "", None, txid, arena, None, outer,
+                        storage, select, "", None, txid, arena, outer,
                     )?;
                     // Set outputs can repeat names such as ?column?. Bind by
                     // ordinal so one output never acquires a sibling's type.
@@ -1207,9 +1205,35 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             catalog: Some(&catalog),
         };
         if let Some(from) = select.from {
-            self.table_ref(&from.base, &columns, &row, outer)?;
-            for join in from.joins {
-                self.table_ref(&join.table, &columns, &row, outer)?;
+            let scope = scope.as_ref().expect("a FROM clause resolves a scope");
+            let reach =
+                |preceding, lateral: bool, reads_left: bool| super::scope::DerivedTableOuter {
+                    siblings: scope,
+                    preceding,
+                    visible_from: if lateral && reads_left {
+                        scope.lateral_from
+                    } else {
+                        preceding
+                    },
+                    lateral,
+                    enclosing: outer,
+                };
+            self.table_ref(
+                &from.base,
+                &columns,
+                &row,
+                &reach(0, true, true),
+                &reach(0, false, true),
+            )?;
+            for (index, join) in from.joins.iter().enumerate() {
+                let reads_left = !join.kind.is_right_or_full();
+                self.table_ref(
+                    &join.table,
+                    &columns,
+                    &row,
+                    &reach(index + 1, true, reads_left),
+                    &reach(index + 1, false, reads_left),
+                )?;
                 if let Some(expression) = join.on {
                     self.expression(expression, &columns, &row)?;
                 }
@@ -1545,9 +1569,33 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             catalog: Some(&catalog),
         };
         if let Some(from) = extra {
-            self.table_ref(&from.base, &columns, &row, outer)?;
-            for join in from.joins {
-                self.table_ref(&join.table, &columns, &row, outer)?;
+            // The assignment target is entry 0, out of every FROM item's reach.
+            let reach = |preceding, lateral: bool| super::scope::DerivedTableOuter {
+                siblings: &scope,
+                preceding,
+                visible_from: if lateral {
+                    scope.lateral_from
+                } else {
+                    preceding
+                },
+                lateral,
+                enclosing: outer,
+            };
+            self.table_ref(
+                &from.base,
+                &columns,
+                &row,
+                &reach(1, true),
+                &reach(1, false),
+            )?;
+            for (index, join) in from.joins.iter().enumerate() {
+                self.table_ref(
+                    &join.table,
+                    &columns,
+                    &row,
+                    &reach(index + 2, true),
+                    &reach(index + 2, false),
+                )?;
                 if let Some(expression) = join.on {
                     self.expression(expression, &columns, &row)?;
                 }

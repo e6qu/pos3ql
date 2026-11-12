@@ -176,7 +176,7 @@ impl ParameterInference<'_> {
         };
         let resolver = scope.as_ref().map(|scope| query::CatalogScopeCols {
             scope,
-            outer_scope: None,
+            outer: None,
             storage: self.storage,
             txid,
             arena: self.arena,

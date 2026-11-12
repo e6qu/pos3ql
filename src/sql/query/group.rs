@@ -59,7 +59,7 @@ pub(super) fn row_passes_correlated_where<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     row: &JoinRow<'_, 'a, '_>,
-    enclosing: Option<&dyn ColumnLookup<'a>>,
+    outer: Option<&dyn ColumnLookup<'a>>,
     scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
     lists: &mut [SubqueryList<'a>],
 ) -> Result<bool, SqlError> {
@@ -74,7 +74,7 @@ pub(super) fn row_passes_correlated_where<'a>(
         correlated,
         base,
         row,
-        enclosing,
+        outer,
         storage,
         txid,
         arena,
@@ -87,25 +87,22 @@ pub(super) fn row_passes_correlated_where<'a>(
         subs: Some(&row_subs),
         ..*hooks
     };
-    let row = super::Chained {
-        inner: row,
-        outer: enclosing,
-    };
+    let row = super::Chained { inner: row, outer };
     where_passes(w, arena, params, &row, &h)
 }
 
 /// The outer-row lookup for a correlated subquery re-evaluated per GROUP:
 /// a reference resolves to a grouping key's value for this group (a key
-/// collapsed by the current grouping set reads NULL). Anything else is
-/// PostgreSQL's ungrouped-column error (42803). A name that is not a column
-/// of the grouped query is left to the levels around it.
-struct GroupRow<'g, 'a> {
+/// collapsed by the current grouping set reads NULL). Any other column of the
+/// grouped query is PostgreSQL's ungrouped-column error (42803); a name the
+/// grouped query does not define is left to the enclosing queries.
+struct GroupRow<'g, 's, 'd, 'a> {
+    scope: &'s QueryScope<'d>,
     group_by: &'a [&'a Expr<'a>],
     keys: &'g [Datum<'a>],
-    scope: &'g QueryScope<'a>,
 }
 
-impl<'a> ColumnLookup<'a> for GroupRow<'_, 'a> {
+impl<'a> ColumnLookup<'a> for GroupRow<'_, '_, '_, 'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         for (g, v) in self.group_by.iter().zip(self.keys) {
             if let Expr::Column {
@@ -128,28 +125,41 @@ impl<'a> ColumnLookup<'a> for GroupRow<'_, 'a> {
         ))
     }
 
+    // Static types are the grouped query's own: a key keeps its column's type.
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<crate::sql::types::ColType, SqlError> {
-        super::ScopeSchema(self.scope).resolve_column_type(qualifier, name)
+        ScopeSchema(self.scope).resolve_column_type(qualifier, name)
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        super::ScopeSchema(self.scope).col_type(qualifier, name)
-    }
-
-    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        super::ScopeSchema(self.scope).column_type_oid(qualifier, name)
+        ScopeSchema(self.scope).col_type(qualifier, name)
     }
 
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
-        super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
+        ScopeSchema(self.scope).column_type_mod(qualifier, name)
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        ScopeSchema(self.scope).column_type_oid(qualifier, name)
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
-        super::ScopeSchema(self.scope).collation(qualifier, name)
+        ScopeSchema(self.scope).collation(qualifier, name)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        ScopeSchema(self.scope).column_user_type(qualifier, name)
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<crate::sql::types::ColType> {
+        ScopeSchema(self.scope).whole_row_type(table)
     }
 }
 
@@ -475,9 +485,16 @@ pub(super) fn groups_for_mask<'a>(
 
     // Correlated subquery nodes appearing in the select list, HAVING, or the
     // ORDER BY keys re-evaluate per group (their outer references resolve to
-    // the group's keys); the rest were WHERE-level and already applied.
+    // the group's keys); the rest were WHERE-level and already applied. One
+    // inside an aggregate's arguments reads each input row instead.
     let mut group_correlated_list = ArenaList::new(arena);
     for &node in correlated {
+        if agg_nodes
+            .iter()
+            .any(|(_, aggregate)| expr_contains_node(aggregate, node as *const Expr))
+        {
+            continue;
+        }
         let in_group_clauses = statement.items.iter().any(|item| {
             matches!(item, SelectItem::Expr { expression, .. }
                 if expr_contains_node(expression, node as *const Expr))
@@ -694,9 +711,9 @@ pub(super) fn groups_for_mask<'a>(
             hooks.subs
         } else {
             let group_row = GroupRow {
+                scope,
                 group_by: statement.group_by,
                 keys: &key_vals[..n_keys],
-                scope,
             };
             merged_subs = merge_correlated(
                 group_correlated,
@@ -727,12 +744,8 @@ pub(super) fn groups_for_mask<'a>(
             sequences: hooks.sequences,
             merge_action: hooks.merge_action,
         };
-        // Outer references, such as PL/pgSQL variables, read the caller's row.
-        let scope_schema = ScopeSchema(scope);
-        let schema = super::scan::Chained {
-            inner: &scope_schema,
-            outer,
-        };
+        let own = ScopeSchema(scope);
+        let schema = super::Chained { inner: &own, outer };
         if let Some(h) = statement.having {
             match eval_full(h, arena, params, &schema, &group_hooks)? {
                 Datum::Bool(true) => {}
@@ -1280,7 +1293,7 @@ fn expand_grouped_stars<'a>(
                 let mut error = None;
                 let resolver = super::CatalogScopeCols {
                     scope,
-                    outer_scope: None,
+                    outer: None,
                     storage,
                     txid,
                     arena,
@@ -1381,13 +1394,14 @@ pub(super) fn ungrouped_column<'e, 'a>(
             .find_map(|e| ungrouped_column(e, group_by, scope, agg_nodes))
     };
     match expression {
-        Expr::WholeRow(_) | Expr::SchemaColumn { .. } | Expr::RecursiveState { .. } => {
-            Some(expression)
-        }
-        // A name outside the query's own sources is an outer reference, such
-        // as a PL/pgSQL variable: constant within every group.
-        Expr::Column { qualifier, name }
-        | Expr::RoutineParam {
+        // A column of an enclosing query is constant within each group.
+        Expr::Column { qualifier, name } => scope
+            .find_column(*qualifier, name)
+            .is_ok()
+            .then_some(expression),
+        Expr::WholeRow(table) => scope.source(table).is_ok().then_some(expression),
+        Expr::SchemaColumn { .. } | Expr::RecursiveState { .. } => Some(expression),
+        Expr::RoutineParam {
             qualifier, name, ..
         } => scope.find_column(*qualifier, name).ok().map(|_| expression),
         Expr::Null

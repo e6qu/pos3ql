@@ -415,30 +415,23 @@ queries, including data-modifying ones, in one new command as PostgreSQL
 does. Remaining: `OPEN ... FOR` a query with data-modifying `WITH` queries
 fails with `0A000` (the cursor reruns its query at each `FETCH` and cannot
 keep the written rows); and a PL/pgSQL write with `WITH` queries whose nested
-AFTER trigger waits fails with `0A000` instead of resuming. A derived table
-in FROM, or a `WITH` query run as one, that names a routine variable or a
-trigger's `NEW`/`OLD` row fails as an unknown column in a function called
-from SQL or an AFTER trigger (`SELECT a INTO x FROM (SELECT n + 1 AS a) q`):
-describing it for planner inputs does not see the routine's variables.
-Describing a derived table sees one level of FROM items at most, which
-needs a chain of enclosing scopes: a `LATERAL` item inside a parenthesized
-join or a derived table can reference only the FROM items beside it, so
-`a JOIN (b JOIN LATERAL (SELECT a.x) s ON true) ON true` reports a missing
-FROM-clause entry for `a` where PostgreSQL accepts it; a reference from a
-non-`LATERAL` derived table's projection to an earlier FROM item reports a
-missing FROM-clause entry without PostgreSQL's `invalid reference` detail
-and `LATERAL` hint; and one in its `WHERE` clause (`SELECT * FROM a,
-(SELECT * FROM b WHERE b.y = a.x) d`) runs as if the item were `LATERAL`
-where PostgreSQL rejects it. A
+AFTER trigger waits fails with `0A000` instead of resuming. A `LATERAL` item on the right of
+a `RIGHT` or `FULL` join that reads only FROM items outside that join
+(`SELECT * FROM b, a RIGHT JOIN LATERAL (SELECT b.y) s ON true`) fails with
+`0A000` where PostgreSQL accepts it. A derived table computes output
+columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
+FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
+PostgreSQL, which drops unread subquery outputs, returns the row. A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
 PostgreSQL types it as the table's row type `t`. A row constructor casts to a table's row type
 (`ROW(1, 'a')::t`) but not to a view's, and an array of a table's row type
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. In a trigger function,
-`SELECT ... INTO NEW.col` (and `EXECUTE ... INTO NEW.col`, `FETCH ... INTO
-NEW.col`) fails with `"new.col" is not a known variable`, where PostgreSQL
-assigns the field; `NEW.col := ...` works. A `CONSTANT`
+`FETCH ... INTO NEW.col`, a write's `RETURNING ... INTO NEW.col`, any
+`INTO OLD.col`, and assigning `NEW` in an AFTER trigger fail with `0A000`,
+where PostgreSQL assigns the field; `SELECT` and `EXECUTE ... INTO NEW.col`
+in a BEFORE trigger work. A `CONSTANT`
 assignment error has no cursor position: PL/pgSQL assignment targets do not
 keep their place in the routine body.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY

@@ -53,6 +53,7 @@ mod procedural_subtransactions;
 mod procedure_progress;
 mod pseudo_type_identities;
 mod query_execution;
+mod query_scope_chain;
 mod record_comparisons;
 mod relation_row_types;
 mod result_streams;

@@ -457,3 +457,173 @@ fn repeatable_read_writes_fail_on_rows_changed_after_the_snapshot() {
     sessions.second("ROLLBACK");
     sessions.finish();
 }
+
+const ITEMS: &str = "CREATE TABLE items (id int PRIMARY KEY, qty int, note text); \
+     CREATE TABLE stock (id int, qty int); \
+     INSERT INTO items VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 3, 'c'); \
+     INSERT INTO stock VALUES (1, 1), (2, 2), (4, 4)";
+
+/// Runs `statement` in the second session while the first holds `change`
+/// uncommitted, then commits the change and returns the statement's output.
+fn after_concurrent_change(sessions: &mut Sessions, change: &str, statement: &str) -> Vec<u8> {
+    sessions.first(
+        "DELETE FROM items; DELETE FROM stock; \
+         INSERT INTO items VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 3, 'c'); \
+         INSERT INTO stock VALUES (1, 1), (2, 2), (4, 4)",
+    );
+    sessions.first(&format!("BEGIN; {change}"));
+    let parked = sessions.second_waits(statement);
+    sessions.first("COMMIT");
+    sessions.resume_second(statement, parked)
+}
+
+#[test]
+fn read_committed_select_for_update_returns_and_rechecks_the_latest_version() {
+    for mode in MODES {
+        let mut sessions = sessions("select-for-update-recheck", mode, ITEMS);
+        for (change, statement, expected) in [
+            // The latest version is returned, not the one first read.
+            (
+                "UPDATE items SET qty = qty + 1 WHERE id = 1",
+                "SELECT * FROM items WHERE id = 1 FOR UPDATE",
+                &["1|2|a"][..],
+            ),
+            (
+                "UPDATE items SET note = 'z' WHERE id = 1",
+                "SELECT id, qty * 10, note FROM items WHERE id = 1 FOR SHARE",
+                &["1|10|z"],
+            ),
+            // A row that no longer meets WHERE leaves the result, and LIMIT
+            // takes the next row instead.
+            (
+                "UPDATE items SET qty = 100 WHERE id = 1",
+                "SELECT id FROM items WHERE qty < 50 ORDER BY id LIMIT 1 FOR UPDATE",
+                &["2"],
+            ),
+            // Join conditions run again with the unlocked side as read.
+            (
+                "UPDATE items SET qty = qty + 1",
+                "SELECT i.id, s.qty FROM items i JOIN stock s ON s.id = i.id AND s.qty = i.qty \
+                 ORDER BY i.id FOR UPDATE",
+                &[],
+            ),
+            (
+                "UPDATE items SET qty = qty + 1 WHERE id = 1",
+                "SELECT i.id, i.qty, s.qty FROM items i LEFT JOIN stock s \
+                 ON s.id = i.id AND s.qty = i.qty ORDER BY i.id FOR UPDATE OF i",
+                &["1|2|NULL", "2|2|2", "3|3|NULL"],
+            ),
+        ] {
+            let output = after_concurrent_change(&mut sessions, change, statement);
+            assert!(error_sqlstates(&output).is_empty(), "{mode:?} {statement}");
+            assert_eq!(data_rows(&output), expected, "{mode:?} {statement}");
+        }
+        sessions.finish();
+    }
+}
+
+#[test]
+fn read_committed_merge_chooses_its_action_again_for_the_latest_version() {
+    let mut sessions = sessions("merge-recheck", TransactionMode::Mvcc, ITEMS);
+    for (change, statement, expected) in [
+        // The update applies to the committed quantity (no lost update) and
+        // its WHEN conditions run again.
+        (
+            "UPDATE items SET qty = qty + 1 WHERE id = 1",
+            "MERGE INTO items USING stock ON stock.id = items.id \
+             WHEN MATCHED AND items.qty = 1 THEN UPDATE SET qty = items.qty + 10 \
+             WHEN MATCHED THEN UPDATE SET note = 'm' \
+             WHEN NOT MATCHED THEN INSERT VALUES (stock.id, stock.qty, 'i')",
+            &["1|2|m", "2|2|m", "3|3|c", "4|4|i"][..],
+        ),
+        (
+            "UPDATE items SET note = 'z' WHERE id = 1",
+            "MERGE INTO items USING stock ON stock.id = items.id \
+             WHEN MATCHED THEN UPDATE SET qty = items.qty + 10",
+            &["1|11|z", "2|12|b", "3|3|c"],
+        ),
+        // A deleted target row turns the pair into NOT MATCHED.
+        (
+            "DELETE FROM items WHERE id = 1",
+            "MERGE INTO items USING stock ON stock.id = items.id \
+             WHEN MATCHED THEN UPDATE SET note = 'm' \
+             WHEN NOT MATCHED THEN INSERT VALUES (stock.id, stock.qty, 'i')",
+            &["1|1|i", "2|2|m", "3|3|c", "4|4|i"],
+        ),
+        // A join condition that no longer holds runs the NOT MATCHED BY
+        // SOURCE action on the target row and the NOT MATCHED action for
+        // the source row.
+        (
+            "UPDATE items SET id = 5 WHERE id = 1",
+            "MERGE INTO items USING stock ON stock.id = items.id \
+             WHEN MATCHED THEN UPDATE SET note = 'm' \
+             WHEN NOT MATCHED BY SOURCE THEN UPDATE SET note = 's' \
+             WHEN NOT MATCHED THEN INSERT VALUES (stock.id + 30, stock.qty, 'n')",
+            &["2|2|m", "3|3|s", "5|1|s", "31|1|n", "34|4|n"],
+        ),
+    ] {
+        let output = after_concurrent_change(&mut sessions, change, statement);
+        assert!(error_sqlstates(&output).is_empty(), "{statement}");
+        assert_eq!(
+            sessions.rows("SELECT * FROM items ORDER BY id"),
+            expected,
+            "{statement}"
+        );
+    }
+    sessions.finish();
+}
+
+#[test]
+fn row_locks_reject_nullable_outer_join_sides_and_set_returning_targets() {
+    let mut sessions = sessions("lock-validation", TransactionMode::Mvcc, ITEMS);
+    for (statement, message) in [
+        (
+            "SELECT * FROM items LEFT JOIN stock ON stock.id = items.id FOR UPDATE",
+            "FOR UPDATE cannot be applied to the nullable side of an outer join",
+        ),
+        (
+            "SELECT * FROM items RIGHT JOIN stock ON stock.id = items.id FOR SHARE OF items",
+            "FOR SHARE cannot be applied to the nullable side of an outer join",
+        ),
+        (
+            "SELECT id, generate_series(1, 2) FROM items FOR UPDATE",
+            "FOR UPDATE is not allowed with set-returning functions in the target list",
+        ),
+    ] {
+        let output = sessions.second(statement);
+        assert_eq!(error_sqlstates(&output), ["0A000"], "{statement}");
+        assert!(
+            String::from_utf8_lossy(&output).contains(message),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    sessions.finish();
+}
+
+#[test]
+fn only_a_changed_key_value_waits_for_key_share_locks() {
+    let mut sessions = sessions(
+        "key-value-lock-strength",
+        TransactionMode::Mvcc,
+        PARENT_CHILD,
+    );
+    sessions.first("BEGIN; INSERT INTO children VALUES (10, 1)");
+    // Assignments that keep every key value take FOR NO KEY UPDATE strength.
+    for statement in [
+        "UPDATE parents SET id = id WHERE id = 1",
+        "UPDATE parents SET id = 1, note = 'same' WHERE id = 1",
+        "MERGE INTO parents USING (SELECT 1 AS id) s ON s.id = parents.id \
+         WHEN MATCHED THEN UPDATE SET id = parents.id",
+    ] {
+        let output = sessions.second(statement);
+        assert!(error_sqlstates(&output).is_empty(), "{statement}");
+    }
+    // A changed key value waits for the inserting child's key share lock.
+    let update = "UPDATE parents SET id = 3 WHERE id = 1";
+    let parked = sessions.second_waits(update);
+    sessions.first("COMMIT");
+    let output = sessions.resume_second(update, parked);
+    assert_eq!(error_sqlstates(&output), ["23503"]);
+    sessions.finish();
+}

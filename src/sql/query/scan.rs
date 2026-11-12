@@ -365,6 +365,73 @@ impl<'a> ColumnLookup<'a> for NoColumns {
     }
 }
 
+/// The latest version of a locked source row, in the source's column order.
+/// `None` when the row is gone, which a held lock rules out except for the
+/// locking transaction's own deletion.
+pub(super) fn latest_locked_source<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'a>,
+    table: usize,
+    slot: usize,
+    rowid: u64,
+    arena: &'a Arena,
+) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    let Some(state) = storage.row_state(slot, rowid)? else {
+        return Ok(None);
+    };
+    let Some(home) = storage.uniqueness_row_home(slot, rowid, state, txid)? else {
+        return Ok(None);
+    };
+    let bytes = storage.row_bytes(slot, rowid, home, arena)?;
+    let definitions = storage.table_definition_images();
+    let physical = definitions.definition(storage, slot, txid)?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    physical.schema(&mut schema);
+    let mut physical_values = [Datum::Null; MAX_COLUMNS];
+    rowenc::decode(bytes, &schema[..physical.n_columns], &mut physical_values)?;
+    let logical = scope
+        .defs
+        .stored(table)
+        .expect("locked source is a stored relation");
+    let values = arena
+        .alloc_slice_with(logical.n_columns, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    crate::storage::RelationColumnMap::new(logical, physical, arena)?
+        .project(&physical_values[..physical.n_columns], values);
+    refresh_catalog_object_names(storage, txid, values, arena)?;
+    Ok(Some(values))
+}
+
+/// The SELECT row-security policy a stored source's scan applies.
+pub(super) fn source_select_security<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'a>,
+    table: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<RowSecurityPlan<'a>>, SqlError> {
+    if scope.derived[table].is_some() {
+        return Ok(None);
+    }
+    let current_role = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    let role = scope.authorization_roles[table].map_or(current_role, usize::from);
+    plan_row_security(
+        storage,
+        scope.slots[table],
+        role,
+        PolicyCommandKind::Select,
+        RowSecurityExpression::Using,
+        txid,
+        arena,
+    )
+}
+
 fn refresh_catalog_object_names<'a>(
     storage: &Storage,
     txid: u32,

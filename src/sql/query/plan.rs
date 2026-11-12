@@ -974,7 +974,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         return 0;
     }
     let oid_of = |x: &Expr| -> Option<i32> {
-        crate::sql::exec::infer_type_res(x, &ScopeCols(scope))
+        crate::sql::exec::infer_type_res(x, &ScopeCols::new(scope))
             .ok()
             .map(|t| t.0)
     };

@@ -4192,6 +4192,9 @@ pub struct JoinRow<'s, 'v, 'd> {
     /// Stable MVCC identities for physical base-table contributors. Derived
     /// rows, function rows, and outer-join null sides carry `None`.
     pub rowids: &'s [Option<u64>],
+    /// Names resolve over the first `visible` FROM items. A `LATERAL` item's
+    /// body sees only the items to its left, not its own or later columns.
+    pub(crate) visible: usize,
 }
 
 impl<'s, 'v> JoinRow<'s, 'v, '_> {
@@ -4252,7 +4255,7 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
 
 impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
-        super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
+        super::ScopeSchema::prefix(self.scope, self.visible).column_type_mod(qualifier, name)
     }
     fn whole_row_field_metadata(
         &self,
@@ -4260,14 +4263,15 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         index: usize,
         catalog: Option<&dyn super::super::eval::CatalogAccess>,
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
-        super::ScopeSchema(self.scope).whole_row_field_metadata(table, index, catalog)
+        super::ScopeSchema::prefix(self.scope, self.visible)
+            .whole_row_field_metadata(table, index, catalog)
     }
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<crate::sql::types::ColType, SqlError> {
-        super::ScopeSchema(self.scope).resolve_column_type(qualifier, name)
+        super::ScopeSchema::prefix(self.scope, self.visible).resolve_column_type(qualifier, name)
     }
 
     fn is_empty_scope(&self) -> bool {
@@ -4285,7 +4289,10 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 name
             )),
         };
-        match self.scope.find_column(qualifier, name)? {
+        match self
+            .scope
+            .find_column_among(self.visible, qualifier, name)?
+        {
             ResolvedColumn::Table(t, c) => one(t, c),
             // Merged USING/NATURAL column: the first non-null contributor.
             ResolvedColumn::Merged(m) => {
@@ -4302,7 +4309,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'v>, SqlError> {
-        let table = self.scope.table_index(qualifier)?;
+        let table = self.scope.table_index_among(self.visible, qualifier)?;
         let visible = self.scope.defs.get(table).expect("resolved").n_columns;
         self.table_values(table)
             .and_then(|values| values.get(visible + index))
@@ -4317,12 +4324,19 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        let entry = self.scope.find_column(qualifier, name).ok()?;
+        let entry = self
+            .scope
+            .find_column_among(self.visible, qualifier, name)
+            .ok()?;
         Some(self.scope.output_type(entry))
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        match self.scope.find_column(qualifier, name).ok() {
+        match self
+            .scope
+            .find_column_among(self.visible, qualifier, name)
+            .ok()
+        {
             Some(ResolvedColumn::Table(table, column)) => self
                 .scope
                 .defs
@@ -4341,8 +4355,12 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn record_field_collation(&self, base: &Expr<'v>, field: &str) -> crate::sql::ast::Collation {
-        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.scope))
-            .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
+        crate::sql::exec::record_field_metadata(
+            base,
+            field,
+            &super::ScopeCols::prefix(self.scope, self.visible),
+        )
+        .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
     }
 
     fn column_user_type(
@@ -4350,7 +4368,11 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        match self.scope.find_column(qualifier, name).ok()? {
+        match self
+            .scope
+            .find_column_among(self.visible, qualifier, name)
+            .ok()?
+        {
             ResolvedColumn::Table(t, c) => self
                 .scope
                 .defs
@@ -4362,11 +4384,15 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn whole_row_is_scalar(&self, table: &str) -> bool {
-        self.scope.func_scalar_type(table).is_some()
+        self.scope
+            .func_scalar_type_among(self.visible, table)
+            .is_some()
     }
 
     fn whole_row_type(&self, table: &str) -> Option<crate::sql::types::ColType> {
-        self.scope.qualified_star_columns(table).ok()?;
+        self.scope
+            .qualified_star_columns_among(self.visible, table)
+            .ok()?;
         Some(
             self.scope
                 .func_scalar_type(table)
@@ -4378,7 +4404,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         if self.scope.using_alias(table).is_some() {
             return Ok(true);
         }
-        let t = self.scope.table_index(table)?;
+        let t = self.scope.table_index_among(self.visible, table)?;
         match self.table_present(t) {
             Some(present) => Ok(present),
             None => Err(sql_err!(
@@ -4401,7 +4427,9 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 value: Datum::Null,
             }; MAX_COLUMNS];
             for (index, field) in fields.iter_mut().enumerate().take(alias.n_columns) {
-                let entry = self.scope.qualified_star_entry(table, index)?;
+                let entry = self
+                    .scope
+                    .qualified_star_entry_among(self.visible, table, index)?;
                 let name = self.scope.output_name(entry);
                 field.name = arena.alloc_str(name).map_err(|_| arena_full())?;
                 field.type_oid = self.scope.output_type(entry).oid();
@@ -4412,7 +4440,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 .map(|fields| Some(&*fields))
                 .map_err(|_| arena_full());
         }
-        let t = self.scope.table_index(table)?;
+        let t = self.scope.table_index_among(self.visible, table)?;
         let def = self.scope.defs.get(t).expect("resolved");
         if !self.whole_row_present(table)? {
             return Ok(None);
@@ -4450,7 +4478,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         if let Some(fields) = self.whole_row_fields(table, arena)? {
             return Ok(fields);
         }
-        let table = self.scope.table_index(table)?;
+        let table = self.scope.table_index_among(self.visible, table)?;
         let definition = self.scope.defs.get(table).expect("resolved");
         let columns = definition.columns();
         let fields = arena
@@ -6172,6 +6200,7 @@ fn scan_source_mode<'a>(
                 buffer_offsets: buffers.offsets,
             },
             rowids: &bound_rowids[..scope.n],
+            visible: scope.n,
         })
     }
 
@@ -7131,7 +7160,7 @@ fn scan_source_mode<'a>(
             } else {
                 &from.joins[t - 1].table
             };
-            let outer_row = assemble(
+            let mut outer_row = assemble(
                 storage,
                 txid,
                 scope,
@@ -7142,6 +7171,7 @@ fn scan_source_mode<'a>(
                 decode_buffers,
                 arena,
             )?;
+            outer_row.visible = t;
             let chained = Chained {
                 inner: &outer_row,
                 outer,
@@ -7684,16 +7714,6 @@ fn scan_source_mode<'a>(
     // item depends on the tables to its left, so any lateral entry also pins the
     // order to FROM order (reordering could bind a dependency after it).
     let any_lateral = scope.lateral[..scope.n].iter().any(|&l| l);
-    // A LATERAL item references the tables to its left, so it cannot be the
-    // right side of a RIGHT/FULL join (PostgreSQL rejects this too).
-    for j in from.joins {
-        if j.table.lateral && matches!(j.kind, JoinKind::Right | JoinKind::Full) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "a LATERAL item cannot be on the right side of a RIGHT or FULL join"
-            ));
-        }
-    }
     let all_cross = from.joins.iter().all(|j| matches!(j.kind, JoinKind::Cross));
     let order = arena
         .alloc_slice_with(scope.n, |index| index)

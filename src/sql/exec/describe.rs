@@ -662,7 +662,7 @@ impl ColTypeResolver for CatalogCols<'_> {
                 )
             })
             .transpose()?;
-        let schema = scope.as_ref().map(super::super::query::ScopeSchema);
+        let schema = scope.as_ref().map(super::super::query::ScopeSchema::new);
         let empty = super::super::eval::NoColumns;
         let outer: &dyn super::super::eval::ColumnLookup<'_> = match &schema {
             Some(schema) => schema,

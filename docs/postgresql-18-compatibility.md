@@ -54,6 +54,12 @@ Schemas and catalogs:
   binary input with `0A000`, as PostgreSQL does. Copying non-null statistics
   values, including `pg_statistic[]`, into user tables fails with `0A000`.
 
+- A `LATERAL` item, or a function's arguments in `FROM`, read only the items
+  to its left, never their own or later items' columns: in `SELECT * FROM t,
+  LATERAL (SELECT v) s`, `v` is `t.v`. On the right of a `RIGHT` or `FULL`
+  join such an item reads none of them; naming one fails with `42P10` and
+  PostgreSQL's detail, and a body that names none runs once.
+
 Data-modifying statements:
 
 - A `FROM`, `USING` or `MERGE` source item cannot refer to the statement's
@@ -61,7 +67,13 @@ Data-modifying statements:
   o.n) g` and `FROM LATERAL (SELECT o.n)` fail with `42P10`; a plain subquery,
   a join condition or a `MERGE` source fails with `42P01` (`invalid reference
   to FROM-clause entry for table "o"`). An unqualified target column in a plain
-  subquery reports `42703` without PostgreSQL's detail line.
+  subquery reports `42703` without PostgreSQL's detail line. The target
+  answers a `LATERAL` body's unqualified column before the other items do, so
+  `UPDATE orders SET n = 0 FROM items i, LATERAL (SELECT n) s` fails with
+  `42P10` even when `items` also has `n`.
+- `RETURNING` in `UPDATE ... FROM` and `DELETE ... USING` reads only the
+  target row: `RETURNING *` fails with `0A000` where PostgreSQL also lists the
+  other items' columns, and a reference to another item fails with `42P01`.
 - Correlated subqueries in `WHERE` and `WHEN` conditions run for every
   candidate row: `DELETE FROM orders WHERE EXISTS (SELECT 1 FROM refunds r
   WHERE r.order_id = orders.id)`.

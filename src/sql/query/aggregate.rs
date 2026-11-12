@@ -100,7 +100,7 @@ pub(crate) fn fold_aggregates<'a>(
     let states: &mut [AggState] = arena
         .alloc_slice_with(agg_nodes.len(), |_| AggState::default())
         .map_err(|_| arena_full())?;
-    let scope_columns = super::ScopeCols(scope);
+    let scope_columns = super::ScopeCols::new(scope);
     let outer_columns =
         super::aggregate_outer_columns(Some(scope), outer_arg, storage, txid, arena);
     let columns: &dyn crate::sql::exec::ColTypeResolver = match &outer_columns {
@@ -173,7 +173,7 @@ pub(crate) fn fold_aggregates<'a>(
             arena,
             params,
             &Chained {
-                inner: &super::ScopeSchema(scope),
+                inner: &super::ScopeSchema::new(scope),
                 outer: outer_arg,
             },
             hooks,

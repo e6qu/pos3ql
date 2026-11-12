@@ -2244,6 +2244,7 @@ impl<'a> RetainedSelect<'a> {
                 offsets: &[0],
             },
             rowids: &rowids,
+            visible: self.scope.n,
         })
     }
 

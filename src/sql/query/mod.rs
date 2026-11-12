@@ -571,7 +571,7 @@ fn collect_stored_query_composite_field_rename_select<'a>(
             count,
         )?;
         let columns: &dyn super::exec::ColTypeResolver = match outer_scope {
-            Some(scope) => &ScopeCols(scope.current),
+            Some(scope) => &ScopeCols::new(scope.current),
             None => &super::exec::NoCols,
         };
         for expression in select
@@ -605,7 +605,7 @@ fn collect_stored_query_composite_field_rename_select<'a>(
     });
     let columns: &dyn super::exec::ColTypeResolver = match (&catalog_columns, outer_scope) {
         (Some(columns), _) => columns,
-        (None, Some(scope)) => &ScopeCols(scope.current),
+        (None, Some(scope)) => &ScopeCols::new(scope.current),
         (None, None) => &super::exec::NoCols,
     };
     let scope_chain = scope.as_ref().map(|current| StoredQueryRenameScope {
@@ -8679,7 +8679,7 @@ fn describe_contextual_items<'a>(
             arena,
         },
     };
-    let schema = scope.map(ScopeSchema);
+    let schema = scope.map(ScopeSchema::new);
     let empty = super::eval::NoColumns;
     let row = Chained {
         inner: schema
@@ -9073,6 +9073,7 @@ fn window_row<'r, 'a>(
             offsets: offs,
         },
         rowids: &[],
+        visible: scope.n,
     }
 }
 
@@ -9460,7 +9461,7 @@ fn check_select_types<'a>(
         txid,
         arena,
     };
-    let schema = ScopeSchema(scope);
+    let schema = ScopeSchema::new(scope);
     let row = Chained {
         inner: &schema,
         outer,
@@ -9909,7 +9910,7 @@ fn expand_select_record_calls<'a>(
         .as_ref()
         .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, outer))
         .transpose()?;
-    let schema = scope.as_ref().map(ScopeSchema);
+    let schema = scope.as_ref().map(ScopeSchema::new);
     let empty = super::eval::NoColumns;
     let inner: &dyn ColumnLookup<'a> = match schema.as_ref() {
         Some(schema) => schema,
@@ -12839,7 +12840,7 @@ fn array_subquery_field_type_inner<'q>(
                 txid,
                 arena,
                 outer_scope
-                    .map(ScopeSchema)
+                    .map(ScopeSchema::new)
                     .as_ref()
                     .map(|schema| schema as &dyn ColumnLookup<'_>),
             )?;
@@ -12965,7 +12966,7 @@ fn subquery_result_type_inner<'a>(
                     txid,
                     arena,
                     outer_scope
-                        .map(ScopeSchema)
+                        .map(ScopeSchema::new)
                         .as_ref()
                         .map(|schema| schema as &dyn ColumnLookup<'_>),
                 )?;
@@ -13759,15 +13760,34 @@ fn aggregate_outer_columns<'s, 'd, 'o, 'r, 'c>(
     })
 }
 
-pub(super) struct ScopeCols<'s, 'd>(pub(super) &'s QueryScope<'d>);
+/// Column types of the first `visible` FROM items of a scope; every item
+/// unless built with `prefix` for a `LATERAL` item's body.
+#[derive(Clone, Copy)]
+pub(super) struct ScopeCols<'s, 'd> {
+    scope: &'s QueryScope<'d>,
+    visible: usize,
+}
+
+impl<'s, 'd> ScopeCols<'s, 'd> {
+    pub(super) fn new(scope: &'s QueryScope<'d>) -> Self {
+        Self::prefix(scope, scope.n)
+    }
+
+    pub(super) fn prefix(scope: &'s QueryScope<'d>, visible: usize) -> Self {
+        Self { scope, visible }
+    }
+}
+
 impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     fn is_empty_scope(&self) -> bool {
-        self.0.n == 0
+        self.visible == 0
     }
 
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
-        let entry = self.0.find_column(qualifier, name)?;
-        Ok(self.0.output_type(entry))
+        let entry = self
+            .scope
+            .find_column_among(self.visible, qualifier, name)?;
+        Ok(self.scope.output_type(entry))
     }
 
     fn column_meta(
@@ -13775,11 +13795,14 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<super::exec::StaticTypeMeta> {
-        let entry = self.0.find_column(qualifier, name).ok()?;
-        let ctype = self.0.output_type(entry);
+        let entry = self
+            .scope
+            .find_column_among(self.visible, qualifier, name)
+            .ok()?;
+        let ctype = self.scope.output_type(entry);
         let type_mod = match entry {
             scope::ResolvedColumn::Table(table, column) => {
-                self.0.defs.get(table)?.columns.get(column)?.type_mod
+                self.scope.defs.get(table)?.columns.get(column)?.type_mod
             }
             scope::ResolvedColumn::Merged(_) => -1,
         };
@@ -13787,21 +13810,23 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
             ctype,
             type_oid: ctype.oid(),
             type_mod,
-            collation: self.0.output_collation(entry),
+            collation: self.scope.output_collation(entry),
         })
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
-        self.0.qualified_star_columns(name).is_ok()
+        self.scope
+            .qualified_star_columns_among(self.visible, name)
+            .is_ok()
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
-        self.0.func_scalar_type(name)
+        self.scope.func_scalar_type_among(self.visible, name)
     }
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
-        let t = self.0.table_index(name).ok()?;
-        let def = self.0.defs.get(t)?;
+        let t = self.scope.table_index_among(self.visible, name).ok()?;
+        let def = self.scope.defs.get(t)?;
         Some(&def.columns()[..def.n_columns])
     }
 
@@ -13810,8 +13835,11 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
         name: &str,
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
-        let entry = self.0.qualified_star_entry(name, index).ok()?;
-        let field_name = self.0.output_name(entry);
+        let entry = self
+            .scope
+            .qualified_star_entry_among(self.visible, name, index)
+            .ok()?;
+        let field_name = self.scope.output_name(entry);
         Some((
             crate::util::StackStr::from_str(field_name),
             self.column_meta(Some(name), field_name)?,
@@ -13819,12 +13847,15 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        let entry = self.0.find_column(qualifier, name).ok()?;
-        if self.0.output_type(entry) != ColType::Record {
+        let entry = self
+            .scope
+            .find_column_among(self.visible, qualifier, name)
+            .ok()?;
+        if self.scope.output_type(entry) != ColType::Record {
             return None;
         }
         match entry {
-            scope::ResolvedColumn::Table(t, c) => Some(self.0.defs.get(t)?.columns[c].type_mod),
+            scope::ResolvedColumn::Table(t, c) => Some(self.scope.defs.get(t)?.columns[c].type_mod),
             _ => None,
         }
     }
@@ -13876,8 +13907,8 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
     }
 
     fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
-        let schema = ScopeSchema(self.scope);
-        let outer_schema = self.outer_scope.map(ScopeSchema);
+        let schema = ScopeSchema::new(self.scope);
+        let outer_schema = self.outer_scope.map(ScopeSchema::new);
         let outer = Chained {
             inner: &schema,
             outer: outer_schema
@@ -14447,7 +14478,7 @@ pub(super) fn record_star_width(
 }
 
 fn infer_scope_type(expression: &Expr, scope: &QueryScope) -> Result<(i32, i16), SqlError> {
-    let (oid, typlen) = super::exec::infer_type_res(expression, &ScopeCols(scope))?;
+    let (oid, typlen) = super::exec::infer_type_res(expression, &ScopeCols::new(scope))?;
     if oid == super::types::oid::UNKNOWN {
         Ok((super::types::oid::TEXT, -1))
     } else {

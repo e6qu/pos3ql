@@ -2295,7 +2295,7 @@ pub(crate) fn describe_derived_definition<'a>(
         // columns, including during procedural input/dependency analysis.
         super::expand_ctes(sub, storage, txid, arena)?
     };
-    let outer_schema = outer.map(super::ScopeSchema);
+    let outer_schema = outer.map(super::ScopeSchema::new);
     let outer_columns = outer_schema
         .as_ref()
         .map(|schema| schema as &dyn ColumnLookup<'_>);
@@ -2530,19 +2530,31 @@ pub(crate) fn describe_enclosed_derived_definition<'a>(
     col_alias: Option<&[&str]>,
     txid: u32,
     arena: &'a Arena,
-    lateral: Option<&QueryScope<'_>>,
+    lateral: Option<super::ScopeSchema<'_, '_>>,
     enclosing: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<RelationDefinition<'a>, SqlError> {
     // A LATERAL set operation's branches read the tables to its left, so it
     // is described against them like an enclosed body.
-    if enclosing.is_none() && (lateral.is_none() || sub.set_body.is_none()) {
+    // A body refused the items to its left resolves through the lookup that
+    // reports the refusal.
+    if enclosing.is_none()
+        && (lateral.is_none() || sub.set_body.is_none())
+        && !lateral.is_some_and(|schema| schema.refuses())
+    {
         return describe_derived_definition(
-            storage, sub, exposed, col_alias, txid, arena, lateral, None,
+            storage,
+            sub,
+            exposed,
+            col_alias,
+            txid,
+            arena,
+            lateral.map(|schema| schema.scope),
+            None,
         );
     }
     // A LATERAL body also reads the tables to its left, nearer than the
     // enclosing levels.
-    let lateral_schema = lateral.map(super::ScopeSchema);
+    let lateral_schema = lateral;
     let chained;
     let outer_row: &dyn ColumnLookup<'a> = match (&lateral_schema, enclosing) {
         (Some(schema), enclosing) => {
@@ -3951,8 +3963,10 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => -1,
                 };
+                // A one-array UNNEST returns a scalar, which a table alias
+                // names; a multi-array UNNEST names each column `unnest`.
                 default_cols[index] = table_function_column(
-                    SqlName::parse("unnest")?,
+                    SqlName::parse(if args.len() == 1 { name } else { "unnest" })?,
                     ctype,
                     user_type,
                     type_mod,

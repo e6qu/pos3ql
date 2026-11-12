@@ -139,23 +139,23 @@ impl<'a> ColumnLookup<'a> for GroupRow<'_, 'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<crate::sql::types::ColType, SqlError> {
-        super::ScopeSchema(self.scope).resolve_column_type(qualifier, name)
+        super::ScopeSchema::new(self.scope).resolve_column_type(qualifier, name)
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        super::ScopeSchema(self.scope).col_type(qualifier, name)
+        super::ScopeSchema::new(self.scope).col_type(qualifier, name)
     }
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        super::ScopeSchema(self.scope).column_type_oid(qualifier, name)
+        super::ScopeSchema::new(self.scope).column_type_oid(qualifier, name)
     }
 
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
-        super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
+        super::ScopeSchema::new(self.scope).column_type_mod(qualifier, name)
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
-        super::ScopeSchema(self.scope).collation(qualifier, name)
+        super::ScopeSchema::new(self.scope).collation(qualifier, name)
     }
 }
 
@@ -483,7 +483,7 @@ pub(super) fn groups_for_mask<'a>(
     let group_correlated = group_correlated_list.as_slice();
 
     let n_aggs = agg_nodes.len();
-    let scope_columns = super::ScopeCols(scope);
+    let scope_columns = super::ScopeCols::new(scope);
     let outer_columns = super::aggregate_outer_columns(Some(scope), outer, storage, txid, arena);
     let aggregate_columns: &dyn crate::sql::exec::ColTypeResolver = match &outer_columns {
         Some(columns) => columns,
@@ -672,7 +672,7 @@ pub(super) fn groups_for_mask<'a>(
                 arena,
                 params,
                 &super::scan::Chained {
-                    inner: &ScopeSchema(scope),
+                    inner: &ScopeSchema::new(scope),
                     outer,
                 },
                 &direct_hooks,
@@ -718,7 +718,7 @@ pub(super) fn groups_for_mask<'a>(
             merge_action: hooks.merge_action,
         };
         // Outer references, such as PL/pgSQL variables, read the caller's row.
-        let scope_schema = ScopeSchema(scope);
+        let scope_schema = ScopeSchema::new(scope);
         let schema = super::scan::Chained {
             inner: &scope_schema,
             outer,

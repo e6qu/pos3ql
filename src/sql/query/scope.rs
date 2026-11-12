@@ -405,6 +405,44 @@ pub struct QueryScope<'d> {
     pub join_on: &'d mut [Option<&'d Expr<'d>>],
 }
 
+/// Whether a `LATERAL` FROM item may read the items to its left. Only the
+/// right side of an inner or left join (or a comma item) may; the right side
+/// of a RIGHT or FULL join names them only to fail with `42P10`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeftAccess {
+    Lateral,
+    OuterJoinRefused,
+}
+
+impl LeftAccess {
+    pub(crate) fn of(join: &crate::sql::ast::Join<'_>) -> Self {
+        if matches!(
+            join.kind,
+            crate::sql::ast::JoinKind::Right | crate::sql::ast::JoinKind::Full
+        ) {
+            Self::OuterJoinRefused
+        } else {
+            Self::Lateral
+        }
+    }
+
+    fn schema<'s, 'd>(self, scope: &'s QueryScope<'d>) -> super::ScopeSchema<'s, 'd> {
+        self.prefix(scope, scope.n)
+    }
+
+    /// The items left of FROM position `visible`, as this item reads them.
+    pub(crate) fn prefix<'s, 'd>(
+        self,
+        scope: &'s QueryScope<'d>,
+        visible: usize,
+    ) -> super::ScopeSchema<'s, 'd> {
+        match self {
+            Self::Lateral => super::ScopeSchema::prefix(scope, visible),
+            Self::OuterJoinRefused => super::ScopeSchema::refusing(scope, visible),
+        }
+    }
+}
+
 /// Type-only lookup over FROM items already registered in a scope. Table
 /// functions are implicitly lateral in PostgreSQL, so their output definition
 /// may depend on a preceding column before a concrete row has been bound.
@@ -521,11 +559,11 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
         index: usize,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
-        super::ScopeSchema(self.0).whole_row_field_metadata(table, index, catalog)
+        super::ScopeSchema::new(self.0).whole_row_field_metadata(table, index, catalog)
     }
 
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
-        super::ScopeSchema(self.0).column_type_mod(qualifier, name)
+        super::ScopeSchema::new(self.0).column_type_mod(qualifier, name)
     }
 
     fn resolve_column_type(
@@ -533,7 +571,7 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ColType, SqlError> {
-        super::ScopeSchema(self.0).resolve_column_type(qualifier, name)
+        super::ScopeSchema::new(self.0).resolve_column_type(qualifier, name)
     }
 
     fn is_empty_scope(&self) -> bool {
@@ -561,7 +599,7 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
     }
 
     fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
-        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.0))
+        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols::new(self.0))
             .map_or(crate::sql::ast::Collation::None, |meta| meta.collation)
     }
 
@@ -794,8 +832,10 @@ impl<'d> QueryScope<'d> {
             sequences,
             outer,
             catalog_scan(&from.base, predicate, from.joins.is_empty()),
+            LeftAccess::Lateral,
         )?;
-        for j in from.joins {
+        for (index, j) in from.joins.iter().enumerate() {
+            scope.merge_left_of(from.joins, index, arena)?;
             scope
                 .add_exec(
                     storage,
@@ -806,10 +846,11 @@ impl<'d> QueryScope<'d> {
                     sequences,
                     outer,
                     catalog_scan(&j.table, predicate, false),
+                    LeftAccess::of(j),
                 )
                 .map_err(|error| scope.left_column_detail(storage, txid, &j.table, error))?;
         }
-        scope.build_merges(from, arena, Some(arena))?;
+        scope.build_merges(from.joins, arena, Some(arena))?;
         Ok(scope)
     }
 
@@ -962,6 +1003,7 @@ impl<'d> QueryScope<'d> {
         sequences: Option<&dyn SequenceAccess>,
         outer: Option<&dyn ColumnLookup<'a>>,
         catalog_scan: crate::sql::catalog_snapshot::CatalogScan,
+        left: LeftAccess,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
@@ -1037,7 +1079,7 @@ impl<'d> QueryScope<'d> {
             tref.col_alias,
             txid,
             arena,
-            tref.lateral.then_some(&*self),
+            tref.lateral.then(|| left.schema(self)),
             outer,
         )?;
         if let Some(slot) = tref.view_access {
@@ -1046,7 +1088,8 @@ impl<'d> QueryScope<'d> {
             definition.name = view.name_for(txid);
         }
         self.defs.set_arena(self.n, definition);
-        if tref.lateral {
+        // A body the left items cannot feed reads none of them: it runs once.
+        if tref.lateral && left == LeftAccess::Lateral {
             self.names[self.n] = exposed;
             self.derived[self.n] = Some(&[]);
             self.lateral[self.n] = true;
@@ -1157,13 +1200,14 @@ impl<'d> QueryScope<'d> {
         outer: Option<&dyn ColumnLookup<'_>>,
     ) -> Result<QueryScope<'a>, SqlError> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
-        scope.add_schema(storage, &from.base, txid, arena, outer)?;
-        for j in from.joins {
+        scope.add_schema(storage, &from.base, txid, arena, outer, LeftAccess::Lateral)?;
+        for (index, j) in from.joins.iter().enumerate() {
+            scope.merge_left_of(from.joins, index, arena)?;
             scope
-                .add_schema(storage, &j.table, txid, arena, outer)
+                .add_schema(storage, &j.table, txid, arena, outer, LeftAccess::of(j))
                 .map_err(|error| scope.left_column_detail(storage, txid, &j.table, error))?;
         }
-        scope.build_merges(from, arena, None)?;
+        scope.build_merges(from.joins, arena, None)?;
         Ok(scope)
     }
 
@@ -1174,6 +1218,7 @@ impl<'d> QueryScope<'d> {
         txid: u32,
         arena: &'a Arena,
         outer: Option<&dyn ColumnLookup<'_>>,
+        left: LeftAccess,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
@@ -1249,7 +1294,7 @@ impl<'d> QueryScope<'d> {
             tref.col_alias,
             txid,
             arena,
-            tref.lateral.then_some(&*self),
+            tref.lateral.then(|| left.schema(self)),
             outer_types
                 .as_ref()
                 .map(|columns| columns as &dyn ColumnLookup<'a>),
@@ -1266,7 +1311,7 @@ impl<'d> QueryScope<'d> {
         // No rows: this scope is never scanned, only described. An empty row
         // set keeps a stray scan safe rather than reading a physical slot.
         self.derived[self.n] = Some(&[]);
-        self.lateral[self.n] = tref.lateral;
+        self.lateral[self.n] = tref.lateral && left == LeftAccess::Lateral;
         self.slots[self.n] = usize::MAX;
         self.n += 1;
         Ok(())
@@ -1720,24 +1765,39 @@ impl<'d> QueryScope<'d> {
         Ok(())
     }
 
+    /// Before `joins[index]`'s item is described: a LATERAL item or table
+    /// function may name a USING/NATURAL-merged column of the joins to its
+    /// left, so those merges must exist while its body is typed.
+    fn merge_left_of(
+        &mut self,
+        joins: &[crate::sql::ast::Join<'d>],
+        index: usize,
+        arena: &'d Arena,
+    ) -> Result<(), SqlError> {
+        let item = &joins[index].table;
+        if item.lateral || item.is_function_source() {
+            self.build_merges(&joins[..index], arena, None)?;
+        }
+        Ok(())
+    }
+
     /// (table position, column index) for a possibly-qualified name.
-    /// Resolves every USING/NATURAL join in `from`: computes the merged
+    /// Resolves every USING/NATURAL join in `joins`: computes the merged
     /// output columns (and the join tree's output order) and synthesizes the
     /// equality predicates (when `arena` is given — the schema-only Describe
     /// path passes None and never evaluates joins).
     fn build_merges(
         &mut self,
-        from: &FromClause<'d>,
+        joins: &[crate::sql::ast::Join<'d>],
         scratch_arena: &'d Arena,
         expression_arena: Option<&'d Arena>,
     ) -> Result<(), SqlError> {
-        if !from.joins.iter().any(|j| j.natural || j.using.is_some()) {
+        if !joins.iter().any(|j| j.natural || j.using.is_some()) {
             return Ok(());
         }
         // Definitions are now available: a merged join needs capacity for its
         // actual columns, not the maximum relation width for every source.
-        let merged_capacity = from
-            .joins
+        let merged_capacity = joins
             .iter()
             .enumerate()
             .map(|(index, join)| {
@@ -1755,6 +1815,7 @@ impl<'d> QueryScope<'d> {
                 ctype: ColType::Bool,
             })
             .map_err(|_| arena_full())?;
+        self.n_merged = 0;
         // The left join tree's output columns, updated join by join.
         let out = scratch_arena
             .alloc_slice_with(self.total_columns(), |_| ResolvedColumn::Table(0, 0))
@@ -1764,7 +1825,7 @@ impl<'d> QueryScope<'d> {
             out[n_out] = ResolvedColumn::Table(0, c);
             n_out += 1;
         }
-        for (join_index, join) in from.joins.iter().enumerate() {
+        for (join_index, join) in joins.iter().enumerate() {
             let right_t = join_index + 1;
             let right_def = self.defs.get(right_t).expect("resolved");
             if !(join.natural || join.using.is_some()) {
@@ -2102,8 +2163,14 @@ impl<'d> QueryScope<'d> {
     }
 
     pub fn table_index(&self, name: &str) -> Result<usize, SqlError> {
+        self.table_index_among(self.n, name)
+    }
+
+    /// `table_index` over the first `visible` FROM items only: a `LATERAL`
+    /// body sees just the items to its left, never itself or later items.
+    pub(crate) fn table_index_among(&self, visible: usize, name: &str) -> Result<usize, SqlError> {
         let mut found = None;
-        for t in 0..self.n {
+        for t in 0..visible {
             if self.entry_answers_to(t, name) {
                 if found.is_some() {
                     // Two same-named tables from different schemas: a bare
@@ -2122,8 +2189,8 @@ impl<'d> QueryScope<'d> {
             // *invalid* reference (wrong schema or an alias); one matching
             // nothing is *missing* — PostgreSQL's two wordings.
             Some((schema, table))
-                if self.names[..self.n].contains(&table)
-                    || (0..self.n).any(|index| {
+                if self.names[..visible].contains(&table)
+                    || (0..visible).any(|index| {
                         self.defs.get(index).is_some_and(|definition| {
                             definition.schema.as_str() == schema
                                 && definition.name.as_str() == table
@@ -2160,10 +2227,18 @@ impl<'d> QueryScope<'d> {
     /// Width of a qualified star, whether it names a FROM item or a merged
     /// USING-column alias.
     pub fn qualified_star_columns(&self, name: &str) -> Result<usize, SqlError> {
+        self.qualified_star_columns_among(self.n, name)
+    }
+
+    pub(crate) fn qualified_star_columns_among(
+        &self,
+        visible: usize,
+        name: &str,
+    ) -> Result<usize, SqlError> {
         if let Some(alias) = self.using_alias(name) {
             return Ok(alias.n_columns);
         }
-        let table = self.table_index(name)?;
+        let table = self.table_index_among(visible, name)?;
         Ok(self.defs.get(table).expect("resolved").n_columns)
     }
 
@@ -2173,12 +2248,21 @@ impl<'d> QueryScope<'d> {
         name: &str,
         index: usize,
     ) -> Result<ResolvedColumn, SqlError> {
+        self.qualified_star_entry_among(self.n, name, index)
+    }
+
+    pub(crate) fn qualified_star_entry_among(
+        &self,
+        visible: usize,
+        name: &str,
+        index: usize,
+    ) -> Result<ResolvedColumn, SqlError> {
         if let Some(alias) = self.using_alias(name) {
             return (index < alias.n_columns)
                 .then_some(ResolvedColumn::Merged(alias.first_merged + index))
                 .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN, "column does not exist"));
         }
-        let table = self.table_index(name)?;
+        let table = self.table_index_among(visible, name)?;
         (index < self.defs.get(table).expect("resolved").n_columns)
             .then_some(ResolvedColumn::Table(table, index))
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN, "column does not exist"))
@@ -2189,12 +2273,20 @@ impl<'d> QueryScope<'d> {
     /// storage- or subquery-derived table returns None (its whole-row reference
     /// is a record).
     pub fn func_scalar_type(&self, name: &str) -> Option<ColType> {
-        self.func_scalar_column(name)
+        self.func_scalar_type_among(self.n, name)
+    }
+
+    pub(crate) fn func_scalar_type_among(&self, visible: usize, name: &str) -> Option<ColType> {
+        self.func_scalar_column_among(visible, name)
             .map(|column| self.output_type(column))
     }
 
     pub(super) fn func_scalar_column(&self, name: &str) -> Option<ResolvedColumn> {
-        let t = self.table_index(name).ok()?;
+        self.func_scalar_column_among(self.n, name)
+    }
+
+    fn func_scalar_column_among(&self, visible: usize, name: &str) -> Option<ResolvedColumn> {
+        let t = self.table_index_among(visible, name).ok()?;
         if !self.func_scalar[t] {
             return None;
         }
@@ -2207,34 +2299,47 @@ impl<'d> QueryScope<'d> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
-        self.find_column_unpositioned(qualifier, name)
+        self.find_column_among(self.n, qualifier, name)
+    }
+
+    /// `find_column` over the first `visible` FROM items: the scope a
+    /// `LATERAL` item's body resolves its outer references in.
+    pub(crate) fn find_column_among(
+        &self,
+        visible: usize,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_column_unpositioned(visible, qualifier, name)
             .map_err(|error| crate::sql::error_position::column_reference(error, qualifier, name))
     }
 
     fn find_column_unpositioned(
         &self,
+        visible: usize,
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
-        self.find_relation_column(qualifier, name).map_err(|error| {
-            if error.sqlstate == sqlstate::UNDEFINED_COLUMN
-                && self.names_system_column(qualifier, name)
-            {
-                sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "system column \"{}\" is not supported",
-                    name
-                )
-            } else {
-                error
-            }
-        })
+        self.find_relation_column(visible, qualifier, name)
+            .map_err(|error| {
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && self.names_system_column(visible, qualifier, name)
+                {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "system column \"{}\" is not supported",
+                        name
+                    )
+                } else {
+                    error
+                }
+            })
     }
 
     /// Whether `name` is a PostgreSQL system column of a relation the
     /// reference can name: a table, foreign table or catalog, but not a view,
     /// subquery or function. Only a catalog's `tableoid` is exposed.
-    fn names_system_column(&self, qualifier: Option<&str>, name: &str) -> bool {
+    fn names_system_column(&self, visible: usize, qualifier: Option<&str>, name: &str) -> bool {
         if !crate::storage::SYSTEM_COLUMN_NAMES.contains(&name) {
             return false;
         }
@@ -2247,13 +2352,16 @@ impl<'d> QueryScope<'d> {
         };
         match qualifier {
             Some(qualifier) if self.using_alias(qualifier).is_some() => false,
-            Some(qualifier) => self.table_index(qualifier).is_ok_and(has_system_columns),
-            None => (0..self.n).any(has_system_columns),
+            Some(qualifier) => self
+                .table_index_among(visible, qualifier)
+                .is_ok_and(has_system_columns),
+            None => (0..visible).any(has_system_columns),
         }
     }
 
     fn find_relation_column(
         &self,
+        visible: usize,
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
@@ -2273,7 +2381,7 @@ impl<'d> QueryScope<'d> {
                             )
                         });
                 }
-                let t = self.table_index(q)?;
+                let t = self.table_index_among(visible, q)?;
                 match self.scope_column_index(t, name) {
                     Some(c) => Ok(ResolvedColumn::Table(t, c)),
                     None => Err(sql_err!(
@@ -2290,20 +2398,40 @@ impl<'d> QueryScope<'d> {
                 // so referencing it is not ambiguous.
                 if self.n_output > 0 {
                     let mut found = None;
+                    let mut consider = |entry: ResolvedColumn| {
+                        if self.output_name(entry) != name {
+                            return Ok(());
+                        }
+                        if found.is_some() {
+                            return Err(sql_err!(
+                                crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
+                                "column reference \"{}\" is ambiguous",
+                                name
+                            ));
+                        }
+                        found = Some(entry);
+                        Ok(())
+                    };
                     for k in 0..self.n_output {
-                        if self.output_name(self.output[k]) == name {
-                            if found.is_some() {
-                                return Err(sql_err!(
-                                    crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
-                                    "column reference \"{}\" is ambiguous",
-                                    name
-                                ));
+                        match self.output[k] {
+                            ResolvedColumn::Table(t, _) if t >= visible => {}
+                            ResolvedColumn::Merged(m)
+                                if self.merged[m].parts.iter().any(|&(t, _)| t >= visible) =>
+                            {
+                                // The merging join includes an item the
+                                // body cannot see yet: its visible side's
+                                // own column is what the name reaches.
+                                for &(t, c) in self.merged[m].parts {
+                                    if t < visible {
+                                        consider(ResolvedColumn::Table(t, c))?;
+                                    }
+                                }
                             }
-                            found = Some(self.output[k]);
+                            entry => consider(entry)?,
                         }
                     }
                     return found
-                        .or_else(|| self.func_scalar_column(name))
+                        .or_else(|| self.func_scalar_column_among(visible, name))
                         .ok_or_else(|| {
                             sql_err!(
                                 sqlstate::UNDEFINED_COLUMN,
@@ -2313,7 +2441,7 @@ impl<'d> QueryScope<'d> {
                         });
                 }
                 let mut found = None;
-                for t in 0..self.n {
+                for t in 0..visible {
                     if let Some(c) = self.scope_column_index(t, name) {
                         if found.is_some() {
                             return Err(sql_err!(
@@ -2326,7 +2454,7 @@ impl<'d> QueryScope<'d> {
                     }
                 }
                 found
-                    .or_else(|| self.func_scalar_column(name))
+                    .or_else(|| self.func_scalar_column_among(visible, name))
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_COLUMN,

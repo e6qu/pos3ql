@@ -86157,6 +86157,20 @@ pub(crate) fn reject_dml_target_references(
     txid: u32,
     statement: &Stmt<'_>,
 ) -> Result<(), SqlError> {
+    // `RETURNING *` lists the FROM/USING items' columns after the target's;
+    // only the target's row reaches RETURNING here, so refuse the star
+    // rather than return fewer columns than PostgreSQL.
+    let joined_star = match statement {
+        Stmt::Update(update) => update.from.is_some() && returning_star(update.returning),
+        Stmt::Delete(delete) => delete.using.is_some() && returning_star(delete.returning),
+        _ => false,
+    };
+    if joined_star {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "RETURNING * is not supported with UPDATE ... FROM or DELETE ... USING"
+        ));
+    }
     match statement {
         Stmt::Update(update) => reject_target_references_of(
             storage,
@@ -86190,6 +86204,13 @@ pub(crate) fn reject_dml_target_references(
         ),
         _ => Ok(()),
     }
+}
+
+fn returning_star(returning: crate::sql::ast::Returning<'_>) -> bool {
+    returning
+        .items
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard))
 }
 
 fn reject_target_references_of(
@@ -86271,11 +86292,9 @@ fn reject_target_references(
         if let Some(arguments) = table.func_args {
             for argument in arguments {
                 found = found.or(expression_names_target(argument, exposed, &mut |name| {
-                    // An unqualified argument column the items to its left
-                    // cannot answer is the target's.
-                    !merge
-                        && target_columns.contains(&name)
-                        && !left_may_answer(storage, txid, from, index, name)
+                    // The target precedes every FROM item in PostgreSQL's
+                    // namespace, so it answers an unqualified column first.
+                    !merge && target_columns.contains(&name)
                 }));
             }
         }
@@ -86307,7 +86326,7 @@ fn reject_target_references(
                         hidden_column.get_or_insert_with(|| hidden_column_error(exposed, name));
                         return false;
                     }
-                    !left_may_answer(storage, txid, from, index, name)
+                    true
                 },
             ));
         }
@@ -86329,20 +86348,6 @@ fn reject_target_references(
         }
     }
     Ok(())
-}
-
-/// Whether an item left of `index` in `from` may have a column `name`.
-fn left_may_answer(
-    storage: &Storage,
-    txid: u32,
-    from: &crate::sql::ast::FromClause<'_>,
-    index: usize,
-    name: &str,
-) -> bool {
-    core::iter::once(&from.base)
-        .chain(from.joins.iter().map(|join| &join.table))
-        .take(index)
-        .any(|table| item_may_answer(storage, txid, table, name))
 }
 
 /// PostgreSQL's `errorMissingColumn` for an unqualified column of the target

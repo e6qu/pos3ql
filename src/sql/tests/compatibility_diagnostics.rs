@@ -1420,3 +1420,84 @@ fn a_plain_source_subquery_cannot_see_the_target_columns() {
         );
     });
 }
+
+#[test]
+fn a_lateral_body_reads_only_the_items_to_its_left() {
+    with_engine("lateral-left-items", |engine, budget| {
+        for sql in [
+            "CREATE TABLE lt (id int, v int)",
+            "INSERT INTO lt VALUES (1, 10), (2, 20)",
+            "CREATE TABLE lu (id int, v int)",
+            "INSERT INTO lu VALUES (1, 100)",
+            "CREATE TABLE lw (w int)",
+            "INSERT INTO lw VALUES (5)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // The item's own columns, and later items', are not its body's.
+        for (sql, rows) in [
+            (
+                "SELECT * FROM lt, LATERAL (SELECT v) s ORDER BY 1",
+                &["1|10|10", "2|20|20"][..],
+            ),
+            (
+                "SELECT * FROM lt a, LATERAL (SELECT v) s, lu ORDER BY 1",
+                &["1|10|10|1|100", "2|20|20|1|100"],
+            ),
+            (
+                "SELECT * FROM lt a JOIN lu b USING (v), LATERAL (SELECT v) s",
+                &[],
+            ),
+            (
+                "SELECT * FROM lt a LEFT JOIN LATERAL (SELECT v WHERE v > 10) s ON true ORDER BY 1",
+                &["1|10|NULL", "2|20|20"],
+            ),
+            (
+                "SELECT * FROM lt, unnest(ARRAY[v, v + 1]) AS v ORDER BY 1, 3",
+                &["1|10|10", "1|10|11", "2|20|20", "2|20|21"],
+            ),
+            (
+                "SELECT * FROM lt a RIGHT JOIN LATERAL (SELECT 1 AS one) s ON true ORDER BY 1",
+                &["1|10|1", "2|20|1"],
+            ),
+            (
+                "UPDATE lt SET v = v + s.w FROM lw, LATERAL (SELECT w) s WHERE lt.id = 1 \
+                 RETURNING lt.id, lt.v",
+                &["1|15"],
+            ),
+        ] {
+            assert_eq!(data_rows(&run_with(engine, budget, sql)), rows, "{sql}");
+        }
+        for (sql, expected) in [
+            (
+                "SELECT * FROM lt a JOIN lu b ON a.id = b.id, LATERAL (SELECT v) s",
+                "ERROR 42702 column reference \"v\" is ambiguous @62".to_string(),
+            ),
+            (
+                "SELECT * FROM lt a FULL JOIN LATERAL (SELECT v) s ON true",
+                "ERROR 42P10 invalid reference to FROM-clause entry for table \"a\" @46 \
+                 detail: The combining JOIN type must be INNER or LEFT for a LATERAL reference."
+                    .to_string(),
+            ),
+            (
+                "UPDATE lt SET v = 1 FROM lu x, LATERAL (SELECT v) s",
+                "ERROR 42P10 invalid reference to FROM-clause entry for table \"lt\" @48 \
+                 hint: There is an entry for table \"lt\", but it cannot be referenced from \
+                 this part of the query."
+                    .to_string(),
+            ),
+            (
+                "DELETE FROM lt USING lw WHERE false RETURNING *",
+                "ERROR 0A000 RETURNING * is not supported with UPDATE ... FROM or DELETE ... \
+                 USING"
+                    .to_string(),
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [expected],
+                "{sql}"
+            );
+        }
+    });
+}

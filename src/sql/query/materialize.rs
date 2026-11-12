@@ -42,11 +42,11 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
         index: usize,
         catalog: Option<&dyn super::super::eval::CatalogAccess>,
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
-        ScopeSchema(self.scope).whole_row_field_metadata(table, index, catalog)
+        ScopeSchema::new(self.scope).whole_row_field_metadata(table, index, catalog)
     }
 
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
-        ScopeSchema(self.scope).column_type_mod(qualifier, name)
+        ScopeSchema::new(self.scope).column_type_mod(qualifier, name)
     }
 
     fn resolve_column_type(
@@ -54,7 +54,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ColType, SqlError> {
-        ScopeSchema(self.scope).resolve_column_type(qualifier, name)
+        ScopeSchema::new(self.scope).resolve_column_type(qualifier, name)
     }
 
     fn is_empty_scope(&self) -> bool {
@@ -116,7 +116,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     }
 
     fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
-        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.scope))
+        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols::new(self.scope))
             .map_or(Collation::None, |meta| meta.collation)
     }
 
@@ -426,6 +426,7 @@ pub(super) fn sources_row<'s, 'a>(
             buffer_offsets: &[],
         },
         rowids: &rowids[..scope.n],
+        visible: scope.n,
     }
 }
 
@@ -921,12 +922,14 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                             let order = arena
                                 .alloc_slice_with(scope.n, |table| table)
                                 .map_err(|_| arena_full())?;
-                            let as_read_row = sources_row(scope, read, order, rowids);
+                            let mut as_read_row = sources_row(scope, read, order, rowids);
+                            as_read_row.visible = table;
                             let as_read = Chained {
                                 inner: &as_read_row,
                                 outer: self.outer,
                             };
-                            let left = sources_row(scope, bound, order, rowids);
+                            let mut left = sources_row(scope, bound, order, rowids);
+                            left.visible = table;
                             let latest = Chained {
                                 inner: &left,
                                 outer: self.outer,
@@ -967,7 +970,8 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                         let order = arena
                             .alloc_slice_with(scope.n, |table| table)
                             .map_err(|_| arena_full())?;
-                        let left = sources_row(scope, bound, order, rowids);
+                        let mut left = sources_row(scope, bound, order, rowids);
+                        left.visible = table;
                         let chained = Chained {
                             inner: &left,
                             outer: self.outer,
@@ -1166,10 +1170,66 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
 /// yields NULL — while resolving no values. Value lookups fail exactly as an
 /// empty row's would, so grouped columns still resolve through the group hook
 /// and bare ungrouped references remain the same error.
-pub(crate) struct ScopeSchema<'s, 'd>(pub(crate) &'s QueryScope<'d>);
+#[derive(Clone, Copy)]
+pub(crate) struct ScopeSchema<'s, 'd> {
+    pub(crate) scope: &'s QueryScope<'d>,
+    /// Names resolve over the first `visible` FROM items; a `LATERAL`
+    /// item's body sees only the items to its left.
+    visible: usize,
+    /// The body of a `LATERAL` item on the right of a RIGHT or FULL join:
+    /// a name found among the items fails as PostgreSQL's
+    /// `check_lateral_ref_ok` does.
+    refused: bool,
+}
+
+impl<'s, 'd> ScopeSchema<'s, 'd> {
+    pub(crate) fn new(scope: &'s QueryScope<'d>) -> Self {
+        Self::prefix(scope, scope.n)
+    }
+
+    pub(crate) fn prefix(scope: &'s QueryScope<'d>, visible: usize) -> Self {
+        Self {
+            scope,
+            visible,
+            refused: false,
+        }
+    }
+
+    pub(crate) fn refusing(scope: &'s QueryScope<'d>, visible: usize) -> Self {
+        Self {
+            refused: true,
+            ..Self::prefix(scope, visible)
+        }
+    }
+
+    pub(crate) fn refuses(&self) -> bool {
+        self.refused
+    }
+
+    fn refuse(&self, table: &str) -> SqlError {
+        crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+            detail: Some(crate::stack_format!(
+                crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+                "The combining JOIN type must be INNER or LEFT for a LATERAL reference."
+            )),
+            hint: None,
+            objects: crate::sql::eval::ErrorObjects::default(),
+        });
+        sql_err!(
+            sqlstate::INVALID_COLUMN_REFERENCE,
+            "invalid reference to FROM-clause entry for table \"{}\"",
+            table
+        )
+    }
+
+    fn columns(&self) -> super::ScopeCols<'s, 'd> {
+        super::ScopeCols::prefix(self.scope, self.visible)
+    }
+}
+
 impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
-        crate::sql::exec::ColTypeResolver::column_meta(&super::ScopeCols(self.0), qualifier, name)
+        crate::sql::exec::ColTypeResolver::column_meta(&self.columns(), qualifier, name)
             .map_or(-1, |column| column.type_mod)
     }
 
@@ -1179,21 +1239,24 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         index: usize,
         catalog: Option<&dyn super::super::eval::CatalogAccess>,
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
-        let entry = self.0.qualified_star_entry(table, index).ok()?;
+        let entry = self
+            .scope
+            .qualified_star_entry_among(self.visible, table, index)
+            .ok()?;
         match entry {
             super::scope::ResolvedColumn::Table(table, column) => {
                 super::super::eval::stored_row_field_metadata(
-                    self.0.defs.get(table)?.columns().get(column)?,
+                    self.scope.defs.get(table)?.columns().get(column)?,
                     catalog,
                 )
             }
             super::scope::ResolvedColumn::Merged(_) => Some((
-                crate::util::StackStr::from_str(self.0.output_name(entry)),
+                crate::util::StackStr::from_str(self.scope.output_name(entry)),
                 crate::sql::exec::StaticTypeMeta {
-                    type_oid: self.0.output_type(entry).oid(),
-                    ctype: self.0.output_type(entry),
+                    type_oid: self.scope.output_type(entry).oid(),
+                    ctype: self.scope.output_type(entry),
                     type_mod: -1,
-                    collation: self.0.output_collation(entry),
+                    collation: self.scope.output_collation(entry),
                 },
             )),
         }
@@ -1204,17 +1267,36 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ColType, SqlError> {
-        match self.0.find_column(qualifier, name) {
-            Ok(column) => Ok(self.0.output_type(column)),
+        match self.scope.find_column_among(self.visible, qualifier, name) {
+            Ok(column) if self.refused => {
+                let table = match column {
+                    super::scope::ResolvedColumn::Table(table, _) => table,
+                    super::scope::ResolvedColumn::Merged(merged) => {
+                        self.scope.merged[merged].parts[0].0
+                    }
+                };
+                Err(crate::sql::error_position::at_reference(
+                    self.refuse(self.scope.names[table]),
+                    qualifier.unwrap_or(name),
+                ))
+            }
+            Ok(column) => Ok(self.scope.output_type(column)),
             Err(error) if qualifier.is_none() && error.sqlstate == sqlstate::UNDEFINED_COLUMN => {
-                self.whole_row_type(name).ok_or(error)
+                match self.whole_row_type(name) {
+                    Some(_) if self.refused => Err(crate::sql::error_position::at_reference(
+                        self.refuse(name),
+                        name,
+                    )),
+                    Some(ctype) => Ok(ctype),
+                    None => Err(error),
+                }
             }
             Err(error) => Err(error),
         }
     }
 
     fn is_empty_scope(&self) -> bool {
-        self.0.n == 0
+        self.visible == 0
     }
 
     fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
@@ -1225,27 +1307,32 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         ))
     }
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        match self.0.find_column(qualifier, name) {
-            Ok(entry) => Some(self.0.output_type(entry)),
+        match self.scope.find_column_among(self.visible, qualifier, name) {
+            Ok(entry) => Some(self.scope.output_type(entry)),
             Err(error)
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                     && qualifier.is_none()
-                    && (self.0.using_alias(name).is_some() || self.0.table_index(name).is_ok()) =>
+                    && (self.scope.using_alias(name).is_some()
+                        || self.scope.table_index_among(self.visible, name).is_ok()) =>
             {
-                Some(self.0.func_scalar_type(name).unwrap_or(ColType::Record))
+                Some(
+                    self.scope
+                        .func_scalar_type_among(self.visible, name)
+                        .unwrap_or(ColType::Record),
+                )
             }
             Err(_) => None,
         }
     }
     fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
-        self.0
-            .find_column(qualifier, name)
+        self.scope
+            .find_column_among(self.visible, qualifier, name)
             .ok()
-            .map(|entry| self.0.output_collation(entry))
+            .map(|entry| self.scope.output_collation(entry))
             .unwrap_or(Collation::None)
     }
     fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
-        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.0))
+        crate::sql::exec::record_field_metadata(base, field, &self.columns())
             .map_or(Collation::None, |meta| meta.collation)
     }
     fn column_user_type(
@@ -1253,26 +1340,42 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        match self.0.find_column(qualifier, name).ok()? {
+        match self
+            .scope
+            .find_column_among(self.visible, qualifier, name)
+            .ok()?
+        {
             super::scope::ResolvedColumn::Table(table, column) => {
-                self.0.defs.get(table)?.columns.get(column)?.user_type
+                self.scope.defs.get(table)?.columns.get(column)?.user_type
             }
             super::scope::ResolvedColumn::Merged(_) => None,
         }
     }
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
-        match self.0.find_column(qualifier, name).ok()? {
+        match self
+            .scope
+            .find_column_among(self.visible, qualifier, name)
+            .ok()?
+        {
             super::scope::ResolvedColumn::Table(t, c) => Some((t as u32, c as u32)),
             super::scope::ResolvedColumn::Merged(m) => Some((u32::MAX, m as u32)),
         }
     }
     fn whole_row_is_scalar(&self, table: &str) -> bool {
-        self.0.func_scalar_type(table).is_some()
+        self.scope
+            .func_scalar_type_among(self.visible, table)
+            .is_some()
     }
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
-        self.0.qualified_star_columns(table).ok()?;
-        Some(self.0.func_scalar_type(table).unwrap_or(ColType::Record))
+        self.scope
+            .qualified_star_columns_among(self.visible, table)
+            .ok()?;
+        Some(
+            self.scope
+                .func_scalar_type_among(self.visible, table)
+                .unwrap_or(ColType::Record),
+        )
     }
 }
 
@@ -1573,7 +1676,7 @@ pub(super) fn prepare_materialization<'a>(
     let mut any_postponed = false;
     let mut raw_needed = false;
     if defer_allowed {
-        let schema = ScopeSchema(scope);
+        let schema = ScopeSchema::new(scope);
         let row = Chained {
             inner: &schema,
             outer,

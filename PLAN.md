@@ -345,10 +345,7 @@ and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
 constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
 `INSERT has more target columns than expressions` without its position; other
-target and expression count errors are positioned. A subquery nested in a
-FROM subquery that names a column of another FROM item or of the `UPDATE` or
-`DELETE` target (`FROM t, (SELECT (SELECT v)) s`) fails with `42703` without
-PostgreSQL's detail and `LATERAL` hint. An error raised while
+target and expression count errors are positioned. An error raised while
 PostgreSQL inlines a SQL function's body
 (`SQL function "f" during inlining`) has no context line. Under
 `#variable_conflict use_variable` a variable that is also a column fails with
@@ -397,7 +394,10 @@ several of its source rows produced the values the statement read but
 recheck differently, or when it is a `UNION ALL` branch that reads tables
 (PostgreSQL keeps the rows it first joined). `RETURNING`
 of `UPDATE ... FROM` and `DELETE ... USING` cannot read the `FROM`/`USING`
-items (`42P01`). The
+items (`42P01`; `RETURNING *` fails with `0A000`). A parameter used inside a
+`FROM` subquery of `PREPARE` (`PREPARE p AS SELECT * FROM (SELECT 1 + $1) s`)
+is typed `text` before the subquery is described, so the statement fails
+with `42883`. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

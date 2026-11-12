@@ -776,7 +776,7 @@ fn check_select_literals<'a>(
     };
     // A FROM clause that does not resolve is reported by the query's own
     // analysis when it runs, in PostgreSQL's order.
-    let outer_columns = outer.map(super::ScopeSchema);
+    let outer_columns = outer.map(super::ScopeSchema::new);
     let Ok(scope) = crate::sql::error_position::preserving_pending(|| {
         QueryScope::resolve_schema(
             storage,
@@ -1027,7 +1027,7 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
         index: usize,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
-        let schema = self.scope.map(ScopeSchema);
+        let schema = self.scope.map(ScopeSchema::new);
         let empty = crate::sql::eval::NoColumns;
         let inner: &dyn ColumnLookup<'_> = match &schema {
             Some(schema) => schema,
@@ -1041,7 +1041,7 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
     }
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        let schema = self.scope.map(ScopeSchema);
+        let schema = self.scope.map(ScopeSchema::new);
         let empty = crate::sql::eval::NoColumns;
         let inner: &dyn ColumnLookup<'_> = match &schema {
             Some(schema) => schema,
@@ -1059,7 +1059,7 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ColType, SqlError> {
-        let schema = self.scope.map(ScopeSchema);
+        let schema = self.scope.map(ScopeSchema::new);
         let empty = crate::sql::eval::NoColumns;
         let inner: &dyn ColumnLookup<'_> = match &schema {
             Some(schema) => schema,
@@ -1124,7 +1124,7 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
     fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
         if let Some(scope) = self.scope {
             let collation =
-                crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(scope))
+                crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols::new(scope))
                     .map_or(Collation::None, |meta| meta.collation);
             if collation != Collation::None {
                 return collation;
@@ -2755,7 +2755,7 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
 
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         let inner = match self.scope {
-            Some(scope) => ScopeCols(scope).resolve(qualifier, name),
+            Some(scope) => ScopeCols::new(scope).resolve(qualifier, name),
             None => self.catalog.resolve(qualifier, name),
         };
         match inner {
@@ -2880,7 +2880,7 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
     }
 
     fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
-        let schema = self.scope.map(ScopeSchema);
+        let schema = self.scope.map(ScopeSchema::new);
         let empty = crate::sql::eval::NoColumns;
         let inner: &dyn ColumnLookup<'_> = match &schema {
             Some(schema) => schema,
@@ -3623,7 +3623,7 @@ fn run_subquery<'a>(
             sequences: hooks.sequences,
             merge_action: hooks.merge_action,
         };
-        let schema = ScopeSchema(&scope);
+        let schema = ScopeSchema::new(&scope);
         let base = Chained {
             inner: &schema,
             outer,

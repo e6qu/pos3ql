@@ -62479,14 +62479,21 @@ fn lateral_joins() {
         data_rows(&bytes),
         ["1|1|10", "1|2|20", "2|1|10", "2|2|20", "2|3|30"]
     );
-    // RIGHT JOIN LATERAL is rejected loudly.
+    // The right side of a RIGHT JOIN cannot read the left items; a body
+    // that reads none runs once.
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT t.id, s.one FROM lt t RIGHT JOIN LATERAL (SELECT 1 AS one) s ON true ORDER BY 1",
+    );
+    assert_eq!(data_rows(&bytes), ["1|1", "2|1", "3|1"]);
     assert!(
         String::from_utf8_lossy(&run_with(
             &mut e,
             &mut b,
-            "SELECT * FROM lt t RIGHT JOIN LATERAL (SELECT 1) s ON true"
+            "SELECT * FROM lt t RIGHT JOIN LATERAL (SELECT t.id) s ON true"
         ))
-        .contains("0A000")
+        .contains("42P10")
     );
 }
 

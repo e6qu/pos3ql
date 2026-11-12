@@ -2640,7 +2640,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                 });
         }
         let resolved = match self.scope {
-            Some(scope) => super::ScopeCols(scope).resolve(qualifier, name),
+            Some(scope) => super::ScopeCols::new(scope).resolve(qualifier, name),
             None => crate::sql::exec::NoCols.resolve(qualifier, name),
         };
         if resolved.as_ref().is_err_and(|error| {

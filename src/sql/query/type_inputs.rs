@@ -1050,6 +1050,48 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         Ok(())
     }
 
+    /// Walks a FROM clause whose first item is scope item `first`. A LATERAL
+    /// item or a table function's arguments read only the items to its left;
+    /// a join condition reads the whole `row`.
+    fn walk_from_items<'a>(
+        &mut self,
+        from: &ast::FromClause<'a>,
+        scope: &super::QueryScope<'_>,
+        first: usize,
+        columns: &dyn ColTypeResolver,
+        row: &dyn ColumnLookup<'a>,
+        outer: Option<&dyn ColumnLookup<'a>>,
+    ) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
+        let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
+        for (index, table) in core::iter::once(&from.base)
+            .chain(from.joins.iter().map(|join| &join.table))
+            .enumerate()
+        {
+            let access = index
+                .checked_sub(1)
+                .map_or(super::scope::LeftAccess::Lateral, |join| {
+                    super::scope::LeftAccess::of(&from.joins[join])
+                });
+            let left = access.prefix(scope, first + index);
+            let left_row = super::Chained {
+                inner: &left,
+                outer,
+            };
+            let left_columns = RuntimeColumnTypes {
+                row: &left_row,
+                catalog: Some(&catalog),
+            };
+            self.table_ref(table, &left_columns, &left_row, outer)?;
+            if let Some(expression) = index.checked_sub(1).and_then(|join| from.joins[join].on) {
+                self.expression(expression, columns, row)?;
+            }
+        }
+        Ok(())
+    }
+
     fn table_ref<'a>(
         &mut self,
         table: &ast::TableRef<'a>,
@@ -1219,7 +1261,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             ),
             None => None,
         };
-        let schema = scope.as_ref().map(super::materialize::ScopeSchema);
+        let schema = scope.as_ref().map(super::materialize::ScopeSchema::new);
         let empty = crate::sql::eval::NoColumns;
         let inner: &dyn ColumnLookup<'_> = schema
             .as_ref()
@@ -1231,13 +1273,8 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             catalog: Some(&catalog),
         };
         if let Some(from) = select.from {
-            self.table_ref(&from.base, &columns, &row, outer)?;
-            for join in from.joins {
-                self.table_ref(&join.table, &columns, &row, outer)?;
-                if let Some(expression) = join.on {
-                    self.expression(expression, &columns, &row)?;
-                }
-            }
+            let scope = scope.as_ref().expect("a FROM clause resolves a scope");
+            self.walk_from_items(&from, scope, 0, &columns, &row, outer)?;
         }
         let mut output_index = 0usize;
         let mut target_inputs = crate::mem::arena::ArenaList::new(self.arena);
@@ -1536,7 +1573,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             self.arena,
             outer.map(|outer| outer as &dyn ColumnLookup<'_>),
         )?;
-        let schema = super::materialize::ScopeSchema(&scope);
+        let schema = super::materialize::ScopeSchema::new(&scope);
         let row = super::Chained {
             inner: &schema,
             outer,
@@ -1547,13 +1584,8 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             catalog: Some(&catalog),
         };
         if let Some(from) = extra {
-            self.table_ref(&from.base, &columns, &row, outer)?;
-            for join in from.joins {
-                self.table_ref(&join.table, &columns, &row, outer)?;
-                if let Some(expression) = join.on {
-                    self.expression(expression, &columns, &row)?;
-                }
-            }
+            // The target is scope item 0; the extra items follow it.
+            self.walk_from_items(from, &scope, 1, &columns, &row, outer)?;
         }
         if let Stmt::Insert(insert) = statement
             && let Some(select) = insert.select
@@ -1660,7 +1692,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         if matches!(statement, Stmt::Insert(_)) && filter.is_some() {
             scope.set_target_aliases(&["excluded"], arena)?;
         }
-        let schema = super::materialize::ScopeSchema(&scope);
+        let schema = super::materialize::ScopeSchema::new(&scope);
         let row = super::Chained {
             inner: &schema,
             outer,
@@ -1676,7 +1708,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             return Ok(());
         }
         scope.set_target_aliases(&[returning.old_name(), returning.new_name()], arena)?;
-        let schema = super::materialize::ScopeSchema(&scope);
+        let schema = super::materialize::ScopeSchema::new(&scope);
         let row = super::Chained {
             inner: &schema,
             outer,

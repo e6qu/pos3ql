@@ -790,3 +790,197 @@ fn a_prepared_partition_move_keeps_its_marker_across_restart() {
         sessions.finish();
     }
 }
+
+#[test]
+fn read_committed_rechecks_run_lateral_sources_as_postgresql_plans_them() {
+    let mut sessions = sessions("lateral-recheck", TransactionMode::Mvcc, ITEMS);
+    for (statement, expected) in [
+        // A simple subquery without FROM is pulled up and runs again.
+        (
+            "SELECT i.id, i.qty, s.x FROM items i, LATERAL (SELECT i.qty * 10 AS x) s \
+             WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|2|20"][..],
+        ),
+        (
+            "SELECT i.id, s.y FROM items i, LATERAL (VALUES (i.qty + 1)) s(y) \
+             WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|3"],
+        ),
+        (
+            "SELECT i.id, s.x FROM items i, LATERAL (SELECT i.qty * 10 AS x WHERE i.qty < 2) s \
+             ORDER BY i.id FOR UPDATE OF i",
+            &[],
+        ),
+        // Functions and subqueries the planner keeps separate return the
+        // row first read.
+        (
+            "SELECT i.id, g FROM items i, LATERAL generate_series(i.qty, 2) g \
+             WHERE i.id = 1 ORDER BY g FOR UPDATE OF i",
+            &["1|1", "1|2"],
+        ),
+        (
+            "SELECT i.id, s.x FROM items i, LATERAL (SELECT i.qty * 10 AS x LIMIT 1) s \
+             WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|10"],
+        ),
+        (
+            "SELECT i.id, s.m FROM items i, LATERAL (SELECT max(qty) + i.qty AS m FROM stock \
+             WHERE stock.id = i.id) s WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|2"],
+        ),
+        // A flattened UNION ALL returns its first branch again.
+        (
+            "SELECT i.id, s.y FROM items i, LATERAL (SELECT i.qty + 1 AS y UNION ALL \
+             SELECT i.qty + 2) s WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|3", "1|3"],
+        ),
+    ] {
+        let output = after_concurrent_change(
+            &mut sessions,
+            "UPDATE items SET qty = qty + 1 WHERE id = 1",
+            statement,
+        );
+        assert!(error_sqlstates(&output).is_empty(), "{statement}");
+        assert_eq!(data_rows(&output), expected, "{statement}");
+    }
+    // A pulled-up subquery reading tables keeps rows pos3ql does not retain.
+    let output = after_concurrent_change(
+        &mut sessions,
+        "UPDATE items SET qty = qty + 1 WHERE id = 1",
+        "SELECT i.id, s.y FROM items i, LATERAL (SELECT stock.qty + i.qty AS y FROM stock \
+         WHERE stock.id = i.id) s WHERE i.id = 1 FOR UPDATE OF i",
+    );
+    assert_eq!(error_sqlstates(&output), ["0A000"]);
+    sessions.finish();
+}
+
+#[test]
+fn read_committed_semi_joins_recheck_the_subquery_row_first_matched() {
+    let mut sessions = sessions("semi-join-recheck", TransactionMode::Mvcc, ITEMS);
+    for (statement, expected) in [
+        (
+            "SELECT id FROM items WHERE EXISTS (SELECT 1 FROM stock WHERE stock.qty = items.qty) \
+             ORDER BY id FOR UPDATE",
+            &["2"][..],
+        ),
+        (
+            "SELECT id FROM items WHERE EXISTS (SELECT 1 FROM stock WHERE stock.qty >= items.qty) \
+             ORDER BY id FOR UPDATE",
+            &["2", "3"],
+        ),
+        // A condition PostgreSQL keeps as a subplan runs again.
+        (
+            "SELECT id FROM items WHERE EXISTS (SELECT 1 FROM stock WHERE stock.qty = items.qty) \
+             OR id = 3 ORDER BY id FOR UPDATE",
+            &["1", "2", "3"],
+        ),
+        (
+            "UPDATE items SET note = 'u' WHERE EXISTS \
+             (SELECT 1 FROM stock WHERE stock.qty = items.qty) RETURNING id",
+            &["2"],
+        ),
+        (
+            "DELETE FROM items WHERE qty IN (SELECT qty FROM stock) RETURNING id",
+            &["2"],
+        ),
+    ] {
+        let output = after_concurrent_change(
+            &mut sessions,
+            "UPDATE items SET qty = qty + 1 WHERE id = 1",
+            statement,
+        );
+        assert!(error_sqlstates(&output).is_empty(), "{statement}");
+        assert_eq!(data_rows(&output), expected, "{statement}");
+    }
+    sessions.finish();
+}
+
+#[test]
+fn a_merge_source_row_runs_not_matched_for_every_lost_pair() {
+    let mut sessions = sessions(
+        "merge-lost-pairs",
+        TransactionMode::Mvcc,
+        "CREATE TABLE mt (id int, k int, v int); CREATE TABLE ms (k int, w int)",
+    );
+    let merge = "MERGE INTO mt USING ms ON ms.k = mt.k \
+         WHEN MATCHED THEN UPDATE SET v = mt.v + ms.w \
+         WHEN NOT MATCHED THEN INSERT VALUES (100 + ms.w, ms.k, ms.w) \
+         RETURNING merge_action(), mt.id";
+    for (change, expected) in [
+        (
+            "UPDATE mt SET k = k + 10",
+            &["INSERT|101", "INSERT|101", "INSERT|102", "INSERT|103"][..],
+        ),
+        // The stage runs right after the lost pair, as PostgreSQL's does.
+        (
+            "UPDATE mt SET k = 11 WHERE id = 1",
+            &["INSERT|101", "UPDATE|2", "UPDATE|3", "INSERT|103"],
+        ),
+        (
+            "DELETE FROM mt WHERE id = 2",
+            &["UPDATE|1", "INSERT|101", "UPDATE|3", "INSERT|103"],
+        ),
+    ] {
+        sessions.first(
+            "DELETE FROM mt; DELETE FROM ms; INSERT INTO mt VALUES (1, 1, 10), (2, 1, 20), \
+             (3, 2, 30); INSERT INTO ms VALUES (1, 1), (2, 2), (3, 3)",
+        );
+        sessions.first(&format!("BEGIN; {change}"));
+        let parked = sessions.second_waits(merge);
+        sessions.first("COMMIT");
+        let output = sessions.resume_second(merge, parked);
+        assert!(error_sqlstates(&output).is_empty(), "{change}");
+        assert_eq!(data_rows(&output), expected, "{change}");
+    }
+    sessions.finish();
+}
+
+#[test]
+fn updates_and_deletes_run_correlated_where_subqueries_per_row() {
+    let mut sessions = sessions(
+        "correlated-dml-where",
+        TransactionMode::Mvcc,
+        "CREATE TABLE aa (id int, v int); CREATE TABLE bb (id int, w int); \
+         INSERT INTO aa VALUES (1, 1), (2, 2), (3, 3); INSERT INTO bb VALUES (1, 1), (3, 9)",
+    );
+    for (statement, expected) in [
+        (
+            "UPDATE aa SET v = v + 10 WHERE EXISTS (SELECT 1 FROM bb WHERE bb.id = aa.id) \
+             RETURNING id, v",
+            &["1|11", "3|13"][..],
+        ),
+        (
+            "UPDATE aa t SET v = 0 WHERE t.id = (SELECT max(id) FROM bb WHERE bb.w > t.v - 100) \
+             RETURNING id",
+            &["3"],
+        ),
+        (
+            "DELETE FROM aa WHERE v = (SELECT aa.v) AND id = 2 RETURNING id",
+            &["2"],
+        ),
+        (
+            "UPDATE aa SET v = 5 FROM bb WHERE bb.id = aa.id AND EXISTS \
+             (SELECT 1 FROM bb b2 WHERE b2.w = aa.v + 0 * bb.w) RETURNING aa.id",
+            &[],
+        ),
+        (
+            "MERGE INTO aa USING bb ON bb.id = aa.id WHEN MATCHED AND EXISTS \
+             (SELECT 1 FROM bb b2 WHERE b2.id = aa.id AND b2.w = 9) THEN DELETE \
+             RETURNING aa.id",
+            &["3"],
+        ),
+    ] {
+        let output = sessions.second(statement);
+        assert!(error_sqlstates(&output).is_empty(), "{statement}");
+        assert_eq!(data_rows(&output), expected, "{statement}");
+    }
+    // A LATERAL set operation reads the tables to its left.
+    assert_eq!(
+        sessions.rows(
+            "SELECT aa.id, s.y FROM aa, LATERAL (SELECT aa.v + 1 AS y UNION ALL \
+             SELECT aa.v + 2) s ORDER BY 1, 2"
+        ),
+        ["1|12", "1|13"]
+    );
+    sessions.finish();
+}

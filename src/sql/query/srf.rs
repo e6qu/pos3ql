@@ -2533,24 +2533,27 @@ pub(crate) fn describe_enclosed_derived_definition<'a>(
     lateral: Option<&QueryScope<'_>>,
     enclosing: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<RelationDefinition<'a>, SqlError> {
-    let Some(enclosing) = enclosing else {
+    // A LATERAL set operation's branches read the tables to its left, so it
+    // is described against them like an enclosed body.
+    if enclosing.is_none() && (lateral.is_none() || sub.set_body.is_none()) {
         return describe_derived_definition(
             storage, sub, exposed, col_alias, txid, arena, lateral, None,
         );
-    };
+    }
     // A LATERAL body also reads the tables to its left, nearer than the
     // enclosing levels.
     let lateral_schema = lateral.map(super::ScopeSchema);
     let chained;
-    let outer_row: &dyn ColumnLookup<'a> = match &lateral_schema {
-        Some(schema) => {
+    let outer_row: &dyn ColumnLookup<'a> = match (&lateral_schema, enclosing) {
+        (Some(schema), enclosing) => {
             chained = super::Chained {
                 inner: schema,
-                outer: Some(enclosing),
+                outer: enclosing,
             };
             &chained
         }
-        None => enclosing,
+        (None, Some(enclosing)) => enclosing,
+        (None, None) => unreachable!("an unenclosed body without LATERAL returned above"),
     };
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let n_cols = super::describe_select(

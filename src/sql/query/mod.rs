@@ -41,7 +41,7 @@ pub(crate) use setops::set_query_into_rows;
 
 pub(crate) mod generator;
 mod materialize;
-pub(crate) use materialize::ScopeSchema;
+pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
 use materialize::{external_materialized_into, materialized_rows, materialized_select};
 
 mod scan;
@@ -837,6 +837,7 @@ use subquery::{
 };
 pub(crate) use subquery::{
     expression_has_correlated_subquery, subquery_hooks_outer, subquery_hooks_with_outer,
+    uncorrelated_subquery_hooks,
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
 pub(crate) use subquery::{type_witness, walk_children};
@@ -14458,6 +14459,91 @@ fn expr_contains_node<'a>(e: &'a Expr<'a>, target: *const Expr<'a>) -> bool {
     found
 }
 
+/// A semi-join's recheck in PostgreSQL's EvalPlanQual: the subquery row the
+/// version `first` matched first, in scan order, must also satisfy the
+/// subquery's `WHERE` with the locked row's `latest` version. The match
+/// order follows pos3ql's scan, which PostgreSQL's choice equals for a
+/// sequential scan of one relation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn semi_join_first_match_passes<'a>(
+    storage: &'a Storage,
+    select: &'a Select<'a>,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    first: &dyn ColumnLookup<'a>,
+    latest: &dyn ColumnLookup<'a>,
+    sequences: Option<&dyn SequenceAccess>,
+) -> Result<bool, SqlError> {
+    let from = select.from.as_ref().ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a semi-join recheck has no FROM clause"
+        )
+    })?;
+    let where_clause = select.where_clause;
+    let scope = QueryScope::resolve_exec_outer(
+        storage,
+        from,
+        where_clause,
+        txid,
+        arena,
+        params,
+        sequences,
+        Some(first),
+    )?;
+    let subs = uncorrelated_subquery_hooks(
+        &[where_clause],
+        storage,
+        txid,
+        arena,
+        params,
+        Some(first),
+        sequences,
+    )?;
+    let correlated_subqueries = ProceduralSubqueries { storage, txid };
+    let catalog = storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        subs: Some(&subs),
+        subquery_executor: Some(&correlated_subqueries),
+        catalog: Some(&catalog),
+        sequences,
+        ..super::eval::NO_HOOKS
+    };
+    let expressions: &[&Expr<'a>] = match where_clause {
+        Some(predicate) => &[predicate],
+        None => &[],
+    };
+    let pax_columns = pax_column_demand(&scope, from, expressions);
+    let retain_match = core::cell::Cell::new(false);
+    let mut passes = None;
+    scan_source_recycling_retaining_match_with_pax_columns(
+        storage,
+        &scope,
+        from,
+        txid,
+        where_clause,
+        arena,
+        params,
+        &hooks,
+        Some(first),
+        pax_columns,
+        &retain_match,
+        &mut |inner| {
+            let again = Chained {
+                inner,
+                outer: Some(latest),
+            };
+            passes = Some(match where_clause {
+                Some(predicate) => plan::where_passes(predicate, arena, params, &again, &hooks)?,
+                None => true,
+            });
+            Ok(false)
+        },
+    )?;
+    Ok(passes.unwrap_or(false))
+}
+
 /// For `UPDATE ... FROM` / `DELETE ... USING`: enumerates the extra tables in
 /// `from`, resolving the target row's columns through `target` (as the outer
 /// scope), and invokes `on_match` with a combined lookup for the FIRST joined
@@ -14490,14 +14576,17 @@ pub fn first_from_match<'a>(
         .map_err(|_| arena_full())?;
     subquery_expressions[0] = where_clause;
     collect_table_sample_expressions(from, &mut subquery_expressions[1..]);
-    let subs = subquery_hooks(
+    // A subquery reading the target or a FROM row runs per joined row.
+    let subs = uncorrelated_subquery_hooks(
         subquery_expressions,
         storage,
         txid,
         arena,
         params,
+        Some(target),
         sequences,
     )?;
+    let correlated_subqueries = ProceduralSubqueries { storage, txid };
     let catalog = StorageCatalog {
         storage,
         routine_workspace: arena,
@@ -14509,7 +14598,7 @@ pub fn first_from_match<'a>(
         group: None,
         aggs: None,
         subs: Some(&subs),
-        subquery_executor: None,
+        subquery_executor: Some(&correlated_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,

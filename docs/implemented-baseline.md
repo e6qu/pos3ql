@@ -96,13 +96,31 @@ action again for the target row's latest version: a `WHEN MATCHED` pair whose
 pair whose `ON` condition no longer holds runs the `WHEN NOT MATCHED BY SOURCE`
 actions on the target row and the `WHEN NOT MATCHED` action for the source
 row; a deleted target row leaves only the `WHEN NOT MATCHED` action, as in
-PostgreSQL 15 and later. An `IN (subquery)` condition that does not refer to
-the outer query is rechecked against the subquery row it first matched, as
-PostgreSQL's semi-join does: the row stays only if the tested value did not
-change. Two differences remain: PostgreSQL rechecks a correlated `EXISTS
-(subquery)` against the subquery row it first matched, where pos3ql runs the
-subquery again; and a query with a `LATERAL` source fails such a recheck with `0A000` where
-PostgreSQL runs the `LATERAL` source again.
+PostgreSQL 15 and later. A source row that loses several matches runs its
+`WHEN NOT MATCHED` action once for each lost pair, right after that pair, as
+PostgreSQL does.
+
+`UPDATE`, `DELETE` and `SELECT ... FOR UPDATE` recheck their `WHERE` the way
+PostgreSQL's plan does. An `IN (subquery)` condition that does not refer to
+the outer query, and an `EXISTS (subquery)` condition that does (both at the
+top level of `WHERE`), are semi-joins in PostgreSQL's plan: the row stays only
+if the subquery row it first matched still matches. For example, `UPDATE jobs
+SET state = 'done' WHERE EXISTS (SELECT 1 FROM workers w WHERE w.slot =
+jobs.slot)` that waited for another session's change to `jobs.slot` skips the
+job when the worker it first matched no longer has that slot, even if another
+worker does. pos3ql takes the first match in its own scan order, which equals
+PostgreSQL's for a sequential scan of one table; a different join plan in
+PostgreSQL can pick a different first row. Other conditions, and correlated
+subqueries PostgreSQL keeps as subplans (under `OR`, with aggregates or
+volatile functions), run again over the latest version.
+
+A `LATERAL` source follows the same plan rules: a simple subquery without
+`FROM` (`LATERAL (SELECT t.qty * 10 AS x)`) runs again over the latest row; a
+function, a `VALUES` list of several rows and a subquery with aggregates,
+`GROUP BY`, `DISTINCT`, `LIMIT` or `OFFSET` keep the row first read; a `UNION
+ALL` of simple branches returns its first branch's row again. A simple
+`LATERAL` subquery that reads tables fails the recheck with `0A000`, because
+PostgreSQL keeps the rows it first joined and pos3ql does not retain them.
 
 A commit becomes visible all at once, and only after it is durable: new
 statements never see half of an order-and-invoice update. If commit waits for

@@ -372,6 +372,7 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
         layout: DmlTableLayout<'a>,
         table: usize,
         rowid: u64,
+        seen: crate::storage::RowSnapshot,
         latest: crate::storage::VisibleRowHome,
         arena: &'a Arena,
     ) -> Result<Option<&'a [u8]>, SqlError> {
@@ -381,18 +382,65 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
         let mut values = [Datum::Null; MAX_COLUMNS];
         layout.project(&physical, &mut values);
         let Some(from) = self.from else {
-            let matched = row_matches_values(
+            if !row_matches_values(
                 storage,
                 txid,
                 self.def,
                 self.alias,
                 &values,
-                self.where_clause,
+                None,
                 arena,
                 self.params,
                 self.hooks,
                 self.row_security,
                 self.outer,
+            )? {
+                return Ok(None);
+            }
+            let Some(predicate) = self.where_clause else {
+                return Ok(Some(bytes));
+            };
+            // The version the statement selected, for the semi-joins whose
+            // recheck keeps the subquery row it first matched.
+            let first_bytes = storage.row_bytes(table, rowid, seen, arena)?;
+            let mut first_physical = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(first_bytes, layout.schema, &mut first_physical)?;
+            let mut first_values = [Datum::Null; MAX_COLUMNS];
+            layout.project(&first_physical, &mut first_values);
+            let relation = crate::storage::RelationDefinition::from_definition(self.def);
+            let first_row = RowCtx {
+                def: relation,
+                values: &first_values[..self.def.n_columns],
+                alias: self.alias,
+            };
+            let latest_row = RowCtx {
+                def: relation,
+                values: &values[..self.def.n_columns],
+                alias: self.alias,
+            };
+            let first_scope = self.outer.map(|outer| TriggerDmlScope {
+                row: &first_row,
+                outer,
+            });
+            let latest_scope = self.outer.map(|outer| TriggerDmlScope {
+                row: &latest_row,
+                outer,
+            });
+            let matched = super::query::locked_row_where_passes(
+                storage,
+                txid,
+                predicate,
+                match first_scope.as_ref() {
+                    Some(scope) => scope,
+                    None => &first_row,
+                },
+                match latest_scope.as_ref() {
+                    Some(scope) => scope,
+                    None => &latest_row,
+                },
+                arena,
+                self.params,
+                self.hooks,
             )?;
             return Ok(matched.then_some(bytes));
         };
@@ -494,7 +542,9 @@ fn lock_selected_dml_rows<'a, Definition: crate::storage::DefinitionBacking>(
             row_conflicts::LockedVersion::Updated(latest) => {
                 let snapshot = latest.snapshot();
                 let layout = retained_rows.layout(table)?;
-                match requalify.latest(storage, txn.txid, layout, table, rowid, latest, arena)? {
+                match requalify
+                    .latest(storage, txn.txid, layout, table, rowid, home, latest, arena)?
+                {
                     Some(bytes) => {
                         retained_rows.replace(table, rowid, bytes)?;
                         Some(PhysicalRow::local(table, rowid, snapshot))
@@ -67672,10 +67722,11 @@ pub(crate) fn merge<'a>(
     drop(selection_snapshot);
     // Row changes start here; a wait before them restarts the statement.
     row_progress::enter_rows(progress.as_deref_mut());
-    // Row progress counts one position per source row and target row pair,
-    // plus each source row's NOT MATCHED stage; the last source position is
-    // the NOT MATCHED BY SOURCE pass.
-    let stride = n_target + 1;
+    // Row progress counts, per source row, one position for each target row
+    // pair, one for the NOT MATCHED stage a lost pair runs, and one for the
+    // stage of a source row that matched nothing; the last source position
+    // is the NOT MATCHED BY SOURCE pass.
+    let stride = 2 * n_target + 1;
     let positions = (source_rows.len() + 1).saturating_mul(stride);
     let (first_position, mut affected_count, mut resumed_match) = match progress.as_deref() {
         Some(progress) => {
@@ -67720,11 +67771,18 @@ pub(crate) fn merge<'a>(
         )
     });
     let mut source_index = first_position / stride;
-    let mut first_target = first_position % stride;
-    // Whether the running source row matched a target row, and whether a
-    // concurrent change took a match away; kept with an unfinished row.
+    // A resumed position past the pairs continues a lost pair's NOT MATCHED
+    // stage, or the stage of a source row that matched nothing.
+    let mut first_target = match first_position % stride {
+        pair if pair < 2 * n_target => pair % n_target.max(1),
+        _ => n_target,
+    };
+    let mut resumed_lost_pair = (n_target..2 * n_target)
+        .contains(&(first_position % stride))
+        .then_some(first_target);
+    // Whether the running source row matched a target row; kept with an
+    // unfinished row.
     let mut matched = false;
-    let mut match_lost = false;
     let rows_outcome = (|| -> Outcome {
         loop {
             let by_source = source_index == source_rows.len();
@@ -67743,10 +67801,191 @@ pub(crate) fn merge<'a>(
                 width
             };
             let sv = &sv[..source_def.n_columns.min(n_src_cols)];
+            // A source row runs its NOT MATCHED [BY TARGET] stage when it
+            // matched nothing, and right after each pair a concurrent change
+            // took away, as PostgreSQL's ExecMerge does. A deleted NOT
+            // MATCHED BY SOURCE row runs it with a NULL source row.
+            macro_rules! run_not_matched {
+                ($position:expr) => {
+                    'not_matched: {
+                        let position = $position;
+                        match row_progress::start_row(
+                            progress.as_deref_mut(),
+                            position,
+                            None,
+                            affected_count,
+                            row_progress::capture_lengths([
+                                insert_transitions.as_ref(),
+                                update_transitions.as_ref(),
+                                delete_transitions.as_ref(),
+                            ]),
+                            txn,
+                            responder,
+                            arena,
+                        ) {
+                            Ok(None) => {}
+                            Ok(Some(resumed)) => {
+                                match emit_merge_progress_returning(
+                                    progress.as_deref_mut(),
+                                    ChangedRow {
+                                        index: position,
+                                        row: None,
+                                        changed: affected_count,
+                                        transitions: row_progress::capture_lengths([
+                                            insert_transitions.as_ref(),
+                                            update_transitions.as_ref(),
+                                            delete_transitions.as_ref(),
+                                        ]),
+                                    },
+                                    storage,
+                                    txn,
+                                    def,
+                                    target_alias,
+                                    source_def,
+                                    source_alias,
+                                    Some(sv),
+                                    statement.returning,
+                                    None,
+                                    resumed.new,
+                                    "INSERT",
+                                    arena,
+                                    params,
+                                    responder,
+                                    &mut capture,
+                                    seq_session,
+                                )? {
+                                    Ok(()) => {}
+                                    Err(error) => return sql_fail(error),
+                                }
+                                affected_count += 1;
+                                break 'not_matched;
+                            }
+                            Err(error) => return sql_fail(error),
+                        }
+                        // First satisfied WHEN NOT MATCHED clause (source columns only).
+                        let source_ctx = RowCtx {
+                            def: *source_def,
+                            values: sv,
+                            alias: None,
+                        };
+                        for when in statement.whens.iter().filter(|w| {
+                            matches!(
+                                w.kind(),
+                                crate::sql::ast::MergeMatchKind::NotMatchedByTarget
+                            )
+                        }) {
+                            if let Some(cond) = when.condition() {
+                                match eval_merge_expression(
+                                    cond,
+                                    storage,
+                                    txn.txid,
+                                    seq_session,
+                                    arena,
+                                    params,
+                                    &ProceduralMergeScope {
+                                        row: &source_ctx,
+                                        outer,
+                                    },
+                                    None,
+                                ) {
+                                    Ok(Datum::Bool(true)) => {}
+                                    Ok(_) => continue,
+                                    Err(e) => return sql_fail(e),
+                                }
+                            }
+                            match when.action() {
+                                MergeAction::DoNothing => {}
+                                MergeAction::Insert {
+                                    columns,
+                                    values,
+                                    default_values,
+                                    overriding,
+                                } => {
+                                    match merge_insert(
+                                        storage,
+                                        txn,
+                                        assignment_casts,
+                                        table_target,
+                                        def,
+                                        columns,
+                                        values,
+                                        default_values,
+                                        overriding,
+                                        &ProceduralMergeScope {
+                                            row: &source_ctx,
+                                            outer,
+                                        },
+                                        &generated,
+                                        &defaults,
+                                        seq_session,
+                                        arena,
+                                        params,
+                                        &checks,
+                                        insert_check,
+                                        responder,
+                                        insert_transitions.as_mut(),
+                                    ) {
+                                        Ok(Some(inserted)) => {
+                                            if !statement.returning.is_empty() {
+                                                match emit_merge_progress_returning(
+                                                    progress.as_deref_mut(),
+                                                    ChangedRow {
+                                                        index: position,
+                                                        row: None,
+                                                        changed: affected_count,
+                                                        transitions: row_progress::capture_lengths([
+                                                            insert_transitions.as_ref(),
+                                                            update_transitions.as_ref(),
+                                                            delete_transitions.as_ref(),
+                                                        ]),
+                                                    },
+                                                    storage,
+                                                    txn,
+                                                    def,
+                                                    target_alias,
+                                                    source_def,
+                                                    source_alias,
+                                                    Some(sv),
+                                                    statement.returning,
+                                                    None,
+                                                    Some(inserted),
+                                                    "INSERT",
+                                                    arena,
+                                                    params,
+                                                    responder,
+                                                    &mut capture,
+                                                    seq_session,
+                                                ) {
+                                                    Ok(Ok(())) => {}
+                                                    Ok(Err(error)) => return sql_fail(error),
+                                                    Err(wire) => return Err(wire),
+                                                }
+                                            }
+                                            affected_count += 1;
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => return sql_fail(error),
+                                    }
+                                }
+                                _ => {
+                                    return sql_fail(sql_err!(
+                                        sqlstate::SYNTAX_ERROR,
+                                        "only INSERT / DO NOTHING is allowed in a WHEN NOT MATCHED clause"
+                                    ));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                };
+            }
             let resumed = core::mem::take(&mut resumed_match);
             matched = by_source || resumed.matched;
-            match_lost = resumed.lost;
             for j in core::mem::take(&mut first_target)..n_target {
+                if core::mem::take(&mut resumed_lost_pair) == Some(j) {
+                    run_not_matched!(source_index * stride + n_target + j);
+                    continue;
+                }
                 if by_source && matched_by_source[j] {
                     continue;
                 }
@@ -67865,6 +68104,7 @@ pub(crate) fn merge<'a>(
                 let mut pair_physical = target_physical[j];
                 let mut pair_row = selected_rows[j];
                 let mut by_source_actions = by_source;
+                let mut pair_lost = false;
                 let mut choose_again = true;
                 while core::mem::take(&mut choose_again) {
                     let lookup = MergeLookup {
@@ -67885,7 +68125,7 @@ pub(crate) fn merge<'a>(
                             match $lock {
                                 Ok(MergeRowLock::Current) => {}
                                 Ok(MergeRowLock::Deleted) => {
-                                    match_lost = true;
+                                    pair_lost = true;
                                     break;
                                 }
                                 Ok(MergeRowLock::Updated {
@@ -67917,7 +68157,7 @@ pub(crate) fn merge<'a>(
                                             Ok(Datum::Bool(true)) => {}
                                             Ok(_) => {
                                                 by_source_actions = true;
-                                                match_lost = true;
+                                                pair_lost = true;
                                             }
                                             Err(error) => return sql_fail(error),
                                         }
@@ -68705,193 +68945,12 @@ pub(crate) fn merge<'a>(
                         break;
                     }
                 }
-            }
-            // A source row runs its NOT MATCHED [BY TARGET] stage when it
-            // matched nothing, or when a concurrent change took a match
-            // away. PostgreSQL runs the stage once per lost pair; one source
-            // row losing several matches runs it once here. A deleted
-            // NOT MATCHED BY SOURCE row runs it with a NULL source row, as
-            // PostgreSQL's ExecMerge does.
-            let not_matched = !matched || match_lost;
-            if by_source && !not_matched {
-                break;
-            }
-            if not_matched {
-                let position = source_index * stride + n_target;
-                match row_progress::start_row(
-                    progress.as_deref_mut(),
-                    position,
-                    None,
-                    affected_count,
-                    row_progress::capture_lengths([
-                        insert_transitions.as_ref(),
-                        update_transitions.as_ref(),
-                        delete_transitions.as_ref(),
-                    ]),
-                    txn,
-                    responder,
-                    arena,
-                ) {
-                    Ok(None) => {}
-                    Ok(Some(resumed)) => {
-                        match emit_merge_progress_returning(
-                            progress.as_deref_mut(),
-                            ChangedRow {
-                                index: position,
-                                row: None,
-                                changed: affected_count,
-                                transitions: row_progress::capture_lengths([
-                                    insert_transitions.as_ref(),
-                                    update_transitions.as_ref(),
-                                    delete_transitions.as_ref(),
-                                ]),
-                            },
-                            storage,
-                            txn,
-                            def,
-                            target_alias,
-                            source_def,
-                            source_alias,
-                            Some(sv),
-                            statement.returning,
-                            None,
-                            resumed.new,
-                            "INSERT",
-                            arena,
-                            params,
-                            responder,
-                            &mut capture,
-                            seq_session,
-                        )? {
-                            Ok(()) => {}
-                            Err(error) => return sql_fail(error),
-                        }
-                        affected_count += 1;
-                        if by_source {
-                            break;
-                        }
-                        source_index += 1;
-                        continue;
-                    }
-                    Err(error) => return sql_fail(error),
+                if pair_lost {
+                    run_not_matched!(source_index * stride + n_target + j);
                 }
             }
-            if not_matched {
-                let position = source_index * stride + n_target;
-                // First satisfied WHEN NOT MATCHED clause (source columns only).
-                let source_ctx = RowCtx {
-                    def: *source_def,
-                    values: sv,
-                    alias: None,
-                };
-                for when in statement.whens.iter().filter(|w| {
-                    matches!(
-                        w.kind(),
-                        crate::sql::ast::MergeMatchKind::NotMatchedByTarget
-                    )
-                }) {
-                    if let Some(cond) = when.condition() {
-                        match eval_merge_expression(
-                            cond,
-                            storage,
-                            txn.txid,
-                            seq_session,
-                            arena,
-                            params,
-                            &ProceduralMergeScope {
-                                row: &source_ctx,
-                                outer,
-                            },
-                            None,
-                        ) {
-                            Ok(Datum::Bool(true)) => {}
-                            Ok(_) => continue,
-                            Err(e) => return sql_fail(e),
-                        }
-                    }
-                    match when.action() {
-                        MergeAction::DoNothing => {}
-                        MergeAction::Insert {
-                            columns,
-                            values,
-                            default_values,
-                            overriding,
-                        } => {
-                            match merge_insert(
-                                storage,
-                                txn,
-                                assignment_casts,
-                                table_target,
-                                def,
-                                columns,
-                                values,
-                                default_values,
-                                overriding,
-                                &ProceduralMergeScope {
-                                    row: &source_ctx,
-                                    outer,
-                                },
-                                &generated,
-                                &defaults,
-                                seq_session,
-                                arena,
-                                params,
-                                &checks,
-                                insert_check,
-                                responder,
-                                insert_transitions.as_mut(),
-                            ) {
-                                Ok(Some(inserted)) => {
-                                    if !statement.returning.is_empty() {
-                                        match emit_merge_progress_returning(
-                                            progress.as_deref_mut(),
-                                            ChangedRow {
-                                                index: position,
-                                                row: None,
-                                                changed: affected_count,
-                                                transitions: row_progress::capture_lengths([
-                                                    insert_transitions.as_ref(),
-                                                    update_transitions.as_ref(),
-                                                    delete_transitions.as_ref(),
-                                                ]),
-                                            },
-                                            storage,
-                                            txn,
-                                            def,
-                                            target_alias,
-                                            source_def,
-                                            source_alias,
-                                            Some(sv),
-                                            statement.returning,
-                                            None,
-                                            Some(inserted),
-                                            "INSERT",
-                                            arena,
-                                            params,
-                                            responder,
-                                            &mut capture,
-                                            seq_session,
-                                        ) {
-                                            Ok(Ok(())) => {}
-                                            Ok(Err(error)) => return sql_fail(error),
-                                            Err(wire) => return Err(wire),
-                                        }
-                                    }
-                                    affected_count += 1;
-                                }
-                                Ok(None) => {}
-                                Err(error) => return sql_fail(error),
-                            }
-                        }
-                        _ => {
-                            return sql_fail(sql_err!(
-                                sqlstate::SYNTAX_ERROR,
-                                "only INSERT / DO NOTHING is allowed in a WHEN NOT MATCHED clause"
-                            ));
-                        }
-                    }
-                    break;
-                }
+            if !matched {
+                run_not_matched!(source_index * stride + 2 * n_target);
             }
             if by_source {
                 break;
@@ -68906,10 +68965,7 @@ pub(crate) fn merge<'a>(
                 progress,
                 affected,
                 matched_by_source,
-                SourceRowMatch {
-                    matched,
-                    lost: match_lost,
-                },
+                SourceRowMatch { matched },
                 arena,
                 &storage.row_work,
             )
@@ -68972,43 +69028,28 @@ pub(crate) fn merge<'a>(
 #[derive(Clone, Copy, Default)]
 struct SourceRowMatch {
     matched: bool,
-    /// A concurrent change took one of its matches away.
-    lost: bool,
 }
 
 impl SourceRowMatch {
     fn flag(self) -> u8 {
-        match (self.matched, self.lost) {
-            (_, true) => b'2',
-            (true, false) => b'1',
-            (false, false) => b'0',
-        }
+        if self.matched { b'1' } else { b'0' }
     }
 
     fn from_flag(flag: &[u8]) -> Result<Self, SqlError> {
-        Ok(match flag {
-            b"0" => Self::default(),
-            b"1" => Self {
-                matched: true,
-                lost: false,
-            },
-            b"2" => Self {
-                matched: true,
-                lost: true,
-            },
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "a resumed MERGE row has an invalid match state"
-                ));
-            }
-        })
+        match flag {
+            b"0" => Ok(Self { matched: false }),
+            b"1" => Ok(Self { matched: true }),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a resumed MERGE row has an invalid match state"
+            )),
+        }
     }
 }
 
 /// Saves `MERGE`'s per-target flags and the running source row's match with
 /// an unfinished row: `1` or `0` per target row for `affected` and
-/// `matched_by_source`, then the running row's [`SourceRowMatch`].
+/// `matched_by_source`, then the running row's [`SourceRowMatch`] flag.
 fn save_merge_state(
     progress: &mut RowProgress,
     affected: &[bool],
@@ -72963,7 +73004,7 @@ pub(crate) fn update<'a>(
             subquery_expression_count += 1;
         }
     }
-    let subs = match super::query::subquery_hooks_with_outer(
+    let subs = match super::query::uncorrelated_subquery_hooks(
         &subquery_expressions[..subquery_expression_count],
         storage,
         txn.txid,
@@ -72981,11 +73022,15 @@ pub(crate) fn update<'a>(
     };
     let catalog = super::query::storage_catalog(storage, arena, txn.txid);
     let effect_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+    let correlated_subqueries = super::query::ProceduralSubqueries {
+        storage,
+        txid: txn.txid,
+    };
     let hooks = super::eval::EvalHooks {
         group: None,
         aggs: None,
         subs: Some(&subs),
-        subquery_executor: None,
+        subquery_executor: Some(&correlated_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -74211,12 +74256,13 @@ pub(crate) fn delete<'a>(
         return sql_fail(error);
     }
 
-    let subs = match super::query::subquery_hooks(
+    let subs = match super::query::uncorrelated_subquery_hooks(
         &[statement.where_clause],
         storage,
         txn.txid,
         arena,
         params,
+        outer,
         Some(&crate::sql::sequence::SeqEval::new(
             storage,
             seq_session,
@@ -74228,11 +74274,15 @@ pub(crate) fn delete<'a>(
     };
     let catalog = super::query::storage_catalog(storage, arena, txn.txid);
     let effect_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+    let correlated_subqueries = super::query::ProceduralSubqueries {
+        storage,
+        txid: txn.txid,
+    };
     let hooks = super::eval::EvalHooks {
         group: None,
         aggs: None,
         subs: Some(&subs),
-        subquery_executor: None,
+        subquery_executor: Some(&correlated_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,

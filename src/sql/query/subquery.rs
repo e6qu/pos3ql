@@ -1824,7 +1824,7 @@ fn set_tree_has_outer_ref<'a>(
 
 /// Whether a top-level subquery node references any column from the enclosing
 /// query — i.e. is correlated and must be re-evaluated per outer row.
-fn subquery_node_correlated<'a>(
+pub(super) fn subquery_node_correlated<'a>(
     node: &'a Expr<'a>,
     storage: &'a Storage,
     txid: u32,
@@ -3978,6 +3978,45 @@ pub(crate) fn subquery_hooks_with_outer<'a>(
     let storage_for_eval: &'a Storage = unsafe { &*(storage as *const Storage) };
     let borrowed = prepare_subqueries(
         exprs,
+        storage_for_eval,
+        txid,
+        arena,
+        params,
+        SUBQUERY_DEPTH,
+        outer,
+        sequences,
+    )?;
+    detach_subquery_values(borrowed, arena)
+}
+
+/// Evaluates the subqueries of a data-modifying statement's `WHERE` (and
+/// other row-independent expressions) that do not read the written row. A
+/// correlated subquery runs per row through [`ProceduralSubqueries`], as
+/// PostgreSQL runs a correlated `SubPlan` for every candidate row.
+pub(crate) fn uncorrelated_subquery_hooks<'a>(
+    exprs: &[Option<&'a Expr<'a>>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: Option<&dyn ColumnLookup<'a>>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    // SAFETY: as in `subquery_hooks_with_outer`; every value is detached
+    // before this function returns.
+    let storage_for_eval: &'a Storage = unsafe { &*(storage as *const Storage) };
+    let mut nodes = ArenaList::new(arena);
+    for expression in exprs.iter().flatten() {
+        collect_subqueries(expression, &mut nodes)?;
+    }
+    let mut uncorrelated = ArenaList::new(arena);
+    for &node in nodes.as_slice() {
+        if !subquery_node_correlated(node, storage_for_eval, txid, arena)? {
+            uncorrelated.push(node).map_err(|_| arena_full())?;
+        }
+    }
+    let borrowed = eval_subquery_nodes(
+        uncorrelated.as_slice(),
         storage_for_eval,
         txid,
         arena,

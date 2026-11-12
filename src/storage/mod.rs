@@ -46368,6 +46368,19 @@ impl Storage {
         })
     }
 
+    /// Whether a visible user-defined aggregate could be what `name` with
+    /// `arity` arguments calls; built-in aggregates are known by name.
+    pub(crate) fn has_aggregate_routine_candidate(
+        &self,
+        name: &str,
+        arity: usize,
+        txid: u32,
+    ) -> bool {
+        self.has_routine_candidate(name, arity, txid, |kind, _| {
+            matches!(kind, RoutineKind::Aggregate(_))
+        })
+    }
+
     fn has_routine_candidate(
         &self,
         name: &str,

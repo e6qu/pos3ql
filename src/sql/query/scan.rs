@@ -5061,6 +5061,45 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
     Ok(LateralRows::External(run))
 }
 
+/// The first row a `LATERAL` source yields for `outer`, decoded, as a locked
+/// row's recheck runs the source again with the row's latest version.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn first_lateral_row<'a, C: ColumnLookup<'a>>(
+    storage: &'a Storage,
+    txid: u32,
+    tref: &'a crate::sql::ast::TableRef<'a>,
+    width: usize,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: &C,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    let first = match materialize_lateral_source(
+        storage, txid, tref, width, arena, params, outer, hooks,
+    )? {
+        LateralRows::Local(rows) => rows.first().copied(),
+        LateralRows::External(None) => None,
+        LateralRows::External(Some(run)) => {
+            let mut first = None;
+            consume_external_lateral_run(storage, run, arena, false, &mut |_, bytes| {
+                first = Some(bytes);
+                Ok(false)
+            })?;
+            first
+        }
+    };
+    let Some(bytes) = first else {
+        return Ok(None);
+    };
+    let values = arena
+        .alloc_slice_with(width, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    for (column, value) in values.iter_mut().enumerate() {
+        *value = crate::sql::exec::decode_projected_col_record(bytes, column, arena)?;
+    }
+    Ok(Some(values))
+}
+
 fn consume_external_lateral_run<'a>(
     storage: &'a Storage,
     run: crate::sql::external::ExternalRun,

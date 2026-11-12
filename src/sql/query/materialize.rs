@@ -490,6 +490,286 @@ pub(super) struct LockedRowRecheck<'r, 'a> {
     changed: &'a mut [Option<usize>],
 }
 
+/// Rechecks `predicate` for a locked row's latest version, as PostgreSQL's
+/// EvalPlanQual runs the query's plan again over it. A top-level `IN
+/// (subquery)` without outer references and a top-level correlated `EXISTS`
+/// are semi-joins in PostgreSQL's plan, whose recheck keeps the subquery row
+/// first matched: the `IN` operand must still equal its first value, and the
+/// `EXISTS` condition runs over the subquery row the version `first` matched
+/// first. Every other condition runs again over `latest`, with correlated
+/// subqueries evaluated for it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn locked_row_where_passes<'a>(
+    storage: &Storage,
+    txid: u32,
+    predicate: &'a Expr<'a>,
+    first: &dyn ColumnLookup<'a>,
+    latest: &dyn ColumnLookup<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<bool, SqlError> {
+    // SAFETY: Storage outlives this call and stays immutable during it; only
+    // a Boolean escapes, so no value borrowing relation bytes outlives it.
+    let storage: &'a Storage = unsafe { &*(storage as *const Storage) };
+    let correlated_subqueries = super::ProceduralSubqueries { storage, txid };
+    let hooks = EvalHooks {
+        subquery_executor: Some(&correlated_subqueries),
+        ..*hooks
+    };
+    let first = Chained {
+        inner: first,
+        outer: None,
+    };
+    let latest = Chained {
+        inner: latest,
+        outer: None,
+    };
+    let mut conjuncts = [predicate; super::plan::MAX_CONJUNCTS];
+    let mut count = 0;
+    if !super::plan::flatten_and(predicate, &mut conjuncts, &mut count) {
+        conjuncts[0] = predicate;
+        count = 1;
+    }
+    for conjunct in &conjuncts[..count] {
+        let passes = match conjunct {
+            Expr::InSubquery {
+                operand,
+                negated: false,
+                ..
+            } if !super::subquery::subquery_node_correlated(conjunct, storage, txid, arena)? => {
+                let before = eval_full(operand, arena, params, &first, &hooks)?;
+                let after = eval_full(operand, arena, params, &latest, &hooks)?;
+                let catalog = super::storage_catalog(storage, arena, txid);
+                !before.is_null()
+                    && !after.is_null()
+                    && crate::sql::eval::compare_datums_collated(
+                        storage,
+                        txid,
+                        crate::sql::eval::resolved_expression_collation(
+                            operand,
+                            &latest,
+                            Some(&catalog),
+                        )?,
+                        &before,
+                        &after,
+                    )?
+                    .is_eq()
+            }
+            Expr::Exists(select)
+                if semi_join_exists(select, storage, txid)
+                    && super::subquery::subquery_node_correlated(
+                        conjunct, storage, txid, arena,
+                    )? =>
+            {
+                super::semi_join_first_match_passes(
+                    storage,
+                    select,
+                    txid,
+                    arena,
+                    params,
+                    &first,
+                    &latest,
+                    hooks.sequences,
+                )?
+            }
+            _ => super::plan::conjunct_passes(conjunct, arena, params, &latest, &hooks)?,
+        };
+        if !passes {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether PostgreSQL turns `EXISTS (select)` into a semi-join
+/// (`convert_EXISTS_sublink_to_join` after `simplify_EXISTS_query`): a plain
+/// query over ordinary relations without grouping, aggregates, window
+/// functions, set operations, `OFFSET` or a non-constant `LIMIT`, whose
+/// `WHERE` calls no volatile function.
+fn semi_join_exists(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
+    let Some(from) = select.from.as_ref() else {
+        return false;
+    };
+    let plain = |table: &crate::sql::ast::TableRef<'_>| {
+        table.subquery.is_none() && !table.is_function_source() && table.cte.is_none()
+    };
+    let limit_removable = match select.limit {
+        None => true,
+        Some(Expr::Int(limit)) => *limit > 0,
+        Some(_) => false,
+    };
+    plain(&from.base)
+        && from.joins.iter().all(|join| plain(&join.table))
+        && select.set_body.is_none()
+        && select.with.is_empty()
+        && select.locking.is_empty()
+        && select.group_by.is_empty()
+        && select.grouping_sets.is_empty()
+        && select.having.is_none()
+        && select.offset.is_none()
+        && limit_removable
+        && !select.items.iter().any(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                super::expr_has_window(expression)
+                    || expression_has_aggregate_use(expression, storage, txid)
+            }
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+        })
+        && !select.where_clause.is_some_and(|predicate| {
+            super::cte::expression_contains_function(predicate, &|name, arguments| {
+                crate::sql::ast::is_volatile_function(name)
+                    || storage.has_volatile_function_routine_candidate(name, arguments, txid)
+            })
+        })
+}
+
+/// How a locked row's recheck treats a `LATERAL` source, following the plan
+/// PostgreSQL's EvalPlanQual re-runs. A simple subquery without `FROM` is
+/// pulled up into the outer query, so its expressions and `WHERE` run again
+/// over the latest row. A function, a `VALUES` list of several rows and a
+/// subquery the planner keeps separate (aggregates, `GROUP BY`, `DISTINCT`,
+/// `LIMIT`/`OFFSET`, set operations, window or set-returning functions,
+/// volatile output expressions) keep the row the statement first read.
+enum LateralRecheck {
+    Keep,
+    Rerun,
+}
+
+fn lateral_recheck(
+    storage: &Storage,
+    txid: u32,
+    tref: &crate::sql::ast::TableRef<'_>,
+) -> Result<LateralRecheck, SqlError> {
+    let Some(select) = tref.subquery else {
+        return Ok(LateralRecheck::Keep);
+    };
+    if let Some(body) = select.set_body {
+        return Ok(match body {
+            crate::sql::ast::SetTree::Select(select) if select.from.is_none() => {
+                lateral_recheck_select(storage, txid, select)
+            }
+            crate::sql::ast::SetTree::Select(_) => {
+                return Err(lateral_recheck_unsupported());
+            }
+            // PostgreSQL flattens a `UNION ALL` of simple branches into an
+            // append whose recheck returns the first branch's row again.
+            crate::sql::ast::SetTree::Op {
+                operator: crate::sql::ast::SetOp::Union,
+                all: true,
+                syntax: crate::sql::ast::SetOperationSyntax::Explicit,
+                ..
+            } => {
+                if !union_all_branches_rerun(storage, txid, body) {
+                    return Err(lateral_recheck_unsupported());
+                }
+                LateralRecheck::Rerun
+            }
+            crate::sql::ast::SetTree::Op { .. } => LateralRecheck::Keep,
+        });
+    }
+    let rerun = lateral_recheck_select(storage, txid, select);
+    if matches!(rerun, LateralRecheck::Rerun) && select.from.is_some() {
+        return Err(lateral_recheck_unsupported());
+    }
+    Ok(rerun)
+}
+
+fn lateral_recheck_select(storage: &Storage, txid: u32, select: &Select<'_>) -> LateralRecheck {
+    if select.distinct
+        || !select.distinct_on.is_empty()
+        || !select.group_by.is_empty()
+        || !select.grouping_sets.is_empty()
+        || select.having.is_some()
+        || select.limit.is_some()
+        || select.offset.is_some()
+        || !select.with.is_empty()
+        || !select.locking.is_empty()
+        || super::srf::has_project_set(select.items, storage, txid)
+    {
+        return LateralRecheck::Keep;
+    }
+    for item in select.items {
+        let (SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression)) = item
+        else {
+            continue;
+        };
+        if super::expr_has_window(expression)
+            || expression_has_aggregate_use(expression, storage, txid)
+            || super::cte::expression_contains_function(expression, &|name, arguments| {
+                crate::sql::ast::is_volatile_function(name)
+                    || storage.has_volatile_function_routine_candidate(name, arguments, txid)
+            })
+        {
+            return LateralRecheck::Keep;
+        }
+    }
+    LateralRecheck::Rerun
+}
+
+/// Whether every branch of a `UNION ALL` tree is a simple query without
+/// `FROM`, so running the tree again reproduces PostgreSQL's append recheck.
+fn union_all_branches_rerun(
+    storage: &Storage,
+    txid: u32,
+    tree: &crate::sql::ast::SetTree<'_>,
+) -> bool {
+    match tree {
+        crate::sql::ast::SetTree::Select(select) => {
+            select.from.is_none()
+                && select.set_body.is_none()
+                && matches!(
+                    lateral_recheck_select(storage, txid, select),
+                    LateralRecheck::Rerun
+                )
+        }
+        crate::sql::ast::SetTree::Op {
+            operator: crate::sql::ast::SetOp::Union,
+            all: true,
+            syntax: crate::sql::ast::SetOperationSyntax::Explicit,
+            left,
+            right,
+        } => {
+            union_all_branches_rerun(storage, txid, left)
+                && union_all_branches_rerun(storage, txid, right)
+        }
+        crate::sql::ast::SetTree::Op { .. } => false,
+    }
+}
+
+/// Whether `expression` calls an aggregate outside a nested subquery. The
+/// subquery's own columns are not in scope here, so a call is classified by
+/// name: a built-in aggregate or any visible user-defined aggregate.
+fn expression_has_aggregate_use(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+    if let Expr::Call {
+        name,
+        args,
+        over: None,
+        ..
+    } = expression
+        && (expression.is_aggregate()
+            || storage.has_aggregate_routine_candidate(name, args.len(), txid))
+    {
+        return true;
+    }
+    let mut found = false;
+    super::walk_children(expression, &mut |child| {
+        found |= expression_has_aggregate_use(child, storage, txid);
+        Ok(())
+    })
+    .expect("expression visitor cannot fail");
+    found
+}
+
+/// A pulled-up `LATERAL` subquery with `FROM` keeps the rows its tables
+/// first matched; pos3ql does not retain them for the recheck.
+fn lateral_recheck_unsupported() -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "a concurrently updated row locked with a LATERAL subquery that reads tables cannot be rechecked"
+    )
+}
+
 impl<'r, 'a> LockedRowRecheck<'r, 'a> {
     #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
     pub(super) fn new(
@@ -586,12 +866,6 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
     ) -> Result<Option<&'a [u8]>, SqlError> {
         use super::scan::BoundRow;
         let scope = self.scope;
-        if scope.lateral[..scope.n].iter().any(|lateral| *lateral) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "a concurrently updated row locked with a LATERAL source cannot be rechecked"
-            ));
-        }
         let raw_at = self.plan.width + self.plan.n_keys;
         let presence_at = raw_at + scope.total_columns();
         // `read` holds every source as the statement read it; `bound` swaps in
@@ -623,6 +897,49 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
             }
             column_at += n_columns;
             bound[table] = read[table];
+            if scope.lateral[table] {
+                let tref = if table == 0 {
+                    &self.from.base
+                } else {
+                    &self.from.joins[table - 1].table
+                };
+                match lateral_recheck(storage, txid, tref)? {
+                    LateralRecheck::Keep => {}
+                    LateralRecheck::Rerun => {
+                        let order = arena
+                            .alloc_slice_with(scope.n, |table| table)
+                            .map_err(|_| arena_full())?;
+                        let left = sources_row(scope, bound, order, rowids);
+                        let chained = Chained {
+                            inner: &left,
+                            outer: self.outer,
+                        };
+                        let first = super::scan::first_lateral_row(
+                            storage,
+                            txid,
+                            tref,
+                            n_columns,
+                            arena,
+                            self.params,
+                            &chained,
+                            self.hooks,
+                        )?;
+                        bound[table] = first.map(BoundRow::Values);
+                        // An inner or cross join to a source that yields no
+                        // row drops the locked row; a left join null-extends.
+                        if first.is_none()
+                            && (table == 0
+                                || matches!(
+                                    self.from.joins[table - 1].kind,
+                                    crate::sql::ast::JoinKind::Inner
+                                        | crate::sql::ast::JoinKind::Cross
+                                ))
+                        {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
             if let Some(slot) = self.changed[table] {
                 let rowid = rowids[table].ok_or_else(|| {
                     sql_err!(
@@ -713,9 +1030,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
             }
         }
         let joined = sources_row(scope, bound, order, rowids);
-        if self.plan.where_correlated.is_empty()
-            && let Some(predicate) = self.statement.where_clause
-        {
+        if let Some(predicate) = self.statement.where_clause {
             let read_row = sources_row(scope, read, order, rowids);
             let latest = Chained {
                 inner: &joined,
@@ -725,40 +1040,17 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                 inner: &read_row,
                 outer: self.outer,
             };
-            let mut conjuncts = [predicate; super::plan::MAX_CONJUNCTS];
-            let mut count = 0;
-            if !super::plan::flatten_and(predicate, &mut conjuncts, &mut count) {
-                conjuncts[0] = predicate;
-                count = 1;
-            }
-            for conjunct in &conjuncts[..count] {
-                // PostgreSQL turns an uncorrelated `IN (subquery)` into a
-                // semi-join whose recheck keeps the subquery row first
-                // matched: the operand must still equal its first value.
-                let passes = if let Expr::InSubquery {
-                    operand,
-                    negated: false,
-                    ..
-                } = conjunct
-                {
-                    let before = eval_full(operand, arena, self.params, &first, self.hooks)?;
-                    let after = eval_full(operand, arena, self.params, &latest, self.hooks)?;
-                    !before.is_null()
-                        && !after.is_null()
-                        && crate::sql::eval::compare_datums_collated(
-                            storage,
-                            txid,
-                            scope.expression_collation(storage, arena, operand)?,
-                            &before,
-                            &after,
-                        )?
-                        .is_eq()
-                } else {
-                    super::plan::conjunct_passes(conjunct, arena, self.params, &latest, self.hooks)?
-                };
-                if !passes {
-                    return Ok(None);
-                }
+            if !locked_row_where_passes(
+                storage,
+                txid,
+                predicate,
+                &first,
+                &latest,
+                arena,
+                self.params,
+                self.hooks,
+            )? {
+                return Ok(None);
             }
         }
         let layout = MaterializedLayout {
@@ -785,7 +1077,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
             self.hooks,
             self.correlated,
             self.base,
-            self.plan.where_correlated,
+            &[],
             &self.plan.order_exprs,
             self.plan.n_keys,
             if self.plan.any_postponed {

@@ -378,10 +378,15 @@ changes and nested `CALL`, but rejects DDL and other utility statements with
 `0A000` because that trigger runs without the engine's utility executor. A
 table's or view's row type cannot
 appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
-where PostgreSQL accepts it. Under `READ COMMITTED`, a locked row's recheck runs a correlated `EXISTS
-(subquery)` again, where PostgreSQL's semi-join recheck keeps the subquery row
-it first matched (which row depends on its join plan). A query with a `LATERAL` source
-fails that recheck with `0A000` instead of running the source again. The
+where PostgreSQL accepts it. Under `READ COMMITTED`, a locked row's recheck
+fails with `0A000` for a simple `LATERAL` subquery that reads tables (PostgreSQL
+keeps the rows it first joined); an `UPDATE ... FROM` or `DELETE ... USING`
+recheck runs its join again instead of keeping the joined rows; a foreign key
+check that waited for a parent row another transaction moved to a different
+partition reports `23503` where PostgreSQL fails with `40001`. A `FROM` item
+of `UPDATE`, `DELETE` or `MERGE` that refers to the target is accepted where
+PostgreSQL fails with `42P10` or `42P01` (`invalid reference to FROM-clause
+entry`), and `RETURNING` cannot read `FROM`/`USING` items. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

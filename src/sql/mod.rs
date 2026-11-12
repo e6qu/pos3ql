@@ -10363,14 +10363,21 @@ impl Engine {
             }
         };
         let mut result_columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let described = type_inputs::with_source(
-            type_inputs::Source::RootCommand { statement: 0 },
-            sql,
-            bindings,
-            || match statement {
-                Stmt::Select(select) => query::expand_ctes(select, &self.storage, txn.txid, arena)
+        // The query's analysis errors are positioned in the PREPARE text.
+        let described = crate::sql::error_position::with_analysis_in(sql, || {
+            type_inputs::with_source(
+                type_inputs::Source::RootCommand { statement: 0 },
+                sql,
+                bindings,
+                || match statement {
+                    Stmt::Select(select) => query::expand_ctes(
+                        select,
+                        &self.storage,
+                        txn.txid,
+                        arena,
+                    )
                     .and_then(|select| {
-                        query::describe_select(
+                        let count = query::describe_select(
                             select,
                             &self.storage,
                             txn.txid,
@@ -10378,37 +10385,47 @@ impl Engine {
                             &mut result_columns,
                             crate::sql::exec::DescriptionTarget::Wire,
                             None,
-                        )
+                        )?;
+                        query::analyse_select(select, &self.storage, txn.txid, arena, None)?;
+                        Ok(count)
                     }),
-                Stmt::SetQuery(query) => query::describe_set_query(
-                    &self.storage,
-                    txn.txid,
-                    query,
-                    &mut result_columns,
-                    arena,
-                    crate::sql::exec::DescriptionTarget::Wire,
-                ),
-                Stmt::With { statement, .. } => self.describe_data_modification_columns(
-                    statement,
-                    arena,
-                    txn,
-                    &mut result_columns,
-                    crate::sql::exec::DescriptionTarget::Wire,
-                ),
-                Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => self
-                    .describe_data_modification_columns(
+                    Stmt::SetQuery(query) => query::describe_set_query(
+                        &self.storage,
+                        txn.txid,
+                        query,
+                        &mut result_columns,
+                        arena,
+                        crate::sql::exec::DescriptionTarget::Wire,
+                    )
+                    .and_then(|count| {
+                        query::analyse_set_query(query, &self.storage, txn.txid, arena)?;
+                        Ok(count)
+                    }),
+                    Stmt::With { statement, .. } => self.describe_data_modification_columns(
                         statement,
                         arena,
                         txn,
                         &mut result_columns,
                         crate::sql::exec::DescriptionTarget::Wire,
                     ),
-                _ => Err(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "utility statements cannot be prepared"
-                )),
-            },
-        );
+                    Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
+                        let count = self.describe_data_modification_columns(
+                            statement,
+                            arena,
+                            txn,
+                            &mut result_columns,
+                            crate::sql::exec::DescriptionTarget::Wire,
+                        )?;
+                        query::analyse_dml_condition(statement, &self.storage, txn.txid, arena)?;
+                        Ok(count)
+                    }
+                    _ => Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "utility statements cannot be prepared"
+                    )),
+                },
+            )
+        });
         let result_count = match described {
             Ok(count) => count,
             Err(error) => return Ok(Err(error)),

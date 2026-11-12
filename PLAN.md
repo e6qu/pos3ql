@@ -313,9 +313,10 @@ A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. A trigger fired
 inside a writing statement cannot `FETCH` from a session cursor that
 evaluates rows as fetched, or first read one whose data-modifying `WITH`
-queries have not run (`0A000`). A
-parameter used as a cursor is type-checked when the statement runs rather
-than when the routine is created. `pg_sleep` and its
+queries have not run (`0A000`). A SQL `PREPARE`
+without declared parameter types does not infer them from their use, so
+`PREPARE p AS SELECT * FROM t WHERE label > $1; EXECUTE p(2)` compares text
+with an integer and fails where PostgreSQL types `$1` as `text`. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,

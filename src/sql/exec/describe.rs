@@ -1041,6 +1041,28 @@ impl ColTypeResolver for CatalogCols<'_> {
 
 /// Emits one `ColDesc` per field of a `(record).*` expansion, resolving field
 /// names and types at the caller's `'q` lifetime (single-table describe path).
+/// PostgreSQL expands `(expression).*` only for a composite or record value;
+/// any other type is rejected by name before its fields are looked up.
+pub(crate) fn reject_scalar_expansion(
+    base: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &crate::storage::Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    if let Ok((type_oid, _)) = infer_type_res(base, columns)
+        && type_oid != oid::UNKNOWN
+        && ColType::from_oid(type_oid)
+            .is_some_and(|ctype| !matches!(ctype, ColType::Record | ColType::Composite(_)))
+    {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "type {} is not composite",
+            crate::sql::catalog::format_type_name(storage, txid, type_oid)?.as_str()
+        ));
+    }
+    Ok(())
+}
+
 fn describe_record_star<'q>(
     base: &Expr<'q>,
     context: DescribeContext<'q, '_>,
@@ -1074,6 +1096,9 @@ fn describe_record_star<'q>(
     } else {
         &NoCols
     };
+    if let Some(storage) = storage {
+        reject_scalar_expansion(base, columns, storage, txid)?;
+    }
     match base {
         Expr::Call {
             kind: crate::sql::ast::CallKind::SqlSyntax,
@@ -3451,6 +3476,7 @@ pub(crate) fn expand_record_call_items<'a>(
         let SelectItem::RecordStar(base) = item else {
             unreachable!()
         };
+        reject_scalar_expansion(base, columns, storage, txid)?;
         let mut shared = crate::mem::arena::ArenaList::new(arena);
         collect_shared(base, columns, storage, txid, &mut shared)?;
         let mut failure = None;

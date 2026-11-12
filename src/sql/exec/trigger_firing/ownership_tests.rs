@@ -221,7 +221,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             &storage,
             100,
             &original,
-            &|_| false,
+            &|_| None,
         )
         .unwrap();
         let transition_row = encode_projected_pub(&new, &original).unwrap();

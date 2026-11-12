@@ -590,15 +590,7 @@ pub(crate) fn execute<'a>(
         &engine.storage,
         transaction.txid,
         arena,
-        &|name| {
-            routine
-                .parameters()
-                .iter()
-                .any(|parameter| parameter.name == name)
-                || routine.result_columns[..routine.result_column_count]
-                    .iter()
-                    .any(|column| column.name == name)
-        },
+        &|name| routine_parameter_type(routine, name),
     )?;
     let set_returning = kind == PlpgsqlProgramKind::SetFunction;
     let inputs_named = routine

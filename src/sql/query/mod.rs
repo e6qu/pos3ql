@@ -7710,6 +7710,168 @@ pub(crate) fn analyse_routine_statement<'a>(
     ))
 }
 
+/// PostgreSQL's parse analysis of a stored query (`PREPARE`): the operators,
+/// functions and condition types of the query, its join conditions, its set
+/// operation branches, derived tables and subqueries resolve before it ever
+/// runs. `select` has its views and `WITH` queries expanded. `LATERAL`
+/// derived tables and `FROM`-less subqueries are analysed when they run.
+pub(crate) fn analyse_select<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<(), SqlError> {
+    if let Some(body) = select.set_body {
+        return analyse_set_tree(body, storage, txid, arena, outer);
+    }
+    let Some(from) = select.from.as_ref() else {
+        return Ok(());
+    };
+    for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+        if let Some(subquery) = table.subquery
+            && !table.lateral
+        {
+            analyse_select(subquery, storage, txid, arena, outer)?;
+        }
+    }
+    let scope = QueryScope::resolve_schema(storage, from, txid, arena, outer)?;
+    check_select_types(select, &scope, storage, txid, arena, outer)?;
+    check_key_types(select, &scope, arena, storage, txid)?;
+    let schema = ScopeSchema(&scope);
+    let row = Chained {
+        inner: &schema,
+        outer,
+    };
+    let catalog = CatalogScopeCols {
+        scope: &scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    for join in from.joins {
+        if let Some(condition) = join.on {
+            if outer.is_none() {
+                super::exec::infer_type_res(condition, &catalog)?;
+            }
+            analyse_sublinks(condition, storage, txid, arena, &row)?;
+        }
+    }
+    let items = select.items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            Some(*expression)
+        }
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => None,
+    });
+    for expression in items
+        .chain(select.where_clause)
+        .chain(select.group_by.iter().copied())
+        .chain(select.having)
+        .chain(select.order_by.iter().map(|key| key.expression))
+    {
+        analyse_sublinks(expression, storage, txid, arena, &row)?;
+    }
+    Ok(())
+}
+
+/// [`analyse_select`] for the condition of a stored `UPDATE` or `DELETE`,
+/// over its target and `FROM`/`USING` tables.
+pub(crate) fn analyse_dml_condition<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let (target, alias, extra, condition) = match statement {
+        Stmt::Update(update) => (update.table, update.alias, update.from, update.where_clause),
+        Stmt::Delete(delete) => (
+            delete.table,
+            delete.alias,
+            delete.using,
+            delete.where_clause,
+        ),
+        _ => return Ok(()),
+    };
+    let Some(condition) = condition else {
+        return Ok(());
+    };
+    let scope = dependencies::dml_dependency_scope(storage, target, alias, extra, txid, arena)?;
+    let columns = CatalogScopeCols {
+        scope: &scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    super::exec::infer_type_res(condition, &columns)?;
+    check_where_type(condition, &columns, storage, txid, arena)?;
+    check_literal_operands(condition, &scope, arena)?;
+    let schema = ScopeSchema(&scope);
+    let row = Chained {
+        inner: &schema,
+        outer: None,
+    };
+    analyse_sublinks(condition, storage, txid, arena, &row)
+}
+
+fn analyse_sublinks<'a>(
+    expression: &'a Expr<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    row: &dyn ColumnLookup<'a>,
+) -> Result<(), SqlError> {
+    match expression {
+        Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::RowSubquery { select, .. } => {
+            analyse_select(select, storage, txid, arena, Some(row))
+        }
+        Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
+        } => {
+            analyse_sublinks(operand, storage, txid, arena, row)?;
+            analyse_select(select, storage, txid, arena, Some(row))
+        }
+        _ => walk_children(expression, &mut |child| {
+            analyse_sublinks(child, storage, txid, arena, row)
+        }),
+    }
+}
+
+/// [`analyse_select`] for every branch of a set-operation query.
+pub(crate) fn analyse_set_query<'a>(
+    query: &'a crate::sql::ast::SetQuery<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    analyse_set_tree(query.body, storage, txid, arena, None)
+}
+
+fn analyse_set_tree<'a>(
+    tree: &'a crate::sql::ast::SetTree<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<(), SqlError> {
+    match tree {
+        crate::sql::ast::SetTree::Select(select) => {
+            analyse_select(select, storage, txid, arena, outer)
+        }
+        crate::sql::ast::SetTree::Op { left, right, .. } => {
+            analyse_set_tree(left, storage, txid, arena, outer)?;
+            analyse_set_tree(right, storage, txid, arena, outer)
+        }
+    }
+}
+
 /// [`analyse_routine_statement`] for every statement of a parsed body.
 pub(crate) fn analyse_routine_program<'a>(
     program: &RoutineFunctionProgram<'a>,
@@ -8691,7 +8853,7 @@ pub(crate) fn describe_query_under<'a>(
         super::type_inputs::validate_restored(parser, storage, txid)
     })?;
     let select = expand_ctes_under(select, storage, txid, path, arena)?;
-    describe_select(
+    let count = describe_select(
         select,
         storage,
         txid,
@@ -8699,7 +8861,9 @@ pub(crate) fn describe_query_under<'a>(
         out,
         crate::sql::exec::DescriptionTarget::Sql,
         None,
-    )
+    )?;
+    analyse_select(select, storage, txid, arena, None)?;
+    Ok(count)
 }
 
 #[expect(
@@ -13526,6 +13690,7 @@ fn describe_scope_record_star<'q>(
         txid,
         arena,
     };
+    super::exec::reject_scalar_expansion(base, &resolver, storage, txid)?;
     match base {
         Expr::Call {
             kind: super::ast::CallKind::SqlSyntax,
@@ -14417,6 +14582,7 @@ pub(super) fn record_star_width(
             &fromless
         }
     };
+    super::exec::reject_scalar_expansion(base, columns, storage, txid)?;
     super::exec::record_shape_metadata(base, columns, |_, _| {})?.ok_or_else(|| {
         sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,

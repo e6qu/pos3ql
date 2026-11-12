@@ -934,7 +934,9 @@ pub(crate) use describe::{
     bound_parameter_context_active, bound_parameter_type_oid, enter_routine_parameter_types,
     routine_parameter_collation, routine_parameter_depth, with_bound_parameter_types,
 };
-pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
+pub(crate) use describe::{
+    describe_data_modification_columns, describe_returning_items, reject_scalar_expansion,
+};
 pub(crate) use routine_lookup::{RoutineLookupMiss, RoutineTarget, lookup_routine};
 
 mod call_environment;
@@ -4246,15 +4248,7 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
         context.storage(),
         context.txn.txid,
         context.arena,
-        &|name| {
-            routine
-                .parameters()
-                .iter()
-                .any(|parameter| parameter.name == name)
-                || routine.result_columns[..routine.result_column_count]
-                    .iter()
-                    .any(|column| column.name == name)
-        },
+        &|name| routine_parameter_type(&routine, name),
     )?;
     let invocation = TriggerInvocation::new(
         context.storage(),
@@ -22441,12 +22435,29 @@ fn parse_plpgsql_program_inner<'a>(
 /// routines, triggers, and anonymous blocks.  Syntax parsing retains the
 /// spelling because it deliberately has no storage borrow; execution receives
 /// only concrete representations plus their durable user-type identities.
+/// The declared type of a routine's parameter or output column named `name`.
+type ParameterType<'p> = dyn Fn(SqlName) -> Option<ColType> + 'p;
+
+fn routine_parameter_type(routine: &crate::storage::RoutineDef, name: SqlName) -> Option<ColType> {
+    routine
+        .parameters()
+        .iter()
+        .find(|parameter| parameter.name == name)
+        .map(|parameter| parameter.ctype)
+        .or_else(|| {
+            routine.result_columns[..routine.result_column_count]
+                .iter()
+                .find(|column| column.name == name)
+                .map(|column| column.ctype)
+        })
+}
+
 fn resolve_plpgsql_program_locals<'a>(
     program: ParsedTriggerProgram<'a>,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
-    has_parameter: &dyn Fn(SqlName) -> bool,
+    has_parameter: &ParameterType<'_>,
 ) -> Result<TriggerProgram<'a>, SqlError> {
     let parsed_kind = program.kind;
     let resolved = arena
@@ -22578,7 +22589,7 @@ fn compile_plpgsql_execution<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
-    has_parameter: &dyn Fn(SqlName) -> bool,
+    has_parameter: &ParameterType<'_>,
 ) -> Result<(TriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
     let written = source;
     let source = ProgramSource::capture(source, kind, &storage.execution_control)?;
@@ -22592,7 +22603,7 @@ fn compile_plpgsql_execution<'a>(
 fn validate_plpgsql_variable_uses(
     program: &TriggerProgram<'_>,
     trigger: bool,
-    has_parameter: &dyn Fn(SqlName) -> bool,
+    has_parameter: &ParameterType<'_>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     struct ScopedLocal<'a> {
@@ -22605,7 +22616,7 @@ fn validate_plpgsql_variable_uses(
         target: PlpgsqlVariableName,
         locals: &[TriggerLocalDecl],
         mut shadowed: Option<&ScopedLocal<'_>>,
-        has_parameter: &dyn Fn(SqlName) -> bool,
+        has_parameter: &ParameterType<'_>,
     ) -> Option<bool> {
         while let Some(local) = shadowed {
             if local.name == target.name
@@ -22621,13 +22632,13 @@ fn validate_plpgsql_variable_uses(
             .map(|local| local.constant)
             // A parameter's label is its routine's name, which this check
             // does not know; execution resolves the label.
-            .or_else(|| has_parameter(target.name).then_some(false))
+            .or_else(|| has_parameter(target.name).map(|_| false))
     }
     fn reject(
         target: PlpgsqlVariableName,
         locals: &[TriggerLocalDecl],
         shadowed: Option<&ScopedLocal<'_>>,
-        has_parameter: &dyn Fn(SqlName) -> bool,
+        has_parameter: &ParameterType<'_>,
         trigger: bool,
     ) -> Result<(), SqlError> {
         match binding_constant(target, locals, shadowed, has_parameter) {
@@ -22666,7 +22677,7 @@ fn validate_plpgsql_variable_uses(
         current: TriggerBlock<'_>,
         locals: &[TriggerLocalDecl],
         shadowed: Option<&ScopedLocal<'_>>,
-        has_parameter: &dyn Fn(SqlName) -> bool,
+        has_parameter: &ParameterType<'_>,
         trigger: bool,
         arena: &Arena,
     ) -> Result<(), SqlError> {
@@ -22708,6 +22719,19 @@ fn validate_plpgsql_variable_uses(
                                 scoped = local.parent;
                             }
                             match locals.iter().rfind(|local| target.names(local)) {
+                                // A parameter takes PostgreSQL's cursor check
+                                // when the routine is created.
+                                None if target.label.is_none()
+                                    && !loop_variable
+                                    && has_parameter(name)
+                                        .is_some_and(|ctype| ctype != ColType::Refcursor) =>
+                                {
+                                    sql_err!(
+                                        sqlstate::DATATYPE_MISMATCH,
+                                        "variable \"{}\" must be of type cursor or refcursor",
+                                        name.as_str()
+                                    )
+                                }
                                 _ if loop_variable => sql_err!(
                                     sqlstate::DATATYPE_MISMATCH,
                                     "variable \"{}\" must be of type cursor or refcursor",
@@ -22957,7 +22981,7 @@ fn validate_plpgsql_variable_uses(
         block: TriggerBlock<'_>,
         locals: &[TriggerLocalDecl],
         shadowed: Option<&ScopedLocal<'_>>,
-        has_parameter: &dyn Fn(SqlName) -> bool,
+        has_parameter: &ParameterType<'_>,
         trigger: bool,
         arena: &Arena,
     ) -> Result<(), SqlError> {
@@ -23176,7 +23200,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         &engine.storage,
         txn.txid,
         arena,
-        &|_| false,
+        &|_| None,
     )?;
     let definition = crate::storage::RelationDefinition::EMPTY;
     let invocation = TriggerInvocation::anonymous(program.settings(guc.plpgsql_settings()))?
@@ -23250,15 +23274,7 @@ pub(crate) fn execute_event_trigger<'a>(
         &engine.storage,
         txn.txid,
         arena,
-        &|name| {
-            routine
-                .parameters()
-                .iter()
-                .any(|parameter| parameter.name == name)
-                || routine.result_columns[..routine.result_column_count]
-                    .iter()
-                    .any(|column| column.name == name)
-        },
+        &|name| routine_parameter_type(routine, name),
     )?;
     let definition = crate::storage::RelationDefinition::EMPTY;
     let invocation = TriggerInvocation::event_trigger(
@@ -23353,15 +23369,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         &engine.storage,
         txn.txid,
         arena,
-        &|name| {
-            routine
-                .parameters()
-                .iter()
-                .any(|parameter| parameter.name == name)
-                || routine.result_columns[..routine.result_column_count]
-                    .iter()
-                    .any(|column| column.name == name)
-        },
+        &|name| routine_parameter_type(routine, name),
     )?;
     let declaration_capacity = routine
         .parameters()
@@ -35595,6 +35603,8 @@ fn validate_policy_definition(
     }
     let sql = arena.alloc_str(sql.as_str()).map_err(|_| arena_full())?;
     let mut columns = [ColDesc::new("", 0, 0); 2];
+    // PostgreSQL analyses a policy expression without its statement text, so
+    // its errors carry no position.
     let count = super::query::describe_query_under(
         sql,
         storage,
@@ -35603,7 +35613,10 @@ fn validate_policy_definition(
         query_inputs.as_slice(),
         arena,
         &mut columns,
-    )?;
+    )
+    .inspect_err(|error| {
+        crate::sql::error_position::take_position(error);
+    })?;
     for column in &columns[..count] {
         if column.type_oid != crate::sql::types::oid::BOOL {
             return Err(sql_err!(
@@ -41015,10 +41028,14 @@ pub(crate) fn validate_routine_body(
     let has_parameter = |name| {
         parameters[..routine.arguments.len()]
             .iter()
-            .any(|parameter| parameter.name == name)
-            || result_columns[..result_column_count]
-                .iter()
-                .any(|column| column.name == name)
+            .find(|parameter| parameter.name == name)
+            .map(|parameter| parameter.ctype)
+            .or_else(|| {
+                result_columns[..result_column_count]
+                    .iter()
+                    .find(|column| column.name == name)
+                    .map(|column| column.ctype)
+            })
     };
     let body_text = match routine.body {
         super::ast::RoutineBody::String(body)
@@ -44156,15 +44173,17 @@ pub fn create_view(
     let user = super::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(raw_path, user.as_str(), txn.txid);
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let described_count = match super::query::describe_query_under(
-        sql,
-        storage,
-        txn.txid,
-        path,
-        literal_inputs,
-        arena,
-        &mut described,
-    ) {
+    let described_count = match crate::sql::error_position::with_analysis_in(sql, || {
+        super::query::describe_query_under(
+            sql,
+            storage,
+            txn.txid,
+            path,
+            literal_inputs,
+            arena,
+            &mut described,
+        )
+    }) {
         Ok(count) => count,
         Err(error) => return sql_fail(error),
     };

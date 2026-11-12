@@ -17115,7 +17115,7 @@ impl Engine {
                 unfinished.map_or((statement_mark, output_mark), |row| (row.mark, row.output));
             self.rollback_waiting_statement(txn, rollback);
             self.dml_scratch.clear();
-            if let Err(error) = responder.restart_attempt(attempt_mark.from_output(output_mark)) {
+            if let Err(error) = responder.restart_attempt(attempt_mark.restarted_at(output_mark)) {
                 // Rows already sent cannot be withdrawn for another attempt.
                 return Ok(Err(error));
             }

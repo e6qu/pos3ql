@@ -341,7 +341,7 @@ pub(crate) struct AttemptMark {
 impl AttemptMark {
     /// The same attempt restarted from an earlier output position, such as
     /// the start of a write's unfinished row.
-    pub(crate) fn from_output(self, output: OutputMark) -> Self {
+    pub(crate) fn restarted_at(self, output: OutputMark) -> Self {
         Self { output, ..self }
     }
 

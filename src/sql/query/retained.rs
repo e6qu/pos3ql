@@ -1350,6 +1350,11 @@ impl<'a> RetainedSelect<'a> {
                 crate::storage::LockedRowRecheck::Unchanged => LockedRow::Unchanged,
                 crate::storage::LockedRowRecheck::OwnChange => LockedRow::Skip,
                 crate::storage::LockedRowRecheck::Deleted => LockedRow::Deleted,
+                crate::storage::LockedRowRecheck::MovedOut => {
+                    return Err(crate::sql::exec::moved_out(
+                        storage.keeps_transaction_snapshot(txid),
+                    ));
+                }
                 crate::storage::LockedRowRecheck::Updated(home) => {
                     let version = home.snapshot().row_version();
                     let bytes = storage.row_bytes(table, rowid, home, state_arena)?;

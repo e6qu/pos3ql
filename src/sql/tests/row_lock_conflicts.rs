@@ -627,3 +627,166 @@ fn only_a_changed_key_value_waits_for_key_share_locks() {
     assert_eq!(error_sqlstates(&output), ["23503"]);
     sessions.finish();
 }
+
+const PARTITIONS: &str = "CREATE TABLE pt (id int, k int, v int) PARTITION BY LIST (k); \
+     CREATE TABLE pt1 PARTITION OF pt FOR VALUES IN (1); \
+     CREATE TABLE pt2 PARTITION OF pt FOR VALUES IN (2); \
+     CREATE TABLE ps (id int, v int)";
+
+const MOVED_OUT: &str =
+    "tuple to be locked was already moved to another partition due to concurrent update";
+
+/// Statements that lock row 1 of `pt1` while another transaction moves it to
+/// `pt2`, and the message PostgreSQL 18 reports under repeatable read.
+const MOVE_LOCKERS: [(&str, &str); 9] = [
+    ("UPDATE pt SET v = v + 1 WHERE id = 1", "concurrent update"),
+    (
+        "UPDATE pt SET k = 2, v = 7 WHERE id = 1",
+        "concurrent update",
+    ),
+    ("DELETE FROM pt WHERE id = 1", "concurrent update"),
+    ("UPDATE pt1 SET v = v + 1 WHERE id = 1", "concurrent update"),
+    (
+        "SELECT * FROM pt WHERE id = 1 FOR UPDATE",
+        "concurrent update",
+    ),
+    (
+        "SELECT * FROM pt WHERE id = 1 FOR KEY SHARE",
+        "concurrent update",
+    ),
+    (
+        "MERGE INTO pt USING ps ON ps.id = pt.id WHEN MATCHED THEN UPDATE SET v = pt.v + 10",
+        "concurrent update",
+    ),
+    (
+        "MERGE INTO pt USING ps ON ps.id = pt.id WHEN MATCHED THEN DELETE",
+        "concurrent update",
+    ),
+    (
+        "WITH x AS (UPDATE pt SET v = v + 1 WHERE id = 1 RETURNING *) SELECT * FROM x",
+        "concurrent update",
+    ),
+];
+
+fn reset_partitions(sessions: &mut Sessions) {
+    sessions.first(
+        "DELETE FROM pt; DELETE FROM ps; \
+         INSERT INTO pt VALUES (1, 1, 1), (2, 1, 2); INSERT INTO ps VALUES (1, 1)",
+    );
+}
+
+#[test]
+fn a_concurrent_partition_move_fails_waiting_lockers_as_postgresql_does() {
+    let mut sessions = sessions("partition-move", TransactionMode::Mvcc, PARTITIONS);
+    for (isolation, repeatable) in [("READ COMMITTED", false), ("REPEATABLE READ", true)] {
+        for (statement, repeatable_message) in MOVE_LOCKERS {
+            reset_partitions(&mut sessions);
+            sessions.second(&format!(
+                "BEGIN ISOLATION LEVEL {isolation}; SELECT count(*) FROM ps"
+            ));
+            sessions.first("BEGIN; UPDATE pt SET k = 2 WHERE id = 1");
+            let parked = sessions.second_waits(statement);
+            sessions.first("COMMIT");
+            let output = sessions.resume_second(statement, parked);
+            assert_eq!(
+                error_sqlstates(&output),
+                ["40001"],
+                "{isolation} {statement}"
+            );
+            let message = if repeatable {
+                format!("could not serialize access due to {repeatable_message}")
+            } else {
+                MOVED_OUT.to_owned()
+            };
+            assert!(
+                String::from_utf8_lossy(&output).contains(&message),
+                "{isolation} {statement}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            sessions.second("ROLLBACK");
+            assert_eq!(
+                sessions.rows("SELECT id, k, v FROM pt2"),
+                ["1|2|1"],
+                "{isolation} {statement}"
+            );
+        }
+    }
+    // An ordinary deletion is still skipped under read committed, and a
+    // rolled-back move leaves the row to the waiting statement.
+    reset_partitions(&mut sessions);
+    sessions.first("BEGIN; DELETE FROM pt WHERE id = 1");
+    let update = "UPDATE pt SET v = 50 WHERE id = 1";
+    let parked = sessions.second_waits(update);
+    sessions.first("COMMIT");
+    let output = sessions.resume_second(update, parked);
+    assert!(error_sqlstates(&output).is_empty());
+    assert!(String::from_utf8_lossy(&output).contains("UPDATE 0"));
+    reset_partitions(&mut sessions);
+    sessions.first("BEGIN; UPDATE pt SET k = 2 WHERE id = 1");
+    let parked = sessions.second_waits(update);
+    sessions.first("ROLLBACK");
+    let output = sessions.resume_second(update, parked);
+    assert!(error_sqlstates(&output).is_empty());
+    assert_eq!(
+        sessions.rows("SELECT id, k, v FROM pt1 WHERE id = 1"),
+        ["1|1|50"]
+    );
+    // MERGE moving the row marks the deletion too.
+    reset_partitions(&mut sessions);
+    sessions
+        .first("BEGIN; MERGE INTO pt USING ps ON ps.id = pt.id WHEN MATCHED THEN UPDATE SET k = 2");
+    let parked = sessions.second_waits(update);
+    sessions.first("COMMIT");
+    let output = sessions.resume_second(update, parked);
+    assert_eq!(error_sqlstates(&output), ["40001"]);
+    assert!(String::from_utf8_lossy(&output).contains(MOVED_OUT));
+    sessions.finish();
+}
+
+#[test]
+fn a_prepared_partition_move_keeps_its_marker_across_restart() {
+    for cold in [false, true] {
+        let mut config = test_config(&format!("row-lock-prepared-move-{cold}"));
+        config.max_prepared_transactions = 2;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        writer.success(
+            &mut engine,
+            &format!(
+                "{PARTITIONS}; INSERT INTO pt VALUES (1, 1, 1), (2, 1, 2); \
+                 BEGIN; UPDATE pt SET k = 2 WHERE id = 1; PREPARE TRANSACTION 'move'"
+            ),
+            false,
+        );
+        drop(writer);
+        if cold {
+            drop(engine);
+            budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+            engine = Engine::new(&config, &mut budget).unwrap();
+        }
+        let first = ConfiguredTransactionSession::new(&config, &mut budget);
+        let second = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        let mut sessions = Sessions {
+            config,
+            engine,
+            first,
+            second,
+        };
+        let update = "UPDATE pt SET v = v + 1 WHERE id = 1";
+        let parked = sessions.second_waits(update);
+        sessions.first("COMMIT PREPARED 'move'");
+        let output = sessions.resume_second(update, parked);
+        assert_eq!(error_sqlstates(&output), ["40001"], "cold={cold}");
+        assert!(
+            String::from_utf8_lossy(&output).contains(MOVED_OUT),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            sessions.rows("SELECT id, k, v FROM pt ORDER BY id"),
+            ["1|2|1", "2|1|2"]
+        );
+        sessions.finish();
+    }
+}

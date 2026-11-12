@@ -26,7 +26,7 @@ schema changes follow a different procedure; see
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
 | Checkpoint manifest | `pos3ql-manifest-v38` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
-| Journal record | Version `26` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
+| Journal record | Version `27` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process's writer token. |
@@ -82,7 +82,7 @@ Do not keep a decoder or add a conversion solely for an older pos3ql version.
 ### Journal records
 
 Framing is 24 bytes: CRC32C, payload length and LSN in bytes 0–15; byte 16 is
-the operation kind; byte 17 is the version (`26`); bytes 18–23 are zero.
+the operation kind; byte 17 is the version (`27`); bytes 18–23 are zero.
 Field-width changes use new kind bytes. Kinds with special rules:
 
 | Kind | Meaning | Rule |
@@ -107,6 +107,11 @@ Field-width changes use new kind bytes. Kinds with special rules:
 
 Other payload rules:
 
+- **Row deletion (kind 4)** has a flags byte after the schema name: bit 0
+  means the removed image follows, bit 1 means the deletion moved the row to
+  another partition. Other bits are rejected. Recovery and restored prepared
+  transactions keep the move flag, so a statement that waited for the row
+  fails with PostgreSQL's `40001` instead of skipping it.
 - **Table definition payload** is version 17: version byte, ten-byte catalog
   position, name, then the definition. Other versions are rejected.
 - **Domain payload** uses marker 251; earlier layouts are rejected. A mandatory

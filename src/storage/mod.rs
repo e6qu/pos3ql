@@ -3105,6 +3105,9 @@ pub struct RowState {
     /// generations; WAL/SST objects, not this metadata, are the durable copy.
     pub history: CommittedHistory,
     pub pending: PendingVersions,
+    /// The committed deletion moved the row to another partition; only set
+    /// while `committed` is `None`.
+    pub(crate) committed_moved_out: bool,
 }
 
 /// Where a committed row's bytes live: the RAM heap, or spilled to the
@@ -3183,6 +3186,10 @@ pub(crate) struct PendingChange {
     /// Insert and delete change index membership even when an index expression
     /// or predicate references no table column.
     pub changes_existence: bool,
+    /// The deletion half of an `UPDATE` or `MERGE` that moved the row to
+    /// another partition. Never set with an image. PostgreSQL marks such a
+    /// version so a later locker fails instead of treating it as deleted.
+    pub moved_out: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3254,6 +3261,7 @@ impl RowState {
             checkpoint_change_lsn: commit_lsn,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
+            committed_moved_out: false,
         }
     }
 }
@@ -36499,6 +36507,7 @@ impl Storage {
         table_index: usize,
         rowid: u64,
         image: Option<RowLoc>,
+        moved_out: bool,
         commit_lsn: u64,
     ) -> Result<(), SqlError> {
         self.tables[table_index]
@@ -36514,6 +36523,7 @@ impl Storage {
                 checkpoint_change_lsn: 0,
                 history: CommittedHistory::empty(),
                 pending: PendingVersions::empty(),
+                committed_moved_out: false,
             },
         };
         if state.pending.is_some() {
@@ -36534,6 +36544,7 @@ impl Storage {
             return Ok(());
         }
         state.committed = image.map(RowHome::Heap);
+        state.committed_moved_out = moved_out;
         state.committed_lsn = commit_lsn;
         state.committed_generation = Some(generation);
         state.checkpoint_change_lsn = commit_lsn;
@@ -36961,6 +36972,7 @@ impl Storage {
             }
         }
         state.committed = pending.loc.map(RowHome::Heap);
+        state.committed_moved_out = pending.moved_out;
         state.committed_lsn = commit_lsn;
         state.committed_generation = Some(generation);
         state.checkpoint_change_lsn = commit_lsn;

@@ -380,10 +380,7 @@ table's or view's row type cannot
 appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
 where PostgreSQL accepts it. Under `READ COMMITTED`, a locked row's recheck runs a correlated `EXISTS
 (subquery)` again, where PostgreSQL's semi-join recheck keeps the subquery row
-it first matched (which row depends on its join plan), and a row another transaction moved to a different partition is
-skipped where PostgreSQL fails with `40001` (`tuple to be locked was already
-moved to another partition due to concurrent update`); storage does not yet
-mark a version deleted by a partition move. A query with a `LATERAL` source
+it first matched (which row depends on its join plan). A query with a `LATERAL` source
 fails that recheck with `0A000` instead of running the source again. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.

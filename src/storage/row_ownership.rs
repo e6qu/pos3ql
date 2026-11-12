@@ -497,6 +497,7 @@ mod tests {
                             checkpoint_change_lsn: 7,
                             history: super::super::CommittedHistory::empty(),
                             pending: super::super::PendingVersions::empty(),
+                            committed_moved_out: false,
                         },
                     )
                     .unwrap();

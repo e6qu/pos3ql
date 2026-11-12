@@ -3062,6 +3062,31 @@ impl TxnState {
         Ok(undo)
     }
 
+    /// Deletes a row an `UPDATE` or `MERGE` moves to another partition. The
+    /// storage marks the deletion as a move so concurrent lockers fail with
+    /// PostgreSQL's `40001` instead of skipping the row.
+    pub(crate) fn move_row_out(
+        &mut self,
+        storage: &crate::storage::Storage,
+        target: crate::storage::TableDefinitionTarget,
+        rowid: u64,
+        command: u32,
+        statistics: crate::storage::RowWriteStatistics,
+    ) -> Result<crate::storage::PendingWriteUndo, SqlError> {
+        if target.transaction() != self.txid {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "row definition selection belongs to another transaction"
+            ));
+        }
+        let undo = storage.write_pending_move_out(target, rowid, command, statistics)?;
+        if let Err(error) = self.touch(target.table() as u32, rowid, undo) {
+            storage.restore_pending(target.table(), rowid, self.txid, undo);
+            return Err(error);
+        }
+        Ok(undo)
+    }
+
     pub(crate) fn record_table_drop(
         &mut self,
         storage: &crate::storage::Storage,

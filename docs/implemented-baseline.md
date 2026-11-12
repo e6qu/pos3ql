@@ -73,6 +73,18 @@ concurrent update`, or `concurrent delete` for an `UPDATE`, `DELETE` or
 `MERGE` of a deleted row); `FOR KEY SHARE` still succeeds when the change kept
 every unique key column.
 
+A row another transaction moved to a different partition (an `UPDATE` or
+`MERGE` that changed its partition key) cannot be followed into its new
+partition. A statement that waited for that row fails with `40001`, as in
+PostgreSQL: `tuple to be locked was already moved to another partition due to
+concurrent update` under `READ COMMITTED`, and `could not serialize access due
+to concurrent update` under `REPEATABLE READ` and `SERIALIZABLE`. For example,
+`UPDATE orders SET note = 'x' WHERE id = 7` fails when another session's
+`UPDATE orders SET region = 'eu' WHERE id = 7` moved the order to another
+partition first; retry the statement to update it in its new partition. The
+move is recorded in the journal, so a prepared transaction's move still fails
+waiting statements after a restart.
+
 Under `READ COMMITTED`, `SELECT ... FOR UPDATE` returns the locked row's latest
 version: the join conditions, `WHERE` and output list run again over it, while
 the other tables in the join keep the rows first read. For example, a job
@@ -87,11 +99,9 @@ row; a deleted target row leaves only the `WHEN NOT MATCHED` action, as in
 PostgreSQL 15 and later. An `IN (subquery)` condition that does not refer to
 the outer query is rechecked against the subquery row it first matched, as
 PostgreSQL's semi-join does: the row stays only if the tested value did not
-change. Three differences remain: PostgreSQL rechecks a correlated `EXISTS
+change. Two differences remain: PostgreSQL rechecks a correlated `EXISTS
 (subquery)` against the subquery row it first matched, where pos3ql runs the
-subquery again; a row another transaction moved to a
-different partition is skipped where PostgreSQL fails with `40001`; and a
-query with a `LATERAL` source fails such a recheck with `0A000` where
+subquery again; and a query with a `LATERAL` source fails such a recheck with `0A000` where
 PostgreSQL runs the `LATERAL` source again.
 
 A commit becomes visible all at once, and only after it is durable: new

@@ -1003,7 +1003,7 @@ mod row_progress;
 mod trigger_firing;
 mod write_attempts;
 pub(crate) use row_conflicts::{
-    LockedVersion, concurrent_change, lock_selected_row, locked_result_row_current,
+    LockedVersion, concurrent_change, lock_selected_row, locked_result_row_current, moved_out,
 };
 pub(crate) use row_progress::{
     RetainedWrite, RowProgress, StepRecord, begin_main_step, cte_step_records, is_wait,

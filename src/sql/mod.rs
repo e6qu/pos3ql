@@ -14375,6 +14375,11 @@ impl Engine {
                 len += 1;
                 Ok(())
             };
+            // The sub-statement's foreign key checks wait for the statement's
+            // end, where its main statement fires them.
+            let outer = txn
+                .with_sub_statement
+                .replace((txn.trigger_depth(), txn.command_id()));
             let outcome = match (finished, dml) {
                 (Some(_), _) => Ok(Ok(())),
                 (None, Stmt::Merge(_)) => Self::execute_merge(
@@ -14403,6 +14408,7 @@ impl Engine {
                     self.work.connection_id(),
                 ),
             };
+            txn.with_sub_statement = outer;
             let rows: &'a [&'a [u8]] = match finished {
                 Some(finished) => finished.rows,
                 None if len == 0 => &[],
@@ -17129,6 +17135,7 @@ impl Engine {
             invocations.map(|invocations| query::RoutineInvocationContext::new(invocations, arena)),
             || {
                 let mut progress = progress;
+                let statement_events = (txn.trigger_depth(), txn.command_id());
                 let dml_mats = match self.run_dml_ctes(
                     statement.with,
                     txn,
@@ -17168,6 +17175,7 @@ impl Engine {
                 {
                     return Ok(Err(error));
                 }
+                responder.begin_command_completion_capture();
                 let outcome = if statement.from.is_none() {
                     query::constant_select_resumable(
                         &self.storage,
@@ -17193,9 +17201,45 @@ impl Engine {
                         responder,
                     )
                 };
+                let outcome = Self::fire_with_foreign_key_events(
+                    &self.storage,
+                    txn,
+                    statement_events,
+                    dml_mats,
+                    arena,
+                    responder,
+                    outcome,
+                );
                 exec::settle_main_step(progress, outcome, dml_mats, arena, &self.storage.row_work)
             },
         )
+    }
+
+    /// After the main statement of a `WITH` whose sub-statements modify data:
+    /// the sub-statements' foreign key checks it did not fire itself.
+    /// A failing check replaces the main statement's unsent command tag, as
+    /// PostgreSQL fires them before completing the statement.
+    fn fire_with_foreign_key_events<T>(
+        storage: &Storage,
+        txn: &mut TxnState,
+        (depth, command): (u16, u32),
+        materialized: &[(&str, &ast::MaterializedCte<'_>)],
+        arena: &Arena,
+        responder: &mut Responder,
+        outcome: Result<Result<(), SqlError>, T>,
+    ) -> Result<Result<(), SqlError>, T> {
+        match outcome {
+            Ok(Ok(())) if !materialized.is_empty() => {
+                let checked = exec::constraints::fire_statement_foreign_key_events(
+                    storage, txn, depth, command, arena,
+                );
+                if checked.is_err() && responder.completion_tag().is_some() {
+                    let _ = responder.take_command_completion_tag(arena, false);
+                }
+                Ok(checked)
+            }
+            outcome => outcome,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -18296,6 +18340,7 @@ impl Engine {
             return Ok(Err(error));
         }
         let mut progress = progress;
+        let statement_events = (txn.trigger_depth(), txn.command_id());
         let dml_mats =
             match self.run_dml_ctes(ctes, txn, arena, params, guc, responder, &mut progress) {
                 Ok(materialized) => materialized.unwrap_or(&[]),
@@ -18323,6 +18368,7 @@ impl Engine {
             Ok(expanded) => expanded,
             Err(error) => return Ok(Err(error)),
         };
+        responder.begin_command_completion_capture();
         let outcome = match statement {
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
                 &mut self.storage,
@@ -18354,6 +18400,15 @@ impl Engine {
                 "WITH expanded to a non-data-modifying statement"
             ))),
         };
+        let outcome = Self::fire_with_foreign_key_events(
+            &self.storage,
+            txn,
+            statement_events,
+            dml_mats,
+            arena,
+            responder,
+            outcome,
+        );
         exec::settle_main_step(progress, outcome, dml_mats, arena, &self.storage.row_work)
     }
 

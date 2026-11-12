@@ -116,19 +116,30 @@ is owned.
   A top-level write's `AFTER` events, foreign key checks and immediate
   constraint checks yield; reads after an event's first effect block until that event ends,
   so a trigger body that writes and then reads cold data still blocks.
-  The next step's selection in a multi-step write, `AFTER` triggers between
-  the steps of a rule-rewritten write, and `AFTER` work (foreign key checks
-  included) of writes inside routine bodies read synchronously. Letting the next step's selection
+  Writes in `CALL` and `DO` bodies keep their `AFTER` work the same way. The
+  next step's selection in a multi-step write, the `AFTER` work (foreign key
+  checks included) of its steps (rule actions, the statements of a
+  data-modifying `WITH`), and `AFTER` work of writes inside functions called
+  from a restartable statement read synchronously. A step's foreign key
+  check that waits and resumes the step at a completion position past its
+  last row loops with empty caches: each attempt waits again without a new
+  GET, so it also needs the step-local block pinning below. Letting the next step's selection
   yield and roll back to the step's start is not enough: with empty caches
   each retried selection issued a new GET and never finished (a rule action
   joining a cold table), so the step must keep the blocks it downloaded
   across its attempts. `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and
   `SET DEFAULT` still rewrite the referencing rows as the parent row is
-  written, without firing the referencing table's triggers, where
-  PostgreSQL runs them as SQL from its `AFTER` event at the statement's end.
-  A data-modifying `WITH` sub-statement fires its `AFTER` events and foreign
-  key checks at its own end, so `WITH d AS (DELETE FROM p ...) INSERT INTO p
-  SELECT ...` fails a NO ACTION check PostgreSQL passes.
+  written, without firing the referencing table's triggers or rules.
+  PostgreSQL 18.6 runs each as a `DELETE` or `UPDATE` of the referencing
+  table from its `RI_ConstraintTrigger_a_*` event at the statement's end
+  (deferred with the constraint): rules rewrite it, its `BEFORE` triggers
+  fire then, `BEFORE STATEMENT` once per table and operation in the
+  statement, and its `AFTER ROW` and `AFTER STATEMENT` events join the end of
+  the statement's queue (`AFTER STATEMENT` once per table and operation,
+  after the last such change). A data-modifying `WITH` sub-statement fires
+  its `AFTER ROW` and `AFTER STATEMENT` triggers at its own end, where
+  PostgreSQL fires them after the main statement's rows (its foreign key
+  checks already wait for the statement's end).
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written

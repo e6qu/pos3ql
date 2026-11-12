@@ -442,6 +442,10 @@ pub struct TxnState {
     transaction_start: Option<i64>,
     suspended_statement: Option<SuspendedStatement>,
     pub(super) write_completion_boundary: Option<WriteCompletionBoundary>,
+    /// The statement (trigger depth, command) whose data-modifying `WITH`
+    /// sub-statement is running: its foreign key checks wait for the whole
+    /// statement's end, as PostgreSQL fires them after the main statement.
+    pub(crate) with_sub_statement: Option<(u16, u32)>,
     pub(super) pending_write_completion: Option<super::exec::SuspendedWriteCompletion>,
     /// The top-level `CALL` or `DO` body waiting at a saved statement. It
     /// outlives transactions the body commits; ending the statement releases it.
@@ -1344,6 +1348,7 @@ impl TxnState {
             transaction_start: None,
             suspended_statement: None,
             write_completion_boundary: None,
+            with_sub_statement: None,
             pending_write_completion: None,
             pending_procedure: None,
             retained_write: None,
@@ -1822,6 +1827,18 @@ impl TxnState {
             self.statement_timeout_consumed = false;
             super::query::arm_timeout(timeout_ms);
         }
+    }
+
+    /// Moves the waiting statement's deadline into the past, so its resumed
+    /// attempt fails with `57014` without the test depending on elapsed time.
+    #[cfg(test)]
+    pub(crate) fn expire_suspended_statement_deadline(&mut self) {
+        let suspended = self
+            .suspended_statement
+            .as_mut()
+            .expect("a waiting statement keeps its deadline");
+        assert_ne!(suspended.deadline, 0, "the statement has a timeout");
+        suspended.deadline = 1;
     }
 
     pub(crate) fn restore_statement_deadline(&self, deadline: i64) {
@@ -3596,6 +3613,7 @@ impl TxnState {
         self.awaited_parent_read = None;
         self.procedure_restart = false;
         self.write_completion_boundary = None;
+        self.with_sub_statement = None;
         self.concurrent_index = None;
         self.immediate_index_utility = None;
         if let Some(owner) = &self.plan_invalidations {

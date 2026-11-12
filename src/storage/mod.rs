@@ -51358,6 +51358,20 @@ impl Storage {
         }
     }
 
+    /// Lets a referential check see every change of its own transaction,
+    /// including those of the running command, as PostgreSQL's checks do.
+    pub(crate) fn own_changes_snapshot(&self) -> ReadSnapshotScope {
+        let previous = execution_visibility();
+        replace_execution_visibility(VisibilityContext {
+            read_snapshot: SNAPSHOT_ALL,
+            ..previous
+        });
+        ReadSnapshotScope {
+            previous,
+            thread: core::marker::PhantomData,
+        }
+    }
+
     pub(crate) fn dml_expression_snapshot(&self, command: u32) -> ReadSnapshotScope {
         let previous = execution_visibility();
         replace_execution_visibility(VisibilityContext {

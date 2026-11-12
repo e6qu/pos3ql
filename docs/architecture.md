@@ -113,7 +113,10 @@ ACTION and RESTRICT checks of keys it removes, wait beside the row until its
 PostgreSQL's `RI_ConstraintTrigger_c_<oid>`/`_a_<oid>` triggers. A referencing
 check reads the row's current version, so a row deleted before the check is
 not checked; a referenced check carries the old key, and NO ACTION passes
-when another row provides that key again. The log is cut into 64 KiB pages:
+when another row provides that key again. Checks see every change of their
+transaction, and those of a data-modifying `WITH` sub-statement wait for the
+end of the whole statement, so `WITH d AS (DELETE FROM p ...) INSERT INTO p
+SELECT ...` passes as in PostgreSQL. The log is cut into 64 KiB pages:
 `deferred_trigger_bytes` of them stay in memory per connection and older
 pages move to the `trigger_event_spill_bytes` file shared by all
 connections, recreated empty at startup. Only when both are full does
@@ -131,7 +134,11 @@ keeps the body and continues at its waiting statement; a wait before the
 body starts runs the same event again, replaying its sequence values from
 the event's start. Each event's reads yield until its own first effect
 (a write, sequence call or routine call in its body), after which the rest
-of that event reads synchronously; the next event yields again. Cancellation, a statement or lock timeout, an error and
+of that event reads synchronously; the next event yields again. A write in
+a `CALL` or `DO` body keeps its `AFTER` work the same way in the body's
+frame. The steps of a multi-step write (rule actions, data-modifying `WITH`)
+run their `AFTER` work inline and synchronously.
+Cancellation, a statement or lock timeout, an error and
 the end of the transaction release the kept progress.
 
 **Routine calls keep a write's changed rows.** A row expression, row trigger

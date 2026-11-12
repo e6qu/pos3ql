@@ -87,7 +87,10 @@ impl AfterRowCursor {
                     trigger_depth,
                     command,
                     ..
-                } if trigger_depth == self.depth && command == self.command => {
+                } if trigger_depth == self.depth
+                    && command == self.command
+                    && context.txn.with_sub_statement != Some((self.depth, self.command)) =>
+                {
                     match constraints::foreign_key_event_mode(
                         context.host.storage(),
                         context.txn,
@@ -274,8 +277,11 @@ struct CompletionCursor {
     reply: CompletionReply,
     phase: AfterPhase,
     /// The completion ends a top-level statement: it runs the immediate
-    /// constraint checks, and its reads yield again at each event.
+    /// constraint checks.
     statement_end: bool,
+    /// Its owner keeps it across a wait, so its reads yield again at each
+    /// event: a top-level statement, or a write in a `CALL` or `DO` body.
+    reopen_reads: bool,
 }
 
 pub(crate) struct SuspendedWriteCompletion {
@@ -511,7 +517,7 @@ impl WriteCompletionState {
         }
         loop {
             if let Some(firing) = &mut self.firing {
-                if self.cursor.statement_end {
+                if self.cursor.reopen_reads {
                     query::reopen_reads_after_kept_work();
                 }
                 match firing.poll(context) {
@@ -549,7 +555,7 @@ impl WriteCompletionState {
                     Err(error) => return sql_fail(error),
                 },
             };
-            if self.cursor.statement_end {
+            if self.cursor.reopen_reads {
                 query::reopen_reads_after_kept_work();
             }
             let mark = arena.mark();
@@ -747,13 +753,15 @@ impl CompletionCursor {
         reply: CompletionReply,
         depth: u16,
         command: u32,
-        statement_end: bool,
+        boundary: Option<super::super::txn::WriteCompletionBoundary>,
     ) -> Self {
         Self {
             completion,
             reply,
             phase: AfterPhase::Rows(AfterRowCursor::new(depth, command)),
-            statement_end,
+            statement_end: boundary.is_some_and(|boundary| boundary.statement_end),
+            reopen_reads: boundary
+                .is_some_and(|boundary| boundary.statement_end || boundary.retained),
         }
     }
 
@@ -877,13 +885,8 @@ impl WriteCompletion {
         let boundary = context.txn.write_completion_boundary.filter(|boundary| {
             boundary.command == context.txn.command_id() && boundary.depth == depth
         });
-        let mut cursor = CompletionCursor::new(
-            self,
-            reply,
-            depth,
-            context.txn.command_id(),
-            boundary.is_some_and(|boundary| boundary.statement_end),
-        );
+        let mut cursor =
+            CompletionCursor::new(self, reply, depth, context.txn.command_id(), boundary);
         if let Some(boundary) = boundary {
             let selected = match cursor.next(&mut context, target) {
                 Ok(Some(selected)) => selected,
@@ -964,7 +967,7 @@ mod ownership_tests {
                 CompletionReply::Command,
                 0,
                 0,
-                false,
+                None,
             );
             let mut responder = Responder::new(&mut buffer);
             assert!(responder.buffer.append(&[0xa5; 50]));
@@ -1020,6 +1023,7 @@ mod ownership_tests {
                 reply: CompletionReply::CountOnly,
                 phase: AfterPhase::Reply,
                 statement_end: false,
+                reopen_reads: false,
             };
             nested.complete(&mut responder).unwrap().unwrap();
             assert_eq!(responder.buffer.len(), completed_bytes);

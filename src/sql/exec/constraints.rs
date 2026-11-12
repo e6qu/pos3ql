@@ -2838,6 +2838,47 @@ pub(crate) fn foreign_key_event_mode(
     Some(txn.constraint_mode(identity, timing))
 }
 
+/// Runs the immediate foreign key checks the statement at `depth` running as
+/// `command` still has queued: those of data-modifying `WITH` sub-statements
+/// when the main statement fired no events of its own (a `SELECT`, or a
+/// write rewritten into other statements).
+pub(crate) fn fire_statement_foreign_key_events(
+    storage: &Storage,
+    txn: &mut TxnState,
+    depth: u16,
+    command: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    txn.queue_all_pending_row_events()?;
+    let mut cursor = txn.trigger_events_from(command);
+    while cursor < txn.trigger_events_end() {
+        let index = cursor;
+        let (event, next, fired) = txn.trigger_event(index)?;
+        cursor = next;
+        let crate::sql::txn::DeferredTriggerKind::ForeignKey {
+            identity,
+            check,
+            trigger_depth,
+            command: queued_by,
+            ..
+        } = event.kind
+        else {
+            continue;
+        };
+        if fired || trigger_depth != depth || queued_by != command {
+            continue;
+        }
+        match foreign_key_event_mode(storage, txn, identity, check) {
+            None => txn.fire_trigger_event(index)?,
+            Some(crate::sql::ast::ConstraintMode::Deferred) => {}
+            Some(crate::sql::ast::ConstraintMode::Immediate) => {
+                fire_foreign_key_event(storage, txn, index, arena)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Runs the queued foreign key check `index` and marks it fired. A check
 /// that waits for a row lock runs again under the snapshot it started with.
 pub(crate) fn fire_foreign_key_event(
@@ -2870,6 +2911,8 @@ pub(crate) fn fire_foreign_key_event(
     let read = txn
         .take_awaited_parent_read(current)
         .unwrap_or_else(|| storage.validation_read());
+    // A data-modifying `WITH` reads below its own command; its checks do not.
+    let _own_changes = storage.own_changes_snapshot();
     let result = match check {
         crate::sql::txn::ForeignKeyCheck::Referencing => validate_constraint_obligation(
             storage,

@@ -256,7 +256,7 @@ fn executor_trigger_errors_timeouts_and_rollbacks_undo_its_effects() {
     assert!(error_sqlstates(&output).is_empty());
     writer.success(
         &mut engine,
-        "SET application_name = 'wait'; SET statement_timeout = '50ms'",
+        "SET application_name = 'wait'; SET statement_timeout = '1h'",
         true,
     );
     holder.success(&mut engine, "SELECT pg_advisory_lock(7)", true);
@@ -268,7 +268,7 @@ fn executor_trigger_errors_timeouts_and_rollbacks_undo_its_effects() {
     else {
         panic!("the trigger did not wait");
     };
-    std::thread::sleep(std::time::Duration::from_millis(80));
+    writer.transaction.expire_suspended_statement_deadline();
     writer.send.clear();
     writer.arena.recycle_front();
     let status = crate::mem::guard::forbid_alloc(|| {

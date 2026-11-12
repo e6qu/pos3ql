@@ -1,7 +1,7 @@
 use super::object_reads::{advance, read_request, replace_uncached_blocks, reply};
 use super::*;
 use std::net::TcpListener;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 fn resume_procedure_wait(
     engine: &mut Engine,
@@ -435,7 +435,7 @@ fn procedure_wait_failures_release_saved_frames() {
             true,
         );
         if timeout {
-            writer.success(&mut engine, "SET statement_timeout = '50ms'", true);
+            writer.success(&mut engine, "SET statement_timeout = '1h'", true);
         }
         holder.success(&mut engine, "SELECT pg_advisory_lock(711)", true);
         let sql = "CALL failed_wait()";
@@ -451,7 +451,7 @@ fn procedure_wait_failures_release_saved_frames() {
             };
             assert!(writer.transaction.pending_procedure.is_some(), "{label}");
             if timeout {
-                std::thread::sleep(Duration::from_millis(80));
+                writer.transaction.expire_suspended_statement_deadline();
             }
             output_mark.truncate_unsent(&mut writer.send);
             writer.arena.recycle_front();

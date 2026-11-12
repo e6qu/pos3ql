@@ -909,6 +909,69 @@ fn procedural_write_rows_resume_after_storage_waits() {
     }
 }
 
+/// Foreign key checks queued by writes in a procedure, a `DO` body and a
+/// dynamic `EXECUTE` are the only cold reads: each check waits for a delayed
+/// GET while another client runs, and the write finishes with PostgreSQL
+/// 18.6's rows; both transaction modes and both protocols.
+#[test]
+fn nested_foreign_key_checks_yield_after_storage_waits() {
+    let statements = [
+        "CALL fill()",
+        "DO $$BEGIN INSERT INTO plain_do VALUES (11, 11), (12, 12); END$$",
+        "DO $$BEGIN EXECUTE 'INSERT INTO plain_ex VALUES (21, 21), (22, 22)'; END$$",
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for extended in [false, true] {
+            let mut cold = cold_table(
+                &format!("nested-fk-waits-{extended}"),
+                mode,
+                "CREATE TABLE hot_log(stage text); \
+                 CREATE TABLE cold_more(id integer PRIMARY KEY); \
+                 INSERT INTO cold_more SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_gone(id integer PRIMARY KEY); \
+                 INSERT INTO cold_gone SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_pairs(id integer PRIMARY KEY); \
+                 INSERT INTO cold_pairs SELECT generate_series(1, 40); \
+                 CREATE TABLE plain(id int, more int REFERENCES cold_more); \
+                 CREATE TABLE plain_do(id int, more int REFERENCES cold_gone); \
+                 CREATE TABLE plain_ex(id int, more int REFERENCES cold_pairs); \
+                 CREATE PROCEDURE fill() LANGUAGE plpgsql AS $$BEGIN \
+                 INSERT INTO plain SELECT g, g FROM generate_series(1, 3) g; END$$",
+            );
+            for sql in statements {
+                let context = format!("{mode:?} extended={extended}: {sql}");
+                let waits = cold.run(sql, extended, other_client_progresses);
+                assert!(waits > 0, "{context}: a foreign key check must wait");
+                let output = cold.writer.send.readable().to_vec();
+                assert!(
+                    error_sqlstates(&output).is_empty(),
+                    "{context}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            let context = format!("{mode:?} extended={extended}");
+            assert_eq!(
+                cold.rows(
+                    "SELECT string_agg(id || ':' || more, ',' ORDER BY id) FROM plain; \
+                     SELECT string_agg(id || ':' || more, ',' ORDER BY id) FROM plain_do; \
+                     SELECT string_agg(id || ':' || more, ',' ORDER BY id) FROM plain_ex"
+                ),
+                ["1:1,2:2,3:3", "11:11,12:12", "21:21,22:22"],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows("SELECT count(*) FROM hot_log"),
+                ["3"],
+                "{context}"
+            );
+            cold.finish();
+        }
+    }
+}
+
 /// Notes whose AFTER row and statement triggers read cold tables before
 /// their writes, sequence calls and notices, with a deferrable foreign key
 /// checked at the statement's end against a cold parent.

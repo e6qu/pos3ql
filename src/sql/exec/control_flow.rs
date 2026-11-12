@@ -151,13 +151,37 @@ pub(super) fn at_routine_exit<T>(
     })
 }
 
+/// Checks a BEFORE trigger's returned row, which PostgreSQL reports
+/// `during function exit`.
+pub(super) fn at_trigger_exit<T>(
+    context: &TriggerExecContext<'_, '_, '_>,
+    invocation: TriggerInvocation<'_>,
+    run: impl FnOnce() -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    run().map_err(|error| {
+        if error.sqlstate.internal_control().is_some() {
+            return error;
+        }
+        let signature = match procedural_signature(context, invocation) {
+            Ok(signature) => signature,
+            Err(signature_error) => return signature_error,
+        };
+        let activity = ProceduralActivity::Phase {
+            source: None,
+            text: "during function exit",
+        };
+        let frame = ProceduralFrame::new(signature, None, activity, invocation.print_strict_params);
+        crate::sql::error_context::with_frame(&frame, || crate::sql::error_context::capture(error))
+    })
+}
+
 /// PostgreSQL's name for a statement in a context line (`plpgsql_stmt_typename`).
 pub(super) fn statement_name(statement: TriggerStatement<'_>) -> &'static str {
     match statement {
         TriggerStatement::Null => "NULL",
         TriggerStatement::TransactionControl(PlpgsqlTransactionCommand::Commit(_)) => "COMMIT",
         TriggerStatement::TransactionControl(PlpgsqlTransactionCommand::Rollback(_)) => "ROLLBACK",
-        TriggerStatement::Assign(_) | TriggerStatement::LocalAssign(_) => "assignment",
+        TriggerStatement::LocalAssign(_) => "assignment",
         TriggerStatement::SelectInto(_)
         | TriggerStatement::Utility { .. }
         | TriggerStatement::Dml { .. } => "SQL statement",
@@ -1147,18 +1171,12 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the interpreter retains the complete typed firing context"
-    )]
     pub(super) fn execute_block(
         &mut self,
         context: &mut TriggerExecContext<'_, 'a, '_>,
         definition: crate::storage::RelationDefinition<'_>,
         invocation: TriggerInvocation<'a>,
-        old: Option<&[Datum<'a>]>,
-        new: &mut Option<&mut [Datum<'a>]>,
-        before: bool,
+        records: &mut TriggerRows<'_, 'a>,
         transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
         program: &CompiledProgram<'a>,
     ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
@@ -1175,9 +1193,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                 context,
                 definition,
                 invocation,
-                old,
-                new,
-                before,
+                records,
                 transition_relations,
                 program,
             )
@@ -1194,9 +1210,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
         context: &mut TriggerExecContext<'_, 'a, '_>,
         definition: crate::storage::RelationDefinition<'_>,
         invocation: TriggerInvocation<'a>,
-        old: Option<&[Datum<'a>]>,
-        new: &mut Option<&mut [Datum<'a>]>,
-        before: bool,
+        records: &mut TriggerRows<'_, 'a>,
         transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
         program: &CompiledProgram<'a>,
     ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
@@ -1392,11 +1406,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                         // it, not the one it initializes.
                         let value = match declaration.initial {
                             Some(initial) => {
-                                let transition = TriggerTransition {
-                                    definition,
-                                    old,
-                                    new: new.as_deref(),
-                                };
+                                let transition = records.transition(definition);
                                 let scope = TriggerLocalScope {
                                     locals: &workspace.locals[..index],
                                     values: &workspace.values[..index],
@@ -1469,9 +1479,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                         context,
                         definition,
                         invocation,
-                        old,
-                        new,
-                        before,
+                        records,
                         transition_relations,
                         scope,
                         scope_values,
@@ -1506,8 +1514,8 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             condition,
                             definition,
                             invocation,
-                            old,
-                            new.as_deref(),
+                            records.old.row(),
+                            records.new.row(),
                             scope,
                             scope_values,
                             status.found,
@@ -1668,7 +1676,6 @@ fn bind_exception_variables<'a>(
         expression(query.command) || query.arguments.iter().any(|value| expression(value))
     };
     let needed = match statement {
-        TriggerStatement::Assign(value) => value.exception_variables,
         TriggerStatement::LocalAssign(value) => value.exception_variables,
         TriggerStatement::Perform(query)
         | TriggerStatement::ReturnQuery(query)

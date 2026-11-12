@@ -928,6 +928,7 @@ pub(super) use function_execution::{FunctionOutput, SuspendedFunction};
 pub(super) use sql_function_execution::execute_sql_function;
 pub(crate) use sql_function_execution::sql_function_inlining;
 mod trigger_firing;
+use trigger_firing::{TriggerRecordName, TriggerRows};
 mod write_completion;
 pub(super) use write_completion::SuspendedWriteCompletion;
 pub(super) use write_completion::resume as resume_write_completion;
@@ -4165,6 +4166,25 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
         materialized_relations: transition_relations,
         ..invocation
     };
+    // `OLD`, and `NEW` unless it is the caller's BEFORE row, are records
+    // local to this invocation.
+    let arena = context.arena;
+    let width = definition.n_columns;
+    let local_row = |row: Option<&[Datum<'values>]>| match row {
+        Some(row) => arena.alloc_slice_copy(row),
+        None => arena.alloc_slice_with(width, |_| Datum::Null),
+    };
+    let old_assigned = old.is_some();
+    let old = local_row(old).map_err(|_| super::query::arena_full_pub())?;
+    let (new, new_assigned, caller_new) = match new {
+        Some(row) if before => (row, true, true),
+        row => {
+            let assigned = row.is_some();
+            let row =
+                local_row(row.map(|row| &*row)).map_err(|_| super::query::arena_full_pub())?;
+            (row, assigned, false)
+        }
+    };
     trigger_firing::TriggerFiring::new(
         context,
         code,
@@ -4172,10 +4192,13 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
         trigger_firing::FiringBinding {
             invocation,
             definition,
-            old,
-            new,
+            rows: trigger_firing::TriggerRows {
+                old: trigger_firing::TriggerRecord::new(old, old_assigned),
+                new: trigger_firing::TriggerRecord::new(new, new_assigned),
+                before: before && trigger.level == TriggerLevel::Row,
+            },
+            caller_new,
             level: trigger.level,
-            before,
         },
         call_environment::CallEnvironment::new(config, security),
     )
@@ -17144,14 +17167,6 @@ fn plpgsql_function_program_kind(routine: &crate::storage::RoutineDef) -> Plpgsq
     }
 }
 
-#[derive(Clone, Copy)]
-struct TriggerAssignment<'a> {
-    column: SqlName,
-    expression: &'a Expr<'a>,
-    // Dependencies include the original target's subscripts after lowering.
-    exception_variables: bool,
-}
-
 /// A variable as a statement names it: `x`, or `label.x` for the `x` that
 /// the block, loop or routine labelled `label` declares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17909,7 +17924,6 @@ pub enum InsertSource<'a> {
 enum TriggerStatement<'a> {
     Null,
     TransactionControl(PlpgsqlTransactionCommand),
-    Assign(TriggerAssignment<'a>),
     LocalAssign(TriggerLocalAssignment<'a>),
     SelectInto(TriggerSelectInto<'a>),
     DynamicQuery(PlpgsqlDynamicQuery<'a>),
@@ -18301,6 +18315,45 @@ pub(crate) struct TriggerTransition<'d, 's, 'v> {
     new: Option<&'s [Datum<'v>]>,
 }
 
+impl<'v> TriggerTransition<'_, '_, 'v> {
+    /// `OLD` or `NEW` by its folded name, `None` while it is NULL.
+    fn record(&self, name: &str) -> Result<Option<&[Datum<'v>]>, SqlError> {
+        match TriggerRecordName::parse(name) {
+            Some(TriggerRecordName::Old) if self.definition.n_columns > 0 => Ok(self.old),
+            Some(TriggerRecordName::New) if self.definition.n_columns > 0 => Ok(self.new),
+            _ => Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "missing FROM-clause entry for table \"{}\"",
+                name
+            )),
+        }
+    }
+
+    fn record_fields<'value>(
+        &self,
+        values: Option<&[Datum<'v>]>,
+        arena: &'value Arena,
+    ) -> Result<&'value [RecordField<'value>], SqlError>
+    where
+        'v: 'value,
+    {
+        let columns = self.definition.columns();
+        let fields = arena
+            .alloc_slice_with(columns.len(), |index| RecordField {
+                name: "",
+                type_oid: columns[index].ctype.oid(),
+                value: values.map_or(Datum::Null, |values| values[index]),
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        for (field, column) in fields.iter_mut().zip(columns) {
+            field.name = arena
+                .alloc_str(column.name.as_str())
+                .map_err(|_| super::query::arena_full_pub())?;
+        }
+        Ok(&*fields)
+    }
+}
+
 impl<'d, 's, 'stored, 'value> ColumnLookup<'value> for TriggerTransition<'d, 's, 'stored>
 where
     'stored: 'value,
@@ -18316,9 +18369,12 @@ where
     }
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
-        (table == "old" || table == "new").then_some(ColType::Record)
+        (TriggerRecordName::parse(table).is_some() && self.definition.n_columns > 0)
+            .then_some(ColType::Record)
     }
 
+    // A record that holds no row (`NEW` in a DELETE trigger) reads as NULL,
+    // with the relation's fields.
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         let Some(qualifier) = qualifier else {
             return Err(sql_err!(
@@ -18327,32 +18383,16 @@ where
                 name
             ));
         };
-        let (transition, values) = if qualifier == "old" {
-            ("OLD", self.old)
-        } else if qualifier == "new" {
-            ("NEW", self.new)
-        } else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "missing FROM-clause entry for table \"{}\"",
-                qualifier
-            ));
-        };
-        let Some(values) = values else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "record \"{}\" is not assigned yet",
-                transition
-            ));
-        };
+        let values = self.record(qualifier)?;
         let Some(column) = self.definition.column_index(name) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
-                "column \"{}\" does not exist",
+                "record \"{}\" has no field \"{}\"",
+                qualifier,
                 name
             ));
         };
-        Ok(values[column])
+        Ok(values.map_or(Datum::Null, |values| values[column]))
     }
 
     fn whole_row_fields(
@@ -18360,45 +18400,23 @@ where
         table: &str,
         arena: &'value Arena,
     ) -> Result<Option<&'value [RecordField<'value>]>, SqlError> {
-        let values = if table == "old" {
-            self.old
-        } else if table == "new" {
-            self.new
-        } else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "missing FROM-clause entry for table \"{}\"",
-                table
-            ));
-        };
-        let Some(values) = values else {
-            let transition = if table == "old" { "OLD" } else { "NEW" };
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "record \"{}\" is not assigned yet",
-                transition
-            ));
-        };
-        let mut materialized = [RecordField {
-            name: "",
-            type_oid: 0,
-            value: Datum::Null,
-        }; MAX_COLUMNS];
-        for (index, field) in materialized
-            .iter_mut()
-            .enumerate()
-            .take(self.definition.n_columns)
-        {
-            field.name = arena
-                .alloc_str(self.definition.columns()[index].name.as_str())
-                .map_err(|_| super::query::arena_full_pub())?;
-            field.type_oid = self.definition.columns()[index].ctype.oid();
-            field.value = values[index];
+        match self.record(table)? {
+            Some(values) => self.record_fields(Some(values), arena).map(Some),
+            None => Ok(None),
         }
-        let fields = arena
-            .alloc_slice_copy(&materialized[..self.definition.n_columns])
-            .map_err(|_| super::query::arena_full_pub())?;
-        Ok(Some(&*fields))
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'value Arena,
+    ) -> Result<&'value [RecordField<'value>], SqlError> {
+        let values = self.record(table)?;
+        self.record_fields(values, arena)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        Ok(self.record(table)?.is_some())
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
@@ -19014,34 +19032,6 @@ fn trigger_assignment_operator(
             _ => None,
         })
     })
-}
-
-fn parse_trigger_assignment<'a>(
-    statement: &'a str,
-    arena: &'a Arena,
-) -> Result<Option<TriggerAssignment<'a>>, SqlError> {
-    let Some((offset, width)) = trigger_assignment_operator(statement, arena)? else {
-        return Ok(None);
-    };
-    let (target, expression) = (&statement[..offset], &statement[offset + width..]);
-    let target = target.trim();
-    let expression = expression.trim();
-    if target.is_empty() || expression.is_empty() {
-        return Ok(None);
-    }
-    let expression = parse_plpgsql_expression(expression, arena)?;
-    let (qualifier, column, expression) =
-        parse_plpgsql_assignment_target(target, expression, arena)?;
-    if qualifier != Some("new") {
-        return Ok(None);
-    }
-    Ok(Some(TriggerAssignment {
-        column,
-        expression,
-        exception_variables: super::plpgsql_inputs::references_exception_variables(
-            statement, arena,
-        )?,
-    }))
 }
 
 /// Resolves a PL/pgSQL assignment target and lowers any chained subscripts to
@@ -20420,7 +20410,7 @@ fn parse_trigger_return<'a>(
         {
             TriggerReturn::Void
         }
-        PlpgsqlProgramKind::Function if !value.is_empty() => {
+        PlpgsqlProgramKind::Function | PlpgsqlProgramKind::Trigger if !value.is_empty() => {
             TriggerReturn::Value(parse_plpgsql_expression(value, arena)?)
         }
         PlpgsqlProgramKind::VoidFunction if value.is_empty() => TriggerReturn::Void,
@@ -21224,9 +21214,6 @@ fn parse_trigger_statement<'a>(
                 statement: super::parser::parse_stored_statement(segment, arena)?,
             });
         }
-    }
-    if let Some(assignment) = parse_trigger_assignment(segment, arena)? {
-        return Ok(TriggerStatement::Assign(assignment));
     }
     if let Some(assignment) = parse_trigger_local_assignment(segment, arena)? {
         return Ok(TriggerStatement::LocalAssign(assignment));
@@ -22268,7 +22255,6 @@ fn validate_plpgsql_constant_assignments(
                 }
                 TriggerStatement::Null
                 | TriggerStatement::TransactionControl(_)
-                | TriggerStatement::Assign(_)
                 | TriggerStatement::DynamicQuery(_)
                 | TriggerStatement::Utility { .. }
                 | TriggerStatement::Dml { .. }
@@ -22553,14 +22539,11 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         &code,
         &[],
     )?;
-    let mut no_new = None;
     match execution.execute_block(
         &mut context,
         definition,
         invocation,
-        None,
-        &mut no_new,
-        false,
+        &mut TriggerRows::none(),
         None,
         &code,
     )? {
@@ -22644,14 +22627,11 @@ pub(crate) fn execute_event_trigger<'a>(
         &code,
         &[],
     )?;
-    let mut no_new = None;
     match execution.execute_block(
         &mut context,
         definition,
         invocation,
-        None,
-        &mut no_new,
-        false,
+        &mut TriggerRows::none(),
         None,
         &code,
     )? {
@@ -22810,14 +22790,11 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         &seeded[..seeded_count],
     )?;
     drop(seeded);
-    let mut no_new = None;
     match execution.execute_block(
         &mut context,
         definition,
         invocation,
-        None,
-        &mut no_new,
-        false,
+        &mut TriggerRows::none(),
         None,
         &code,
     )? {
@@ -23447,6 +23424,11 @@ struct TriggerLocalScope<'t, 'a> {
 }
 
 impl<'a> TriggerLocalScope<'_, 'a> {
+    /// `NEW.x` and `OLD.x` read a trigger function's records.
+    fn names_trigger_record(&self, qualifier: Option<&str>) -> bool {
+        qualifier.is_some_and(|name| self.transition.whole_row_type(name).is_some())
+    }
+
     fn variable(&self, name: &str) -> Option<PlpgsqlVariable<'a>> {
         plpgsql_variable(self.locals, self.values, self.invocation, self.found, name)
     }
@@ -23665,8 +23647,42 @@ where
         ))
     }
 
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.transition.whole_row_type(table)
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::eval::CatalogAccess>,
+    ) -> Option<(StackStr<64>, StaticTypeMeta)> {
+        self.transition
+            .whole_row_field_metadata(table, index, catalog)
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'value Arena,
+    ) -> Result<Option<&'value [RecordField<'value>]>, SqlError> {
+        self.transition.whole_row_fields(table, arena)
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'value Arena,
+    ) -> Result<&'value [RecordField<'value>], SqlError> {
+        self.transition.whole_row_expansion_fields(table, arena)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        self.transition.whole_row_present(table)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
-        if matches!(qualifier, Some("old" | "new")) {
+        if self.names_trigger_record(qualifier) {
             return self.transition.lookup(qualifier, name);
         }
         if let Some(variable) = self.named(qualifier, name) {
@@ -23730,7 +23746,7 @@ where
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        if matches!(qualifier, Some("old" | "new")) {
+        if self.names_trigger_record(qualifier) {
             return self.transition.col_type(qualifier, name);
         }
         self.named(qualifier, name)
@@ -23749,7 +23765,7 @@ where
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        if matches!(qualifier, Some("old" | "new")) {
+        if self.names_trigger_record(qualifier) {
             return self.transition.collation(qualifier, name);
         }
         if let Some(variable) = self.named(qualifier, name) {
@@ -23808,7 +23824,7 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        if matches!(qualifier, Some("old" | "new")) {
+        if self.names_trigger_record(qualifier) {
             return self.transition.column_user_type(qualifier, name);
         }
         if let Some(variable) = self.named(qualifier, name) {
@@ -23992,32 +24008,12 @@ where
                         )
                     });
             }
-            let (record, values) = if qualifier == "old" {
-                ("OLD", self.old)
-            } else if qualifier == "new" {
-                ("NEW", self.new)
-            } else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "missing FROM-clause entry for table \"{}\"",
-                    qualifier
-                ));
-            };
-            let Some(values) = values else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "record \"{}\" is not assigned yet",
-                    record
-                ));
-            };
-            let Some(column) = self.definition.column_index(name) else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
-                ));
-            };
-            return Ok(values[column]);
+            return TriggerTransition {
+                definition: self.definition,
+                old: self.old,
+                new: self.new,
+            }
+            .lookup(Some(qualifier), name);
         }
         Err(sql_err!(
             sqlstate::UNDEFINED_COLUMN,
@@ -28022,9 +28018,6 @@ fn assign_trigger_local<'a>(
             let Some(record) = target.label.and_then(|label| {
                 trigger_local_index(locals, PlpgsqlVariableName::plain(label)).ok()
             }) else {
-                if target.label.is_some_and(|label| label.as_str() == "new") {
-                    return Err(new_field_target_unsupported(target));
-                }
                 return Err(error);
             };
             return assign_trigger_record_field(
@@ -28064,110 +28057,98 @@ fn assign_trigger_local<'a>(
 #[derive(Clone, Copy)]
 enum PlpgsqlIntoTarget {
     Local(usize),
-    /// A column of a trigger's `NEW` row (`SELECT ... INTO NEW.col`).
-    NewColumn(usize),
+    /// A field of a trigger's `OLD` or `NEW` record (`INTO NEW.col`).
+    TriggerField(TriggerRecordName, usize),
+    /// A trigger's whole `OLD` or `NEW` record (`INTO NEW`).
+    TriggerRecord(TriggerRecordName),
 }
 
-/// Resolves an `INTO` target: a variable, or a field of a trigger's `NEW`
-/// row when no variable answers to it.
+impl PlpgsqlIntoTarget {
+    /// A single record or row target receives a query's whole row.
+    fn takes_row(self, locals: &[TriggerLocalDecl]) -> bool {
+        match self {
+            Self::Local(index) => {
+                matches!(locals[index].ctype, ColType::Record | ColType::Composite(_))
+            }
+            Self::TriggerRecord(_) => true,
+            Self::TriggerField(..) => false,
+        }
+    }
+}
+
+/// Resolves an `INTO` target: a variable, or a trigger function's `OLD` or
+/// `NEW` record or one of its fields when no variable answers to the name.
 fn plpgsql_into_target(
     locals: &[TriggerLocalDecl],
     definition: crate::storage::RelationDefinition<'_>,
     target: PlpgsqlVariableName,
 ) -> Result<PlpgsqlIntoTarget, SqlError> {
-    match trigger_local_index(locals, target) {
-        Ok(index) => Ok(PlpgsqlIntoTarget::Local(index)),
-        Err(error) => match target.label {
-            Some(label)
-                if label.as_str() == "new"
-                    && definition.n_columns > 0
-                    && trigger_local_index(locals, PlpgsqlVariableName::plain(label)).is_err() =>
-            {
-                definition
-                    .column_index(target.name.as_str())
-                    .map(PlpgsqlIntoTarget::NewColumn)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "record \"new\" has no field \"{}\"",
-                            target.name.as_str()
-                        )
-                    })
+    let error = match trigger_local_index(locals, target) {
+        Ok(index) => return Ok(PlpgsqlIntoTarget::Local(index)),
+        Err(error) if definition.n_columns == 0 => return Err(error),
+        Err(error) => error,
+    };
+    match target.label {
+        Some(label) => {
+            let Some(record) = TriggerRecordName::parse(label.as_str()) else {
+                return Err(error);
+            };
+            if trigger_local_index(locals, PlpgsqlVariableName::plain(label)).is_ok() {
+                return Err(error);
             }
-            Some(label)
-                if label.as_str() == "old"
-                    && definition.n_columns > 0
-                    && trigger_local_index(locals, PlpgsqlVariableName::plain(label)).is_err() =>
-            {
-                Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "assigning a field of OLD is not supported"
-                ))
-            }
-            _ => Err(error),
-        },
-    }
-}
-
-/// `INTO NEW.col` outside a static `SELECT ... INTO` is not implemented.
-fn new_field_target_unsupported(target: PlpgsqlVariableName) -> SqlError {
-    sql_err!(
-        sqlstate::FEATURE_NOT_SUPPORTED,
-        "assigning NEW.{} here is not supported; use SELECT ... INTO or :=",
-        target.name.as_str()
-    )
-}
-
-/// The variable an `INTO` target names, rejecting a `NEW` field explicitly
-/// where only variables can receive values.
-fn plpgsql_into_local(
-    locals: &[TriggerLocalDecl],
-    definition: crate::storage::RelationDefinition<'_>,
-    target: PlpgsqlVariableName,
-) -> Result<usize, SqlError> {
-    match plpgsql_into_target(locals, definition, target)? {
-        PlpgsqlIntoTarget::Local(index) => Ok(index),
-        PlpgsqlIntoTarget::NewColumn(_) => Err(new_field_target_unsupported(target)),
+            definition
+                .column_index(target.name.as_str())
+                .map(|column| PlpgsqlIntoTarget::TriggerField(record, column))
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "record \"{}\" has no field \"{}\"",
+                        record.as_str(),
+                        target.name.as_str()
+                    )
+                })
+        }
+        None => TriggerRecordName::parse(target.name.as_str())
+            .map(PlpgsqlIntoTarget::TriggerRecord)
+            .ok_or(error),
     }
 }
 
 /// Stores `value` into `target` with PL/pgSQL's assignment conversion. A
-/// `NEW` column converts as a variable of the column's type would.
+/// trigger record's field converts as a variable of the column's type would.
 #[expect(
     clippy::too_many_arguments,
-    reason = "an INTO target reaches the variables and the trigger's NEW row"
+    reason = "an INTO target reaches the variables and the trigger's records"
 )]
 fn assign_plpgsql_into_target<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     definition: crate::storage::RelationDefinition<'_>,
-    new: &mut Option<&mut [Datum<'a>]>,
-    before: bool,
+    records: &mut TriggerRows<'_, 'a>,
     locals: &[TriggerLocalDecl],
     values: &mut [Datum<'a>],
     target: PlpgsqlVariableName,
     resolved: PlpgsqlIntoTarget,
     value: Datum<'a>,
 ) -> Result<(), SqlError> {
-    let column = match resolved {
+    let (record, column) = match resolved {
         PlpgsqlIntoTarget::Local(_) => {
             return assign_trigger_local(context, locals, values, target, value);
         }
-        PlpgsqlIntoTarget::NewColumn(column) => column,
+        PlpgsqlIntoTarget::TriggerRecord(record) => {
+            let row = trigger_record_row(
+                definition,
+                value,
+                TriggerRowSource::Assignment,
+                context.storage(),
+                context.txn.txid,
+                context.arena,
+            )?;
+            records.record_mut(record).set_row(row);
+            return Ok(());
+        }
+        PlpgsqlIntoTarget::TriggerField(record, column) => (record, column),
     };
-    if !before || new.is_none() {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "NEW assignments require a BEFORE INSERT or UPDATE trigger"
-        ));
-    }
     let meta = &definition.columns()[column];
-    if meta.default.is_generated() {
-        return Err(sql_err!(
-            sqlstate::GENERATED_ALWAYS,
-            "cannot assign to generated column \"{}\"",
-            meta.name.as_str()
-        ));
-    }
     let sequences = crate::sql::sequence::SeqEval::new(
         context.storage(),
         context.seq_session(),
@@ -28191,8 +28172,201 @@ fn assign_plpgsql_into_target<'a>(
         context.arena,
         &sequences,
     )?;
-    new.as_deref_mut().expect("checked NEW image")[column] = value;
+    records.record_mut(record).set_field(column, value);
     Ok(())
+}
+
+/// The trigger record whose field `target` names (`NEW.col`) when no
+/// variable or block label answers to it.
+fn trigger_record_field_target(
+    locals: &[TriggerLocalDecl],
+    definition: crate::storage::RelationDefinition<'_>,
+    target: PlpgsqlVariableName,
+) -> Option<TriggerRecordName> {
+    let label = target.label?;
+    let record = TriggerRecordName::parse(label.as_str())?;
+    (definition.n_columns > 0
+        && trigger_local_index(locals, target).is_err()
+        && trigger_local_index(locals, PlpgsqlVariableName::plain(label)).is_err())
+    .then_some(record)
+}
+
+/// `NEW.col := expression` and `OLD.col := expression` convert the value
+/// to the column's declared type, as an assignment to the column would.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the assignment evaluates in the statement's complete variable scope"
+)]
+fn assign_trigger_record_column<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    definition: crate::storage::RelationDefinition<'_>,
+    records: &mut TriggerRows<'_, 'a>,
+    locals: &[TriggerLocalDecl],
+    local_values: &[Datum<'a>],
+    found: Option<bool>,
+    invocation: TriggerInvocation<'a>,
+    record: TriggerRecordName,
+    assignment: TriggerLocalAssignment<'a>,
+) -> Result<(), SqlError> {
+    let Some(column) = definition.column_index(assignment.name.name.as_str()) else {
+        // PostgreSQL resolves the target while planning the assignment.
+        let error = || {
+            Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "record \"{}\" has no field \"{}\"",
+                record.as_str(),
+                assignment.name.name.as_str()
+            ))
+        };
+        return match crate::sql::error_context::innermost_assignment() {
+            Some(statement) => in_procedural_query(
+                statement,
+                crate::sql::error_context::QueryMode::Assignment,
+                false,
+                error,
+            ),
+            None => error(),
+        };
+    };
+    let transition = records.transition(definition);
+    let scope = TriggerLocalScope {
+        locals,
+        values: &local_values[..locals.len()],
+        found,
+        invocation,
+        transition: &transition,
+    };
+    let catalog = super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..NO_HOOKS
+    };
+    let source = super::eval::expression_type_identity(assignment.expression, &scope, &hooks)?
+        .routine_argument_oid();
+    let cast = prepare_assignment_cast(
+        source,
+        &definition.columns()[column],
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+    )?;
+    let input_collation =
+        super::eval::coercion_input_collation(assignment.expression, &scope, hooks.catalog)?;
+    let value = eval_procedural_expression(context, assignment.expression, &scope, None)?;
+    let value = coerce_assignment(
+        value,
+        &definition.columns()[column],
+        PlannedAssignmentCast {
+            input_collation,
+            defined: cast.as_ref(),
+            site: None,
+        },
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+        Some(&crate::sql::sequence::SeqEval::new(
+            context.storage(),
+            context.seq_session(),
+            context.txn.txid,
+        )),
+    )?;
+    records.record_mut(record).set_field(column, value);
+
+    Ok(())
+}
+
+/// What produced a row for a trigger record, which decides PostgreSQL's
+/// error for a value that is not a row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TriggerRowSource {
+    Assignment,
+    Return,
+}
+
+/// The triggering relation's row that `value` holds, or `None` for NULL.
+/// PostgreSQL keeps `OLD` and `NEW` as records, so a row of another
+/// structure is accepted until a BEFORE trigger returns it; the relation's
+/// structure is checked here, where the row is stored.
+pub(super) fn trigger_record_row<'a>(
+    definition: crate::storage::RelationDefinition<'_>,
+    value: Datum<'a>,
+    source: TriggerRowSource,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    let fields = match value {
+        Datum::Null => return Ok(None),
+        Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+        _ if source == TriggerRowSource::Return => {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "cannot return non-composite value from function returning composite type"
+            ));
+        }
+        value => {
+            let text = crate::sql::eval::cast_to_text(value, arena)?;
+            return Err(if text.trim_start().starts_with('(') {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "input of anonymous composite types is not implemented"
+                )
+            } else {
+                crate::sql::error_position::with_detail(
+                    sql_err!(
+                        sqlstate::INVALID_TEXT_REPRESENTATION,
+                        "malformed record literal: \"{}\"",
+                        text
+                    ),
+                    format_args!("Missing left parenthesis."),
+                )
+            });
+        }
+    };
+    let columns = definition.columns();
+    let mismatch = |detail: core::fmt::Arguments<'_>| {
+        crate::sql::error_position::with_detail(
+            sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "returned row structure does not match the structure of the triggering table"
+            ),
+            detail,
+        )
+    };
+    for (index, column) in columns.iter().enumerate() {
+        let Some(field) = fields.get(index) else {
+            return Err(mismatch(format_args!(
+                "Number of returned columns ({}) does not match expected column count ({}).",
+                fields.len(),
+                columns.len()
+            )));
+        };
+        let declared = storage
+            .routine_type_oid(column.ctype, column.user_type, txid)
+            .unwrap_or(column.ctype.oid());
+        if field.type_oid != declared && field.type_oid != column.ctype.oid() {
+            let returned = crate::sql::catalog::format_type_name(storage, txid, field.type_oid)?;
+            let expected = crate::sql::catalog::format_type_name(storage, txid, declared)?;
+            return Err(mismatch(format_args!(
+                "Returned type {} does not match expected type {} in column \"{}\" (position {}).",
+                returned.as_str(),
+                expected.as_str(),
+                column.name.as_str(),
+                index + 1
+            )));
+        }
+    }
+    if fields.len() != columns.len() {
+        return Err(mismatch(format_args!(
+            "Number of returned columns ({}) does not match expected column count ({}).",
+            fields.len(),
+            columns.len()
+        )));
+    }
+    let row = arena
+        .alloc_slice_with(columns.len(), |index| fields[index].value)
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(Some(&*row))
 }
 
 /// Replaces one field of a row or record variable and stores the row through
@@ -29035,9 +29209,7 @@ fn execute_trigger_step<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     definition: crate::storage::RelationDefinition<'_>,
     invocation: TriggerInvocation<'a>,
-    old: Option<&[Datum<'a>]>,
-    new: &mut Option<&mut [Datum<'a>]>,
-    before: bool,
+    records: &mut TriggerRows<'_, 'a>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     locals: &[TriggerLocalDecl],
     local_values: &mut [Datum<'a>],
@@ -29051,9 +29223,7 @@ fn execute_trigger_step<'a>(
             context,
             definition,
             invocation,
-            old,
-            new,
-            before,
+            records,
             transition_relations,
             locals,
             local_values,
@@ -29093,9 +29263,7 @@ fn execute_trigger_step_in<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     definition: crate::storage::RelationDefinition<'_>,
     invocation: TriggerInvocation<'a>,
-    old: Option<&[Datum<'a>]>,
-    new: &mut Option<&mut [Datum<'a>]>,
-    before: bool,
+    records: &mut TriggerRows<'_, 'a>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     locals: &[TriggerLocalDecl],
     local_values: &mut [Datum<'a>],
@@ -29138,6 +29306,10 @@ fn execute_trigger_step_in<'a>(
                 let returns = statement.returns();
                 finish_resumed_static_write(
                     context,
+                    NewRowTarget {
+                        definition,
+                        records: &mut *records,
+                    },
                     locals,
                     local_values,
                     into,
@@ -29189,8 +29361,7 @@ fn execute_trigger_step_in<'a>(
                     context,
                     NewRowTarget {
                         definition,
-                        new,
-                        before,
+                        records,
                     },
                     locals,
                     local_values,
@@ -29222,11 +29393,7 @@ fn execute_trigger_step_in<'a>(
         None => super::sequence::SavedStatementPosition::capture()?,
     };
     let (statement, input_plan) = {
-        let transition = TriggerTransition {
-            definition,
-            old,
-            new: new.as_deref(),
-        };
+        let transition = records.transition(definition);
         let row = TriggerLocalScope {
             locals,
             values: &local_values[..locals.len()],
@@ -29279,11 +29446,7 @@ fn execute_trigger_step_in<'a>(
                     };
                     let values = match expression {
                         Some(expression) => {
-                            let transition = TriggerTransition {
-                                definition,
-                                old,
-                                new: new.as_deref(),
-                            };
+                            let transition = records.transition(definition);
                             let scope = TriggerLocalScope {
                                 locals,
                                 values: &local_values[..locals.len()],
@@ -29341,11 +29504,7 @@ fn execute_trigger_step_in<'a>(
                 )?,
                 None => query,
             };
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
+            let transition = records.transition(definition);
             let scope = TriggerLocalScope {
                 locals,
                 values: &local_values[..locals.len()],
@@ -29397,11 +29556,7 @@ fn execute_trigger_step_in<'a>(
             Ok(None)
         }),
         TriggerStatement::ReturnDynamicQuery(query) => execute_trigger_statement(|| {
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
+            let transition = records.transition(definition);
             let scope = TriggerLocalScope {
                 locals,
                 values: &local_values[..locals.len()],
@@ -29435,11 +29590,7 @@ fn execute_trigger_step_in<'a>(
                 TriggerReturn::Null => TriggerReturnValue::Null,
                 TriggerReturn::Void => TriggerReturnValue::Void,
                 TriggerReturn::Value(expression) => {
-                    let transition = TriggerTransition {
-                        definition,
-                        old,
-                        new: new.as_deref(),
-                    };
+                    let transition = records.transition(definition);
                     let scope = TriggerLocalScope {
                         locals,
                         values: &local_values[..locals.len()],
@@ -29447,95 +29598,39 @@ fn execute_trigger_step_in<'a>(
                         invocation,
                         transition: &transition,
                     };
-                    TriggerReturnValue::Value(eval_procedural_expression(
-                        context, expression, &scope, None,
-                    )?)
+                    let value = eval_procedural_expression(context, expression, &scope, None)?;
+                    if invocation.program_kind == PlpgsqlProgramKind::Trigger
+                        && !matches!(
+                            value,
+                            Datum::Null | Datum::Record(_) | Datum::Composite { .. }
+                        )
+                    {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "cannot return non-composite value from function returning composite type"
+                        ));
+                    }
+                    TriggerReturnValue::Value(value)
                 }
             };
             Ok(Some(TriggerFlow::Return(result)))
         }),
-        TriggerStatement::Assign(assignment) => execute_trigger_statement(|| {
-            if !before || new.is_none() {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "NEW assignments require a BEFORE INSERT or UPDATE trigger"
-                ));
-            }
-            let Some(column) = definition.column_index(assignment.column.as_str()) else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    assignment.column.as_str()
-                ));
-            };
-            if definition.columns()[column].default.is_generated() {
-                return Err(sql_err!(
-                    sqlstate::GENERATED_ALWAYS,
-                    "cannot assign to generated column \"{}\"",
-                    assignment.column.as_str()
-                ));
-            }
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
-            let scope = TriggerLocalScope {
-                locals,
-                values: &local_values[..locals.len()],
-                found: status.found,
-                invocation,
-                transition: &transition,
-            };
-            let catalog =
-                super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
-            let hooks = EvalHooks {
-                catalog: Some(&catalog),
-                ..NO_HOOKS
-            };
-            let source =
-                super::eval::expression_type_identity(assignment.expression, &scope, &hooks)?
-                    .routine_argument_oid();
-            let cast = prepare_assignment_cast(
-                source,
-                &definition.columns()[column],
-                context.storage(),
-                context.txn.txid,
-                context.arena,
-            )?;
-            let input_collation = super::eval::coercion_input_collation(
-                assignment.expression,
-                &scope,
-                hooks.catalog,
-            )?;
-            let value = eval_procedural_expression(context, assignment.expression, &scope, None)?;
-            let value = coerce_assignment(
-                value,
-                &definition.columns()[column],
-                PlannedAssignmentCast {
-                    input_collation,
-                    defined: cast.as_ref(),
-                    site: None,
-                },
-                context.storage(),
-                context.txn.txid,
-                context.arena,
-                Some(&crate::sql::sequence::SeqEval::new(
-                    context.storage(),
-                    context.seq_session(),
-                    context.txn.txid,
-                )),
-            )?;
-            new.as_deref_mut().expect("checked NEW image")[column] = value;
-
-            Ok(None)
-        }),
         TriggerStatement::LocalAssign(assignment) => execute_trigger_statement(|| {
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
+            if let Some(record) = trigger_record_field_target(locals, definition, assignment.name) {
+                assign_trigger_record_column(
+                    context,
+                    definition,
+                    records,
+                    locals,
+                    local_values,
+                    status.found,
+                    invocation,
+                    record,
+                    assignment,
+                )?;
+                return Ok(None);
+            }
+            let transition = records.transition(definition);
             let scope = TriggerLocalScope {
                 locals,
                 values: &local_values[..locals.len()],
@@ -29606,6 +29701,19 @@ fn execute_trigger_step_in<'a>(
                     Datum::Null => None,
                     _ => unreachable!("boolean cast preserves its datum kind"),
                 };
+            } else if assignment.name.label.is_none()
+                && definition.n_columns > 0
+                && let Some(record) = TriggerRecordName::parse(assignment.name.name.as_str())
+            {
+                let row = trigger_record_row(
+                    definition,
+                    value,
+                    TriggerRowSource::Assignment,
+                    context.storage(),
+                    context.txn.txid,
+                    context.arena,
+                )?;
+                records.record_mut(record).set_row(row);
             } else {
                 assign_trigger_local(context, locals, local_values, assignment.name, value)?;
             }
@@ -29613,10 +29721,10 @@ fn execute_trigger_step_in<'a>(
             Ok(None)
         }),
         TriggerStatement::CursorOpen(statement) => execute_trigger_statement(|| {
-            let changed = [trigger_local_index(
+            let changed = [CursorOutputSlot::Local(trigger_local_index(
                 locals,
                 PlpgsqlVariableName::plain(statement.variable),
-            )?];
+            )?)];
             cursor_statement_effect(
                 context,
                 &invocation,
@@ -29626,8 +29734,9 @@ fn execute_trigger_step_in<'a>(
                 },
                 &changed,
                 local_values,
+                records,
                 status,
-                |context, local_values, status, completed| {
+                |context, local_values, records, status, completed| {
                     let local = trigger_local_index(
                         locals,
                         PlpgsqlVariableName::plain(statement.variable),
@@ -29671,11 +29780,7 @@ fn execute_trigger_step_in<'a>(
                             ));
                         }
                     };
-                    let transition = TriggerTransition {
-                        definition,
-                        old,
-                        new: new.as_deref(),
-                    };
+                    let transition = records.transition(definition);
                     let scope = TriggerLocalScope {
                         locals,
                         values: &local_values[..locals.len()],
@@ -29819,12 +29924,42 @@ fn execute_trigger_step_in<'a>(
             )
         }),
         TriggerStatement::CursorMotion(statement) => execute_trigger_statement(|| {
+            let mut targets = [PlpgsqlIntoTarget::Local(0); MAX_COLUMNS];
+            let mut slots = 0usize;
+            for (index, target) in statement.targets.iter().enumerate() {
+                targets[index] = plpgsql_into_target(locals, definition, *target)?;
+                slots += match targets[index] {
+                    PlpgsqlIntoTarget::TriggerRecord(_) => 1 + definition.n_columns,
+                    _ => 1,
+                };
+            }
+            let targets = &targets[..statement.targets.len()];
+            // A wait replays the stored outputs; a whole trigger record is
+            // stored as its assigned state and each field.
             let changed = context
                 .arena
-                .alloc_slice_with(statement.targets.len(), |_| 0usize)
+                .alloc_slice_with(slots, |_| CursorOutputSlot::Local(0))
                 .map_err(|_| super::query::arena_full_pub())?;
-            for (local, target) in changed.iter_mut().zip(statement.targets) {
-                *local = plpgsql_into_local(locals, definition, *target)?;
+            let mut slot = 0;
+            for target in targets {
+                match *target {
+                    PlpgsqlIntoTarget::Local(index) => {
+                        changed[slot] = CursorOutputSlot::Local(index);
+                        slot += 1;
+                    }
+                    PlpgsqlIntoTarget::TriggerField(record, column) => {
+                        changed[slot] = CursorOutputSlot::Field(record, column);
+                        slot += 1;
+                    }
+                    PlpgsqlIntoTarget::TriggerRecord(record) => {
+                        for column in 0..definition.n_columns {
+                            changed[slot + column] = CursorOutputSlot::Field(record, column);
+                        }
+                        // Replayed after the fields, which assign the record.
+                        changed[slot + definition.n_columns] = CursorOutputSlot::Assigned(record);
+                        slot += 1 + definition.n_columns;
+                    }
+                }
             }
             cursor_statement_effect(
                 context,
@@ -29836,8 +29971,9 @@ fn execute_trigger_step_in<'a>(
                 },
                 changed,
                 local_values,
+                records,
                 status,
-                |context, local_values, status, completed| {
+                |context, local_values, records, status, completed| {
                     let local = trigger_local_index(
                         locals,
                         PlpgsqlVariableName::plain(statement.variable),
@@ -29911,19 +30047,7 @@ fn execute_trigger_step_in<'a>(
                                 "FETCH statement returned more than one row"
                             ));
                         }
-                        let target_local = statement
-                            .targets
-                            .first()
-                            .copied()
-                            .map(|target| trigger_local_index(locals, target))
-                            .transpose()?;
-                        let record_target = statement.targets.len() == 1
-                            && target_local.is_some_and(|target| {
-                                matches!(
-                                    locals[target].ctype,
-                                    ColType::Record | ColType::Composite(_)
-                                )
-                            });
+                        let record_target = targets.len() == 1 && targets[0].takes_row(locals);
                         let mut column_names = [None; MAX_COLUMNS];
                         let mut column_type_oids = [0; MAX_COLUMNS];
                         let column_count = {
@@ -30001,11 +30125,14 @@ fn execute_trigger_step_in<'a>(
                             values[0] = Datum::Record(&*fields);
                         }
                         for (index, target) in statement.targets.iter().copied().enumerate() {
-                            assign_trigger_local(
+                            assign_plpgsql_into_target(
                                 context,
+                                definition,
+                                records,
                                 locals,
                                 local_values,
                                 target,
+                                targets[index],
                                 values[index],
                             )?;
                         }
@@ -30017,15 +30144,16 @@ fn execute_trigger_step_in<'a>(
             )
         }),
         TriggerStatement::CursorClose(variable) => execute_trigger_statement(|| {
-            let changed: &[usize] = &[];
+            let changed: &[CursorOutputSlot] = &[];
             cursor_statement_effect(
                 context,
                 &invocation,
                 CursorReceiptOperation::Close { variable },
                 changed,
                 local_values,
+                records,
                 status,
-                |context, local_values, _status, _completed| {
+                |context, local_values, _records, _status, _completed| {
                     let local = trigger_local_index(locals, PlpgsqlVariableName::plain(variable))?;
                     if locals[local].ctype != ColType::Refcursor {
                         return Err(sql_err!(
@@ -30070,8 +30198,8 @@ fn execute_trigger_step_in<'a>(
                     condition,
                     definition,
                     invocation,
-                    old,
-                    new.as_deref(),
+                    records.old.row(),
+                    records.new.row(),
                     locals,
                     &local_values[..locals.len()],
                     status.found,
@@ -30104,11 +30232,7 @@ fn execute_trigger_step_in<'a>(
                 )?,
                 None => query,
             };
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
+            let transition = records.transition(definition);
             let scope = TriggerLocalScope {
                 locals,
                 values: &local_values[..locals.len()],
@@ -30116,12 +30240,7 @@ fn execute_trigger_step_in<'a>(
                 invocation,
                 transition: &transition,
             };
-            let record_target = statement.targets.len() == 1
-                && matches!(
-                    targets[0],
-                    PlpgsqlIntoTarget::Local(index)
-                        if matches!(locals[index].ctype, ColType::Record | ColType::Composite(_))
-                );
+            let record_target = statement.targets.len() == 1 && targets[0].takes_row(locals);
             let arena = context.arena;
             let mut fields = [("", 0); MAX_PROJ];
             let record_width = if record_target {
@@ -30254,8 +30373,7 @@ fn execute_trigger_step_in<'a>(
                     assign_plpgsql_into_target(
                         context,
                         definition,
-                        new,
-                        before,
+                        records,
                         locals,
                         local_values,
                         statement.targets[index],
@@ -30273,11 +30391,7 @@ fn execute_trigger_step_in<'a>(
             for (index, target) in statement.targets.iter().enumerate() {
                 targets[index] = plpgsql_into_target(locals, definition, *target)?;
             }
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
+            let transition = records.transition(definition);
             let scope = TriggerLocalScope {
                 locals,
                 values: &local_values[..locals.len()],
@@ -30302,12 +30416,7 @@ fn execute_trigger_step_in<'a>(
                 _ => true,
             };
             with_bound_parameter_types(query.parameter_types, || {
-                let record_target = statement.targets.len() == 1
-                    && matches!(
-                        targets[0],
-                        PlpgsqlIntoTarget::Local(index)
-                            if matches!(locals[index].ctype, ColType::Record | ColType::Composite(_))
-                    );
+                let record_target = statement.targets.len() == 1 && targets[0].takes_row(locals);
                 let (record_width, record_names, record_type_oids) = {
                     let mut names = [StackStr::<63>::new(); MAX_PROJ];
                     let mut type_oids = [0i32; MAX_PROJ];
@@ -30634,8 +30743,7 @@ fn execute_trigger_step_in<'a>(
                     context,
                     NewRowTarget {
                         definition,
-                        new,
-                        before,
+                        records,
                     },
                     locals,
                     local_values,
@@ -30650,11 +30758,7 @@ fn execute_trigger_step_in<'a>(
             })
         }),
         TriggerStatement::DynamicQuery(query) => execute_trigger_statement(|| {
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
+            let transition = records.transition(definition);
             let scope = TriggerLocalScope {
                 locals,
                 values: &local_values[..locals.len()],
@@ -30760,11 +30864,7 @@ fn execute_trigger_step_in<'a>(
                     )?,
                     None => query,
                 };
-                let transition = TriggerTransition {
-                    definition,
-                    old,
-                    new: new.as_deref(),
-                };
+                let transition = records.transition(definition);
                 let scope = TriggerLocalScope {
                     locals,
                     values: &local_values[..locals.len()],
@@ -30820,19 +30920,15 @@ fn execute_trigger_step_in<'a>(
                 assertion.condition,
                 definition,
                 invocation,
-                old,
-                new.as_deref(),
+                records.old.row(),
+                records.new.row(),
                 locals,
                 &local_values[..locals.len()],
                 status.found,
             )? {
                 return Ok(None);
             }
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
+            let transition = records.transition(definition);
             let scope = TriggerLocalScope {
                 locals,
                 values: &local_values[..locals.len()],
@@ -30876,11 +30972,7 @@ fn execute_trigger_step_in<'a>(
             Err(error)
         }),
         TriggerStatement::Raise(TriggerRaise::Message(raise)) => execute_trigger_statement(|| {
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
+            let transition = records.transition(definition);
             let scope = TriggerLocalScope {
                 locals,
                 values: &local_values[..locals.len()],
@@ -31059,11 +31151,7 @@ fn execute_trigger_step_in<'a>(
                 },
                 None => statement,
             };
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
+            let transition = records.transition(definition);
             let scope = TriggerLocalScope {
                 locals,
                 values: &local_values[..locals.len()],
@@ -31118,7 +31206,7 @@ fn execute_trigger_step_in<'a>(
             };
             let returns = !statement.returning.is_empty();
             let mut returning =
-                StaticReturning::new(context, locals, into, Stmt::Insert(statement))?;
+                StaticReturning::new(context, locals, definition, into, Stmt::Insert(statement))?;
             let arena = context.arena;
             let params = context.params;
             let boundary = context.nested_write_boundary();
@@ -31189,6 +31277,10 @@ fn execute_trigger_step_in<'a>(
                 let (rows, output) = resume_nested_write(context, status)?;
                 finish_resumed_static_write(
                     context,
+                    NewRowTarget {
+                        definition,
+                        records: &mut *records,
+                    },
                     locals,
                     local_values,
                     into,
@@ -31209,6 +31301,10 @@ fn execute_trigger_step_in<'a>(
                     let selected = returning.values(context.arena)?;
                     finish_static_returning(
                         context,
+                        NewRowTarget {
+                            definition,
+                            records: &mut *records,
+                        },
                         locals,
                         local_values,
                         into,
@@ -31261,11 +31357,7 @@ fn execute_trigger_step_in<'a>(
                 }
                 None => statement,
             };
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
+            let transition = records.transition(definition);
             let scope = TriggerLocalScope {
                 locals,
                 values: &local_values[..locals.len()],
@@ -31275,7 +31367,7 @@ fn execute_trigger_step_in<'a>(
             };
             let returns = !statement.returning.is_empty();
             let mut returning =
-                StaticReturning::new(context, locals, into, Stmt::Update(statement))?;
+                StaticReturning::new(context, locals, definition, into, Stmt::Update(statement))?;
             let arena = context.arena;
             let params = context.params;
             let boundary = context.nested_write_boundary();
@@ -31345,6 +31437,10 @@ fn execute_trigger_step_in<'a>(
                 let (rows, output) = resume_nested_write(context, status)?;
                 finish_resumed_static_write(
                     context,
+                    NewRowTarget {
+                        definition,
+                        records: &mut *records,
+                    },
                     locals,
                     local_values,
                     into,
@@ -31365,6 +31461,10 @@ fn execute_trigger_step_in<'a>(
                     let selected = returning.values(context.arena)?;
                     finish_static_returning(
                         context,
+                        NewRowTarget {
+                            definition,
+                            records: &mut *records,
+                        },
                         locals,
                         local_values,
                         into,
@@ -31417,11 +31517,7 @@ fn execute_trigger_step_in<'a>(
                 }
                 None => statement,
             };
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
+            let transition = records.transition(definition);
             let scope = TriggerLocalScope {
                 locals,
                 values: &local_values[..locals.len()],
@@ -31431,7 +31527,7 @@ fn execute_trigger_step_in<'a>(
             };
             let returns = !statement.returning.is_empty();
             let mut returning =
-                StaticReturning::new(context, locals, into, Stmt::Delete(statement))?;
+                StaticReturning::new(context, locals, definition, into, Stmt::Delete(statement))?;
             let arena = context.arena;
             let params = context.params;
             let boundary = context.nested_write_boundary();
@@ -31500,6 +31596,10 @@ fn execute_trigger_step_in<'a>(
                 let (rows, output) = resume_nested_write(context, status)?;
                 finish_resumed_static_write(
                     context,
+                    NewRowTarget {
+                        definition,
+                        records: &mut *records,
+                    },
                     locals,
                     local_values,
                     into,
@@ -31520,6 +31620,10 @@ fn execute_trigger_step_in<'a>(
                     let selected = returning.values(context.arena)?;
                     finish_static_returning(
                         context,
+                        NewRowTarget {
+                            definition,
+                            records: &mut *records,
+                        },
                         locals,
                         local_values,
                         into,
@@ -31549,11 +31653,7 @@ fn execute_trigger_step_in<'a>(
                 reverse,
             } = program.source
             {
-                let transition = TriggerTransition {
-                    definition,
-                    old,
-                    new: new.as_deref(),
-                };
+                let transition = records.transition(definition);
                 // Range expressions bind outside the loop's implicit integer declaration.
                 let scope = TriggerLocalScope {
                     locals,
@@ -31626,11 +31726,7 @@ fn execute_trigger_step_in<'a>(
                                     )?,
                                     None => query,
                                 };
-                                let transition = TriggerTransition {
-                                    definition,
-                                    old,
-                                    new: new.as_deref(),
-                                };
+                                let transition = records.transition(definition);
                                 let scope = TriggerLocalScope {
                                     locals,
                                     values: &local_values[..locals.len()],
@@ -31663,11 +31759,7 @@ fn execute_trigger_step_in<'a>(
                                 values
                             }
                             TriggerForSource::DynamicQuery(query) => {
-                                let transition = TriggerTransition {
-                                    definition,
-                                    old,
-                                    new: new.as_deref(),
-                                };
+                                let transition = records.transition(definition);
                                 let scope = TriggerLocalScope {
                                     locals,
                                     values: &local_values[..locals.len()],
@@ -31683,11 +31775,7 @@ fn execute_trigger_step_in<'a>(
                                 )?
                             }
                             TriggerForSource::Array { expression, slice } => {
-                                let transition = TriggerTransition {
-                                    definition,
-                                    old,
-                                    new: new.as_deref(),
-                                };
+                                let transition = records.transition(definition);
                                 let scope = TriggerLocalScope {
                                     locals,
                                     values: &local_values[..locals.len()],
@@ -31802,8 +31890,8 @@ fn execute_trigger_step_in<'a>(
                 program.condition,
                 definition,
                 invocation,
-                old,
-                new.as_deref(),
+                records.old.row(),
+                records.new.row(),
                 locals,
                 &local_values[..locals.len()],
                 status.found,
@@ -31839,11 +31927,7 @@ fn execute_trigger_step_in<'a>(
                                 values: &local_values[..locals.len()],
                                 found: status.found,
                                 invocation,
-                                transition: &TriggerTransition {
-                                    definition,
-                                    old,
-                                    new: new.as_deref(),
-                                },
+                                transition: &records.transition(definition),
                             },
                             None,
                         )?,
@@ -31858,11 +31942,7 @@ fn execute_trigger_step_in<'a>(
             Ok(control_flow::Step::complete())
         }
         TriggerStatement::Case(program) => {
-            let transition = TriggerTransition {
-                definition,
-                old,
-                new: new.as_deref(),
-            };
+            let transition = records.transition(definition);
             let scope = TriggerLocalScope {
                 locals,
                 values: &local_values[..locals.len()],
@@ -32010,16 +32090,22 @@ enum CursorReceiptOperation {
     },
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a cursor effect replays into the variables and the trigger's records"
+)]
 fn cursor_statement_effect<'s, 'a, 'b>(
     context: &mut TriggerExecContext<'s, 'a, 'b>,
     invocation: &TriggerInvocation<'a>,
     operation: CursorReceiptOperation,
-    changed: &[usize],
+    changed: &[CursorOutputSlot],
     local_values: &mut [Datum<'a>],
+    records: &mut TriggerRows<'_, 'a>,
     status: &mut TriggerExecutionStatus<'a>,
     execute: impl FnOnce(
         &mut TriggerExecContext<'s, 'a, 'b>,
         &mut [Datum<'a>],
+        &mut TriggerRows<'_, 'a>,
         &mut TriggerExecutionStatus<'a>,
         &mut bool,
     ) -> Result<(), SqlError>,
@@ -32099,7 +32185,7 @@ fn cursor_statement_effect<'s, 'a, 'b>(
                 }
             };
             let mut completed = false;
-            let result = execute(context, local_values, status, &mut completed);
+            let result = execute(context, local_values, records, status, &mut completed);
             let changed_settings = match (&context.host, settings) {
                 (PlpgsqlExecHost::Routine { guc, .. }, Some(settings)) => {
                     !guc.matches_statement_settings(&settings)
@@ -32152,16 +32238,9 @@ fn cursor_statement_effect<'s, 'a, 'b>(
                 }
                 output[4] = status.found.map_or(Datum::Null, Datum::Bool);
                 output[5] = Datum::Int8(status.row_count);
-                for (at, local) in changed.iter().copied().enumerate() {
-                    output[6 + at * 2] = Datum::Int4(
-                        i32::try_from(local).map_err(|_| super::query::arena_full_pub())?,
-                    );
-                    output[7 + at * 2] = *local_values.get(local).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "cursor output local is unavailable"
-                        )
-                    })?;
+                for (at, slot) in changed.iter().copied().enumerate() {
+                    output[6 + at * 2] = Datum::Int4(slot.code()?);
+                    output[7 + at * 2] = slot.read(local_values, records)?;
                 }
                 Ok(&*output)
             })();
@@ -32194,18 +32273,87 @@ fn cursor_statement_effect<'s, 'a, 'b>(
         ));
     };
     status.row_count = row_count;
-    for (at, local) in changed.iter().copied().enumerate() {
-        if !matches!(result[6 + at * 2], Datum::Int4(index) if usize::try_from(index).ok() == Some(local))
-        {
+    for (at, slot) in changed.iter().copied().enumerate() {
+        if !matches!(result[6 + at * 2], Datum::Int4(code) if code == slot.code()?) {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "cursor output target changed while waiting"
             ));
         }
-        local_values[local] = result[7 + at * 2];
+        slot.write(local_values, records, result[7 + at * 2])?;
     }
     cursor_effect_result(result)?;
     Ok(None)
+}
+
+/// A value a cursor statement stores, which its effect receipt replays.
+#[derive(Clone, Copy)]
+enum CursorOutputSlot {
+    Local(usize),
+    /// A field of a trigger's `OLD` or `NEW` record.
+    Field(TriggerRecordName, usize),
+    /// Whether a trigger record holds a row after a whole-record `INTO`;
+    /// it follows the record's fields, whose replay assigns the record.
+    Assigned(TriggerRecordName),
+}
+
+impl CursorOutputSlot {
+    /// A local keeps its index; trigger record slots use negative codes.
+    fn code(self) -> Result<i32, SqlError> {
+        let record = |name: TriggerRecordName| match name {
+            TriggerRecordName::Old => 0,
+            TriggerRecordName::New => 1,
+        };
+        let code = match self {
+            Self::Local(index) => i64::try_from(index).unwrap_or(i64::MAX),
+            Self::Assigned(name) => -1 - record(name),
+            Self::Field(name, column) => {
+                -3 - record(name) - 2 * i64::try_from(column).unwrap_or(i64::MAX / 4)
+            }
+        };
+        i32::try_from(code).map_err(|_| super::query::arena_full_pub())
+    }
+
+    fn read<'a>(
+        self,
+        local_values: &[Datum<'a>],
+        records: &mut TriggerRows<'_, 'a>,
+    ) -> Result<Datum<'a>, SqlError> {
+        match self {
+            Self::Local(index) => local_values.get(index).copied().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "cursor output local is unavailable"
+                )
+            }),
+            Self::Assigned(name) => Ok(Datum::Bool(records.record_mut(name).row().is_some())),
+            Self::Field(name, column) => Ok(records
+                .record_mut(name)
+                .row()
+                .map_or(Datum::Null, |row| row[column])),
+        }
+    }
+
+    fn write<'a>(
+        self,
+        local_values: &mut [Datum<'a>],
+        records: &mut TriggerRows<'_, 'a>,
+        value: Datum<'a>,
+    ) -> Result<(), SqlError> {
+        match (self, value) {
+            (Self::Local(index), value) => local_values[index] = value,
+            (Self::Assigned(_), Datum::Bool(true)) => {}
+            (Self::Assigned(name), Datum::Bool(false)) => records.record_mut(name).set_row(None),
+            (Self::Field(name, column), value) => records.record_mut(name).set_field(column, value),
+            (Self::Assigned(_), _) => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "cursor replay has an invalid record state"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[inline(never)]
@@ -32343,8 +32491,7 @@ fn finish_dynamic_into<'a>(
             assign_plpgsql_into_target(
                 context,
                 new_row.definition,
-                new_row.new,
-                new_row.before,
+                new_row.records,
                 locals,
                 local_values,
                 target,
@@ -32356,11 +32503,10 @@ fn finish_dynamic_into<'a>(
     })
 }
 
-/// A trigger's `NEW` row as an `INTO` target can reach it.
+/// A trigger's `OLD` and `NEW` records as `INTO` targets can reach them.
 struct NewRowTarget<'r, 'n, 'm, 'a> {
     definition: crate::storage::RelationDefinition<'r>,
-    new: &'n mut Option<&'m mut [Datum<'a>]>,
-    before: bool,
+    records: &'n mut TriggerRows<'m, 'a>,
 }
 
 /// The RETURNING rows of a static PL/pgSQL data change: the first row,
@@ -32377,6 +32523,7 @@ impl<'a> StaticReturning<'a> {
     fn new(
         context: &TriggerExecContext<'_, 'a, '_>,
         locals: &[TriggerLocalDecl],
+        definition: crate::storage::RelationDefinition<'_>,
         into: Option<PlpgsqlInto<'a>>,
         statement: Stmt<'a>,
     ) -> Result<Self, SqlError> {
@@ -32384,10 +32531,7 @@ impl<'a> StaticReturning<'a> {
         if let Some(PlpgsqlInto {
             targets: [target], ..
         }) = into
-            && matches!(
-                locals[trigger_local_index(locals, *target)?].ctype,
-                ColType::Record | ColType::Composite(_)
-            )
+            && plpgsql_into_target(locals, definition, *target)?.takes_row(locals)
         {
             let arena = context.arena;
             let statement = arena
@@ -32478,6 +32622,7 @@ impl<'a> StaticReturning<'a> {
 )]
 fn finish_static_returning<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
+    targets: NewRowTarget<'_, '_, '_, 'a>,
     locals: &[TriggerLocalDecl],
     local_values: &mut [Datum<'a>],
     into: Option<PlpgsqlInto<'a>>,
@@ -32490,12 +32635,26 @@ fn finish_static_returning<'a>(
     // Checking the result and storing it happen after the query, outside
     // its context.
     crate::sql::error_context::outside_query(|| {
-        store_static_returning(context, locals, local_values, into, returns, selected, rows)
+        store_static_returning(
+            context,
+            targets,
+            locals,
+            local_values,
+            into,
+            returns,
+            selected,
+            rows,
+        )
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "INTO assignment needs the statement's variables and trigger records"
+)]
 fn store_static_returning<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
+    targets: NewRowTarget<'_, '_, '_, 'a>,
     locals: &[TriggerLocalDecl],
     local_values: &mut [Datum<'a>],
     into: Option<PlpgsqlInto<'a>>,
@@ -32529,7 +32688,17 @@ fn store_static_returning<'a>(
         _ => return Err(too_many_rows_returned(parameters, context.arena)),
     }
     for (target, value) in into.targets.iter().copied().zip(selected.iter().copied()) {
-        assign_trigger_local(context, locals, local_values, target, value)?;
+        let resolved = plpgsql_into_target(locals, targets.definition, target)?;
+        assign_plpgsql_into_target(
+            context,
+            targets.definition,
+            targets.records,
+            locals,
+            local_values,
+            target,
+            resolved,
+            value,
+        )?;
     }
     Ok(())
 }
@@ -32542,6 +32711,7 @@ fn store_static_returning<'a>(
 )]
 fn finish_resumed_static_write<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
+    targets: NewRowTarget<'_, '_, '_, 'a>,
     locals: &[TriggerLocalDecl],
     local_values: &mut [Datum<'a>],
     into: Option<PlpgsqlInto<'a>>,
@@ -32566,6 +32736,7 @@ fn finish_resumed_static_write<'a>(
     };
     finish_static_returning(
         context,
+        targets,
         locals,
         local_values,
         into,
@@ -43491,7 +43662,9 @@ fn alter_action_support(action: &AlterAction<'_>) -> (&'static str, bool, bool, 
             false,
             false,
         ),
-        AlterAction::SetStorageOptions(_) => ("SET", true, true, false),
+        AlterAction::SetStorageOptions(_) | AlterAction::SetViewOptions { .. } => {
+            ("SET", true, true, false)
+        }
         AlterAction::ResetStorageOptions(_) => ("RESET", true, true, false),
         AlterAction::SetInheritance { inherit, .. } => (
             if *inherit { "INHERIT" } else { "NO INHERIT" },
@@ -43515,6 +43688,24 @@ fn alter_action_support(action: &AlterAction<'_>) -> (&'static str, bool, bool, 
         AlterAction::SetReplicaIdentity(_) => ("REPLICA IDENTITY", false, true, false),
         AlterAction::AttachPartition { .. } => ("ATTACH PARTITION", false, false, false),
         AlterAction::DetachPartition { .. } => ("DETACH PARTITION", false, false, false),
+    }
+}
+
+fn unrecognized_relation_parameter(name: &str) -> SqlError {
+    sql_err!(
+        sqlstate::INVALID_PARAMETER_VALUE,
+        "unrecognized parameter \"{}\"",
+        name
+    )
+}
+
+/// The first view option of a `SET (...)` list, which a table or
+/// materialized view does not have.
+fn first_view_option_name(options: &[crate::sql::ast::ViewOption]) -> &'static str {
+    match options.first() {
+        Some(crate::sql::ast::ViewOption::SecurityInvoker(_)) => "security_invoker",
+        Some(crate::sql::ast::ViewOption::SecurityBarrier(_)) => "security_barrier",
+        Some(crate::sql::ast::ViewOption::CheckOption(_)) | None => "check_option",
     }
 }
 
@@ -43578,7 +43769,7 @@ pub(crate) fn alter_view_table_actions(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    use crate::sql::ast::AlterViewAction;
+    use crate::sql::ast::{AlterViewAction, ViewOptionName};
     let relation_column_missing = |column: &str| {
         sql_err!(
             sqlstate::UNDEFINED_COLUMN,
@@ -43607,18 +43798,33 @@ pub(crate) fn alter_view_table_actions(
                     name.name
                 ));
             }
-            // A view has no storage parameters; resetting one is a no-op.
-            AlterAction::ResetStorageOptions(_) => continue,
-            AlterAction::SetStorageOptions(options) => {
-                return sql_fail(sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "unrecognized parameter \"{}\"",
-                    if options.fillfactor.is_some() {
-                        "fillfactor"
-                    } else {
-                        ""
+            // Resetting a parameter a view lacks changes nothing.
+            AlterAction::ResetStorageOptions(names) => {
+                let mut options = [ViewOptionName::SecurityInvoker; 3];
+                let mut count = 0;
+                for (named, option) in [
+                    (names.security_invoker, ViewOptionName::SecurityInvoker),
+                    (names.security_barrier, ViewOptionName::SecurityBarrier),
+                    (names.check_option, ViewOptionName::CheckOption),
+                ] {
+                    if named {
+                        options[count] = option;
+                        count += 1;
                     }
-                ));
+                }
+                if count == 0 {
+                    continue;
+                }
+                match arena.alloc_slice_copy(&options[..count]) {
+                    Ok(options) => AlterViewAction::ResetOptions(options),
+                    Err(_) => return sql_fail(super::query::arena_full_pub()),
+                }
+            }
+            AlterAction::SetViewOptions { options, storage } if storage.is_empty() => {
+                AlterViewAction::SetOptions(options)
+            }
+            AlterAction::SetStorageOptions(_) | AlterAction::SetViewOptions { .. } => {
+                return sql_fail(unrecognized_relation_parameter("fillfactor"));
             }
             // Identity subcommands reach their columns, which on a view are
             // never NOT NULL and never identities.
@@ -75680,6 +75886,23 @@ pub(crate) fn capture_alter_rewrite_rows<'arena>(
     Ok(source)
 }
 
+/// `ALTER TABLE` subcommands with their own executor, which a list runs
+/// one at a time.
+fn alter_action_runs_alone(action: &AlterAction<'_>) -> bool {
+    matches!(
+        action,
+        AlterAction::SetTriggerEnabled { .. }
+            | AlterAction::SetRuleEnabled { .. }
+            | AlterAction::SetRowLevelSecurity(_)
+            | AlterAction::SetReplicaIdentity(_)
+            | AlterAction::SetInheritance { .. }
+            | AlterAction::SetWithoutOids
+            | AlterAction::SetCluster(_)
+            | AlterAction::ClearCluster
+            | AlterAction::SetTypeMembership(_)
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn alter_table_relation(
     storage: &mut Storage,
@@ -75854,6 +76077,55 @@ fn alter_table_relation(
         return sql_fail(error);
     }
 
+    // A list can combine column and constraint subcommands with ones each
+    // run alone. Every subcommand of the last kind belongs to PostgreSQL's
+    // final pass, so the others run first, then each in written order.
+    if statement.actions.len() > 1 && statement.actions.iter().any(alter_action_runs_alone) {
+        drop(definitions);
+        let mut groups = ArenaList::new(arena);
+        for action in statement.actions {
+            if !alter_action_runs_alone(action) && groups.push(*action).is_err() {
+                return sql_fail(super::query::arena_full_pub());
+            }
+        }
+        let grouped = groups.as_slice();
+        let alone = statement
+            .actions
+            .iter()
+            .filter(|action| alter_action_runs_alone(action));
+        let sequence = (!grouped.is_empty())
+            .then_some(grouped)
+            .into_iter()
+            .chain(alone.map(core::slice::from_ref));
+        for actions in sequence {
+            let outcome = alter_table_relation(
+                storage,
+                wal,
+                txn,
+                scratch,
+                &AlterTable {
+                    actions,
+                    ..*statement
+                },
+                arena,
+                seq_session,
+                responder,
+                false,
+                expected_kind,
+                tag,
+                inheritance_scope,
+            );
+            match outcome {
+                Ok(Ok(())) => {}
+                other => return other,
+            }
+        }
+        if emit_completion {
+            responder.command_complete(tag)?;
+        }
+        return sql_ok();
+    }
+
     let identity_mode_restriction = if def.partition.attachment.is_some() {
         Some("cannot change identity column of a partition")
     } else if statement.only && def.partition.is_partitioned() {
@@ -75866,22 +76138,22 @@ fn alter_table_relation(
     // an ordinary ALTER TABLE mutate that list would leave `reloftype` pointing
     // at a different row shape.
     if def.type_membership.composite_slot().is_some()
-        && statement.actions.iter().any(|action| {
-            matches!(
-                action,
-                AlterAction::AddColumn { .. }
-                    | AlterAction::DropColumn { .. }
-                    | AlterAction::RenameColumn { .. }
-                    | AlterAction::AlterColumnType { .. }
-                    | AlterAction::SetNotNull { .. }
-                    | AlterAction::DropNotNull { .. }
-            )
+        && let Some((message, column)) = statement.actions.iter().find_map(|action| match action {
+            AlterAction::AddColumn { .. } => Some(("cannot add column to typed table", None)),
+            AlterAction::DropColumn { .. } => Some(("cannot drop column from typed table", None)),
+            AlterAction::RenameColumn { .. } => Some(("cannot rename column of typed table", None)),
+            // PostgreSQL positions this one at the column.
+            AlterAction::AlterColumnType { column, .. } => {
+                Some(("cannot alter column type of typed table", Some(*column)))
+            }
+            _ => None,
         })
     {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "typed-table attributes must be altered through their composite type"
-        ));
+        let error = sql_err!(sqlstate::WRONG_OBJECT_TYPE, "{}", message);
+        return sql_fail(match column {
+            Some(column) => crate::sql::error_position::at_subject(error, column),
+            None => error,
+        });
     }
 
     let has_ordinary_child = (0..storage.table_count()).any(|candidate| {
@@ -76203,27 +76475,43 @@ fn alter_table_relation(
                 Ok(source) => source,
                 Err(error) => return sql_fail(error),
             };
+            // PostgreSQL's ATExecAddOf compares the columns by position.
             let fields = composite.fields_for(txn.txid);
-            let matches = def.columns().len()
-                == fields.iter().filter(|field| !field.dropped).count()
-                && def
-                    .columns()
-                    .iter()
-                    .zip(fields.iter().filter(|field| !field.dropped))
-                    .all(|(column, field)| {
-                        column.name == field.name
-                            && column.ctype == field.ctype
-                            && column.type_mod == field.type_mod
-                            && column.collation == field.collation
-                            && column.user_type == field.user_type
-                            && column.not_null.is_required() == field.not_null
-                    });
-            if !matches {
+            let mut columns = def.columns().iter();
+            for field in fields.iter().filter(|field| !field.dropped) {
+                let Some(column) = columns.next() else {
+                    return sql_fail(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "table is missing column \"{}\"",
+                        field.name.as_str()
+                    ));
+                };
+                if column.name != field.name {
+                    return sql_fail(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "table has column \"{}\" where type requires \"{}\"",
+                        column.name.as_str(),
+                        field.name.as_str()
+                    ));
+                }
+                if column.ctype != field.ctype
+                    || column.type_mod != field.type_mod
+                    || column.collation != field.collation
+                    || column.user_type != field.user_type
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "table \"{}\" has different type for column \"{}\"",
+                        def.name.as_str(),
+                        field.name.as_str()
+                    ));
+                }
+            }
+            if let Some(column) = columns.next() {
                 return sql_fail(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
-                    "table \"{}\" has a row type that does not match composite type \"{}\"",
-                    def.name.as_str(),
-                    type_name.name
+                    "table has extra column \"{}\"",
+                    column.name.as_str()
                 ));
             }
             crate::storage::TableTypeMembership::Composite(reference)
@@ -76750,6 +77038,11 @@ fn alter_table_relation(
             }
             AlterAction::SetStorageOptions(_) | AlterAction::ResetStorageOptions(_) => {
                 unreachable!("storage options are handled by the metadata-only path")
+            }
+            AlterAction::SetViewOptions { options, .. } => {
+                return sql_fail(unrecognized_relation_parameter(first_view_option_name(
+                    options,
+                )));
             }
             AlterAction::SetInheritance { .. } => {
                 return sql_fail(sql_err!(

@@ -77,6 +77,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         AlterAction::SetForeignOptions(_)
         | AlterAction::SetColumnForeignOptions { .. }
         | AlterAction::SetStorageOptions(_)
+        | AlterAction::SetViewOptions { .. }
         | AlterAction::ResetStorageOptions(_) => 4,
         // Standalone forms; never appear in a multi-action list.
         AlterAction::RenameTable(_)
@@ -6491,14 +6492,7 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Ident("owner") {
             return self.alter_owner(AlterOwnerKind::View, name, if_exists);
         }
-        let action = if self.peeked != Tok::Ident("rename")
-            && self.peeked != Tok::Ident("set")
-            && self.peeked != Tok::Ident("reset")
-        {
-            crate::sql::ast::AlterViewAction::TableActions(
-                self.alter_view_table_actions(name, if_exists)?,
-            )
-        } else if self.eat_ident("rename")? {
+        let action = if self.eat_ident("rename")? {
             if self.eat_ident("to")? {
                 crate::sql::ast::AlterViewAction::RenameTo(self.col_ident("new view name")?)
             } else {
@@ -6508,19 +6502,12 @@ impl<'a> Parser<'a> {
                 let to = self.col_ident("new view column name")?;
                 crate::sql::ast::AlterViewAction::RenameColumn { from, to }
             }
-        } else if self.eat_ident("set")? {
-            if self.eat_ident("schema")? {
-                crate::sql::ast::AlterViewAction::SetSchema(self.col_ident("schema name")?)
-            } else if self.eat_op("(")? {
-                crate::sql::ast::AlterViewAction::SetOptions(self.view_options()?)
-            } else {
-                let action = self.alter_table_set_action()?;
-                crate::sql::ast::AlterViewAction::TableActions(self.arena_slice(&[action])?)
-            }
         } else {
-            self.expect_ident("reset")?;
-            self.expect_op("(")?;
-            crate::sql::ast::AlterViewAction::ResetOptions(self.view_option_names()?)
+            // SET SCHEMA, options and column defaults parse as ALTER TABLE
+            // subcommands, which may form a list.
+            crate::sql::ast::AlterViewAction::TableActions(
+                self.alter_view_table_actions(name, if_exists)?,
+            )
         };
         Ok(Stmt::AlterView {
             name,
@@ -6611,50 +6598,86 @@ impl<'a> Parser<'a> {
     }
 
     fn view_options(&mut self) -> Result<&'a [crate::sql::ast::ViewOption], ParseError> {
-        use crate::sql::ast::{ViewCheckOption, ViewOption};
+        let (storage, options) = self.relation_options()?;
+        if storage.fillfactor.is_some() {
+            return Err(self.unrecognized_parameter("fillfactor"));
+        }
+        Ok(options)
+    }
+
+    fn unrecognized_parameter(&self, option: &str) -> ParseError {
+        ParseError {
+            at: self.peek_at,
+            message: stack_format!(PARSE_MESSAGE_BYTES, "unrecognized parameter \"{}\"", option),
+            sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        }
+    }
+
+    /// A `SET (...)` list of table storage parameters and view options,
+    /// through `)`. Which of them a relation has is checked when the
+    /// statement runs, as PostgreSQL validates them against its kind.
+    fn relation_options(
+        &mut self,
+    ) -> Result<
+        (
+            crate::sql::ast::RelationStorageOptions,
+            &'a [crate::sql::ast::ViewOption],
+        ),
+        ParseError,
+    > {
+        use crate::sql::ast::{RelationStorageOptions, ViewCheckOption, ViewOption};
+        let mut storage = RelationStorageOptions::DEFAULT;
         let mut options = [ViewOption::SecurityInvoker(false); 3];
         let mut count = 0usize;
-        let mut seen = [false; 3];
+        let mut seen = [false; 4];
         loop {
-            if count == options.len() {
-                return Err(self.limit("view options", options.len()));
-            }
-            let option = self.any_ident("view option name")?;
-            let (index, parsed) = if option.eq_ignore_ascii_case("security_invoker") {
-                (
-                    0,
-                    ViewOption::SecurityInvoker(self.subscription_bool_option(option)?),
-                )
+            let option = self.any_ident("relation option name")?;
+            let index = if option.eq_ignore_ascii_case("security_invoker") {
+                options[count] =
+                    ViewOption::SecurityInvoker(self.subscription_bool_option(option)?);
+                0
             } else if option.eq_ignore_ascii_case("security_barrier") {
-                (
-                    1,
-                    ViewOption::SecurityBarrier(self.subscription_bool_option(option)?),
-                )
+                options[count] =
+                    ViewOption::SecurityBarrier(self.subscription_bool_option(option)?);
+                1
             } else if option.eq_ignore_ascii_case("check_option") {
                 self.expect_op("=")?;
-                let value = self.any_ident("check_option value")?;
+                let value = match self.peeked {
+                    Tok::Ident(value) | Tok::Str(value) => value,
+                    _ => return Err(self.syntax_error_here()),
+                };
                 let value = if value.eq_ignore_ascii_case("local") {
                     ViewCheckOption::Local
                 } else if value.eq_ignore_ascii_case("cascaded") {
                     ViewCheckOption::Cascaded
                 } else {
-                    return Err(self.err_here("check_option must be local or cascaded"));
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            PARSE_MESSAGE_BYTES,
+                            "invalid value for enum option \"check_option\": {}",
+                            value
+                        ),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
+                        hint: None,
+                        near: None,
+                        detail: Some("Valid values are \"local\" and \"cascaded\"."),
+                    });
                 };
-                (2, ViewOption::CheckOption(value))
+                self.advance()?;
+                options[count] = ViewOption::CheckOption(value);
+                2
+            } else if option.eq_ignore_ascii_case("fillfactor") {
+                self.expect_op("=")?;
+                storage.fillfactor = Some(self.integer_reloption("fillfactor", 10, 100)? as u8);
+                3
             } else {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(
-                        PARSE_MESSAGE_BYTES,
-                        "unrecognized parameter \"{}\"",
-                        option
-                    ),
-                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                    cursor: None,
-                    hint: None,
-                    near: None,
-                    detail: None,
-                });
+                return Err(self.unrecognized_parameter(option));
             };
             if core::mem::replace(&mut seen[index], true) {
                 return Err(ParseError {
@@ -6671,41 +6694,7 @@ impl<'a> Parser<'a> {
                     detail: None,
                 });
             }
-            options[count] = parsed;
-            count += 1;
-            if !self.eat_op(",")? {
-                break;
-            }
-        }
-        self.expect_op(")")?;
-        self.arena_slice(&options[..count])
-    }
-
-    fn view_option_names(&mut self) -> Result<&'a [crate::sql::ast::ViewOptionName], ParseError> {
-        use crate::sql::ast::ViewOptionName;
-        let mut names = [ViewOptionName::SecurityInvoker; 3];
-        let mut count = 0usize;
-        let mut seen = [false; 3];
-        loop {
-            if count == names.len() {
-                return Err(self.limit("view options", names.len()));
-            }
-            let option = self.any_ident("view option name")?;
-            let (index, parsed) = if option.eq_ignore_ascii_case("security_invoker") {
-                (0, ViewOptionName::SecurityInvoker)
-            } else if option.eq_ignore_ascii_case("security_barrier") {
-                (1, ViewOptionName::SecurityBarrier)
-            } else if option.eq_ignore_ascii_case("check_option") {
-                (2, ViewOptionName::CheckOption)
-            } else {
-                // Resetting a parameter a view does not have changes nothing.
-                if !self.eat_op(",")? {
-                    break;
-                }
-                continue;
-            };
-            if !core::mem::replace(&mut seen[index], true) {
-                names[count] = parsed;
+            if index < 3 {
                 count += 1;
             }
             if !self.eat_op(",")? {
@@ -6713,7 +6702,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(")")?;
-        self.arena_slice(&names[..count])
+        Ok((storage, self.arena_slice(&options[..count])?))
     }
 
     /// One `ALTER TABLE ... SET` subcommand, after `SET`.
@@ -6734,9 +6723,10 @@ impl<'a> Parser<'a> {
                 AlterAction::SetWithoutOids
             }
         } else if self.eat_op("(")? {
-            let options = self.relation_storage_options()?;
-            self.expect_op(")")?;
-            AlterAction::SetStorageOptions(options)
+            match self.relation_options()? {
+                (storage, []) => AlterAction::SetStorageOptions(storage),
+                (storage, options) => AlterAction::SetViewOptions { options, storage },
+            }
         } else {
             self.expect_ident("access")?;
             self.expect_ident("method")?;
@@ -6786,11 +6776,38 @@ impl<'a> Parser<'a> {
         if_exists: bool,
         only: bool,
     ) -> Result<Stmt<'a>, ParseError> {
-        // RENAME … and SET SCHEMA are standalone forms: PostgreSQL does not
-        // combine them with a comma-separated subcommand list, so they parse to
-        // a single-element list on their own.
+        // RENAME …, SET SCHEMA and partition attachment are standalone forms:
+        // PostgreSQL does not combine them with a comma-separated subcommand
+        // list, so they parse to a single-element list on their own.
+        let mut buffer = ArenaList::new(self.arena);
         if self.eat_ident("set")? {
+            if self.eat_ident("schema")? {
+                let action = AlterAction::SetSchema(self.col_ident("schema name")?);
+                return Ok(Self::alter_table_statement(
+                    foreign,
+                    AlterTable {
+                        table,
+                        if_exists,
+                        only,
+                        actions: self.arena_slice(&[action])?,
+                    },
+                ));
+            }
             let action = self.alter_table_set_action()?;
+            self.push(&mut buffer, action)?;
+            if !self.eat_op(",")? {
+                return Ok(Self::alter_table_statement(
+                    foreign,
+                    AlterTable {
+                        table,
+                        if_exists,
+                        only,
+                        actions: buffer.as_slice(),
+                    },
+                ));
+            }
+        } else if matches!(self.peeked, Tok::Ident("attach" | "detach")) {
+            let action = self.alter_table_cmd(foreign, table.name)?;
             return Ok(Self::alter_table_statement(
                 foreign,
                 AlterTable {
@@ -6798,37 +6815,6 @@ impl<'a> Parser<'a> {
                     if_exists,
                     only,
                     actions: self.arena_slice(&[action])?,
-                },
-            ));
-        }
-        if self.eat_ident("cluster")? {
-            self.expect_ident("on")?;
-            // PostgreSQL's grammar takes an unqualified name, looked up in the
-            // table's schema.
-            let index = QualName {
-                schema: None,
-                name: self.col_ident("index name")?,
-            };
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[AlterAction::SetCluster(index)])?,
-                },
-            ));
-        }
-        if self.eat_ident("of")? {
-            let type_name = self.qual_name("composite type name")?;
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self
-                        .arena_slice(&[AlterAction::SetTypeMembership(Some(type_name))])?,
                 },
             ));
         }
@@ -6857,153 +6843,11 @@ impl<'a> Parser<'a> {
                 },
             ));
         }
-        if self.eat_ident("force")? {
-            self.expect_ident("row")?;
-            self.expect_ident("level")?;
-            self.expect_ident("security")?;
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                        RowLevelSecurityAlteration::Force,
-                    )])?,
-                },
-            ));
-        }
-        if self.eat_ident("not")? {
-            self.expect_ident("of")?;
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[AlterAction::SetTypeMembership(None)])?,
-                },
-            ));
-        }
-        if self.eat_ident("no")? {
-            let action = if self.eat_ident("inherit")? {
-                AlterAction::SetInheritance {
-                    parent: self.qual_name("parent relation name")?,
-                    inherit: false,
-                }
-            } else {
-                self.expect_ident("force")?;
-                self.expect_ident("row")?;
-                self.expect_ident("level")?;
-                self.expect_ident("security")?;
-                AlterAction::SetRowLevelSecurity(RowLevelSecurityAlteration::NoForce)
-            };
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[action])?,
-                },
-            ));
-        }
-        let trigger_mode = if self.eat_ident("enable")? {
-            if self.eat_ident("row")? {
-                self.expect_ident("level")?;
-                self.expect_ident("security")?;
-                return Ok(Self::alter_table_statement(
-                    foreign,
-                    AlterTable {
-                        table,
-                        if_exists,
-                        only,
-                        actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                            RowLevelSecurityAlteration::Enable,
-                        )])?,
-                    },
-                ));
-            }
-            if self.eat_ident("replica")? {
-                Some(crate::sql::ast::TriggerEnableMode::Replica)
-            } else if self.eat_ident("always")? {
-                Some(crate::sql::ast::TriggerEnableMode::Always)
-            } else {
-                Some(crate::sql::ast::TriggerEnableMode::Origin)
-            }
-        } else if self.eat_ident("disable")? {
-            if self.eat_ident("row")? {
-                self.expect_ident("level")?;
-                self.expect_ident("security")?;
-                return Ok(Self::alter_table_statement(
-                    foreign,
-                    AlterTable {
-                        table,
-                        if_exists,
-                        only,
-                        actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                            RowLevelSecurityAlteration::Disable,
-                        )])?,
-                    },
-                ));
-            }
-            Some(crate::sql::ast::TriggerEnableMode::Disabled)
-        } else {
-            None
-        };
-        if let Some(enabled) = trigger_mode {
-            if self.eat_ident("rule")? {
-                if matches!(self.peeked, Tok::Ident("all" | "user")) {
-                    return Err(self.syntax_error_here());
-                }
-                let action = AlterAction::SetRuleEnabled {
-                    name: self.col_ident("rewrite rule name")?,
-                    enabled,
-                };
-                return Ok(Self::alter_table_statement(
-                    foreign,
-                    AlterTable {
-                        table,
-                        if_exists,
-                        only,
-                        actions: self.arena_slice(&[action])?,
-                    },
-                ));
-            }
-            self.expect_ident("trigger")?;
-            let target = match (enabled, self.peeked) {
-                (
-                    crate::sql::ast::TriggerEnableMode::Origin
-                    | crate::sql::ast::TriggerEnableMode::Disabled,
-                    Tok::Ident("all"),
-                ) => {
-                    self.advance()?;
-                    crate::sql::ast::TriggerEnableTarget::All
-                }
-                (
-                    crate::sql::ast::TriggerEnableMode::Origin
-                    | crate::sql::ast::TriggerEnableMode::Disabled,
-                    Tok::Ident("user"),
-                ) => {
-                    self.advance()?;
-                    crate::sql::ast::TriggerEnableTarget::User
-                }
-                _ => crate::sql::ast::TriggerEnableTarget::Name(self.col_ident("trigger name")?),
-            };
-            let action = AlterAction::SetTriggerEnabled { target, enabled };
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[action])?,
-                },
-            ));
-        }
-        // Otherwise a comma-separated list of ADD / DROP / ALTER subcommands.
-        let mut buffer = ArenaList::new(self.arena);
+        // Otherwise a comma-separated list of subcommands.
         loop {
+            if matches!(self.peeked, Tok::Ident("attach" | "detach" | "rename")) {
+                return Err(self.syntax_error_here());
+            }
             let action = self.alter_table_cmd(foreign, table.name)?;
             self.push(&mut buffer, action)?;
             if !self.eat_op(",")? {
@@ -7310,6 +7154,104 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The relation-level subcommands of an `ALTER TABLE` list: trigger,
+    /// rule and row-security switches, `CLUSTER ON`, `OF`, `NOT OF`, and
+    /// `NO INHERIT`.
+    fn alter_table_relation_cmd(&mut self) -> Result<Option<AlterAction<'a>>, ParseError> {
+        use crate::sql::ast::{TriggerEnableMode, TriggerEnableTarget};
+        if self.eat_ident("cluster")? {
+            self.expect_ident("on")?;
+            // PostgreSQL's grammar takes an unqualified name, looked up in the
+            // table's schema.
+            return Ok(Some(AlterAction::SetCluster(QualName {
+                schema: None,
+                name: self.col_ident("index name")?,
+            })));
+        }
+        if self.eat_ident("of")? {
+            let type_name = self.qual_name("composite type name")?;
+            return Ok(Some(AlterAction::SetTypeMembership(Some(type_name))));
+        }
+        if self.eat_ident("not")? {
+            self.expect_ident("of")?;
+            return Ok(Some(AlterAction::SetTypeMembership(None)));
+        }
+        let row_level_security = |parser: &mut Self| -> Result<(), ParseError> {
+            parser.expect_ident("row")?;
+            parser.expect_ident("level")?;
+            parser.expect_ident("security")
+        };
+        if self.eat_ident("force")? {
+            row_level_security(self)?;
+            return Ok(Some(AlterAction::SetRowLevelSecurity(
+                RowLevelSecurityAlteration::Force,
+            )));
+        }
+        if self.eat_ident("no")? {
+            if self.eat_ident("inherit")? {
+                return Ok(Some(AlterAction::SetInheritance {
+                    parent: self.qual_name("parent relation name")?,
+                    inherit: false,
+                }));
+            }
+            self.expect_ident("force")?;
+            row_level_security(self)?;
+            return Ok(Some(AlterAction::SetRowLevelSecurity(
+                RowLevelSecurityAlteration::NoForce,
+            )));
+        }
+        let enabled = if self.eat_ident("enable")? {
+            if self.peeked == Tok::Ident("row") {
+                row_level_security(self)?;
+                return Ok(Some(AlterAction::SetRowLevelSecurity(
+                    RowLevelSecurityAlteration::Enable,
+                )));
+            }
+            if self.eat_ident("replica")? {
+                TriggerEnableMode::Replica
+            } else if self.eat_ident("always")? {
+                TriggerEnableMode::Always
+            } else {
+                TriggerEnableMode::Origin
+            }
+        } else if self.eat_ident("disable")? {
+            if self.peeked == Tok::Ident("row") {
+                row_level_security(self)?;
+                return Ok(Some(AlterAction::SetRowLevelSecurity(
+                    RowLevelSecurityAlteration::Disable,
+                )));
+            }
+            TriggerEnableMode::Disabled
+        } else {
+            return Ok(None);
+        };
+        if self.eat_ident("rule")? {
+            if matches!(self.peeked, Tok::Ident("all" | "user")) {
+                return Err(self.syntax_error_here());
+            }
+            return Ok(Some(AlterAction::SetRuleEnabled {
+                name: self.col_ident("rewrite rule name")?,
+                enabled,
+            }));
+        }
+        self.expect_ident("trigger")?;
+        let target = match (enabled, self.peeked) {
+            (
+                TriggerEnableMode::Origin | TriggerEnableMode::Disabled,
+                Tok::Ident(word @ ("all" | "user")),
+            ) => {
+                self.advance()?;
+                if word == "all" {
+                    TriggerEnableTarget::All
+                } else {
+                    TriggerEnableTarget::User
+                }
+            }
+            _ => TriggerEnableTarget::Name(self.col_ident("trigger name")?),
+        };
+        Ok(Some(AlterAction::SetTriggerEnabled { target, enabled }))
+    }
+
     /// One ADD / DROP / ALTER subcommand of an ALTER TABLE (the comma-listable
     /// forms; RENAME and SET SCHEMA are handled by the caller).
     fn alter_table_cmd(
@@ -7317,6 +7259,9 @@ impl<'a> Parser<'a> {
         foreign: bool,
         table: &str,
     ) -> Result<AlterAction<'a>, ParseError> {
+        if let Some(action) = self.alter_table_relation_cmd()? {
+            return Ok(action);
+        }
         if self.eat_ident("options")? {
             Ok(AlterAction::SetForeignOptions(
                 self.alter_foreign_options()?,
@@ -7342,12 +7287,6 @@ impl<'a> Parser<'a> {
                 parent: self.qual_name("parent relation name")?,
                 inherit: true,
             })
-        } else if self.eat_ident("no")? {
-            self.expect_ident("inherit")?;
-            Ok(AlterAction::SetInheritance {
-                parent: self.qual_name("parent relation name")?,
-                inherit: false,
-            })
         } else if self.eat_ident("replica")? {
             self.expect_ident("identity")?;
             let target = if self.eat_ident("default")? {
@@ -7363,36 +7302,11 @@ impl<'a> Parser<'a> {
             };
             Ok(AlterAction::SetReplicaIdentity(target))
         } else if self.eat_ident("set")? {
-            if self.eat_ident("logged")? {
-                Ok(AlterAction::SetPersistence(
-                    crate::sql::ast::RelationPersistence::Permanent,
-                ))
-            } else if self.eat_ident("unlogged")? {
-                Ok(AlterAction::SetPersistence(
-                    crate::sql::ast::RelationPersistence::Unlogged,
-                ))
-            } else if self.eat_ident("tablespace")? {
-                Ok(AlterAction::SetTablespace(
-                    self.col_ident("tablespace name")?,
-                ))
-            } else if self.eat_op("(")? {
-                let options = self.relation_storage_options()?;
-                self.expect_op(")")?;
-                Ok(AlterAction::SetStorageOptions(options))
-            } else {
-                self.expect_ident("access")?;
-                self.expect_ident("method")?;
-                if self.eat_ident("default")? {
-                    Ok(AlterAction::ResetAccessMethod)
-                } else {
-                    let method = self.any_ident("table access method")?;
-                    Ok(AlterAction::SetAccessMethod(if method == "heap" {
-                        crate::sql::ast::TableAccessMethod::Heap
-                    } else {
-                        crate::sql::ast::TableAccessMethod::Named(method)
-                    }))
-                }
+            // SET SCHEMA stands alone.
+            if self.peeked == Tok::Ident("schema") {
+                return Err(self.syntax_error_here());
             }
+            self.alter_table_set_action()
         } else if self.eat_ident("reset")? {
             self.expect_op("(")?;
             let names = self.relation_storage_option_names()?;

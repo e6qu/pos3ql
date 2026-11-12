@@ -6188,7 +6188,7 @@ impl<'a> Parser<'a> {
     /// An integer storage parameter value, checked as PostgreSQL's
     /// `parse_one_reloption` checks it: `parse_int` (decimal, octal, hex or a
     /// rounded fraction), then the option's bounds.
-    fn integer_reloption(
+    pub(super) fn integer_reloption(
         &mut self,
         name: &str,
         minimum: i32,
@@ -6285,31 +6285,22 @@ impl<'a> Parser<'a> {
         Ok(options)
     }
 
+    /// `RESET (...)` names. PostgreSQL ignores a name the relation does
+    /// not have.
     pub(super) fn relation_storage_option_names(
         &mut self,
     ) -> Result<RelationStorageOptionNames, ParseError> {
         let mut names = RelationStorageOptionNames::EMPTY;
         loop {
             let option = self.any_ident("table storage parameter")?;
-            let flag = if option.eq_ignore_ascii_case("fillfactor") {
-                &mut names.fillfactor
-            } else {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(
-                        super::PARSE_MESSAGE_BYTES,
-                        "unrecognized parameter \"{}\"",
-                        option
-                    ),
-                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                    cursor: None,
-                    hint: None,
-                    near: None,
-                    detail: None,
-                });
-            };
-            if core::mem::replace(flag, true) {
-                return Err(self.err_here("table storage parameter specified more than once"));
+            if option.eq_ignore_ascii_case("fillfactor") {
+                names.fillfactor = true;
+            } else if option.eq_ignore_ascii_case("security_invoker") {
+                names.security_invoker = true;
+            } else if option.eq_ignore_ascii_case("security_barrier") {
+                names.security_barrier = true;
+            } else if option.eq_ignore_ascii_case("check_option") {
+                names.check_option = true;
             }
             if !self.eat_op(",")? {
                 break;

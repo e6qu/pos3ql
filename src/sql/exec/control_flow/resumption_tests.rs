@@ -128,9 +128,7 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                     &mut context,
                     definition,
                     invocation,
-                    None,
-                    &mut None,
-                    false,
+                    &mut TriggerRows::none(),
                     None,
                     &code,
                 )
@@ -224,9 +222,7 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                     &mut context,
                     definition,
                     invocation,
-                    None,
-                    &mut None,
-                    false,
+                    &mut TriggerRows::none(),
                     None,
                     &code,
                 );
@@ -253,9 +249,7 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                         &mut context,
                         definition,
                         invocation,
-                        None,
-                        &mut None,
-                        false,
+                        &mut TriggerRows::none(),
                         None,
                         &code,
                     )

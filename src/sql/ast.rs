@@ -3881,10 +3881,19 @@ impl RelationStorageOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelationStorageOptionNames {
     pub fillfactor: bool,
+    /// View options; resetting one a relation lacks changes nothing.
+    pub security_invoker: bool,
+    pub security_barrier: bool,
+    pub check_option: bool,
 }
 
 impl RelationStorageOptionNames {
-    pub const EMPTY: Self = Self { fillfactor: false };
+    pub const EMPTY: Self = Self {
+        fillfactor: false,
+        security_invoker: false,
+        security_barrier: false,
+        check_option: false,
+    };
 }
 
 /// Parsed access-method spelling; only an executable variant can reach a
@@ -5464,6 +5473,12 @@ pub enum AlterAction<'a> {
     SetRowLevelSecurity(RowLevelSecurityAlteration),
     SetPersistence(RelationPersistence),
     SetStorageOptions(RelationStorageOptions),
+    /// `SET (...)` naming view options, with any table storage parameters
+    /// written beside them; each relation kind rejects the ones it lacks.
+    SetViewOptions {
+        options: &'a [ViewOption],
+        storage: RelationStorageOptions,
+    },
     ResetStorageOptions(RelationStorageOptionNames),
     SetInheritance {
         parent: QualName<'a>,

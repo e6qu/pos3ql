@@ -189,7 +189,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             columns: &columns,
         };
         let old_note = original.alloc_slice_with(8192, |_| b'x').unwrap();
-        let old = [
+        let mut old = [
             Datum::Int4(10),
             Datum::Text(core::str::from_utf8(old_note).unwrap()),
         ];
@@ -298,10 +298,13 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             FiringBinding {
                 invocation,
                 definition,
-                old: Some(&old),
-                new: Some(&mut new),
+                rows: super::TriggerRows {
+                    old: super::TriggerRecord::new(&mut old, true),
+                    new: super::TriggerRecord::new(&mut new, true),
+                    before: true,
+                },
+                caller_new: true,
                 level: TriggerLevel::Row,
-                before: true,
             },
             CallEnvironment::new(Some(settings), Some(security)),
         )

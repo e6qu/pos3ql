@@ -7623,8 +7623,6 @@ fn scan_source_mode<'a>(
     // item depends on the tables to its left, so any lateral entry also pins the
     // order to FROM order (reordering could bind a dependency after it).
     let any_lateral = scope.lateral[..scope.n].iter().any(|&l| l);
-    // A LATERAL item references the tables to its left, so it cannot be the
-    // right side of a RIGHT/FULL join (PostgreSQL rejects this too).
     // Joins run as one left-deep chain. That equals PostgreSQL's tree for a
     // RIGHT or FULL join only within the first comma-separated FROM item;
     // the parser runs any later such item as a parenthesized join.
@@ -7641,11 +7639,13 @@ fn scan_source_mode<'a>(
             "RIGHT or FULL join after a comma was not grouped"
         ));
     }
-    for j in from.joins {
-        if j.table.lateral && matches!(j.kind, JoinKind::Right | JoinKind::Full) {
+    // The scope materializes the right side of a RIGHT or FULL join once:
+    // a LATERAL item there reads only FROM items outside the join.
+    for (index, j) in from.joins.iter().enumerate() {
+        if scope.lateral[index + 1] && matches!(j.kind, JoinKind::Right | JoinKind::Full) {
             return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "a LATERAL item cannot be on the right side of a RIGHT or FULL join"
+                sqlstate::INTERNAL_ERROR,
+                "the right side of a RIGHT or FULL join was not materialized"
             ));
         }
     }

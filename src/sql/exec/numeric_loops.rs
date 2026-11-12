@@ -221,7 +221,6 @@ pub(super) fn visit_nested_blocks<'a>(
             TriggerStatement::Loop(block) => visit(*block, BlockEdge::Ordinary),
             TriggerStatement::Null
             | TriggerStatement::TransactionControl(_)
-            | TriggerStatement::Assign(_)
             | TriggerStatement::LocalAssign(_)
             | TriggerStatement::SelectInto(_)
             | TriggerStatement::DynamicQuery(_)

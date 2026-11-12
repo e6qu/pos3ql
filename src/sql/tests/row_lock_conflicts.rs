@@ -984,3 +984,41 @@ fn updates_and_deletes_run_correlated_where_subqueries_per_row() {
     );
     sessions.finish();
 }
+
+const PARTITIONED_PARENT: &str = "CREATE TABLE fp (id int, k int, PRIMARY KEY (id, k)) PARTITION BY LIST (k); \
+     CREATE TABLE fp1 PARTITION OF fp FOR VALUES IN (1); \
+     CREATE TABLE fp2 PARTITION OF fp FOR VALUES IN (2); \
+     CREATE TABLE fc (id int, pid int, pk int, FOREIGN KEY (pid, pk) REFERENCES fp)";
+
+#[test]
+fn foreign_key_checks_follow_partitioned_parents_as_postgresql_does() {
+    let mut sessions = sessions(
+        "partitioned-parent",
+        TransactionMode::Mvcc,
+        PARTITIONED_PARENT,
+    );
+    // A waiting check cannot follow a parent moved to another partition.
+    sessions.first("INSERT INTO fp VALUES (1, 1)");
+    sessions.first("BEGIN; UPDATE fp SET k = 2 WHERE id = 1");
+    let insert = "INSERT INTO fc VALUES (1, 1, 1)";
+    let parked = sessions.second_waits(insert);
+    sessions.first("COMMIT");
+    let output = sessions.resume_second(insert, parked);
+    assert_eq!(error_sqlstates(&output), ["40001"]);
+    assert!(String::from_utf8_lossy(&output).contains(MOVED_OUT));
+    // After the move, a new statement finds no parent.
+    let output = sessions.second(insert);
+    assert_eq!(error_sqlstates(&output), ["23503"]);
+    // Repeatable read checks a partitioned parent with a current snapshot.
+    for (change, expected) in [
+        ("INSERT INTO fp VALUES (5, 1)", &[][..]),
+        ("DELETE FROM fp WHERE id = 5", &["23503"][..]),
+    ] {
+        sessions.second("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM fc");
+        sessions.first(change);
+        let output = sessions.second("INSERT INTO fc VALUES (5, 5, 1)");
+        assert_eq!(error_sqlstates(&output), expected, "{change}");
+        sessions.second("ROLLBACK");
+    }
+    sessions.finish();
+}

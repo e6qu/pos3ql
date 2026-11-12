@@ -3232,10 +3232,16 @@ fn parent_has_key(
     use super::row_conflicts::{LockedVersion, concurrent_change, uses_transaction_snapshot};
     let parent_definition = storage.table_def(parent_index, txid).clone();
     // Read committed follows the latest committed parent, as PostgreSQL's
-    // check query takes a new snapshot; the other levels keep theirs.
+    // check query takes a new snapshot. The other levels keep theirs, except
+    // for a partitioned parent: PostgreSQL's `RI_FKey_check` reads it with
+    // a current snapshot (`detectNewRows`), so a parent deleted after the
+    // transaction's snapshot is missing (`23503`) and a newer one counts.
+    let partitioned_parent = parent_definition.partition.is_partitioned();
     let latest = match read {
         ParentRead::Validation(read) => Some(read),
-        ParentRead::Write(isolation) if !uses_transaction_snapshot(isolation) => {
+        ParentRead::Write(isolation)
+            if !uses_transaction_snapshot(isolation) || partitioned_parent =>
+        {
             Some(storage.validation_read())
         }
         ParentRead::Write(_) => None,
@@ -3277,6 +3283,7 @@ fn parent_has_key(
         let mapped = super::remap_columns(&physical, &parent_definition, parent_cols)?;
         let mut visit = |rowid: u64, state: crate::storage::RowRead<'_>| {
             use core::ops::ControlFlow;
+            let moved_out = state.committed.is_none() && state.committed_moved_out;
             let home = match latest {
                 Some(read) => read.visible_row_home(storage, row_table, rowid, state, txid)?,
                 None => storage.visible_row_home_at(
@@ -3289,6 +3296,21 @@ fn parent_has_key(
                 )?,
             };
             let Some(home) = home else {
+                // A matching parent the statement saw that another
+                // transaction then moved to a different partition cannot be
+                // followed: PostgreSQL's check query, which locked the row
+                // under an older snapshot, fails with `40001`.
+                if moved_out
+                    && matches!(read, ParentRead::Write(isolation) if !uses_transaction_snapshot(isolation))
+                    && let Some(state) = storage.row_state(row_table, rowid)?
+                    && let Some(selected) =
+                        storage.visible_row_home(row_table, rowid, state, txid)?
+                    && storage.with_row_bytes(row_table, rowid, selected, |bytes| {
+                        key_matches(&physical, &mapped, bytes)
+                    })?
+                {
+                    return Err(super::row_conflicts::moved_out(false));
+                }
                 return Ok(ControlFlow::Continue(()));
             };
             let seen = home.snapshot();

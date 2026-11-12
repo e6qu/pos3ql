@@ -53,7 +53,10 @@ example, if one session deletes customer 7 while another inserts an order for
 customer 7, the order insert waits; when the delete commits the insert fails
 with `23503`, and when it rolls back the insert succeeds. Under `REPEATABLE
 READ` and `SERIALIZABLE`, an insert whose parent was deleted or had its key
-changed after the transaction's snapshot fails with `40001`. Changing other
+changed after the transaction's snapshot fails with `40001`; a partitioned
+parent table is read with a current snapshot instead, as PostgreSQL's check
+does, so a parent inserted after the snapshot counts and one deleted after it
+fails the insert with `23503`. Changing other
 parent columns does not conflict, nor does an assignment that keeps the key
 value, such as `UPDATE customers SET id = id`. `ON DELETE`/`ON UPDATE` actions lock the
 referencing rows they check or rewrite. Each locked row takes one entry of the
@@ -81,9 +84,10 @@ concurrent update` under `READ COMMITTED`, and `could not serialize access due
 to concurrent update` under `REPEATABLE READ` and `SERIALIZABLE`. For example,
 `UPDATE orders SET note = 'x' WHERE id = 7` fails when another session's
 `UPDATE orders SET region = 'eu' WHERE id = 7` moved the order to another
-partition first; retry the statement to update it in its new partition. The
-move is recorded in the journal, so a prepared transaction's move still fails
-waiting statements after a restart.
+partition first; retry the statement to update it in its new partition. A foreign
+key check that waited for its parent row fails the same way under `READ
+COMMITTED`. The move is recorded in the journal, so a prepared transaction's
+move still fails waiting statements after a restart.
 
 Under `READ COMMITTED`, `SELECT ... FOR UPDATE` returns the locked row's latest
 version: the join conditions, `WHERE` and output list run again over it, while

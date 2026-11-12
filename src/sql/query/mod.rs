@@ -840,7 +840,9 @@ use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
     prepare_outer_subqueries, subquery_witness,
 };
-pub(crate) use subquery::{expression_has_correlated_subquery, subquery_hooks_outer};
+pub(crate) use subquery::{
+    expression_has_correlated_subquery, subquery_hooks_outer, uncorrelated_subquery_hooks,
+};
 pub use subquery::{prepare_subqueries, subquery_hooks};
 pub(crate) use subquery::{type_witness, walk_children};
 
@@ -14479,7 +14481,8 @@ pub fn first_from_match<'a, 'r>(
         .map_err(|_| arena_full())?;
     subquery_expressions[0] = where_clause;
     collect_table_sample_expressions(from, &mut subquery_expressions[1..]);
-    let subs = subquery_hooks(
+    // A subquery reading the target or a FROM row runs for each joined row.
+    let subs = uncorrelated_subquery_hooks(
         subquery_expressions,
         storage,
         txid,
@@ -14487,6 +14490,7 @@ pub fn first_from_match<'a, 'r>(
         params,
         sequences,
     )?;
+    let correlated_subqueries = ProceduralSubqueries { storage, txid };
     let catalog = StorageCatalog {
         storage,
         routine_workspace: arena,
@@ -14498,7 +14502,7 @@ pub fn first_from_match<'a, 'r>(
         group: None,
         aggs: None,
         subs: Some(&subs),
-        subquery_executor: None,
+        subquery_executor: Some(&correlated_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,

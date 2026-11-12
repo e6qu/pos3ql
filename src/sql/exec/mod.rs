@@ -71221,6 +71221,11 @@ pub(crate) fn update<'a>(
         subquery_expressions[subquery_expression_count] = Some(expression);
         subquery_expression_count += 1;
     }
+    // A correlated WHERE subquery runs for each target row.
+    let correlated_subqueries = super::query::ProceduralSubqueries {
+        storage,
+        txid: txn.txid,
+    };
     let mut assignment_correlated = [false; MAX_COLUMNS];
     for (index, (_, expression)) in statement.assignments.iter().enumerate() {
         assignment_correlated[index] = match super::query::expression_has_correlated_subquery(
@@ -71234,7 +71239,7 @@ pub(crate) fn update<'a>(
             subquery_expression_count += 1;
         }
     }
-    let subs = match super::query::subquery_hooks(
+    let subs = match super::query::uncorrelated_subquery_hooks(
         &subquery_expressions[..subquery_expression_count],
         storage,
         txn.txid,
@@ -71255,7 +71260,7 @@ pub(crate) fn update<'a>(
         group: None,
         aggs: None,
         subs: Some(&subs),
-        subquery_executor: None,
+        subquery_executor: Some(&correlated_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -72437,7 +72442,12 @@ pub(crate) fn delete<'a>(
         return sql_fail(error);
     }
 
-    let subs = match super::query::subquery_hooks(
+    // A correlated WHERE subquery runs for each target row.
+    let correlated_subqueries = super::query::ProceduralSubqueries {
+        storage,
+        txid: txn.txid,
+    };
+    let subs = match super::query::uncorrelated_subquery_hooks(
         &[statement.where_clause],
         storage,
         txn.txid,
@@ -72458,7 +72468,7 @@ pub(crate) fn delete<'a>(
         group: None,
         aggs: None,
         subs: Some(&subs),
-        subquery_executor: None,
+        subquery_executor: Some(&correlated_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,

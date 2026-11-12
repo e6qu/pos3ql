@@ -3029,12 +3029,13 @@ pub(crate) fn open_trigger_cursor(
             "cursor opening has no active SQL source lifetime"
         )
     })?;
+    let site = cursor::CursorOpenSite {
+        owner: type_input_plans::owner()?,
+        source,
+        position,
+    };
     let attempt = cursors.open_at(
-        cursor::CursorOpenSite {
-            owner: type_input_plans::owner()?,
-            source,
-            position,
-        },
+        site,
         name,
         sql,
         scroll,
@@ -10517,14 +10518,29 @@ impl Engine {
             Ok(types) => types,
             Err(_) => return Ok(Err(eval::arena_full())),
         };
+        // A declared domain keeps its identity; its value runs as the base type.
+        let declared_oids = match arena.alloc_slice_with(param_types.len(), |_| 0) {
+            Ok(oids) => oids,
+            Err(_) => return Ok(Err(eval::arena_full())),
+        };
         for (index, type_name) in param_types.iter().enumerate() {
-            let Some(ctype) = ColType::from_sql_name(type_name) else {
+            let resolved = match ColType::from_sql_name(type_name) {
+                Some(ctype) => Some((ctype, ctype.oid())),
+                None => catalog::user_type_oid(&self.storage, txn.txid, type_name).and_then(
+                    |type_oid| {
+                        exec::catalog_column_type(&self.storage, txn.txid, type_oid)
+                            .map(|(ctype, _)| (ctype, type_oid))
+                    },
+                ),
+            };
+            let Some((ctype, type_oid)) = resolved else {
                 return Ok(Err(SqlError {
                     sqlstate: SqlState::known(sqlstate::UNDEFINED_OBJECT),
                     message: stack_format!(192, "type \"{}\" does not exist", type_name),
                 }));
             };
             types[index] = ctype;
+            declared_oids[index] = type_oid;
         }
         let inherited = match type_inputs::bindings_for_active_source(sql, arena) {
             Ok(bindings) => bindings.unwrap_or(&[]),
@@ -10688,9 +10704,10 @@ impl Engine {
             )));
         }
         let parameter_oids = match arena.alloc_slice_with(parameter_count, |index| {
-            types
+            declared_oids
                 .get(index)
-                .map_or(types::oid::UNKNOWN, |ctype| ctype.oid())
+                .copied()
+                .unwrap_or(types::oid::UNKNOWN)
         }) {
             Ok(oids) => oids,
             Err(_) => return Ok(Err(eval::arena_full())),
@@ -10699,44 +10716,17 @@ impl Engine {
             type_inputs::Source::RootCommand { statement: 0 },
             sql,
             bindings,
-            || -> Result<&[ColType], SqlError> {
-                param_types::infer(&self.storage, statement, txn.txid, arena, parameter_oids);
-                for (target, declared) in parameter_oids.iter_mut().zip(types.iter()) {
-                    *target = declared.oid();
-                }
-                param_types::finish_unresolved(sql, arena, parameter_oids)?;
-                let all = arena
-                    .alloc_slice_with(parameter_count, |_| ColType::Bool)
-                    .map_err(|_| eval::arena_full())?;
-                for (index, target) in all.iter_mut().enumerate() {
-                    *target = match types.get(index) {
-                        Some(declared) => *declared,
-                        // A domain parameter is held as its base type; the
-                        // recorded parameter type stays the domain.
-                        None => ColType::from_oid(parameter_oids[index])
-                            .or_else(|| {
-                                eval::CatalogAccess::domain_base_type(
-                                    &query::storage_catalog(&self.storage, arena, txn.txid),
-                                    parameter_oids[index],
-                                )
-                            })
-                            .ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::FEATURE_NOT_SUPPORTED,
-                                    "parameter ${} has unsupported type OID {}",
-                                    index + 1,
-                                    parameter_oids[index]
-                                )
-                            })?,
-                    };
-                }
-                Ok(all)
+            || -> Result<(), SqlError> {
+                let ambiguity =
+                    param_types::infer(&self.storage, statement, txn.txid, arena, parameter_oids);
+                parameter_oids[..declared_oids.len()].copy_from_slice(declared_oids);
+                param_types::finish_unresolved(sql, arena, parameter_oids, ambiguity)?;
+                Ok(())
             },
         );
-        let types = match inferred {
-            Ok(types) => types,
-            Err(error) => return Ok(Err(error)),
-        };
+        if let Err(error) = inferred {
+            return Ok(Err(error));
+        }
         let mut result_columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         // The query's analysis errors are positioned in the PREPARE text.
         let described = exec::with_bound_parameter_types(parameter_oids, || {
@@ -10759,10 +10749,11 @@ impl Engine {
                                 txn.txid,
                                 arena,
                                 &mut result_columns,
-                                crate::sql::exec::DescriptionTarget::Wire,
+                                crate::sql::exec::DescriptionTarget::Sql,
                                 None,
                             )?;
                             query::analyse_select(select, &self.storage, txn.txid, arena, None)?;
+                            query::analyse_fromless_select(select, &self.storage, txn.txid, arena)?;
                             Ok(count)
                         }),
                         Stmt::SetQuery(query) => query::describe_set_query(
@@ -10771,7 +10762,7 @@ impl Engine {
                             query,
                             &mut result_columns,
                             arena,
-                            crate::sql::exec::DescriptionTarget::Wire,
+                            crate::sql::exec::DescriptionTarget::Sql,
                         )
                         .and_then(|count| {
                             query::analyse_set_query(query, &self.storage, txn.txid, arena)?;
@@ -10782,7 +10773,7 @@ impl Engine {
                             arena,
                             txn,
                             &mut result_columns,
-                            crate::sql::exec::DescriptionTarget::Wire,
+                            crate::sql::exec::DescriptionTarget::Sql,
                         ),
                         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
                             let count = self.describe_data_modification_columns(
@@ -10790,7 +10781,7 @@ impl Engine {
                                 arena,
                                 txn,
                                 &mut result_columns,
-                                crate::sql::exec::DescriptionTarget::Wire,
+                                crate::sql::exec::DescriptionTarget::Sql,
                             )?;
                             query::analyse_dml_condition(
                                 statement,
@@ -10812,6 +10803,37 @@ impl Engine {
             Ok(count) => count,
             Err(error) => return Ok(Err(error)),
         };
+        let types = match (|| -> Result<&[ColType], SqlError> {
+            let all = arena
+                .alloc_slice_with(parameter_count, |_| ColType::Bool)
+                .map_err(|_| eval::arena_full())?;
+            for (index, target) in all.iter_mut().enumerate() {
+                *target = match types.get(index) {
+                    Some(declared) => *declared,
+                    // A domain parameter is held as its base type; the
+                    // recorded parameter type stays the domain.
+                    None => ColType::from_oid(parameter_oids[index])
+                        .or_else(|| {
+                            eval::CatalogAccess::domain_base_type(
+                                &query::storage_catalog(&self.storage, arena, txn.txid),
+                                parameter_oids[index],
+                            )
+                        })
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "parameter ${} has unsupported type OID {}",
+                                index + 1,
+                                parameter_oids[index]
+                            )
+                        })?,
+                };
+            }
+            Ok(all)
+        })() {
+            Ok(types) => types,
+            Err(error) => return Ok(Err(error)),
+        };
         let mut result_types = [0i32; MAX_PROJ];
         for (target, column) in result_types.iter_mut().zip(&result_columns[..result_count]) {
             *target = column.type_oid;
@@ -10820,6 +10842,7 @@ impl Engine {
             name,
             sql,
             types,
+            parameter_oids,
             &result_types[..result_count],
             bound_inputs,
         ) {
@@ -14438,9 +14461,10 @@ impl Engine {
             }
         };
         parser.set_type_inputs(type_inputs::decode(bound_inputs, arena)?);
+        let mut ambiguity = param_types::Ambiguity::default();
         if let Ok(Some(statement)) = parser.next_stmt() {
             type_inputs::validate_restored(&parser, &self.storage, txn.txid)?;
-            param_types::infer(&self.storage, &statement, txn.txid, arena, oids);
+            ambiguity = param_types::infer(&self.storage, &statement, txn.txid, arena, oids);
         }
         // A client's explicit (non-zero) parameter type overrides inference.
         for (i, bytes) in client_oid_bytes.as_chunks::<4>().0.iter().enumerate() {
@@ -14449,7 +14473,7 @@ impl Engine {
                 oids[i] = c;
             }
         }
-        param_types::finish_unresolved(text, arena, oids)?;
+        param_types::finish_unresolved(text, arena, oids, ambiguity)?;
         Ok(oids)
     }
 
@@ -15505,17 +15529,42 @@ impl Engine {
                 definition.mode == crate::storage::RewriteMode::Instead
                     && definition.condition.is_none()
             });
-        if outer_returns_rows
-            && suppress_original
-            && !storage
+        if outer_returns_rows {
+            let returning_rules = storage
                 .firing_rules_for(target, event, txn.replication_apply, txn.txid)
-                .any(|(_, rule)| rule.definition_for(txn.txid).returning_action.is_some())
-        {
-            return Ok(Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "cannot perform a RETURNING query on relation \"{}\"",
-                relation.name
-            )));
+                .filter(|(_, rule)| rule.definition_for(txn.txid).returning_action.is_some())
+                .count();
+            if returning_rules > 1 {
+                return Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot have RETURNING lists in multiple rules"
+                )));
+            }
+            let instead = storage
+                .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+                .any(|(_, rule)| {
+                    rule.definition_for(txn.txid).mode == crate::storage::RewriteMode::Instead
+                });
+            if instead && returning_rules == 0 {
+                let command = match event {
+                    crate::storage::RewriteEvent::Insert => "INSERT",
+                    crate::storage::RewriteEvent::Update => "UPDATE",
+                    crate::storage::RewriteEvent::Delete => "DELETE",
+                    crate::storage::RewriteEvent::Select => "SELECT",
+                };
+                return Ok(Err(error_position::with_computed_hint(
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot perform {} RETURNING on relation \"{}\"",
+                        command,
+                        relation.name
+                    ),
+                    format_args!(
+                        "You need an unconditional ON {} DO INSTEAD rule with a RETURNING clause.",
+                        command
+                    ),
+                )));
+            }
         }
         let insert_event = event == crate::storage::RewriteEvent::Insert;
         let mut original_filter: Option<&Expr<'a>> = None;
@@ -15627,6 +15676,8 @@ impl Engine {
         }
 
         let mut last_name: Option<SqlName> = None;
+        // Without the original, PostgreSQL's command tag counts the rows of
+        // the last INSTEAD rule action with the original's command type.
         let mut rewritten_rows = 0u64;
         loop {
             let selected = storage
@@ -15650,7 +15701,8 @@ impl Engine {
             if let Err(error) = txn.enter_rule(rule.oid(), relation.name) {
                 return Ok(Err(error));
             }
-            let action_result = (|| -> Result<Result<u64, SqlError>, WireFull> {
+            let sets_tag = definition.mode == crate::storage::RewriteMode::Instead;
+            let action_result = (|| -> Result<Result<Option<u64>, SqlError>, WireFull> {
                 let user = eval::funcs::system::session_user_owned();
                 let path = storage.compute_path(
                     definition.creation_path.as_str(),
@@ -15701,7 +15753,7 @@ impl Engine {
                     }
                     None => None,
                 };
-                let mut affected = 0u64;
+                let mut tag_rows = None;
                 for (action_index, action_sql) in definition.action_sql().enumerate() {
                     let parsed = match query::parse_stored_rule_statement(
                         &definition,
@@ -15737,60 +15789,87 @@ impl Engine {
                         Ok(action) => action,
                         Err(error) => return Ok(Err(error)),
                     };
-                    let actions = match query::split_rule_insert_defaults(
-                        action,
-                        || rule_insert_target_columns(storage, action, txn.txid, arena),
-                        arena,
-                    ) {
-                        Ok(actions) => actions,
-                        Err(error) => return Ok(Err(error)),
-                    };
                     let use_returning = outer_returns_rows
                         && definition.returning_action == Some(action_index as u8);
-                    if use_returning && actions.len() > 1 {
-                        return Ok(Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "RETURNING from a rule INSERT whose VALUES rows write DEFAULT in different columns is not supported"
-                        )));
-                    }
-                    for action in actions {
-                        let action = match query::attach_rule_source(
-                            action,
-                            transition.source,
-                            condition,
-                            arena,
-                        ) {
-                            Ok(action) => action,
-                            Err(error) => return Ok(Err(error)),
+                    // PostgreSQL drops a rule's RETURNING list when the
+                    // triggering statement has none.
+                    let action = if use_returning {
+                        action
+                    } else {
+                        let stripped = match action {
+                            Stmt::Insert(insert) => Stmt::Insert(ast::Insert {
+                                returning: ast::Returning::NONE,
+                                ..*insert
+                            }),
+                            Stmt::Update(update) => Stmt::Update(ast::Update {
+                                returning: ast::Returning::NONE,
+                                ..*update
+                            }),
+                            Stmt::Delete(delete) => Stmt::Delete(ast::Delete {
+                                returning: ast::Returning::NONE,
+                                ..*delete
+                            }),
+                            other => *other,
                         };
-                        let outcome = Self::execute_rule_action(
-                            storage,
-                            scratch,
-                            arena,
-                            action,
-                            rule_authorization,
-                            txn,
-                            params,
-                            guc,
-                            cursors,
-                            row_buffers,
-                            responder,
-                            if use_returning { capture.take() } else { None },
-                            use_returning,
-                            connection_id,
-                        )?;
-                        if let Err(error) = outcome {
-                            return Ok(Err(error));
+                        match arena.alloc(stripped) {
+                            Ok(action) => &*action,
+                            Err(_) => return Ok(Err(query::arena_full_pub())),
                         }
-                        affected =
-                            affected.saturating_add(responder.take_affected_rows().unwrap_or(0));
+                    };
+                    let action = match query::attach_rule_source(
+                        action,
+                        transition.source,
+                        condition,
+                        || rule_insert_target(storage, action, txn.txid, arena),
+                        arena,
+                    ) {
+                        Ok(action) => action,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    let outcome = Self::execute_rule_action(
+                        storage,
+                        scratch,
+                        arena,
+                        action,
+                        rule_authorization,
+                        txn,
+                        params,
+                        guc,
+                        cursors,
+                        row_buffers,
+                        responder,
+                        if use_returning { capture.take() } else { None },
+                        use_returning,
+                        connection_id,
+                    )?;
+                    if let Err(error) = outcome {
+                        return Ok(Err(error));
+                    }
+                    let rows = responder.take_affected_rows().unwrap_or(0);
+                    fn command(mut statement: &Stmt<'_>) -> u8 {
+                        while let Stmt::With {
+                            statement: body, ..
+                        } = statement
+                        {
+                            statement = body;
+                        }
+                        match statement {
+                            Stmt::Insert(_) => 1,
+                            Stmt::Update(_) => 2,
+                            Stmt::Delete(_) => 3,
+                            _ => 0,
+                        }
+                    }
+                    if sets_tag && command(action) == command(statement) {
+                        tag_rows = Some(rows);
                     }
                 }
-                Ok(Ok(affected))
+                Ok(Ok(tag_rows))
             })();
             txn.leave_rule();
             match action_result? {
-                Ok(affected) => rewritten_rows = rewritten_rows.saturating_add(affected),
+                Ok(Some(rows)) => rewritten_rows = rows,
+                Ok(None) => {}
                 Err(error) => return Ok(Err(error)),
             }
         }
@@ -16276,6 +16355,7 @@ impl Engine {
                                 on_conflict: rewritten.on_conflict,
                                 returning: rewritten.returning,
                                 overriding: rewritten.overriding,
+                                values_defaults: rewritten.values_defaults,
                             }) {
                                 Ok(rewritten) => &*rewritten,
                                 Err(_) => return Ok(Err(query::arena_full_pub())),
@@ -19656,12 +19736,14 @@ impl Engine {
         outer_params: &[Datum<'a>],
         sqlprep: &SqlPreparedPool,
         arena: &'a Arena,
+        txid: u32,
     ) -> Result<&'a [Datum<'a>], SqlError> {
         let declared_codes = sqlprep.get_type_codes(name).ok_or_else(|| SqlError {
             sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
             message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
         })?;
         let declared = prep::decode_types(declared_codes, arena)?;
+        let declared_oids = prep::decode_oids(sqlprep.get_type_oids(name), arena)?;
         if !declared.is_empty() && arguments.len() != declared.len() {
             return Err(SqlError {
                 sqlstate: SqlState::known(sqlstate::PROTOCOL_VIOLATION),
@@ -19680,7 +19762,14 @@ impl Engine {
         for (index, argument) in arguments.iter().enumerate() {
             let value = eval(argument, arena, outer_params, &NoColumns)?;
             values[index] = if index < declared.len() {
-                eval::cast(value, declared[index].internal_name(), arena)?
+                exec::prepared_argument(
+                    &self.storage,
+                    txid,
+                    value,
+                    declared[index],
+                    declared_oids[index],
+                    arena,
+                )?
             } else {
                 value
             };
@@ -20409,11 +20498,12 @@ impl Engine {
                 if options.analyze
                     && let Stmt::ExecutePrepared { name, args } = statement
                 {
-                    prepared_params =
-                        match self.prepared_explain_arguments(name, args, params, sqlprep, arena) {
-                            Ok(values) => values,
-                            Err(error) => return Ok(Err(error)),
-                        };
+                    prepared_params = match self
+                        .prepared_explain_arguments(name, args, params, sqlprep, arena, txn.txid)
+                    {
+                        Ok(values) => values,
+                        Err(error) => return Ok(Err(error)),
+                    };
                 }
                 let actual = if options.analyze {
                     let before = self.storage.block_io_stats();
@@ -22625,6 +22715,10 @@ impl Engine {
                     },
                     None => &[],
                 };
+                let parameter_oids = match prep::decode_oids(sqlprep.get_type_oids(name), arena) {
+                    Ok(oids) => oids,
+                    Err(error) => return Ok(Err(error)),
+                };
                 let n_decl = decl.len();
                 let bound_inputs = match sqlprep
                     .type_inputs(name)
@@ -22682,19 +22776,28 @@ impl Engine {
                         Err(e) => return Ok(Err(e)),
                     };
                     inner_params[i] = if i < n_decl {
-                        match eval::cast(v, decl[i].internal_name(), arena) {
+                        match exec::prepared_argument(
+                            &self.storage,
+                            txn.txid,
+                            v,
+                            decl[i],
+                            parameter_oids[i],
+                            arena,
+                        ) {
                             Ok(v) => v,
-                            Err(e) => return Ok(Err(e)),
+                            Err(e) => {
+                                return Ok(Err(match a {
+                                    Expr::Str(text) if e.sqlstate.as_str().starts_with("22") => {
+                                        error_position::at_subject(e, text)
+                                    }
+                                    _ => e,
+                                }));
+                            }
                         }
                     } else {
                         v
                     };
                 }
-                let parameter_oids =
-                    match arena.alloc_slice_with(decl.len(), |index| decl[index].oid()) {
-                        Ok(oids) => oids,
-                        Err(_) => return Ok(Err(eval::arena_full())),
-                    };
                 let mut inner = match Parser::new(text, arena) {
                     Ok(p) => p,
                     Err(e) => {
@@ -24253,12 +24356,13 @@ impl Engine {
                 "cursor opening has no active SQL source lifetime"
             )
         })?;
+        let site = cursor::CursorOpenSite {
+            owner: type_input_plans::owner()?,
+            source,
+            position,
+        };
         let attempt = cursors.open_at(
-            cursor::CursorOpenSite {
-                owner: type_input_plans::owner()?,
-                source,
-                position,
-            },
+            site,
             name,
             statement,
             scroll,
@@ -25183,6 +25287,16 @@ impl Engine {
                         "DECLARE CURSOR can only be used in transaction blocks"
                     )));
                 }
+                // `pg_cursors` shows a declared cursor's whole client query
+                // string, as PostgreSQL does.
+                let client = error_position::with_client_query(|client| {
+                    client.map(|client| arena.alloc_str(client))
+                });
+                let statement = match client {
+                    Some(Ok(client)) => client,
+                    Some(Err(_)) => return Ok(Err(query::arena_full_pub())),
+                    None => *statement,
+                };
                 if let Err(error) = self.materialize_cursor(
                     name,
                     statement,
@@ -30383,28 +30497,58 @@ pub(crate) fn analyze_dml_cte<'a>(
 }
 
 /// The column names, in order, of the table a rule's INSERT action writes.
-fn rule_insert_target_columns<'a>(
+/// The columns and declared types of a rule `INSERT` action's target table
+/// or view.
+fn rule_insert_target<'a>(
     storage: &Storage,
     action: &Stmt<'a>,
     txid: u32,
     arena: &'a Arena,
-) -> Result<&'a [&'a str], SqlError> {
+) -> Result<query::RuleInsertTarget<'a>, SqlError> {
     let Stmt::Insert(insert) = action else {
-        return Ok(&[]);
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "rule INSERT target requires an INSERT action"
+        ));
     };
-    let Some(crate::storage::ResolvedRelation::Table(slot)) =
-        storage.resolve_relation(insert.table.schema, insert.table.name, txid)
-    else {
-        return Ok(&[]);
+    let view_definition;
+    let table_definition;
+    let columns = match storage.resolve_relation(insert.table.schema, insert.table.name, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => {
+            table_definition = storage.table_def(slot, txid);
+            table_definition.columns()
+        }
+        Some(crate::storage::ResolvedRelation::View(view)) => {
+            view_definition = exec::view_trigger_definition(storage, view, txid, arena)?;
+            view_definition.columns()
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "relation \"{}\" does not exist",
+                insert.table.name
+            ));
+        }
     };
-    let definition = storage.table_def(slot, txid);
     let names = arena
-        .alloc_slice_with(definition.columns().len(), |_| "")
+        .alloc_slice_with(columns.len(), |_| "")
         .map_err(|_| crate::sql::eval::arena_full())?;
-    for (name, column) in names.iter_mut().zip(definition.columns()) {
+    let type_oids = arena
+        .alloc_slice_with(columns.len(), |_| 0)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for ((name, type_oid), column) in names.iter_mut().zip(type_oids.iter_mut()).zip(columns) {
         *name = arena
             .alloc_str(column.name.as_str())
             .map_err(|_| crate::sql::eval::arena_full())?;
+        *type_oid = storage
+            .routine_type_oid(column.ctype, column.user_type, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type of column \"{}\" is unavailable",
+                    column.name.as_str()
+                )
+            })?;
     }
-    Ok(names)
+    Ok(query::RuleInsertTarget { names, type_oids })
 }

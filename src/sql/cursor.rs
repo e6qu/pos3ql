@@ -75,7 +75,6 @@ pub struct CursorPool {
     next_plan_generation: u64,
 }
 
-const CURSOR_STATEMENT_BYTES: usize = 4096;
 pub(crate) const DESCRIPTION_BYTES: usize = 1024;
 
 thread_local! {
@@ -176,7 +175,6 @@ struct CursorSlot {
     plan_generation: Option<core::num::NonZeroU64>,
     open_site: Option<CursorOpenSite>,
     name: SqlName,
-    statement: StackStr<CURSOR_STATEMENT_BYTES>,
     created_at: i64,
     scroll: CursorScroll,
     hold: bool,
@@ -605,7 +603,6 @@ impl CursorPool {
                 plan_generation: None,
                 open_site: None,
                 name: SqlName::parse("").expect("empty fits"),
-                statement: StackStr::new(),
                 created_at: 0,
                 scroll: CursorScroll::Default,
                 hold: false,
@@ -698,14 +695,6 @@ impl CursorPool {
             ));
         };
         let name = SqlName::parse(name)?;
-        let statement = StackStr::<CURSOR_STATEMENT_BYTES>::from_str(statement);
-        if statement.is_truncated() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "cursor statement exceeds {} bytes",
-                CURSOR_STATEMENT_BYTES
-            ));
-        }
         let exhausted = || {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -723,7 +712,6 @@ impl CursorPool {
         slot.plan_generation = Some(generation);
         slot.open_site = None;
         slot.name = name;
-        slot.statement = statement;
         slot.created_at = created_at;
         slot.scroll = scroll;
         slot.hold = hold;
@@ -731,6 +719,10 @@ impl CursorPool {
         slot.tentative = true;
         slot.failed = false;
         slot.query.clear();
+        if let Err(error) = slot.query.set_statement(statement) {
+            slot.plan_generation = None;
+            return Err(error);
+        }
         slot.description.clear();
         slot.reset_rows();
         slot.row_base = 0;
@@ -760,7 +752,7 @@ impl CursorPool {
             !slot.active && slot.plan_generation.is_some() && slot.open_site == Some(site)
         }) {
             if slot.name.as_str() != name
-                || slot.statement.as_str() != statement
+                || slot.query.statement() != statement
                 || slot.scroll != scroll
                 || slot.hold != hold
                 || slot.binary != binary
@@ -1445,7 +1437,7 @@ impl CursorPool {
             }
             emit(CursorInfo {
                 name: slot.name.as_str(),
-                statement: slot.statement.as_str(),
+                statement: slot.query.statement(),
                 holdable: slot.hold,
                 binary: slot.binary,
                 scrollable: slot.scroll == CursorScroll::Scroll,

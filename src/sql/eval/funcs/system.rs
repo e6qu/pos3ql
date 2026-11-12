@@ -2446,57 +2446,10 @@ pub(crate) fn dispatch<'a>(
                 {
                     return Ok(Datum::Text(name));
                 }
-                if crate::storage::NamedTypeKind::from_oid(o).is_some() {
-                    return Ok(Datum::Text("???"));
-                }
-                let Some(coltype) = exec::coltype_of_oid(o) else {
-                    return Ok(Datum::Text("???"));
-                };
-                let (base, array) = match coltype {
-                    ColType::Array(element) => (element.to_coltype(), true),
-                    scalar => (scalar, false),
-                };
-                let name = base.name();
-                // Array typmods describe their elements. Render the base under
-                // that modifier, then attach [] as PostgreSQL does.
-                let mut text = match TypeMod::decode(base, type_mod) {
-                    TypeMod::None => stack_format!(80, "{}", name),
-                    TypeMod::Length(n) | TypeMod::BitLength(n) => {
-                        stack_format!(80, "{}({})", name, n)
-                    }
-                    TypeMod::NumericPS { precision, scale } => {
-                        stack_format!(80, "{}({},{})", name, precision, scale)
-                    }
-                    TypeMod::TemporalPrecision(p) => {
-                        // The precision sits inside the name, before the
-                        // time-zone tail — `timestamp(3) without time zone`. The
-                        // split finds the tail for both spellings, since
-                        // "without" begins "with".
-                        match name.split_once(" with") {
-                            Some((head, tail)) => {
-                                stack_format!(80, "{}({}) with{}", head, p, tail)
-                            }
-                            None => stack_format!(80, "{}({})", name, p),
-                        }
-                    }
-                    TypeMod::IntervalMod { range, precision } => match range.name() {
-                        Some(fields) => match precision {
-                            Some(p) => stack_format!(80, "interval {}({})", fields, p),
-                            None => stack_format!(80, "interval {}", fields),
-                        },
-                        None => match precision {
-                            Some(p) => stack_format!(80, "interval({})", p),
-                            None => stack_format!(80, "interval"),
-                        },
-                    },
-                };
-                if array {
-                    use core::fmt::Write as _;
-                    let _ = text.write_str("[]");
-                }
-                Ok(Datum::Text(
-                    arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
-                ))
+                Ok(Datum::Text(match builtin_type_with_type_mod(o, type_mod) {
+                    Some(text) => arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
+                    None => "???",
+                }))
             }
             "to_regclass" | "to_regproc" | "to_regprocedure" | "to_regoper" | "to_regoperator"
             | "to_regtype" | "to_regnamespace" | "to_regrole" | "to_regcollation"
@@ -2684,4 +2637,74 @@ pub(crate) fn dispatch<'a>(
             _ => unreachable!("dispatch guard admitted an unhandled name"),
         }
     })())
+}
+
+/// `format_type(oid, typmod)` for a built-in type: its SQL spelling with the
+/// modifier; `None` for a named or unknown type.
+pub(crate) fn builtin_type_with_type_mod(
+    oid: i32,
+    type_mod: i32,
+) -> Option<crate::util::StackStr<80>> {
+    if crate::storage::NamedTypeKind::from_oid(oid).is_some() {
+        return None;
+    }
+    let coltype = exec::coltype_of_oid(oid)?;
+    let (base, array) = match coltype {
+        ColType::Array(element) => (element.to_coltype(), true),
+        scalar => (scalar, false),
+    };
+    let name = base.name();
+    // Array typmods describe their elements. Render the base under
+    // that modifier, then attach [] as PostgreSQL does.
+    let mut text = match TypeMod::decode(base, type_mod) {
+        TypeMod::None => stack_format!(80, "{}", name),
+        TypeMod::Length(n) | TypeMod::BitLength(n) => {
+            stack_format!(80, "{}({})", name, n)
+        }
+        TypeMod::NumericPS { precision, scale } => {
+            stack_format!(80, "{}({},{})", name, precision, scale)
+        }
+        TypeMod::TemporalPrecision(p) => {
+            // The precision sits inside the name, before the
+            // time-zone tail — `timestamp(3) without time zone`. The
+            // split finds the tail for both spellings, since
+            // "without" begins "with".
+            match name.split_once(" with") {
+                Some((head, tail)) => {
+                    stack_format!(80, "{}({}) with{}", head, p, tail)
+                }
+                None => stack_format!(80, "{}({})", name, p),
+            }
+        }
+        TypeMod::IntervalMod { range, precision } => match range.name() {
+            Some(fields) => match precision {
+                Some(p) => stack_format!(80, "interval {}({})", fields, p),
+                None => stack_format!(80, "interval {}", fields),
+            },
+            None => match precision {
+                Some(p) => stack_format!(80, "interval({})", p),
+                None => stack_format!(80, "interval"),
+            },
+        },
+    };
+    if array {
+        use core::fmt::Write as _;
+        let _ = text.write_str("[]");
+    }
+    Some(text)
+}
+
+/// PostgreSQL's `format_type_with_typemod` for a diagnostic.
+pub(crate) fn format_type_with_type_mod(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    oid: i32,
+    type_mod: i32,
+) -> Result<crate::util::StackStr<260>, SqlError> {
+    if let Some(text) = builtin_type_with_type_mod(oid, type_mod) {
+        let mut name = crate::util::StackStr::<260>::new();
+        let _ = core::fmt::Write::write_str(&mut name, text.as_str());
+        return Ok(name);
+    }
+    crate::sql::catalog::format_type_name(storage, txid, oid)
 }

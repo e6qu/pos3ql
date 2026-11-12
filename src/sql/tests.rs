@@ -7950,13 +7950,7 @@ fn postgresql_18_refcursor_type_catalog_and_native_plpgsql_cursors() {
          BEGIN; SELECT returned_cursor_probe(); \
          SELECT name, statement, is_holdable, is_binary, is_scrollable \
            FROM pg_cursors WHERE name = 'returned'; \
-         FETCH NEXT FROM returned; CLOSE returned; COMMIT; \
-         BEGIN; \
-         DECLARE visible SCROLL CURSOR FOR SELECT 1; \
-         SELECT name, statement, is_holdable, is_binary, is_scrollable, creation_time IS NOT NULL \
-           FROM pg_cursors; \
-         SELECT count(*) FROM pg_cursor(); \
-         CLOSE visible; COMMIT",
+         FETCH NEXT FROM returned; CLOSE returned; COMMIT",
     );
     assert_eq!(
         data_rows(&output),
@@ -7972,11 +7966,21 @@ fn postgresql_18_refcursor_type_catalog_and_native_plpgsql_cursors() {
             "returned",
             "returned|SELECT 11::integer AS value|f|f|f",
             "11",
-            "visible|DECLARE visible SCROLL CURSOR FOR SELECT 1|f|f|t|t",
-            "1",
         ],
         "{}",
         String::from_utf8_lossy(&output),
+    );
+    // A declared cursor shows the client's whole query string.
+    const DECLARED: &str = "BEGIN; DECLARE visible SCROLL CURSOR FOR SELECT 1; \
+         SELECT name, statement, is_holdable, is_binary, is_scrollable, creation_time IS NOT NULL \
+           FROM pg_cursors; \
+         SELECT count(*) FROM pg_cursor(); CLOSE visible; COMMIT";
+    let declared = run_with(&mut engine, &mut budget, DECLARED);
+    assert_eq!(
+        data_rows(&declared),
+        [format!("visible|{DECLARED}|f|f|t|t"), "1".to_string()],
+        "{}",
+        String::from_utf8_lossy(&declared),
     );
     assert_eq!(copy_data_rows(&output), ["saved\t{left,right}"]);
     for query in [
@@ -13600,12 +13604,13 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
         (
             "CREATE RULE invalid_returning AS ON INSERT TO rule_defaults \
              DO ALSO INSERT INTO rule_default_log VALUES (NEW.id, NEW.label) RETURNING id",
-            "conditional or non-INSTEAD",
+            "RETURNING lists are not supported in non-INSTEAD rules",
         ),
         (
             "CREATE RULE second_returning AS ON INSERT TO rule_redirect DO INSTEAD \
-             INSERT INTO rule_destination VALUES (NEW.id) RETURNING id",
-            "multiple RETURNING lists",
+             INSERT INTO rule_destination VALUES (NEW.id) RETURNING id; \
+             INSERT INTO rule_redirect VALUES (1) RETURNING id",
+            "cannot have RETURNING lists in multiple rules",
         ),
         (
             "CREATE RULE update_guard AS ON UPDATE TO rule_defaults DO ALSO NOTHING; \

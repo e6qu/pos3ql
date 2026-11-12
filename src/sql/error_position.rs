@@ -159,6 +159,8 @@ fn note(error: SqlError, note: AnalysisNote) -> SqlError {
 
 const FUNCTION_HINT: &str = "No function matches the given name and argument types. You might need to add explicit type casts.";
 const BINARY_OPERATOR_HINT: &str = "No operator matches the given name and argument types. You might need to add explicit type casts.";
+const AMBIGUOUS_OPERATOR_HINT: &str =
+    "Could not choose a best candidate operator. You might need to add explicit type casts.";
 const UNARY_OPERATOR_HINT: &str = "No operator matches the given name and argument type. You might need to add an explicit type cast.";
 
 std::thread_local! {
@@ -168,6 +170,31 @@ std::thread_local! {
     /// position; utility commands look names up without one.
     static ANALYZED: Cell<bool> = const { Cell::new(false) };
     static PENDING: Cell<Option<Pending>> = const { Cell::new(None) };
+    /// The client's whole query string, PostgreSQL's `debug_query_string`:
+    /// the outermost statement source while it runs.
+    static CLIENT_QUERY: Cell<(*const u8, usize)> = const { Cell::new((core::ptr::null(), 0)) };
+}
+
+struct ClientQueryScope(Option<(*const u8, usize)>);
+
+impl Drop for ClientQueryScope {
+    fn drop(&mut self) {
+        if let Some(prior) = self.0 {
+            CLIENT_QUERY.with(|client| client.set(prior));
+        }
+    }
+}
+
+/// Runs `run` with the client's whole query string, if a client statement is
+/// running.
+pub(crate) fn with_client_query<R>(run: impl FnOnce(Option<&str>) -> R) -> R {
+    let (text, len) = CLIENT_QUERY.with(Cell::get);
+    if text.is_null() {
+        return run(None);
+    }
+    // with_statement_source keeps the client's text alive while it is installed.
+    let bytes = unsafe { core::slice::from_raw_parts(text, len) };
+    run(core::str::from_utf8(bytes).ok())
 }
 
 struct SourceScope(Source, bool);
@@ -193,6 +220,13 @@ pub(crate) fn with_statement_source<R>(
 ) -> R {
     PENDING.with(|pending| pending.set(None));
     crate::sql::error_context::reset();
+    let _client = ClientQueryScope(CLIENT_QUERY.with(|client| {
+        client
+            .get()
+            .0
+            .is_null()
+            .then(|| client.replace((text.as_ptr(), text.len())))
+    }));
     let _scope = SourceScope(
         SOURCE.with(|source| {
             source.replace(Source {
@@ -606,6 +640,13 @@ pub(crate) fn expression_error(
             source_position, ..
         } if state == sqlstate::UNDEFINED_FUNCTION && message.starts_with("operator ") => {
             annotated(error, source_position.get(), BINARY_OPERATOR_HINT)
+        }
+        Expr::Binary {
+            source_position, ..
+        } if state == sqlstate::AMBIGUOUS_FUNCTION
+            && message.starts_with("operator is not unique: ") =>
+        {
+            annotated(error, source_position.get(), AMBIGUOUS_OPERATOR_HINT)
         }
         Expr::Unary {
             source_position, ..

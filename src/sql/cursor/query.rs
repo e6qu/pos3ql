@@ -24,6 +24,9 @@ pub(crate) struct CursorQuery {
     bound: Option<BoundQuery<'static>>,
     pub(crate) retained: Option<crate::sql::query::RetainedSelect<'static>>,
     result_type_oids: Option<crate::mem::arena::FrozenArenaSliceHandle<i32>>,
+    /// The client query that opened the cursor, as `pg_cursors` shows it;
+    /// retained at the arena's tail while the query and its rows are released.
+    statement: Option<crate::mem::arena::FrozenArenaSliceHandle<u8>>,
     arena: Arena,
     owner: crate::sql::type_input_plans::Owner,
     snapshot: Option<CursorSnapshot>,
@@ -102,6 +105,7 @@ impl CursorQuery {
             bound: None,
             retained: None,
             result_type_oids: None,
+            statement: None,
             arena: Arena::new(budget, "cursor_query_bytes", bytes)?,
             owner: crate::sql::type_input_plans::Owner::Unlocated,
             snapshot: None,
@@ -112,9 +116,33 @@ impl CursorQuery {
         self.snapshot = None;
         self.retained = None;
         self.result_type_oids = None;
+        self.statement = None;
         self.bound = None;
         self.arena.reset();
         self.owner = crate::sql::type_input_plans::Owner::Unlocated;
+    }
+
+    /// Records the opening client query; called once on a cleared query.
+    pub(crate) fn set_statement(&mut self, statement: &str) -> Result<(), SqlError> {
+        let bytes = statement.as_bytes();
+        let retained = self
+            .arena
+            .retain_slice_with(bytes.len(), |index| bytes[index])
+            .map_err(|_| query_full())?;
+        self.statement = Some(
+            self.arena
+                .freeze_retained_slice(retained)
+                .map_err(|_| query_full())?,
+        );
+        Ok(())
+    }
+
+    /// The opening client query, or empty once the cursor's query failed.
+    pub(crate) fn statement(&self) -> &str {
+        self.statement
+            .and_then(|handle| self.arena.retained_slice(handle).ok())
+            .and_then(|bytes| core::str::from_utf8(bytes).ok())
+            .unwrap_or("")
     }
 
     pub(crate) fn owner(&self) -> crate::sql::type_input_plans::Owner {
@@ -277,7 +305,12 @@ impl CursorQuery {
         owner: crate::sql::type_input_plans::Owner,
         validate: impl FnOnce(&crate::sql::parser::Parser<'_>) -> Result<(), SqlError>,
     ) -> Result<(), SqlError> {
-        self.clear();
+        // The opening statement stays at the arena's tail.
+        self.snapshot = None;
+        self.retained = None;
+        self.result_type_oids = None;
+        self.bound = None;
+        self.arena.recycle_front();
         self.owner = owner;
         let full = query_full;
         let source = self.arena.alloc_str(sql).map_err(|_| full())?;

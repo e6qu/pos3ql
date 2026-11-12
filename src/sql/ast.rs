@@ -5138,6 +5138,11 @@ pub struct Insert<'a> {
     pub returning: Returning<'a>,
     /// `OVERRIDING { SYSTEM | USER } VALUE` for identity columns.
     pub overriding: Overriding,
+    /// A rewrite rule's multi-row `VALUES` action run over its source rows:
+    /// when non-empty, the `select` source's last output column is the
+    /// zero-based `VALUES` row, and entry `n` holds the target positions row
+    /// `n` writes as `DEFAULT`.
+    pub values_defaults: &'a [crate::storage::ColumnSet],
 }
 
 /// `OVERRIDING` mode for `INSERT` into a table with identity columns.

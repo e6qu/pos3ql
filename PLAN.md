@@ -100,10 +100,6 @@ is owned.
   values where PostgreSQL evaluates a volatile output list again, and a
   row-locking cursor over a join, or ordered by an expression that is not a
   source column, locks all its rows at that first read.
-  `pg_cursors.statement` shows the `DECLARE` statement alone, where PostgreSQL
-  shows the client's whole query string (several statements, the trailing
-  semicolon); keeping it needs that text in the cursor's startup-sized
-  storage.
   PL/pgSQL bound cursor declarations (`c CURSOR FOR ...` in `DECLARE`) are
   rejected with `0A000`; a `refcursor` opened with `OPEN ... FOR` works. Saving a held cursor at
   commit yields during storage waits. Cursors keep declared record and domain
@@ -274,10 +270,7 @@ and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
 with `0A000` where PostgreSQL changes the catalog entry; `information_schema`
 domains such as `cardinal_number` do not exist. `CREATE FUNCTION` checks a
 SQL function's final query against a scalar result only; a composite or record
-result is checked when called. A polymorphic SQL function whose body
-returns another type than the resolved one (`anyelement` called with an
-integer, body returning `text`) fails converting the value where PostgreSQL
-reports `return type mismatch` while inlining it. Expressions are shown as stored, not deparsed: `pg_get_expr`,
+result is checked when called. Expressions are shown as stored, not deparsed: `pg_get_expr`,
 `pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
 `text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
 the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
@@ -303,12 +296,13 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
-`pg_constraint` omits the system catalogs' own not-null constraints. A rewrite rule `INSERT` action whose `VALUES` rows write
-`DEFAULT` in different columns runs as one insert per pattern, so `RETURNING`
-from such an action fails with `0A000`, its statement triggers fire once per
-pattern, and its rows are inserted pattern by pattern; a multi-row `VALUES`
-action also inserts each `VALUES` row for every source row in turn, where
-PostgreSQL inserts every `VALUES` row for one source row before the next. A derived table computes output
+`pg_constraint` omits the system catalogs' own not-null constraints. A rewrite rule's multi-row `INSERT ... VALUES` action
+resolves each column's type across its rows as a `VALUES` list does, so
+`VALUES ('1'::text, 3), (2, DEFAULT)` into a `text` column fails with `VALUES
+types text and integer cannot be matched` where PostgreSQL converts each value
+to the target column's type; and a rule action's `RETURNING` list that reads
+`NEW` or `OLD` fails with `missing FROM-clause entry` when the triggering
+statement asks for rows. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
@@ -325,15 +319,14 @@ subquery that reads an earlier item's column fails when its own output
 column has the same name (`SELECT * FROM generate_series(1,2) g, LATERAL
 (SELECT g) x` reports `column reference "g" is ambiguous`) or when that item
 renames its columns (`generate_series(1,2) g(c), LATERAL (SELECT c) x` reports
-`column "c" does not exist`); PostgreSQL returns the rows. An untyped
-parameter of a built-in operator whose overloads PostgreSQL ranks by type
-category takes the other operand's type (`jsonb -> $1` reads `jsonb` where
-PostgreSQL reads `text`), and an ambiguous one (`date + $1`) reports
-`operator does not exist` instead of `operator is not unique`. A `PREPARE`
-parameter inferred as a domain (`$1::pos`) is checked as the domain but
-listed in `pg_prepared_statements` as its base type. `PREPARE`
-converts a constant (`'a'::int`) and checks a `WHERE` without `FROM` when the
-statement is executed, where PostgreSQL rejects them at `PREPARE`. `pg_sleep` and its
+`column "c" does not exist`); PostgreSQL returns the rows. A
+protocol-level `Parse` message checks only syntax and parameter types, so
+analysis errors (`SELECT current_date + $1`, `SELECT 1 WHERE 'x'`) arrive at
+`Bind` or `Execute` where PostgreSQL reports them at `Parse`, and
+`pg_prepared_statements` lists only SQL `PREPARE` statements, not protocol
+ones. `PREPARE` checks a `SELECT` without `FROM` and the types of every
+query, but constant inputs of a query with `FROM` (`SELECT 'a'::int FROM t`)
+are converted when it runs. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,

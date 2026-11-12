@@ -91,10 +91,10 @@ pub(crate) use cte::expand_from_schema;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
-    RuleTransitionType, attach_rule_source, dml_parameter_scope_query, expand_set_tree,
-    expand_stored_query, expand_stored_query_exec, expand_stored_rule_action_exec,
+    RuleInsertTarget, RuleTransitionType, attach_rule_source, dml_parameter_scope_query,
+    expand_set_tree, expand_stored_query, expand_stored_query_exec, expand_stored_rule_action_exec,
     expand_stored_rule_expression_exec, expand_stored_statement_exec, restrict_rule_original,
-    rule_original_transition, rule_transition_source, split_rule_insert_defaults,
+    rule_original_transition, rule_transition_source,
 };
 pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
@@ -3939,6 +3939,15 @@ impl StorageCatalog<'_, '_, '_, '_> {
             |parser| {
                 validate_stored_type_inputs(parser, self.storage, self.txid, dependencies.view())
             },
+        )?;
+        super::exec::check_polymorphic_sql_result(
+            self.storage,
+            self.txid,
+            routine,
+            arguments,
+            routine.body.as_str(),
+            &function_program,
+            self.routine_workspace,
         )?;
         let program_access = routine_program_access(&function_program);
         if program_access == RoutineProgramAccess::Engine {
@@ -10802,9 +10811,35 @@ fn check_where_type<'a>(
         ));
     }
     if let Expr::Str(text) = w {
-        super::eval::parse_bool(text)?;
+        super::eval::parse_bool(text)
+            .map_err(|error| crate::sql::error_position::at_subject(error, text))?;
     }
     Ok(())
+}
+
+/// Parse analysis of a FROM-less `SELECT` without running it: its `WHERE`
+/// type and its constant inputs, as `PREPARE` checks them.
+pub(crate) fn analyse_fromless_select<'a>(
+    statement: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    if statement.from.is_some() || statement.set_body.is_some() {
+        return Ok(());
+    }
+    let columns = super::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    if let Some(condition) = statement.where_clause {
+        check_where_type(condition, &columns, storage, txid, arena)?;
+    }
+    check_select_constants(statement, arena, storage, txid)
 }
 
 /// Admit the virtual input row once before scalar projection or set expansion.

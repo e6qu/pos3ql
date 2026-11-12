@@ -872,7 +872,7 @@ fn known_null(
     })
 }
 
-fn simple_expression<'a>(statements: &'a [Stmt<'a>]) -> Option<&'a Expr<'a>> {
+pub(super) fn simple_expression<'a>(statements: &'a [Stmt<'a>]) -> Option<&'a Expr<'a>> {
     let [Stmt::Select(select)] = statements else {
         return None;
     };

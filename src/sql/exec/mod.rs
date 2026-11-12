@@ -982,7 +982,9 @@ mod sql_function_execution;
 pub(super) use function_execution::execute as execute_plpgsql_function;
 pub(super) use function_execution::{FunctionOutput, SuspendedFunction};
 pub(super) use sql_function_execution::execute_sql_function;
-pub(crate) use sql_function_execution::sql_function_inlining;
+pub(crate) use sql_function_execution::{
+    check_inlined_polymorphic_result, check_polymorphic_sql_result, sql_function_inlining,
+};
 mod trigger_firing;
 use trigger_firing::{TriggerRecordName, TriggerRecordValue, TriggerRows};
 mod write_completion;
@@ -24642,6 +24644,7 @@ where
         &mut |values| {
             let values = coerce_insert_projection(
                 values,
+                !statement.values_defaults.is_empty(),
                 &definition,
                 &targets[..count],
                 casts,
@@ -25846,6 +25849,7 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
         .expect("a live SQL prepared statement owns its routine input plans");
     let declared =
         crate::sql::prep::decode_types(sqlprep.get_type_codes(name).unwrap_or(&[]), context.arena)?;
+    let declared_oids = crate::sql::prep::decode_oids(sqlprep.get_type_oids(name), context.arena)?;
     let declared_count = declared.len();
     if declared_count != 0 && values.len() != declared_count {
         return Err(sql_err!(
@@ -25858,9 +25862,16 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
     }
     for (index, value) in values.iter_mut().enumerate() {
         if index < declared_count {
-            parameter_types[index] = declared[index].oid();
+            parameter_types[index] = declared_oids[index];
             *value = detached_trigger_datum(
-                crate::sql::eval::cast(*value, declared[index].internal_name(), context.arena)?,
+                prepared_argument(
+                    context.storage(),
+                    context.txn.txid,
+                    *value,
+                    declared[index],
+                    declared_oids[index],
+                    context.arena,
+                )?,
                 context.arena,
             )?;
         }
@@ -45193,9 +45204,6 @@ fn alter_view_inner(
                     name.name
                 ));
             };
-            if let Err(error) = super::query::resolve_view_for_dml(storage, name, txn.txid, arena) {
-                return sql_fail(error);
-            }
             let mut descriptions = [ColDesc::new("", 0, 0); MAX_PROJ];
             let count = match super::catalog::describe_view(
                 storage,
@@ -46227,32 +46235,24 @@ fn stored_rule_definition(
         if !super::query::statement_returns_rows(action.statement) {
             continue;
         }
-        if rule.condition.is_some() || !matches!(mode, crate::storage::RewriteMode::Instead) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "RETURNING lists are not supported in conditional or non-INSTEAD rules"
-            ));
-        }
         if returning_action.replace(index as u8).is_some() {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "cannot have multiple RETURNING lists in a rule"
             ));
         }
-    }
-    if returning_action.is_some()
-        && storage
-            .rules_for(target, event, txn.txid)
-            .any(|(_, existing)| {
-                let existing = existing.definition_for(txn.txid);
-                existing.returning_action.is_some()
-                    && !(rule.or_replace && existing.name.as_str() == rule.name)
-            })
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot have multiple RETURNING lists in rules for the same relation and event"
-        ));
+        if rule.condition.is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "RETURNING lists are not supported in conditional rules"
+            ));
+        }
+        if !matches!(mode, crate::storage::RewriteMode::Instead) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "RETURNING lists are not supported in non-INSTEAD rules"
+            ));
+        }
     }
     if let Some(condition) = rule.condition {
         if condition.contains_subquery() {
@@ -46421,8 +46421,8 @@ fn stored_rule_definition(
         ));
     }
     let transition_values = [&Expr::Null; crate::storage::MAX_COLUMNS];
-    for action in rule.actions {
-        super::query::expand_stored_rule_action_exec(
+    for (index, action) in rule.actions.iter().enumerate() {
+        let expanded = super::query::expand_stored_rule_action_exec(
             action.statement,
             storage,
             txn.txid,
@@ -46438,6 +46438,19 @@ fn stored_rule_definition(
             condition_columns.old,
             condition_columns.new,
         )?;
+        if returning_action == Some(index as u8) {
+            check_rule_returning_list(
+                storage,
+                txn.txid,
+                action.statement,
+                path,
+                dependencies.view(),
+                rule_owner,
+                &condition_columns,
+                arena,
+            )?;
+        }
+        let _ = expanded;
     }
     Ok((
         crate::storage::RuleDefinition {
@@ -46455,6 +46468,120 @@ fn stored_rule_definition(
         },
         dependencies,
     ))
+}
+
+/// PostgreSQL's `checkRuleResultList` for a rule action's `RETURNING` list:
+/// it must produce the rule relation's row, entry for entry, with each
+/// entry's type and size. OLD and NEW are typed as the rule relation's
+/// columns.
+#[expect(clippy::too_many_arguments, reason = "stored rule analysis context")]
+fn check_rule_returning_list<'a>(
+    storage: &Storage,
+    txid: u32,
+    action: &'a Stmt<'a>,
+    path: crate::storage::PathContext,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    rule_owner: u16,
+    columns: &RuleConditionColumns<'_>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let count = columns.count;
+    let typed = arena
+        .alloc_slice_with(count, |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    for (value, metadata) in typed.iter_mut().zip(&columns.metadata[..count]) {
+        *value = arena
+            .alloc(Expr::BoundDefault {
+                expression: &Expr::Null,
+                type_oid: metadata.type_oid,
+            })
+            .map_err(|_| arena_full())?;
+    }
+    let expanded = super::query::expand_stored_rule_action_exec(
+        action,
+        storage,
+        txid,
+        path,
+        dependencies,
+        arena,
+        crate::sql::eval::NO_PARAMS,
+        None,
+        rule_owner,
+        &columns.names[..count],
+        typed,
+        typed,
+        columns.old,
+        columns.new,
+    )?;
+    let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let described_count = describe_data_modification_columns(
+        storage,
+        expanded,
+        arena,
+        txid,
+        &mut described,
+        DescriptionTarget::Sql,
+    )?;
+    for (index, entry) in described[..described_count].iter().enumerate() {
+        let Some(column) = columns.metadata[..count].get(index) else {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "RETURNING list has too many entries"
+            ));
+        };
+        let name = columns.names[index];
+        if entry.type_oid != column.type_oid {
+            let entry_type = super::catalog::format_type_name(storage, txid, entry.type_oid)?;
+            let column_type = super::catalog::format_type_name(storage, txid, column.type_oid)?;
+            return Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "RETURNING list's entry {} has different type from column \"{}\"",
+                    index + 1,
+                    name
+                ),
+                format_args!(
+                    "RETURNING list entry has type {}, but column has type {}.",
+                    entry_type.as_str(),
+                    column_type.as_str()
+                ),
+            ));
+        }
+        if entry.type_mod != column.type_mod && entry.type_mod != -1 && column.type_mod != -1 {
+            let entry_type = super::eval::funcs::system::format_type_with_type_mod(
+                storage,
+                txid,
+                entry.type_oid,
+                entry.type_mod,
+            )?;
+            let column_type = super::eval::funcs::system::format_type_with_type_mod(
+                storage,
+                txid,
+                column.type_oid,
+                column.type_mod,
+            )?;
+            return Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "RETURNING list's entry {} has different size from column \"{}\"",
+                    index + 1,
+                    name
+                ),
+                format_args!(
+                    "RETURNING list entry has type {}, but column has type {}.",
+                    entry_type.as_str(),
+                    column_type.as_str()
+                ),
+            ));
+        }
+    }
+    if described_count != count {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "RETURNING list has too few entries"
+        ));
+    }
+    Ok(())
 }
 
 pub fn create_rule(
@@ -69650,6 +69777,108 @@ where
     }
 }
 
+/// The view-column defaults an INSERT through an INSTEAD OF trigger applies
+/// to the columns it does not write.
+fn instead_of_view_defaults<'a>(
+    storage: &Storage,
+    view_slot: usize,
+    definition: &crate::storage::TableDefView<'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<ViewCheck<'a>, SqlError> {
+    let view = storage.view(view_slot);
+    let base_columns = arena
+        .alloc_slice_with(definition.n_columns, |_| "")
+        .map_err(|_| super::query::arena_full_pub())?;
+    for (name, column) in base_columns.iter_mut().zip(definition.columns()) {
+        *name = arena
+            .alloc_str(column.name.as_str())
+            .map_err(|_| super::query::arena_full_pub())?;
+    }
+    Ok(ViewCheck {
+        predicate: None,
+        view_name: arena
+            .alloc_str(view.name.as_str())
+            .map_err(|_| super::query::arena_full_pub())?,
+        defaults: ViewInsertDefaults {
+            base_columns,
+            columns: *view.columns_for(txid),
+            inputs: view.default_inputs_for(txid).detached_sections(arena)?,
+        },
+    })
+}
+
+#[expect(clippy::too_many_arguments, reason = "default evaluation context")]
+fn fill_instead_of_view_defaults<'values, 'arena: 'values>(
+    values: &mut [Datum<'values>],
+    explicit: &[bool],
+    storage: &Storage,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
+    defaults: ViewCheck<'_>,
+    definition: &'values crate::storage::TableDefView<'_>,
+    expressions: &constraints::ParsedDefaults<'arena>,
+    arena: &'arena Arena,
+) -> Result<(), SqlError> {
+    let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        sequences: Some(&sequences),
+        ..NO_HOOKS
+    };
+    for column in 0..definition.n_columns {
+        if !explicit[column] {
+            values[column] = insert_default_value(
+                storage,
+                txid,
+                Some(defaults),
+                definition,
+                column,
+                None,
+                expressions[column],
+                arena,
+                &hooks,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// An `EXECUTE` argument converted to its prepared parameter's type: the
+/// execution type, then a declared domain's constraints.
+pub(crate) fn prepared_argument<'a>(
+    storage: &Storage,
+    txid: u32,
+    value: Datum<'a>,
+    ctype: ColType,
+    type_oid: i32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let value = match catalog_column_type(storage, txid, type_oid) {
+        Some((ctype, Some(user_type))) => {
+            let column = ColumnMeta {
+                ctype,
+                user_type: Some(user_type),
+                ..ColumnMeta::EMPTY
+            };
+            coerce_column_value(value, &column, storage, txid, arena, None)?
+        }
+        _ => super::eval::cast(value, ctype.internal_name(), arena)?,
+    };
+    let Some((crate::storage::NamedTypeKind::Domain, creation, false)) =
+        crate::storage::NamedTypeKind::from_oid(type_oid)
+    else {
+        return Ok(value);
+    };
+    let target = crate::storage::TypeDefinitionTarget::by_creation(
+        storage,
+        crate::storage::NamedTypeKind::Domain,
+        creation,
+    )?;
+    constraints::coerce_domain_value(storage, target, value, txid, arena, &[], None)
+}
+
 pub(crate) fn view_trigger_definition<'a>(
     storage: &Storage,
     view_slot: usize,
@@ -69920,48 +70149,42 @@ pub(crate) fn instead_of_view_dml<'a>(
                     "INSERT options ON CONFLICT and OVERRIDING are not supported for INSTEAD OF triggers"
                 ));
             }
-            if let Some(select) = insert.select {
-                let target_count = if insert.columns.is_empty() {
-                    def.n_columns
+            let target_count = if insert.columns.is_empty() {
+                def.n_columns
+            } else {
+                insert.columns.len()
+            };
+            let mut targets = [0usize; MAX_COLUMNS];
+            for (index, target) in targets[..target_count].iter_mut().enumerate() {
+                *target = if insert.columns.is_empty() {
+                    index
                 } else {
-                    insert.columns.len()
+                    match def.column_index(insert.columns[index]) {
+                        Some(column) => column,
+                        None => return sql_fail(undefined_column(insert.columns[index])),
+                    }
                 };
-                let mut source_columns = [ColDesc::new("", 0, 0); MAX_COLUMNS];
-                let source_count = match super::query::describe_select(
-                    select,
-                    storage,
-                    txn.txid,
-                    arena,
-                    &mut source_columns,
-                    crate::sql::exec::DescriptionTarget::Sql,
-                    None,
-                ) {
-                    Ok(count) => count,
+            }
+            let targets = &targets[..target_count];
+            // A column the statement leaves out or writes as DEFAULT takes the
+            // view column's default, as PostgreSQL's rewriter supplies it.
+            let defaults = match instead_of_view_defaults(storage, view_slot, &def, txn.txid, arena)
+            {
+                Ok(defaults) => defaults,
+                Err(error) => return sql_fail(error),
+            };
+            let default_exprs =
+                match parse_view_defaults(Some(defaults), &def, arena, storage, txn.txid) {
+                    Ok(expressions) => expressions,
                     Err(error) => return sql_fail(error),
                 };
-                if source_count != target_count {
-                    return sql_fail(sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "INSERT has wrong number of expressions"
-                    ));
-                }
+            if let Some(select) = insert.select {
                 let source_casts = match prepare_insert_select_casts(
                     insert, select, storage, txn.txid, arena, None,
                 ) {
                     Ok(casts) => casts,
                     Err(error) => return sql_fail(error),
                 };
-                let mut source_targets = [0; MAX_COLUMNS];
-                for (index, target) in source_targets[..target_count].iter_mut().enumerate() {
-                    *target = if insert.columns.is_empty() {
-                        index
-                    } else {
-                        match def.column_index(insert.columns[index]) {
-                            Some(column) => column,
-                            None => return sql_fail(undefined_column(insert.columns[index])),
-                        }
-                    };
-                }
                 let mut rows = match scratch.pool().lease::<&[u8]>(0) {
                     Ok(rows) => rows,
                     Err(error) => {
@@ -69987,8 +70210,9 @@ pub(crate) fn instead_of_view_dml<'a>(
                     &mut |values| {
                         let values = coerce_insert_projection(
                             values,
+                            !insert.values_defaults.is_empty(),
                             &def,
-                            &source_targets[..target_count],
+                            targets,
                             source_casts,
                             insert.overriding,
                             storage,
@@ -70013,21 +70237,31 @@ pub(crate) fn instead_of_view_dml<'a>(
                     return sql_fail(error);
                 }
                 for bytes in rows.as_slice() {
-                    let mut selected = [Datum::Null; MAX_COLUMNS];
-                    for (index, value) in selected[..source_count].iter_mut().enumerate() {
-                        *value = decode_projected_pub(bytes, index);
-                    }
+                    let (width, written_defaults) = match rule_values_row_defaults(insert, bytes) {
+                        Ok(row) => row,
+                        Err(error) => return sql_fail(error),
+                    };
                     let mut values = [Datum::Null; MAX_COLUMNS];
-                    for (source, value) in selected[..target_count].iter().enumerate() {
-                        let column = if insert.columns.is_empty() {
-                            source
-                        } else {
-                            match def.column_index(insert.columns[source]) {
-                                Some(column) => column,
-                                None => return sql_fail(undefined_column(insert.columns[source])),
-                            }
-                        };
-                        values[column] = *value;
+                    let mut explicit = [false; MAX_COLUMNS];
+                    for (source, column) in targets[..width.min(target_count)].iter().enumerate() {
+                        if written_defaults.contains(source) {
+                            continue;
+                        }
+                        values[*column] = decode_projected_pub(bytes, source);
+                        explicit[*column] = true;
+                    }
+                    if let Err(error) = fill_instead_of_view_defaults(
+                        &mut values,
+                        &explicit,
+                        storage,
+                        txn.txid,
+                        seq_session,
+                        defaults,
+                        &def,
+                        &default_exprs,
+                        arena,
+                    ) {
+                        return sql_fail(error);
                     }
                     match finish_instead_of_view_new_row(
                         storage,
@@ -70051,61 +70285,55 @@ pub(crate) fn instead_of_view_dml<'a>(
                     affected += 1;
                 }
             } else {
-                if let Err(error) = check_insert_values_shape(
-                    insert,
-                    if insert.columns.is_empty() {
-                        def.n_columns
-                    } else {
-                        insert.columns.len()
-                    },
-                ) {
+                if let Err(error) = check_insert_values_shape(insert, target_count) {
                     return sql_fail(error);
                 }
                 for row in insert.rows {
                     let mut values = [Datum::Null; MAX_COLUMNS];
-                    if row.len()
-                        != if insert.columns.is_empty() {
-                            def.n_columns
-                        } else {
-                            insert.columns.len()
-                        }
+                    let mut explicit = [false; MAX_COLUMNS];
                     {
-                        return sql_fail(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "INSERT through an INSTEAD OF trigger requires a value for every view column"
-                        ));
-                    }
-                    let sequences =
-                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                    let hooks = EvalHooks {
-                        catalog: Some(&catalog),
-                        sequences: Some(&sequences),
-                        ..NO_HOOKS
-                    };
-                    for (index, expression) in row.iter().enumerate() {
-                        let column = if insert.columns.is_empty() {
-                            index
-                        } else {
-                            match def.column_index(insert.columns[index]) {
-                                Some(column) => column,
-                                None => return sql_fail(undefined_column(insert.columns[index])),
+                        let sequences =
+                            crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                        let hooks = EvalHooks {
+                            catalog: Some(&catalog),
+                            sequences: Some(&sequences),
+                            ..NO_HOOKS
+                        };
+                        for (index, expression) in row.iter().enumerate() {
+                            if matches!(expression, Expr::DefaultMarker) {
+                                continue;
                             }
-                        };
-                        values[column] = match eval_prepared_assignment(
-                            assignment_casts,
-                            expression,
-                            &def.columns[column],
-                            storage,
-                            txn.txid,
-                            arena,
-                            params,
-                            &NoColumns,
-                            &hooks,
-                        ) {
-                            Ok(value) => value,
-                            Err(error) => return sql_fail(error),
-                        };
+                            let column = targets[index];
+                            values[column] = match eval_prepared_assignment(
+                                assignment_casts,
+                                expression,
+                                &def.columns[column],
+                                storage,
+                                txn.txid,
+                                arena,
+                                params,
+                                &NoColumns,
+                                &hooks,
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => return sql_fail(error),
+                            };
+                            explicit[column] = true;
+                        }
+                    }
+                    if let Err(error) = fill_instead_of_view_defaults(
+                        &mut values,
+                        &explicit,
+                        storage,
+                        txn.txid,
+                        seq_session,
+                        defaults,
+                        &def,
+                        &default_exprs,
+                        arena,
+                    ) {
+                        return sql_fail(error);
                     }
                     match finish_instead_of_view_new_row(
                         storage,
@@ -71035,6 +71263,7 @@ where
                 let mut fill = |vals: &[Datum]| -> Result<(), SqlError> {
                     let vals = coerce_insert_projection(
                         vals,
+                        !statement.values_defaults.is_empty(),
                         def,
                         &targets[..n_targets],
                         source_assignment_casts.expect("SELECT has a cast plan"),
@@ -71114,7 +71343,10 @@ where
         };
         let mut inserted = 0u64;
         for bytes in rows_bytes.iter() {
-            let n_src = projected_row_width(bytes);
+            let (n_src, defaults) = match rule_values_row_defaults(statement, bytes) {
+                Ok(row) => row,
+                Err(error) => return sql_fail(error),
+            };
             if n_src > n_targets || (n_src < n_targets && !statement.columns.is_empty()) {
                 let msg = if n_src > n_targets {
                     "INSERT has more expressions than target columns"
@@ -71126,6 +71358,9 @@ where
             let mut values = [Datum::Null; MAX_COLUMNS];
             let mut explicit = [false; MAX_COLUMNS];
             for i in 0..n_src {
+                if defaults.contains(i) {
+                    continue; // the rule's VALUES row wrote DEFAULT
+                }
                 // A generated column cannot be a target of INSERT ... SELECT.
                 if let Err(e) = reject_generated_write(def, targets[i]) {
                     return sql_fail(e);
@@ -82367,6 +82602,11 @@ fn prepare_insert_select_casts<'a>(
         arena,
         outer,
         &mut |source, input_collation| {
+            if index == count && !statement.values_defaults.is_empty() {
+                // The rule action's row-number column is not assigned.
+                index += 1;
+                return Ok(());
+            }
             let target = if statement.columns.is_empty() {
                 index
             } else {
@@ -82410,6 +82650,7 @@ fn prepare_insert_select_casts<'a>(
             Ok(())
         },
     )?;
+    let index = index - usize::from(!statement.values_defaults.is_empty());
     if !statement.columns.is_empty() && index != count {
         return Err(insert_more_targets(statement.columns, index));
     }
@@ -82502,12 +82743,45 @@ fn insert_more_targets(columns: &[&str], at: usize) -> SqlError {
     }
 }
 
+/// The assigned width of one selected `INSERT` row and the target positions
+/// a rule action's `VALUES` row wrote as `DEFAULT`, read from its trailing
+/// row number.
+fn rule_values_row_defaults(
+    statement: &Insert<'_>,
+    bytes: &[u8],
+) -> Result<(usize, ColumnSet), SqlError> {
+    let width = projected_row_width(bytes);
+    if statement.values_defaults.is_empty() {
+        return Ok((width, ColumnSet::EMPTY));
+    }
+    let number = match width
+        .checked_sub(1)
+        .map(|last| decode_projected_pub(bytes, last))
+    {
+        Some(Datum::Int4(number)) => usize::try_from(number).ok(),
+        Some(Datum::Int8(number)) => usize::try_from(number).ok(),
+        _ => None,
+    };
+    let defaults = number
+        .and_then(|number| statement.values_defaults.get(number))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "rule INSERT row lacks its VALUES row number"
+            )
+        })?;
+    Ok((width - 1, *defaults))
+}
+
+/// Assignment conversions of one selected row. A rule action's trailing
+/// `VALUES` row number (`row_number`) is kept unconverted.
 #[expect(
     clippy::too_many_arguments,
     reason = "selected INSERT projection contract"
 )]
 fn coerce_insert_projection<'a, B: crate::storage::DefinitionBacking>(
     values: &[Datum<'a>],
+    row_number: bool,
     definition: &crate::storage::TableDefinition<B>,
     targets: &[usize],
     casts: &[PlannedAssignmentCast<'_>],
@@ -82517,7 +82791,8 @@ fn coerce_insert_projection<'a, B: crate::storage::DefinitionBacking>(
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<&'a [Datum<'a>], SqlError> {
-    if values.len() > targets.len() || casts.len() != targets.len() {
+    let assigned = values.len() - usize::from(row_number && !values.is_empty());
+    if assigned > targets.len() || casts.len() != targets.len() {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
             "INSERT has more expressions than target columns"
@@ -82526,7 +82801,7 @@ fn coerce_insert_projection<'a, B: crate::storage::DefinitionBacking>(
     let output = arena
         .alloc_slice_copy(values)
         .map_err(|_| super::eval::arena_full())?;
-    for (index, value) in output.iter_mut().enumerate() {
+    for (index, value) in output[..assigned].iter_mut().enumerate() {
         let target = targets[index];
         if identity_action(definition, target, overriding) == IdentityAction::UseSequence {
             continue;

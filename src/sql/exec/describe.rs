@@ -3965,6 +3965,14 @@ pub fn record_field_metadata(
             _ => expr_record_handle(base, columns)
                 .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0)),
         },
+        Expr::Param(index) => match bound_parameter_type_oid(*index).and_then(coltype_of_oid) {
+            Some(ColType::Composite(slot)) => {
+                return columns
+                    .composite_field(slot, field)
+                    .ok_or_else(|| could_not_identify(field));
+            }
+            _ => None,
+        },
         Expr::Cast { type_name, .. } => {
             let mut found = None;
             columns.visit_named_composite_fields(type_name, &mut |name, metadata| {
@@ -4364,6 +4372,55 @@ fn builtin_binary_type_named(
     ro: i32,
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
+    // An unknown operand takes the type of the built-in operator PostgreSQL's
+    // candidate selection chooses for it, or the choice is ambiguous.
+    let (lo, ro) = match operator.operator_name() {
+        Some(name) if lo == oid::UNKNOWN || ro == oid::UNKNOWN => {
+            match crate::sql::catalog::builtin_operator_choice(name, Some(lo), Some(ro)) {
+                crate::sql::catalog::BuiltinOperatorChoice::NotUnique => {
+                    let named = |type_oid: i32| {
+                        if type_oid == oid::UNKNOWN {
+                            Some(crate::util::StackStr::<260>::from_str("unknown"))
+                        } else {
+                            builtin_type_name_fixed(type_oid)
+                                .or_else(|| columns.type_name_fixed(type_oid).ok().flatten())
+                        }
+                    };
+                    if let (Some(left), Some(right)) = (named(lo), named(ro)) {
+                        return Err(sql_err!(
+                            sqlstate::AMBIGUOUS_FUNCTION,
+                            "operator is not unique: {} {} {}",
+                            left.as_str(),
+                            name,
+                            right.as_str()
+                        ));
+                    }
+                    (lo, ro)
+                }
+                crate::sql::catalog::BuiltinOperatorChoice::Unique(_) => {
+                    match crate::sql::catalog::builtin_operator_input_oids(name, Some(lo), Some(ro))
+                    {
+                        Some((Some(left), Some(right))) => {
+                            let concrete = |actual: i32, declared: i32| {
+                                if actual == oid::UNKNOWN
+                                    && !crate::sql::catalog::is_polymorphic_pseudo_type(declared)
+                                    && coltype_of_oid(declared).is_some()
+                                {
+                                    declared
+                                } else {
+                                    actual
+                                }
+                            };
+                            (concrete(lo, left), concrete(ro, right))
+                        }
+                        _ => (lo, ro),
+                    }
+                }
+                crate::sql::catalog::BuiltinOperatorChoice::Missing => (lo, ro),
+            }
+        }
+        _ => (lo, ro),
+    };
     builtin_binary_type(operator, lo, ro).map_err(|error| {
         let user = |oid: i32| builtin_type_name_fixed(oid).is_none();
         if error.sqlstate != sqlstate::UNDEFINED_FUNCTION

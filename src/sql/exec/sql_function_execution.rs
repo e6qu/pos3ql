@@ -1178,6 +1178,15 @@ pub(in crate::sql) fn execute_sql_function<'a>(
         .source
         .parse(context.storage(), context.txn.txid, arena)?;
     let arguments = state[0].arguments.decode(arena)?;
+    check_polymorphic_sql_result(
+        context.storage(),
+        context.txn.txid,
+        routine,
+        arguments,
+        parsed.text,
+        &parsed.program,
+        arena,
+    )?;
     let result = state[0].execute(&parsed, arguments, &mut context);
     if policy == query::RoutineExecution::Retained
         && result.as_ref().is_err_and(control_flow::is_execution_wait)
@@ -1188,6 +1197,123 @@ pub(in crate::sql) fn execute_sql_function<'a>(
         *suspended = Some(SuspendedFunction::Sql(SuspendedSqlFunction { state }));
     }
     result
+}
+
+/// PostgreSQL's `check_sql_fn_retval` for a function declared to return a
+/// polymorphic type, once this call's arguments resolve it, and for any other
+/// scalar result: an inlinable body fails `during inlining`, any other at its
+/// final statement.
+pub(crate) fn check_polymorphic_sql_result<'a>(
+    storage: &Storage,
+    txid: u32,
+    routine: &crate::storage::RoutineDef,
+    arguments: &[Datum<'_>],
+    body: &str,
+    program: &query::RoutineFunctionProgram<'a>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    if routine.kind.is_set_returning() || arguments.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+        return Ok(());
+    }
+    let mut argument_oids = [0; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    for (target, argument) in argument_oids.iter_mut().zip(arguments) {
+        *target = argument.type_oid();
+    }
+    check_polymorphic_result(
+        storage,
+        txid,
+        routine,
+        &argument_oids[..arguments.len()],
+        body,
+        program,
+        inlined_by_postgresql(program),
+        arena,
+    )
+}
+
+#[expect(clippy::too_many_arguments, reason = "SQL function check context")]
+fn check_polymorphic_result<'a>(
+    storage: &Storage,
+    txid: u32,
+    routine: &crate::storage::RoutineDef,
+    argument_oids: &[i32],
+    body: &str,
+    program: &query::RoutineFunctionProgram<'a>,
+    inlined: bool,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let _ = argument_oids;
+    // A polymorphic call runs an instance whose result is already resolved.
+    let scalar = routine.kind.function_result().is_some_and(|result| {
+        !matches!(
+            result,
+            ColType::Composite(_) | ColType::Record | ColType::Void
+        )
+    });
+    let Some(resolved) = scalar
+        .then(|| storage.routine_function_result_oid(routine, txid))
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let declared = crate::sql::catalog::format_type_name(storage, txid, resolved)?;
+    let frame = crate::sql::error_context::SqlFunctionFrame {
+        name: routine.name.as_str(),
+        body,
+        // PostgreSQL 18 checks the final query as it prepares that statement.
+        statement: core::cell::Cell::new(program.preceding.len() + 1),
+        inlining: if inlined && inlinable_declaration(routine) {
+            crate::sql::error_context::SqlFunctionInlining::Folded
+        } else {
+            crate::sql::error_context::SqlFunctionInlining::Executed
+        },
+    };
+    crate::sql::error_context::within(&frame, || {
+        query::check_routine_scalar_result(
+            program,
+            resolved,
+            declared.as_str(),
+            storage,
+            txid,
+            arena,
+        )
+    })
+}
+
+/// The planner's inlining attempt for a call of `routine` checks a
+/// polymorphic result as PostgreSQL's `inline_function` does.
+#[expect(clippy::too_many_arguments, reason = "planner inlining context")]
+pub(crate) fn check_inlined_polymorphic_result<'a>(
+    storage: &Storage,
+    txid: u32,
+    routine: &crate::storage::RoutineDef,
+    argument_oids: &[i32],
+    body: &'a str,
+    statement: &'a crate::sql::ast::Stmt<'a>,
+    inlinable: bool,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let query = match statement {
+        crate::sql::ast::Stmt::Select(select) => query::RoutineQuery::Select(select),
+        crate::sql::ast::Stmt::SetQuery(set) => query::RoutineQuery::Set(set),
+        _ => return Ok(()),
+    };
+    let program = query::RoutineFunctionProgram {
+        preceding: &[],
+        result: query::RoutineFunctionResult::Query(
+            arena.alloc(query).map_err(|_| query::arena_full_pub())?,
+        ),
+    };
+    check_polymorphic_result(
+        storage,
+        txid,
+        routine,
+        argument_oids,
+        body,
+        &program,
+        inlinable,
+        arena,
+    )
 }
 
 fn response_full(_: WireFull) -> SqlError {

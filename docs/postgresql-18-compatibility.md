@@ -315,7 +315,12 @@ Domains and checked inputs:
   `double precision` in `pg_prepared_statements`, so `EXECUTE q(2.5)` returns
   2. A parameter that is never used (`SELECT $2::int` leaves `$1` unused) or
   only passed where any type is accepted (`pg_typeof($1)`) fails with `42P18`;
-  an otherwise untyped one is `text`.
+  an otherwise untyped one is `text`. An untyped operand of a built-in
+  operator takes the type PostgreSQL's operator selection picks
+  (`jsonb -> $1` reads `text`); when it cannot pick one (`current_date + $1`)
+  `PREPARE` fails with `operator is not unique` (`42725`). A domain parameter,
+  declared (`PREPARE q(positive_integer)`) or inferred, is listed as the
+  domain and `EXECUTE` checks its constraints.
 - SQL functions are validated at `CREATE`, then each backend checks and keeps
   the first call's inputs for that definition and argument types. PL/pgSQL keeps
   one instance per resolved argument types and collation. Views, rules,

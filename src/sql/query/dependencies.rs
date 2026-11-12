@@ -1396,6 +1396,17 @@ pub(crate) fn validate_dml_assignment_casts(
                     insert_values(insert.columns, row)?;
                 }
                 if let Some(select) = insert.select {
+                    // A rule action's trailing VALUES row number is not assigned.
+                    let assigned;
+                    let select = if insert.values_defaults.is_empty() {
+                        select
+                    } else {
+                        assigned = Select {
+                            items: &select.items[..select.items.len().saturating_sub(1)],
+                            ..*select
+                        };
+                        &assigned
+                    };
                     check_insert_counts(
                         select,
                         insert.columns,

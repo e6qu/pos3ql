@@ -8161,6 +8161,7 @@ impl<'a> Parser<'a> {
             on_conflict,
             returning,
             overriding,
+            values_defaults: &[],
         }))
     }
 

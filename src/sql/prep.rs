@@ -46,6 +46,26 @@ pub(crate) fn decode_types<'a>(codes: &[u8], arena: &'a Arena) -> Result<&'a [Co
     Ok(types)
 }
 
+/// The parameter type OIDs of a prepared statement, copied to `arena`.
+pub(crate) fn decode_oids<'a>(
+    oids: Option<PreparedTypeOids<'_>>,
+    arena: &'a Arena,
+) -> Result<&'a [i32], SqlError> {
+    let Some(oids) = oids else {
+        return Ok(&[]);
+    };
+    let decoded = arena.alloc_slice_with(oids.len(), |_| 0).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "prepared parameter types exceed the statement arena"
+        )
+    })?;
+    for (target, oid) in decoded.iter_mut().zip(oids.iter()) {
+        *target = oid;
+    }
+    Ok(decoded)
+}
+
 pub struct SqlPreparedPool {
     slots: Vec<Slot>,
     request: FixedBuf,
@@ -83,7 +103,8 @@ pub(crate) struct PendingTypeInput {
 struct Slot {
     active: bool,
     name: SqlName,
-    /// Query text, parameter codes, result OIDs, then bound type inputs.
+    /// Query text, parameter codes, parameter OIDs, result OIDs, then bound
+    /// type inputs.
     /// All metadata shares the slot's configured `prepared_bytes` reservation.
     data: FixedBuf,
     text_len: usize,
@@ -93,6 +114,15 @@ struct Slot {
     n_results: usize,
     input_bytes: usize,
     plan: u64,
+}
+
+impl Slot {
+    fn parameter_oids(&self) -> PreparedTypeOids<'_> {
+        let start = self.text_len + self.n_params;
+        PreparedTypeOids {
+            bytes: &self.data.readable()[start..start + self.n_params * 4],
+        }
+    }
 }
 
 thread_local! {
@@ -124,18 +154,20 @@ pub(crate) fn with_active<R>(f: impl FnOnce(Option<&SqlPreparedPool>) -> R) -> R
 pub(crate) struct PreparedInfo<'a> {
     pub(crate) name: &'a str,
     pub(crate) statement: &'a str,
-    pub(crate) parameter_type_codes: &'a [u8],
+    /// The declared or inferred parameter types, domains included.
+    pub(crate) parameter_types: PreparedTypeOids<'a>,
     pub(crate) prepared_at: i64,
     pub(crate) custom_plans: i64,
-    pub(crate) result_types: PreparedResultTypes<'a>,
+    pub(crate) result_types: PreparedTypeOids<'a>,
 }
 
+/// Big-endian type OIDs retained with a prepared statement.
 #[derive(Clone, Copy)]
-pub(crate) struct PreparedResultTypes<'a> {
+pub(crate) struct PreparedTypeOids<'a> {
     bytes: &'a [u8],
 }
 
-impl PreparedResultTypes<'_> {
+impl PreparedTypeOids<'_> {
     pub(crate) fn len(self) -> usize {
         self.bytes.len() / 4
     }
@@ -197,14 +229,23 @@ impl SqlPreparedPool {
         })
     }
 
+    /// Retains a statement with its parameters' execution types and their
+    /// declared type OIDs (a domain parameter runs as its base type).
     pub fn store(
         &mut self,
         name: &str,
         sql: &str,
         param_types: &[ColType],
+        param_oids: &[i32],
         result_types: &[i32],
         type_inputs: &[u8],
     ) -> Result<(), SqlError> {
+        if param_oids.len() != param_types.len() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "prepared parameter types and type identities differ in count"
+            ));
+        }
         if self.get(name).is_some() {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::DUPLICATE_PREPARED_STATEMENT,
@@ -236,7 +277,7 @@ impl SqlPreparedPool {
         let result_bytes = result_types.len().saturating_mul(4);
         if sql
             .len()
-            .saturating_add(param_types.len())
+            .saturating_add(param_types.len().saturating_mul(5))
             .saturating_add(result_bytes)
             .saturating_add(type_inputs.len())
             > slot.data.capacity()
@@ -249,6 +290,12 @@ impl SqlPreparedPool {
         assert!(slot.data.append(sql.as_bytes()), "capacity checked above");
         for ctype in param_types {
             assert!(slot.data.append(&[ctype.code()]), "capacity checked above");
+        }
+        for type_oid in param_oids {
+            assert!(
+                slot.data.append(&type_oid.to_be_bytes()),
+                "capacity checked above"
+            );
         }
         for type_oid in result_types {
             assert!(
@@ -288,12 +335,20 @@ impl SqlPreparedPool {
             .map(|s| &s.data.readable()[s.text_len..s.text_len + s.n_params])
     }
 
+    /// The parameter type OIDs of a prepared statement, domains included.
+    pub(crate) fn get_type_oids(&self, name: &str) -> Option<PreparedTypeOids<'_>> {
+        self.slots
+            .iter()
+            .find(|slot| slot.active && slot.name.as_str() == name)
+            .map(Slot::parameter_oids)
+    }
+
     pub(crate) fn type_inputs(&self, name: &str) -> Option<&[u8]> {
         self.slots
             .iter()
             .find(|slot| slot.active && slot.name.as_str() == name)
             .map(|slot| {
-                let start = slot.text_len + slot.n_params + slot.n_results * 4;
+                let start = slot.text_len + slot.n_params * 5 + slot.n_results * 4;
                 &slot.data.readable()[start..start + slot.input_bytes]
             })
     }
@@ -527,17 +582,16 @@ impl SqlPreparedPool {
 
     pub(crate) fn visit(&self, mut visitor: impl FnMut(PreparedInfo<'_>)) {
         for slot in self.slots.iter().filter(|slot| slot.active) {
-            let result_start = slot.text_len + slot.n_params;
+            let result_start = slot.text_len + slot.n_params * 5;
             let result_end = result_start + slot.n_results * 4;
             visitor(PreparedInfo {
                 name: slot.name.as_str(),
                 statement: core::str::from_utf8(&slot.data.readable()[..slot.text_len])
                     .expect("prepared SQL was validated as UTF-8"),
-                parameter_type_codes: &slot.data.readable()
-                    [slot.text_len..slot.text_len + slot.n_params],
+                parameter_types: slot.parameter_oids(),
                 prepared_at: slot.prepared_at,
                 custom_plans: slot.custom_plans,
-                result_types: PreparedResultTypes {
+                result_types: PreparedTypeOids {
                     bytes: &slot.data.readable()[result_start..result_end],
                 },
             });

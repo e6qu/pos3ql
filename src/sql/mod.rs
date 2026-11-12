@@ -657,6 +657,12 @@ pub struct Engine {
     max_spill_generations_per_table: usize,
     result_streams_opened: u64,
     result_streams_spooled: [u64; 3],
+    /// Cold-read restarts after which a statement attempt reads the rest
+    /// synchronously: more than the block caches and read slots hold, so
+    /// the next attempt could not find every block the last one read.
+    restart_read_bound: u32,
+    /// The current attempt is past that bound.
+    complete_reads: bool,
     ckpt: Option<Checkpointer>,
     temporary_spiller: Option<TemporarySpiller>,
     /// A durable, installed manifest whose heap and journal cleanup remains.
@@ -2880,6 +2886,18 @@ impl Engine {
         let _ = self.replace_read_owner(Some(identity.read_owner()));
     }
 
+    /// See `restart_read_bound`.
+    pub(crate) fn restart_read_bound(&self) -> u32 {
+        self.restart_read_bound
+    }
+
+    /// Makes the next statement attempt read synchronously: it restarted
+    /// after more cold reads than the caches hold, so restarting again could
+    /// evict the blocks it needs and never finish.
+    pub(crate) fn set_complete_reads(&mut self, complete: bool) {
+        self.complete_reads = complete;
+    }
+
     pub(crate) fn bind_query_connection(&mut self, connection_id: i32) {
         self.work.bind_connection(connection_id);
         let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
@@ -2898,6 +2916,24 @@ impl Engine {
     pub(crate) fn cancel_read_owner(&mut self, owner: crate::store::ReadOwner) {
         if let Some(checkpointer) = &mut self.ckpt {
             checkpointer.cancel_read_owner(owner);
+        }
+    }
+
+    /// See [`crate::store::FetchHistory`]; without object storage nothing is
+    /// recorded.
+    pub(crate) fn exchange_fetch_history(&mut self, history: &mut crate::store::FetchHistory) {
+        if let Some(checkpointer) = &mut self.ckpt {
+            checkpointer.exchange_fetch_history(history);
+        }
+    }
+
+    /// Whether the bound connection waits on an object read still in flight
+    /// and holds no completed one, so running its statement again now would
+    /// only wait again.
+    pub(crate) fn read_owner_awaits_read(&self) -> bool {
+        match (&self.ckpt, self.read_owner) {
+            (Some(checkpointer), Some(owner)) => checkpointer.owner_awaits_read(owner),
+            _ => false,
         }
     }
 
@@ -4336,6 +4372,20 @@ impl Engine {
             max_spill_generations_per_table: config.max_spill_generations_per_table,
             result_streams_opened: 0,
             result_streams_spooled: [0; 3],
+            restart_read_bound: {
+                let plan = crate::store::StackPlan::resolve(
+                    config.block_cache_bytes,
+                    config.disk_cache_bytes,
+                );
+                u32::try_from(
+                    plan.ram
+                        .units
+                        .saturating_add(plan.disk.units)
+                        .saturating_add(config.object_store_get_slots),
+                )
+                .unwrap_or(u32::MAX)
+            },
+            complete_reads: false,
             commit_progress: CommitProgressMode::Inline,
             inflight_publication: None,
             publication_failed: false,
@@ -6175,6 +6225,7 @@ impl Engine {
                                     rowid,
                                     old_row: Some(old_row),
                                     command_id: p.cid,
+                                    moved_out: p.moved_out,
                                 },
                             )
                         })
@@ -10054,6 +10105,7 @@ impl Engine {
                             obligation.rowid,
                             txn.txid,
                             txn.isolation,
+                            self.storage.validation_read(),
                             arena,
                         ) {
                             return Ok(Err(error));
@@ -13190,7 +13242,10 @@ impl Engine {
                                         }
                                         self.storage.preserve_advisory_statement();
                                         self.rollback_waiting_statement(txn, statement_mark);
-                                        if !lock_timeout_expired {
+                                        // The statement runs again from its start, so
+                                        // its earlier attempt's output is withdrawn.
+                                        let withdrawn = responder.truncate_to(output_mark);
+                                        if withdrawn.is_ok() && !lock_timeout_expired {
                                             return Ok(ExtendedExecutionStatus::Blocked {
                                                 wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
                                                     StatementWait::ObjectIo
@@ -13201,10 +13256,12 @@ impl Engine {
                                         }
                                         self.storage
                                             .rollback_locks_to(txn.txid, statement_mark.lock);
-                                        e = sql_err!(
-                                            sqlstate::LOCK_NOT_AVAILABLE,
-                                            "canceling statement due to lock timeout"
-                                        );
+                                        e = withdrawn.err().unwrap_or_else(|| {
+                                            sql_err!(
+                                                sqlstate::LOCK_NOT_AVAILABLE,
+                                                "canceling statement due to lock timeout"
+                                            )
+                                        });
                                     } else {
                                         txn.procedure_restart = false;
                                         e = sql_err!(
@@ -15510,65 +15567,91 @@ impl Engine {
                         Ok(action) => action,
                         Err(error) => return Ok(Err(error)),
                     };
-                    let action = match query::attach_rule_source(
+                    let actions = match query::split_rule_insert_defaults(
                         action,
-                        transition.source,
-                        condition,
+                        || rule_insert_target_columns(storage, action, txn.txid, arena),
                         arena,
                     ) {
-                        Ok(action) => action,
+                        Ok(actions) => actions,
                         Err(error) => return Ok(Err(error)),
                     };
                     let use_returning = outer_returns_rows
                         && definition.returning_action == Some(action_index as u8);
-                    let action = if use_returning {
-                        match Self::rule_action_with_returning(
-                            storage, statement, columns, action, txn.txid, arena,
+                    if use_returning && actions.len() > 1 {
+                        return Ok(Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "RETURNING from a rule INSERT whose VALUES rows write DEFAULT in different columns is not supported"
+                        )));
+                    }
+                    // A rule INSERT split by its DEFAULT columns reports the
+                    // rows of every part.
+                    let mut instead_parts: Option<u64> = None;
+                    for action in actions {
+                        let action = match query::attach_rule_source(
+                            action,
+                            transition.source,
+                            condition,
+                            arena,
                         ) {
                             Ok(action) => action,
                             Err(error) => return Ok(Err(error)),
-                        }
-                    } else {
-                        action
-                    };
-                    let action_rows = match steps.begin(progress.as_deref_mut(), txn, responder) {
-                        Ok(Some(affected)) => affected,
-                        Ok(None) => {
-                            let outcome = Self::execute_rule_action(
-                                storage,
-                                scratch,
-                                arena,
-                                action,
-                                rule_authorization,
-                                txn,
-                                params,
-                                guc,
-                                responder,
-                                if use_returning { capture.take() } else { None },
-                                use_returning,
-                                connection_id,
-                                progress.as_deref_mut(),
-                            )?;
-                            if let Err(error) = outcome {
-                                return Ok(Err(steps.stop(
-                                    progress.as_deref_mut(),
-                                    error,
+                        };
+                        let action = if use_returning {
+                            match Self::rule_action_with_returning(
+                                storage, statement, columns, action, txn.txid, arena,
+                            ) {
+                                Ok(action) => action,
+                                Err(error) => return Ok(Err(error)),
+                            }
+                        } else {
+                            action
+                        };
+                        let action_rows = match steps.begin(progress.as_deref_mut(), txn, responder)
+                        {
+                            Ok(Some(affected)) => affected,
+                            Ok(None) => {
+                                let outcome = Self::execute_rule_action(
+                                    storage,
+                                    scratch,
                                     arena,
-                                    &storage.row_work,
-                                )));
+                                    action,
+                                    rule_authorization,
+                                    txn,
+                                    params,
+                                    guc,
+                                    responder,
+                                    if use_returning { capture.take() } else { None },
+                                    use_returning,
+                                    connection_id,
+                                    progress.as_deref_mut(),
+                                )?;
+                                if let Err(error) = outcome {
+                                    return Ok(Err(steps.stop(
+                                        progress.as_deref_mut(),
+                                        error,
+                                        arena,
+                                        &storage.row_work,
+                                    )));
+                                }
+                                let action_rows = responder.take_affected_rows().unwrap_or(0);
+                                if let Err(error) =
+                                    steps.finish(progress.as_deref_mut(), action_rows)
+                                {
+                                    return Ok(Err(error));
+                                }
+                                action_rows
                             }
-                            let action_rows = responder.take_affected_rows().unwrap_or(0);
-                            if let Err(error) = steps.finish(progress.as_deref_mut(), action_rows) {
-                                return Ok(Err(error));
-                            }
-                            action_rows
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        if definition.mode == crate::storage::RewriteMode::Instead
+                            && core::mem::discriminant(action) == core::mem::discriminant(statement)
+                        {
+                            instead_parts =
+                                Some(instead_parts.unwrap_or(0).saturating_add(action_rows));
                         }
-                        Err(error) => return Ok(Err(error)),
-                    };
-                    if definition.mode == crate::storage::RewriteMode::Instead
-                        && core::mem::discriminant(action) == core::mem::discriminant(statement)
-                    {
-                        instead_rows = Some(action_rows);
+                    }
+                    if instead_parts.is_some() {
+                        instead_rows = instead_parts;
                     }
                 }
                 Ok(Ok(()))
@@ -16140,6 +16223,7 @@ impl Engine {
                             let rewritten = match arena.alloc(Insert {
                                 source_position: rewritten.source_position,
                                 table: view.base,
+                                alias: rewritten.alias,
                                 columns,
                                 rows: rewritten.rows,
                                 select: rewritten.select,
@@ -16445,7 +16529,7 @@ impl Engine {
             self.work.reset();
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
-            let output_mark = responder.mark();
+            let output_mark = responder.attempt_mark();
             let outcome = self.execute_select_once(
                 statement,
                 arena,
@@ -16461,7 +16545,7 @@ impl Engine {
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                 return Ok(Err(error));
             }
-            if let Err(error) = responder.truncate_to(output_mark) {
+            if let Err(error) = responder.restart_attempt(output_mark) {
                 // Rows already sent cannot be withdrawn for another attempt.
                 return Ok(Err(error));
             }
@@ -16553,7 +16637,7 @@ impl Engine {
                 self.work.reset();
                 self.storage.set_read_snapshot(source_snapshot);
                 invocations.begin_attempt();
-                let output_mark = responder.mark();
+                let output_mark = responder.attempt_mark();
                 let outcome = {
                     let sequence =
                         sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
@@ -16568,7 +16652,7 @@ impl Engine {
                 if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                     return Ok(Err(error));
                 }
-                if let Err(error) = responder.truncate_to(output_mark) {
+                if let Err(error) = responder.restart_attempt(output_mark) {
                     // Rows already sent cannot be withdrawn for another attempt.
                     return Ok(Err(error));
                 }
@@ -16926,7 +17010,8 @@ impl Engine {
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
             let attempt_arena_mark = arena.mark();
-            let output_mark = responder.mark();
+            let attempt_mark = responder.attempt_mark();
+            let output_mark = attempt_mark.output();
             let (wal, lock) = (self.wal.stage_mark(txn.txid), self.storage.lock_mark());
             let statement_mark = txn.statement_mark(wal, lock);
             let effects = txn.transaction_effect_mark();
@@ -16942,6 +17027,7 @@ impl Engine {
                 command: txn.command_id(),
                 depth: txn.trigger_depth(),
                 retained: true,
+                statement_end: true,
             });
             let prior_handoff = core::mem::replace(&mut txn.write_completion_boundary, boundary);
             let outcome = {
@@ -17047,7 +17133,7 @@ impl Engine {
                 unfinished.map_or((statement_mark, output_mark), |row| (row.mark, row.output));
             self.rollback_waiting_statement(txn, rollback);
             self.dml_scratch.clear();
-            if let Err(error) = responder.truncate_to(output_mark) {
+            if let Err(error) = responder.restart_attempt(attempt_mark.restarted_at(output_mark)) {
                 // Rows already sent cannot be withdrawn for another attempt.
                 return Ok(Err(error));
             }
@@ -19053,6 +19139,7 @@ impl Engine {
                     rowid,
                     old_row: None,
                     command_id: pending.cid,
+                    moved_out: pending.moved_out,
                 },
             };
             records = records.saturating_add(1);
@@ -20436,7 +20523,10 @@ impl Engine {
                     | Stmt::Merge(_)
                     | Stmt::With { .. }
             );
-        let _atomic_reads = if statement_writes(statement) && !yields_before_effects {
+        let _atomic_reads = if (statement_writes(statement)
+            || reset_workspace && self.complete_reads)
+            && !yields_before_effects
+        {
             self.ckpt
                 .as_ref()
                 .map(Checkpointer::atomic_block_read_scope)
@@ -20466,6 +20556,9 @@ impl Engine {
         // install this session's effective search path in the worker-local
         // execution context used by every name resolution below.
         let _ = eval::take_diagnostic();
+        if reset_workspace {
+            eval::clear_eval_messages();
+        }
         exec::reset_record_shapes();
         for (_, composite) in self.storage.composites_with_slots_visible_to(txn.txid) {
             if let Err(error) = exec::register_named_composite_shape(
@@ -20648,6 +20741,11 @@ impl Engine {
                 | Stmt::Delete(_)
                 | Stmt::Merge(_)
         ) {
+            if let Err(error) =
+                exec::reject_dml_target_references(&self.storage, txn.txid, statement)
+            {
+                return Ok(Err(error));
+            }
             let planned = planner_inputs::with_parameters(Some(params), || {
                 self.prepare_planner_inputs(
                     statement, None, arena, txn, sqlprep, cursors, guc, responder,
@@ -21014,6 +21112,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 identities,
                 *if_exists,
                 *cascade,
@@ -21274,6 +21374,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 exec::DropRoutineCommand {
                     targets: exec::DropRoutineTargets::Routines(functions),
                     if_exists: *if_exists,
@@ -21291,6 +21393,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 exec::DropRoutineCommand {
                     targets: exec::DropRoutineTargets::Routines(procedures),
                     if_exists: *if_exists,
@@ -21308,6 +21412,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 exec::DropRoutineCommand {
                     targets: exec::DropRoutineTargets::Routines(routines),
                     if_exists: *if_exists,
@@ -21325,6 +21431,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 aggregates,
                 *if_exists,
                 *cascade,
@@ -21439,6 +21547,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 names,
                 *if_exists,
                 *cascade,
@@ -21461,6 +21571,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 names,
                 *if_exists,
                 *cascade,
@@ -21549,6 +21661,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 *kind,
                 name,
                 *if_exists,
@@ -21838,6 +21952,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 names,
                 *if_exists,
                 *cascade,
@@ -22124,6 +22240,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 names,
                 *if_exists,
                 *cascade,
@@ -27719,6 +27837,7 @@ fn replay_transaction_batches(
                             table,
                             rowid,
                             command_id,
+                            moved_out,
                             ..
                         } => {
                             let Some(table_slot) =
@@ -27729,14 +27848,25 @@ fn replay_transaction_batches(
                             let row_target = storage
                                 .select_table_definition(table_slot, transaction_id)
                                 .0;
-                            prepared.slot_mut(slot).transaction.write_row(
-                                storage,
-                                row_target,
-                                rowid,
-                                command_id,
-                                None,
-                                crate::storage::RowWriteStatistics::Untracked,
-                            )?;
+                            let transaction = &mut prepared.slot_mut(slot).transaction;
+                            if moved_out {
+                                transaction.move_row_out(
+                                    storage,
+                                    row_target,
+                                    rowid,
+                                    command_id,
+                                    crate::storage::RowWriteStatistics::Untracked,
+                                )?;
+                            } else {
+                                transaction.write_row(
+                                    storage,
+                                    row_target,
+                                    rowid,
+                                    command_id,
+                                    None,
+                                    crate::storage::RowWriteStatistics::Untracked,
+                                )?;
+                            }
                         }
                         WalOp::SequenceAdvance {
                             identity,
@@ -28746,12 +28876,13 @@ fn apply_wal_op(
             };
             let loc = storage.heap.append_bytes(row)?;
             storage.observe_rowid(rowid);
-            storage.replay_committed_row(index, rowid, Some(loc), lsn)?;
+            storage.replay_committed_row(index, rowid, Some(loc), false, lsn)?;
         }
         WalOp::Delete {
             schema,
             table,
             rowid,
+            moved_out,
             ..
         } => {
             let Some(index) = storage.wal_table_slot(schema, table, 0) else {
@@ -28760,7 +28891,7 @@ fn apply_wal_op(
                     message: stack_format!(192, "journal deletes from unknown table \"{}\"", table),
                 });
             };
-            storage.replay_committed_row(index, rowid, None, lsn)?;
+            storage.replay_committed_row(index, rowid, None, moved_out, lsn)?;
         }
         WalOp::CreateView {
             identity,
@@ -31089,4 +31220,31 @@ pub(crate) fn analyze_dml_cte<'a>(
             source: ast::MaterializedCteSource::Inline(&[]),
         },
     ))
+}
+
+/// The column names, in order, of the table a rule's INSERT action writes.
+fn rule_insert_target_columns<'a>(
+    storage: &Storage,
+    action: &Stmt<'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [&'a str], SqlError> {
+    let Stmt::Insert(insert) = action else {
+        return Ok(&[]);
+    };
+    let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(insert.table.schema, insert.table.name, txid)
+    else {
+        return Ok(&[]);
+    };
+    let definition = storage.table_def(slot, txid);
+    let names = arena
+        .alloc_slice_with(definition.columns().len(), |_| "")
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for (name, column) in names.iter_mut().zip(definition.columns()) {
+        *name = arena
+            .alloc_str(column.name.as_str())
+            .map_err(|_| crate::sql::eval::arena_full())?;
+    }
+    Ok(names)
 }

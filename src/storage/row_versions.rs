@@ -712,6 +712,7 @@ mod tests {
             loc: Some(RowLoc::test(command, 4)),
             changed_columns: ColumnSet::EMPTY,
             changes_existence: false,
+            moved_out: false,
         }
     }
 

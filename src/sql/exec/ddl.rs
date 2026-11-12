@@ -744,6 +744,7 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
         | Expr::BoundLiteral { .. }
         | Expr::BitLit(_)
         | Expr::Param(_)
+        | Expr::OuterAggregate { .. }
         | Expr::DefaultMarker => {}
         Expr::Array(items) => {
             for e in *items {
@@ -777,6 +778,28 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
 /// Applies each parsed table constraint to `def`: single-column PK/UNIQUE set
 /// column flags; multi-column PK/UNIQUE become entries in `def.uniques`; CHECK
 /// predicates and FOREIGN KEYs are validated and recorded.
+/// PostgreSQL's rejection of a key, foreign key or exclusion constraint on a
+/// foreign table, positioned where the constraint was written.
+pub(super) fn reject_foreign_table_constraint(
+    constraint: &TableConstraint,
+) -> Result<(), SqlError> {
+    let kind = match constraint {
+        TableConstraint::PrimaryKey { .. } => "primary key",
+        TableConstraint::Unique { .. } => "unique",
+        TableConstraint::ForeignKey { .. } => "foreign key",
+        TableConstraint::Exclusion { .. } => "exclusion",
+        TableConstraint::Check { .. } => return Ok(()),
+    };
+    Err(crate::sql::error_position::at_source_position(
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} constraints are not supported on foreign tables",
+            kind
+        ),
+        constraint.source_position(),
+    ))
+}
+
 pub(super) fn attach_constraints(
     storage: &Storage,
     def: &mut TableDefBuilder,
@@ -794,8 +817,12 @@ pub(super) fn attach_constraints(
             .iter()
             .any(|k| k.kind.is_primary());
     for con in constraints {
+        if def.kind == crate::storage::TableKind::Foreign {
+            reject_foreign_table_constraint(con)?;
+        }
         match con {
             TableConstraint::PrimaryKey {
+                source_position: _,
                 name,
                 columns,
                 timing,
@@ -855,6 +882,7 @@ pub(super) fn attach_constraints(
                 }
             }
             TableConstraint::Unique {
+                source_position: _,
                 name,
                 columns,
                 timing,
@@ -915,6 +943,7 @@ pub(super) fn attach_constraints(
                 }
             }
             TableConstraint::Check {
+                source_position: _,
                 name,
                 expression,
                 text,
@@ -964,6 +993,7 @@ pub(super) fn attach_constraints(
                 def.n_checks += 1;
             }
             TableConstraint::ForeignKey {
+                source_position: _,
                 name,
                 columns,
                 parent,
@@ -1001,6 +1031,7 @@ pub(super) fn attach_constraints(
                 )?;
             }
             TableConstraint::Exclusion {
+                source_position: _,
                 name,
                 columns,
                 operators,
@@ -1014,10 +1045,13 @@ pub(super) fn attach_constraints(
                         def.columns[column as usize].ctype,
                         crate::sql::types::ColType::Range(_)
                     ) {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "data type {} has no default operator class for access method \"gist\"",
-                            def.columns[column as usize].ctype.name()
+                        return Err(crate::sql::error_position::with_hint(
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "data type {} has no default operator class for access method \"gist\"",
+                                def.columns[column as usize].ctype.name()
+                            ),
+                            crate::sql::error_position::DEFAULT_OPERATOR_CLASS_HINT,
                         ));
                     }
                 }

@@ -440,6 +440,7 @@ impl<'a> SortState<'a> {
 
     /// Encodes one filtered input row: its sort keys, saved output values
     /// and, for postponed items, its input columns.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn encode_input<'work>(
         &self,
         scope: &QueryScope<'_>,
@@ -448,6 +449,7 @@ impl<'a> SortState<'a> {
         row: &scan::JoinRow<'_, 'work, '_>,
         work: &'work Arena,
         params: &[Datum<'_>],
+        subqueries: Option<&crate::sql::eval::SubqueryValues<'_, '_>>,
     ) -> Result<&'work [u8], SqlError> {
         let catalog = StorageCatalog {
             storage,
@@ -458,6 +460,7 @@ impl<'a> SortState<'a> {
         };
         let hooks = EvalHooks {
             catalog: Some(&catalog),
+            subs: subqueries,
             ..crate::sql::eval::NO_HOOKS
         };
         let mut values = crate::mem::arena::ArenaList::new(work);
@@ -610,6 +613,7 @@ impl<'a> SortState<'a> {
                 buffer_offsets: &[],
             },
             rowids,
+            visible: scope.n,
         })
     }
 }

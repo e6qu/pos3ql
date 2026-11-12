@@ -2926,6 +2926,22 @@ impl TableDefView<'_> {
     }
 }
 
+/// PostgreSQL's system columns, which a table's own columns cannot be named.
+pub(crate) const SYSTEM_COLUMN_NAMES: [&str; 6] =
+    ["tableoid", "cmax", "xmax", "cmin", "xmin", "ctid"];
+
+/// Rejects a table column named like a system column (`CheckAttributeNamesTypes`).
+pub(crate) fn reject_system_column_name(name: &str) -> Result<(), SqlError> {
+    if SYSTEM_COLUMN_NAMES.contains(&name) {
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_COLUMN,
+            "column name \"{}\" conflicts with a system column name",
+            name
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn partition_bound_matches(
     strategy: PartitionStrategy,
     keys: [u16; MAX_PARTITION_KEYS],
@@ -3119,6 +3135,9 @@ pub struct RowState {
     /// generations; WAL/SST objects, not this metadata, are the durable copy.
     pub history: CommittedHistory,
     pub pending: PendingVersions,
+    /// The committed deletion moved the row to another partition; only set
+    /// while `committed` is `None`.
+    pub(crate) committed_moved_out: bool,
 }
 
 /// Where a committed row's bytes live: the RAM heap, or spilled to the
@@ -3197,6 +3216,10 @@ pub(crate) struct PendingChange {
     /// Insert and delete change index membership even when an index expression
     /// or predicate references no table column.
     pub changes_existence: bool,
+    /// The deletion half of an `UPDATE` or `MERGE` that moved the row to
+    /// another partition. Never set with an image. PostgreSQL marks such a
+    /// version so a later locker fails instead of treating it as deleted.
+    pub moved_out: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3268,6 +3291,7 @@ impl RowState {
             checkpoint_change_lsn: commit_lsn,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
+            committed_moved_out: false,
         }
     }
 }
@@ -19292,6 +19316,11 @@ impl Storage {
             .find(|activity| activity.pid == pid)
             .copied()
         else {
+            crate::sql::eval::raise_eval_message(
+                crate::sql::eval::EvalMessageLevel::Warning,
+                sqlstate::WARNING,
+                format_args!("PID {pid} is not a PostgreSQL backend process"),
+            )?;
             return Ok(false);
         };
         let current_role = self
@@ -37201,6 +37230,7 @@ impl Storage {
         table_index: usize,
         rowid: u64,
         image: Option<RowLoc>,
+        moved_out: bool,
         commit_lsn: u64,
     ) -> Result<(), SqlError> {
         self.tables[table_index]
@@ -37216,6 +37246,7 @@ impl Storage {
                 checkpoint_change_lsn: 0,
                 history: CommittedHistory::empty(),
                 pending: PendingVersions::empty(),
+                committed_moved_out: false,
             },
         };
         if state.pending.is_some() {
@@ -37236,6 +37267,7 @@ impl Storage {
             return Ok(());
         }
         state.committed = image.map(RowHome::Heap);
+        state.committed_moved_out = moved_out;
         state.committed_lsn = commit_lsn;
         state.committed_generation = Some(generation);
         state.checkpoint_change_lsn = commit_lsn;
@@ -37663,6 +37695,7 @@ impl Storage {
             }
         }
         state.committed = pending.loc.map(RowHome::Heap);
+        state.committed_moved_out = pending.moved_out;
         state.committed_lsn = commit_lsn;
         state.committed_generation = Some(generation);
         state.checkpoint_change_lsn = commit_lsn;
@@ -41002,6 +41035,9 @@ impl Storage {
     /// A name already visible to `txid` is a duplicate (42P07); a name held by
     /// another transaction's uncommitted DDL joins the shared wait graph.
     pub fn create_table_in(&self, mut def: TableDefBuilder, txid: u32) -> Result<usize, SqlError> {
+        for column in def.columns() {
+            reject_system_column_name(column.name.as_str())?;
+        }
         def.has_toast |= def
             .columns()
             .iter()
@@ -47094,6 +47130,19 @@ impl Storage {
         self.has_routine_candidate(name, arity, txid, |_, _| true)
     }
 
+    /// Whether a visible routine other than an aggregate could answer `name`
+    /// with `arity` arguments, such as a `sum(integer)` function.
+    pub(crate) fn has_non_aggregate_routine_candidate(
+        &self,
+        name: &str,
+        arity: usize,
+        txid: u32,
+    ) -> bool {
+        self.has_routine_candidate(name, arity, txid, |kind, _| {
+            !matches!(kind, RoutineKind::Aggregate(_))
+        })
+    }
+
     pub(crate) fn has_volatile_function_routine_candidate(
         &self,
         name: &str,
@@ -47108,6 +47157,19 @@ impl Storage {
                     | RoutineKind::RecordFunction { .. }
                     | RoutineKind::TableFunction
             ) && attributes.volatility == RoutineVolatility::Volatile
+        })
+    }
+
+    /// Whether a visible user-defined aggregate could be what `name` with
+    /// `arity` arguments calls; built-in aggregates are known by name.
+    pub(crate) fn has_aggregate_routine_candidate(
+        &self,
+        name: &str,
+        arity: usize,
+        txid: u32,
+    ) -> bool {
+        self.has_routine_candidate(name, arity, txid, |kind, _| {
+            matches!(kind, RoutineKind::Aggregate(_))
         })
     }
 
@@ -52445,6 +52507,13 @@ impl Storage {
                 transaction_id
             ));
         }
+        // PostgreSQL's bootstrap (1) and frozen (2) identities are permanently
+        // committed; the invalid identity 0 has no status.
+        match transaction_id {
+            0 => return Ok(None),
+            1 | 2 => return Ok(Some("committed")),
+            _ => {}
+        }
         if identities.active.iter().any(|identity| {
             identity.assigned && u64::from(identity.transaction_id) == transaction_id
         }) {
@@ -53927,6 +53996,52 @@ impl Storage {
             operator.database == current_database() && operator.visible_to(txid)
         })
         .map(move |(slot, operator)| (slot, operator.definition_for(txid)))
+    }
+
+    /// Whether a visible operator of this database named `name` lives in a
+    /// schema on the search path. Builtin operator evaluation asks this per
+    /// row, so it scans under one lock and copies only matching names.
+    pub(crate) fn has_operator_named_on_path(&self, name: &str, txid: u32) -> bool {
+        const BATCH: usize = 16;
+        let mut next = 0;
+        loop {
+            let mut schemas = [None; BATCH];
+            let mut found = 0;
+            let mut resume = None;
+            {
+                let catalog = self
+                    .operator_catalog
+                    .lock()
+                    .expect("operator catalog lock poisoned");
+                for (slot, operator) in catalog.operators.iter().enumerate().skip(next) {
+                    if !(operator.database == current_database() && operator.visible_to(txid)) {
+                        continue;
+                    }
+                    let definition = operator.definition_for(txid);
+                    if definition.name.as_str() != name {
+                        continue;
+                    }
+                    if found == BATCH {
+                        resume = Some(slot);
+                        break;
+                    }
+                    schemas[found] = Some(definition.schema);
+                    found += 1;
+                }
+            }
+            // The search path is read without the operator catalog's lock.
+            if schemas[..found]
+                .iter()
+                .flatten()
+                .any(|schema| self.schema_is_on_path(*schema, txid))
+            {
+                return true;
+            }
+            match resume {
+                Some(slot) => next = slot,
+                None => return false,
+            }
+        }
     }
 
     pub(crate) fn operator_count(&self) -> usize {
@@ -57460,11 +57575,14 @@ impl Storage {
             }
         };
         class.ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "data type {} has no default operator class for access method \"{}\"",
-                input.ctype.name(),
-                method.name()
+            crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "data type {} has no default operator class for access method \"{}\"",
+                    input.ctype.name(),
+                    method.name()
+                ),
+                crate::sql::error_position::DEFAULT_OPERATOR_CLASS_HINT,
             )
         })
     }

@@ -7,6 +7,7 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod aggregate_levels;
 mod array_element_comparisons;
 mod assignment_and_name_diagnostics;
 mod builtin_aggregate_resolution;
@@ -34,6 +35,7 @@ mod geometry_assignments;
 mod index_parent_ownership;
 mod indirect_execute_privileges;
 mod information_schema_domains;
+mod initplans;
 mod joined_dml_returning;
 mod key_preparation;
 mod nested_planner_inputs;
@@ -26688,6 +26690,24 @@ fn command_tags(bytes: &[u8]) -> Vec<String> {
 }
 
 /// Extracts text values from DataRow messages, '|'-joined per row.
+/// The message text of each `NoticeResponse` in `bytes`.
+fn notice_messages(bytes: &[u8]) -> Vec<String> {
+    let mut messages = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let length = u32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        if bytes[offset] == b'N'
+            && let Some(message) = bytes[offset + 5..offset + 1 + length]
+                .split(|byte| *byte == 0)
+                .find(|field| field.first() == Some(&b'M'))
+        {
+            messages.push(String::from_utf8(message[1..].to_vec()).unwrap());
+        }
+        offset += 1 + length;
+    }
+    messages
+}
+
 fn data_rows(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -28529,6 +28549,20 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
         )
         .unwrap();
     assert_eq!(inferred[..2], [domain_oid, enum_oid]);
+    // Parameters inside a data-modifying statement's own expressions take
+    // the type their target-scope operands give them, through an alias too.
+    let inferred = engine
+        .infer_param_types(
+            "UPDATE protocol_types AS t SET count = t.count + $1 \
+             WHERE t.count + $2 > 0 RETURNING t.count * $3",
+            &arena,
+            &transaction,
+            3,
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(inferred[..3], [crate::sql::types::oid::INT4; 3]);
     let inferred = engine
         .infer_param_types(
             "SELECT p.state, count(*) FROM protocol_types p \
@@ -46536,7 +46570,9 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
         String::from_utf8_lossy(&branches)
     );
 
-    let unsupported = run_with(
+    // An AFTER trigger's NEW is a record local to the invocation, as in
+    // PostgreSQL: assigning it does not change the stored row.
+    run_with(
         &mut engine,
         &mut budget,
         "CREATE FUNCTION after_mutation() RETURNS trigger LANGUAGE plpgsql AS
@@ -46545,18 +46581,14 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
            FOR EACH ROW EXECUTE FUNCTION after_mutation();
          INSERT INTO trigger_body_target (id, value) VALUES (2, 3);",
     );
-    assert!(
-        String::from_utf8_lossy(&unsupported).contains("0A000"),
-        "{}",
-        String::from_utf8_lossy(&unsupported)
-    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT count(*) FROM trigger_body_target WHERE id = 2"
+            "SELECT value FROM trigger_body_target WHERE id = 2"
         )),
-        ["0"]
+        // The BEFORE trigger's increment, not the AFTER trigger's assignment.
+        ["4"]
     );
 
     // As in PostgreSQL, RETURNING without INTO is accepted when the function
@@ -62716,14 +62748,15 @@ fn lateral_joins() {
         data_rows(&bytes),
         ["1|1|10", "1|2|20", "2|1|10", "2|2|20", "2|3|30"]
     );
-    // RIGHT JOIN LATERAL is rejected loudly.
-    assert!(
-        String::from_utf8_lossy(&run_with(
+    // A LATERAL item on the right of a RIGHT join that reads nothing of
+    // the join's left side runs once for the join, as in PostgreSQL.
+    assert_eq!(
+        data_rows(&run_with(
             &mut e,
             &mut b,
-            "SELECT * FROM lt t RIGHT JOIN LATERAL (SELECT 1) s ON true"
-        ))
-        .contains("0A000")
+            "SELECT t.id, s.k FROM lt t RIGHT JOIN LATERAL (SELECT 1 AS k) s ON true ORDER BY 1"
+        )),
+        ["1|1", "2|1", "3|1"]
     );
 }
 
@@ -75214,7 +75247,7 @@ fn typed_table_membership_controls_composite_attribute_and_drop_lifecycle() {
         "ALTER TABLE typed_lifecycle_rows ADD COLUMN forbidden integer",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("0A000"),
+        String::from_utf8_lossy(&output).contains("cannot add column to typed table"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -101211,4 +101244,38 @@ fn pseudo_type_columns_fail_like_postgresql() {
     }
     let output = session.execute(&mut engine, "CREATE TABLE p(c anyelement[])", false);
     assert_eq!(error_sqlstates(&output), ["42704"]);
+}
+
+#[test]
+fn spilled_grouping_keys_read_enclosing_aggregates() {
+    for external in [false, true] {
+        let mut config = test_config(if external {
+            "outer-aggregate-key-external"
+        } else {
+            "outer-aggregate-key-inline"
+        });
+        config.object_store_on = external;
+        config.object_store_sim = external;
+        config.object_store_bucket =
+            format!("outer-aggregate-key-{}-{external}", std::process::id());
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        assert_eq!(engine.storage.spill_attached(), external);
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE oak_t (id int); CREATE TABLE oak_u (x int); \
+             INSERT INTO oak_t VALUES (1),(2),(3); INSERT INTO oak_u VALUES (5),(6)",
+        );
+        assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+        // The inner query groups by the outer query's aggregate.
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT (SELECT count(*) FROM oak_u GROUP BY max(oak_t.id)) FROM oak_t",
+            )),
+            ["2"]
+        );
+    }
 }

@@ -27,6 +27,14 @@ macro_rules! delegate_async_block_reads {
             self.inner.read_capacity_generation()
         }
 
+        fn owner_awaits_read(&self, owner: super::ReadOwner) -> bool {
+            self.inner.owner_awaits_read(owner)
+        }
+
+        fn exchange_fetch_history(&mut self, history: &mut super::FetchHistory) {
+            self.inner.exchange_fetch_history(history);
+        }
+
         fn enable_async_gets(&mut self) {
             self.inner.enable_async_gets();
         }
@@ -330,6 +338,49 @@ pub(crate) fn decode(bytes: &[u8], verify_identity: bool) -> Result<Block<'_>, B
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ReadOwner(pub(crate) u128);
 
+/// The objects one message's attempts have requested from object storage, as
+/// a fixed Bloom filter. Requesting one again means the caches evicted it
+/// before the message finished, so restarting cannot be relied on to finish.
+/// A false positive only reports such a refetch early.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FetchHistory {
+    bits: [u64; 32],
+    refetched: bool,
+}
+
+impl FetchHistory {
+    pub(crate) const fn new() -> Self {
+        Self {
+            bits: [0; 32],
+            refetched: false,
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Records a request for `id`, noting whether it was requested before.
+    pub(crate) fn record(&mut self, id: &BlockId) {
+        const BITS: usize = 32 * 64;
+        // Block names are SHA-256 digests: their bytes are already uniform.
+        let first = u16::from_le_bytes([id.0[0], id.0[1]]) as usize % BITS;
+        let second = u16::from_le_bytes([id.0[2], id.0[3]]) as usize % BITS;
+        let mut seen = true;
+        for bit in [first, second] {
+            let (word, mask) = (bit / 64, 1u64 << (bit % 64));
+            seen &= self.bits[word] & mask != 0;
+            self.bits[word] |= mask;
+        }
+        self.refetched |= seen;
+    }
+
+    /// Whether an object was requested again since the last call.
+    pub(crate) fn take_refetched(&mut self) -> bool {
+        core::mem::take(&mut self.refetched)
+    }
+}
+
 /// Accepts immutable block bytes and returns their content identity. A batch
 /// writer owns those bytes until its caller completes the uploads; identities
 /// must not enter a published root before that completion.
@@ -416,6 +467,16 @@ pub(crate) trait BlockStore {
     fn read_capacity_generation(&self) -> u64 {
         0
     }
+
+    /// Whether `owner` waits on an object read still in flight and holds no
+    /// completed one: running its statement again would only wait again.
+    fn owner_awaits_read(&self, _owner: ReadOwner) -> bool {
+        false
+    }
+
+    /// Swaps in the request history of the message about to run (and back
+    /// out after it), so object requests record into that message's history.
+    fn exchange_fetch_history(&mut self, _history: &mut FetchHistory) {}
 
     /// Enables non-blocking object reads for this stack. The server owns the
     /// resulting socket readiness registration.
@@ -649,6 +710,22 @@ impl From<BlockError> for StoreError {
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_history_reports_an_object_requested_again() {
+        let mut history = FetchHistory::new();
+        let first = BlockId::for_block(BlockType::SstData, b"first");
+        let second = BlockId::for_block(BlockType::SstData, b"second");
+        history.record(&first);
+        history.record(&second);
+        assert!(!history.take_refetched());
+        history.record(&first);
+        assert!(history.take_refetched());
+        assert!(!history.take_refetched());
+        history.clear();
+        history.record(&first);
+        assert!(!history.take_refetched());
+    }
 
     fn round_trip(payload: &[u8], block_type: BlockType, lsn: u64) {
         let mut buffer = [0u8; BLOCK_SIZE];

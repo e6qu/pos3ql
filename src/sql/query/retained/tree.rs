@@ -89,6 +89,7 @@ impl<'a> ScanNode<'a> {
                 offsets: &[0],
             },
             rowids: &rowids,
+            visible: scope.n,
         })
     }
 }
@@ -144,6 +145,8 @@ pub(super) struct Pull<'c, 'a> {
     pub(super) buffers: &'c mut RowCursorBuffers,
     pub(super) work: &'c Arena,
     pub(super) params: &'c [Datum<'c>],
+    /// The statement's subquery results, run before its first row.
+    pub(super) subqueries: Option<&'c crate::sql::eval::SubqueryValues<'c, 'c>>,
 }
 
 /// A retained plan: its nodes, leaf first and root last.
@@ -530,6 +533,7 @@ fn advance<'a>(
                 pull.buffers,
                 pull.work,
                 pull.params,
+                pull.subqueries,
             )?;
             if !ready {
                 *state = ReaderState::Complete;
@@ -558,6 +562,7 @@ fn advance<'a>(
                 };
                 let hooks = EvalHooks {
                     catalog: Some(&catalog),
+                    subs: pull.subqueries,
                     ..crate::sql::eval::NO_HOOKS
                 };
                 where_passes(predicate, work, pull.params, row, &hooks)
@@ -569,6 +574,10 @@ fn advance<'a>(
             }
             release(below, pull.state_arena);
         },
+        // A row a wait interrupted before it was released is evaluated
+        // again rather than skipped.
+        PlanNode::Sort(sort) if sort.has_current() => Ok(true),
+        PlanNode::Group(group) if group.has_current() => Ok(true),
         PlanNode::Sort(sort) => {
             while !sort.filled() {
                 if !advance(below, state, keep_finished, pull)? {
@@ -578,7 +587,15 @@ fn advance<'a>(
                 let work = pull.work;
                 let mark = work.mark();
                 let pushed = with_row(below, pull.scope, work, |row| {
-                    sort.encode_input(pull.scope, pull.storage, pull.txid, row, work, pull.params)
+                    sort.encode_input(
+                        pull.scope,
+                        pull.storage,
+                        pull.txid,
+                        row,
+                        work,
+                        pull.params,
+                        pull.subqueries,
+                    )
                 })
                 .and_then(|row| sort.push_encoded(row));
                 // SAFETY: the encoded row was copied into the sort's lease.
@@ -606,6 +623,7 @@ fn advance<'a>(
                     };
                     let hooks = EvalHooks {
                         catalog: Some(&catalog),
+                        subs: pull.subqueries,
                         ..crate::sql::eval::NO_HOOKS
                     };
                     group.accept(

@@ -450,10 +450,21 @@ pub(crate) fn at_subject(error: SqlError, subject: &str) -> SqlError {
     error
 }
 
+/// PostgreSQL's hint for a type without a default operator class.
+pub(crate) const DEFAULT_OPERATOR_CLASS_HINT: &str = "You must specify an operator class for the index or define a default operator class for the data type.";
+
 /// Attaches PostgreSQL's `hint` to `error`.
 pub(crate) fn with_hint(error: SqlError, hint: &'static str) -> SqlError {
     record(&error, None, Some(hint));
     error
+}
+
+/// Positions `error` where the parser recorded `position`.
+pub(crate) fn at_source_position(
+    error: SqlError,
+    position: crate::sql::ast::SourcePosition,
+) -> SqlError {
+    at_parsed_offset(error, position.get())
 }
 
 /// A position at byte `at` of the parsed source.
@@ -491,6 +502,12 @@ pub(crate) fn expression_error(
     let message = error.message.as_str();
     match expression {
         Expr::Column { qualifier, name } => column_reference(error, *qualifier, name),
+        // An aggregate placed where its query cannot compute it.
+        Expr::Call {
+            source_position, ..
+        } if state == sqlstate::GROUPING_ERROR && message.starts_with("aggregate function") => {
+            at_parsed_offset(error, source_position.get())
+        }
         Expr::Cast {
             type_name,
             operand,

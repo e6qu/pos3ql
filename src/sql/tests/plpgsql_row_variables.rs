@@ -171,3 +171,42 @@ fn before_triggers_select_into_new_fields() {
         );
     });
 }
+
+#[test]
+fn trigger_records_are_assignable_record_variables() {
+    with_engine("plpgsql-trigger-records", |engine, budget| {
+        for sql in [
+            "CREATE TABLE rec (a int, b text)",
+            "CREATE FUNCTION old_row() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+             SELECT 'from old' INTO OLD.b; OLD.a := OLD.a * 10; RETURN OLD; END $$",
+            "CREATE FUNCTION after_row() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+             NEW.a := NEW.a + 100; RAISE NOTICE '%', NEW; RETURN NULL; END $$",
+            "CREATE TRIGGER old_row BEFORE UPDATE ON rec FOR EACH ROW EXECUTE FUNCTION old_row()",
+            "CREATE TRIGGER after_row AFTER INSERT ON rec FOR EACH ROW EXECUTE FUNCTION after_row()",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        assert_eq!(
+            notices(engine, budget, "INSERT INTO rec VALUES (1, 'x')"),
+            ["NOTICE 00000 (101,x)", "INSERT 0 1"]
+        );
+        run_with(engine, budget, "UPDATE rec SET b = 'y'");
+        assert_eq!(
+            data_rows(&run_with(engine, budget, "SELECT * FROM rec")),
+            ["10|from old"]
+        );
+        for sql in [
+            "CREATE FUNCTION scalar_row() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN RETURN ROW(5, 6); END $$",
+            "CREATE TRIGGER scalar_row BEFORE INSERT ON rec FOR EACH ROW EXECUTE FUNCTION scalar_row()",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        assert_eq!(
+            notices(engine, budget, "INSERT INTO rec VALUES (1, 'x')")[0],
+            "ERROR 42804 returned row structure does not match the structure of the triggering \
+             table detail: Returned type integer does not match expected type text in column \
+             \"b\" (position 2)."
+        );
+    });
+}

@@ -158,6 +158,7 @@ fn run<'a>(
         command: context.txn.command_id(),
         depth: context.txn.trigger_depth(),
         retained: true,
+        statement_end: false,
     });
     context.txn.running_procedures = context
         .txn
@@ -181,9 +182,7 @@ fn run<'a>(
             context,
             definition,
             body.invocation,
-            None,
-            &mut None,
-            false,
+            &mut TriggerRows::none(),
             None,
             body.code,
         )

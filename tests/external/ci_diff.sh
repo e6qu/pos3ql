@@ -9,6 +9,7 @@
 # Env:
 #   PGHOST / PGPORT / PGUSER   PostgreSQL to diff against (default 127.0.0.1 / 5432 / postgres)
 #   P3_PORT                    port pos3ql should listen on (default 15599)
+#   P3_OPERATIONS_PORT         pos3ql's operations endpoint port (default 15597)
 #   SLT_LIMIT                  max sqllogictest blocks per file (default 20000 = all vendored)
 #   SLT_UNSUPPORTED_BUDGET     maximum unsupported blocks per shard (ratchet)
 #   FUZZ_COUNT / FUZZ_SEED     generative fuzz statements / seed (default 20000 / 1)
@@ -44,6 +45,7 @@ PGPORT=${PGPORT:-5432}
 PGUSER=${PGUSER:-postgres}
 export PGHOST PGPORT PGUSER
 P3_PORT=${P3_PORT:-15599}
+P3_OPERATIONS_PORT=${P3_OPERATIONS_PORT:-15597}
 SLT_LIMIT=${SLT_LIMIT:-20000}
 SLT_UNSUPPORTED_BUDGET=${SLT_UNSUPPORTED_BUDGET:-0}
 FUZZ_COUNT=${FUZZ_COUNT:-20000}
@@ -236,6 +238,8 @@ SQL
 printf 'pos3ql executable: %s\n' "$P3_BIN"
 cat > "$WORK/p3.conf" <<EOF
 listen_addr = 127.0.0.1:${P3_PORT}
+operations_listen_addr = 127.0.0.1:${P3_OPERATIONS_PORT}
+operations_max_connections = 2
 data_dir = ${WORK}/p3data
 object_store = off
 log_format = text
@@ -327,7 +331,8 @@ else bad "wire probes"; cat "$WORK/wire.out"; fi
 restart_p3_fresh || exit 1
 echo "=== stalled result clients (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/result_streams.py" --host 127.0.0.1 --p3 "$P3_PORT" \
-  --pg "$PGPORT" --user "$PGUSER" --storage-mode local > "$WORK/result_streams.out" 2>&1; then
+  --pg "$PGPORT" --user "$PGUSER" --storage-mode local \
+  --operations "127.0.0.1:${P3_OPERATIONS_PORT}" > "$WORK/result_streams.out" 2>&1; then
   ok "stalled result clients"
 else bad "stalled result clients"; cat "$WORK/result_streams.out"; fi
 

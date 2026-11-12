@@ -135,6 +135,20 @@ pub(super) fn admit_grouping<'a>(
             return Ok(None);
         }
     }
+    // A user function that could answer an aggregate's name, such as a
+    // `sum(integer)` function, is resolved by the general executor.
+    if aggregates
+        .as_slice()
+        .iter()
+        .any(|&(_, aggregate)| match aggregate {
+            Expr::Call { name, args, .. } => {
+                storage.has_non_aggregate_routine_candidate(name, args.len(), txid)
+            }
+            _ => false,
+        })
+    {
+        return Ok(None);
+    }
     let plain =
         aggregates.is_empty() && statement.group_by.is_empty() && statement.having.is_none();
     // DISTINCT ON keeps each first row of a retained sort.
@@ -1155,6 +1169,7 @@ fn fold_group<'t: 'w, 'w>(
                 offsets: &offsets[..scope.n],
             },
             rowids: &[None; MAX_RETAINED_SOURCES][..scope.n],
+            visible: scope.n,
         };
         for (state, (_, node)) in states.iter_mut().zip(aggregates) {
             state.update(node, work, params, &row, &hooks)?;

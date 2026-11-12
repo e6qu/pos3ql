@@ -345,7 +345,7 @@ pub(crate) fn describe_data_modification_columns<'a>(
     let (target, returning, target_alias, from) = match statement {
         Stmt::Insert(insert) => {
             let insert = *insert;
-            (insert.table, insert.returning, None, None)
+            (insert.table, insert.returning, insert.alias, None)
         }
         Stmt::Update(update) => {
             let update = *update;
@@ -375,7 +375,7 @@ pub(crate) fn describe_data_modification_columns<'a>(
                     arena,
                 )?;
                 let (returning, target_alias, from) = match rewritten {
-                    Stmt::Insert(insert) => (insert.returning, None, None),
+                    Stmt::Insert(insert) => (insert.returning, insert.alias, None),
                     Stmt::Update(update) => (update.returning, update.alias, update.from),
                     Stmt::Delete(delete) => (delete.returning, delete.alias, delete.using),
                     _ => unreachable!("view rewrite keeps its statement kind"),
@@ -979,6 +979,24 @@ impl ColTypeResolver for CatalogCols<'_> {
             })
     }
 
+    /// The target relation's own row type, found by the definition's
+    /// qualified name; an unnamed definition stays an anonymous record.
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        let definition = self.definition?;
+        if !crate::sql::eval::qualifier_answers_target(definition, self.alias, name) {
+            return None;
+        }
+        let slot = self.storage.find_visible(
+            definition.schema.as_str(),
+            definition.name.as_str(),
+            self.txid,
+        )?;
+        Some(ColType::Composite(Some(
+            self.storage
+                .relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)),
+        )))
+    }
+
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
         let definition = self.definition?;
         (self.output_aliases.contains(&name)
@@ -1476,6 +1494,7 @@ fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
 /// name), or a CASE whose ELSE yields a name. `None` for anything unnamed.
 fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
     match expression {
+        Expr::OuterAggregate { call, .. } => name_of(call),
         Expr::Column { name, .. }
         | Expr::RoutineParam { name, .. }
         | Expr::SchemaColumn { name, .. } => Some(name),
@@ -1680,6 +1699,10 @@ fn cast_target_name(type_name: &str) -> Option<&str> {
         return ColType::from_sql_name(type_name.trim_end_matches("[]"))
             .map(ColType::internal_name)
             .or_else(|| type_name.trim_end_matches("[]").rsplit('.').next());
+    }
+    // An array type written by its `pg_type` name (`_int4`) keeps that name.
+    if let Some(ColType::Array(_)) = ColType::from_sql_name(type_name) {
+        return type_name.rsplit('.').next();
     }
     ColType::from_sql_name(type_name)
         .map(ColType::internal_name)
@@ -4250,6 +4273,10 @@ impl<'a> ColumnLookup<'a> for DefCols<'_> {
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         ColTypeResolver::is_whole_row(self, table).then_some(ColType::Record)
     }
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        ColTypeResolver::is_whole_row(self, table)
+            .then(|| (self.0.schema.as_str(), self.0.name.as_str()))
+    }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.resolve(qualifier, name)?;
@@ -4286,10 +4313,10 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
             && !self.output_aliases.contains(&qualifier)
             && !crate::sql::eval::qualifier_answers_target(self.definition, self.alias, qualifier)
         {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "missing FROM-clause entry for table \"{}\"",
-                qualifier
+            return Err(crate::sql::eval::unknown_target_qualifier(
+                self.definition,
+                self.alias,
+                qualifier,
             ));
         }
         self.definition
@@ -4364,6 +4391,14 @@ impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         ColTypeResolver::is_whole_row(self, table).then_some(ColType::Record)
+    }
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        ColTypeResolver::is_whole_row(self, table).then(|| {
+            (
+                self.definition.schema.as_str(),
+                self.definition.name.as_str(),
+            )
+        })
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
@@ -4450,6 +4485,85 @@ fn comparable(a: ColType, b: ColType) -> bool {
         || (timeofday(a) && timeofday(b))
         || (bit(a) && bit(b))
         || (stringy(a) && stringy(b))
+}
+
+/// An untyped literal compared with a type that has no comparison operators
+/// (`json`, `refcursor`, `cstring`) finds no operator to adopt a type from:
+/// PostgreSQL reports `json = unknown`.
+/// Resolves a quantified comparison's operator (`x op ANY/ALL (array)`, or
+/// against a subquery's column) from the declared types, as PostgreSQL does
+/// before reading any element.
+fn validate_quantified_comparison(
+    operator: crate::sql::ast::BinaryOp,
+    operand: &Expr<'_>,
+    left_oid: i32,
+    element_oid: i32,
+    columns: &dyn ColTypeResolver,
+) -> Result<(), SqlError> {
+    // A visible user-defined operator answers for its own operand types.
+    if let Some(name) = operator.operator_name()
+        && columns
+            .operator_result(name, left_oid, element_oid)
+            .is_some()
+    {
+        return Ok(());
+    }
+    let left = coltype_of_oid(left_oid);
+    let right = (element_oid != oid::UNKNOWN)
+        .then(|| coltype_of_oid(element_oid))
+        .flatten();
+    if element_oid != oid::UNKNOWN
+        && let Some(error) = untyped_comparison_undefined(
+            left_oid,
+            operator.operator_name().unwrap_or("?"),
+            element_oid,
+        )
+    {
+        return Err(error);
+    }
+    validate_declared_enum_comparison(
+        operator,
+        infer_routine_argument_oid(operand, columns)?,
+        element_oid,
+        columns,
+    )?;
+    if let (Some(left), Some(right)) = (left, right) {
+        use crate::sql::ast::BinaryOp::{Eq, Gt, GtEq, Lt, LtEq, NotEq};
+        let invalid = match operator {
+            Eq | NotEq => !comparable(left, right),
+            Lt | LtEq | Gt | GtEq => {
+                !comparable(left, right)
+                    || !left.has_builtin_ordering()
+                    || !right.has_builtin_ordering()
+            }
+            _ => false,
+        };
+        if invalid {
+            return Err(operator_undefined(
+                left,
+                operator.operator_name().unwrap_or("?"),
+                right,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn untyped_comparison_undefined(left: i32, operator: &str, right: i32) -> Option<SqlError> {
+    let typed = match (left, right) {
+        (oid::UNKNOWN, oid::UNKNOWN) => return None,
+        (oid::UNKNOWN, typed) | (typed, oid::UNKNOWN) => coltype_of_oid(typed)?,
+        _ => return None,
+    };
+    if matches!(typed, ColType::Array(_)) || typed.has_builtin_equality() {
+        return None;
+    }
+    let unknown = ColType::Pseudo(crate::sql::types::PseudoType::Unknown);
+    Some(if left == oid::UNKNOWN {
+        operator_undefined(unknown, operator, typed)
+    } else {
+        operator_undefined(typed, operator, unknown)
+    })
 }
 
 /// [`builtin_binary_type`], naming the operand types in a missing-operator
@@ -4779,6 +4893,11 @@ pub(crate) fn builtin_binary_type(
     let is_bit = |o: i32| matches!(o, oid::BIT | oid::VARBIT);
     Ok(match operator {
         Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+            if let Some(error) =
+                untyped_comparison_undefined(lo, operator.operator_name().unwrap_or("?"), ro)
+            {
+                return Err(error);
+            }
             // Unknown coerces; two concrete types must be comparable.
             if lo != oid::UNKNOWN
                 && ro != oid::UNKNOWN
@@ -4811,7 +4930,8 @@ pub(crate) fn builtin_binary_type(
             }
             of(ColType::Bool)
         }
-        And | Or | Like | ILike => of(ColType::Bool),
+        And | Or | Like | ILike | RegexMatch | RegexIMatch | NotLike | NotILike | RegexNotMatch
+        | RegexNotIMatch => of(ColType::Bool),
         TextSearchMatch => of(ColType::Bool),
         TextSearchPhrase => of(ColType::TsQuery),
         Overlaps if lo == oid::TSQUERY || ro == oid::TSQUERY => of(ColType::TsQuery),
@@ -5168,6 +5288,9 @@ fn infer_type_unpositioned(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
+    if let Expr::OuterAggregate { call, .. } = expression {
+        return infer_type_unpositioned(call, columns);
+    }
     let of = |t: ColType| (t.oid(), t.typlen());
     let selected = selected_call(expression, columns)?;
     if let Expr::Call {
@@ -5275,6 +5398,7 @@ fn infer_type_unpositioned(
         ),
         Expr::RecursiveState { ctype, .. } => of(*ctype),
         Expr::Null | Expr::Str(_) => (oid::UNKNOWN, -2),
+        Expr::OuterAggregate { .. } => unreachable!("outer aggregates take their call's type"),
         Expr::Param(index) => bound_parameter_type_oid(*index)
             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))
             .or_else(|| routine_parameter_type(*index))
@@ -5438,6 +5562,23 @@ fn infer_type_unpositioned(
             use crate::sql::ast::BinaryOp::*;
             let lo = infer_type_res(left, columns)?.0;
             let ro = infer_type_res(right, columns)?.0;
+            // PostgreSQL compares two row constructors field by field, each
+            // pair through its own operator.
+            if matches!(operator, Eq | NotEq | Lt | LtEq | Gt | GtEq)
+                && let (Some(left_fields), Some(right_fields)) = (
+                    crate::sql::eval::row_constructor_fields(left),
+                    crate::sql::eval::row_constructor_fields(right),
+                )
+                && left_fields.len() == right_fields.len()
+            {
+                for (left, right) in left_fields.iter().zip(right_fields.iter()) {
+                    builtin_binary_type(
+                        operator,
+                        infer_type_res(left, columns)?.0,
+                        infer_type_res(right, columns)?.0,
+                    )?;
+                }
+            }
             if let Some(result) = operator.operator_name().and_then(|name| {
                 crate::sql::eval::funcs::geometry::operator_result(name, &[lo, ro])
             }) {
@@ -5550,7 +5691,8 @@ fn infer_type_unpositioned(
         }
         Expr::IsNull { .. } => of(ColType::Bool),
         Expr::InList { operand, list, .. } => {
-            let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
+            let left_oid = infer_type_res(operand, columns)?.0;
+            let left = coltype_of_oid(left_oid);
             for item in *list {
                 validate_declared_enum_comparison(
                     crate::sql::ast::BinaryOp::Eq,
@@ -5558,7 +5700,18 @@ fn infer_type_unpositioned(
                     infer_routine_argument_oid(item, columns)?,
                     columns,
                 )?;
-                let right = coltype_of_oid(infer_type_res(item, columns)?.0);
+                let right_oid = infer_type_res(item, columns)?.0;
+                // One item is a plain `=`; a longer list first takes one
+                // common type, which an untyped item adopts.
+                let right_oid = if list.len() > 1 && right_oid == oid::UNKNOWN {
+                    left_oid
+                } else {
+                    right_oid
+                };
+                if let Some(error) = untyped_comparison_undefined(left_oid, "=", right_oid) {
+                    return Err(error);
+                }
+                let right = coltype_of_oid(right_oid);
                 if let (Some(left), Some(right)) = (left, right)
                     && !comparable(left, right)
                 {
@@ -5575,7 +5728,8 @@ fn infer_type_unpositioned(
             ..
         } => {
             if let Some(operand) = operand {
-                let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
+                let left_oid = infer_type_res(operand, columns)?.0;
+                let left = coltype_of_oid(left_oid);
                 for (when, _) in *whens {
                     validate_declared_enum_comparison(
                         crate::sql::ast::BinaryOp::Eq,
@@ -5583,7 +5737,11 @@ fn infer_type_unpositioned(
                         infer_routine_argument_oid(when, columns)?,
                         columns,
                     )?;
-                    let right = coltype_of_oid(infer_type_res(when, columns)?.0);
+                    let right_oid = infer_type_res(when, columns)?.0;
+                    if let Some(error) = untyped_comparison_undefined(left_oid, "=", right_oid) {
+                        return Err(error);
+                    }
+                    let right = coltype_of_oid(right_oid);
                     if let (Some(left), Some(right)) = (left, right)
                         && !comparable(left, right)
                     {
@@ -5700,8 +5858,26 @@ fn infer_type_unpositioned(
                     (metadata.type_oid, metadata.ctype.typlen())
                 })
         }
-        // `x IN (subquery)` and EXISTS are predicates: their result is boolean.
-        Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } | Expr::Exists(_) => {
+        Expr::Exists(_) => of(ColType::Bool),
+        // `x IN (subquery)` and `x op ANY (subquery)` resolve their operator
+        // from the subquery's declared column type before reading any row. A
+        // row operand compares field by field when the subquery runs.
+        Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
+        } => {
+            let operator = match expression {
+                Expr::QuantifiedSubquery { operator, .. } => *operator,
+                _ => crate::sql::ast::BinaryOp::Eq,
+            };
+            if crate::sql::eval::row_constructor_fields(operand).is_none()
+                && let Some((column_oid, _)) = columns.subquery_type(&Expr::Subquery(select))?
+            {
+                let left_oid = infer_type_res(operand, columns)?.0;
+                validate_quantified_comparison(operator, operand, left_oid, column_oid, columns)?;
+            }
             of(ColType::Bool)
         }
         Expr::AnyAll {
@@ -5710,45 +5886,14 @@ fn infer_type_unpositioned(
             array,
             ..
         } => {
-            let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
-            let right = coltype_of_oid(infer_type_res(array, columns)?.0).and_then(|ctype| {
-                if let ColType::Array(element) = ctype {
-                    Some(element.to_coltype())
-                } else {
-                    None
-                }
-            });
+            let left_oid = infer_type_res(operand, columns)?.0;
             let element_oid = coltype_of_oid(infer_type_res(array, columns)?.0)
                 .and_then(|ctype| match ctype {
                     ColType::Array(element) => Some(element.element_oid()),
                     _ => None,
                 })
                 .unwrap_or(oid::UNKNOWN);
-            validate_declared_enum_comparison(
-                *operator,
-                infer_routine_argument_oid(operand, columns)?,
-                element_oid,
-                columns,
-            )?;
-            if let (Some(left), Some(right)) = (left, right) {
-                use crate::sql::ast::BinaryOp::{Eq, Gt, GtEq, Lt, LtEq, NotEq};
-                let invalid = match operator {
-                    Eq | NotEq => !comparable(left, right),
-                    Lt | LtEq | Gt | GtEq => {
-                        !comparable(left, right)
-                            || !left.has_builtin_ordering()
-                            || !right.has_builtin_ordering()
-                    }
-                    _ => false,
-                };
-                if invalid {
-                    return Err(operator_undefined(
-                        left,
-                        operator.operator_name().unwrap_or("?"),
-                        right,
-                    ));
-                }
-            }
+            validate_quantified_comparison(*operator, operand, left_oid, element_oid, columns)?;
             of(ColType::Bool)
         }
         Expr::Array(items) => of(ColType::Array(

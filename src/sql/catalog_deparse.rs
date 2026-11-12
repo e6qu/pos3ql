@@ -190,6 +190,7 @@ impl Context<'_> {
             Expr::Bool(_)
             | Expr::IsNull { .. }
             | Expr::InList { .. }
+            | Expr::AnyAll { .. }
             | Expr::Like { .. }
             | Expr::Match { .. } => Some(oid::BOOL),
             Expr::Str(_) | Expr::Null => None,
@@ -650,6 +651,57 @@ impl Context<'_> {
                     self.write(item, element, output)?;
                 }
                 output.push("])")?;
+                self.close(output)
+            }
+            Expr::Array(items) => {
+                let mut element = None;
+                for item in *items {
+                    if let Some(found) = self.type_of(item)? {
+                        element = Some(found);
+                        break;
+                    }
+                }
+                let element = element.unwrap_or(oid::TEXT);
+                output.push("ARRAY[")?;
+                for (index, item) in items.iter().enumerate() {
+                    if index != 0 {
+                        output.push(", ")?;
+                    }
+                    self.write(item, Some(element), output)?;
+                }
+                output.push("]")
+            }
+            Expr::AnyAll {
+                operand,
+                operator,
+                array,
+                all,
+            } => {
+                let Some(symbol) = operator.operator_name() else {
+                    return output.unsupported();
+                };
+                let element = match self.type_of(operand)? {
+                    Some(found) => Some(operator_type(found)),
+                    None => Some(oid::TEXT),
+                };
+                // An untyped array literal takes the operand's array type,
+                // which this deparser has no spelling for.
+                if matches!(array, Expr::Str(_)) {
+                    return output.unsupported();
+                }
+                self.open(output)?;
+                self.wrapped(
+                    operand,
+                    Some(element),
+                    Parent::ArrayComparison,
+                    true,
+                    output,
+                )?;
+                output.push(" ")?;
+                output.push(symbol)?;
+                output.push(if *all { " ALL (" } else { " ANY (" })?;
+                self.write(array, None, output)?;
+                output.push(")")?;
                 self.close(output)
             }
             Expr::Like {

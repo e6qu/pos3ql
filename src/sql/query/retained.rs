@@ -85,9 +85,13 @@ pub(crate) enum StreamSource {
     Table(usize),
     /// A builtin set-returning function: only its next value is retained.
     Generated,
-    /// A nested-loop join: the read positions of its physical tables; literal
-    /// and generated items retain their rows or next value.
+    /// A join: the read positions of its physical tables; literal and
+    /// generated items retain their rows or next value. Its first row may
+    /// read a whole level (a hash build, an inner rescan).
     Join([Option<usize>; MAX_RETAINED_SOURCES]),
+    /// A `UNION ALL` read as one appended stream: the read positions of
+    /// every query's physical tables.
+    Appended([Option<usize>; MAX_RETAINED_SOURCES]),
 }
 
 /// One ORDER BY key of a sorted locking cursor: a source column.
@@ -259,6 +263,16 @@ pub(crate) struct RetainedSelect<'a> {
     /// a sort or hash table that does not fit leaves nothing queued, and the
     /// statement runs in the general executor instead.
     description: Option<&'a [ColDesc<'a>]>,
+    /// Uncorrelated subqueries, run once before the first row: see
+    /// [`statement_sublinks`].
+    sublinks: &'a [&'a Expr<'a>],
+    /// Their results, kept in the reader's allocation once run.
+    subqueries: Option<crate::sql::eval::SubqueryValues<'a, 'a>>,
+    /// The statement's `WHERE`, whose conjuncts that read no column run once
+    /// before the first row (PostgreSQL's one-time filter).
+    one_time: Option<&'a Expr<'a>>,
+    /// A one-time filter was not true: the statement returns no rows.
+    filtered_out: bool,
 }
 
 fn description_too_large(mode: RetainedMode) -> SqlError {
@@ -423,8 +437,83 @@ fn retained_expression_with(
             .chain(order_by.iter().map(|order| order.expression))
             .chain(*filter)
             .all(|argument| retained_expression_with(argument, catalog, statement, leaves)),
+        // Run once before the first row; [`statement_sublinks`] admits them.
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::ArraySubquery(_) | Expr::RowSubquery { .. }
+            if statement.is_some() =>
+        {
+            true
+        }
         _ => false,
     }
+}
+
+/// The subqueries in a retained statement's expressions, which its reader
+/// runs once before its first row, as the general executor runs them before
+/// its scan, and keeps in its own allocation. `None` when one cannot be
+/// kept that way: it reads a column of the statement (correlated), returns
+/// a list (`IN`, `ANY`/`ALL`), or calls a volatile or user-defined function.
+fn statement_sublinks<'a>(
+    statement: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<&'a [&'a Expr<'a>]>, SqlError> {
+    let mut nodes = crate::mem::arena::ArenaList::new(arena);
+    let from = statement.from.as_ref();
+    let expressions = statement
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                Some(*expression)
+            }
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => None,
+        })
+        .chain(statement.where_clause)
+        .chain(statement.having)
+        .chain(statement.group_by.iter().copied())
+        .chain(statement.distinct_on.iter().copied())
+        .chain(statement.order_by.iter().map(|order| order.expression))
+        .chain(statement.limit)
+        .chain(statement.offset)
+        .chain(
+            from.into_iter()
+                .flat_map(|from| from.joins.iter().filter_map(|join| join.on)),
+        )
+        .chain(
+            from.into_iter()
+                .flat_map(|from| {
+                    core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table))
+                })
+                .flat_map(|table| table.func_args.unwrap_or(&[]).iter().copied()),
+        );
+    for expression in expressions {
+        super::subquery::collect_subqueries(expression, &mut nodes)?;
+    }
+    for &node in nodes.as_slice() {
+        let select = match node {
+            Expr::Subquery(select)
+            | Expr::Exists(select)
+            | Expr::ArraySubquery(select)
+            | Expr::RowSubquery { select, .. } => *select,
+            _ => return Ok(None),
+        };
+        if super::cte::select_contains_function(select, &|name, arguments| {
+            crate::sql::ast::is_volatile_function(name)
+                || storage.has_callable_candidate(name, arguments, txid)
+        }) {
+            return Ok(None);
+        }
+        // Correlation is read from the subquery's FROM items as written; one
+        // it cannot resolve that way (a view, which the general executor
+        // expands as it runs the subquery) is not kept, and the statement
+        // runs there, reporting any real error itself.
+        match super::subquery::subquery_node_correlated(node, storage, txid, arena) {
+            Ok(false) => {}
+            Ok(true) | Err(_) => return Ok(None),
+        }
+    }
+    Ok(Some(nodes.as_slice()))
 }
 
 fn retained_scalar_calls(
@@ -2209,6 +2298,11 @@ impl<'a> RetainedSelect<'a> {
                 crate::storage::LockedRowRecheck::Unchanged => LockedRow::Unchanged,
                 crate::storage::LockedRowRecheck::OwnChange => LockedRow::Skip,
                 crate::storage::LockedRowRecheck::Deleted => LockedRow::Deleted,
+                crate::storage::LockedRowRecheck::MovedOut => {
+                    return Err(crate::sql::exec::moved_out(
+                        storage.keeps_transaction_snapshot(txid),
+                    ));
+                }
                 crate::storage::LockedRowRecheck::Updated(home) => {
                     let version = home.snapshot().row_version();
                     let bytes = storage.row_bytes(table, rowid, home, state_arena)?;
@@ -2443,6 +2537,9 @@ impl<'a> RetainedSelect<'a> {
         if let Some(leaves) = appended_leaves(statement, arena)? {
             return Self::appended_source(storage, txid, statement, leaves, arena);
         }
+        if statement_sublinks(statement, storage, txid, arena)?.is_none() {
+            return Ok(None);
+        }
         if !from.joins.is_empty() {
             let Some((scope, shape, ..)) =
                 retained_join_scope(storage, txid, statement, from, None, true, true, arena)?
@@ -2591,7 +2688,11 @@ impl<'a> RetainedSelect<'a> {
         let mut tables = [None; MAX_RETAINED_SOURCES];
         let mut count = 0;
         for leaf in leaves {
-            if !branch_admitted(storage, txid, leaf, arena)? {
+            // An appended query runs no subqueries of its own.
+            if !branch_admitted(storage, txid, leaf, arena)?
+                || statement_sublinks(leaf, storage, txid, arena)?
+                    .is_none_or(|sublinks| !sublinks.is_empty())
+            {
                 return Ok(None);
             }
             let leaf_tables = match Self::stream_source(storage, txid, leaf, arena)? {
@@ -2600,7 +2701,7 @@ impl<'a> RetainedSelect<'a> {
                 }
                 Some(StreamSource::Generated) => [None; MAX_RETAINED_SOURCES],
                 Some(StreamSource::Join(tables)) => tables,
-                None => return Ok(None),
+                Some(StreamSource::Appended(_)) | None => return Ok(None),
             };
             for table in leaf_tables.into_iter().flatten() {
                 let Some(target) = tables.get_mut(count) else {
@@ -2638,7 +2739,7 @@ impl<'a> RetainedSelect<'a> {
                 return Ok(None);
             }
         }
-        Ok(Some(StreamSource::Join(tables)))
+        Ok(Some(StreamSource::Appended(tables)))
     }
 
     pub(crate) fn open(
@@ -2712,6 +2813,17 @@ impl<'a> RetainedSelect<'a> {
             && (mode == RetainedMode::Statement || reader_use == RetainedUse::Stream);
         // Likewise it groups them itself.
         let groups_itself = mode == RetainedMode::Statement || reader_use == RetainedUse::Stream;
+        // Only a reader that returns its rows once runs subqueries before
+        // them; a declared cursor or an appended query does not.
+        let Some(sublinks) = statement_sublinks(statement, storage, txid, arena)? else {
+            return Ok(None);
+        };
+        if !sublinks.is_empty()
+            && !(mode == RetainedMode::Statement
+                || mode == RetainedMode::Cursor && reader_use == RetainedUse::Stream)
+        {
+            return Ok(None);
+        }
         if let Some(from) = statement.from.as_ref()
             && !from.joins.is_empty()
         {
@@ -2726,6 +2838,7 @@ impl<'a> RetainedSelect<'a> {
                 mode,
                 self_sorts,
                 groups_itself,
+                sublinks,
             );
         }
         let from = statement.from.as_ref();
@@ -3247,6 +3360,10 @@ impl<'a> RetainedSelect<'a> {
             order,
             saves_scroll_output: false,
             description,
+            sublinks,
+            subqueries: None,
+            one_time: statement.where_clause,
+            filtered_out: false,
         }))
     }
 
@@ -3265,6 +3382,7 @@ impl<'a> RetainedSelect<'a> {
         mode: RetainedMode,
         self_sorts: bool,
         groups_itself: bool,
+        sublinks: &'a [&'a Expr<'a>],
     ) -> Result<Option<Self>, SqlError> {
         let Some((scope, shape, statement, aggregates)) = retained_join_scope(
             storage,
@@ -3517,6 +3635,10 @@ impl<'a> RetainedSelect<'a> {
             order: &[],
             saves_scroll_output,
             description,
+            sublinks,
+            subqueries: None,
+            one_time: statement.where_clause,
+            filtered_out: false,
         }))
     }
 
@@ -3538,6 +3660,35 @@ impl<'a> RetainedSelect<'a> {
             matches!(self.plan.bounds(), RowBounds::Active { .. }),
             "statement bounds must be prepared"
         );
+        if self.filtered_out {
+            return Ok(false);
+        }
+        let first = self.subqueries.is_none();
+        if !self.sublinks.is_empty() && self.subqueries.is_none() {
+            // Each runs when an expression first reads it, as PostgreSQL's
+            // initPlans do, and keeps its value in the reader's allocation.
+            let subqueries =
+                super::subquery::first_read_subqueries(self.sublinks, storage, txid, state_arena)
+                    .map_err(|_| {
+                    // Like a build that does not fit: the statement runs
+                    // spooled, or in the general executor, instead.
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "subquery plans exceed the retained reader's allocation"
+                    )
+                    .plan_build_exhausted()
+                })?;
+            self.subqueries = Some(subqueries);
+        }
+        // A grouping still returns its one row over no input, so it filters
+        // its input row by row instead.
+        if first
+            && self.plan.group().is_none()
+            && !self.one_time_filter_passes(storage, txid, work, params)?
+        {
+            self.filtered_out = true;
+            return Ok(false);
+        }
         self.plan.advance(&mut Pull {
             scope: &self.scope,
             storage,
@@ -3547,7 +3698,31 @@ impl<'a> RetainedSelect<'a> {
             buffers,
             work,
             params,
+            subqueries: self.subqueries.as_ref(),
         })
+    }
+
+    /// Evaluates the statement's one-time filter before its first row.
+    fn one_time_filter_passes<'w>(
+        &'w self,
+        storage: &'w Storage,
+        txid: u32,
+        work: &'w Arena,
+        params: &[Datum<'w>],
+    ) -> Result<bool, SqlError> {
+        let catalog = StorageCatalog {
+            storage,
+            routine_workspace: work,
+            txid,
+            invocations: None,
+            statement_arena: None,
+        };
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            subs: self.subqueries.as_ref(),
+            ..super::super::eval::NO_HOOKS
+        };
+        super::scan::one_time_filter_passes(self.one_time, &self.scope, work, params, &hooks, None)
     }
 
     /// Moves an appended query to its next row.
@@ -3561,6 +3736,7 @@ impl<'a> RetainedSelect<'a> {
             buffers: pull.buffers,
             work: pull.work,
             params: pull.params,
+            subqueries: None,
         })
     }
 
@@ -3594,6 +3770,7 @@ impl<'a> RetainedSelect<'a> {
             let hooks = EvalHooks {
                 catalog: Some(&catalog),
                 sequences: sequence,
+                subs: self.subqueries.as_ref(),
                 ..super::super::eval::NO_HOOKS
             };
             return grouping.having_passes(&self.scope, work, params, &hooks);
@@ -3612,6 +3789,7 @@ impl<'a> RetainedSelect<'a> {
         let hooks = EvalHooks {
             catalog: Some(&catalog),
             sequences: sequence,
+            subs: self.subqueries.as_ref(),
             ..super::super::eval::NO_HOOKS
         };
         self.plan.with_row(&self.scope, work, |row| {
@@ -3662,6 +3840,7 @@ impl<'a> RetainedSelect<'a> {
             let hooks = EvalHooks {
                 catalog: Some(&catalog),
                 sequences: sequence,
+                subs: self.subqueries.as_ref(),
                 ..super::super::eval::NO_HOOKS
             };
             let value = grouping.with_group(&self.scope, work, &hooks, |row, hooks| {
@@ -3683,6 +3862,7 @@ impl<'a> RetainedSelect<'a> {
         let hooks = EvalHooks {
             catalog: Some(&catalog),
             sequences: sequence,
+            subs: self.subqueries.as_ref(),
             ..super::super::eval::NO_HOOKS
         };
         self.plan.with_row(&self.scope, work, |row| {
@@ -3773,6 +3953,7 @@ impl<'a> RetainedSelect<'a> {
             buffers,
             work,
             params: &[],
+            subqueries: None,
         })
     }
 

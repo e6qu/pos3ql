@@ -214,6 +214,20 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
+    fn owner_awaits_read(&self, owner: super::ReadOwner) -> bool {
+        match self {
+            Layer::Base(store) => store.owner_awaits_read(owner),
+            Layer::Disk(cache) => cache.owner_awaits_read(owner),
+        }
+    }
+
+    fn exchange_fetch_history(&mut self, history: &mut super::FetchHistory) {
+        match self {
+            Layer::Base(store) => store.exchange_fetch_history(history),
+            Layer::Disk(cache) => cache.exchange_fetch_history(history),
+        }
+    }
+
     fn enable_async_gets(&mut self) {
         match self {
             Layer::Base(store) => store.enable_async_gets(),
@@ -444,6 +458,20 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         match self {
             TieredStore::WithRam(cache) => cache.read_capacity_generation(),
             TieredStore::WithoutRam(layer) => layer.read_capacity_generation(),
+        }
+    }
+
+    fn owner_awaits_read(&self, owner: super::ReadOwner) -> bool {
+        match self {
+            TieredStore::WithRam(cache) => cache.owner_awaits_read(owner),
+            TieredStore::WithoutRam(layer) => layer.owner_awaits_read(owner),
+        }
+    }
+
+    fn exchange_fetch_history(&mut self, history: &mut super::FetchHistory) {
+        match self {
+            TieredStore::WithRam(cache) => cache.exchange_fetch_history(history),
+            TieredStore::WithoutRam(layer) => layer.exchange_fetch_history(history),
         }
     }
 

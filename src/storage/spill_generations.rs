@@ -1682,6 +1682,7 @@ impl SpilledRowState {
                 checkpoint_change_lsn: 0,
                 history: super::CommittedHistory::empty(),
                 pending: super::PendingVersions::empty(),
+                committed_moved_out: false,
             },
             snapshot.row_layout,
         )

@@ -627,3 +627,506 @@ fn only_a_changed_key_value_waits_for_key_share_locks() {
     assert_eq!(error_sqlstates(&output), ["23503"]);
     sessions.finish();
 }
+
+const PARTITIONS: &str = "CREATE TABLE pt (id int, k int, v int) PARTITION BY LIST (k); \
+     CREATE TABLE pt1 PARTITION OF pt FOR VALUES IN (1); \
+     CREATE TABLE pt2 PARTITION OF pt FOR VALUES IN (2); \
+     CREATE TABLE ps (id int, v int)";
+
+const MOVED_OUT: &str =
+    "tuple to be locked was already moved to another partition due to concurrent update";
+
+/// Statements that lock row 1 of `pt1` while another transaction moves it to
+/// `pt2`, and the message PostgreSQL 18 reports under repeatable read.
+const MOVE_LOCKERS: [(&str, &str); 9] = [
+    ("UPDATE pt SET v = v + 1 WHERE id = 1", "concurrent update"),
+    (
+        "UPDATE pt SET k = 2, v = 7 WHERE id = 1",
+        "concurrent update",
+    ),
+    ("DELETE FROM pt WHERE id = 1", "concurrent update"),
+    ("UPDATE pt1 SET v = v + 1 WHERE id = 1", "concurrent update"),
+    (
+        "SELECT * FROM pt WHERE id = 1 FOR UPDATE",
+        "concurrent update",
+    ),
+    (
+        "SELECT * FROM pt WHERE id = 1 FOR KEY SHARE",
+        "concurrent update",
+    ),
+    (
+        "MERGE INTO pt USING ps ON ps.id = pt.id WHEN MATCHED THEN UPDATE SET v = pt.v + 10",
+        "concurrent update",
+    ),
+    (
+        "MERGE INTO pt USING ps ON ps.id = pt.id WHEN MATCHED THEN DELETE",
+        "concurrent update",
+    ),
+    (
+        "WITH x AS (UPDATE pt SET v = v + 1 WHERE id = 1 RETURNING *) SELECT * FROM x",
+        "concurrent update",
+    ),
+];
+
+fn reset_partitions(sessions: &mut Sessions) {
+    sessions.first(
+        "DELETE FROM pt; DELETE FROM ps; \
+         INSERT INTO pt VALUES (1, 1, 1), (2, 1, 2); INSERT INTO ps VALUES (1, 1)",
+    );
+}
+
+#[test]
+fn a_concurrent_partition_move_fails_waiting_lockers_as_postgresql_does() {
+    let mut sessions = sessions("partition-move", TransactionMode::Mvcc, PARTITIONS);
+    for (isolation, repeatable) in [("READ COMMITTED", false), ("REPEATABLE READ", true)] {
+        for (statement, repeatable_message) in MOVE_LOCKERS {
+            reset_partitions(&mut sessions);
+            sessions.second(&format!(
+                "BEGIN ISOLATION LEVEL {isolation}; SELECT count(*) FROM ps"
+            ));
+            sessions.first("BEGIN; UPDATE pt SET k = 2 WHERE id = 1");
+            let parked = sessions.second_waits(statement);
+            sessions.first("COMMIT");
+            let output = sessions.resume_second(statement, parked);
+            assert_eq!(
+                error_sqlstates(&output),
+                ["40001"],
+                "{isolation} {statement}"
+            );
+            let message = if repeatable {
+                format!("could not serialize access due to {repeatable_message}")
+            } else {
+                MOVED_OUT.to_owned()
+            };
+            assert!(
+                String::from_utf8_lossy(&output).contains(&message),
+                "{isolation} {statement}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            sessions.second("ROLLBACK");
+            assert_eq!(
+                sessions.rows("SELECT id, k, v FROM pt2"),
+                ["1|2|1"],
+                "{isolation} {statement}"
+            );
+        }
+    }
+    // An ordinary deletion is still skipped under read committed, and a
+    // rolled-back move leaves the row to the waiting statement.
+    reset_partitions(&mut sessions);
+    sessions.first("BEGIN; DELETE FROM pt WHERE id = 1");
+    let update = "UPDATE pt SET v = 50 WHERE id = 1";
+    let parked = sessions.second_waits(update);
+    sessions.first("COMMIT");
+    let output = sessions.resume_second(update, parked);
+    assert!(error_sqlstates(&output).is_empty());
+    assert!(String::from_utf8_lossy(&output).contains("UPDATE 0"));
+    reset_partitions(&mut sessions);
+    sessions.first("BEGIN; UPDATE pt SET k = 2 WHERE id = 1");
+    let parked = sessions.second_waits(update);
+    sessions.first("ROLLBACK");
+    let output = sessions.resume_second(update, parked);
+    assert!(error_sqlstates(&output).is_empty());
+    assert_eq!(
+        sessions.rows("SELECT id, k, v FROM pt1 WHERE id = 1"),
+        ["1|1|50"]
+    );
+    // MERGE moving the row marks the deletion too.
+    reset_partitions(&mut sessions);
+    sessions
+        .first("BEGIN; MERGE INTO pt USING ps ON ps.id = pt.id WHEN MATCHED THEN UPDATE SET k = 2");
+    let parked = sessions.second_waits(update);
+    sessions.first("COMMIT");
+    let output = sessions.resume_second(update, parked);
+    assert_eq!(error_sqlstates(&output), ["40001"]);
+    assert!(String::from_utf8_lossy(&output).contains(MOVED_OUT));
+    sessions.finish();
+}
+
+#[test]
+fn a_prepared_partition_move_keeps_its_marker_across_restart() {
+    for cold in [false, true] {
+        let mut config = test_config(&format!("row-lock-prepared-move-{cold}"));
+        config.max_prepared_transactions = 2;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        writer.success(
+            &mut engine,
+            &format!(
+                "{PARTITIONS}; INSERT INTO pt VALUES (1, 1, 1), (2, 1, 2); \
+                 BEGIN; UPDATE pt SET k = 2 WHERE id = 1; PREPARE TRANSACTION 'move'"
+            ),
+            false,
+        );
+        drop(writer);
+        if cold {
+            drop(engine);
+            budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+            engine = Engine::new(&config, &mut budget).unwrap();
+        }
+        let first = ConfiguredTransactionSession::new(&config, &mut budget);
+        let second = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        let mut sessions = Sessions {
+            config,
+            engine,
+            first,
+            second,
+        };
+        let update = "UPDATE pt SET v = v + 1 WHERE id = 1";
+        let parked = sessions.second_waits(update);
+        sessions.first("COMMIT PREPARED 'move'");
+        let output = sessions.resume_second(update, parked);
+        assert_eq!(error_sqlstates(&output), ["40001"], "cold={cold}");
+        assert!(
+            String::from_utf8_lossy(&output).contains(MOVED_OUT),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            sessions.rows("SELECT id, k, v FROM pt ORDER BY id"),
+            ["1|2|1", "2|1|2"]
+        );
+        sessions.finish();
+    }
+}
+
+#[test]
+fn read_committed_rechecks_run_lateral_sources_as_postgresql_plans_them() {
+    let mut sessions = sessions("lateral-recheck", TransactionMode::Mvcc, ITEMS);
+    for (statement, expected) in [
+        // A simple subquery without FROM is pulled up and runs again.
+        (
+            "SELECT i.id, i.qty, s.x FROM items i, LATERAL (SELECT i.qty * 10 AS x) s \
+             WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|2|20"][..],
+        ),
+        (
+            "SELECT i.id, s.y FROM items i, LATERAL (VALUES (i.qty + 1)) s(y) \
+             WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|3"],
+        ),
+        (
+            "SELECT i.id, s.x FROM items i, LATERAL (SELECT i.qty * 10 AS x WHERE i.qty < 2) s \
+             ORDER BY i.id FOR UPDATE OF i",
+            &[],
+        ),
+        // Functions and subqueries the planner keeps separate return the
+        // row first read.
+        (
+            "SELECT i.id, g FROM items i, LATERAL generate_series(i.qty, 2) g \
+             WHERE i.id = 1 ORDER BY g FOR UPDATE OF i",
+            &["1|1", "1|2"],
+        ),
+        (
+            "SELECT i.id, s.x FROM items i, LATERAL (SELECT i.qty * 10 AS x LIMIT 1) s \
+             WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|10"],
+        ),
+        (
+            "SELECT i.id, s.m FROM items i, LATERAL (SELECT max(qty) + i.qty AS m FROM stock \
+             WHERE stock.id = i.id) s WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|2"],
+        ),
+        // A flattened UNION ALL returns its first branch again.
+        (
+            "SELECT i.id, s.y FROM items i, LATERAL (SELECT i.qty + 1 AS y UNION ALL \
+             SELECT i.qty + 2) s WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|3", "1|3"],
+        ),
+    ] {
+        let output = after_concurrent_change(
+            &mut sessions,
+            "UPDATE items SET qty = qty + 1 WHERE id = 1",
+            statement,
+        );
+        assert!(error_sqlstates(&output).is_empty(), "{statement}");
+        assert_eq!(data_rows(&output), expected, "{statement}");
+    }
+    // A pulled-up subquery reading tables keeps the source rows it first
+    // joined: its conditions and output run again with the latest row.
+    for (statement, expected) in [
+        (
+            "SELECT i.id, s.y FROM items i, LATERAL (SELECT stock.qty + i.qty AS y FROM stock \
+             WHERE stock.id = i.id) s WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|3"][..],
+        ),
+        (
+            "SELECT i.id, s.y FROM items i, LATERAL (SELECT stock.qty AS y FROM stock \
+             WHERE stock.qty >= i.qty) s ORDER BY i.id, s.y FOR UPDATE OF i",
+            &["1|2", "1|4", "2|2", "2|4", "3|4"],
+        ),
+        (
+            "SELECT i.id, s.qty FROM items i LEFT JOIN LATERAL (SELECT * FROM stock \
+             WHERE stock.qty > i.qty) s ON true WHERE i.id = 1 ORDER BY s.qty FOR UPDATE OF i",
+            &["1|NULL", "1|4"],
+        ),
+        (
+            "SELECT i.id, s.y FROM items i, LATERAL (SELECT 1 AS y FROM stock \
+             WHERE stock.id >= i.id) s WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|1", "1|1", "1|1"],
+        ),
+    ] {
+        let output = after_concurrent_change(
+            &mut sessions,
+            "UPDATE items SET qty = qty + 1 WHERE id = 1",
+            statement,
+        );
+        assert!(error_sqlstates(&output).is_empty(), "{statement}");
+        assert_eq!(data_rows(&output), expected, "{statement}");
+    }
+    sessions.finish();
+}
+
+#[test]
+fn read_committed_semi_joins_recheck_the_subquery_row_first_matched() {
+    let mut sessions = sessions("semi-join-recheck", TransactionMode::Mvcc, ITEMS);
+    for (statement, expected) in [
+        (
+            "SELECT id FROM items WHERE EXISTS (SELECT 1 FROM stock WHERE stock.qty = items.qty) \
+             ORDER BY id FOR UPDATE",
+            &["2"][..],
+        ),
+        (
+            "SELECT id FROM items WHERE EXISTS (SELECT 1 FROM stock WHERE stock.qty >= items.qty) \
+             ORDER BY id FOR UPDATE",
+            &["2", "3"],
+        ),
+        // A condition PostgreSQL keeps as a subplan runs again.
+        (
+            "SELECT id FROM items WHERE EXISTS (SELECT 1 FROM stock WHERE stock.qty = items.qty) \
+             OR id = 3 ORDER BY id FOR UPDATE",
+            &["1", "2", "3"],
+        ),
+        (
+            "UPDATE items SET note = 'u' WHERE EXISTS \
+             (SELECT 1 FROM stock WHERE stock.qty = items.qty) RETURNING id",
+            &["2"],
+        ),
+        (
+            "DELETE FROM items WHERE qty IN (SELECT qty FROM stock) RETURNING id",
+            &["2"],
+        ),
+    ] {
+        let output = after_concurrent_change(
+            &mut sessions,
+            "UPDATE items SET qty = qty + 1 WHERE id = 1",
+            statement,
+        );
+        assert!(error_sqlstates(&output).is_empty(), "{statement}");
+        assert_eq!(data_rows(&output), expected, "{statement}");
+    }
+    sessions.finish();
+}
+
+#[test]
+fn a_merge_source_row_runs_not_matched_for_every_lost_pair() {
+    let mut sessions = sessions(
+        "merge-lost-pairs",
+        TransactionMode::Mvcc,
+        "CREATE TABLE mt (id int, k int, v int); CREATE TABLE ms (k int, w int)",
+    );
+    let merge = "MERGE INTO mt USING ms ON ms.k = mt.k \
+         WHEN MATCHED THEN UPDATE SET v = mt.v + ms.w \
+         WHEN NOT MATCHED THEN INSERT VALUES (100 + ms.w, ms.k, ms.w) \
+         RETURNING merge_action(), mt.id";
+    for (change, expected) in [
+        (
+            "UPDATE mt SET k = k + 10",
+            &["INSERT|101", "INSERT|101", "INSERT|102", "INSERT|103"][..],
+        ),
+        // The stage runs right after the lost pair, as PostgreSQL's does.
+        (
+            "UPDATE mt SET k = 11 WHERE id = 1",
+            &["INSERT|101", "UPDATE|2", "UPDATE|3", "INSERT|103"],
+        ),
+        (
+            "DELETE FROM mt WHERE id = 2",
+            &["UPDATE|1", "INSERT|101", "UPDATE|3", "INSERT|103"],
+        ),
+    ] {
+        sessions.first(
+            "DELETE FROM mt; DELETE FROM ms; INSERT INTO mt VALUES (1, 1, 10), (2, 1, 20), \
+             (3, 2, 30); INSERT INTO ms VALUES (1, 1), (2, 2), (3, 3)",
+        );
+        sessions.first(&format!("BEGIN; {change}"));
+        let parked = sessions.second_waits(merge);
+        sessions.first("COMMIT");
+        let output = sessions.resume_second(merge, parked);
+        assert!(error_sqlstates(&output).is_empty(), "{change}");
+        assert_eq!(data_rows(&output), expected, "{change}");
+    }
+    sessions.finish();
+}
+
+#[test]
+fn updates_and_deletes_run_correlated_where_subqueries_per_row() {
+    let mut sessions = sessions(
+        "correlated-dml-where",
+        TransactionMode::Mvcc,
+        "CREATE TABLE aa (id int, v int); CREATE TABLE bb (id int, w int); \
+         INSERT INTO aa VALUES (1, 1), (2, 2), (3, 3); INSERT INTO bb VALUES (1, 1), (3, 9)",
+    );
+    for (statement, expected) in [
+        (
+            "UPDATE aa SET v = v + 10 WHERE EXISTS (SELECT 1 FROM bb WHERE bb.id = aa.id) \
+             RETURNING id, v",
+            &["1|11", "3|13"][..],
+        ),
+        (
+            "UPDATE aa t SET v = 0 WHERE t.id = (SELECT max(id) FROM bb WHERE bb.w > t.v - 100) \
+             RETURNING id",
+            &["3"],
+        ),
+        (
+            "DELETE FROM aa WHERE v = (SELECT aa.v) AND id = 2 RETURNING id",
+            &["2"],
+        ),
+        (
+            "UPDATE aa SET v = 5 FROM bb WHERE bb.id = aa.id AND EXISTS \
+             (SELECT 1 FROM bb b2 WHERE b2.w = aa.v + 0 * bb.w) RETURNING aa.id",
+            &[],
+        ),
+        (
+            "MERGE INTO aa USING bb ON bb.id = aa.id WHEN MATCHED AND EXISTS \
+             (SELECT 1 FROM bb b2 WHERE b2.id = aa.id AND b2.w = 9) THEN DELETE \
+             RETURNING aa.id",
+            &["3"],
+        ),
+    ] {
+        let output = sessions.second(statement);
+        assert!(error_sqlstates(&output).is_empty(), "{statement}");
+        assert_eq!(data_rows(&output), expected, "{statement}");
+    }
+    // A LATERAL set operation reads the tables to its left.
+    assert_eq!(
+        sessions.rows(
+            "SELECT aa.id, s.y FROM aa, LATERAL (SELECT aa.v + 1 AS y UNION ALL \
+             SELECT aa.v + 2) s ORDER BY 1, 2"
+        ),
+        ["1|12", "1|13"]
+    );
+    sessions.finish();
+}
+
+const PARTITIONED_PARENT: &str = "CREATE TABLE fp (id int, k int, PRIMARY KEY (id, k)) PARTITION BY LIST (k); \
+     CREATE TABLE fp1 PARTITION OF fp FOR VALUES IN (1); \
+     CREATE TABLE fp2 PARTITION OF fp FOR VALUES IN (2); \
+     CREATE TABLE fc (id int, pid int, pk int, FOREIGN KEY (pid, pk) REFERENCES fp)";
+
+#[test]
+fn foreign_key_checks_follow_partitioned_parents_as_postgresql_does() {
+    let mut sessions = sessions(
+        "partitioned-parent",
+        TransactionMode::Mvcc,
+        PARTITIONED_PARENT,
+    );
+    // A waiting check cannot follow a parent moved to another partition.
+    sessions.first("INSERT INTO fp VALUES (1, 1)");
+    sessions.first("BEGIN; UPDATE fp SET k = 2 WHERE id = 1");
+    let insert = "INSERT INTO fc VALUES (1, 1, 1)";
+    let parked = sessions.second_waits(insert);
+    sessions.first("COMMIT");
+    let output = sessions.resume_second(insert, parked);
+    assert_eq!(error_sqlstates(&output), ["40001"]);
+    assert!(String::from_utf8_lossy(&output).contains(MOVED_OUT));
+    // After the move, a new statement finds no parent.
+    let output = sessions.second(insert);
+    assert_eq!(error_sqlstates(&output), ["23503"]);
+    // Repeatable read checks a partitioned parent with a current snapshot.
+    for (change, expected) in [
+        ("INSERT INTO fp VALUES (5, 1)", &[][..]),
+        ("DELETE FROM fp WHERE id = 5", &["23503"][..]),
+    ] {
+        sessions.second("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM fc");
+        sessions.first(change);
+        let output = sessions.second("INSERT INTO fc VALUES (5, 5, 1)");
+        assert_eq!(error_sqlstates(&output), expected, "{change}");
+        sessions.second("ROLLBACK");
+    }
+    // A check that waited for the parent's deletion or move keeps the
+    // snapshot it started with: repeatable read fails with 40001, and read
+    // committed does not find a parent inserted again under the same key.
+    for (isolation, change, expected) in [
+        ("REPEATABLE READ", "DELETE FROM fp WHERE id = 6", "40001"),
+        ("SERIALIZABLE", "UPDATE fp SET id = 7 WHERE id = 6", "40001"),
+        (
+            "READ COMMITTED",
+            "DELETE FROM fp WHERE id = 6; INSERT INTO fp VALUES (6, 1)",
+            "23503",
+        ),
+    ] {
+        sessions.first("DELETE FROM fp; INSERT INTO fp VALUES (6, 1)");
+        sessions.second(&format!(
+            "BEGIN ISOLATION LEVEL {isolation}; SELECT count(*) FROM fc"
+        ));
+        sessions.first(&format!("BEGIN; {change}"));
+        let insert = "INSERT INTO fc VALUES (6, 6, 1)";
+        let parked = sessions.second_waits(insert);
+        sessions.first("COMMIT");
+        let output = sessions.resume_second(insert, parked);
+        assert_eq!(error_sqlstates(&output), [expected], "{isolation} {change}");
+        sessions.second("ROLLBACK");
+    }
+    sessions.finish();
+}
+
+const JOINED: &str = "CREATE TABLE ut (id int PRIMARY KEY, k int, v int); \
+     CREATE TABLE uf (k int, label text); \
+     CREATE TABLE ug (k int, n int); \
+     INSERT INTO uf VALUES (1, 'one'), (2, 'two'), (3, 'three'); \
+     INSERT INTO ug VALUES (1, 10), (2, 20)";
+
+#[test]
+fn read_committed_from_rechecks_keep_the_joined_from_rows() {
+    let mut sessions = sessions("joined-from-recheck", TransactionMode::Mvcc, JOINED);
+    // PostgreSQL rechecks the target's latest version against the FROM
+    // row it joined; it does not join the new key to another FROM row.
+    // The second FROM row the first version joined still qualifies, and
+    // the assignments read it.
+    for (statement, tag, rows) in [
+        (
+            "UPDATE ut SET v = v + 1 FROM uf WHERE ut.k = uf.k AND ut.id = 1",
+            "UPDATE 0",
+            &["1|2|0", "2|2|0"][..],
+        ),
+        (
+            "UPDATE ut SET v = length(uf.label) FROM uf WHERE ut.k = uf.k OR uf.k = 3",
+            "UPDATE 2",
+            &["1|2|5", "2|2|3"][..],
+        ),
+        (
+            "UPDATE ut SET v = s.n FROM (SELECT k, n FROM ug) s WHERE ut.k = s.k",
+            "UPDATE 1",
+            &["1|2|0", "2|2|20"][..],
+        ),
+        (
+            "UPDATE ut SET v = coalesce(g.n, -1) FROM uf LEFT JOIN ug g ON g.k = uf.k + 1 \
+             WHERE ut.k = uf.k",
+            "UPDATE 1",
+            &["1|2|0", "2|2|-1"][..],
+        ),
+        (
+            "DELETE FROM ut USING uf WHERE ut.k = uf.k AND uf.label = 'one'",
+            "DELETE 0",
+            &["1|2|0", "2|2|0"][..],
+        ),
+    ] {
+        sessions.first("DELETE FROM ut; INSERT INTO ut VALUES (1, 1, 0), (2, 2, 0)");
+        sessions.first("BEGIN; UPDATE ut SET k = 2 WHERE id = 1");
+        let parked = sessions.second_waits(statement);
+        sessions.first("COMMIT");
+        let output = sessions.resume_second(statement, parked);
+        assert!(
+            String::from_utf8_lossy(&output).contains(tag),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            sessions.rows("SELECT * FROM ut ORDER BY id"),
+            rows,
+            "{statement}"
+        );
+    }
+    sessions.finish();
+}

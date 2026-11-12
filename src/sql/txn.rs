@@ -91,6 +91,10 @@ pub(super) struct WriteCompletionBoundary {
     /// statement that restarts on a wait still takes its writes' AFTER work,
     /// so those triggers run on the engine, but nothing in it is retained.
     pub(super) retained: bool,
+    /// The write is a top-level statement: its completion also runs the
+    /// transaction's immediate constraint checks, so a wait in them keeps
+    /// the finished AFTER events instead of running the statement again.
+    pub(super) statement_end: bool,
 }
 
 impl TxnState {
@@ -447,6 +451,9 @@ pub struct TxnState {
     /// The top-level write waiting inside its rows; its next run continues
     /// at the unfinished row. Ending or canceling the statement releases it.
     retained_write: Option<super::exec::RetainedWrite>,
+    /// The snapshot of the foreign key check that made the running statement
+    /// wait for a parent row's lock; that check runs again under it.
+    awaited_parent_read: Option<(ConstraintIdentity, crate::storage::ValidationRead)>,
     /// Saved procedure bodies currently running, and whether a wait inside
     /// one reached a position no saved frame can own, so the whole statement
     /// must instead roll back and run again.
@@ -1171,6 +1178,7 @@ impl TxnState {
             pending_write_completion: None,
             pending_procedure: None,
             retained_write: None,
+            awaited_parent_read: None,
             running_procedures: 0,
             procedure_restart: false,
             cache_capacity_wait: None,
@@ -1724,6 +1732,7 @@ impl TxnState {
     pub(crate) fn release_suspended_statement(&mut self) {
         self.suspended_statement = None;
         self.retained_write = None;
+        self.awaited_parent_read = None;
         self.cache_capacity_wait = None;
         self.checkpoint_request = None;
     }
@@ -1739,7 +1748,30 @@ impl TxnState {
         let command = self.next_command_identity()?;
         self.command_counter = command;
         self.command_id = command;
+        self.awaited_parent_read = None;
         Ok(())
+    }
+
+    /// Keeps the snapshot of the foreign key check `constraint` that waits for
+    /// a parent row's lock.
+    pub(crate) fn await_parent_read(
+        &mut self,
+        constraint: ConstraintIdentity,
+        read: crate::storage::ValidationRead,
+    ) {
+        self.awaited_parent_read = Some((constraint, read));
+    }
+
+    /// The snapshot the waiting foreign key check `constraint` started with.
+    pub(crate) fn take_awaited_parent_read(
+        &mut self,
+        constraint: ConstraintIdentity,
+    ) -> Option<crate::storage::ValidationRead> {
+        let (awaited, read) = self.awaited_parent_read?;
+        (awaited == constraint).then(|| {
+            self.awaited_parent_read = None;
+            read
+        })
     }
 
     #[cfg(test)]
@@ -3097,6 +3129,31 @@ impl TxnState {
         Ok(undo)
     }
 
+    /// Deletes a row an `UPDATE` or `MERGE` moves to another partition. The
+    /// storage marks the deletion as a move so concurrent lockers fail with
+    /// PostgreSQL's `40001` instead of skipping the row.
+    pub(crate) fn move_row_out(
+        &mut self,
+        storage: &crate::storage::Storage,
+        target: crate::storage::TableDefinitionTarget,
+        rowid: u64,
+        command: u32,
+        statistics: crate::storage::RowWriteStatistics,
+    ) -> Result<crate::storage::PendingWriteUndo, SqlError> {
+        if target.transaction() != self.txid {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "row definition selection belongs to another transaction"
+            ));
+        }
+        let undo = storage.write_pending_move_out(target, rowid, command, statistics)?;
+        if let Err(error) = self.touch(target.table() as u32, rowid, undo) {
+            storage.restore_pending(target.table(), rowid, self.txid, undo);
+            return Err(error);
+        }
+        Ok(undo)
+    }
+
     pub(crate) fn record_table_drop(
         &mut self,
         storage: &crate::storage::Storage,
@@ -3362,6 +3419,7 @@ impl TxnState {
         self.pending_write_completion = None;
         self.pending_procedure = None;
         self.retained_write = None;
+        self.awaited_parent_read = None;
         self.procedure_restart = false;
         self.write_completion_boundary = None;
         self.concurrent_index = None;

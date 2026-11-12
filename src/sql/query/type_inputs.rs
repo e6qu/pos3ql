@@ -89,6 +89,10 @@ impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
         self.row.column_type_oid(qualifier, name)
     }
+
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        self.row.row_variable(name)
+    }
     fn collation(&self, qualifier: Option<&str>, name: &str) -> ast::Collation {
         self.row.collation(qualifier, name)
     }
@@ -1623,7 +1627,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         let txid = self.txid;
         let arena = self.arena;
         let (target, alias, extra, returning) = match statement {
-            Stmt::Insert(insert) => (insert.table, None, None, insert.returning),
+            Stmt::Insert(insert) => (insert.table, insert.alias, None, insert.returning),
             Stmt::Update(update) => (update.table, update.alias, update.from, update.returning),
             Stmt::Delete(delete) => (delete.table, delete.alias, delete.using, delete.returning),
             Stmt::Merge(merge) => {

@@ -73,6 +73,8 @@ const MAX_QUERY_DEPTH: usize = 64;
 // Text input reserves one byte for PostgreSQL's internal terminator. Binary
 // input carries that terminator separately and can fill the 11-bit field.
 const MAX_TEXT_LEXEME_BYTES: usize = 2_046;
+/// PostgreSQL's parser skips, with a NOTICE, a document word this long.
+const MAX_PARSED_WORD_BYTES: usize = 2_048;
 const MAX_WIRE_LEXEME_BYTES: usize = 2_047;
 const MAX_LEXEME_POSITIONS: usize = 256;
 const MAX_TEXT_SEARCH_STORAGE_BYTES: usize = (1 << 20) - 1;
@@ -684,6 +686,15 @@ impl<'a> QueryParser<'a> {
             return Ok(node);
         }
         let bytes = self.source.as_bytes();
+        if self.at == bytes.len() {
+            // PostgreSQL's parser reaches the end of input still expecting
+            // an operand.
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "no operand in tsquery: \"{}\"",
+                self.source
+            ));
+        }
         let quoted = bytes.get(self.at) == Some(&b'\'');
         let (start, end) = if quoted {
             self.at += 1;
@@ -1126,7 +1137,7 @@ fn canonical_expression(source: &[u8]) -> CanonicalExpression<'_> {
                 let begin = at;
                 at += 1;
                 let distance = if source.get(at..at + 2) == Some(&b"->"[..]) {
-                    at += 2;
+                    at += 1;
                     1
                 } else {
                     let mut value = 0u16;
@@ -2054,6 +2065,14 @@ fn document_tokens_with<'a>(
     let mut emit = |kind: u8, source: &str| -> Result<(), SqlError> {
         if source.is_empty() {
             return Ok(());
+        }
+        if source.len() >= MAX_PARSED_WORD_BYTES {
+            return crate::sql::eval::raise_eval_message_with_detail(
+                crate::sql::eval::EvalMessageLevel::Notice,
+                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                format_args!("word is too long to be indexed"),
+                "Words longer than 2047 characters are ignored.",
+            );
         }
         match normalize(kind, source, arena)? {
             TextSearchLexeme::Unmapped => {}
@@ -3033,155 +3052,486 @@ pub fn query_tree<'a>(source: &'a str, arena: &'a Arena) -> Result<&'a str, SqlE
     format_query(&output, arena)
 }
 
-fn query_subtree_equal(
-    left: &Query<'_>,
-    left_index: u32,
-    right: &Query<'_>,
-    right_index: u32,
-) -> bool {
-    match (
-        left.node(left_index).expect("query node"),
-        right.node(right_index).expect("query node"),
-    ) {
-        (QueryNode::Lexeme { text: a, .. }, QueryNode::Lexeme { text: b, .. }) => a == b,
-        (QueryNode::Not(a), QueryNode::Not(b)) => query_subtree_equal(left, a, right, b),
-        (QueryNode::And(al, ar), QueryNode::And(bl, br))
-        | (QueryNode::Or(al, ar), QueryNode::Or(bl, br)) => {
-            query_subtree_equal(left, al, right, bl) && query_subtree_equal(left, ar, right, br)
+/// PostgreSQL's n-ary query tree (`QTNode`) for `ts_rewrite`. Child order
+/// follows `QT2QTN`: a binary operator's right operand is child 0.
+#[derive(Clone, Copy)]
+struct RewriteNode<'a> {
+    kind: RewriteKind<'a>,
+    children: &'a [u32],
+    /// A substituted subtree that this pass must not search again.
+    no_change: bool,
+    /// `QTNode.sign`: operand checksum bits, computed when a query is read
+    /// and deliberately not recomputed after a substitution, as PostgreSQL
+    /// does; it gates later matches.
+    sign: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RewriteKind<'a> {
+    Lexeme {
+        text: &'a str,
+        weights: u8,
+        prefix: bool,
+        crc: i32,
+    },
+    Not,
+    And,
+    Or,
+    Phrase(u16),
+}
+
+impl RewriteKind<'_> {
+    /// PostgreSQL's `QueryItemType` then operator code ordering.
+    fn rank(self) -> (u8, u8) {
+        match self {
+            Self::Lexeme { .. } => (1, 0),
+            Self::Not => (2, 1),
+            Self::And => (2, 2),
+            Self::Or => (2, 3),
+            Self::Phrase(_) => (2, 4),
         }
-        (
-            QueryNode::Phrase {
-                left: al,
-                right: ar,
-                distance: ad,
-            },
-            QueryNode::Phrase {
-                left: bl,
-                right: br,
-                distance: bd,
-            },
-        ) => {
-            ad == bd
-                && query_subtree_equal(left, al, right, bl)
-                && query_subtree_equal(left, ar, right, br)
-        }
-        _ => false,
     }
 }
 
-fn clone_query_subtree<'a>(
-    source: &Query<'a>,
-    index: u32,
-    output: &mut Query<'a>,
-) -> Result<u32, SqlError> {
-    let node = match source.node(index).expect("query node") {
-        node @ QueryNode::Lexeme { .. } => node,
-        QueryNode::Not(child) => QueryNode::Not(clone_query_subtree(source, child, output)?),
-        QueryNode::And(left, right) => QueryNode::And(
-            clone_query_subtree(source, left, output)?,
-            clone_query_subtree(source, right, output)?,
-        ),
-        QueryNode::Or(left, right) => QueryNode::Or(
-            clone_query_subtree(source, left, output)?,
-            clone_query_subtree(source, right, output)?,
-        ),
-        QueryNode::Phrase {
-            left,
-            right,
-            distance,
-        } => QueryNode::Phrase {
-            left: clone_query_subtree(source, left, output)?,
-            right: clone_query_subtree(source, right, output)?,
-            distance,
-        },
-    };
-    output.push(node)
+fn lexeme_crc32(text: &str) -> i32 {
+    legacy_crc32_bytes(text.bytes())
 }
 
-fn rewrite_query_subtree<'a>(
-    source: &Query<'a>,
-    index: u32,
-    target: &Query<'a>,
-    replacement: &Query<'a>,
-    output: &mut Query<'a>,
-) -> Result<Option<u32>, SqlError> {
-    if target
-        .root
-        .is_some_and(|root| query_subtree_equal(source, index, target, root))
-    {
-        return replacement
-            .root
-            .map(|root| clone_query_subtree(replacement, root, output))
-            .transpose();
-    }
-    let node = match source.node(index).expect("query node") {
-        node @ QueryNode::Lexeme { .. } => return output.push(node).map(Some),
-        QueryNode::Not(child) => {
-            let Some(child) = rewrite_query_subtree(source, child, target, replacement, output)?
-            else {
-                return Ok(None);
-            };
-            QueryNode::Not(child)
+struct RewriteTree<'a> {
+    arena: &'a Arena,
+    nodes: ArenaList<'a, RewriteNode<'a>>,
+}
+
+impl<'a> RewriteTree<'a> {
+    fn new(arena: &'a Arena) -> Self {
+        Self {
+            arena,
+            nodes: ArenaList::new(arena),
         }
-        QueryNode::And(left, right) | QueryNode::Or(left, right) => {
-            let left = rewrite_query_subtree(source, left, target, replacement, output)?;
-            let right = rewrite_query_subtree(source, right, target, replacement, output)?;
-            match (left, right) {
-                (Some(left), Some(right)) => {
-                    if matches!(source.node(index), Some(QueryNode::And(..))) {
-                        QueryNode::And(left, right)
-                    } else {
-                        QueryNode::Or(left, right)
+    }
+
+    fn node(&self, id: u32) -> RewriteNode<'a> {
+        self.nodes.as_slice()[id as usize]
+    }
+
+    fn push(&mut self, node: RewriteNode<'a>) -> Result<u32, SqlError> {
+        let id = u32::try_from(self.nodes.len()).map_err(|_| capacity("tsquery"))?;
+        self.nodes.push(node).map_err(|_| arena_full("tsquery"))?;
+        Ok(id)
+    }
+
+    fn children(&self, ids: &[u32]) -> Result<&'a mut [u32], SqlError> {
+        self.arena
+            .alloc_slice_copy(ids)
+            .map_err(|_| arena_full("tsquery"))
+    }
+
+    fn import(&mut self, query: &Query<'_>, index: u32) -> Result<u32, SqlError> {
+        let node = query.node(index).ok_or_else(|| syntax("tsquery", ""))?;
+        let (kind, operands): (RewriteKind<'a>, [Option<u32>; 2]) = match node {
+            QueryNode::Lexeme {
+                text,
+                weights,
+                prefix,
+            } => (
+                RewriteKind::Lexeme {
+                    text: self
+                        .arena
+                        .alloc_str(text)
+                        .map_err(|_| arena_full("tsquery"))?,
+                    weights,
+                    prefix,
+                    crc: lexeme_crc32(text),
+                },
+                [None, None],
+            ),
+            QueryNode::Not(child) => (RewriteKind::Not, [Some(child), None]),
+            QueryNode::And(left, right) => (RewriteKind::And, [Some(right), Some(left)]),
+            QueryNode::Or(left, right) => (RewriteKind::Or, [Some(right), Some(left)]),
+            QueryNode::Phrase {
+                left,
+                right,
+                distance,
+            } => (RewriteKind::Phrase(distance), [Some(right), Some(left)]),
+        };
+        let mut ids = [0u32; 2];
+        let mut count = 0;
+        let mut sign = match kind {
+            RewriteKind::Lexeme { crc, .. } => 1u32 << ((crc as u32) % 32),
+            _ => 0,
+        };
+        for operand in operands.into_iter().flatten() {
+            ids[count] = self.import(query, operand)?;
+            sign |= self.node(ids[count]).sign;
+            count += 1;
+        }
+        let children = self.children(&ids[..count])?;
+        self.push(RewriteNode {
+            kind,
+            children,
+            no_change: false,
+            sign,
+        })
+    }
+
+    /// `QTNodeCompare`: operators before operands, then by operator code,
+    /// child count, children and phrase distance; operands by checksum and
+    /// text. Weights and prefix marks do not take part.
+    fn compare(&self, left: u32, right: u32) -> Ordering {
+        let (a, b) = (self.node(left), self.node(right));
+        let (a_rank, b_rank) = (a.kind.rank(), b.kind.rank());
+        if a_rank != b_rank {
+            return b_rank.cmp(&a_rank);
+        }
+        match (a.kind, b.kind) {
+            (
+                RewriteKind::Lexeme {
+                    text: a_text,
+                    crc: a_crc,
+                    ..
+                },
+                RewriteKind::Lexeme {
+                    text: b_text,
+                    crc: b_crc,
+                    ..
+                },
+            ) => b_crc
+                .cmp(&a_crc)
+                .then_with(|| a_text.as_bytes().cmp(b_text.as_bytes())),
+            _ => {
+                if a.children.len() != b.children.len() {
+                    return b.children.len().cmp(&a.children.len());
+                }
+                for (&x, &y) in a.children.iter().zip(b.children) {
+                    let ordering = self.compare(x, y);
+                    if ordering.is_ne() {
+                        return ordering;
                     }
                 }
-                (Some(node), None) | (None, Some(node)) => return Ok(Some(node)),
-                (None, None) => return Ok(None),
+                match (a.kind, b.kind) {
+                    (RewriteKind::Phrase(x), RewriteKind::Phrase(y)) => y.cmp(&x),
+                    _ => Ordering::Equal,
+                }
             }
         }
-        QueryNode::Phrase {
-            left,
-            right,
-            distance,
-        } => {
-            let left = rewrite_query_subtree(source, left, target, replacement, output)?;
-            let right = rewrite_query_subtree(source, right, target, replacement, output)?;
-            match (left, right) {
-                (Some(left), Some(right)) => QueryNode::Phrase {
-                    left,
-                    right,
-                    distance,
-                },
-                (Some(node), None) | (None, Some(node)) => return Ok(Some(node)),
-                (None, None) => return Ok(None),
+    }
+
+    /// `QTNTernary` then `QTNSort`: flattens nested AND and OR operators and
+    /// orders commutative operands. The copy clears substitution marks.
+    fn normalize(&mut self, id: u32) -> Result<u32, SqlError> {
+        let node = self.node(id);
+        if matches!(node.kind, RewriteKind::Lexeme { .. }) {
+            if !node.no_change {
+                return Ok(id);
+            }
+            return self.push(RewriteNode {
+                no_change: false,
+                ..node
+            });
+        }
+        let mut width = 0usize;
+        let mut normalized = ArenaList::new(self.arena);
+        for &child in node.children {
+            let child = self.normalize(child)?;
+            normalized.push(child).map_err(|_| arena_full("tsquery"))?;
+            let child_node = self.node(child);
+            width += if matches!(node.kind, RewriteKind::And | RewriteKind::Or)
+                && child_node.kind == node.kind
+            {
+                child_node.children.len()
+            } else {
+                1
+            };
+        }
+        let children = self
+            .arena
+            .alloc_slice_with(width, |_| 0u32)
+            .map_err(|_| arena_full("tsquery"))?;
+        let mut at = 0;
+        for &child in normalized.as_slice() {
+            let child_node = self.node(child);
+            if matches!(node.kind, RewriteKind::And | RewriteKind::Or)
+                && child_node.kind == node.kind
+            {
+                children[at..at + child_node.children.len()].copy_from_slice(child_node.children);
+                at += child_node.children.len();
+            } else {
+                children[at] = child;
+                at += 1;
             }
         }
-    };
-    output.push(node).map(Some)
+        self.sort(node.kind, children);
+        self.push(RewriteNode {
+            children,
+            no_change: false,
+            ..node
+        })
+    }
+
+    fn sort(&self, kind: RewriteKind<'a>, children: &mut [u32]) {
+        if children.len() > 1 && !matches!(kind, RewriteKind::Phrase(_)) {
+            children.sort_unstable_by(|&a, &b| self.compare(a, b));
+        }
+    }
+
+    /// `QTNEq`: equal signatures and equal trees.
+    fn equal(&self, left: u32, right: u32) -> bool {
+        self.node(left).sign == self.node(right).sign && self.compare(left, right).is_eq()
+    }
+
+    fn substitute(&mut self, replacement: Option<u32>) -> Result<Option<u32>, SqlError> {
+        replacement
+            .map(|id| {
+                let node = self.node(id);
+                self.push(RewriteNode {
+                    no_change: true,
+                    ..node
+                })
+            })
+            .transpose()
+    }
+
+    /// `findeq`: replaces `id` itself, or for AND and OR the subset of its
+    /// sorted operands, when it matches `target`.
+    fn replace_here(
+        &mut self,
+        id: u32,
+        target: u32,
+        replacement: Option<u32>,
+        found: &mut bool,
+    ) -> Result<Option<u32>, SqlError> {
+        let node = self.node(id);
+        let target_node = self.node(target);
+        if node.sign & target_node.sign != target_node.sign
+            || node.no_change
+            || node.kind.rank().0 != target_node.kind.rank().0
+        {
+            return Ok(Some(id));
+        }
+        if matches!(node.kind, RewriteKind::Lexeme { .. }) {
+            if self.equal(id, target) {
+                *found = true;
+                return self.substitute(replacement);
+            }
+            return Ok(Some(id));
+        }
+        if node.kind.rank() != target_node.kind.rank() {
+            return Ok(Some(id));
+        }
+        if node.children.len() == target_node.children.len() {
+            if self.equal(id, target) {
+                *found = true;
+                return self.substitute(replacement);
+            }
+            return Ok(Some(id));
+        }
+        if node.children.len() < target_node.children.len() || target_node.children.is_empty() {
+            return Ok(Some(id));
+        }
+        let matched = self
+            .arena
+            .alloc_slice_with(node.children.len(), |_| false)
+            .map_err(|_| arena_full("tsquery"))?;
+        let (mut i, mut j, mut count) = (0, 0, 0);
+        while i < node.children.len() && j < target_node.children.len() {
+            match self.compare(node.children[i], target_node.children[j]) {
+                Ordering::Equal => {
+                    matched[i] = true;
+                    count += 1;
+                    i += 1;
+                    j += 1;
+                }
+                Ordering::Less => i += 1,
+                Ordering::Greater => break,
+            }
+        }
+        if count != target_node.children.len() {
+            return Ok(Some(id));
+        }
+        let substitute = self.substitute(replacement)?;
+        let width = node.children.len() - count + usize::from(substitute.is_some());
+        let children = self
+            .arena
+            .alloc_slice_with(width, |_| 0u32)
+            .map_err(|_| arena_full("tsquery"))?;
+        let mut at = 0;
+        for (index, &child) in node.children.iter().enumerate() {
+            if !matched[index] {
+                children[at] = child;
+                at += 1;
+            }
+        }
+        if let Some(substitute) = substitute {
+            children[at] = substitute;
+        }
+        self.sort(node.kind, children);
+        *found = true;
+        self.push(RewriteNode { children, ..node }).map(Some)
+    }
+
+    /// `dofindsubquery`: matches at `id`, then at its operands, dropping
+    /// removed operands and an operator left with one (other than NOT).
+    fn replace(
+        &mut self,
+        id: u32,
+        target: u32,
+        replacement: Option<u32>,
+        found: &mut bool,
+    ) -> Result<Option<u32>, SqlError> {
+        let Some(id) = self.replace_here(id, target, replacement, found)? else {
+            return Ok(None);
+        };
+        let node = self.node(id);
+        if node.no_change || matches!(node.kind, RewriteKind::Lexeme { .. }) {
+            return Ok(Some(id));
+        }
+        let mut kept = ArenaList::new(self.arena);
+        for &child in node.children {
+            if let Some(child) = self.replace(child, target, replacement, found)? {
+                kept.push(child).map_err(|_| arena_full("tsquery"))?;
+            }
+        }
+        match kept.as_slice() {
+            [] => Ok(None),
+            [only] if node.kind != RewriteKind::Not => Ok(Some(*only)),
+            _ => {
+                let children = self.children(kept.as_slice())?;
+                self.push(RewriteNode { children, ..node }).map(Some)
+            }
+        }
+    }
+
+    /// `QTNBinary`, then the binary query PostgreSQL stores and prints.
+    fn export(&self, id: u32, output: &mut Query<'a>) -> Result<u32, SqlError> {
+        let node = self.node(id);
+        match node.kind {
+            RewriteKind::Lexeme {
+                text,
+                weights,
+                prefix,
+                ..
+            } => output.push(QueryNode::Lexeme {
+                text,
+                weights,
+                prefix,
+            }),
+            RewriteKind::Not => {
+                let child = self.export(node.children[0], output)?;
+                output.push(QueryNode::Not(child))
+            }
+            kind => {
+                let binary = |left: u32, right: u32| match kind {
+                    RewriteKind::And => QueryNode::And(left, right),
+                    RewriteKind::Or => QueryNode::Or(left, right),
+                    RewriteKind::Phrase(distance) => QueryNode::Phrase {
+                        left,
+                        right,
+                        distance,
+                    },
+                    _ => unreachable!("only binary operators reach here"),
+                };
+                // QTNBinary pairs the first two operands, then moves the last
+                // operand into the second place, until two remain. Child 0
+                // is the printed right operand.
+                let children = self.children(node.children)?;
+                let mut count = children.len();
+                let mut first = self.export(children[0], output)?;
+                while count > 2 {
+                    let second = self.export(children[1], output)?;
+                    first = output.push(binary(second, first))?;
+                    children[1] = children[count - 1];
+                    count -= 1;
+                }
+                let second = self.export(children[1], output)?;
+                output.push(binary(second, first))
+            }
+        }
+    }
+
+    fn format(&self, root: Option<u32>) -> Result<&'a str, SqlError> {
+        let mut output = Query::empty(self.arena);
+        output.root = root
+            .map(|root| self.export(root, &mut output))
+            .transpose()?;
+        format_query(&output, self.arena)
+    }
+
+    fn load(&mut self, source: &str) -> Result<Option<u32>, SqlError> {
+        let source = self
+            .arena
+            .alloc_str(source)
+            .map_err(|_| arena_full("tsquery"))?;
+        let query = parse_query(source, self.arena)?;
+        query.root.map(|root| self.import(&query, root)).transpose()
+    }
 }
 
+/// `ts_rewrite(query, target, substitute)`, as PostgreSQL's
+/// `tsquery_rewrite_query`.
 pub fn rewrite_query<'a>(
     source: &str,
     target: &str,
     replacement: &str,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    let source = arena.alloc_str(source).map_err(|_| arena_full("tsquery"))?;
-    let target = arena.alloc_str(target).map_err(|_| arena_full("tsquery"))?;
-    let replacement = arena
-        .alloc_str(replacement)
-        .map_err(|_| arena_full("tsquery"))?;
-    let source = parse_query(source, arena)?;
-    let target = parse_query(target, arena)?;
-    let replacement = parse_query(replacement, arena)?;
-    let Some(root) = source.root else {
-        return Ok("");
+    let mut tree = RewriteTree::new(arena);
+    let (Some(root), Some(target)) = (tree.load(source)?, tree.load(target)?) else {
+        return arena.alloc_str(source).map_err(|_| arena_full("tsquery"));
     };
-    if target.root.is_none() {
-        return format_query(&source, arena);
+    let root = tree.normalize(root)?;
+    let target = tree.normalize(target)?;
+    let replacement = tree.load(replacement)?;
+    let mut found = false;
+    let root = tree.replace(root, target, replacement, &mut found)?;
+    tree.format(root)
+}
+
+/// `ts_rewrite(query, select)`: applies each selected (target, substitute)
+/// pair in turn, renormalizing after a pair that matched, as PostgreSQL's
+/// `tsquery_rewrite`.
+pub struct QueryRewriter<'a> {
+    tree: RewriteTree<'a>,
+    root: Option<u32>,
+    source: Option<&'a str>,
+}
+
+impl<'a> QueryRewriter<'a> {
+    pub fn new(source: &str, arena: &'a Arena) -> Result<Self, SqlError> {
+        let mut tree = RewriteTree::new(arena);
+        let root = tree.load(source)?;
+        let (root, source) = match root {
+            Some(root) => (Some(tree.normalize(root)?), None),
+            None => (
+                None,
+                Some(arena.alloc_str(source).map_err(|_| arena_full("tsquery"))?),
+            ),
+        };
+        Ok(Self { tree, root, source })
     }
-    let mut output = Query::empty(arena);
-    output.root = rewrite_query_subtree(&source, root, &target, &replacement, &mut output)?;
-    format_query(&output, arena)
+
+    pub fn apply(&mut self, target: &str, replacement: &str) -> Result<(), SqlError> {
+        let Some(root) = self.root else {
+            return Ok(());
+        };
+        let Some(target) = self.tree.load(target)? else {
+            return Ok(());
+        };
+        let target = self.tree.normalize(target)?;
+        let replacement = self.tree.load(replacement)?;
+        let mut found = false;
+        self.root = self.tree.replace(root, target, replacement, &mut found)?;
+        if found && let Some(root) = self.root {
+            self.root = Some(self.tree.normalize(root)?);
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<&'a str, SqlError> {
+        match self.source {
+            Some(source) => Ok(source),
+            None => self.tree.format(self.root),
+        }
+    }
 }
 
 pub fn headline<'a>(
@@ -4275,19 +4625,39 @@ pub fn compare_vector(left: &str, right: &str) -> Ordering {
         })
 }
 
-fn legacy_crc32(raw: &[u8]) -> i32 {
-    let mut crc = u32::MAX;
-    for byte in (UnescapedBytes { raw, at: 0 }) {
-        crc ^= u32::from(byte) << 24;
-        for _ in 0..8 {
-            let high = crc & 0x8000_0000;
-            crc <<= 1;
-            if high != 0 {
-                crc ^= 0x04c1_1db7;
-            }
+/// PostgreSQL's reflected CRC-32 table (`pg_crc32_table`).
+const LEGACY_CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut crc = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+            bit += 1;
         }
+        table[index] = crc;
+        index += 1;
+    }
+    table
+};
+
+/// PostgreSQL's `LEGACY_CRC32`, a tsquery operand's `valcrc`: the reflected
+/// table driven by the high byte, as the pre-9.5 implementation did.
+fn legacy_crc32_bytes(bytes: impl IntoIterator<Item = u8>) -> i32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc = LEGACY_CRC32_TABLE[((crc >> 24) as u8 ^ byte) as usize] ^ (crc << 8);
     }
     (crc ^ u32::MAX) as i32
+}
+
+fn legacy_crc32(raw: &[u8]) -> i32 {
+    legacy_crc32_bytes(UnescapedBytes { raw, at: 0 })
 }
 
 fn query_storage_size(source: &[u8]) -> usize {

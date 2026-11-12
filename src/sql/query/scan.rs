@@ -867,6 +867,7 @@ pub(super) enum PaxFullRowReason {
     UnprovableExpression,
     RowSecurityPolicy,
     WideColumn,
+    RetainedJoinRow,
 }
 
 /// The only two legal physical read modes for a source scan.
@@ -4181,9 +4182,30 @@ pub struct JoinRow<'s, 'v, 'd> {
     /// Stable MVCC identities for physical base-table contributors. Derived
     /// rows, function rows, and outer-join null sides carry `None`.
     pub rowids: &'s [Option<u64>],
+    /// Names resolve over the first `visible` FROM items. A `LATERAL` item's
+    /// body sees only the items to its left, not its own or later columns.
+    pub(crate) visible: usize,
 }
 
 impl<'s, 'v> JoinRow<'s, 'v, '_> {
+    /// The row as the body of the `LATERAL` item at FROM position `table`
+    /// reads it: only the items to its left.
+    pub(crate) fn left_of(self, table: usize) -> Self {
+        Self {
+            visible: table,
+            ..self
+        }
+    }
+
+    /// The column a name resolves to among the visible items.
+    fn visible_column(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.scope.find_column_among(self.visible, qualifier, name)
+    }
+
     /// None means the source has not joined yet. A present zero-column row
     /// remains distinct from an outer join's absent source.
     pub(crate) fn table_present(&self, table: usize) -> Option<bool> {
@@ -4263,6 +4285,17 @@ impl<'v> JoinRow<'_, 'v, '_> {
 
 impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        if self.visible < self.scope.n {
+            return match self.visible_column(qualifier, name) {
+                Ok(ResolvedColumn::Table(table, column)) => self
+                    .scope
+                    .defs
+                    .get(table)
+                    .and_then(|definition| definition.columns.get(column))
+                    .map_or(-1, |column| column.type_mod),
+                _ => -1,
+            };
+        }
         super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
     }
     fn whole_row_field_metadata(
@@ -4278,11 +4311,16 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<crate::sql::types::ColType, SqlError> {
+        if self.visible < self.scope.n {
+            return self
+                .visible_column(qualifier, name)
+                .map(|entry| self.scope.output_type(entry));
+        }
         super::ScopeSchema(self.scope).resolve_column_type(qualifier, name)
     }
 
     fn is_empty_scope(&self) -> bool {
-        self.scope.n == 0
+        self.visible == 0
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
@@ -4296,7 +4334,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 name
             )),
         };
-        match self.scope.find_column(qualifier, name)? {
+        match self.visible_column(qualifier, name)? {
             ResolvedColumn::Table(t, c) => one(t, c),
             // Merged USING/NATURAL column: the first non-null contributor.
             ResolvedColumn::Merged(m) => {
@@ -4328,12 +4366,12 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        let entry = self.scope.find_column(qualifier, name).ok()?;
+        let entry = self.visible_column(qualifier, name).ok()?;
         Some(self.scope.output_type(entry))
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        match self.scope.find_column(qualifier, name).ok() {
+        match self.visible_column(qualifier, name).ok() {
             Some(ResolvedColumn::Table(table, column)) => self
                 .scope
                 .defs
@@ -4361,7 +4399,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        match self.scope.find_column(qualifier, name).ok()? {
+        match self.visible_column(qualifier, name).ok()? {
             ResolvedColumn::Table(t, c) => self
                 .scope
                 .defs
@@ -4500,6 +4538,12 @@ impl Chained<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
+        self.inner
+            .outer_aggregate(call)
+            .or_else(|| self.outer?.outer_aggregate(call))
+    }
+
     fn check_unassigned_row_field(
         &self,
         qualifier: &str,
@@ -4694,6 +4738,16 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             }
             Err(_) => None,
         }
+    }
+
+    /// A relation of the inner scope shadows an outer variable of its name.
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        if self.inner.whole_row_type(name).is_some() {
+            return None;
+        }
+        self.inner
+            .row_variable(name)
+            .or_else(|| self.outer?.row_variable(name))
     }
 
     fn column_type_oid(&self, q: Option<&str>, name: &str) -> Option<i32> {
@@ -5109,6 +5163,45 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
         .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
         .expect("spill-attached block store")?;
     Ok(LateralRows::External(run))
+}
+
+/// The first row a `LATERAL` source yields for `outer`, decoded, as a locked
+/// row's recheck runs the source again with the row's latest version.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn first_lateral_row<'a, C: ColumnLookup<'a>>(
+    storage: &'a Storage,
+    txid: u32,
+    tref: &'a crate::sql::ast::TableRef<'a>,
+    width: usize,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: &C,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    let first = match materialize_lateral_source(
+        storage, txid, tref, width, arena, params, outer, hooks,
+    )? {
+        LateralRows::Local(rows) => rows.first().copied(),
+        LateralRows::External(None) => None,
+        LateralRows::External(Some(run)) => {
+            let mut first = None;
+            consume_external_lateral_run(storage, run, arena, false, None, &mut |_, bytes| {
+                first = Some(bytes);
+                Ok(false)
+            })?;
+            first
+        }
+    };
+    let Some(bytes) = first else {
+        return Ok(None);
+    };
+    let values = arena
+        .alloc_slice_with(width, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    for (column, value) in values.iter_mut().enumerate() {
+        *value = crate::sql::exec::decode_projected_col_record(bytes, column, arena)?;
+    }
+    Ok(Some(values))
 }
 
 fn consume_external_lateral_run<'a>(
@@ -6044,6 +6137,111 @@ pub(super) fn admit_sources(
     Ok(current_role)
 }
 
+/// Evaluates once, before any row, each `WHERE` conjunct that reads an
+/// uncorrelated subquery and no column of this query, as PostgreSQL's
+/// one-time filter does: one that is false or null leaves the scan empty
+/// without reading a row, and its error surfaces even over an empty source.
+/// The scan still applies the whole condition per row.
+pub(super) fn one_time_filter_passes<'a>(
+    where_clause: Option<&'a Expr<'a>>,
+    scope: &QueryScope<'_>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<bool, SqlError> {
+    let Some(predicate) = where_clause else {
+        return Ok(true);
+    };
+    let mut conjuncts = [&Expr::Null; MAX_ONE_TIME_CONJUNCTS];
+    let mut count = 0;
+    if !super::plan::flatten_and(predicate, &mut conjuncts, &mut count) {
+        // Longer conditions keep per-row evaluation only.
+        count = 0;
+    }
+    let row = Chained {
+        inner: &NoColumns,
+        outer,
+    };
+    for conjunct in &conjuncts[..count] {
+        // Only a conjunct reading an uncorrelated subquery can behave
+        // differently once than per row: that subquery runs when first read.
+        if !conjunct.contains_subquery()
+            || conjunct.contains_volatile_function().is_some()
+            || !reads_no_query_column(conjunct, scope, hooks)
+        {
+            continue;
+        }
+        // A value that is not boolean is left to the per-row evaluation,
+        // which reports it.
+        if matches!(
+            eval_full(conjunct, arena, params, &row, hooks)?,
+            Datum::Bool(false) | Datum::Null
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+const MAX_ONE_TIME_CONJUNCTS: usize = 64;
+
+/// Whether an expression reads no column of `scope`, and every subquery in it
+/// is one the query prepared without a row (an uncorrelated one).
+fn reads_no_query_column(
+    expression: &Expr<'_>,
+    scope: &QueryScope<'_>,
+    hooks: &EvalHooks<'_, '_>,
+) -> bool {
+    let prepared = |node: &Expr<'_>| {
+        let address = (node as *const Expr<'_>).cast::<()>();
+        hooks.subs.is_some_and(|subs| {
+            subs.scalars
+                .iter()
+                .any(|(candidate, _, _)| core::ptr::eq(candidate.cast::<()>(), address))
+                || subs
+                    .lists
+                    .iter()
+                    .any(|list| core::ptr::eq(list.node.cast::<()>(), address))
+                || subs
+                    .deferred
+                    .iter()
+                    .any(|deferred| core::ptr::eq(deferred.node, address))
+        })
+    };
+    match expression {
+        // A name this query binds as a column or a whole row, or one it would
+        // reject, is the query's.
+        Expr::Column { qualifier, name } => {
+            matches!(
+                scope.find_column(*qualifier, name),
+                Err(error) if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                )
+            ) && scope.source(qualifier.unwrap_or(name)).is_err()
+        }
+        Expr::WholeRow(name) => scope.source(name).is_err(),
+        Expr::SchemaColumn { .. } | Expr::RecursiveState { .. } | Expr::OuterAggregate { .. } => {
+            false
+        }
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::ArraySubquery(_) | Expr::RowSubquery { .. } => {
+            prepared(expression)
+        }
+        Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } => {
+            prepared(expression) && reads_no_query_column(operand, scope, hooks)
+        }
+        _ => {
+            let mut free = true;
+            let _ = super::subquery::walk_children(expression, &mut |child| {
+                free &= reads_no_query_column(child, scope, hooks);
+                Ok(())
+            });
+            free
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_source_mode<'a>(
     storage: &'a Storage,
@@ -6064,6 +6262,9 @@ fn scan_source_mode<'a>(
 ) -> Result<(), SqlError> {
     let current_role = admit_sources(storage, scope, txid, pax_demand)?;
     validate_materialized_view_reads(storage, scope, where_clause, arena, txid)?;
+    if !one_time_filter_passes(where_clause, scope, arena, params, hooks, outer)? {
+        return Ok(());
+    }
     let sample_plans = arena
         .alloc_slice_with(scope.n, |_| None::<TableSamplePlan>)
         .map_err(|_| arena_full())?;
@@ -6363,6 +6564,7 @@ fn scan_source_mode<'a>(
                 buffer_offsets: buffers.offsets,
             },
             rowids: &bound_rowids[..scope.n],
+            visible: scope.n,
         })
     }
 
@@ -7371,7 +7573,8 @@ fn scan_source_mode<'a>(
                 depth,
                 decode_buffers,
                 arena,
-            )?;
+            )?
+            .left_of(t);
             let chained = Chained {
                 inner: &outer_row,
                 outer,
@@ -7972,8 +8175,6 @@ fn scan_source_mode<'a>(
     // item depends on the tables to its left, so any lateral entry also pins the
     // order to FROM order (reordering could bind a dependency after it).
     let any_lateral = scope.lateral[..scope.n].iter().any(|&l| l);
-    // A LATERAL item references the tables to its left, so it cannot be the
-    // right side of a RIGHT/FULL join (PostgreSQL rejects this too).
     // Joins run as one left-deep chain. That equals PostgreSQL's tree for a
     // RIGHT or FULL join only within the first comma-separated FROM item;
     // the parser runs any later such item as a parenthesized join.
@@ -7990,11 +8191,13 @@ fn scan_source_mode<'a>(
             "RIGHT or FULL join after a comma was not grouped"
         ));
     }
-    for j in from.joins {
-        if j.table.lateral && matches!(j.kind, JoinKind::Right | JoinKind::Full) {
+    // The scope materializes the right side of a RIGHT or FULL join once:
+    // a LATERAL item there reads only FROM items outside the join.
+    for (index, j) in from.joins.iter().enumerate() {
+        if scope.lateral[index + 1] && matches!(j.kind, JoinKind::Right | JoinKind::Full) {
             return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "a LATERAL item cannot be on the right side of a RIGHT or FULL join"
+                sqlstate::INTERNAL_ERROR,
+                "the right side of a RIGHT or FULL join was not materialized"
             ));
         }
     }

@@ -1,0 +1,34 @@
+-- Builtins that PostgreSQL completes with a NOTICE or WARNING return its
+-- values; ts_rewrite flattens, sorts and rewrites as tsquery_rewrite does.
+select timestamptypmodin('{7}'::cstring[]), timetypmodin('{9}'), timestamptztypmodin('{8}'), timetztypmodin('{7}'), intervaltypmodin('{32767,7}');
+select timestamptypmodin(x) from (values ('{7}'::cstring[]),('{8}')) v(x);
+select to_tsquery('english', 'the'), plainto_tsquery('english', ''), websearch_to_tsquery('english', 'the or a'), phraseto_tsquery('english', 'the');
+select to_tsvector('simple', repeat('x', 2048) || ' y'), to_tsvector('simple', repeat('x', 2047) || ' y') = to_tsvector('simple', repeat('x', 2047) || ' y');
+select pg_cancel_backend(999999), pg_terminate_backend(999999);
+select '!!!'::tsquery;
+select to_tsquery('a &');
+select 'a <-> '::tsquery;
+select '()'::tsquery;
+select txid_status(0), txid_status(1), txid_status(2), pg_xact_status('2'), txid_status('1');
+select pg_snapshot_xmin('10:20:'), pg_visible_in_snapshot('1', '10:20:'), txid_visible_in_snapshot('15', '10:20:15');
+select ts_rewrite('b & a'::tsquery, 'x'::tsquery, 'y'::tsquery);
+select ts_rewrite('a & b'::tsquery, 'a'::tsquery, 'c'::tsquery);
+select ts_rewrite('c & b & a'::tsquery, 'x'::tsquery, 'y'::tsquery);
+select ts_rewrite('(c | b) & a'::tsquery, 'x'::tsquery, 'y'::tsquery);
+select ts_rewrite('b <-> a'::tsquery, 'x'::tsquery, 'y'::tsquery);
+select ts_rewrite('!b & a'::tsquery, 'x'::tsquery, 'y'::tsquery);
+select ts_rewrite('aa & a & b:*'::tsquery, 'x'::tsquery, 'y'::tsquery);
+select ts_rewrite('a & b'::tsquery, 'a'::tsquery, 'z | y'::tsquery);
+select ts_rewrite('(a | b) & (c <-> d) & e'::tsquery, 'x'::tsquery, 'y'::tsquery);
+select ts_rewrite('a & b & c'::tsquery, 'a & c'::tsquery, 'z'::tsquery);
+select ts_rewrite('a & b & c & d & e'::tsquery, 'b & d'::tsquery, 'q'::tsquery);
+select ts_rewrite('a | (b & c)'::tsquery, 'b & c'::tsquery, ''::tsquery);
+select ts_rewrite('!a'::tsquery, 'a'::tsquery, ''::tsquery);
+select ts_rewrite('a <2> (b & c)'::tsquery, 'c'::tsquery, 'z'::tsquery);
+select q from (values ('a'::tsquery),('b'),('c'),('aa'),('ab'),('abc'),('a & b'),('b & a'),('!a'),('a <-> b'),('a | c')) v(q) order by q;
+create table rewrite_aliases (t tsquery, s tsquery);
+insert into rewrite_aliases values ('a', 'c'), ('c & b', 'x | y'), ('', 'q'), ('x', 'w');
+select ts_rewrite('a & b'::tsquery, 'select t, s from rewrite_aliases');
+select ts_rewrite('b & a & d'::tsquery, 'select t, s from rewrite_aliases where false');
+select ts_rewrite(''::tsquery, 'select t, s from rewrite_aliases');
+drop table rewrite_aliases;

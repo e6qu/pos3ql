@@ -663,6 +663,7 @@ fn run_body<'a>(
         command: context.txn.command_id(),
         depth: context.txn.trigger_depth(),
         retained,
+        statement_end: false,
     });
     let definition = crate::storage::RelationDefinition::EMPTY;
     let result = (|| {
@@ -678,7 +679,12 @@ fn run_body<'a>(
             seeded,
         )?;
         execution.execute_block(
-            context, definition, invocation, None, &mut None, false, None, code,
+            context,
+            definition,
+            invocation,
+            &mut TriggerRows::none(),
+            None,
+            code,
         )
     })();
     context.txn.write_completion_boundary = prior;

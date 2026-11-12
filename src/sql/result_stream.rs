@@ -21,9 +21,9 @@ const STREAM_PLAN_HEADROOM: usize = 32 * 1024;
 pub(crate) enum StreamChoice {
     /// A `SELECT` reopens as a stream if its output first overflows.
     Promote,
-    /// A `UNION ALL` opens its stream before it runs: the general
-    /// executor's attempt would materialize every query before its first
-    /// row could overflow.
+    /// The statement opens its stream before it runs. A `UNION ALL`
+    /// statement does: the general executor's attempt would materialize
+    /// every query before its first row could overflow.
     Open,
     /// A FETCH streams its cursor's rows from the start: they are evaluated
     /// as the client reads them and never saved in `cursor_bytes`.
@@ -129,11 +129,12 @@ impl Engine {
             return Err(SpoolReason::Capacity);
         }
         let mark = self.work.mark();
-        let mut appended = false;
+        // A UNION ALL statement, as opposed to a UNION ALL in FROM.
+        let mut set_query = false;
         let (source, source_len) = match statement {
             Stmt::Select(select) => (
                 query::stream_query(select, &self.storage, txid, &self.work).and_then(|stream| {
-                    appended = select.set_body.is_some();
+                    set_query = select.set_body.is_some();
                     stream.map_or(Ok(None), |select| {
                         query::RetainedSelect::stream_source(
                             &self.storage,
@@ -149,7 +150,7 @@ impl Engine {
                 query::set_query_select(set, &self.work)
                     .and_then(|select| query::stream_query(select, &self.storage, txid, &self.work))
                     .and_then(|select| {
-                        appended = true;
+                        set_query = true;
                         select.map_or(Ok(None), |select| {
                             query::RetainedSelect::stream_source(
                                 &self.storage,
@@ -167,7 +168,7 @@ impl Engine {
                     .copy_query_text(copy, txid, &self.work)
                     .and_then(|text| {
                         let select = crate::sql::parser::parse_query(text, &self.work)?;
-                        appended = select.set_body.is_some();
+                        set_query = select.set_body.is_some();
                         let Some(select) =
                             query::stream_query(select, &self.storage, txid, &self.work)?
                         else {
@@ -189,6 +190,11 @@ impl Engine {
         };
         // The probe resolved names in scratch memory only.
         unsafe { self.work.rewind_to(mark) };
+        // Only a `UNION ALL` opens before it runs. A grouping, sort or join
+        // runs in the general executor first and promotes when its output
+        // overflows: retained readers do not yet reproduce every analysis
+        // check and wait of that executor.
+        let opens = matches!(source, Ok(Some(query::StreamSource::Appended(_)))) && set_query;
         let positions = match source {
             // Conservative: every resident entry and every saved generation.
             Ok(Some(query::StreamSource::Table(table))) => {
@@ -199,7 +205,7 @@ impl Engine {
             }
             // A generator retains only its next value.
             Ok(Some(query::StreamSource::Generated)) => Some(0),
-            Ok(Some(query::StreamSource::Join(tables))) => {
+            Ok(Some(query::StreamSource::Join(tables) | query::StreamSource::Appended(tables))) => {
                 tables.iter().flatten().try_fold(0usize, |total, &table| {
                     crate::storage::RowCursor::position_bytes(
                         self.storage.resident_row_entries(table),
@@ -216,7 +222,7 @@ impl Engine {
             .and_then(|bytes| bytes.checked_add(STREAM_PLAN_HEADROOM));
         match estimate {
             Some(bytes) if bytes <= ResultStream::query_bytes(self.result_stream_bytes) => {
-                Ok(if appended {
+                Ok(if opens {
                     StreamChoice::Open
                 } else {
                     StreamChoice::Promote
@@ -782,6 +788,7 @@ impl Engine {
     ) -> Result<(), SqlError> {
         self.refresh_prepared_transaction_catalog()?;
         let _ = eval::take_diagnostic();
+        eval::clear_eval_messages();
         exec::reset_record_shapes();
         for (_, composite) in self.storage.composites_with_slots_visible_to(txn.txid) {
             exec::register_named_composite_shape(

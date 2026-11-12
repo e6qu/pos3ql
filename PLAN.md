@@ -129,11 +129,26 @@ is owned.
   `DO` bodies (see the
   [execution model](docs/architecture.md#execution-model)). Remaining: a
   write whose scan ran a volatile built-in reads its rows synchronously.
-  Reads after a write's last row (statement-level and `AFTER` triggers,
-  foreign key checks queued as constraint events, transition tables, the
-  next step's selection) read synchronously. The write completion already
-  runs an event that waited again instead of skipping it; those reads still
-  need to leave the statement's effect protection so they can wait.
+  A top-level write's `AFTER` events and immediate constraint checks
+  yield; reads after an event's first effect block until that event ends,
+  so a trigger body that writes and then reads cold data still blocks.
+  The next step's selection in a multi-step write, `AFTER` triggers between
+  the steps of a rule-rewritten write, and `AFTER` work of writes inside
+  routine bodies read synchronously. Letting the next step's selection
+  yield and roll back to the step's start is not enough: with empty caches
+  each retried selection issued a new GET and never finished (a rule action
+  joining a cold table), so the step must keep the blocks it downloaded
+  across its attempts. Deferrable foreign key checks in `IMMEDIATE` mode run
+  after all of the statement's `AFTER ROW` triggers, where PostgreSQL runs
+  them among each row's triggers in name order, so a failing check can
+  follow notices and writes PostgreSQL never reaches. A non-deferrable
+  foreign key is checked as each row is written, where PostgreSQL checks it
+  in that same AFTER order at the statement's end: `INSERT INTO tree VALUES
+  (2, 1), (1, NULL)` on a self-referencing table, or a row whose parent an
+  `AFTER` trigger inserts, fails with `23503` where PostgreSQL succeeds.
+  Queuing every check as an AFTER event needs an event queue that spills,
+  because the fixed deferred-constraint capacity would otherwise limit how
+  many rows one statement may write.
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written
@@ -180,9 +195,15 @@ is owned.
     index-probed joins, `RIGHT` and `FULL` joins of more than two items or
     over generator calls, grouping sets,
     subqueries other than the simple FROM subqueries merged into their query
-    (scalar, `IN`/`EXISTS`, grouped or bounded derived tables, scans of CTEs
-    that run once, and derived tables whose FROM names collide with the outer
-    query's, such as a `NOT MATERIALIZED` CTE read twice),
+    and uncorrelated scalar, `EXISTS`, `ARRAY` and row subqueries of unsorted,
+    ungrouped streams (correlated ones, `IN`/`ANY`/`ALL` lists, subqueries
+    under a sort or grouping, grouped or bounded derived tables, and scans of
+    CTEs that run once). A correlated subquery is analysed again for each
+    outer row: the general executor resolves its FROM scope, aggregate calls
+    and output type, and evaluates its operators without binding them first
+    (about 1 ms per outer row for a 50-row inner scan in a debug build).
+    Binding the subquery once per statement and rewinding a retained child
+    tree per row removes that,
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs
@@ -206,6 +227,14 @@ is owned.
     their history in `cursor_bytes`. A scrollable cursor moving back rereads
     its input from the first row; retained position checkpoints would bound
     that reread.
+  - In object-store mode a join or grouping runs in the general executor
+    first and streams only once its output overflows, so a cold input larger
+    than the block caches restarts on each cold read until the synchronous
+    fallback reads it. Opening such a stream before it runs needs the
+    retained readers to report the general executor's analysis errors
+    (literal checks in join conditions, aggregates owned by an outer query,
+    user functions named like aggregates, aggregates over `record`) and to
+    resume their concurrent cold reads without stalling.
   - Saving a held cursor at commit reads storage synchronously: the fourteen
     callers of the commit path (statement, protocol, procedure and
     replication commits) do not yet accept a wait before the commit is
@@ -373,11 +402,7 @@ behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: renaming or moving a
 built-in function fails with `0A000` where PostgreSQL changes the catalog
-entry (every built-in name lookup must consult a renamed or moved row);
-arrays of `cstring` (`ARRAY['a'::cstring]`, `'{a}'::cstring[]`) fail with
-`0A000`, and `SELECT DISTINCT`, `ORDER BY`, `IN` and `GREATEST` over
-`cstring` values succeed where PostgreSQL reports that `cstring` has no
-equality or ordering operator; `pg_type` lists all 473
+entry (every built-in name lookup must consult a renamed or moved row); `pg_type` lists all 473
 `pg_catalog` types but of `information_schema`'s 148 only its domains and their
 arrays (the row types of its views, whose OIDs initdb assigns after importing
 the platform's collations, need the pinned reference image); a
@@ -392,7 +417,21 @@ do). Parameter inference walks a statement in its own order rather than
 PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
 untyped to an `"any"` argument by another can be accepted where PostgreSQL
 reports `42P18`, and a user-defined polymorphic argument left untyped becomes
-`text` where PostgreSQL reports `42804`. A SQL function whose earlier
+`text` where PostgreSQL reports `42804`. 
+An aggregate in a subquery that reads only an outer query's columns
+belongs to that query, as in PostgreSQL, except through a subquery in `FROM`
+or a set operation, whose outer references fail as missing FROM-clause
+entries; a `UNION` subquery reading an outer column fails the same way, and a
+correlated `LIMIT` or `JOIN ... ON` inside a subquery cannot read an outer
+column. A subquery reading an aggregate of a query that also has window
+functions fails with `0A000`. An aggregate whose argument is a scalar subquery
+(`SELECT sum((SELECT v FROM u LIMIT 1)) FROM t`) fails with `42725`
+(`function sum is not unique`), and `CREATE VIEW` over a query with a
+correlated scalar subquery fails with `XX000` (`column dependency has no
+owning relation dependency`). An aggregate of an `UPDATE` or `DELETE`
+target in a subquery of its `WHERE` (`UPDATE t SET v = 2 WHERE (SELECT
+max(t.v) FROM u) > 0`) is not rejected with PostgreSQL's `aggregate functions
+are not allowed in WHERE`. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final
@@ -403,10 +442,13 @@ conditions are printed in PostgreSQL's analyzed form (`'x'::text`,
 operators, `IN`, `LIKE`, `IS NULL`, `IS [NOT] DISTINCT FROM`, `IS [NOT]
 TRUE/FALSE`, `CASE`, casts, SQL value functions and built-in function calls;
 other expressions (subqueries, user-defined function calls, `$n` parameters,
-array constructors and whole-row references) are still printed as stored, and
-an index expression or view that passes a whole-row reference to a function
-taking the table's row type (`CREATE INDEX ON t (f(t.*))`) fails with `42883`
-because its validation types the reference as `record`. `pg_get_viewdef` uses PostgreSQL's
+array constructors outside a quantified comparison, and whole-row
+references) are still printed as stored. A whole-row reference in an index
+expression or `CHECK` (`CREATE INDEX ON t (f(t.*))`) fails with `0A000`
+until column dependencies record whole-row users, and a view passing `t.*`
+to a function taking the table's row type fails with `42883` because view
+dependency recording still types the reference as `record` (the bare `t`
+spelling works). `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their
@@ -428,18 +470,22 @@ read. Remaining: a PL/pgSQL write with `WITH` queries whose nested AFTER
 trigger waits fails with `0A000` instead of resuming; and a data-modifying
 `WITH` query runs whole before the main query reads it, so a trigger's or
 called function's notices arrive in a different order than PostgreSQL's
-interleaved execution. `ALTER TABLE` subcommands other than column, constraint and
-storage-option ones (`ENABLE TRIGGER`, `SET LOGGED`, `CLUSTER ON`, `INHERIT`,
-`OF`, `REPLICA IDENTITY`, row security) must be written alone, where
-PostgreSQL accepts them in a comma-separated list, and `ALTER TABLE` on a view
-rejects view options (`SET (security_barrier = true)`) as unknown storage
-parameters. A set operation's type or column-count error and a misplaced
-`DEFAULT` are reported without their cursor position. A cursor whose query
+interleaved execution. The index behind a primary key or unique
+constraint cannot be named by `CLUSTER ON`, `CLUSTER ... USING` or `REPLICA
+IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
+`reloptions` lists its options in a fixed order (`security_invoker`,
+`security_barrier`, `check_option`) where PostgreSQL keeps the order they were
+set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
+marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
+GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
+`pg_constraint` omits the system catalogs' own not-null constraints. A
+misplaced column constraint attribute (`a int NOT NULL DEFERRABLE`) is
+reported before a later syntax error in the same statement, where PostgreSQL
+reports the syntax error first. A rewrite rule `INSERT` action whose `VALUES` rows write
+`DEFAULT` in different columns runs as one insert per pattern, so `RETURNING`
+from such an action fails with `0A000`. A cursor whose query
 cannot stream runs it at `DECLARE` or `OPEN`, so a volatile function's side
-effects happen before the first `FETCH` rather than at it. A `LATERAL` item on the right of
-a `RIGHT` or `FULL` join that reads only FROM items outside that join
-(`SELECT * FROM b, a RIGHT JOIN LATERAL (SELECT b.y) s ON true`) fails with
-`0A000` where PostgreSQL accepts it. A derived table computes output
+effects happen before the first `FETCH` rather than at it. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
@@ -448,12 +494,11 @@ PostgreSQL types it as the table's row type `t`. A row constructor casts to a ta
 (`ROW(1, 'a')::t`) but not to a view's, and an array of a table's row type
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
-`r v%ROWTYPE`) fails with `0A000`; a table's works. In a trigger function,
-`FETCH ... INTO NEW.col`, any `INTO OLD.col`, and assigning `NEW` in an AFTER
-trigger fail with `0A000`, and a write's `RETURNING ... INTO NEW.col` fails
-with `42601` (`"new.a" is not a known variable`), where PostgreSQL assigns the
-field; `SELECT` and `EXECUTE ... INTO NEW.col`
-in a BEFORE trigger work. A `CONSTANT`
+`r v%ROWTYPE`) fails with `0A000`; a table's works. In a trigger function, `OLD` and `NEW` are
+assignable records with the table's row structure, as in PostgreSQL;
+assigning a row of another structure to one fails at the assignment with
+PostgreSQL's `returned row structure does not match` error, where PostgreSQL
+accepts it and fails only if a BEFORE trigger returns it. A `CONSTANT`
 assignment error has no cursor position: PL/pgSQL assignment targets do not
 keep their place in the routine body.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
@@ -473,7 +518,9 @@ the expression in `CONTEXT`. Selecting a field of a named composite cast to
 `record` (`(ROW(1, 2)::t::record).id`) fails as an unknown field. Reading a
 field of a NULL `record` parameter names the expression in `CONTEXT`, which
 PostgreSQL omits because it raises the error while evaluating, not planning.
-COPY to or from a server file or program,
+A user table's `tableoid` system column fails with `0A000`
+(`SELECT tableoid::regclass FROM partitioned` names no partition); catalogs
+expose it. COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
 A view
@@ -497,10 +544,7 @@ that walk, so a cascade lists its objects in the order the statement drops
 them (`DROP TABLE t CASCADE` lists a view over a materialized view of `t`
 before the materialized view) where PostgreSQL follows the walk; the walk's
 objects would have to be described before they are dropped, into a fixed
-per-statement buffer; `pg_depend` still lacks PostgreSQL's rows for types named only inside
-expressions (a cast to a domain in a default or routine body) and the
-column-level rows of views that read a sequence (`SELECT last_value FROM sq`
-depends on `column last_value of sequence sq`). `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
+per-statement buffer. `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
 `_RETURN` rules, at OID `reltype + 1`, and `pg_settings_u`/`pg_settings_n`),
 and `ALTER VIEW` and `ALTER MATERIALIZED VIEW` accept only their own actions,
 so `ALTER VIEW v DISABLE RULE r` fails with `42601` where PostgreSQL reports
@@ -509,13 +553,17 @@ expression (`PARTITION BY LIST ((k + v))`, `PARTITION BY RANGE (lower(a))`)
 fails with `0A000`; PostgreSQL routes rows by the evaluated key and lists it
 in `pg_partitioned_table.partexprs`. A table's or view's row type cannot
 appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
-where PostgreSQL accepts it. Under `READ COMMITTED`, a locked row's recheck runs a correlated `EXISTS
-(subquery)` again, where PostgreSQL's semi-join recheck keeps the subquery row
-it first matched (which row depends on its join plan), and a row another transaction moved to a different partition is
-skipped where PostgreSQL fails with `40001` (`tuple to be locked was already
-moved to another partition due to concurrent update`); storage does not yet
-mark a version deleted by a partition move. A query with a `LATERAL` source
-fails that recheck with `0A000` instead of running the source again. The
+where PostgreSQL accepts it. Under `READ COMMITTED`, a locked row's recheck
+fails with `0A000` for a simple `LATERAL` subquery that reads tables when
+several of its source rows produced the values the statement read but
+recheck differently, or when it is a `UNION ALL` branch that reads tables
+(PostgreSQL keeps the rows it first joined). A parameter used inside a
+`FROM` subquery of `PREPARE` (`PREPARE p AS SELECT * FROM (SELECT 1 + $1) s`)
+is typed `text` before the subquery is described, so the statement fails
+with `42883`. A subquery's `t.*` naming an
+enclosing query's item (`FROM t, LATERAL (SELECT t.*) s`, `SELECT (SELECT
+t.*) FROM t`) fails with `42601` or `42P01`; PostgreSQL expands the outer
+row's columns. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

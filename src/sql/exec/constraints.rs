@@ -558,6 +558,90 @@ fn duplicate_key_error<'v>(
     }
 }
 
+/// Stashes PostgreSQL's DETAIL and constraint fields for a conflict between
+/// `values` and `other` under `exclusion`.
+fn stash_exclusion_conflict(
+    duplicate: DuplicateKey,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    exclusion: &crate::storage::ExclusionConstraint,
+    values: &[Datum],
+    other: &[Datum],
+) -> Result<(), SqlError> {
+    let names = || {
+        exclusion.columns[..exclusion.n_cols]
+            .iter()
+            .map(|column| def.columns()[*column as usize].name.as_str())
+    };
+    let mut existing_text = DetailText::new();
+    write_key_description(
+        &mut existing_text,
+        "key",
+        &mut names(),
+        &mut exclusion.columns[..exclusion.n_cols]
+            .iter()
+            .map(|column| other[*column as usize]),
+    );
+    let existing = match duplicate {
+        DuplicateKey::Write => "existing ",
+        DuplicateKey::IndexBuild => "",
+    };
+    let detail = key_detail(
+        &mut names(),
+        &mut exclusion.columns[..exclusion.n_cols]
+            .iter()
+            .map(|column| values[*column as usize]),
+        format_args!(" conflicts with {existing}{}.", existing_text.as_str()),
+    )?;
+    crate::sql::eval::stash_object_diagnostic(
+        Some(detail.as_str()),
+        crate::sql::eval::ErrorObjects::table_constraint(
+            def.schema.as_str(),
+            def.name.as_str(),
+            exclusion.name.as_str(),
+        ),
+    );
+    Ok(())
+}
+
+/// The 23P01 error for a conflict with exclusion constraint `name`.
+fn exclusion_violation(duplicate: DuplicateKey, name: SqlName) -> SqlError {
+    match duplicate {
+        DuplicateKey::Write => sql_err!(
+            sqlstate::EXCLUSION_VIOLATION,
+            "conflicting key value violates exclusion constraint \"{}\"",
+            name.as_str()
+        ),
+        DuplicateKey::IndexBuild => sql_err!(
+            sqlstate::EXCLUSION_VIOLATION,
+            "could not create exclusion constraint \"{}\"",
+            name.as_str()
+        ),
+    }
+}
+
+/// The index-build exclusion violation between rows `values` and `other`.
+pub(crate) fn index_build_exclusion_violation(
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    exclusion: &crate::storage::ExclusionConstraint,
+    values: &[Datum],
+    other: &[Datum],
+) -> SqlError {
+    match stash_exclusion_conflict(DuplicateKey::IndexBuild, def, exclusion, values, other) {
+        Ok(()) => exclusion_violation(DuplicateKey::IndexBuild, exclusion.name),
+        Err(error) => error,
+    }
+}
+
+/// The index-build unique violation for `values`' key `columns`.
+pub(crate) fn index_build_unique_violation(
+    name: SqlName,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    columns: &[u16],
+    values: &[Datum],
+) -> SqlError {
+    unique_violation(DuplicateKey::IndexBuild, name, def, columns, values)
+}
+
 /// Whether the row `rowid`'s committed key equals `values` under this index's
 /// NULL-equality rule.
 #[expect(
@@ -1767,6 +1851,7 @@ pub(crate) fn check_reindex_constraints(
             predicate,
             arena,
             Some(storage.validation_read()),
+            DuplicateKey::IndexBuild,
         )?;
     }
     check_unique_indexes(
@@ -2509,6 +2594,12 @@ fn check_or_defer_exclusions(
             expressions[crate::storage::MAX_CHECKS + index],
             arena,
             row.validation_read(),
+            // Existing rows meeting a new constraint are its index being built.
+            if matches!(row, ConstraintRow::Existing { .. }) {
+                DuplicateKey::IndexBuild
+            } else {
+                DuplicateKey::Write
+            },
         )?;
     }
     Ok(())
@@ -2527,6 +2618,7 @@ fn enforce_exclusion_constraint(
     predicate: Option<&Expr>,
     arena: &Arena,
     read: Option<ValidationRead>,
+    duplicate: DuplicateKey,
 ) -> Result<(), SqlError> {
     let decoder =
         crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
@@ -2594,43 +2686,11 @@ fn enforce_exclusion_constraint(
                     return Ok(false);
                 }
             }
-            let names = || {
-                exclusion.columns[..exclusion.n_cols]
-                    .iter()
-                    .map(|column| def.columns()[*column as usize].name.as_str())
-            };
-            let mut existing_text = DetailText::new();
-            write_key_description(
-                &mut existing_text,
-                "key",
-                &mut names(),
-                &mut exclusion.columns[..exclusion.n_cols]
-                    .iter()
-                    .map(|column| other[*column as usize]),
-            );
-            let detail = key_detail(
-                &mut names(),
-                &mut exclusion.columns[..exclusion.n_cols]
-                    .iter()
-                    .map(|column| values[*column as usize]),
-                format_args!(" conflicts with existing {}.", existing_text.as_str()),
-            )?;
-            crate::sql::eval::stash_object_diagnostic(
-                Some(detail.as_str()),
-                crate::sql::eval::ErrorObjects::table_constraint(
-                    def.schema.as_str(),
-                    def.name.as_str(),
-                    exclusion.name.as_str(),
-                ),
-            );
+            stash_exclusion_conflict(duplicate, def, exclusion, values, other)?;
             Ok(true)
         })?;
         if conflicts {
-            return Err(sql_err!(
-                sqlstate::EXCLUSION_VIOLATION,
-                "conflicting key value violates exclusion constraint \"{}\"",
-                exclusion.name.as_str()
-            ));
+            return Err(exclusion_violation(duplicate, exclusion.name));
         }
         Ok(ControlFlow::Continue(()))
     };
@@ -2669,20 +2729,42 @@ fn check_or_defer_fk_child(
             transaction.defer_constraint(identity, rowid)?;
             continue;
         }
-        let read = match row.validation_read() {
-            Some(read) => ParentRead::Validation(read),
-            None => ParentRead::Write(
-                txn.as_deref()
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "a written row's foreign key check has no transaction"
-                        )
-                    })?
-                    .isolation,
-            ),
+        if let Some(read) = row.validation_read() {
+            check_fk_child_one_at(
+                storage,
+                def,
+                fk,
+                values,
+                txid,
+                ParentRead::Validation(read),
+                Some(arena),
+            )?;
+            continue;
+        }
+        let transaction = txn.as_deref_mut().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a written row's foreign key check has no transaction"
+            )
+        })?;
+        // PostgreSQL's check query keeps the snapshot it started with while
+        // it waits for the parent row's lock; the statement's next attempt
+        // runs the waiting check again under that snapshot.
+        let identity = transaction.constraint_identity(constraint_table as u32, fk.name);
+        let current = transaction
+            .take_awaited_parent_read(identity)
+            .unwrap_or_else(|| storage.validation_read());
+        let read = ParentRead::Write {
+            isolation: transaction.isolation,
+            current,
         };
-        check_fk_child_one_at(storage, def, fk, values, txid, read, Some(arena))?;
+        if let Err(error) = check_fk_child_one_at(storage, def, fk, values, txid, read, Some(arena))
+        {
+            if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
+                transaction.await_parent_read(identity, current);
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -2698,8 +2780,12 @@ enum ParentRead {
     /// referencing transaction wait for each other. Read committed reads the
     /// latest committed parent; repeatable read and serializable read their
     /// snapshot and fail with `40001` when the parent was deleted or its key
-    /// changed after it.
-    Write(crate::sql::ast::TransactionIsolation),
+    /// changed after it. `current` is the latest committed state the check
+    /// reads under read committed and for a partitioned parent.
+    Write {
+        isolation: crate::sql::ast::TransactionIsolation,
+        current: ValidationRead,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2777,6 +2863,7 @@ pub(crate) fn validate_constraint_obligation(
     rowid: u64,
     txid: u32,
     isolation: crate::sql::ast::TransactionIsolation,
+    current: ValidationRead,
     arena: &Arena,
 ) -> Result<Option<crate::storage::ConstraintTiming>, SqlError> {
     let crate::sql::txn::ConstraintIdentity::Table { table, name, .. } = constraint else {
@@ -2864,7 +2951,7 @@ pub(crate) fn validate_constraint_obligation(
                         &foreign_key,
                         values,
                         txid,
-                        ParentRead::Write(isolation),
+                        ParentRead::Write { isolation, current },
                         Some(arena),
                     )?;
                 }
@@ -2881,6 +2968,7 @@ pub(crate) fn validate_constraint_obligation(
                     predicate,
                     arena,
                     None,
+                    DuplicateKey::Write,
                 )?;
             }
             Ok(())
@@ -3042,14 +3130,25 @@ pub(crate) fn validate_deferred_constraints(
             index += 1;
             continue;
         }
-        validate_constraint_obligation(
+        // A check that waited for its parent row's lock runs again under
+        // the snapshot it started with, as in-row checks do.
+        let read = txn
+            .take_awaited_parent_read(current)
+            .unwrap_or_else(|| storage.validation_read());
+        if let Err(error) = validate_constraint_obligation(
             storage,
             current,
             obligation.rowid,
             txn.txid,
             txn.isolation,
+            read,
             arena,
-        )?;
+        ) {
+            if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
+                txn.await_parent_read(current, read);
+            }
+            return Err(error);
+        }
         txn.complete_deferred_constraint(index)?;
         index += 1;
     }
@@ -3258,13 +3357,19 @@ fn parent_has_key(
     use super::row_conflicts::{LockedVersion, concurrent_change, uses_transaction_snapshot};
     let parent_definition = storage.table_def(parent_index, txid).clone();
     // Read committed follows the latest committed parent, as PostgreSQL's
-    // check query takes a new snapshot; the other levels keep theirs.
+    // check query takes a new snapshot. The other levels keep theirs, except
+    // for a partitioned parent: PostgreSQL's `RI_FKey_check` reads it with
+    // a current snapshot (`detectNewRows`), so a parent deleted after the
+    // transaction's snapshot is missing (`23503`) and a newer one counts.
+    let partitioned_parent = parent_definition.partition.is_partitioned();
     let latest = match read {
         ParentRead::Validation(read) => Some(read),
-        ParentRead::Write(isolation) if !uses_transaction_snapshot(isolation) => {
-            Some(storage.validation_read())
+        ParentRead::Write { isolation, current }
+            if !uses_transaction_snapshot(isolation) || partitioned_parent =>
+        {
+            Some(current)
         }
-        ParentRead::Write(_) => None,
+        ParentRead::Write { .. } => None,
     };
     let key_matches = |physical: &crate::storage::TableDefinition<_>,
                        mapped: &[u16],
@@ -3303,6 +3408,7 @@ fn parent_has_key(
         let mapped = super::remap_columns(&physical, &parent_definition, parent_cols)?;
         let mut visit = |rowid: u64, state: crate::storage::RowRead<'_>| {
             use core::ops::ControlFlow;
+            let moved_out = state.committed.is_none() && state.committed_moved_out;
             let home = match latest {
                 Some(read) => read.visible_row_home(storage, row_table, rowid, state, txid)?,
                 None => storage.visible_row_home_at(
@@ -3315,6 +3421,21 @@ fn parent_has_key(
                 )?,
             };
             let Some(home) = home else {
+                // A matching parent the statement saw that another
+                // transaction then moved to a different partition cannot be
+                // followed: PostgreSQL's check query, which locked the row
+                // under an older snapshot, fails with `40001`.
+                if moved_out
+                    && matches!(read, ParentRead::Write { isolation, .. } if !uses_transaction_snapshot(isolation))
+                    && let Some(state) = storage.row_state(row_table, rowid)?
+                    && let Some(selected) =
+                        storage.visible_row_home(row_table, rowid, state, txid)?
+                    && storage.with_row_bytes(row_table, rowid, selected, |bytes| {
+                        key_matches(&physical, &mapped, bytes)
+                    })?
+                {
+                    return Err(super::row_conflicts::moved_out(false));
+                }
                 return Ok(ControlFlow::Continue(()));
             };
             let seen = home.snapshot();
@@ -3335,7 +3456,7 @@ fn parent_has_key(
     let Some((row_table, rowid, seen)) = found else {
         return Ok(false);
     };
-    let ParentRead::Write(isolation) = read else {
+    let ParentRead::Write { isolation, .. } = read else {
         return Ok(true);
     };
     let arena = arena.ok_or_else(|| {

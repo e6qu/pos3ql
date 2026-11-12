@@ -357,6 +357,34 @@ impl<'a> Parser<'a> {
                     operator = self.any_op_token()?;
                 }
                 self.expect_op(")")?;
+                if matches!(
+                    self.peeked,
+                    Tok::Ident("any") | Tok::Ident("all") | Tok::Ident("some")
+                ) {
+                    let quantified = schema
+                        .is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+                        .then(|| quantified_operator(operator))
+                        .flatten();
+                    let Some(quantified) = quantified else {
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: crate::stack_format!(
+                                super::PARSE_MESSAGE_BYTES,
+                                "quantified operator {} is not supported",
+                                operator
+                            ),
+                            sqlstate: crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                            cursor: None,
+                            hint: None,
+                            near: None,
+                            detail: None,
+                        });
+                    };
+                    let all = self.peeked == Tok::Ident("all");
+                    self.advance()?;
+                    left = self.quantified_pattern(left, quantified, false, all)?;
+                    continue;
+                }
                 let right = self.expression(5)?;
                 left = self.build_operator(source_position, schema, operator, left, right)?;
                 continue;
@@ -482,30 +510,12 @@ impl<'a> Parser<'a> {
                     ) {
                         let all = self.peeked == Tok::Ident("all");
                         self.advance()?;
-                        self.expect_op("(")?;
-                        let array = self.expression(0)?;
-                        self.expect_op(")")?;
                         let operator = if ilike {
                             BinaryOp::ILike
                         } else {
                             BinaryOp::Like
                         };
-                        // NOT LIKE ANY == NOT (LIKE ALL), and vice versa.
-                        let inner = self.arena_expr(Expr::AnyAll {
-                            operand: left,
-                            operator,
-                            array,
-                            all: if negated { !all } else { all },
-                        })?;
-                        left = if negated {
-                            self.arena_expr(Expr::Unary {
-                                source_position,
-                                operator: crate::sql::ast::UnaryOp::Not,
-                                operand: inner,
-                            })?
-                        } else {
-                            inner
-                        };
+                        left = self.quantified_pattern(left, operator, negated, all)?;
                         continue;
                     }
                     let pattern = self.expression(5)?;
@@ -524,6 +534,14 @@ impl<'a> Parser<'a> {
                 if self.peeked == Tok::Ident("similar") {
                     self.advance()?;
                     self.expect_ident("to")?;
+                    // ANY, ALL and SOME are reserved: SIMILAR TO has no
+                    // quantified form.
+                    if matches!(
+                        self.peeked,
+                        Tok::Ident("any") | Tok::Ident("all") | Tok::Ident("some")
+                    ) {
+                        return Err(self.syntax_error_here());
+                    }
                     let pattern = self.expression(5)?;
                     // The escape character rides along as a third argument.
                     let args = match self.escape_clause()? {
@@ -560,11 +578,56 @@ impl<'a> Parser<'a> {
                     return Err(self.syntax_error_here());
                 }
             }
+            // `~~`, `!~~`, `~~*` and `!~~*` are the operators `LIKE`, `NOT
+            // LIKE`, `ILIKE` and `NOT ILIKE` resolve to.
+            if min_prec <= 4
+                && let Tok::Op(o @ ("~~" | "!~~" | "~~*" | "!~~*")) = self.peeked
+            {
+                self.advance()?;
+                let negated = o.starts_with('!');
+                let operator = if o.ends_with('*') {
+                    BinaryOp::ILike
+                } else {
+                    BinaryOp::Like
+                };
+                left = if matches!(
+                    self.peeked,
+                    Tok::Ident("any") | Tok::Ident("all") | Tok::Ident("some")
+                ) {
+                    let all = self.peeked == Tok::Ident("all");
+                    self.advance()?;
+                    self.quantified_pattern(left, operator, negated, all)?
+                } else {
+                    let pattern = self.expression(5)?;
+                    self.arena_expr(Expr::Like {
+                        operand: left,
+                        pattern,
+                        negated,
+                        case_insensitive: operator == BinaryOp::ILike,
+                        escape: None,
+                    })?
+                };
+                continue;
+            }
             // POSIX regex match operators bind like comparisons.
             if min_prec <= 4
                 && let Tok::Op(o @ ("~" | "!~" | "~*" | "!~*")) = self.peeked
             {
                 self.advance()?;
+                if matches!(
+                    self.peeked,
+                    Tok::Ident("any") | Tok::Ident("all") | Tok::Ident("some")
+                ) {
+                    let all = self.peeked == Tok::Ident("all");
+                    self.advance()?;
+                    let operator = if o.ends_with('*') {
+                        BinaryOp::RegexIMatch
+                    } else {
+                        BinaryOp::RegexMatch
+                    };
+                    left = self.quantified_pattern(left, operator, o.starts_with('!'), all)?;
+                    continue;
+                }
                 let pattern = self.expression(5)?;
                 left = self.arena_expr(Expr::Match {
                     operand: left,
@@ -602,7 +665,7 @@ impl<'a> Parser<'a> {
                 let all = self.peeked == Tok::Ident("all");
                 self.advance()?;
                 self.expect_op("(")?;
-                if matches!(self.peeked, Tok::Ident("select") | Tok::Ident("with")) {
+                if self.quantified_subquery_follows()? {
                     let select = self.query_select()?;
                     self.expect_op(")")?;
                     let boxed = self
@@ -654,6 +717,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let right = self.expression(operator.precedence() + 1)?;
+            let right = self.row_subquery_operand(left, operator, right, operator_at)?;
             left = self.arena_expr(Expr::Binary {
                 source_position,
                 operator,
@@ -661,6 +725,86 @@ impl<'a> Parser<'a> {
                 right,
             })?;
         }
+    }
+
+    /// `(a, b) op (SELECT x, y ...)` compares a row constructor with the
+    /// subquery's single row field by field: the subquery becomes a row of
+    /// its fields, NULL for no row, and more than one row is an error.
+    fn row_subquery_operand(
+        &mut self,
+        left: &'a Expr<'a>,
+        operator: BinaryOp,
+        right: &'a Expr<'a>,
+        operator_at: usize,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let Expr::Subquery(select) = right else {
+            return Ok(right);
+        };
+        let Expr::Call { args, .. } = left else {
+            return Ok(right);
+        };
+        if !left.is_row_constructor()
+            || !matches!(
+                operator,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            )
+        {
+            return Ok(right);
+        }
+        let leaf = {
+            let mut leaf = *select;
+            while let Some(tree) = leaf.set_body {
+                let mut node = tree;
+                while let crate::sql::ast::SetTree::Op { left, .. } = node {
+                    node = left;
+                }
+                let crate::sql::ast::SetTree::Select(first) = node else {
+                    unreachable!("a set tree ends in a leaf")
+                };
+                leaf = first;
+            }
+            leaf
+        };
+        if leaf
+            .items
+            .iter()
+            .all(|item| matches!(item, crate::sql::ast::SelectItem::Expr { .. }))
+            && leaf.items.len() != args.len()
+        {
+            return Err(ParseError {
+                at: operator_at,
+                message: crate::util::StackStr::from_str(if leaf.items.len() < args.len() {
+                    "subquery has too few columns"
+                } else {
+                    "subquery has too many columns"
+                }),
+                sqlstate: sqlstate::SYNTAX_ERROR,
+                cursor: Some(operator_at),
+                hint: None,
+                near: None,
+                detail: None,
+            });
+        }
+        let arity = u8::try_from(args.len()).map_err(|_| self.err_here("row is too wide"))?;
+        let record = self.arena_expr_at(Expr::RowSubquery { select, arity }, operator_at)?;
+        let mut fields = ArenaList::new(self.arena);
+        for index in 0..args.len() {
+            let field = self.arena_expr(Expr::RecordFieldIndex {
+                base: record,
+                index: index as u16,
+            })?;
+            self.push(&mut fields, field)?;
+        }
+        let mut row = *left;
+        if let Expr::Call { args, .. } = &mut row {
+            *args = fields.as_slice();
+        }
+        self.arena_expr(row)
     }
 
     pub(super) fn collation_name(
@@ -984,7 +1128,10 @@ impl<'a> Parser<'a> {
                 self.arena_expr_at(Expr::Exists(boxed), exists_at)
             }
             Tok::Ident("default") => {
+                let at = self.peek_at;
                 self.advance()?;
+                self.last_default = at;
+                self.misplaced_default.get_or_insert(at);
                 self.arena_expr(Expr::DefaultMarker)
             }
             Tok::Ident("case") => {
@@ -1145,6 +1292,11 @@ impl<'a> Parser<'a> {
                     return self.plain_call(name, &[precision]);
                 }
                 if self.peeked == Tok::Op("(") {
+                    // ANY, SOME and ALL are reserved; they open a quantified
+                    // operand only after an operator.
+                    if matches!(name, "any" | "some" | "all") {
+                        return Err(self.syntax_error_near(name_at, name_at + name.len()));
+                    }
                     return self.call(name, true, Some(name_at));
                 }
                 // The unmodified SQL-standard temporal spelling keeps its
@@ -2410,14 +2562,20 @@ impl<'a> Parser<'a> {
         if kind == CallKind::SqlSyntax && self.peeked == Tok::Ident("distinct") {
             return Err(self.syntax_error_here());
         }
-        let distinct = if self.peeked == Tok::Ident("distinct") {
+        // `f(ALL args)` is PostgreSQL's spelling of the default, for any
+        // function; it takes no `*`.
+        let all = kind != CallKind::SqlSyntax && self.peeked == Tok::Ident("all");
+        if all {
+            self.advance()?;
+        }
+        let distinct = if !all && self.peeked == Tok::Ident("distinct") {
             self.advance()?;
             true
         } else {
             false
         };
         if self.peeked == Tok::Op("*") {
-            if kind == CallKind::SqlSyntax {
+            if kind == CallKind::SqlSyntax || all {
                 return Err(self.syntax_error_here());
             }
             if distinct {
@@ -2728,6 +2886,124 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.syntax_error_here()),
         }
+    }
+
+    /// `x [NOT] LIKE ANY/ALL (array or subquery)` after its quantifier: a
+    /// negated match is the negation of the opposite quantifier.
+    fn quantified_pattern(
+        &mut self,
+        operand: &'a Expr<'a>,
+        operator: BinaryOp,
+        negated: bool,
+        all: bool,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let operator = if negated {
+            match operator {
+                BinaryOp::Like => BinaryOp::NotLike,
+                BinaryOp::ILike => BinaryOp::NotILike,
+                BinaryOp::RegexMatch => BinaryOp::RegexNotMatch,
+                BinaryOp::RegexIMatch => BinaryOp::RegexNotIMatch,
+                other => other,
+            }
+        } else {
+            operator
+        };
+        if self.quantified_subquery_follows()? {
+            let select = self.query_select()?;
+            self.expect_op(")")?;
+            let select = self
+                .arena
+                .alloc(select)
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+            self.arena_expr(Expr::QuantifiedSubquery {
+                operand,
+                operator,
+                select,
+                all,
+            })
+        } else {
+            let array = self.expression(0)?;
+            self.expect_op(")")?;
+            self.arena_expr(Expr::AnyAll {
+                operand,
+                operator,
+                array,
+                all,
+            })
+        }
+    }
+
+    /// Whether `op ANY (` opens a subquery rather than an array expression:
+    /// a query, possibly wrapped in parentheses that close together right
+    /// before ANY's own, as PostgreSQL's `select_with_parens` reads it.
+    fn quantified_subquery_follows(&mut self) -> Result<bool, ParseError> {
+        let starts_query =
+            |token: Tok<'_>| matches!(token, Tok::Ident("select" | "with" | "values"));
+        if starts_query(self.peeked) {
+            return Ok(true);
+        }
+        if self.peeked != Tok::Op("(") {
+            return Ok(false);
+        }
+        let mark = self.lexer.mark();
+        let result = (|| {
+            let mut wrappers = 1usize;
+            let mut next = self.next_raw_token()?;
+            while next == Tok::Op("(") {
+                wrappers += 1;
+                next = self.next_raw_token()?;
+            }
+            if !starts_query(next) {
+                return Ok(false);
+            }
+            let mut depth = wrappers;
+            loop {
+                match next {
+                    Tok::Eof => return Ok(false),
+                    Tok::Op("(") => depth += 1,
+                    // ANY's own parenthesis, with every wrapper closed.
+                    Tok::Op(")") if depth == 0 => return Ok(true),
+                    Tok::Op(")") => {
+                        depth -= 1;
+                        if depth < wrappers {
+                            // A wrapper closed: what follows must close the
+                            // next one or continue the query at this level.
+                            wrappers = depth;
+                            next = self.next_raw_token()?;
+                            let continues = matches!(
+                                next,
+                                Tok::Op(")")
+                                    | Tok::Ident(
+                                        "union"
+                                            | "intersect"
+                                            | "except"
+                                            | "order"
+                                            | "limit"
+                                            | "offset"
+                                            | "fetch"
+                                            | "for"
+                                    )
+                            );
+                            if !continues {
+                                return Ok(false);
+                            }
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+                next = self.next_raw_token()?;
+            }
+        })();
+        self.lexer.reset(mark);
+        result
+    }
+
+    fn next_raw_token(&mut self) -> Result<Tok<'a>, ParseError> {
+        self.lexer
+            .next_token()
+            .map_err(|error| ParseError::lexical(error, self.text))
     }
 
     /// Builds an expression for an explicit `OPERATOR(operator)` symbol.
@@ -3594,4 +3870,19 @@ fn split_seconds(s: &str) -> Option<(i64, &str)> {
         }
         None => Some((parse_uint(s)?, "")),
     }
+}
+
+/// The built-in operator an explicit `OPERATOR(name) ANY/ALL (...)` names.
+fn quantified_operator(name: &str) -> Option<BinaryOp> {
+    Some(match name {
+        "~" => BinaryOp::RegexMatch,
+        "~*" => BinaryOp::RegexIMatch,
+        "!~" => BinaryOp::RegexNotMatch,
+        "!~*" => BinaryOp::RegexNotIMatch,
+        "~~" => BinaryOp::Like,
+        "~~*" => BinaryOp::ILike,
+        "!~~" => BinaryOp::NotLike,
+        "!~~*" => BinaryOp::NotILike,
+        _ => BinaryOp::from_operator_name(name)?,
+    })
 }

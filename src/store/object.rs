@@ -179,6 +179,7 @@ pub(crate) struct OwnedObjectStore {
     hedge_after: Option<Duration>,
     read_owner: Option<ReadOwner>,
     read_capacity_generation: u64,
+    fetch_history: super::FetchHistory,
 }
 
 struct ObjectReadSlot {
@@ -285,6 +286,7 @@ impl OwnedObjectStore {
             admission: crate::object_store::RequestAdmission::Open,
             read_owner: None,
             read_capacity_generation: 0,
+            fetch_history: super::FetchHistory::new(),
             hedge_after: (config.object_store_hedge_after_ms != 0)
                 .then(|| Duration::from_millis(config.object_store_hedge_after_ms)),
         })
@@ -709,6 +711,7 @@ impl BlockStore for OwnedObjectStore {
         }
         let started = Instant::now();
         let prefix = self.prefix;
+        self.fetch_history.record(id);
         let read = if self.read_mode == ObjectReadMode::Atomic {
             get_block(&mut self.atomic_client, prefix, id, into)
         } else {
@@ -782,6 +785,7 @@ impl BlockStore for OwnedObjectStore {
         }
         let started = Instant::now();
         let prefix = self.prefix;
+        self.fetch_history.record(expected);
         let read = if self.read_mode == ObjectReadMode::Atomic {
             get_packed_block(
                 &mut self.atomic_client,
@@ -837,6 +841,7 @@ impl BlockStore for OwnedObjectStore {
                 return Ok(PrefetchState::Saturated);
             };
             Self::join_owner(slot, owner)?;
+            self.fetch_history.record(id);
             match slot.client.get(key, None) {
                 Ok(result) => {
                     slot.ready_id = Some(*id);
@@ -913,6 +918,22 @@ impl BlockStore for OwnedObjectStore {
 
     fn read_capacity_generation(&self) -> u64 {
         self.read_capacity_generation
+    }
+
+    fn exchange_fetch_history(&mut self, history: &mut super::FetchHistory) {
+        core::mem::swap(&mut self.fetch_history, history);
+    }
+
+    fn owner_awaits_read(&self, owner: ReadOwner) -> bool {
+        let owned = || {
+            self.slots
+                .iter()
+                .filter(move |slot| slot.owners.contains(&owner))
+        };
+        owned().any(|slot| slot.pending_id.is_some())
+            && !owned().any(|slot| {
+                slot.ready_id.is_some() || slot.error_id.is_some() || slot.pending_error.is_some()
+            })
     }
 
     fn io_stats(&self) -> BlockIoStats {

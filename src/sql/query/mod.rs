@@ -43,8 +43,12 @@ pub use setops::set_query;
 pub(crate) use setops::set_query_into_rows;
 
 pub(crate) mod generator;
+mod joined_from;
+pub(crate) use joined_from::{
+    JoinedFromRow, joined_from_match, recheck_joined_from_match, with_joined_from_row,
+};
 mod materialize;
-pub(crate) use materialize::ScopeSchema;
+pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
 use materialize::{external_materialized_into, materialized_rows, materialized_select};
 
 mod scan;
@@ -90,6 +94,7 @@ pub(crate) use type_inputs::capture_procedural_statement_type_inputs;
 pub(crate) use type_inputs::{
     capture_contextual_type_inputs, visit_planner_calls, visit_planner_expression,
 };
+mod aggregate_levels;
 pub(super) mod predicate_safety;
 pub(crate) use cte::expand_enclosed_ctes_exec;
 pub(crate) use cte::expand_from_schema;
@@ -97,10 +102,11 @@ mod pullup;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
-    RuleReturningRelation, RuleTransitionType, attach_rule_source, expand_set_tree,
-    expand_stored_query, expand_stored_query_exec, expand_stored_rule_action_exec,
+    RuleReturningRelation, RuleTransitionType, attach_rule_source, dml_parameter_scope_query,
+    expand_set_tree, expand_stored_query, expand_stored_query_exec, expand_stored_rule_action_exec,
     expand_stored_rule_expression_exec, expand_stored_statement_exec, restrict_rule_original,
     rule_original_transition, rule_returning_entries, rule_returning_items, rule_transition_source,
+    split_rule_insert_defaults,
 };
 pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
@@ -851,6 +857,7 @@ use subquery::{
 };
 pub(crate) use subquery::{
     expression_has_correlated_subquery, subquery_hooks_outer, subquery_hooks_with_outer,
+    uncorrelated_subquery_hooks,
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
 pub(crate) use subquery::{type_witness, walk_children};
@@ -1736,6 +1743,14 @@ pub(crate) fn set_resumable_row(running: bool) {
 /// until its own first effect that a rollback cannot undo.
 pub(crate) fn reopen_statement_reads() {
     set_resumable_row(true);
+    reopen_reads_after_kept_work();
+}
+
+/// A write's post-row work starts a unit that a wait reruns or resumes on
+/// its own (an AFTER event, the immediate constraint checks): the work
+/// before it finished and is kept, so reads yield until that unit's own
+/// first effect.
+pub(crate) fn reopen_reads_after_kept_work() {
     ACTIVE_READ_EFFECTS.with(|active| {
         if let Some(reads) = active.get() {
             // As in `protect_statement_effects`, the scope's borrow pins it.
@@ -4402,6 +4417,14 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn relation_row_type(&self, schema: &str, name: &str) -> Option<crate::storage::TypeCreation> {
+        let slot = self.storage.find_visible(schema, name, self.txid)?;
+        Some(
+            self.storage
+                .relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)),
+        )
+    }
+
     fn builtin_routine_privileges_present(&self) -> bool {
         self.txid != 0 && self.storage.builtin_routine_count() != 0
     }
@@ -4698,8 +4721,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 .iter()
                 .all(|column| column.type_oid == super::types::oid::TSQUERY);
         let query = RoutineQuery::Select(query);
-        let source = arena.alloc_str(source).map_err(|_| arena_full())?;
-        let mut rewritten = super::full_text::canonical_query(source, arena)?;
+        let mut rewriter = super::full_text::QueryRewriter::new(source, arena)?;
         execute_routine_query(
             &query,
             self.storage,
@@ -4720,13 +4742,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         "ts_rewrite query must return two tsquery columns"
                     ));
                 };
-                rewritten = super::full_text::rewrite_query(
-                    rewritten,
-                    target.as_str(),
-                    replacement.as_str(),
-                    arena,
-                )?;
-                Ok(())
+                rewriter.apply(target.as_str(), replacement.as_str())
             },
         )?;
         if !valid {
@@ -4735,7 +4751,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 "ts_rewrite query must return two tsquery columns"
             ));
         }
-        Ok(rewritten)
+        rewriter.finish()
     }
 
     fn text_search_configuration_name(&self, oid: i32) -> Option<crate::util::StackStr<128>> {
@@ -4960,12 +4976,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn has_operator_candidate(&self, name: &str) -> bool {
-        self.storage
-            .operators_visible_to(self.txid)
-            .any(|(_, operator)| {
-                operator.name.as_str() == name
-                    && self.storage.schema_is_on_path(operator.schema, self.txid)
-            })
+        self.storage.has_operator_named_on_path(name, self.txid)
     }
 
     fn statistics_definition<'a>(
@@ -8339,13 +8350,6 @@ fn require_select_expressions_execute<'a>(
     Ok(())
 }
 
-/// PostgreSQL has no equality or ordering for `json` — two documents differing
-/// only in whitespace or key order are the same value but not the same text, so
-/// it declines rather than answer by a rule it does not hold to, and offers
-/// canonicalized `jsonb` instead. The `=` operator already declines here; these
-/// three sort and deduplicate by the projected encoding and so never consult
-/// it, which is why each has to be checked where its keys are known rather than
-/// where they are compared. `cid` and `cid[]` have equality but no ordering.
 /// Checks a SQL-language routine body statement as PostgreSQL's parse
 /// analysis does at `CREATE FUNCTION`: a query's relations, columns,
 /// functions and types, and a data-changing statement's target relation.
@@ -8538,6 +8542,13 @@ pub(crate) fn check_literal_operands_typed<'a>(
     }
 }
 
+/// PostgreSQL has no equality or ordering for `json` — two documents differing
+/// only in whitespace or key order are the same value but not the same text, so
+/// it declines rather than answer by a rule it does not hold to, and offers
+/// canonicalized `jsonb` instead. The `=` operator already declines here; these
+/// three sort and deduplicate by the projected encoding and so never consult
+/// it, which is why each has to be checked where its keys are known rather than
+/// where they are compared. `cid` and `cid[]` have equality but no ordering.
 fn check_key_types<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
@@ -8596,6 +8607,14 @@ fn check_key_types<'a>(
             _ => None,
         });
     require_select_routine_execute(statement, scope, arena, storage, txid)?;
+    let scope_type = |e: &Expr<'a>| {
+        infer_scope_type(e, scope)
+            .ok()
+            .and_then(|(oid, _)| ColType::from_oid(oid))
+    };
+    for expression in aggregate_bearing_expressions(statement) {
+        check_aggregate_key_types(expression, &scope_type)?;
+    }
     let catalog = storage_catalog(storage, arena, txid);
     for key in statement
         .group_by
@@ -8679,6 +8698,61 @@ fn check_key_types<'a>(
         }
     }
     Ok(())
+}
+
+/// An aggregate's `DISTINCT` arguments and `ORDER BY` keys need their types'
+/// default equality and ordering, exactly as a statement's keys do.
+fn check_aggregate_key_types<'a>(
+    expression: &'a Expr<'a>,
+    type_of: &dyn Fn(&Expr<'a>) -> Option<ColType>,
+) -> Result<(), SqlError> {
+    if let Expr::Call {
+        distinct,
+        args,
+        order_by,
+        over: None,
+        ..
+    } = expression
+    {
+        for argument in args.iter().filter(|_| *distinct) {
+            if let Some(ctype) = type_of(argument).filter(|ctype| !ctype.has_default_equality()) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "could not identify an equality operator for type {}",
+                    ctype.name()
+                ));
+            }
+        }
+        for order in *order_by {
+            if let Some(ctype) =
+                type_of(order.expression).filter(|ctype| !ctype.has_builtin_ordering())
+            {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "could not identify an ordering operator for type {}",
+                    ctype.name()
+                ));
+            }
+        }
+    }
+    walk_children(expression, &mut |child| {
+        check_aggregate_key_types(child, type_of)
+    })
+}
+
+/// The expressions of one query level that can hold aggregate calls.
+fn aggregate_bearing_expressions<'a>(
+    statement: &'a Select<'a>,
+) -> impl Iterator<Item = &'a Expr<'a>> {
+    statement
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .chain(statement.having)
+        .chain(statement.order_by.iter().map(|order| order.expression))
 }
 
 /// `GROUP BY <n>` names the *n*th select-list column, exactly as `ORDER BY <n>`
@@ -9361,15 +9435,9 @@ pub fn and_where<'a>(
 /// Rejects pseudo-type view outputs after the query-descriptor boundary.
 pub fn validate_view_columns(columns: &[ColDesc<'_>]) -> Result<(), SqlError> {
     for column in columns {
-        if matches!(
-            column.type_oid,
-            super::types::oid::RECORD | super::types::oid::RECORD_ARRAY
-        ) {
-            let type_name = if column.type_oid == super::types::oid::RECORD {
-                "record"
-            } else {
-                "record[]"
-            };
+        if let Some(type_name) =
+            ColType::from_oid(column.type_oid).and_then(ColType::rejected_column_pseudo_type)
+        {
             return Err(sql_err!(
                 sqlstate::INVALID_TABLE_DEFINITION,
                 "column \"{}\" has pseudo-type {}",
@@ -9899,8 +9967,38 @@ pub(super) fn collect_aggs<'a>(
             .map_err(|_| arena_full())?;
         return Ok(()); // aggregate arguments evaluate per input row
     }
+    if is_sublink(expression) {
+        push_owned_outer_aggregates(expression, out)?;
+    }
     walk_children(expression, &mut |child| {
         collect_aggs(child, out, storage, txid, columns)
+    })
+}
+
+fn is_sublink(expression: &Expr<'_>) -> bool {
+    matches!(
+        expression,
+        Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_)
+            | Expr::RowSubquery { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
+    )
+}
+
+/// Adds the aggregates that `expression`'s nested queries read from this
+/// query (see `aggregate_levels`), once each.
+fn push_owned_outer_aggregates<'a>(
+    expression: &'a Expr<'a>,
+    out: &mut ArenaList<'a, (*const Expr<'a>, &'a Expr<'a>)>,
+) -> Result<(), SqlError> {
+    aggregate_levels::visit_owned_outer_aggregates(expression, &mut |call| {
+        if !out.as_slice().iter().any(|(p, _)| core::ptr::eq(*p, call)) {
+            out.push((call as *const _, call))
+                .map_err(|_| arena_full())?;
+        }
+        Ok(())
     })
 }
 
@@ -9970,6 +10068,7 @@ fn window_row<'r, 'a>(
             offsets: offs,
         },
         rowids: &[],
+        visible: scope.n,
     }
 }
 
@@ -10028,6 +10127,16 @@ fn collect_grouped_aggs<'a>(
         }
         out.push((e as *const _, e)).map_err(|_| arena_full())?;
         return Ok(());
+    }
+    if is_sublink(e) {
+        // The window layer evaluates subqueries above the grouped derived
+        // table, where an aggregate this query owns has no group to read.
+        aggregate_levels::visit_owned_outer_aggregates(e, &mut |_| {
+            Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a subquery reading an aggregate of a query with window functions is not supported"
+            ))
+        })?;
     }
     walk_children(e, &mut |child| {
         collect_grouped_aggs(child, out, storage, txid, columns)
@@ -10096,6 +10205,7 @@ fn rewrite_grouped_expr<'a>(
         | Expr::BoundLiteral { .. }
         | Expr::BitLit(_)
         | Expr::Param(_)
+        | Expr::OuterAggregate { .. }
         | Expr::DefaultMarker
         // Subqueries evaluate through their own hooks, not the group.
         | Expr::Subquery(_)
@@ -10420,6 +10530,15 @@ pub fn check_select_constants<'a>(
     storage: &Storage,
     txid: u32,
 ) -> Result<(), SqlError> {
+    super::eval::probe_constants(|| check_select_constants_in(statement, arena, storage, txid))
+}
+
+fn check_select_constants_in<'a>(
+    statement: &Select<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
@@ -10460,6 +10579,12 @@ pub(super) fn expr_has_aggregate(
         return Ok(true);
     }
     let mut found = false;
+    if is_sublink(expression) {
+        aggregate_levels::visit_owned_outer_aggregates(expression, &mut |_| {
+            found = true;
+            Ok(())
+        })?;
+    }
     subquery::walk_children(expression, &mut |child| {
         if expr_has_aggregate(child, storage, txid, columns)? {
             found = true;
@@ -11615,6 +11740,16 @@ pub(crate) fn constant_select_resumable<'a>(
     if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
     }
+    let constant_type = |e: &Expr| {
+        super::exec::infer_type_res(e, &resolved_columns)
+            .ok()
+            .and_then(|(oid, _)| ColType::from_oid(oid))
+    };
+    for expression in aggregate_bearing_expressions(statement) {
+        if let Err(e) = check_aggregate_key_types(expression, &constant_type) {
+            return sql_fail(e);
+        }
+    }
     for expression in statement
         .items
         .iter()
@@ -11929,6 +12064,24 @@ pub(crate) fn constant_select_resumable<'a>(
             ));
         }
     }
+    // Sorting one row still needs each key type's ordering operator.
+    for (j, ob) in statement.order_by.iter().enumerate() {
+        let key_type = match order_item[j] {
+            Some(column) => columns.get(column).map(|column| column.type_oid),
+            None => super::exec::infer_type_res(ob.expression, &resolved_columns)
+                .ok()
+                .map(|(type_oid, _)| type_oid),
+        };
+        if let Some(ctype) = key_type.and_then(ColType::from_oid)
+            && !ctype.has_builtin_ordering()
+        {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "could not identify an ordering operator for type {}",
+                ctype.name()
+            ));
+        }
+    }
 
     let offset = match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks) {
         Ok(o) => o,
@@ -12218,6 +12371,28 @@ fn expression_needs_aggregate_resolution(
     storage: &Storage,
     txid: u32,
 ) -> bool {
+    if call_may_be_aggregate(expression, storage, txid) {
+        return true;
+    }
+    let mut found = false;
+    if is_sublink(expression) {
+        aggregate_levels::visit_owned_outer_aggregates(expression, &mut |_| {
+            found = true;
+            Ok(())
+        })
+        .expect("owned-aggregate visitor cannot fail");
+    }
+    walk_children(expression, &mut |child| {
+        found |= expression_needs_aggregate_resolution(child, storage, txid);
+        Ok(())
+    })
+    .expect("aggregate candidate visitor cannot fail");
+    found
+}
+
+/// Whether a call without `OVER` could select an aggregate, judged by its
+/// spelling and the catalog's names alone, before its argument types are known.
+pub(super) fn call_may_be_aggregate(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
     if let Expr::Call {
         name,
         args,
@@ -12242,13 +12417,7 @@ fn expression_needs_aggregate_resolution(
     {
         return true;
     }
-    let mut found = false;
-    walk_children(expression, &mut |child| {
-        found |= expression_needs_aggregate_resolution(child, storage, txid);
-        Ok(())
-    })
-    .expect("aggregate candidate visitor cannot fail");
-    found
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15366,10 +15535,96 @@ fn expr_contains_node<'a>(e: &'a Expr<'a>, target: *const Expr<'a>) -> bool {
     found
 }
 
+/// A semi-join's recheck in PostgreSQL's EvalPlanQual: the subquery row the
+/// version `first` matched first, in scan order, must also satisfy the
+/// subquery's `WHERE` with the locked row's `latest` version. The match
+/// order follows pos3ql's scan, which PostgreSQL's choice equals for a
+/// sequential scan of one relation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn semi_join_first_match_passes<'a>(
+    storage: &'a Storage,
+    select: &'a Select<'a>,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    first: &dyn ColumnLookup<'a>,
+    latest: &dyn ColumnLookup<'a>,
+    sequences: Option<&dyn SequenceAccess>,
+) -> Result<bool, SqlError> {
+    let from = select.from.as_ref().ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a semi-join recheck has no FROM clause"
+        )
+    })?;
+    let where_clause = select.where_clause;
+    let scope = QueryScope::resolve_exec_outer(
+        storage,
+        from,
+        where_clause,
+        txid,
+        arena,
+        params,
+        sequences,
+        Some(first),
+    )?;
+    let subs = uncorrelated_subquery_hooks(
+        &[where_clause],
+        storage,
+        txid,
+        arena,
+        params,
+        Some(first),
+        sequences,
+    )?;
+    let correlated_subqueries = ProceduralSubqueries { storage, txid };
+    let catalog = storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        subs: Some(&subs),
+        subquery_executor: Some(&correlated_subqueries),
+        catalog: Some(&catalog),
+        sequences,
+        ..super::eval::NO_HOOKS
+    };
+    let expressions: &[&Expr<'a>] = match where_clause {
+        Some(predicate) => &[predicate],
+        None => &[],
+    };
+    let pax_columns = pax_column_demand(&scope, from, expressions);
+    let retain_match = core::cell::Cell::new(false);
+    let mut passes = None;
+    scan_source_recycling_retaining_match_with_pax_columns(
+        storage,
+        &scope,
+        from,
+        txid,
+        where_clause,
+        arena,
+        params,
+        &hooks,
+        Some(first),
+        pax_columns,
+        &retain_match,
+        &mut |inner| {
+            let again = Chained {
+                inner,
+                outer: Some(latest),
+            };
+            passes = Some(match where_clause {
+                Some(predicate) => plan::where_passes(predicate, arena, params, &again, &hooks)?,
+                None => true,
+            });
+            Ok(false)
+        },
+    )?;
+    Ok(passes.unwrap_or(false))
+}
+
 /// For `UPDATE ... FROM` / `DELETE ... USING`: enumerates the extra tables in
 /// `from`, resolving the target row's columns through `target` (as the outer
 /// scope), and invokes `on_match` with a combined lookup for the FIRST joined
 /// row that satisfies `where_clause`. Returns whether any match was found.
+/// `matched_row` receives that row's FROM item values.
 #[allow(clippy::too_many_arguments)]
 pub fn first_from_match<'a, 'r>(
     storage: &'a Storage,
@@ -15384,84 +15639,24 @@ pub fn first_from_match<'a, 'r>(
     sequences: Option<&dyn SequenceAccess>,
     matched_row: Option<MatchedFromRow<'_, 'r>>,
 ) -> Result<bool, SqlError> {
-    let scope = QueryScope::resolve_exec_outer(
-        storage,
-        from,
-        where_clause,
-        txid,
-        arena,
-        params,
-        sequences,
-        Some(target),
-    )?;
-    let subquery_expressions = arena
-        .alloc_slice_with(1 + 2 * scope.n, |_| None)
-        .map_err(|_| arena_full())?;
-    subquery_expressions[0] = where_clause;
-    collect_table_sample_expressions(from, &mut subquery_expressions[1..]);
-    let subs = subquery_hooks(
-        subquery_expressions,
-        storage,
-        txid,
-        arena,
-        params,
-        sequences,
-    )?;
-    let catalog = StorageCatalog {
-        storage,
-        routine_workspace: arena,
-        txid,
-        invocations: None,
-        statement_arena: None,
-    };
-    let hooks = EvalHooks {
-        group: None,
-        aggs: None,
-        subs: Some(&subs),
-        subquery_executor: None,
-        windows: None,
-        catalog: Some(&catalog),
-        srf_index: None,
-        project_sets: None,
-        sequences,
-        merge_action: None,
-    };
     let mut found = false;
-    let mut expressions = [&Expr::Null; MAX_PROJ + 1];
-    let mut expression_count = 0usize;
-    if let Some(predicate) = where_clause {
-        expressions[expression_count] = predicate;
-        expression_count += 1;
-    }
-    for &expression in observed {
-        expressions[expression_count] = expression;
-        expression_count += 1;
-    }
-    let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
-    let retain_match = core::cell::Cell::new(false);
     let mut matched_row = matched_row;
-    scan_source_recycling_retaining_match_with_pax_columns(
+    joined_from::scan_from_matches(
         storage,
-        &scope,
         from,
         txid,
         where_clause,
+        observed,
+        false,
         arena,
         params,
-        &hooks,
-        Some(target),
-        pax_columns,
-        &retain_match,
-        &mut |jr| {
+        target,
+        sequences,
+        &mut |row, joined, _| {
             if let Some(matched_row) = matched_row.as_mut() {
-                *matched_row.values = detached_join_values(jr, arena, matched_row.arena)?;
+                *matched_row.values = detached_join_values(row, arena, matched_row.arena)?;
             }
-            let chained_row = Chained {
-                inner: jr,
-                outer: Some(target),
-            };
-            on_match(&chained_row)?;
-            retain_match.set(true);
+            on_match(joined)?;
             found = true;
             Ok(false) // stop at the first match (PostgreSQL uses one arbitrary row)
         },
@@ -15599,6 +15794,7 @@ impl<'a> ReturningJoin<'a> {
                 offsets: self.offsets,
             },
             rowids: self.rowids,
+            visible: self.scope.n,
         })
     }
 }

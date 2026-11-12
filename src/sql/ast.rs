@@ -3884,10 +3884,19 @@ impl RelationStorageOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelationStorageOptionNames {
     pub fillfactor: bool,
+    /// View options; resetting one a relation lacks changes nothing.
+    pub security_invoker: bool,
+    pub security_barrier: bool,
+    pub check_option: bool,
 }
 
 impl RelationStorageOptionNames {
-    pub const EMPTY: Self = Self { fillfactor: false };
+    pub const EMPTY: Self = Self {
+        fillfactor: false,
+        security_invoker: false,
+        security_barrier: false,
+        check_option: false,
+    };
 }
 
 /// Parsed access-method spelling; only an executable variant can reach a
@@ -4199,22 +4208,27 @@ impl ColumnStatisticsOptionNames {
     };
 }
 
-/// A table-level constraint, or a column-level CHECK/REFERENCES desugared to
-/// name its single column.
+/// A table-level constraint, or a column-level constraint desugared to name
+/// its single column. `source_position` is where the constraint was written
+/// (its `CONSTRAINT name` prefix when named), which PostgreSQL's errors about
+/// the constraint point at.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TableConstraint<'a> {
     PrimaryKey {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
         timing: ConstraintTiming,
     },
     Unique {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
         timing: ConstraintTiming,
         nulls_not_distinct: bool,
     },
     Check {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         expression: &'a Expr<'a>,
         /// Source text of the predicate, stored durably and re-parsed at
@@ -4223,6 +4237,7 @@ pub enum TableConstraint<'a> {
         validation: ConstraintValidation,
     },
     ForeignKey {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
         parent: QualName<'a>,
@@ -4234,6 +4249,7 @@ pub enum TableConstraint<'a> {
         validation: ConstraintValidation,
     },
     Exclusion {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
         operators: &'a [ExclusionOperator],
@@ -4241,6 +4257,28 @@ pub enum TableConstraint<'a> {
         predicate_text: Option<&'a str>,
         timing: ConstraintTiming,
     },
+}
+
+impl TableConstraint<'_> {
+    pub const fn source_position(&self) -> SourcePosition {
+        match self {
+            Self::PrimaryKey {
+                source_position, ..
+            }
+            | Self::Unique {
+                source_position, ..
+            }
+            | Self::Check {
+                source_position, ..
+            }
+            | Self::ForeignKey {
+                source_position, ..
+            }
+            | Self::Exclusion {
+                source_position, ..
+            } => *source_position,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5089,6 +5127,9 @@ impl<'a> Returning<'a> {
 pub struct Insert<'a> {
     pub source_position: SourcePosition,
     pub table: QualName<'a>,
+    /// `INSERT INTO t AS alias`: the target's only name in ON CONFLICT and
+    /// RETURNING once given.
+    pub alias: Option<&'a str>,
     /// Empty means "all columns in table order".
     pub columns: &'a [&'a str],
     /// `VALUES` rows. Empty when the source is a `SELECT` (`select` is set).
@@ -5467,6 +5508,12 @@ pub enum AlterAction<'a> {
     SetRowLevelSecurity(RowLevelSecurityAlteration),
     SetPersistence(RelationPersistence),
     SetStorageOptions(RelationStorageOptions),
+    /// `SET (...)` naming view options, with any table storage parameters
+    /// written beside them; each relation kind rejects the ones it lacks.
+    SetViewOptions {
+        options: &'a [ViewOption],
+        storage: RelationStorageOptions,
+    },
     ResetStorageOptions(RelationStorageOptionNames),
     SetInheritance {
         parent: QualName<'a>,
@@ -5899,6 +5946,14 @@ pub enum Expr<'a> {
         source: ParameterSource,
     },
     Param(u32),
+    /// An aggregate call inside a subquery whose arguments read only columns
+    /// of the query `levels_up` levels out, which therefore computes it per
+    /// group (PostgreSQL's `agglevelsup`). Here it reads that query's value
+    /// for the current group; `call` is the node the owning query folds.
+    OuterAggregate {
+        call: &'a Expr<'a>,
+        levels_up: u32,
+    },
     Unary {
         source_position: SourcePosition,
         operator: UnaryOp,
@@ -6344,6 +6399,7 @@ impl<'a> Expr<'a> {
             | Expr::RecursiveState { .. }
             | Expr::RoutineParam { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::Subquery(_)
             | Expr::RowSubquery { .. }
             | Expr::InSubquery { .. }
@@ -6438,7 +6494,7 @@ impl<'a> Expr<'a> {
     /// evaluated per inserted row rather than folded once.
     pub fn contains_call(&self) -> bool {
         match self {
-            Expr::Call { .. } => true,
+            Expr::Call { .. } | Expr::OuterAggregate { .. } => true,
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -6543,6 +6599,7 @@ impl<'a> Expr<'a> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::DefaultMarker => false,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
@@ -6664,6 +6721,7 @@ impl<'a> Expr<'a> {
                 }
                 args.iter().find_map(|a| a.find_function(matches))
             }
+            Expr::OuterAggregate { call, .. } => call.find_function(matches),
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -6763,6 +6821,7 @@ impl<'a> Expr<'a> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::RowSubquery { .. }
@@ -6863,6 +6922,7 @@ impl<'a> Expr<'a> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::RoutineParam { .. }
             | Expr::DefaultMarker
             | Expr::Subquery(_)
@@ -7061,6 +7121,16 @@ pub enum BinaryOp {
     /// (`ILike` is the case-insensitive form). Plain `x LIKE y` uses `Expr::Like`.
     Like,
     ILike,
+    /// POSIX match, used only as the operator of a quantified `~ ANY/ALL`
+    /// (`RegexIMatch` is `~*`). Plain `x ~ y` uses `Expr::Match`.
+    RegexMatch,
+    RegexIMatch,
+    /// The negated forms (`!~~`, `!~~*`, `!~`, `!~*`) of the quantified
+    /// pattern operators above.
+    NotLike,
+    NotILike,
+    RegexNotMatch,
+    RegexNotIMatch,
 }
 
 impl BinaryOp {
@@ -7170,7 +7240,15 @@ impl BinaryOp {
             Self::AbovePoint => ">^",
             Self::NetContainedEq => "<<=",
             Self::NetContainsEq => ">>=",
-            Self::And | Self::Or | Self::Like | Self::ILike => return None,
+            Self::Like => "~~",
+            Self::ILike => "~~*",
+            Self::RegexMatch => "~",
+            Self::RegexIMatch => "~*",
+            Self::NotLike => "!~~",
+            Self::NotILike => "!~~*",
+            Self::RegexNotMatch => "!~",
+            Self::RegexNotIMatch => "!~*",
+            Self::And | Self::Or => return None,
         })
     }
 
@@ -7202,7 +7280,14 @@ impl BinaryOp {
             | Self::BelowPoint
             | Self::AbovePoint => 4,
             Self::NetContainedEq | Self::NetContainsEq => 4,
-            Self::Like | Self::ILike => 4,
+            Self::Like
+            | Self::ILike
+            | Self::RegexMatch
+            | Self::RegexIMatch
+            | Self::NotLike
+            | Self::NotILike
+            | Self::RegexNotMatch
+            | Self::RegexNotIMatch => 4,
             Self::JsonExists | Self::JsonExistsAny | Self::JsonExistsAll | Self::JsonPathExists => {
                 4
             }

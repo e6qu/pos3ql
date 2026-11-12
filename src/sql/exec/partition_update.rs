@@ -40,12 +40,11 @@ pub(super) fn prepare_move<'arena>(
     if !dml_row_available(storage, txn, selected, "updated")? {
         return Ok(false);
     }
-    txn.write_row(
+    txn.move_row_out(
         storage,
         old_target,
         rowid,
         txn.command_id(),
-        None,
         crate::storage::RowWriteStatistics::Tracked,
     )?;
 

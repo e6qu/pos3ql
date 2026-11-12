@@ -53,7 +53,15 @@ example, if one session deletes customer 7 while another inserts an order for
 customer 7, the order insert waits; when the delete commits the insert fails
 with `23503`, and when it rolls back the insert succeeds. Under `REPEATABLE
 READ` and `SERIALIZABLE`, an insert whose parent was deleted or had its key
-changed after the transaction's snapshot fails with `40001`. Changing other
+changed after the transaction's snapshot fails with `40001`; a partitioned
+parent table is read with a current snapshot instead, as PostgreSQL's check
+does, so a parent inserted after the snapshot counts and one deleted after it
+fails the insert with `23503`. A check that waited for the parent row keeps
+the snapshot it started with, as PostgreSQL's check query does: under read
+committed a parent deleted and inserted again with the same key while the
+check waited does not count (`23503`), and under repeatable read a parent
+deleted or moved while a check of a partitioned parent waited fails it with
+`40001`. Changing other
 parent columns does not conflict, nor does an assignment that keeps the key
 value, such as `UPDATE customers SET id = id`. `ON DELETE`/`ON UPDATE` actions lock the
 referencing rows they check or rewrite. Each locked row takes one entry of the
@@ -73,6 +81,19 @@ concurrent update`, or `concurrent delete` for an `UPDATE`, `DELETE` or
 `MERGE` of a deleted row); `FOR KEY SHARE` still succeeds when the change kept
 every unique key column.
 
+A row another transaction moved to a different partition (an `UPDATE` or
+`MERGE` that changed its partition key) cannot be followed into its new
+partition. A statement that waited for that row fails with `40001`, as in
+PostgreSQL: `tuple to be locked was already moved to another partition due to
+concurrent update` under `READ COMMITTED`, and `could not serialize access due
+to concurrent update` under `REPEATABLE READ` and `SERIALIZABLE`. For example,
+`UPDATE orders SET note = 'x' WHERE id = 7` fails when another session's
+`UPDATE orders SET region = 'eu' WHERE id = 7` moved the order to another
+partition first; retry the statement to update it in its new partition. A foreign
+key check that waited for its parent row fails the same way under `READ
+COMMITTED`. The move is recorded in the journal, so a prepared transaction's
+move still fails waiting statements after a restart.
+
 Under `READ COMMITTED`, `SELECT ... FOR UPDATE` returns the locked row's latest
 version: the join conditions, `WHERE` and output list run again over it, while
 the other tables in the join keep the rows first read. For example, a job
@@ -84,15 +105,46 @@ action again for the target row's latest version: a `WHEN MATCHED` pair whose
 pair whose `ON` condition no longer holds runs the `WHEN NOT MATCHED BY SOURCE`
 actions on the target row and the `WHEN NOT MATCHED` action for the source
 row; a deleted target row leaves only the `WHEN NOT MATCHED` action, as in
-PostgreSQL 15 and later. An `IN (subquery)` condition that does not refer to
-the outer query is rechecked against the subquery row it first matched, as
-PostgreSQL's semi-join does: the row stays only if the tested value did not
-change. Three differences remain: PostgreSQL rechecks a correlated `EXISTS
-(subquery)` against the subquery row it first matched, where pos3ql runs the
-subquery again; a row another transaction moved to a
-different partition is skipped where PostgreSQL fails with `40001`; and a
-query with a `LATERAL` source fails such a recheck with `0A000` where
-PostgreSQL runs the `LATERAL` source again.
+PostgreSQL 15 and later. A source row that loses several matches runs its
+`WHEN NOT MATCHED` action once for each lost pair, right after that pair, as
+PostgreSQL does.
+
+`UPDATE`, `DELETE` and `SELECT ... FOR UPDATE` recheck their `WHERE` the way
+PostgreSQL's plan does. An `IN (subquery)` condition that does not refer to
+the outer query, and an `EXISTS (subquery)` condition that does (both at the
+top level of `WHERE`), are semi-joins in PostgreSQL's plan: the row stays only
+if the subquery row it first matched still matches. For example, `UPDATE jobs
+SET state = 'done' WHERE EXISTS (SELECT 1 FROM workers w WHERE w.slot =
+jobs.slot)` that waited for another session's change to `jobs.slot` skips the
+job when the worker it first matched no longer has that slot, even if another
+worker does. pos3ql takes the first match in its own scan order, which equals
+PostgreSQL's for a sequential scan of one table; a different join plan in
+PostgreSQL can pick a different first row. Other conditions, and correlated
+subqueries PostgreSQL keeps as subplans (under `OR`, with aggregates or
+volatile functions), run again over the latest version.
+
+`UPDATE ... FROM` and `DELETE ... USING` keep the `FROM` row each target row
+joined. A target row that another transaction changed is rechecked against
+that row, and the assignments read it; the statement does not join the new
+version to other `FROM` rows. When that row no longer meets the conditions,
+the next `FROM` row the first version joined is tried, as PostgreSQL tries
+each joined row in turn. For example, `UPDATE accounts SET rate = r.rate FROM
+rates r WHERE accounts.tier = r.tier` that waited for another session to move
+an account from tier 1 to tier 2 skips the account instead of giving it tier
+2's rate.
+
+A `LATERAL` source follows the same plan rules: a simple subquery without
+`FROM` (`LATERAL (SELECT t.qty * 10 AS x)`) runs again over the latest row; a
+function, a `VALUES` list of several rows and a subquery with aggregates,
+`GROUP BY`, `DISTINCT`, `LIMIT` or `OFFSET` keep the row first read; a `UNION
+ALL` of simple branches returns its first branch's row again. A simple
+`LATERAL` subquery that reads tables keeps the rows it first joined, as
+PostgreSQL does, and runs its `WHERE` and output list again with the latest
+row: `LATERAL (SELECT s.qty + i.qty AS y FROM stock s WHERE s.id = i.id)`
+returns the same stock row's quantity plus the item's new quantity. pos3ql
+finds those rows again from the values the subquery produced; when several of
+its rows produced the same values but recheck differently, or the subquery is
+a `UNION ALL` branch that reads tables, the recheck fails with `0A000`.
 
 A commit becomes visible all at once, and only after it is durable: new
 statements never see half of an order-and-invoice update. If commit waits for

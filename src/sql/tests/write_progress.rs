@@ -14,6 +14,8 @@ struct ColdTable {
     other: ConfiguredTransactionSession,
     /// Waits during which the writer's transaction kept the write's rows.
     kept_waits: usize,
+    /// Waits during which it kept the write's finished AFTER work.
+    completion_waits: usize,
 }
 
 /// `cold_items` (`id`, `code`) holds rows 1..=40 only in saved objects; GET
@@ -51,6 +53,8 @@ fn cold_table(label: &str, mode: crate::config::TransactionMode, setup: &str) ->
         "cold_extra",
         "cold_gone",
         "cold_pairs",
+        "cold_updates",
+        "cold_deletes",
     ] {
         let Some(table) = engine.storage.find_table("public", name) else {
             continue;
@@ -72,6 +76,7 @@ fn cold_table(label: &str, mode: crate::config::TransactionMode, setup: &str) ->
         writer,
         other,
         kept_waits: 0,
+        completion_waits: 0,
     }
 }
 
@@ -151,6 +156,8 @@ impl ColdTable {
             };
             assert_eq!(wait, StatementWait::ObjectIo, "{sql}");
             self.kept_waits += usize::from(self.writer.transaction.has_retained_write());
+            self.completion_waits +=
+                usize::from(self.writer.transaction.has_pending_write_completion());
             output_mark.truncate_unsent(&mut self.writer.send);
             self.writer.arena.recycle_front();
             completed_statements = completed;
@@ -871,6 +878,142 @@ fn procedural_write_rows_resume_after_storage_waits() {
             assert_eq!(
                 cold.rows("SELECT count(*), sum(n), sum(more), sum(extra) FROM orders"),
                 ["10|156|6|17"],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows("SELECT count(*) FROM hot_log"),
+                ["3"],
+                "{context}"
+            );
+            cold.finish();
+        }
+    }
+}
+
+/// Notes whose AFTER row and statement triggers read cold tables before
+/// their writes, sequence calls and notices, with a deferrable foreign key
+/// checked at the statement's end against a cold parent.
+const AFTER_SETUP: &str = "CREATE TABLE hot_log(stage text); CREATE SEQUENCE numbers; \
+     CREATE TABLE audit(stage text, n bigint); \
+     CREATE TABLE cold_more(id integer PRIMARY KEY); \
+     INSERT INTO cold_more SELECT generate_series(1, 40); \
+     CREATE TABLE cold_gone(id integer PRIMARY KEY, code text); \
+     INSERT INTO cold_gone SELECT g, 'g' || g FROM generate_series(1, 40) g; \
+     CREATE TABLE cold_pairs(id integer PRIMARY KEY, code text); \
+     INSERT INTO cold_pairs SELECT g, 'p' || g FROM generate_series(1, 40) g; \
+     CREATE TABLE cold_extra(id integer PRIMARY KEY); \
+     INSERT INTO cold_extra SELECT generate_series(1, 40); \
+     CREATE TABLE cold_updates(id integer PRIMARY KEY); \
+     INSERT INTO cold_updates SELECT generate_series(1, 30); \
+     CREATE TABLE cold_deletes(id integer PRIMARY KEY); \
+     INSERT INTO cold_deletes SELECT generate_series(1, 20); \
+     CREATE TABLE notes(id integer, more integer REFERENCES cold_more \
+     DEFERRABLE INITIALLY IMMEDIATE, note text); \
+     CREATE FUNCTION after_note() RETURNS trigger LANGUAGE plpgsql AS $$ \
+     DECLARE r record; c text; BEGIN \
+     IF TG_OP = 'INSERT' THEN r := NEW; SELECT code INTO c FROM cold_items WHERE id = r.id; \
+     ELSIF TG_OP = 'UPDATE' THEN r := NEW; \
+     SELECT code INTO c FROM cold_gone WHERE id = r.id; \
+     ELSE r := OLD; SELECT code INTO c FROM cold_pairs WHERE id = r.id; END IF; \
+     RAISE NOTICE '% % %', TG_OP, r.note, c; \
+     INSERT INTO audit VALUES (TG_OP || '-' || r.note || '-' || c, nextval('numbers')); \
+     RETURN NULL; END$$; \
+     CREATE TRIGGER after_note AFTER INSERT OR UPDATE OR DELETE ON notes \
+     FOR EACH ROW EXECUTE FUNCTION after_note(); \
+     CREATE FUNCTION after_notes() RETURNS trigger LANGUAGE plpgsql AS $$ \
+     DECLARE seen bigint; BEGIN \
+     IF TG_OP = 'INSERT' THEN SELECT count(*) INTO seen FROM cold_extra; \
+     ELSIF TG_OP = 'UPDATE' THEN SELECT count(*) INTO seen FROM cold_updates; \
+     ELSE SELECT count(*) INTO seen FROM cold_deletes; END IF; \
+     INSERT INTO audit VALUES (TG_OP || '-all-' || seen, nextval('numbers')); \
+     RAISE NOTICE '% statement', TG_OP; RETURN NULL; END$$; \
+     CREATE TRIGGER after_notes AFTER INSERT OR UPDATE OR DELETE ON notes \
+     FOR EACH STATEMENT EXECUTE FUNCTION after_notes()";
+
+/// Reads after a write's last row yield: AFTER ROW and AFTER STATEMENT
+/// trigger bodies and deferrable foreign key checks wait for delayed GETs
+/// while another client runs. The finished events are kept, so notices,
+/// audit rows, sequence values and the command tag each happen once, with
+/// PostgreSQL 18.6's values; both transaction modes, both protocols,
+/// implicit and explicit transactions.
+#[test]
+fn after_row_reads_yield_after_storage_waits() {
+    let statements: &[(&str, &[&str])] = &[
+        (
+            "INSERT INTO notes VALUES (1, 1, 'a'), (2, NULL, 'b'), (3, 3, 'c')",
+            &[
+                "INSERT a c1",
+                "INSERT b c2",
+                "INSERT c c3",
+                "INSERT statement",
+            ],
+        ),
+        (
+            "UPDATE notes SET more = id + 4, note = note || 'u' WHERE id >= 2",
+            &["UPDATE bu g2", "UPDATE cu g3", "UPDATE statement"],
+        ),
+        (
+            "DELETE FROM notes WHERE id = 1",
+            &["DELETE a p1", "DELETE statement"],
+        ),
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for (extended, explicit) in [(false, false), (true, false), (false, true)] {
+            let mut cold = cold_table(
+                &format!("after-waits-{extended}-{explicit}"),
+                mode,
+                AFTER_SETUP,
+            );
+            if explicit {
+                cold.writer.success(&mut cold.engine, "BEGIN", true);
+            }
+            for &(sql, notices) in statements {
+                let context = format!("{mode:?} extended={extended} explicit={explicit}: {sql}");
+                let kept = cold.completion_waits;
+                let waits = cold.run(sql, extended, other_client_progresses);
+                assert!(waits > 0, "{context}: AFTER work must wait");
+                assert!(
+                    cold.completion_waits > kept,
+                    "{context}: the wait must keep the finished AFTER work"
+                );
+                let output = cold.writer.send.readable().to_vec();
+                assert!(
+                    error_sqlstates(&output).is_empty(),
+                    "{context}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                assert_eq!(notice_messages(&output), notices, "{context}");
+                assert_eq!(command_tags(&output).len(), 1, "{context}");
+            }
+            if explicit {
+                cold.writer.success(&mut cold.engine, "COMMIT", true);
+            }
+            let context = format!("{mode:?} extended={extended} explicit={explicit}");
+            // A missing parent fails the statement once and rolls back its
+            // AFTER work. (Without a Sync, an extended-protocol error would
+            // also end the implicit block of the statements before it.)
+            if !extended {
+                cold.run("INSERT INTO notes VALUES (9, 99, 'z')", false, |_, _| {});
+                let output = cold.writer.send.readable().to_vec();
+                assert_eq!(error_sqlstates(&output), ["23503"], "{context}");
+                assert!(command_tags(&output).is_empty(), "{context}");
+            }
+            assert_eq!(
+                cold.rows("SELECT string_agg(stage || ':' || n, ',' ORDER BY n) FROM audit"),
+                ["INSERT-a-c1:1,INSERT-b-c2:2,INSERT-c-c3:3,INSERT-all-40:4,\
+                     UPDATE-bu-g2:5,UPDATE-cu-g3:6,UPDATE-all-30:7,DELETE-a-p1:8,\
+                     DELETE-all-20:9"],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows(
+                    "SELECT string_agg(id || ':' || more || ':' || note, ',' ORDER BY id) \
+                     FROM notes"
+                ),
+                ["2:6:bu,3:7:cu"],
                 "{context}"
             );
             assert_eq!(

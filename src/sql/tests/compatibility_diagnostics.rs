@@ -1306,6 +1306,203 @@ fn subquery_constants_convert_before_rows_are_read() {
 }
 
 #[test]
+fn unsupported_system_columns_fail_loudly_and_tables_cannot_take_their_names() {
+    with_engine("system-columns", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE TABLE st (a int); CREATE VIEW sv AS SELECT 1 AS ctid",
+        );
+        for (sql, expected) in [
+            (
+                "SELECT ctid FROM st",
+                "ERROR 0A000 system column \"ctid\" is not supported",
+            ),
+            (
+                "SELECT s.xmin FROM st s",
+                "ERROR 0A000 system column \"xmin\" is not supported",
+            ),
+            (
+                "SELECT tableoid FROM st",
+                "ERROR 0A000 system column \"tableoid\" is not supported",
+            ),
+            // Views and subqueries have no system columns.
+            (
+                "SELECT xmin FROM sv",
+                "ERROR 42703 column \"xmin\" does not exist @8",
+            ),
+            (
+                "SELECT ctid FROM (SELECT 1) s",
+                "ERROR 42703 column \"ctid\" does not exist @8",
+            ),
+            (
+                "CREATE TABLE sc (cmin int)",
+                "ERROR 42701 column name \"cmin\" conflicts with a system column name",
+            ),
+            (
+                "ALTER TABLE st ADD COLUMN IF NOT EXISTS xmax int",
+                "ERROR 42701 column name \"xmax\" conflicts with a system column name",
+            ),
+            (
+                "ALTER TABLE st RENAME COLUMN a TO ctid",
+                "ERROR 42701 column name \"ctid\" conflicts with a system column name",
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [expected],
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            data_rows(&run_with(engine, budget, "SELECT ctid FROM sv")),
+            ["1"]
+        );
+    });
+}
+
+#[test]
+fn a_plain_source_subquery_cannot_see_the_target_columns() {
+    with_engine("hidden-target-columns", |engine, budget| {
+        run_with(engine, budget, "CREATE TABLE lt (id int, v int)");
+        for sql in [
+            "UPDATE lt SET v = 1 FROM (SELECT v AS x) s",
+            "DELETE FROM lt USING (SELECT v AS x) s",
+        ] {
+            let position = sql.find("v AS").unwrap() + 1;
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [format!(
+                    "ERROR 42703 column \"v\" does not exist @{position} detail: There is a \
+                     column named \"v\" in table \"lt\", but it cannot be referenced from this \
+                     part of the query."
+                )],
+                "{sql}"
+            );
+        }
+        // An item to the left could be read through LATERAL, also from a
+        // subquery nested in the derived table or in its own FROM item.
+        for sql in [
+            "SELECT * FROM lt, (SELECT v) s",
+            "SELECT * FROM lt, (SELECT (SELECT v)) s",
+            "SELECT * FROM lt, (SELECT 1 FROM (SELECT (SELECT v)) x) s",
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [format!(
+                    "ERROR 42703 column \"v\" does not exist @{} hint: To reference that \
+                     column, you must mark this subquery with LATERAL. detail: There is a \
+                     column named \"v\" in table \"lt\", but it cannot be referenced from \
+                     this part of the query.",
+                    sql.find("v)").unwrap() + 1
+                )],
+                "{sql}"
+            );
+        }
+        // A FROM item inside the derived table supplies the column.
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "SELECT * FROM lt, (SELECT (SELECT v) FROM lt l2) s"
+            )),
+            ["SELECT 0"]
+        );
+        let sql = "UPDATE lt SET v = 1 FROM (SELECT lt.v) s";
+        assert_eq!(
+            diagnostics(&run_with(engine, budget, sql)),
+            [format!(
+                "ERROR 42P01 invalid reference to FROM-clause entry for table \"lt\" @{} \
+                 detail: There is an entry for table \"lt\", but it cannot be referenced \
+                 from this part of the query.",
+                sql.find("lt.v").unwrap() + 1
+            )]
+        );
+    });
+}
+
+#[test]
+fn a_lateral_body_reads_only_the_items_to_its_left() {
+    with_engine("lateral-left-items", |engine, budget| {
+        for sql in [
+            "CREATE TABLE lt (id int, v int)",
+            "INSERT INTO lt VALUES (1, 10), (2, 20)",
+            "CREATE TABLE lu (id int, v int)",
+            "INSERT INTO lu VALUES (1, 100)",
+            "CREATE TABLE lw (w int)",
+            "INSERT INTO lw VALUES (5)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // The item's own columns, and later items', are not its body's.
+        for (sql, rows) in [
+            (
+                "SELECT * FROM lt, LATERAL (SELECT v) s ORDER BY 1",
+                &["1|10|10", "2|20|20"][..],
+            ),
+            (
+                "SELECT * FROM lt a, LATERAL (SELECT v) s, lu ORDER BY 1",
+                &["1|10|10|1|100", "2|20|20|1|100"],
+            ),
+            (
+                "SELECT * FROM lt a JOIN lu b USING (v), LATERAL (SELECT v) s",
+                &[],
+            ),
+            (
+                "SELECT * FROM lt a LEFT JOIN LATERAL (SELECT v WHERE v > 10) s ON true ORDER BY 1",
+                &["1|10|NULL", "2|20|20"],
+            ),
+            (
+                "SELECT * FROM lt, unnest(ARRAY[v, v + 1]) AS v ORDER BY 1, 3",
+                &["1|10|10", "1|10|11", "2|20|20", "2|20|21"],
+            ),
+            (
+                "SELECT * FROM lt a RIGHT JOIN LATERAL (SELECT 1 AS one) s ON true ORDER BY 1",
+                &["1|10|1", "2|20|1"],
+            ),
+            (
+                "UPDATE lt SET v = v + s.w FROM lw, LATERAL (SELECT w) s WHERE lt.id = 1 \
+                 RETURNING lt.id, lt.v",
+                &["1|15"],
+            ),
+            // A comma ends the join tree: `lw` crosses `lt a RIGHT JOIN lu s`.
+            (
+                "SELECT count(*) FROM lw, lt a RIGHT JOIN lu s ON true",
+                &["2"],
+            ),
+            ("DELETE FROM lt USING lw WHERE false RETURNING *", &[]),
+        ] {
+            assert_eq!(data_rows(&run_with(engine, budget, sql)), rows, "{sql}");
+        }
+        for (sql, expected) in [
+            (
+                "SELECT * FROM lt a JOIN lu b ON a.id = b.id, LATERAL (SELECT v) s",
+                "ERROR 42702 column reference \"v\" is ambiguous @62".to_string(),
+            ),
+            (
+                "SELECT * FROM lt a FULL JOIN LATERAL (SELECT v) s ON true",
+                "ERROR 42P10 invalid reference to FROM-clause entry for table \"a\" @46 \
+                 detail: The combining JOIN type must be INNER or LEFT for a LATERAL reference."
+                    .to_string(),
+            ),
+            (
+                "UPDATE lt SET v = 1 FROM lu x, LATERAL (SELECT v) s",
+                "ERROR 42P10 invalid reference to FROM-clause entry for table \"lt\" @48 \
+                 hint: There is an entry for table \"lt\", but it cannot be referenced from \
+                 this part of the query."
+                    .to_string(),
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [expected],
+                "{sql}"
+            );
+        }
+    });
+}
+
+#[test]
 fn plpgsql_labels_name_blocks_loops_and_their_variables() {
     with_engine("plpgsql-labels", |engine, budget| {
         // Results from PostgreSQL 18.6.

@@ -971,8 +971,15 @@ fn collect_statement(
             let mark = arena.mark();
             let result = (|| {
                 record_routine_target(insert.table, storage, txid, path, dependencies)?;
-                let scope =
-                    dml_dependency_scope(storage, insert.table, None, None, txid, arena, None)?;
+                let scope = dml_dependency_scope(
+                    storage,
+                    insert.table,
+                    insert.alias,
+                    None,
+                    txid,
+                    arena,
+                    None,
+                )?;
                 record_insert_targets(
                     insert,
                     &scope,
@@ -1469,7 +1476,7 @@ pub(crate) fn validate_dml_assignment_casts(
         let statement =
             super::cte::expand_dml_ctes_schema(statement, with, storage, txid, None, None, arena)?;
         let (alias, extra) = match statement {
-            Stmt::Insert(_) => (None, None),
+            Stmt::Insert(insert) => (insert.alias, None),
             Stmt::Update(update) => (update.alias, update.from),
             Stmt::Delete(delete) => (delete.alias, delete.using),
             Stmt::Merge(merge) => {
@@ -1595,7 +1602,39 @@ pub(crate) fn validate_dml_assignment_casts(
                     .into_iter()
                     .flatten()
                 {
-                    assign(name, expression, None)?;
+                    assign(name, expression, insert.alias)?;
+                }
+                // A target aliased `excluded` makes the name ambiguous where
+                // the proposed row is also in scope.
+                if let Some(alias) = insert.alias
+                    && alias == "excluded"
+                    && let Some(conflict) = insert.on_conflict
+                    && let Some(assignments) = conflict.update
+                {
+                    let mut ambiguous = None;
+                    for expression in assignments
+                        .iter()
+                        .map(|(_, expression)| *expression)
+                        .chain(conflict.update_where)
+                    {
+                        expression.for_each_column_reference(&mut |qualifier, _| {
+                            if ambiguous.is_none()
+                                && let Some(qualifier) = qualifier
+                                && qualifier == "excluded"
+                            {
+                                ambiguous = Some(crate::sql::error_position::at_subject(
+                                    sql_err!(
+                                        sqlstate::AMBIGUOUS_ALIAS,
+                                        "table reference \"excluded\" is ambiguous"
+                                    ),
+                                    qualifier,
+                                ));
+                            }
+                        });
+                    }
+                    if let Some(error) = ambiguous {
+                        return Err(error);
+                    }
                 }
             }
             Stmt::Update(update) => {
@@ -2155,7 +2194,7 @@ fn visit_dml_assignment_inputs(
         let statement =
             super::cte::expand_dml_ctes_schema(statement, with, storage, txid, None, None, arena)?;
         let (target, alias, extra) = match statement {
-            Stmt::Insert(insert) => (insert.table, None, None),
+            Stmt::Insert(insert) => (insert.table, insert.alias, None),
             Stmt::Update(update) => (update.table, update.alias, update.from),
             Stmt::Merge(merge) => {
                 let source = arena
@@ -2197,7 +2236,7 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
     let mark = arena.mark();
     let result = (|| {
         let (target_name, alias) = match statement {
-            Stmt::Insert(insert) => (insert.table.name, None),
+            Stmt::Insert(insert) => (insert.table.name, insert.alias),
             Stmt::Update(update) => (update.table.name, update.alias),
             Stmt::Merge(merge) => (merge.target.name, merge.target_alias),
             _ => return Ok(()),
@@ -3474,6 +3513,19 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     }
 
     fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        // RETURNING's OLD/NEW rows and ON CONFLICT's EXCLUDED row have the
+        // target relation's row type.
+        if let Some(definition) = self.output_definition(name) {
+            let slot = self.storage.find_visible(
+                definition.schema.as_str(),
+                definition.name.as_str(),
+                self.txid,
+            )?;
+            return Some(ColType::Composite(Some(
+                self.storage
+                    .relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)),
+            )));
+        }
         self.scope?
             .whole_row_type(name)
             .filter(|ctype| matches!(ctype, ColType::Composite(_)))
@@ -4394,6 +4446,9 @@ fn collect_routine_dependencies_with_resolver(
     Ok(unresolved)
 }
 
+/// The columns of a sequence read as a relation, in attribute order.
+const SEQUENCE_RELATION_COLUMNS: [&str; 3] = ["last_value", "log_cnt", "is_called"];
+
 #[derive(Clone, Copy)]
 struct RelationSource<'a> {
     class: DependencyClass,
@@ -4438,6 +4493,44 @@ fn record_relation_column_references<'a>(
         }
         let Some(relation) = context.resolve_relation(storage, txid, table.schema, table.table)?
         else {
+            // A sequence read as a relation records the columns it reads.
+            let name = crate::sql::types::acl_identifier(table.table);
+            let reference = match table.schema {
+                Some(schema) => crate::stack_format!(
+                    264,
+                    "{}.{}",
+                    crate::sql::types::acl_identifier(schema).as_str(),
+                    name.as_str()
+                ),
+                None => crate::stack_format!(264, "{}", name.as_str()),
+            };
+            let (Some(slot), _, _) =
+                resolve_sequence_reference(reference.as_str(), storage, txid, context.path)?
+            else {
+                continue;
+            };
+            let source = &mut sources[n_sources];
+            source.exposed = table.alias.unwrap_or(table.table);
+            source.class = DependencyClass::Sequence;
+            source.slot = slot;
+            source.n_columns = SEQUENCE_RELATION_COLUMNS.len();
+            for (column, name) in SEQUENCE_RELATION_COLUMNS.iter().enumerate() {
+                source.columns[column] = table
+                    .col_alias
+                    .and_then(|aliases| aliases.get(column).copied())
+                    .unwrap_or(name);
+            }
+            if table.alias.is_none() {
+                let schema = storage.sequence_for(slot, txid).schema;
+                let name = crate::stack_format!(
+                    130,
+                    "{}.{}",
+                    table.schema.unwrap_or(schema.as_str()),
+                    table.table
+                );
+                source.qualified = Some(arena.alloc_str(name.as_str()).map_err(|_| arena_full())?);
+            }
+            n_sources += 1;
             continue;
         };
         let source = &mut sources[n_sources];
@@ -5700,6 +5793,33 @@ fn collect_sequence(
     dependencies: &mut StoredQueryDependencies,
 ) -> Result<(), SqlError> {
     let (slot, referenced_schema, referenced_name) =
+        resolve_sequence_reference(sequence_name, storage, txid, path)?;
+    if let Some(slot) = slot {
+        let sequence = storage.sequence_for(slot, txid);
+        dependencies.push(StoredQueryDependency {
+            class: DependencyClass::Sequence,
+            slot: slot as u16,
+            identity: StoredDependencyIdentity::Name,
+            referenced_columns: crate::storage::ColumnSet::EMPTY,
+            written_columns: crate::storage::ColumnSet::EMPTY,
+            schema: sequence.schema,
+            name: sequence.name,
+            referenced_schema,
+            referenced_name,
+        })?;
+    }
+    Ok(())
+}
+
+/// The sequence slot a `regclass` text or a relation name selects, with the
+/// schema and name as written.
+fn resolve_sequence_reference(
+    sequence_name: &str,
+    storage: &Storage,
+    txid: u32,
+    path: &PathContext,
+) -> Result<(Option<usize>, SqlName, SqlName), SqlError> {
+    Ok(
         match crate::sql::identifiers::ObjectReference::parse(sequence_name)? {
             crate::sql::identifiers::ObjectReference::Oid(oid) => {
                 let slot = (0..storage.sequence_count()).find(|slot| {
@@ -5756,20 +5876,6 @@ fn collect_sequence(
                 };
                 (slot, parsed.schema.unwrap_or(SqlName::EMPTY), parsed.name)
             }
-        };
-    if let Some(slot) = slot {
-        let sequence = storage.sequence_for(slot, txid);
-        dependencies.push(StoredQueryDependency {
-            class: DependencyClass::Sequence,
-            slot: slot as u16,
-            identity: StoredDependencyIdentity::Name,
-            referenced_columns: crate::storage::ColumnSet::EMPTY,
-            written_columns: crate::storage::ColumnSet::EMPTY,
-            schema: sequence.schema,
-            name: sequence.name,
-            referenced_schema,
-            referenced_name,
-        })?;
-    }
-    Ok(())
+        },
+    )
 }

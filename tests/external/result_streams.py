@@ -14,7 +14,10 @@ A `COPY ... TO STDOUT` of the table is stalled the same way. A then reads
 everything: exactly one RowDescription per simple query, every row once and
 in order, PortalSuspended after each full page, one CommandComplete and one
 ReadyForQuery. With --pg, the same protocol
-transcript summary is compared with PostgreSQL 18.
+transcript summary is compared with PostgreSQL 18. With --operations, each
+result must also have streamed (or spooled, where noted) by the server's
+pos3ql_result_streams_total counter, so a shape that silently stopped
+streaming fails instead of passing on its spooled output.
 
 PostgreSQL references:
 https://www.postgresql.org/docs/18/protocol-flow.html
@@ -25,6 +28,7 @@ import argparse
 import socket
 import struct
 import time
+import urllib.request
 
 import psycopg
 
@@ -33,23 +37,30 @@ TABLE_ROWS = 5000
 # Results must exceed what loopback socket buffers can absorb (Linux grows a
 # send buffer to 4 MiB), so the server really holds output for a stalled client.
 ALL_PROTOCOLS = ("simple", "extended", "paged")
+# Where each result streams: in both storage modes, only in local mode, or
+# nowhere (it spools).
+BOTH = ("local", "object-store")
+LOCAL = ("local",)
+NOWHERE = ()
 # Paged only in local storage mode; see the sorted query below.
 LOCAL_PAGED = ("simple", "extended", "local-paged")
 COPY_TABLE = "COPY result_stream_rows TO STDOUT"
 QUERIES = (
-    (f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g", ROWS, ALL_PROTOCOLS),
-    ("SELECT id, payload FROM result_stream_rows", TABLE_ROWS, ALL_PROTOCOLS),
+    (f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g", ROWS, ALL_PROTOCOLS, BOTH),
+    ("SELECT id, payload FROM result_stream_rows", TABLE_ROWS, ALL_PROTOCOLS, BOTH),
     # Nested-loop joins resume row by row, paged portals included.
     (
         f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g, (VALUES (1)) v",
         ROWS,
         ALL_PROTOCOLS,
+        BOTH,
     ),
     (
         "SELECT r.id, r.payload, t.k FROM result_stream_rows r "
         "LEFT JOIN (VALUES (0), (1)) t(k) ON t.k = r.id % 2",
         TABLE_ROWS,
         ALL_PROTOCOLS,
+        BOTH,
     ),
     # Local-mode sorts and hash joins resume row by row after their build;
     # rows must still arrive as 1..n, so the sort key reverses a descending
@@ -59,6 +70,7 @@ QUERIES = (
         "SELECT id, payload FROM result_stream_rows ORDER BY -id DESC",
         TABLE_ROWS,
         LOCAL_PAGED,
+        LOCAL,
     ),
     # Two tables' read positions exceed the starter result_stream_bytes, so
     # this hash join spools; a paged portal would buffer more than
@@ -68,6 +80,7 @@ QUERIES = (
         "JOIN result_stream_rows s ON s.id = r.id ORDER BY r.id",
         TABLE_ROWS,
         ("simple", "extended"),
+        NOWHERE,
     ),
     # Groupings resume row by row after reading their input, in both
     # storage modes; rows must arrive as 1..n, so the key orders them.
@@ -75,6 +88,7 @@ QUERIES = (
         "SELECT id, max(payload) FROM result_stream_rows GROUP BY id ORDER BY id",
         TABLE_ROWS,
         ALL_PROTOCOLS,
+        BOTH,
     ),
     # Fixed-size aggregate states fold per group as the input is read.
     (
@@ -82,18 +96,21 @@ QUERIES = (
         "GROUP BY id ORDER BY id",
         TABLE_ROWS,
         ALL_PROTOCOLS,
+        BOTH,
     ),
     # Plain DISTINCT groups by its output list the same way.
     (
         "SELECT DISTINCT id, payload FROM result_stream_rows ORDER BY id",
         TABLE_ROWS,
         ALL_PROTOCOLS,
+        BOTH,
     ),
     # DISTINCT ON keeps each first row of a local-mode sort.
     (
         "SELECT DISTINCT ON (-id) id, payload FROM result_stream_rows ORDER BY -id DESC",
         TABLE_ROWS,
         LOCAL_PAGED,
+        LOCAL,
     ),
     # UNION ALL appends its queries' streams, in both storage modes.
     (
@@ -101,16 +118,18 @@ QUERIES = (
         f"SELECT g, repeat('x', 200) FROM generate_series({TABLE_ROWS + 1}, {ROWS}) g",
         ROWS,
         ALL_PROTOCOLS,
+        BOTH,
     ),
     # COPY TO STDOUT of one table resumes row by row too, as does one of a
     # UNION ALL.
-    (COPY_TABLE, TABLE_ROWS, ("simple",)),
+    (COPY_TABLE, TABLE_ROWS, ("simple",), BOTH),
     (
         "COPY (SELECT id, payload FROM result_stream_rows UNION ALL "
         f"SELECT g, repeat('x', 200) FROM generate_series({TABLE_ROWS + 1}, {ROWS}) g) "
         "TO STDOUT",
         ROWS,
         ("simple",),
+        BOTH,
     ),
 )
 OTHER_QUERIES = 100
@@ -227,8 +246,10 @@ def other_session_progress(host, port, user, database):
         for value in range(OTHER_QUERIES):
             connection.execute("INSERT INTO result_stream_progress VALUES (%s)", (value,))
             assert connection.execute("SELECT 1").fetchone() == (1,)
-        (count,) = connection.execute("SELECT count(*) FROM result_stream_progress").fetchone()
-        assert count == OTHER_QUERIES
+        # A plain read: an aggregate would open a result stream of its own in
+        # object-store mode and count in the stalled result's metrics.
+        rows = connection.execute("SELECT v FROM result_stream_progress").fetchall()
+        assert len(rows) == OTHER_QUERIES
         connection.execute("DROP TABLE result_stream_progress")
     return time.monotonic() - started
 
@@ -299,14 +320,31 @@ def protocols_for(protocols, mode):
             yield protocol
 
 
-def probe(host, port, user, database, mode):
+def stream_counters(operations):
+    """pos3ql's (streamed, spooled) result counters, or None without --operations."""
+    if operations is None:
+        return None
+    with urllib.request.urlopen(f"http://{operations}/metrics", timeout=5) as response:
+        text = response.read().decode()
+    streamed = spooled = 0
+    for line in text.splitlines():
+        name, _, value = line.rpartition(" ")
+        if name == "pos3ql_result_streams_total":
+            streamed += int(value)
+        elif name.startswith("pos3ql_result_stream_spooled_total{"):
+            spooled += int(value)
+    return streamed, spooled
+
+
+def probe(host, port, user, database, mode, operations=None):
     create_table(host, port, user, database)
     results = {"interleaved": interleaved_portals(host, port, user, database)}
-    for query, rows, protocol in [
-        (query, rows, protocol)
-        for query, rows, protocols in QUERIES
+    for query, rows, protocol, streams_in in [
+        (query, rows, protocol, streams_in)
+        for query, rows, protocols, streams_in in QUERIES
         for protocol in protocols_for(protocols, mode)
     ]:
+        before = stream_counters(operations)
         sock = stalled_client(host, port, user, database)
         if protocol == "simple":
             request = message(b"Q", query.encode() + b"\0") + message(b"Q", b"SELECT 1\0")
@@ -332,6 +370,14 @@ def probe(host, port, user, database, mode):
         sock.close()
         results[(query, protocol)] = transcript
         print(f"{protocol} {query!r}: {transcript} (other session {elapsed:.2f}s)", flush=True)
+        after = stream_counters(operations)
+        if after is not None:
+            streamed = after[0] - before[0]
+            spooled = after[1] - before[1]
+            if mode in streams_in:
+                assert (streamed, spooled) == (1, 0), (protocol, query, streamed, spooled)
+            else:
+                assert (streamed, spooled) == (0, 1), (protocol, query, streamed, spooled)
         if query.startswith("COPY "):
             expected = [
                 ("H", None),
@@ -384,8 +430,14 @@ def main():
         required=True,
         help="pos3ql's storage mode, which decides whether its sorts stream",
     )
+    parser.add_argument(
+        "--operations",
+        help="pos3ql's operations endpoint (host:port), to check each result streamed",
+    )
     args = parser.parse_args()
-    actual = probe(args.host, args.p3, args.user, args.database, args.storage_mode)
+    actual = probe(
+        args.host, args.p3, args.user, args.database, args.storage_mode, args.operations
+    )
     if args.pg is not None:
         with psycopg.connect(
             host=args.host, port=args.pg, user=args.user, dbname="postgres", connect_timeout=5

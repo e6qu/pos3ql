@@ -1169,7 +1169,10 @@ pub(crate) fn dispatch<'a>(
                             "array assignment subscripts lack a bound"
                         )
                     })?;
-                    assignment_subscript(eval_full(expression, arena, params, row, hooks)?)
+                    positioned_subscript(
+                        expression,
+                        assignment_subscript(eval_full(expression, arena, params, row, hooks)?),
+                    )
                 };
                 for (slot, kind) in subscripts.iter_mut().zip(kinds.bytes()) {
                     use crate::sql::array_assignment::AssignmentSubscript::{Element, Slice};
@@ -1212,11 +1215,33 @@ pub(crate) fn dispatch<'a>(
                 if args.len() < 3 || star {
                     return Err(arity_err("jsonb subscripting assignment", args.len()));
                 }
+                // Only arrays, jsonb and the subscripted geometric types take
+                // an element assignment; PostgreSQL rejects any other declared
+                // type while analysing it.
+                let declared = crate::sql::types::ColType::from_oid(
+                    crate::sql::eval::expression_type_identity(args[0], row, hooks)?
+                        .routine_argument_oid(),
+                );
+                if let Some(declared) = declared
+                    && !matches!(
+                        declared,
+                        crate::sql::types::ColType::Array(_)
+                            | crate::sql::types::ColType::Jsonb
+                            | crate::sql::types::ColType::Geometry(_)
+                    )
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "cannot subscript type {} because it does not support subscripting",
+                        declared.name()
+                    ));
+                }
                 let base = eval_full(args[0], arena, params, row, hooks)?;
                 let array_target = match base {
                     Datum::Array { .. } => true,
                     Datum::Null => {
                         matches!(*args[0], Expr::Null)
+                            || matches!(declared, Some(crate::sql::types::ColType::Array(_)))
                             || matches!(
                                 crate::sql::eval::static_type_pub(args[0], row),
                                 Some(crate::sql::types::ColType::Array(_))
@@ -1236,9 +1261,12 @@ pub(crate) fn dispatch<'a>(
                     }
                     for (slot, expression) in subscripts.iter_mut().zip(&args[2..]) {
                         *slot = crate::sql::array_assignment::AssignmentSubscript::Element(
-                            assignment_subscript(eval_full(
-                                expression, arena, params, row, hooks,
-                            )?)?,
+                            positioned_subscript(
+                                expression,
+                                assignment_subscript(eval_full(
+                                    expression, arena, params, row, hooks,
+                                )?),
+                            )?,
                         );
                     }
                     let value = enum_element_input(
@@ -1254,6 +1282,7 @@ pub(crate) fn dispatch<'a>(
                         arena,
                     );
                 }
+                let base = eval_full(args[0], arena, params, row, hooks)?;
                 if let Datum::Geometry { kind, text } = base {
                     if args.len() != 3 {
                         return Err(arity_err("geometric subscripting assignment", args.len()));
@@ -2294,6 +2323,20 @@ pub(crate) fn dispatch<'a>(
 }
 
 /// An array subscript of an assignment target: an integer, never NULL.
+/// A constant subscript fails its integer conversion where it is written,
+/// as PostgreSQL coerces subscripts while analysing the assignment.
+fn positioned_subscript(
+    expression: &Expr<'_>,
+    result: Result<i32, SqlError>,
+) -> Result<i32, SqlError> {
+    result.map_err(|error| match expression {
+        Expr::Str(_) if error.sqlstate.as_str().starts_with("22") => {
+            crate::sql::error_position::at_expression(error, expression)
+        }
+        _ => error,
+    })
+}
+
 fn assignment_subscript(value: Datum<'_>) -> Result<i32, SqlError> {
     let value = match value {
         Datum::Int2(value) => i64::from(value),

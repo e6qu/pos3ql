@@ -86027,7 +86027,13 @@ fn reject_target_references_of(
     let Some(from) = from else {
         return Ok(());
     };
-    let def = storage.table_def(resolve_dml_table(storage, target, txid)?, txid);
+    // A view target (written through rules or INSTEAD OF triggers) has no
+    // table definition here; its qualified references are still checked,
+    // and unqualified argument columns resolve where the view is expanded.
+    let Ok(table) = resolve_dml_table(storage, target, txid) else {
+        return reject_target_references(storage, txid, from, exposed, &[], merge);
+    };
+    let def = storage.table_def(table, txid);
     let mut names = [""; MAX_COLUMNS];
     for (name, column) in names.iter_mut().zip(def.columns()) {
         *name = column.name.as_str();

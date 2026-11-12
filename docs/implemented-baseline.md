@@ -44,6 +44,17 @@ earlier status after another transaction changes it. In locking mode, a
 conflicting writer waits for the reader's relation lock, while work on
 unrelated tables continues.
 
+**Referential actions.** `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and
+`SET DEFAULT` run when the statement that deleted or re-keyed the referenced
+rows ends, in the order of that row's `AFTER` events, as in PostgreSQL. So
+`UPDATE tree SET k = k + 10` on a self-referencing `ON UPDATE CASCADE` table
+first renumbers every row and then repoints each child, and an `AFTER DELETE`
+trigger on `orders` already sees the cascaded `lines` gone. These actions are
+never deferred, even for a `DEFERRABLE` key. A `SET DEFAULT` whose default is
+the deleted key fails like `NO ACTION` (`23503`, `Key (...) is still
+referenced`). The rewritten rows do not yet fire the referencing table's
+triggers or rules ([plan](../PLAN.md#pause-and-resume-every-query-path)).
+
 **Foreign keys between different types.** A referencing column may have a
 different type than the key it references whenever PostgreSQL 18 accepts the
 pair: an `integer` `customer_id` can reference a `bigint` primary key, a

@@ -677,12 +677,9 @@ fn run_selected_firing<'run>(
             trigger_slot: None,
             ..
         }) => {
-            constraints::fire_foreign_key_event(
-                context.host.storage(),
-                context.txn,
-                index,
-                context.arena,
-            )?;
+            let arena = context.arena;
+            let (storage, txn, _, seq_session) = context.dml_parts_with_sequence();
+            constraints::fire_queued_foreign_key_event(storage, txn, index, arena, seq_session)?;
             return Ok(None);
         }
         AfterFiring::Row(selected) => {

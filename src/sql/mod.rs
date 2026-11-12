@@ -17226,7 +17226,7 @@ impl Engine {
                     )
                 };
                 let outcome = Self::fire_with_foreign_key_events(
-                    &self.storage,
+                    (&mut self.storage, guc.seq_session()),
                     txn,
                     statement_events,
                     dml_mats,
@@ -17244,7 +17244,7 @@ impl Engine {
     /// A failing check replaces the main statement's unsent command tag, as
     /// PostgreSQL fires them before completing the statement.
     fn fire_with_foreign_key_events<T>(
-        storage: &Storage,
+        (storage, seq_session): (&mut Storage, &guc::SeqSession),
         txn: &mut TxnState,
         (depth, command): (u16, u32),
         materialized: &[(&str, &ast::MaterializedCte<'_>)],
@@ -17255,7 +17255,12 @@ impl Engine {
         match outcome {
             Ok(Ok(())) if !materialized.is_empty() => {
                 let checked = exec::constraints::fire_statement_foreign_key_events(
-                    storage, txn, depth, command, arena,
+                    storage,
+                    txn,
+                    depth,
+                    command,
+                    arena,
+                    seq_session,
                 );
                 if checked.is_err() && responder.completion_tag().is_some() {
                     let _ = responder.take_command_completion_tag(arena, false);
@@ -18425,7 +18430,7 @@ impl Engine {
             ))),
         };
         let outcome = Self::fire_with_foreign_key_events(
-            &self.storage,
+            (&mut self.storage, guc.seq_session()),
             txn,
             statement_events,
             dml_mats,

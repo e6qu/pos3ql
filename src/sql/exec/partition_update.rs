@@ -15,7 +15,6 @@ pub(super) fn prepare_move<'arena>(
     generated: &[Option<&'arena Expr<'arena>>],
     values: &mut [Datum<'arena>],
     arena: &'arena Arena,
-    params: &[Datum<'arena>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Result<bool, SqlError> {
@@ -82,9 +81,6 @@ pub(super) fn prepare_move<'arena>(
                 old_values,
                 None,
                 arena,
-                params,
-                seq_session,
-                MAX_FK_CASCADE_DEPTH,
             )?;
         }
         fire_partition_row_triggers(

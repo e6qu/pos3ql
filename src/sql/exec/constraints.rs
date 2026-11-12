@@ -2839,8 +2839,8 @@ fn foreign_key_trigger_name(
 }
 
 /// When a queued foreign key check fires: `None` once its constraint is gone.
-/// A `RESTRICT` check is never deferred, as PostgreSQL creates its trigger
-/// not deferrable.
+/// A `RESTRICT` check and the rewriting actions are never deferred, as
+/// PostgreSQL creates their triggers not deferrable.
 pub(crate) fn foreign_key_event_mode(
     storage: &Storage,
     txn: &TxnState,
@@ -2851,7 +2851,7 @@ pub(crate) fn foreign_key_event_mode(
         return None;
     }
     let timing = constraint_timing(storage, txn.current_constraint_identity(identity), txn.txid)?;
-    if check == (crate::sql::txn::ForeignKeyCheck::Referenced { restrict: true }) {
+    if !check.deferrable() {
         return Some(crate::sql::ast::ConstraintMode::Immediate);
     }
     Some(txn.constraint_mode(identity, timing))
@@ -2862,11 +2862,12 @@ pub(crate) fn foreign_key_event_mode(
 /// when the main statement fired no events of its own (a `SELECT`, or a
 /// write rewritten into other statements).
 pub(crate) fn fire_statement_foreign_key_events(
-    storage: &Storage,
+    storage: &mut Storage,
     txn: &mut TxnState,
     depth: u16,
     command: u32,
     arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
 ) -> Result<(), SqlError> {
     txn.queue_all_pending_row_events()?;
     let mut cursor = txn.trigger_events_from(command);
@@ -2891,16 +2892,35 @@ pub(crate) fn fire_statement_foreign_key_events(
             None => txn.fire_trigger_event(index)?,
             Some(crate::sql::ast::ConstraintMode::Deferred) => {}
             Some(crate::sql::ast::ConstraintMode::Immediate) => {
-                fire_foreign_key_event(storage, txn, index, arena)?;
+                fire_queued_foreign_key_event(storage, txn, index, arena, seq_session)?;
             }
         }
     }
     Ok(())
 }
 
+/// Runs the queued foreign key event `index`: a referential action or a
+/// check (see [`fire_foreign_key_event`]).
+pub(crate) fn fire_queued_foreign_key_event(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    index: u64,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+) -> Result<(), SqlError> {
+    let (event, _, _) = txn.trigger_event(index)?;
+    match event.kind {
+        crate::sql::txn::DeferredTriggerKind::ForeignKey {
+            check: crate::sql::txn::ForeignKeyCheck::Action(_),
+            ..
+        } => fire_foreign_key_action(storage, txn, index, arena, seq_session),
+        _ => fire_foreign_key_event(storage, txn, index, arena),
+    }
+}
+
 /// Runs the queued foreign key check `index` and marks it fired. A check
 /// that waits for a row lock runs again under the snapshot it started with.
-pub(crate) fn fire_foreign_key_event(
+fn fire_foreign_key_event(
     storage: &Storage,
     txn: &mut TxnState,
     index: u64,
@@ -2943,6 +2963,10 @@ pub(crate) fn fire_foreign_key_event(
             arena,
         )
         .map(|_| ()),
+        crate::sql::txn::ForeignKeyCheck::Action(_) => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a referential action was run as a check"
+        )),
         crate::sql::txn::ForeignKeyCheck::Referenced { restrict } => {
             let old = event
                 .old
@@ -3742,39 +3766,23 @@ fn parent_has_key(
     }
 }
 
-/// Referential-action cascades can chase foreign keys through many tables
-/// (or a cycle); past this depth the statement fails loudly.
-pub(crate) const MAX_FK_CASCADE_DEPTH: u32 = 32;
-
 /// After a parent row is deleted (`new_parent` None) or its referenced key
-/// updated (Some), applies every referencing foreign key's action:
-/// NO ACTION / RESTRICT block (23503); CASCADE deletes or re-keys the
-/// referencing rows; SET NULL / SET DEFAULT rewrite the referencing columns
-/// (re-checking the child's own constraints). Rewritten or deleted child
-/// rows recursively apply their own referential actions. `old_parent` /
-/// `new_parent` must not borrow storage (the cascade mutates it) — decode
-/// them from arena-copied row bytes.
+/// updated (Some), queues every referencing foreign key's action among the
+/// row's AFTER events, as PostgreSQL's `RI_ConstraintTrigger_a_*` triggers:
+/// NO ACTION and RESTRICT check that the old key is no longer referenced;
+/// CASCADE, SET NULL and SET DEFAULT delete or rewrite the referencing rows
+/// (see [`fire_foreign_key_action`]). `old_parent` and `new_parent` are rows
+/// of the parent table `parent_schema.parent_name`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_fk_parent_actions(
-    storage: &mut Storage,
+    storage: &Storage,
     txn: &mut TxnState,
     parent_schema: &str,
     parent_name: &str,
     old_parent: &[Datum],
     new_parent: Option<&[Datum]>,
     arena: &Arena,
-    params: &[Datum],
-    seq_session: &crate::sql::guc::SeqSession,
-    depth: u32,
 ) -> Result<(), SqlError> {
-    let coercion_txid = txn.txid;
-    if depth == 0 {
-        return Err(sql_err!(
-            sqlstate::STATEMENT_TOO_COMPLEX,
-            "foreign key cascade nested more than {} levels deep",
-            MAX_FK_CASCADE_DEPTH
-        ));
-    }
     let parent_index = storage
         .find_visible(parent_schema, parent_name, txn.txid)
         .ok_or_else(|| {
@@ -3788,10 +3796,7 @@ pub(crate) fn apply_fk_parent_actions(
         if !storage.table(child_index).visible_to(txn.txid) {
             continue;
         }
-        let (child_target, cdef) = storage.select_table_definition(child_index, txn.txid);
-        let mut cschema = [ColType::Bool; MAX_COLUMNS];
-        cdef.schema(&mut cschema);
-        let cschema = &cschema[..cdef.n_columns];
+        let (_, cdef) = storage.select_table_definition(child_index, txn.txid);
         for fk_index in 0..cdef.n_fkeys {
             let fk = cdef.fkeys[fk_index];
             if !fk.validation.enforced() {
@@ -3841,201 +3846,334 @@ pub(crate) fn apply_fk_parent_actions(
                 fk.on_update
             };
             use crate::storage::FkAction as StorageFkAction;
-            if matches!(
-                action,
-                StorageFkAction::NoAction | StorageFkAction::Restrict
-            ) {
-                // The check runs among the parent row's AFTER triggers at the
-                // end of the statement (NO ACTION also at commit when
-                // deferred), on the old key alone.
-                let encoded = encode_referenced_key(
+            let (trigger, event) = if new_parent.is_none() {
+                (
+                    crate::storage::ForeignKeyTrigger::ActionDelete,
+                    crate::sql::ast::TriggerEvents::DELETE,
+                )
+            } else {
+                (
+                    crate::storage::ForeignKeyTrigger::ActionUpdate,
+                    crate::sql::ast::TriggerEvents::UPDATE,
+                )
+            };
+            let check = match action {
+                StorageFkAction::NoAction => {
+                    crate::sql::txn::ForeignKeyCheck::Referenced { restrict: false }
+                }
+                StorageFkAction::Restrict => {
+                    crate::sql::txn::ForeignKeyCheck::Referenced { restrict: true }
+                }
+                StorageFkAction::Cascade => crate::sql::txn::ForeignKeyCheck::Action(
+                    crate::sql::txn::ReferentialAction::Cascade,
+                ),
+                StorageFkAction::SetNull => crate::sql::txn::ForeignKeyCheck::Action(
+                    crate::sql::txn::ReferentialAction::SetNull,
+                ),
+                StorageFkAction::SetDefault => crate::sql::txn::ForeignKeyCheck::Action(
+                    crate::sql::txn::ReferentialAction::SetDefault,
+                ),
+            };
+            // A check keeps the old key alone; a cascaded update also the new
+            // key (see [`decode_action_keys`]).
+            let encoded = match check {
+                crate::sql::txn::ForeignKeyCheck::Action(_) => encode_action_keys(
+                    old_parent,
+                    new_parent,
+                    parent_columns,
+                    physical_parent.n_columns,
+                    arena,
+                )?,
+                _ => encode_referenced_key(
                     old_parent,
                     parent_columns,
                     physical_parent.n_columns,
                     arena,
-                )?;
-                let (trigger, event) = if new_parent.is_none() {
-                    (
-                        crate::storage::ForeignKeyTrigger::ActionDelete,
-                        crate::sql::ast::TriggerEvents::DELETE,
-                    )
-                } else {
-                    (
-                        crate::storage::ForeignKeyTrigger::ActionUpdate,
-                        crate::sql::ast::TriggerEvents::UPDATE,
-                    )
-                };
-                let identity = txn.constraint_identity(child_index as u32, fk.name);
-                txn.pend_foreign_key_event(
-                    parent_index as u16,
-                    foreign_key_trigger_name(&fk, trigger)?,
-                    identity,
-                    crate::sql::txn::ForeignKeyCheck::Referenced {
-                        restrict: action == StorageFkAction::Restrict,
-                    },
-                    parent_index as u16,
-                    event,
-                    0,
-                    Some(encoded),
-                )?;
-                continue;
-            }
+                )?,
+            };
+            let identity = txn.constraint_identity(child_index as u32, fk.name);
+            txn.pend_foreign_key_event(
+                parent_index as u16,
+                foreign_key_trigger_name(&fk, trigger)?,
+                identity,
+                check,
+                parent_index as u16,
+                event,
+                0,
+                Some(encoded),
+            )?;
+        }
+    }
+    Ok(())
+}
 
-            // Collect the referencing rows first: the rewrites below mutate
-            // the row map, so the scan must complete before them.
-            let transaction = txn.txid;
-            let refers = |child_row: &[Datum]| -> Result<bool, SqlError> {
-                referencing_key_matches(
-                    storage,
-                    transaction,
-                    &cdef,
-                    &fk,
-                    &physical_parent,
-                    parent_columns,
-                    old_parent,
-                    child_row,
-                    arena,
-                )
+/// Runs the queued referential action `index` (CASCADE, SET NULL or SET
+/// DEFAULT) at the end of the statement that deleted or re-keyed the parent
+/// row, as PostgreSQL's action trigger does: deletes or rewrites the rows
+/// still referencing the old key and queues the actions their own changes
+/// require. The referencing table's triggers and rules do not run.
+pub(crate) fn fire_foreign_key_action(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    index: u64,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+) -> Result<(), SqlError> {
+    use crate::storage::FkAction as StorageFkAction;
+    let (event, _, fired) = txn.trigger_event(index)?;
+    if fired {
+        return Ok(());
+    }
+    let crate::sql::txn::DeferredTriggerKind::ForeignKey {
+        identity,
+        check: crate::sql::txn::ForeignKeyCheck::Action(referential),
+        effective_table,
+        ..
+    } = event.kind
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "queued event is not a referential action"
+        ));
+    };
+    if !txn.constraint_identity_is_current(identity) {
+        return txn.fire_trigger_event(index);
+    }
+    let current = txn.current_constraint_identity(identity);
+    let crate::sql::txn::ConstraintIdentity::Table { table, name, .. } = current else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a referential action names a constraint trigger"
+        ));
+    };
+    let child_index = table as usize;
+    let parent_index = usize::from(effective_table);
+    if child_index >= storage.table_count()
+        || !storage.table(child_index).visible_to(txn.txid)
+        || parent_index >= storage.table_count()
+        || !storage.table(parent_index).visible_to(txn.txid)
+    {
+        return txn.fire_trigger_event(index);
+    }
+    let (child_target, cdef) = storage.select_table_definition(child_index, txn.txid);
+    let Some(fk) = cdef.fkeys().iter().find(|fk| fk.name == name).copied() else {
+        return txn.fire_trigger_event(index);
+    };
+    if !fk.validation.enforced() {
+        return txn.fire_trigger_event(index);
+    }
+    let mut cschema = [ColType::Bool; MAX_COLUMNS];
+    cdef.schema(&mut cschema);
+    let cschema = &cschema[..cdef.n_columns];
+    let physical_parent = storage.table_def(parent_index, txn.txid).clone();
+    let declared_parent = storage
+        .find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txn.txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "foreign key parent is not visible"
+            )
+        })?;
+    let declared_parent = storage.table_def(declared_parent, txn.txid).clone();
+    let mapped = super::remap_columns(&physical_parent, &declared_parent, fk.parent_cols())?;
+    let parent_columns = &mapped[..fk.parent_cols().len()];
+    let keys = event
+        .old
+        .map(|tuple| txn.trigger_event_tuple(tuple, arena))
+        .transpose()?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a referential action lost its old key"
+            )
+        })?;
+    let (old_bytes, old_parent, new_parent) = decode_action_keys(keys, &physical_parent, arena)?;
+    let action = match referential {
+        crate::sql::txn::ReferentialAction::Cascade => StorageFkAction::Cascade,
+        crate::sql::txn::ReferentialAction::SetNull => StorageFkAction::SetNull,
+        crate::sql::txn::ReferentialAction::SetDefault => StorageFkAction::SetDefault,
+    };
+    let params: &[Datum] = &[];
+    let coercion_txid = txn.txid;
+    // Collect the referencing rows first: the rewrites below mutate
+    // the row map, so the scan must complete before them.
+    let transaction = txn.txid;
+    let refers = |child_row: &[Datum]| -> Result<bool, SqlError> {
+        referencing_key_matches(
+            storage,
+            transaction,
+            &cdef,
+            &fk,
+            &physical_parent,
+            parent_columns,
+            old_parent,
+            child_row,
+            arena,
+        )
+    };
+    let rewrite_strength = if new_parent.is_none() && action == StorageFkAction::Cascade {
+        crate::sql::ast::LockStrength::Update
+    } else {
+        let mut changed = crate::storage::ColumnSet::EMPTY;
+        for &column in fk.columns() {
+            changed.insert(column as usize);
+        }
+        super::update_lock_strength(storage, &cdef, changed, txn.txid)
+    };
+    // As PostgreSQL's referential queries, the scan reads the latest
+    // committed rows and locks each one it rewrites; a row that
+    // changed before its lock was granted sends the scan back.
+    let matches = loop {
+        let latest = storage.validation_read();
+        let mut matches = crate::mem::arena::ArenaList::new(arena);
+        latest.for_each_row_state(storage, child_index, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            let Some(home) =
+                latest.visible_row_home(storage, child_index, rowid, state, txn.txid)?
+            else {
+                return Ok(ControlFlow::Continue(()));
             };
-            let rewrite_strength = if new_parent.is_none() && action == StorageFkAction::Cascade {
-                crate::sql::ast::LockStrength::Update
-            } else {
-                let mut changed = crate::storage::ColumnSet::EMPTY;
-                for &column in fk.columns() {
-                    changed.insert(column as usize);
-                }
-                super::update_lock_strength(storage, &cdef, changed, txn.txid)
-            };
-            // As PostgreSQL's referential queries, the scan reads the latest
-            // committed rows and locks each one it rewrites; a row that
-            // changed before its lock was granted sends the scan back.
-            let matches = loop {
-                let latest = storage.validation_read();
-                let mut matches = crate::mem::arena::ArenaList::new(arena);
-                latest.for_each_row_state(storage, child_index, &mut |rowid, state| {
-                    use core::ops::ControlFlow;
-                    let Some(home) =
-                        latest.visible_row_home(storage, child_index, rowid, state, txn.txid)?
-                    else {
-                        return Ok(ControlFlow::Continue(()));
-                    };
-                    let seen = home.snapshot();
-                    storage.with_row_bytes(child_index, rowid, home, |bytes| {
-                        let mut crow = [Datum::Null; MAX_COLUMNS];
-                        rowenc::decode(bytes, cschema, &mut crow)?;
-                        if !refers(&crow[..cdef.n_columns])? {
-                            return Ok(ControlFlow::Continue(()));
-                        }
-                        let copy = &*arena.alloc_slice_copy(bytes).map_err(|_| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "foreign key cascade exceeds the statement arena"
-                            )
-                        })?;
-                        matches.push((rowid, seen, copy)).map_err(|_| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "foreign key cascade row records exceed the statement arena"
-                            )
-                        })?;
-                        Ok(ControlFlow::Continue(()))
-                    })
-                })?;
-                let mut changed = false;
-                for &(rowid, seen, _) in matches.as_slice() {
-                    match super::row_conflicts::lock_selected_row(
-                        storage,
-                        txn.txid,
-                        child_index,
-                        rowid,
-                        seen,
-                        rewrite_strength,
-                        crate::sql::ast::LockWait::Wait,
-                    )? {
-                        Some(super::row_conflicts::LockedVersion::Selected) => {}
-                        Some(_) => changed = true,
-                        None => {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "a foreign key action skipped a locked row"
-                            ));
-                        }
-                    }
-                }
-                if changed {
-                    continue;
-                }
-                // Repeatable read and serializable rewrite only rows their
-                // snapshot sees in the same version (PostgreSQL's crosscheck
-                // snapshot).
-                if super::row_conflicts::uses_transaction_snapshot(txn.isolation) {
-                    for &(rowid, seen, _) in matches.as_slice() {
-                        let snapshot_version = match storage.row_state(child_index, rowid)? {
-                            Some(state) => storage
-                                .visible_row_home_at(
-                                    child_index,
-                                    rowid,
-                                    state,
-                                    txn.txid,
-                                    crate::storage::SNAPSHOT_ALL,
-                                    storage.commit_snapshot(),
-                                )?
-                                .map(|home| home.snapshot().row_version()),
-                            None => None,
-                        };
-                        if snapshot_version != Some(seen.row_version()) {
-                            return Err(super::row_conflicts::concurrent_change(false));
-                        }
-                    }
-                }
-                break matches;
-            };
-            if matches.as_slice().is_empty() {
-                continue;
-            }
-
-            let child_schema = cdef.schema.as_str();
-            let child_name = cdef.name.as_str();
-            let defaults = parse_defaults(&cdef, arena, storage, txn.txid)?;
-            for &(rowid, _, old_bytes) in matches.as_slice() {
+            let seen = home.snapshot();
+            storage.with_row_bytes(child_index, rowid, home, |bytes| {
                 let mut crow = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(old_bytes, cschema, &mut crow)?;
-                let crow = &crow[..cdef.n_columns];
-                if new_parent.is_none() && action == StorageFkAction::Cascade {
-                    // Cascade the delete: grandchildren first, then this row.
-                    apply_fk_parent_actions(
-                        storage,
-                        txn,
-                        child_schema,
-                        child_name,
-                        crow,
-                        None,
-                        arena,
-                        params,
-                        seq_session,
-                        depth - 1,
-                    )?;
-                    txn.write_row(
-                        storage,
-                        child_target,
-                        rowid,
-                        txn.command_id(),
-                        None,
-                        crate::storage::RowWriteStatistics::Tracked,
-                    )?;
-
-                    continue;
+                rowenc::decode(bytes, cschema, &mut crow)?;
+                if !refers(&crow[..cdef.n_columns])? {
+                    return Ok(ControlFlow::Continue(()));
                 }
-                // The rewriting actions produce a new child row image.
-                let mut new_child = [Datum::Null; MAX_COLUMNS];
-                new_child[..cdef.n_columns].copy_from_slice(crow);
-                for (&cc, &pc) in fk.columns().iter().zip(parent_columns) {
-                    new_child[cc as usize] = match action {
-                        // PostgreSQL assigns the new referenced value to
-                        // the referencing column, with its assignment cast,
-                        // type modifier and domain checks.
-                        StorageFkAction::Cascade => super::coerce(
-                            new_parent.expect("delete-cascade handled above")[pc as usize],
+                let copy = &*arena.alloc_slice_copy(bytes).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "foreign key cascade exceeds the statement arena"
+                    )
+                })?;
+                matches.push((rowid, seen, copy)).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "foreign key cascade row records exceed the statement arena"
+                    )
+                })?;
+                Ok(ControlFlow::Continue(()))
+            })
+        })?;
+        let mut changed = false;
+        for &(rowid, seen, _) in matches.as_slice() {
+            match super::row_conflicts::lock_selected_row(
+                storage,
+                txn.txid,
+                child_index,
+                rowid,
+                seen,
+                rewrite_strength,
+                crate::sql::ast::LockWait::Wait,
+            )? {
+                Some(super::row_conflicts::LockedVersion::Selected) => {}
+                Some(_) => changed = true,
+                None => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a foreign key action skipped a locked row"
+                    ));
+                }
+            }
+        }
+        if changed {
+            continue;
+        }
+        // Repeatable read and serializable rewrite only rows their
+        // snapshot sees in the same version (PostgreSQL's crosscheck
+        // snapshot).
+        if super::row_conflicts::uses_transaction_snapshot(txn.isolation) {
+            for &(rowid, seen, _) in matches.as_slice() {
+                let snapshot_version = match storage.row_state(child_index, rowid)? {
+                    Some(state) => storage
+                        .visible_row_home_at(
+                            child_index,
+                            rowid,
+                            state,
+                            txn.txid,
+                            crate::storage::SNAPSHOT_ALL,
+                            storage.commit_snapshot(),
+                        )?
+                        .map(|home| home.snapshot().row_version()),
+                    None => None,
+                };
+                if snapshot_version != Some(seen.row_version()) {
+                    return Err(super::row_conflicts::concurrent_change(false));
+                }
+            }
+        }
+        break matches;
+    };
+
+    let child_schema = cdef.schema.as_str();
+    let child_name = cdef.name.as_str();
+    let defaults = parse_defaults(&cdef, arena, storage, txn.txid)?;
+    for &(rowid, _, old_bytes) in matches.as_slice() {
+        let mut crow = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(old_bytes, cschema, &mut crow)?;
+        let crow = &crow[..cdef.n_columns];
+        if new_parent.is_none() && action == StorageFkAction::Cascade {
+            // Cascade the delete, queuing the deleted row's own actions.
+            apply_fk_parent_actions(storage, txn, child_schema, child_name, crow, None, arena)?;
+            txn.write_row(
+                storage,
+                child_target,
+                rowid,
+                txn.command_id(),
+                None,
+                crate::storage::RowWriteStatistics::Tracked,
+            )?;
+
+            continue;
+        }
+        // The rewriting actions produce a new child row image.
+        let mut new_child = [Datum::Null; MAX_COLUMNS];
+        new_child[..cdef.n_columns].copy_from_slice(crow);
+        for (&cc, &pc) in fk.columns().iter().zip(parent_columns) {
+            new_child[cc as usize] = match action {
+                // PostgreSQL assigns the new referenced value to
+                // the referencing column, with its assignment cast,
+                // type modifier and domain checks.
+                StorageFkAction::Cascade => super::coerce(
+                    new_parent.expect("delete-cascade handled above")[pc as usize],
+                    &cdef.columns()[cc as usize],
+                    storage,
+                    txn.txid,
+                    arena,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        coercion_txid,
+                    )),
+                )?,
+                StorageFkAction::SetNull => Datum::Null,
+                StorageFkAction::SetDefault => match &cdef.columns()[cc as usize].default {
+                    crate::storage::ColumnDefault::None => Datum::Null,
+                    crate::storage::ColumnDefault::Constant { value, .. } => value.as_datum(),
+                    crate::storage::ColumnDefault::Expression(_) => {
+                        let expression = defaults[cc as usize].ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "stored column default did not parse"
+                            )
+                        })?;
+                        let sequence =
+                            crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                        let catalog = crate::sql::query::storage_catalog(storage, arena, txn.txid);
+                        let hooks = crate::sql::eval::EvalHooks {
+                            catalog: Some(&catalog),
+                            sequences: Some(&sequence),
+                            ..crate::sql::eval::NO_HOOKS
+                        };
+                        let value = crate::sql::eval::eval_full(
+                            expression,
+                            arena,
+                            params,
+                            &crate::sql::eval::NoColumns,
+                            &hooks,
+                        )?;
+                        super::coerce(
+                            value,
                             &cdef.columns()[cc as usize],
                             storage,
                             txn.txid,
@@ -4045,119 +4183,158 @@ pub(crate) fn apply_fk_parent_actions(
                                 seq_session,
                                 coercion_txid,
                             )),
-                        )?,
-                        StorageFkAction::SetNull => Datum::Null,
-                        StorageFkAction::SetDefault => match &cdef.columns()[cc as usize].default {
-                            crate::storage::ColumnDefault::None => Datum::Null,
-                            crate::storage::ColumnDefault::Constant { value, .. } => {
-                                value.as_datum()
-                            }
-                            crate::storage::ColumnDefault::Expression(_) => {
-                                let expression = defaults[cc as usize].ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::INTERNAL_ERROR,
-                                        "stored column default did not parse"
-                                    )
-                                })?;
-                                let sequence = crate::sql::sequence::SeqEval::new(
-                                    storage,
-                                    seq_session,
-                                    txn.txid,
-                                );
-                                let catalog =
-                                    crate::sql::query::storage_catalog(storage, arena, txn.txid);
-                                let hooks = crate::sql::eval::EvalHooks {
-                                    catalog: Some(&catalog),
-                                    sequences: Some(&sequence),
-                                    ..crate::sql::eval::NO_HOOKS
-                                };
-                                let value = crate::sql::eval::eval_full(
-                                    expression,
-                                    arena,
-                                    params,
-                                    &crate::sql::eval::NoColumns,
-                                    &hooks,
-                                )?;
-                                super::coerce(
-                                    value,
-                                    &cdef.columns()[cc as usize],
-                                    storage,
-                                    txn.txid,
-                                    arena,
-                                    Some(&crate::sql::sequence::SeqEval::new(
-                                        storage,
-                                        seq_session,
-                                        coercion_txid,
-                                    )),
-                                )?
-                            }
-                            crate::storage::ColumnDefault::Generated(_) => {
-                                return Err(sql_err!(
-                                    sqlstate::INTERNAL_ERROR,
-                                    "generated column cannot be a foreign-key SET DEFAULT target"
-                                ));
-                            }
-                        },
-                        StorageFkAction::NoAction | StorageFkAction::Restrict => {
-                            unreachable!("blocking actions handled above")
-                        }
-                    };
+                        )?
+                    }
+                    crate::storage::ColumnDefault::Generated(_) => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "generated column cannot be a foreign-key SET DEFAULT target"
+                        ));
+                    }
+                },
+                StorageFkAction::NoAction | StorageFkAction::Restrict => {
+                    unreachable!("blocking actions handled above")
                 }
-                let new_child = &new_child[..cdef.n_columns];
-                check_not_null(&cdef, new_child)?;
-                let checks = parse_checks(&cdef, arena)?;
-                enforce_row_constraints(
-                    storage,
-                    child_index,
-                    &cdef,
-                    cschema,
-                    new_child,
-                    ConstraintRow::update(rowid),
-                    txn.txid,
-                    Some(txn),
-                    &checks,
-                    arena,
-                    params,
-                    Some(&crate::sql::sequence::SeqEval::new(
-                        storage,
-                        seq_session,
-                        coercion_txid,
-                    )),
-                )?;
-                // The child's own referenced keys may have changed — recurse.
-                apply_fk_parent_actions(
-                    storage,
-                    txn,
-                    child_schema,
-                    child_name,
-                    crow,
-                    Some(new_child),
-                    arena,
-                    params,
-                    seq_session,
-                    depth - 1,
-                )?;
-                let len = rowenc::encoded_len(new_child);
-                let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "foreign key cascade exceeds the statement arena"
-                    )
-                })?;
-                rowenc::encode(new_child, out);
-                let new_image = storage.heap.append_image(out)?;
-                txn.write_row(
-                    storage,
-                    child_target,
-                    rowid,
-                    txn.command_id(),
-                    Some(new_image),
-                    crate::storage::RowWriteStatistics::Tracked,
-                )?;
-            }
+            };
+        }
+        let new_child = &new_child[..cdef.n_columns];
+        check_not_null(&cdef, new_child)?;
+        let checks = parse_checks(&cdef, arena)?;
+        enforce_row_constraints(
+            storage,
+            child_index,
+            &cdef,
+            cschema,
+            new_child,
+            ConstraintRow::update(rowid),
+            txn.txid,
+            Some(txn),
+            &checks,
+            arena,
+            params,
+            Some(&crate::sql::sequence::SeqEval::new(
+                storage,
+                seq_session,
+                coercion_txid,
+            )),
+        )?;
+        // The child's own referenced keys may have changed.
+        apply_fk_parent_actions(
+            storage,
+            txn,
+            child_schema,
+            child_name,
+            crow,
+            Some(new_child),
+            arena,
+        )?;
+        let len = rowenc::encoded_len(new_child);
+        let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "foreign key cascade exceeds the statement arena"
+            )
+        })?;
+        rowenc::encode(new_child, out);
+        let new_image = storage.heap.append_image(out)?;
+        txn.write_row(
+            storage,
+            child_target,
+            rowid,
+            txn.command_id(),
+            Some(new_image),
+            crate::storage::RowWriteStatistics::Tracked,
+        )?;
+    }
+    // A SET DEFAULT that left a row referencing the deleted key (the default
+    // was that key) fails as NO ACTION would (`ri_set`).
+    if action == StorageFkAction::SetDefault {
+        check_referenced_key(
+            storage,
+            txn,
+            current,
+            false,
+            parent_index,
+            old_bytes,
+            storage.validation_read(),
+            arena,
+        )?;
+    }
+    txn.fire_trigger_event(index)
+}
+
+/// A queued action's keys: the old parent row with only its referenced key,
+/// and for an update the new one, each encoded at the parent's width after
+/// the old row's length.
+#[inline(never)]
+fn encode_action_keys<'a>(
+    old_parent: &[Datum],
+    new_parent: Option<&[Datum]>,
+    parent_columns: &[u16],
+    n_columns: usize,
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
+    let mut old = [Datum::Null; MAX_COLUMNS];
+    let mut new = [Datum::Null; MAX_COLUMNS];
+    for &column in parent_columns {
+        old[usize::from(column)] = old_parent[usize::from(column)];
+        if let Some(new_parent) = new_parent {
+            new[usize::from(column)] = new_parent[usize::from(column)];
         }
     }
-    Ok(())
+    let (old, new) = (&old[..n_columns], &new[..n_columns]);
+    let old_length = rowenc::encoded_len(old);
+    let new_length = if new_parent.is_some() {
+        rowenc::encoded_len(new)
+    } else {
+        0
+    };
+    let length = u32::try_from(old_length).map_err(|_| crate::sql::eval::arena_full())?;
+    let encoded = arena
+        .alloc_slice_with(4 + old_length + new_length, |_| 0u8)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    encoded[..4].copy_from_slice(&length.to_le_bytes());
+    rowenc::encode(old, &mut encoded[4..4 + old_length]);
+    if new_parent.is_some() {
+        rowenc::encode(new, &mut encoded[4 + old_length..]);
+    }
+    Ok(encoded)
+}
+
+/// The encoded old key row, the old key and the new key of
+/// [`encode_action_keys`], decoded at the parent's width.
+#[allow(clippy::type_complexity)]
+fn decode_action_keys<'a>(
+    keys: &'a [u8],
+    parent: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    arena: &'a Arena,
+) -> Result<(&'a [u8], &'a [Datum<'a>], Option<&'a [Datum<'a>]>), SqlError> {
+    let corrupt = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a referential action's keys are malformed"
+        )
+    };
+    let (length, rest) = keys.split_first_chunk::<4>().ok_or_else(corrupt)?;
+    let length = usize::try_from(u32::from_le_bytes(*length)).map_err(|_| corrupt())?;
+    let (old, new) = rest.split_at_checked(length).ok_or_else(corrupt)?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    parent.schema(&mut schema);
+    let schema = &schema[..parent.n_columns];
+    let decode = |bytes: &'a [u8]| -> Result<&'a [Datum<'a>], SqlError> {
+        let values = arena
+            .alloc_slice_with(parent.n_columns, |_| Datum::Null)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        rowenc::decode(bytes, schema, values)?;
+        Ok(values)
+    };
+    let old_values = decode(old)?;
+    let new_values = if new.is_empty() {
+        None
+    } else {
+        Some(decode(new)?)
+    };
+    Ok((old, old_values, new_values))
 }
 
 /// The old parent row with only its referenced key, as a queued check keeps

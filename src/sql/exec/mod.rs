@@ -1179,9 +1179,9 @@ pub(crate) mod constraints;
 mod foreign_key_equality;
 pub use constraints::check_unique_indexes;
 use constraints::{
-    ConstraintRow, MAX_FK_CASCADE_DEPTH, ParsedChecks, apply_fk_parent_actions,
-    check_index_tuple_sizes, enforce_row_constraints, parse_checks, parse_generated,
-    referenced_key_changed, table_is_referenced,
+    ConstraintRow, ParsedChecks, apply_fk_parent_actions, check_index_tuple_sizes,
+    enforce_row_constraints, parse_checks, parse_generated, referenced_key_changed,
+    table_is_referenced,
 };
 pub(crate) use constraints::{coerce_domain_value, parse_defaults};
 pub(crate) use foreign_key_equality::key_operators as foreign_key_operators;
@@ -6828,9 +6828,6 @@ where
             &existing[..def.n_columns],
             Some(&new_values[..def.n_columns]),
             arena,
-            params,
-            seq_session,
-            MAX_FK_CASCADE_DEPTH,
         )?;
     }
     fire_partition_row_triggers(
@@ -34037,12 +34034,17 @@ fn execute_queued_firing<'a>(
             firing.table,
             transition_rows,
         ),
-        None => constraints::fire_foreign_key_event(
-            context.host.storage(),
-            context.txn,
-            firing.index,
-            context.arena,
-        ),
+        None => {
+            let arena = context.arena;
+            let (storage, txn, _, seq_session) = context.dml_parts_with_sequence();
+            constraints::fire_queued_foreign_key_event(
+                storage,
+                txn,
+                firing.index,
+                arena,
+                seq_session,
+            )
+        }
     }
 }
 
@@ -34161,7 +34163,13 @@ pub(crate) fn fire_constraint_triggers(
                     }
                 };
                 if fires {
-                    constraints::fire_foreign_key_event(storage, txn, index, arena)?;
+                    constraints::fire_queued_foreign_key_event(
+                        storage,
+                        txn,
+                        index,
+                        arena,
+                        seq_session,
+                    )?;
                 }
                 continue;
             }
@@ -63931,9 +63939,6 @@ fn apply_replication_delete_row(
             &old_values[..definition.n_columns],
             None,
             arena,
-            &[],
-            context.seq_session,
-            MAX_FK_CASCADE_DEPTH,
         )?;
     }
     txn.write_row(
@@ -64171,9 +64176,6 @@ pub(crate) fn apply_replication_update(
             &old_values[..definition.n_columns],
             Some(&new_values[..definition.n_columns]),
             arena,
-            &[],
-            context.seq_session,
-            MAX_FK_CASCADE_DEPTH,
         )?;
     }
     fire_partition_row_triggers(
@@ -68502,9 +68504,6 @@ pub(crate) fn merge<'a>(
                                         &deleted_values[..row_definition.n_columns],
                                         None,
                                         arena,
-                                        params,
-                                        seq_session,
-                                        MAX_FK_CASCADE_DEPTH,
                                     ) {
                                         return sql_fail(error);
                                     }
@@ -68780,7 +68779,6 @@ pub(crate) fn merge<'a>(
                                         new_layout.generated,
                                         &mut persisted[..new_definition.n_columns],
                                         arena,
-                                        params,
                                         seq_session,
                                         responder,
                                     ) {
@@ -69011,9 +69009,6 @@ pub(crate) fn merge<'a>(
                                             pair_physical,
                                             Some(&source_new[..row_definition.n_columns]),
                                             arena,
-                                            params,
-                                            seq_session,
-                                            MAX_FK_CASCADE_DEPTH,
                                         )
                                     {
                                         return sql_fail(error);
@@ -73850,7 +73845,6 @@ pub(crate) fn update<'a>(
                         new_layout.generated,
                         &mut persisted[..new_definition.n_columns],
                         arena,
-                        params,
                         seq_session,
                         responder,
                     ) {
@@ -74163,9 +74157,6 @@ pub(crate) fn update<'a>(
                         &old_row[..row_definition.n_columns],
                         Some(&parent_new[..row_definition.n_columns]),
                         arena,
-                        params,
-                        seq_session,
-                        MAX_FK_CASCADE_DEPTH,
                     )
                 {
                     return sql_fail(e);
@@ -74764,9 +74755,6 @@ pub(crate) fn delete<'a>(
                         &old_values[..def.n_columns],
                         None,
                         arena,
-                        params,
-                        seq_session,
-                        MAX_FK_CASCADE_DEPTH,
                     )
                 {
                     return sql_fail(error);
@@ -74914,9 +74902,6 @@ pub(crate) fn delete<'a>(
                         &old_physical[..row_definition.n_columns],
                         None,
                         arena,
-                        params,
-                        seq_session,
-                        MAX_FK_CASCADE_DEPTH,
                     )
                 {
                     return sql_fail(error);

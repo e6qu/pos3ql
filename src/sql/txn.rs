@@ -880,6 +880,18 @@ pub(crate) enum ForeignKeyCheck {
     /// A deleted or re-keyed referenced row's old key must not be referenced
     /// any more (`RI_FKey_noaction_*` and, never deferred, `RI_FKey_restrict_*`).
     Referenced { restrict: bool },
+    /// A deleted or re-keyed referenced row's referencing rows are deleted
+    /// or rewritten (`RI_FKey_cascade_*`, `RI_FKey_setnull_*`,
+    /// `RI_FKey_setdefault_*`), never deferred.
+    Action(ReferentialAction),
+}
+
+/// The rewriting referential actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReferentialAction {
+    Cascade,
+    SetNull,
+    SetDefault,
 }
 
 impl ForeignKeyCheck {
@@ -888,6 +900,9 @@ impl ForeignKeyCheck {
             Self::Referencing => 1,
             Self::Referenced { restrict: false } => 2,
             Self::Referenced { restrict: true } => 3,
+            Self::Action(ReferentialAction::Cascade) => 4,
+            Self::Action(ReferentialAction::SetNull) => 5,
+            Self::Action(ReferentialAction::SetDefault) => 6,
         }
     }
 
@@ -896,8 +911,20 @@ impl ForeignKeyCheck {
             1 => Some(Self::Referencing),
             2 => Some(Self::Referenced { restrict: false }),
             3 => Some(Self::Referenced { restrict: true }),
+            4 => Some(Self::Action(ReferentialAction::Cascade)),
+            5 => Some(Self::Action(ReferentialAction::SetNull)),
+            6 => Some(Self::Action(ReferentialAction::SetDefault)),
             _ => None,
         }
+    }
+
+    /// PostgreSQL creates only the NO ACTION trigger with the constraint's
+    /// deferrability.
+    pub(crate) const fn deferrable(self) -> bool {
+        matches!(
+            self,
+            Self::Referencing | Self::Referenced { restrict: false }
+        )
     }
 }
 

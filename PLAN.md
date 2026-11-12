@@ -127,15 +127,20 @@ is owned.
   synchronously: a step's foreign key check that waited resumed the step at a
   completion position past its last row and then waited again without a new
   GET, a loop the download bound does not see. `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and
-  `SET DEFAULT` still rewrite the referencing rows as the parent row is
-  written, without firing the referencing table's triggers or rules.
-  PostgreSQL 18.6 runs each as a `DELETE` or `UPDATE` of the referencing
-  table from its `RI_ConstraintTrigger_a_*` event at the statement's end
-  (deferred with the constraint): rules rewrite it, its `BEFORE` triggers
-  fire then, `BEFORE STATEMENT` once per table and operation in the
-  statement, and its `AFTER ROW` and `AFTER STATEMENT` events join the end of
-  the statement's queue (`AFTER STATEMENT` once per table and operation,
-  after the last such change). A data-modifying `WITH` sub-statement fires
+  `SET DEFAULT` run as queued events at the statement's end, as
+  PostgreSQL 18.6's `RI_ConstraintTrigger_a_*` events (never deferred), but
+  rewrite the referencing rows directly. PostgreSQL runs each as a `DELETE`
+  or `UPDATE` of the referencing table: rules rewrite it (a `DO INSTEAD
+  NOTHING` rule fails it with `XX000`), its `BEFORE` triggers fire then,
+  `BEFORE STATEMENT` once per table and operation in the statement, and its
+  `AFTER ROW` and `AFTER STATEMENT` events join the end of the statement's
+  queue (`AFTER STATEMENT` once per table and operation, after the last such
+  change, with the merged transition rows); an error inside it carries the
+  action query as `CONTEXT`. That needs the action to run through the
+  nested write path with its events tagged at the outer statement's depth,
+  and statement triggers queued as events. `ON DELETE SET NULL (columns)`
+  and `SET DEFAULT (columns)` fail with `42601` (no column list is stored).
+  A data-modifying `WITH` sub-statement fires
   its `AFTER ROW` and `AFTER STATEMENT` triggers at its own end, where
   PostgreSQL fires them after the main statement's rows (its foreign key
   checks already wait for the statement's end).

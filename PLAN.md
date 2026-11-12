@@ -328,13 +328,18 @@ INHERIT` fails with `42601`; an exclusion constraint over a B-tree index fails
 with `42601`, and `box` has no default GiST operator class. `ALTER TABLE ...
 CLUSTER ON` and `REPLICA IDENTITY USING INDEX` reject an index that backs a
 `PRIMARY KEY` or `UNIQUE` constraint (`42704`), since those indexes have no
-separate index slot to mark. A view's `reloptions` list `security_barrier`
-before `check_option` and omit `security_invoker=false`, where PostgreSQL keeps
-the options as written; keeping them needs the written order in the view's
-journal records and checkpoint image. `pg_operator` lists 27 `=` operators
-where PostgreSQL lists 63, so a foreign key's `conpfeqop`, `conppeqop` and
-`conffeqop` are NULL where PostgreSQL lists each key column's equality
-operator (`{96}`); they need the complete built-in operator rows first. `pg_get_viewdef` uses PostgreSQL's
+separate index slot to mark. A view's `reloptions` spell boolean values
+canonically (`security_barrier=true`) where PostgreSQL keeps the written
+spelling (`WITH (security_barrier=on)` lists `security_barrier=on`). A
+statement's scans read catalog changes that routines it called made earlier in
+the same statement: `SELECT mk(g), (SELECT count(*) FROM pg_class WHERE
+relname LIKE 'made_%') FROM generate_series(1, 3) g`, where `mk` creates a
+table, counts the new tables, while PostgreSQL's statement snapshot counts
+none. A foreign key whose referencing and referenced columns are stored
+differently (a `bigint` column referencing an `integer` key) fails with
+`42804` where PostgreSQL compares them with the key's cross-type equality
+operator; checks and cascades would need to convert each value before probing
+the key. `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their

@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 27;
+pub(crate) const RECORD_VERSION: u8 = 28;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -1550,9 +1550,7 @@ pub(crate) enum WalOp<'a> {
         sql: &'a str,
         /// The creator's search_path, under which the body re-resolves.
         path: &'a str,
-        security_invoker: bool,
-        security_barrier: u8,
-        check_option: u8,
+        options: crate::storage::ViewOptions,
         dependencies: WalStoredQueryDependencies<'a>,
     },
     DropView {
@@ -1562,9 +1560,7 @@ pub(crate) enum WalOp<'a> {
     SetViewOptions {
         schema: &'a str,
         name: &'a str,
-        security_invoker: bool,
-        security_barrier: u8,
-        check_option: u8,
+        options: crate::storage::ViewOptions,
     },
     SetViewColumns {
         schema: &'a str,
@@ -3600,26 +3596,26 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             columns,
             sql,
             path,
-            security_invoker: _,
-            security_barrier: _,
-            check_option: _,
+            options: _,
             dependencies,
         } => {
             crate::storage::ViewCatalogIdentity::ENCODED_BYTES
                 + 1
                 + name.len()
                 + columns.encoded_len()
-                + 3
+                + 2
                 + sql.len()
                 + 1
                 + schema.len()
                 + 2
                 + path.len()
-                + 2
+                + crate::storage::ViewOptions::ENCODED_BYTES
                 + dependencies.encoded_len()
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
-        WalOp::SetViewOptions { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 3,
+        WalOp::SetViewOptions { schema, name, .. } => {
+            1 + name.len() + 1 + schema.len() + crate::storage::ViewOptions::ENCODED_BYTES
+        }
         WalOp::SetViewColumns {
             schema,
             name,
@@ -5328,9 +5324,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             columns,
             sql,
             path,
-            security_invoker,
-            security_barrier,
-            check_option,
+            options,
             dependencies,
         } => {
             buffer.append(&(identity.slot() as u16).to_le_bytes())
@@ -5344,28 +5338,18 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, schema)
                 && buffer.append(&(path.len() as u16).to_le_bytes())
                 && buffer.append(path.as_bytes())
-                && buffer.append(&[
-                    u8::from(*security_invoker),
-                    *security_barrier,
-                    *check_option,
-                ])
+                && buffer.append(&options.encode())
                 && dependencies.append(buffer)
         }
         WalOp::DropView { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
         WalOp::SetViewOptions {
             schema,
             name,
-            security_invoker,
-            security_barrier,
-            check_option,
+            options,
         } => {
             name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
-                && buffer.append(&[
-                    u8::from(*security_invoker),
-                    *security_barrier,
-                    *check_option,
-                ])
+                && buffer.append(&options.encode())
         }
         WalOp::SetViewColumns {
             schema,
@@ -8073,6 +8057,12 @@ fn decode_op_inner<'a>(
         *at += len;
         core::str::from_utf8(raw).ok()
     };
+    let take_view_options = |at: &mut usize| -> Option<crate::storage::ViewOptions> {
+        let end = *at + crate::storage::ViewOptions::ENCODED_BYTES;
+        let options = crate::storage::ViewOptions::decode(payload.get(*at..end)?.try_into().ok()?)?;
+        *at = end;
+        Some(options)
+    };
     match kind {
         KIND_DATABASE_SCOPE => decode_large_op(|| {
             let oid = i32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
@@ -8901,20 +8891,7 @@ fn decode_op_inner<'a>(
             at += path_len;
             let path = core::str::from_utf8(raw).ok()?;
             crate::sql::guc::validate_search_path(path).ok()?;
-            let security_invoker = match *payload.get(at)? {
-                0 => false,
-                1 => true,
-                _ => return None,
-            };
-            at += 1;
-            let security_barrier = *payload.get(at)?;
-            crate::storage::ViewSecurityBarrier::from_code(security_barrier)?;
-            at += 1;
-            let check_option = match *payload.get(at)? {
-                0..=2 => *payload.get(at)?,
-                _ => return None,
-            };
-            at += 1;
+            let options = take_view_options(&mut at)?;
             let encoded = payload.get(at..)?;
             if !validate_stored_query_dependencies(encoded) {
                 return None;
@@ -8928,9 +8905,7 @@ fn decode_op_inner<'a>(
                 columns,
                 sql,
                 path,
-                security_invoker,
-                security_barrier,
-                check_option,
+                options,
                 dependencies,
             })
         }),
@@ -8942,26 +8917,11 @@ fn decode_op_inner<'a>(
         KIND_SET_VIEW_OPTIONS => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            let security_invoker = match *payload.get(at)? {
-                0 => false,
-                1 => true,
-                _ => return None,
-            };
-            at += 1;
-            let security_barrier = *payload.get(at)?;
-            crate::storage::ViewSecurityBarrier::from_code(security_barrier)?;
-            at += 1;
-            let check_option = *payload.get(at)?;
-            if check_option > 2 {
-                return None;
-            }
-            at += 1;
+            let options = take_view_options(&mut at)?;
             (at == payload.len()).then_some(WalOp::SetViewOptions {
                 schema,
                 name,
-                security_invoker,
-                security_barrier,
-                check_option,
+                options,
             })
         }),
         KIND_SET_VIEW_COLUMNS_V2 => decode_large_op(|| {
@@ -14690,9 +14650,7 @@ mod tests {
                     },
                     sql: "pos3ql-bound-query-v1\nSELECT /*p3e:0:0*/'old'::state",
                     path: "public",
-                    security_invoker: false,
-                    security_barrier: 0,
-                    check_option: 0,
+                    options: crate::storage::ViewOptions::DEFAULT,
                     dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
                 },
             ),
@@ -16271,9 +16229,7 @@ mod tests {
                     },
                     sql: "SELECT 1 AS value",
                     path: "public",
-                    security_invoker: false,
-                    security_barrier: 0,
-                    check_option: 0,
+                    options: crate::storage::ViewOptions::DEFAULT,
                     dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
                 }
             ));
@@ -16382,6 +16338,15 @@ mod tests {
         assert_eq!(roles.iter().collect::<Vec<_>>(), ["reader"]);
 
         payload.clear();
+        let written_options = crate::storage::ViewOptions {
+            security: crate::storage::ViewSecurity::Invoker,
+            security_barrier: crate::storage::ViewSecurityBarrier::Enabled,
+            check_option: Some(crate::storage::ViewCheckOption::Cascaded),
+            order: crate::storage::ViewOptionOrder::EMPTY
+                .with_last(crate::sql::ast::ViewOptionName::CheckOption)
+                .with_last(crate::sql::ast::ViewOptionName::SecurityInvoker)
+                .with_last(crate::sql::ast::ViewOptionName::SecurityBarrier),
+        };
         assert!(append_payload(
             &mut payload,
             &WalOp::CreateView {
@@ -16394,17 +16359,13 @@ mod tests {
                 },
                 sql: "SELECT * FROM protected",
                 path: "public",
-                security_invoker: true,
-                security_barrier: 1,
-                check_option: 2,
+                options: written_options,
                 dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
             },
         ));
         let Some(WalOp::CreateView {
             identity,
-            security_invoker,
-            security_barrier,
-            check_option,
+            options,
             columns,
             ..
         }) = decode_op(KIND_CREATE_VIEW_V2, payload.readable())
@@ -16416,9 +16377,7 @@ mod tests {
             crate::storage::ViewCatalogIdentity::new(0, 7, 0, 8).unwrap()
         );
         let (columns, _) = columns.decode().unwrap();
-        assert!(security_invoker);
-        assert_eq!(security_barrier, 1);
-        assert_eq!(check_option, 2);
+        assert_eq!(options, written_options);
         assert!(!columns.has_aliases());
         assert_eq!(columns.names()[0].as_str(), "value");
         assert!(matches!(
@@ -16485,20 +16444,27 @@ mod tests {
             &WalOp::SetViewOptions {
                 schema: "public",
                 name: "reader_view",
-                security_invoker: true,
-                security_barrier: 1,
-                check_option: 1,
+                options: written_options,
             },
         ));
         assert!(matches!(
             decode_op(KIND_SET_VIEW_OPTIONS, payload.readable()),
-            Some(WalOp::SetViewOptions {
-                security_invoker: true,
-                security_barrier: 1,
-                check_option: 1,
-                ..
-            })
+            Some(WalOp::SetViewOptions { options, .. }) if options == written_options
         ));
+        // Options outside their listed order are corrupt, not defaults.
+        payload.clear();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::SetViewOptions {
+                schema: "public",
+                name: "reader_view",
+                options: crate::storage::ViewOptions {
+                    order: crate::storage::ViewOptionOrder::EMPTY,
+                    ..written_options
+                },
+            },
+        ));
+        assert!(decode_op(KIND_SET_VIEW_OPTIONS, payload.readable()).is_none());
     }
 
     #[test]
@@ -17878,9 +17844,7 @@ mod tests {
                         columns: columns_image,
                         sql: "SELECT ARRAY[1] AS value",
                         path: "public",
-                        security_invoker: false,
-                        security_barrier: 0,
-                        check_option: 0,
+                        options: crate::storage::ViewOptions::DEFAULT,
                         dependencies: WalStoredQueryDependencies::Captured(dependencies),
                     }
                 } else {
@@ -18203,9 +18167,7 @@ mod tests {
                         },
                         sql: "SELECT 1 AS value",
                         path,
-                        security_invoker: false,
-                        security_barrier: 0,
-                        check_option: 0,
+                        options: crate::storage::ViewOptions::DEFAULT,
                         dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
                     },
                     WalOp::CreateMatview {

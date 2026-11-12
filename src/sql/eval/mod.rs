@@ -3629,10 +3629,11 @@ fn validate_enum_operator_types<'a>(
     let right_type = expression_type_identity(right, row, hooks)?.record_field_oid();
     // PostgreSQL's anyenum operators require an enum declaration. A domain's
     // enum representation is insufficient, even when both operands have it.
-    if [left_type, right_type]
-        .iter()
-        .any(|oid| matches!(catalog.domain_base_type(*oid), Some(ColType::Enum(_))))
-    {
+    // Built-in types (below the first user OID) include no enum domain.
+    if [left_type, right_type].iter().any(|oid| {
+        *oid >= crate::storage::FIRST_NORMAL_OBJECT_ID
+            && matches!(catalog.domain_base_type(*oid), Some(ColType::Enum(_)))
+    }) {
         let left_name = catalog.type_name(left_type, arena)?.unwrap_or("unknown");
         let right_name = catalog.type_name(right_type, arena)?.unwrap_or("unknown");
         return Err(sql_err!(

@@ -6112,6 +6112,9 @@ pub struct ViewOptions {
     pub security: ViewSecurity,
     pub security_barrier: ViewSecurityBarrier,
     pub check_option: Option<ViewCheckOption>,
+    /// The options `pg_class.reloptions` lists; an explicit
+    /// `security_invoker=false` is listed although it selects the default.
+    pub order: ViewOptionOrder,
 }
 
 impl ViewOptions {
@@ -6119,7 +6122,123 @@ impl ViewOptions {
         security: ViewSecurity::Definer,
         security_barrier: ViewSecurityBarrier::Default,
         check_option: None,
+        order: ViewOptionOrder::EMPTY,
     };
+
+    pub const ENCODED_BYTES: usize = 4;
+
+    /// The journal and checkpoint image: security, barrier and check option
+    /// codes, then the listed order.
+    pub fn encode(self) -> [u8; Self::ENCODED_BYTES] {
+        [
+            u8::from(self.security == ViewSecurity::Invoker),
+            self.security_barrier.code(),
+            self.check_option.map_or(0, ViewCheckOption::code),
+            self.order.code(),
+        ]
+    }
+
+    pub fn decode(bytes: [u8; Self::ENCODED_BYTES]) -> Option<Self> {
+        let options = Self {
+            security: match bytes[0] {
+                0 => ViewSecurity::Definer,
+                1 => ViewSecurity::Invoker,
+                _ => return None,
+            },
+            security_barrier: ViewSecurityBarrier::from_code(bytes[1])?,
+            check_option: match bytes[2] {
+                0 => None,
+                code => Some(ViewCheckOption::from_code(code)?),
+            },
+            order: ViewOptionOrder::from_code(bytes[3])?,
+        };
+        options.is_consistent().then_some(options)
+    }
+
+    /// Whether `order` lists exactly the options that are set.
+    pub(crate) fn is_consistent(self) -> bool {
+        use crate::sql::ast::ViewOptionName;
+        self.order.contains(ViewOptionName::SecurityBarrier)
+            == (self.security_barrier != ViewSecurityBarrier::Default)
+            && self.order.contains(ViewOptionName::CheckOption) == self.check_option.is_some()
+            && (self.security == ViewSecurity::Definer
+                || self.order.contains(ViewOptionName::SecurityInvoker))
+    }
+}
+
+/// The options a view's `pg_class.reloptions` lists, in PostgreSQL's order:
+/// as written when the view was created or replaced, with each later
+/// `ALTER VIEW ... SET` moving the options it sets to the end. Two bits per
+/// option, first option lowest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewOptionOrder(u8);
+
+impl ViewOptionOrder {
+    pub const EMPTY: Self = Self(0);
+
+    const fn kind_code(kind: crate::sql::ast::ViewOptionName) -> u8 {
+        match kind {
+            crate::sql::ast::ViewOptionName::CheckOption => 1,
+            crate::sql::ast::ViewOptionName::SecurityBarrier => 2,
+            crate::sql::ast::ViewOptionName::SecurityInvoker => 3,
+        }
+    }
+
+    const fn kind(code: u8) -> Option<crate::sql::ast::ViewOptionName> {
+        match code {
+            1 => Some(crate::sql::ast::ViewOptionName::CheckOption),
+            2 => Some(crate::sql::ast::ViewOptionName::SecurityBarrier),
+            3 => Some(crate::sql::ast::ViewOptionName::SecurityInvoker),
+            _ => None,
+        }
+    }
+
+    pub const fn code(self) -> u8 {
+        self.0
+    }
+
+    /// Accepts only distinct options without gaps.
+    pub fn from_code(code: u8) -> Option<Self> {
+        let order = Self(code);
+        let mut seen = 0u8;
+        let mut ended = false;
+        for position in 0..4 {
+            let kind = (code >> (2 * position)) & 3;
+            if kind == 0 {
+                ended = true;
+            } else if ended || position == 3 || seen & (1 << kind) != 0 {
+                return None;
+            } else {
+                seen |= 1 << kind;
+            }
+        }
+        Some(order)
+    }
+
+    pub fn names(self) -> impl Iterator<Item = crate::sql::ast::ViewOptionName> {
+        (0..3).map_while(move |position| Self::kind((self.0 >> (2 * position)) & 3))
+    }
+
+    pub fn contains(self, kind: crate::sql::ast::ViewOptionName) -> bool {
+        self.names().any(|listed| listed == kind)
+    }
+
+    /// The order without `kind`.
+    #[must_use]
+    pub fn without(self, kind: crate::sql::ast::ViewOptionName) -> Self {
+        let mut code = 0;
+        for (position, listed) in self.names().filter(|listed| *listed != kind).enumerate() {
+            code |= Self::kind_code(listed) << (2 * position);
+        }
+        Self(code)
+    }
+
+    /// The order with `kind` moved to, or added at, the end.
+    #[must_use]
+    pub fn with_last(self, kind: crate::sql::ast::ViewOptionName) -> Self {
+        let rest = self.without(kind);
+        Self(rest.0 | Self::kind_code(kind) << (2 * rest.names().count()))
+    }
 }
 
 #[derive(Clone)]
@@ -23990,6 +24109,11 @@ impl Storage {
 
     pub(crate) fn current_database_oid(&self) -> DatabaseOid {
         current_database()
+    }
+
+    /// Advances with every catalog edit, including uncommitted ones.
+    pub(crate) fn catalog_edit_sequence(&self) -> u64 {
+        self.catalog_sequence.current()
     }
 
     pub(crate) fn current_database_name(&self, txid: u32) -> SqlName {
@@ -54343,6 +54467,24 @@ impl Storage {
             operator.database == current_database() && operator.visible_to(txid)
         })
         .map(move |(slot, operator)| (slot, operator.definition_for(txid)))
+    }
+
+    /// Whether any operator visible to `txid` is named `name`, read under one
+    /// catalog lock. Expression evaluation asks this for every operator it
+    /// applies, so the common answer (no user-defined operator of that name)
+    /// must not copy each slot.
+    pub(crate) fn has_visible_operator_named(&self, name: &str, txid: u32) -> bool {
+        let database = current_database();
+        self.operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned")
+            .operators
+            .iter()
+            .any(|operator| {
+                operator.database == database
+                    && operator.visible_to(txid)
+                    && operator.definition_for(txid).name.as_str() == name
+            })
     }
 
     pub(crate) fn operator_count(&self) -> usize {

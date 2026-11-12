@@ -5384,6 +5384,7 @@ impl<'a> Parser<'a> {
                         security,
                         security_barrier,
                         check_option,
+                        option_order,
                         sql,
                     } => CreateSchemaElement::View {
                         name,
@@ -5393,6 +5394,7 @@ impl<'a> Parser<'a> {
                         security,
                         security_barrier,
                         check_option,
+                        option_order,
                         sql,
                     },
                     Stmt::CreateIndex {
@@ -6142,9 +6144,11 @@ impl<'a> Parser<'a> {
         let mut security = ViewSecurity::Definer;
         let mut security_barrier = ViewSecurityBarrier::Default;
         let mut check_option = None;
+        let mut option_order = crate::storage::ViewOptionOrder::EMPTY;
         if self.eat_ident("with")? {
             self.expect_op("(")?;
             for option in self.view_options()? {
+                option_order = option_order.with_last(option.name());
                 match option {
                     crate::sql::ast::ViewOption::SecurityInvoker(enabled) => {
                         security = if *enabled {
@@ -6170,6 +6174,7 @@ impl<'a> Parser<'a> {
         let end = self.peek_at;
         let sql = self.text[start..end].trim();
         if self.eat_ident("with")? {
+            let at = self.peek_at;
             let option = if self.eat_ident("local")? {
                 crate::sql::ast::ViewCheckOption::Local
             } else {
@@ -6178,7 +6183,10 @@ impl<'a> Parser<'a> {
             };
             self.expect_ident("check")?;
             self.expect_ident("option")?;
-            check_option = Some(option);
+            if check_option.replace(option).is_some() {
+                return Err(Self::duplicate_reloption(at, "check_option"));
+            }
+            option_order = option_order.with_last(crate::sql::ast::ViewOptionName::CheckOption);
         }
         Ok(Stmt::CreateView {
             name,
@@ -6188,6 +6196,7 @@ impl<'a> Parser<'a> {
             security,
             security_barrier,
             check_option,
+            option_order,
             sql,
         })
     }

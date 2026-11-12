@@ -6138,9 +6138,7 @@ impl<'a> Parser<'a> {
         let mut count = 0usize;
         let mut seen = [false; 3];
         loop {
-            if count == options.len() {
-                return Err(self.limit("view options", options.len()));
-            }
+            let at = self.peek_at;
             let option = self.any_ident("view option name")?;
             let (index, parsed) = if option.eq_ignore_ascii_case("security_invoker") {
                 (
@@ -6154,20 +6152,31 @@ impl<'a> Parser<'a> {
                 )
             } else if option.eq_ignore_ascii_case("check_option") {
                 self.expect_op("=")?;
+                let value_at = self.peek_at;
                 let value = self.any_ident("check_option value")?;
                 let value = if value.eq_ignore_ascii_case("local") {
                     ViewCheckOption::Local
                 } else if value.eq_ignore_ascii_case("cascaded") {
                     ViewCheckOption::Cascaded
                 } else {
-                    return Err(self.err_here("check_option must be local or cascaded"));
+                    return Err(Self::invalid_reloption(
+                        value_at,
+                        stack_format!(
+                            96,
+                            "invalid value for enum option \"check_option\": {}",
+                            value
+                        ),
+                    ));
                 };
                 (2, ViewOption::CheckOption(value))
             } else {
-                return Err(self.err_here("unrecognized view option"));
+                return Err(Self::invalid_reloption(
+                    at,
+                    stack_format!(96, "unrecognized parameter \"{}\"", option),
+                ));
             };
             if core::mem::replace(&mut seen[index], true) {
-                return Err(self.err_here("view option specified more than once"));
+                return Err(Self::duplicate_reloption(at, option));
             }
             options[count] = parsed;
             count += 1;
@@ -6179,30 +6188,47 @@ impl<'a> Parser<'a> {
         self.arena_slice(&options[..count])
     }
 
+    /// PostgreSQL validates reloptions after parsing, as `22023`.
+    fn invalid_reloption(at: usize, message: crate::util::StackStr<96>) -> ParseError {
+        ParseError {
+            at,
+            message,
+            sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            cursor: None,
+            hint: None,
+        }
+    }
+
+    fn duplicate_reloption(at: usize, option: &str) -> ParseError {
+        Self::invalid_reloption(
+            at,
+            stack_format!(96, "parameter \"{}\" specified more than once", option),
+        )
+    }
+
+    /// `RESET` names. PostgreSQL removes the listed options and ignores names
+    /// that are repeated or that no view option has.
     fn view_option_names(&mut self) -> Result<&'a [crate::sql::ast::ViewOptionName], ParseError> {
         use crate::sql::ast::ViewOptionName;
         let mut names = [ViewOptionName::SecurityInvoker; 3];
         let mut count = 0usize;
-        let mut seen = [false; 3];
         loop {
-            if count == names.len() {
-                return Err(self.limit("view options", names.len()));
-            }
             let option = self.any_ident("view option name")?;
-            let (index, parsed) = if option.eq_ignore_ascii_case("security_invoker") {
-                (0, ViewOptionName::SecurityInvoker)
+            let parsed = if option.eq_ignore_ascii_case("security_invoker") {
+                Some(ViewOptionName::SecurityInvoker)
             } else if option.eq_ignore_ascii_case("security_barrier") {
-                (1, ViewOptionName::SecurityBarrier)
+                Some(ViewOptionName::SecurityBarrier)
             } else if option.eq_ignore_ascii_case("check_option") {
-                (2, ViewOptionName::CheckOption)
+                Some(ViewOptionName::CheckOption)
             } else {
-                return Err(self.err_here("unrecognized view option"));
+                None
             };
-            if core::mem::replace(&mut seen[index], true) {
-                return Err(self.err_here("view option specified more than once"));
+            if let Some(parsed) = parsed
+                && !names[..count].contains(&parsed)
+            {
+                names[count] = parsed;
+                count += 1;
             }
-            names[count] = parsed;
-            count += 1;
             if !self.eat_op(",")? {
                 break;
             }

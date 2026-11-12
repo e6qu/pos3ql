@@ -6463,7 +6463,7 @@ impl Checkpointer {
                         )
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign table"))?;
                 }
-                Some("vw14") => {
+                Some("vw15") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_view(storage, line, metadata.catalog_sequence)?;
                 }
@@ -11570,7 +11570,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "vw14 {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "vw15 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     view_slot,
                     view.created_at,
                     view.return_rule,
@@ -11579,14 +11579,10 @@ impl Checkpointer {
                     hschema.as_str(),
                     hpath.as_str(),
                     hname.as_str(),
-                    u8::from(matches!(
-                        view.options.security,
-                        crate::storage::ViewSecurity::Invoker
-                    )),
-                    view.options.security_barrier.code(),
-                    view.options
-                        .check_option
-                        .map_or(0, crate::storage::ViewCheckOption::code),
+                    view.options.encode()[0],
+                    view.options.encode()[1],
+                    view.options.encode()[2],
+                    view.options.encode()[3],
                     ManifestViewColumns(view.columns),
                     ManifestInputBytes(view.default_inputs.bytes()),
                     ManifestDependencies(storage.view_dependencies(view_slot, 0).view())
@@ -19003,7 +18999,7 @@ fn load_view(
     catalog_sequence: u64,
 ) -> Result<(), CheckpointSetupError> {
     let mut words = line.split(' ');
-    if words.next() != Some("vw14") {
+    if words.next() != Some("vw15") {
         return Err(CheckpointSetupError::Corrupt("unsupported view record"));
     }
     let identity = crate::storage::ViewCatalogIdentity::new(
@@ -19031,24 +19027,17 @@ fn load_view(
     let path = read_hex(words.next(), "view path missing")?;
     let path_buffer = parse_creation_path(&path, "invalid view creation search path")?;
     let name = read_hex(words.next(), "view name missing")?;
-    let security = match parse_field::<u8>(words.next(), "view security missing")? {
-        0 => crate::storage::ViewSecurity::Definer,
-        1 => crate::storage::ViewSecurity::Invoker,
-        _ => return Err(CheckpointSetupError::Corrupt("invalid view security")),
-    };
-    let security_barrier = crate::storage::ViewSecurityBarrier::from_code(parse_field(
-        words.next(),
+    let mut option_codes = [0u8; crate::storage::ViewOptions::ENCODED_BYTES];
+    for (code, what) in option_codes.iter_mut().zip([
+        "view security missing",
         "view security barrier missing",
-    )?)
-    .ok_or(CheckpointSetupError::Corrupt(
-        "invalid view security barrier",
-    ))?;
-    let check_option = match parse_field::<u8>(words.next(), "view check option missing")? {
-        0 => None,
-        code => crate::storage::ViewCheckOption::from_code(code)
-            .ok_or(CheckpointSetupError::Corrupt("invalid view check option"))
-            .map(Some)?,
-    };
+        "view check option missing",
+        "view option order missing",
+    ]) {
+        *code = parse_field::<u8>(words.next(), what)?;
+    }
+    let options = crate::storage::ViewOptions::decode(option_codes)
+        .ok_or(CheckpointSetupError::Corrupt("invalid view options"))?;
     let encoded_columns = words
         .next()
         .ok_or(CheckpointSetupError::Corrupt("view columns missing"))?;
@@ -19206,11 +19195,7 @@ fn load_view(
             creation_path: path_buffer,
             dependencies,
         },
-        options: crate::storage::ViewOptions {
-            security,
-            security_barrier,
-            check_option,
-        },
+        options,
     };
     storage
         .replay_view(identity, sql_name(&schema)?, sql_name(&name)?, definition)
@@ -20118,7 +20103,7 @@ mod stored_dependency_tests {
             oversized_utf8.as_str(),
         ] {
             let view = format!(
-                "vw14 0 1 0 2 {} {} {} {} 0 0 0 0:0: - i2 0 -",
+                "vw15 0 1 0 2 {} {} {} {} 0 0 0 0 0:0: - i2 0 -",
                 ManifestName("SELECT 1"),
                 ManifestName("public"),
                 ManifestName(path),

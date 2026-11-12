@@ -131,6 +131,16 @@ pub enum ViewOption {
     SecurityInvoker(bool),
 }
 
+impl ViewOption {
+    pub const fn name(self) -> ViewOptionName {
+        match self {
+            Self::CheckOption(_) => ViewOptionName::CheckOption,
+            Self::SecurityBarrier(_) => ViewOptionName::SecurityBarrier,
+            Self::SecurityInvoker(_) => ViewOptionName::SecurityInvoker,
+        }
+    }
+}
+
 /// One option name accepted by `ALTER VIEW ... RESET (...)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewOptionName {
@@ -406,6 +416,9 @@ pub enum CreateSchemaElement<'a> {
         security: ViewSecurity,
         security_barrier: ViewSecurityBarrier,
         check_option: Option<ViewCheckOption>,
+        /// The written options in `reloptions` order, with a trailing
+        /// `WITH CHECK OPTION` clause last.
+        option_order: crate::storage::ViewOptionOrder,
         sql: &'a str,
     },
     Index {
@@ -660,6 +673,9 @@ pub enum Stmt<'a> {
         security: ViewSecurity,
         security_barrier: ViewSecurityBarrier,
         check_option: Option<ViewCheckOption>,
+        /// The written options in `reloptions` order, with a trailing
+        /// `WITH CHECK OPTION` clause last.
+        option_order: crate::storage::ViewOptionOrder,
         sql: &'a str,
     },
     /// `ALTER VIEW` retains a closed action rather than sharing the broader

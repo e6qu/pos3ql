@@ -18606,6 +18606,7 @@ pub struct CreateViewCommand<'a> {
     pub security: super::ast::ViewSecurity,
     pub security_barrier: super::ast::ViewSecurityBarrier,
     pub check_option: Option<super::ast::ViewCheckOption>,
+    pub option_order: crate::storage::ViewOptionOrder,
     pub sql: &'a str,
     pub raw_path: &'a str,
 }
@@ -25882,6 +25883,7 @@ fn execute_bound_plpgsql_utility<'a>(
                             security,
                             security_barrier,
                             check_option,
+                            option_order,
                             sql,
                         } = requalified
                         {
@@ -25930,6 +25932,7 @@ fn execute_bound_plpgsql_utility<'a>(
                                                     security: *security,
                                                     security_barrier: *security_barrier,
                                                     check_option: *check_option,
+                                                    option_order: *option_order,
                                                     sql,
                                                     raw_path: schema_path,
                                                 },
@@ -26195,6 +26198,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     security,
                     security_barrier,
                     check_option,
+                    option_order,
                     sql,
                 } => super::exec::create_view(
                     &mut engine.storage,
@@ -26208,6 +26212,7 @@ fn execute_bound_plpgsql_utility<'a>(
                         security: *security,
                         security_barrier: *security_barrier,
                         check_option: *check_option,
+                        option_order: *option_order,
                         sql,
                         raw_path: guc.search_path().as_str(),
                     },
@@ -42711,6 +42716,7 @@ pub fn create_view(
         security,
         security_barrier,
         check_option,
+        option_order,
         sql,
         raw_path,
     } = command;
@@ -42980,6 +42986,7 @@ pub fn create_view(
                         crate::storage::ViewCheckOption::Cascaded
                     }
                 }),
+                order: option_order,
             },
         },
         or_replace,
@@ -43026,16 +43033,7 @@ pub fn create_view(
                         },
                         sql: durable_sql.as_str(),
                         path: raw_path,
-                        security_invoker: matches!(security, super::ast::ViewSecurity::Invoker),
-                        security_barrier: match security_barrier {
-                            super::ast::ViewSecurityBarrier::Default => 0,
-                            super::ast::ViewSecurityBarrier::Enabled => 1,
-                            super::ast::ViewSecurityBarrier::Disabled => 2,
-                        },
-                        check_option: check_option.map_or(0, |option| match option {
-                            super::ast::ViewCheckOption::Local => 1,
-                            super::ast::ViewCheckOption::Cascaded => 2,
-                        }),
+                        options: storage.view(new_slot).options_for(txn.txid),
                         dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                             storage.view_dependencies(new_slot, txn.txid).view(),
                         ),
@@ -43251,6 +43249,7 @@ pub fn alter_view(
     match action {
         AlterViewAction::SetOptions(view_options) => {
             for option in view_options {
+                options.order = options.order.with_last(option.name());
                 match option {
                     ViewOption::SecurityInvoker(enabled) => {
                         options.security = if *enabled {
@@ -43288,6 +43287,7 @@ pub fn alter_view(
         }
         AlterViewAction::ResetOptions(view_options) => {
             for option in view_options {
+                options.order = options.order.without(*option);
                 match option {
                     ViewOptionName::SecurityInvoker => {
                         options.security = crate::storage::ViewSecurity::Definer;
@@ -43656,11 +43656,7 @@ pub fn alter_view(
             &WalOp::SetViewOptions {
                 schema: schema.as_str(),
                 name: view_name.as_str(),
-                security_invoker: matches!(options.security, crate::storage::ViewSecurity::Invoker),
-                security_barrier: options.security_barrier.code(),
-                check_option: options
-                    .check_option
-                    .map_or(0, crate::storage::ViewCheckOption::code),
+                options,
             },
         )
     };
@@ -43877,14 +43873,7 @@ fn publish_rewritten_view(
                 },
                 sql: rewritten.as_str(),
                 path: creation_path.as_str(),
-                security_invoker: matches!(
-                    view.security_for(txn.txid),
-                    crate::storage::ViewSecurity::Invoker
-                ),
-                security_barrier: view.security_barrier_for(txn.txid).code(),
-                check_option: view
-                    .check_option_for(txn.txid)
-                    .map_or(0, |option| option.code()),
+                options: view.options_for(txn.txid),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                     storage.view_dependencies(new_slot, txn.txid).view(),
                 ),
@@ -55084,14 +55073,7 @@ fn rewrite_composite_dependent_views(
                     },
                     sql: rewritten.as_str(),
                     path: creation_path.as_str(),
-                    security_invoker: matches!(
-                        view.security_for(txn.txid),
-                        crate::storage::ViewSecurity::Invoker
-                    ),
-                    security_barrier: view.security_barrier_for(txn.txid).code(),
-                    check_option: view
-                        .check_option_for(txn.txid)
-                        .map_or(0, |option| option.code()),
+                    options: view.options_for(txn.txid),
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                         storage.view_dependencies(new_slot, txn.txid).view(),
                     ),

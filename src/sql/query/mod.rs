@@ -46,6 +46,8 @@ use materialize::{external_materialized_into, materialized_rows, materialized_se
 
 mod scan;
 pub(crate) use plan::plan_time_bool;
+#[cfg(test)]
+pub(crate) use scan::JOIN_CANDIDATES;
 pub use scan::JoinRow;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
@@ -70,6 +72,9 @@ pub(crate) use cte::{
 };
 pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 
+mod catalog_images;
+#[cfg(test)]
+pub(crate) use catalog_images::IMAGE_BUILDS;
 mod cte;
 pub(crate) use cte::captured_type_oid;
 mod dependencies;
@@ -4390,6 +4395,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn has_operator_candidate(&self, name: &str) -> bool {
+        if !self.storage.has_visible_operator_named(name, self.txid) {
+            return false;
+        }
         self.storage
             .operators_visible_to(self.txid)
             .any(|(_, operator)| {

@@ -16,6 +16,7 @@ mod builtin_routine_comments;
 mod canonical_sequences;
 mod cast_and_operator_class_descriptions;
 mod catalog_identity_lookup;
+mod catalog_join_work;
 mod client_catalog;
 mod composite_parameter_fields;
 mod constraint_index_identity;
@@ -73,6 +74,7 @@ mod type_catalog_rows;
 mod type_dependent_routines;
 mod type_input_binding;
 mod type_input_positions;
+mod view_reloptions;
 mod virtual_search_path;
 
 #[test]
@@ -73358,7 +73360,7 @@ fn temporary_views_are_inferred_shadowed_mutable_and_session_scoped() {
             "2",
             "1",
             "2",
-            "t|{security_invoker=true,check_option=cascaded}",
+            "t|{check_option=cascaded,security_invoker=true}",
         ]
     );
 

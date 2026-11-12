@@ -1195,7 +1195,13 @@ impl<'d> QueryScope<'d> {
                     tref.table
                 )
             })?;
-        let synth = if materialize {
+        let image_key = materialize
+            .then(|| {
+                super::catalog_images::ImageKey::new(storage, namespace, tref.table, scan, txid)
+            })
+            .flatten();
+        let retained_rows = image_key.and_then(|key| super::catalog_images::cached(arena, key));
+        let synth = if materialize && retained_rows.is_none() {
             crate::sql::catalog::synthesize(
                 storage,
                 Some(namespace),
@@ -1239,7 +1245,9 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(columns.len(), |column| columns[column].name.as_str())
             .map_err(|_| arena_full())?;
         let image = self.defs.images.retain_relation(&definition)?;
-        let rows: &'a [&'a [u8]] = if materialize {
+        let rows: &'a [&'a [u8]] = if let Some(rows) = retained_rows {
+            rows
+        } else if materialize {
             const EMPTY: &[u8] = &[];
             let encoded = arena
                 .alloc_slice_with(synth.rows.len(), |_| EMPTY)
@@ -1261,7 +1269,10 @@ impl<'d> QueryScope<'d> {
                 }
                 encoded[i] = crate::sql::exec::encode_projected_pub(&values[..r.len()], arena)?;
             }
-            encoded
+            match image_key {
+                Some(key) => super::catalog_images::retain(arena, key, encoded)?,
+                None => encoded,
+            }
         } else {
             &[]
         };

@@ -3171,12 +3171,31 @@ pub(crate) fn dispatch<'a>(
 /// `None` for an OID that is not a built-in column type.
 /// `modifier_given` distinguishes an explicit `-1` from no modifier, which
 /// makes PostgreSQL spell unconstrained `character` as `bpchar`.
+/// `format_type` of a built-in type without an executable representation
+/// (pseudo-types, catalog row types and their arrays): its `pg_type` name,
+/// or its element's followed by `[]` for a true array type, which excludes
+/// the plain-storage `int2vector` and `oidvector`.
+fn catalog_row_type_name(oid: i32) -> Option<crate::util::StackStr<80>> {
+    const ARRAY_SUBSCRIPT_HANDLER: i32 = 6179;
+    let rows = crate::sql::catalog::builtin_type_rows();
+    let row = &rows[rows.binary_search_by_key(&oid, |row| row.oid).ok()?];
+    if row.element != 0 && row.subscript == ARRAY_SUBSCRIPT_HANDLER && row.storage != b'p' {
+        let element = format_builtin_type(row.element, -1, false)?;
+        return Some(stack_format!(80, "{}[]", element.as_str()));
+    }
+    let mut text = crate::util::StackStr::<80>::new();
+    crate::sql::catalog::write_identifier(&mut text, row.name);
+    Some(text)
+}
+
 pub(crate) fn format_builtin_type(
     o: i32,
     type_mod: i32,
     modifier_given: bool,
 ) -> Option<crate::util::StackStr<80>> {
-    let coltype = exec::coltype_of_oid(o)?;
+    let Some(coltype) = exec::coltype_of_oid(o) else {
+        return catalog_row_type_name(o);
+    };
     let (base, array) = match coltype {
         ColType::Array(element) => (element.to_coltype(), true),
         scalar => (scalar, false),

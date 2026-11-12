@@ -303,6 +303,19 @@ path. A build estimated beyond its fixed 32,768-entry ceiling, a lateral or
 partitioned source, or incompatible key types selects a nested-loop plan before
 execution; `EXPLAIN` reports the same choice.
 
+Other joins run as a nested loop. A `WHERE` condition is checked at the first
+join level where all its sources are bound, including above a `LEFT JOIN` when
+it names only the preserved side. A materialized source (a catalog relation,
+CTE or subquery result) has no index, so a level that compares one of its
+columns with an earlier source's column, or with an outer reference of a
+correlated subquery, hashes that column once and visits only the rows with a
+matching hash; the full `ON` and `WHERE` conditions still decide every row.
+`EXPLAIN` reports these plans as `Nested Loop`. Within one statement, a
+`pg_catalog` base relation is built once and reused by every scan, including
+each run of a correlated subquery, until the statement writes or changes the
+catalog, so psql's `\d`, `\dT` and `\dC` queries do work proportional to
+their results rather than to the product of the catalog sizes.
+
 See [index navigation](index-navigation.md) for searchable summaries and exact
 checks, and [durable formats](durable-format.md) for encodings and accepted
 readers. PostgreSQL's catalog alignment and heap properties describe the SQL

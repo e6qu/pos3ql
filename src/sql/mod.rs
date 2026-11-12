@@ -9,6 +9,7 @@ pub mod catalog;
 mod catalog_image;
 mod catalog_metadata;
 pub mod catalog_node;
+mod catalog_operator_rows;
 mod catalog_snapshot;
 mod catalog_snapshot_keys;
 pub(crate) mod commit;
@@ -19523,6 +19524,7 @@ impl Engine {
                 security,
                 security_barrier,
                 check_option,
+                option_order,
                 sql,
             } => exec::create_view(
                 &mut self.storage,
@@ -19536,6 +19538,7 @@ impl Engine {
                     security: *security,
                     security_barrier: *security_barrier,
                     check_option: *check_option,
+                    option_order: *option_order,
                     sql,
                     raw_path: guc.search_path().as_str(),
                 },
@@ -20935,6 +20938,7 @@ impl Engine {
                                 security,
                                 security_barrier,
                                 check_option,
+                                option_order,
                                 sql,
                             } = requalified
                             {
@@ -20962,6 +20966,7 @@ impl Engine {
                                         security: *security,
                                         security_barrier: *security_barrier,
                                         check_option: *check_option,
+                                        option_order: *option_order,
                                         sql,
                                         raw_path: schema_path,
                                     },
@@ -24375,6 +24380,7 @@ pub(crate) fn requalify_schema_element<'a>(
             security,
             security_barrier,
             check_option,
+            option_order,
             sql,
         } => Stmt::CreateView {
             name: requalify(*name)?,
@@ -24384,6 +24390,7 @@ pub(crate) fn requalify_schema_element<'a>(
             security: *security,
             security_barrier: *security_barrier,
             check_option: *check_option,
+            option_order: *option_order,
             sql,
         },
         ast::CreateSchemaElement::Index {
@@ -26985,9 +26992,7 @@ fn apply_wal_op(
             columns,
             sql,
             path,
-            security_invoker,
-            security_barrier,
-            check_option,
+            options,
             dependencies,
         } => {
             let (columns, default_inputs) = columns.materialize(storage, 0)?;
@@ -27016,35 +27021,7 @@ fn apply_wal_op(
                         creation_path,
                         dependencies,
                     },
-                    options: crate::storage::ViewOptions {
-                        security: if security_invoker {
-                            crate::storage::ViewSecurity::Invoker
-                        } else {
-                            crate::storage::ViewSecurity::Definer
-                        },
-                        security_barrier: crate::storage::ViewSecurityBarrier::from_code(
-                            security_barrier,
-                        )
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::DATA_EXCEPTION,
-                                "journal has invalid view security barrier"
-                            )
-                        })?,
-                        check_option: match check_option {
-                            0 => None,
-                            code => {
-                                Some(crate::storage::ViewCheckOption::from_code(code).ok_or_else(
-                                    || {
-                                        sql_err!(
-                                            sqlstate::DATA_EXCEPTION,
-                                            "journal has invalid view check option"
-                                        )
-                                    },
-                                )?)
-                            }
-                        },
-                    },
+                    options,
                 },
             )?;
         }
@@ -27056,9 +27033,7 @@ fn apply_wal_op(
         WalOp::SetViewOptions {
             schema,
             name,
-            security_invoker,
-            security_barrier,
-            check_option,
+            options,
         } => {
             let slot = storage
                 .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
@@ -27070,38 +27045,8 @@ fn apply_wal_op(
                         name
                     )
                 })?;
-            let check_option = match check_option {
-                0 => None,
-                code => Some(crate::storage::ViewCheckOption::from_code(code).ok_or_else(
-                    || {
-                        sql_err!(
-                            sqlstate::DATA_EXCEPTION,
-                            "journal has invalid view check option"
-                        )
-                    },
-                )?),
-            };
-            let undo = storage.stage_view_options(
-                storage.prepare_view_edit(slot, 0)?,
-                crate::storage::ViewOptions {
-                    security: if security_invoker {
-                        crate::storage::ViewSecurity::Invoker
-                    } else {
-                        crate::storage::ViewSecurity::Definer
-                    },
-                    security_barrier: crate::storage::ViewSecurityBarrier::from_code(
-                        security_barrier,
-                    )
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::DATA_EXCEPTION,
-                            "journal has invalid view security barrier"
-                        )
-                    })?,
-                    check_option,
-                },
-                0,
-            )?;
+            let undo =
+                storage.stage_view_options(storage.prepare_view_edit(slot, 0)?, options, 0)?;
             storage.commit_view_alter(undo);
         }
         WalOp::SetViewColumns {

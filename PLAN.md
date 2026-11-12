@@ -391,8 +391,7 @@ do). Parameter inference walks a statement in its own order rather than
 PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
 untyped to an `"any"` argument by another can be accepted where PostgreSQL
 reports `42P18`, and a user-defined polymorphic argument left untyped becomes
-`text` where PostgreSQL reports `42804`. Trigger functions cannot open cursors (`OPEN`, cursor `FOR` loops) and fail
-with `0A000`. A SQL function whose earlier
+`text` where PostgreSQL reports `42804`. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final
@@ -452,8 +451,7 @@ A PL/pgSQL variable declared with a view's row type (`r v;` or
 `FETCH ... INTO NEW.col`, any `INTO OLD.col`, and assigning `NEW` in an AFTER
 trigger fail with `0A000`, and a write's `RETURNING ... INTO NEW.col` fails
 with `42601` (`"new.a" is not a known variable`), where PostgreSQL assigns the
-field; `OPEN` and `FETCH` in a trigger fired by an ordinary statement fail with
-`0A000` (`SQL cursors are not available in trigger execution`); `SELECT` and `EXECUTE ... INTO NEW.col`
+field; `SELECT` and `EXECUTE ... INTO NEW.col`
 in a BEFORE trigger work. A `CONSTANT`
 assignment error has no cursor position: PL/pgSQL assignment targets do not
 keep their place in the routine body.
@@ -477,16 +475,11 @@ PostgreSQL omits because it raises the error while evaluating, not planning.
 COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
-A SQL-language procedure called from a trigger fired inside a write (a BEFORE
-row trigger, a deferred constraint trigger at `COMMIT`) runs queries, data
-changes and nested `CALL`, but rejects DDL and other utility statements with
-`0A000` because that trigger runs without the engine's utility executor.
 A view
 dropped by the cascade of a function, sequence, collation, operator, text
 search object or type (`DROP FUNCTION f CASCADE` where view `v` calls `f`)
 fails with `0A000` while another table's column, a composite attribute or a
-domain uses the view's row type; PostgreSQL drops those users too. A
-subscripted field assignment in PL/pgSQL (`r.f[1] := x`) fails with `0A000`.
+domain uses the view's row type; PostgreSQL drops those users too.
 `ALTER COLUMN ... TYPE` is refused for columns that a
 view, rule, trigger `WHEN` condition, policy or SQL-standard routine body
 reads or a stored `INSERT` or `UPDATE` writes (including a materialized

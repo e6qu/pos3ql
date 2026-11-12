@@ -1090,6 +1090,20 @@ impl<'a> AggState<'a> {
         self.custom.is_none() && matches!(self.kind, AggKind::Count) && !self.distinct
     }
 
+    /// Whether a recycling scan may reclaim each input row's allocations
+    /// after this aggregate folds it: its running values are plain data, as
+    /// any layout [`Self::fixed_state`] saves other than a reference.
+    pub(crate) fn recycling_safe_for(
+        &self,
+        node: &Expr<'_>,
+        columns: &dyn crate::sql::exec::ColTypeResolver,
+    ) -> bool {
+        self.recycling_safe()
+            || self
+                .fixed_state(node, columns)
+                .is_some_and(|layout| layout != FixedState::Reference)
+    }
+
     /// The fixed-size layout this builtin aggregate's transition state can be
     /// saved in, decided from its kind and its arguments' static types before
     /// any row is read. `None` for a state that grows: `DISTINCT`, an

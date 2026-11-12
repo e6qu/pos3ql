@@ -1034,7 +1034,8 @@ impl<'d> QueryScope<'d> {
             let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);
             let mut sorter = storage.external_sorter()?;
             sorter.reset();
-            select_into_rows(
+            // The sorter copies each row, so its evaluation is reclaimed.
+            super::select_into_rows_recycling(
                 storage,
                 txid,
                 sub,

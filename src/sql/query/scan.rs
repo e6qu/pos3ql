@@ -5817,6 +5817,35 @@ pub(super) fn one_time_filter_passes<'a>(
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<bool, SqlError> {
+    let query_column = |expression: &Expr<'_>| match expression {
+        // A name this query binds as a column or a whole row, or one it would
+        // reject, is the query's.
+        Expr::Column { qualifier, name } => {
+            !matches!(
+                scope.find_column(*qualifier, name),
+                Err(error) if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                )
+            ) || scope.table_index(qualifier.unwrap_or(name)).is_ok()
+        }
+        Expr::WholeRow(name) => scope.table_index(name).is_ok(),
+        _ => true,
+    };
+    one_time_filter_passes_by(where_clause, &query_column, arena, params, hooks, outer)
+}
+
+/// [`one_time_filter_passes`] for a query whose columns `query_column`
+/// recognises: it answers for each column and whole-row reference whether
+/// the query binds it.
+pub(crate) fn one_time_filter_passes_by<'a>(
+    where_clause: Option<&Expr<'a>>,
+    query_column: &dyn Fn(&Expr<'_>) -> bool,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<bool, SqlError> {
     let Some(predicate) = where_clause else {
         return Ok(true);
     };
@@ -5840,7 +5869,7 @@ pub(super) fn one_time_filter_passes<'a>(
         // differently once than per row: that subquery runs when first read.
         if !conjunct.contains_subquery()
             || conjunct.contains_volatile_function().is_some()
-            || !reads_no_query_column(conjunct, scope, hooks)
+            || !reads_no_query_column(conjunct, query_column, hooks)
         {
             continue;
         }
@@ -5858,11 +5887,16 @@ pub(super) fn one_time_filter_passes<'a>(
 
 const MAX_ONE_TIME_CONJUNCTS: usize = 64;
 
-/// Whether an expression reads no column of `scope`, and every subquery in it
-/// is one the query prepared without a row (an uncorrelated one).
+/// Visible rows a scan collects in one visibility pass before it falls back
+/// to counting them first.
+const SINGLE_PASS_ROWS: usize = 64;
+
+/// Whether an expression reads no column `query_column` claims, and every
+/// subquery in it is one the query prepared without a row (an uncorrelated
+/// one).
 fn reads_no_query_column(
     expression: &Expr<'_>,
-    scope: &QueryScope<'_>,
+    query_column: &dyn Fn(&Expr<'_>) -> bool,
     hooks: &EvalHooks<'_, '_>,
 ) -> bool {
     let prepared = |node: &Expr<'_>| {
@@ -5884,18 +5918,7 @@ fn reads_no_query_column(
         })
     };
     match expression {
-        // A name this query binds as a column or a whole row, or one it would
-        // reject, is the query's.
-        Expr::Column { qualifier, name } => {
-            matches!(
-                scope.find_column(*qualifier, name),
-                Err(error) if matches!(
-                    error.sqlstate.as_str(),
-                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
-                )
-            ) && scope.table_index(qualifier.unwrap_or(name)).is_err()
-        }
-        Expr::WholeRow(name) => scope.table_index(name).is_err(),
+        Expr::Column { .. } | Expr::WholeRow(_) => !query_column(expression),
         Expr::SchemaColumn { .. } | Expr::RecursiveState { .. } | Expr::OuterAggregate { .. } => {
             false
         }
@@ -5903,12 +5926,12 @@ fn reads_no_query_column(
             prepared(expression)
         }
         Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } => {
-            prepared(expression) && reads_no_query_column(operand, scope, hooks)
+            prepared(expression) && reads_no_query_column(operand, query_column, hooks)
         }
         _ => {
             let mut free = true;
             let _ = super::subquery::walk_children(expression, &mut |child| {
-                free &= reads_no_query_column(child, scope, hooks);
+                free &= reads_no_query_column(child, query_column, hooks);
                 Ok(())
             });
             free
@@ -7607,16 +7630,12 @@ fn scan_source_mode<'a>(
                 }
                 return Ok(true);
             }
-            let count = match candidates {
-                Some(rowids) => rowids.len(),
-                None => storage.visible_row_count(slot, txid)?,
-            };
             let table_snapshot = storage.table_row_snapshot(slot, Some(arena))?;
-            let ordered = arena
-                .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
-                .map_err(|_| arena_full())?;
             let mut fill = 0usize;
-            if let Some(rowids) = candidates {
+            let ordered = if let Some(rowids) = candidates {
+                let ordered = arena
+                    .alloc_slice_with(rowids.len(), |_| None::<crate::storage::OrderedRowSnapshot>)
+                    .map_err(|_| arena_full())?;
                 for &rowid in rowids {
                     let Some(state) = storage.row_state(slot, rowid)? else {
                         continue;
@@ -7626,16 +7645,45 @@ fn scan_source_mode<'a>(
                         fill += 1;
                     }
                 }
+                ordered
             } else {
+                // A table whose visible rows fit `SINGLE_PASS_ROWS` is
+                // collected in one visibility pass; a larger one is counted
+                // first and collected into a slice of exactly that size.
+                let mut ordered = arena
+                    .alloc_slice_with(SINGLE_PASS_ROWS, |_| {
+                        None::<crate::storage::OrderedRowSnapshot>
+                    })
+                    .map_err(|_| arena_full())?;
+                let mut overflowed = false;
                 storage.for_each_row_state(slot, &mut |rowid, state| {
                     if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
+                        if fill == ordered.len() {
+                            overflowed = true;
+                            return Ok(core::ops::ControlFlow::Break(()));
+                        }
                         ordered[fill] = Some(table_snapshot.retain(rowid, &home)?);
                         fill += 1;
                     }
                     Ok(core::ops::ControlFlow::Continue(()))
                 })?;
-                debug_assert_eq!(fill, count, "visible count is stable");
-            }
+                if overflowed {
+                    let count = storage.visible_row_count(slot, txid)?;
+                    ordered = arena
+                        .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
+                        .map_err(|_| arena_full())?;
+                    fill = 0;
+                    storage.for_each_row_state(slot, &mut |rowid, state| {
+                        if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
+                            ordered[fill] = Some(table_snapshot.retain(rowid, &home)?);
+                            fill += 1;
+                        }
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })?;
+                    debug_assert_eq!(fill, count, "visible count is stable");
+                }
+                ordered
+            };
             // Spilled rows sort by rowid (their SST order — the physical order
             // they were written in); heap rows keep heap-offset order after
             // them, matching insertion order within each group.

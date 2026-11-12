@@ -6006,6 +6006,37 @@ enum ConflictOutcome<'a> {
     },
 }
 
+/// The subqueries of `ON CONFLICT DO UPDATE`'s condition and assignments,
+/// planned once for the statement.
+struct ConflictSubqueries<'a> {
+    values: super::eval::SubqueryValues<'a, 'a>,
+    executor: super::query::DmlSubqueries,
+}
+
+impl<'a> ConflictSubqueries<'a> {
+    fn new(
+        storage: &Storage,
+        txn: &TxnState,
+        on_conflict: Option<super::ast::OnConflict<'a>>,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let executor = super::query::DmlSubqueries::new(storage, txn.txid, txn.command_id());
+        let values = executor.values(
+            on_conflict.into_iter().flat_map(|conflict| {
+                conflict.update_where.into_iter().chain(
+                    conflict
+                        .update
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|(_, expression)| *expression),
+                )
+            }),
+            arena,
+        )?;
+        Ok(Self { values, executor })
+    }
+}
+
 /// Applies an ON CONFLICT clause to one candidate row, against the arbiter
 /// already resolved once for the statement.
 #[allow(clippy::too_many_arguments)]
@@ -6028,6 +6059,7 @@ fn handle_conflict<
     values: &[Datum<'a>],
     on_conflict: &Option<super::ast::OnConflict<'a>>,
     arbiter: &Arbiter<'a>,
+    conflict_subqueries: &ConflictSubqueries<'a>,
     checks: &ParsedChecks,
     view_check: Option<ViewCheck<'a>>,
     row_security_using: Option<super::query::RowSecurityPlan<'a>>,
@@ -6136,32 +6168,11 @@ where
             excluded: logical_excluded,
             outer,
         };
-        let mut subquery_expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
-        let mut subquery_expression_count = 0usize;
-        if let Some(condition) = oc.update_where {
-            subquery_expressions[subquery_expression_count] = Some(condition);
-            subquery_expression_count += 1;
-        }
-        for (_, expression) in assigns {
-            subquery_expressions[subquery_expression_count] = Some(expression);
-            subquery_expression_count += 1;
-        }
-        let subqueries = super::query::subquery_hooks(
-            &subquery_expressions[..subquery_expression_count],
-            storage,
-            txn.txid,
-            arena,
-            params,
-            Some(&crate::sql::sequence::SeqEval::new(
-                storage,
-                seq_session,
-                txn.txid,
-            )),
-        )?;
         let catalog = super::query::storage_catalog(storage, arena, txn.txid);
         let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
         let hooks = EvalHooks {
-            subs: Some(&subqueries),
+            subs: Some(&conflict_subqueries.values),
+            subquery_executor: Some(&conflict_subqueries.executor),
             catalog: Some(&catalog),
             sequences: Some(&sequences),
             ..NO_HOOKS
@@ -6266,7 +6277,8 @@ where
                 let catalog = super::query::storage_catalog(storage, arena, txn.txid);
                 let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
                 let hooks = EvalHooks {
-                    subs: Some(&subqueries),
+                    subs: Some(&conflict_subqueries.values),
+                    subquery_executor: Some(&conflict_subqueries.executor),
                     catalog: Some(&catalog),
                     sequences: Some(&sequences),
                     ..NO_HOOKS
@@ -67474,6 +67486,7 @@ fn finish_insert_row<'a, 'outer, 'snapshot, Definition0: crate::storage::Definit
     generated: &constraints::ParsedDefaults<'a>,
     statement: &Insert<'a>,
     arbiter: &Arbiter<'a>,
+    conflict_subqueries: &ConflictSubqueries<'a>,
     checks: &ParsedChecks<'a>,
     insert_check: Option<super::query::RowSecurityPlan<'a>>,
     view_check: Option<ViewCheck<'a>>,
@@ -67648,6 +67661,7 @@ where
                     &values[..definition.n_columns],
                     &statement.on_conflict,
                     arbiter,
+                    conflict_subqueries,
                     checks,
                     view_check,
                     conflict_using,
@@ -68298,6 +68312,18 @@ pub(crate) fn instead_of_view_dml<'a>(
                 Ok(rows) => rows,
                 Err(error) => return sql_fail(error),
             };
+            let view_subqueries =
+                super::query::DmlSubqueries::new(storage, txn.txid, txn.command_id());
+            let view_subs = match view_subqueries.values(
+                update
+                    .where_clause
+                    .into_iter()
+                    .chain(update.assignments.iter().map(|(_, expression)| *expression)),
+                arena,
+            ) {
+                Ok(subs) => subs,
+                Err(error) => return sql_fail(error),
+            };
             for bytes in rows.as_slice() {
                 let mut old = [Datum::Null; MAX_COLUMNS];
                 if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
@@ -68320,6 +68346,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                     let hooks = super::eval::EvalHooks {
                         catalog: Some(&catalog),
                         sequences: Some(&sequences),
+                        subs: Some(&view_subs),
+                        subquery_executor: Some(&view_subqueries),
                         ..super::eval::NO_HOOKS
                     };
                     let matched = match super::query::first_from_match(
@@ -68350,11 +68378,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                             }
                             Ok(())
                         },
-                        Some(&crate::sql::sequence::SeqEval::new(
-                            storage,
-                            seq_session,
-                            txn.txid,
-                        )),
+                        &hooks,
                     ) {
                         Ok(matched) => matched,
                         Err(error) => return sql_fail(error),
@@ -68369,6 +68393,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                     let hooks = EvalHooks {
                         catalog: Some(&catalog),
                         sequences: Some(&sequences),
+                        subs: Some(&view_subs),
+                        subquery_executor: Some(&view_subqueries),
                         ..NO_HOOKS
                     };
                     if let Some(predicate) = predicate {
@@ -68476,6 +68502,12 @@ pub(crate) fn instead_of_view_dml<'a>(
                 Ok(rows) => rows,
                 Err(error) => return sql_fail(error),
             };
+            let view_subqueries =
+                super::query::DmlSubqueries::new(storage, txn.txid, txn.command_id());
+            let view_subs = match view_subqueries.values(delete.where_clause, arena) {
+                Ok(subs) => subs,
+                Err(error) => return sql_fail(error),
+            };
             for bytes in rows.as_slice() {
                 let mut old = [Datum::Null; MAX_COLUMNS];
                 if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
@@ -68487,6 +68519,16 @@ pub(crate) fn instead_of_view_dml<'a>(
                     alias: delete.alias,
                 };
                 let matched = if let Some(using) = delete.using {
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(&sequences),
+                        subs: Some(&view_subs),
+                        subquery_executor: Some(&view_subqueries),
+                        ..NO_HOOKS
+                    };
                     match super::query::first_from_match(
                         storage,
                         using,
@@ -68497,11 +68539,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         params,
                         &context,
                         &mut |_| Ok(()),
-                        Some(&crate::sql::sequence::SeqEval::new(
-                            storage,
-                            seq_session,
-                            txn.txid,
-                        )),
+                        &hooks,
                     ) {
                         Ok(matched) => matched,
                         Err(error) => return sql_fail(error),
@@ -68513,6 +68551,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                     let hooks = EvalHooks {
                         catalog: Some(&catalog),
                         sequences: Some(&sequences),
+                        subs: Some(&view_subs),
+                        subquery_executor: Some(&view_subqueries),
                         ..NO_HOOKS
                     };
                     match row_matches_values(
@@ -68933,6 +68973,11 @@ where
         }
         None => None,
     };
+    let conflict_subqueries =
+        match ConflictSubqueries::new(storage, txn, statement.on_conflict, arena) {
+            Ok(subqueries) => subqueries,
+            Err(error) => return sql_fail(error),
+        };
     if let Some(updated_columns) = conflict_update_columns
         && let Err(error) = require_table_column_privilege_as(
             storage,
@@ -69294,6 +69339,7 @@ where
                 &generated_exprs,
                 statement,
                 &arbiter,
+                &conflict_subqueries,
                 &checks,
                 insert_check,
                 view_check,
@@ -69398,6 +69444,15 @@ where
     if let Err(error) = check_insert_values_shape(statement, n_targets) {
         return sql_fail(error);
     }
+    let statement_subqueries =
+        super::query::DmlSubqueries::new(storage, txn.txid, txn.command_id());
+    let subqueries = match statement_subqueries.values(
+        statement.rows.iter().flat_map(|row| row.iter().copied()),
+        arena,
+    ) {
+        Ok(subqueries) => subqueries,
+        Err(error) => return sql_fail(error),
+    };
     let mut inserted = 0u64;
     for row_exprs in statement.rows {
         // A column is "explicit" when the row supplies a non-DEFAULT value for
@@ -69427,31 +69482,13 @@ where
             // A per-row sequence evaluator (`nextval`/`setval` in a VALUES item
             // or a DEFAULT expression advance once per row). Scoped so its shared
             // `&storage` borrow ends before the row is written mutably below.
-            let mut subquery_expressions: [Option<&Expr>; MAX_COLUMNS] = [None; MAX_COLUMNS];
-            for (index, expression) in row_exprs.iter().enumerate() {
-                subquery_expressions[index] = Some(expression);
-            }
-            let subqueries = match super::query::subquery_hooks(
-                &subquery_expressions[..row_exprs.len()],
-                storage,
-                txn.txid,
-                arena,
-                params,
-                Some(&crate::sql::sequence::SeqEval::new(
-                    storage,
-                    seq_session,
-                    txn.txid,
-                )),
-            ) {
-                Ok(subqueries) => subqueries,
-                Err(error) => return sql_fail(error),
-            };
             let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
             let catalog = super::query::storage_catalog(storage, arena, txn.txid);
             let hooks = super::eval::EvalHooks {
                 catalog: Some(&catalog),
                 sequences: Some(&seq),
                 subs: Some(&subqueries),
+                subquery_executor: Some(&statement_subqueries),
                 ..super::eval::NO_HOOKS
             };
             for (i, expression) in row_exprs.iter().enumerate() {
@@ -69516,6 +69553,7 @@ where
             &generated_exprs,
             statement,
             &arbiter,
+            &conflict_subqueries,
             &checks,
             insert_check,
             view_check,
@@ -70270,36 +70308,16 @@ pub(crate) fn update<'a>(
         return sql_fail(error);
     }
 
-    let mut subquery_expressions = [None; MAX_COLUMNS + 1];
-    let mut subquery_expression_count = 0usize;
-    if let Some(expression) = statement.where_clause {
-        subquery_expressions[subquery_expression_count] = Some(expression);
-        subquery_expression_count += 1;
-    }
-    let mut assignment_correlated = [false; MAX_COLUMNS];
-    for (index, (_, expression)) in statement.assignments.iter().enumerate() {
-        assignment_correlated[index] = match super::query::expression_has_correlated_subquery(
-            expression, storage, txn.txid, arena,
-        ) {
-            Ok(correlated) => correlated,
-            Err(error) => return sql_fail(error),
-        };
-        if !assignment_correlated[index] {
-            subquery_expressions[subquery_expression_count] = Some(*expression);
-            subquery_expression_count += 1;
-        }
-    }
-    let subs = match super::query::subquery_hooks(
-        &subquery_expressions[..subquery_expression_count],
-        storage,
-        txn.txid,
+    let statement_subqueries =
+        super::query::DmlSubqueries::new(storage, txn.txid, txn.command_id());
+    let subs = match statement_subqueries.values(
+        statement.where_clause.into_iter().chain(
+            statement
+                .assignments
+                .iter()
+                .map(|(_, expression)| *expression),
+        ),
         arena,
-        params,
-        Some(&crate::sql::sequence::SeqEval::new(
-            storage,
-            seq_session,
-            txn.txid,
-        )),
     ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
@@ -70310,7 +70328,7 @@ pub(crate) fn update<'a>(
         group: None,
         aggs: None,
         subs: Some(&subs),
-        subquery_executor: None,
+        subquery_executor: Some(&statement_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -70615,6 +70633,16 @@ pub(crate) fn update<'a>(
                     }
                 }
                 let matched = {
+                    let from_sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let from_catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let from_hooks = super::eval::EvalHooks {
+                        subs: Some(&subs),
+                        subquery_executor: Some(&statement_subqueries),
+                        catalog: Some(&from_catalog),
+                        sequences: Some(&from_sequences),
+                        ..super::eval::NO_HOOKS
+                    };
                     let r = super::query::first_from_match(
                         storage,
                         from,
@@ -70644,28 +70672,9 @@ pub(crate) fn update<'a>(
                                 );
                                 let catalog =
                                     super::query::storage_catalog(storage, arena, txn.txid);
-                                let local_subs;
-                                let active_subs = if assignment_correlated[a] {
-                                    let expressions = [Some(*expression)];
-                                    local_subs = super::query::subquery_hooks_outer(
-                                        &expressions,
-                                        storage,
-                                        txn.txid,
-                                        arena,
-                                        params,
-                                        combined,
-                                        Some(&crate::sql::sequence::SeqEval::new(
-                                            storage,
-                                            seq_session,
-                                            txn.txid,
-                                        )),
-                                    )?;
-                                    &local_subs
-                                } else {
-                                    &subs
-                                };
                                 let hooks = super::eval::EvalHooks {
-                                    subs: Some(active_subs),
+                                    subs: Some(&subs),
+                                    subquery_executor: Some(&statement_subqueries),
                                     catalog: Some(&catalog),
                                     sequences: Some(&sequences),
                                     ..super::eval::NO_HOOKS
@@ -70695,11 +70704,7 @@ pub(crate) fn update<'a>(
                             }
                             Ok(())
                         },
-                        Some(&crate::sql::sequence::SeqEval::new(
-                            storage,
-                            seq_session,
-                            txn.txid,
-                        )),
+                        &from_hooks,
                     );
                     match r {
                         Ok(matched) => matched,
@@ -70733,31 +70738,9 @@ pub(crate) fn update<'a>(
                     }
                     let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
                     let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                    let local_subs;
-                    let active_subs = if assignment_correlated[a] {
-                        let expressions = [Some(*expression)];
-                        local_subs = match super::query::subquery_hooks_outer(
-                            &expressions,
-                            storage,
-                            txn.txid,
-                            arena,
-                            params,
-                            &context,
-                            Some(&crate::sql::sequence::SeqEval::new(
-                                storage,
-                                seq_session,
-                                txn.txid,
-                            )),
-                        ) {
-                            Ok(subs) => subs,
-                            Err(error) => return sql_fail(error),
-                        };
-                        &local_subs
-                    } else {
-                        &subs
-                    };
                     let hooks = super::eval::EvalHooks {
-                        subs: Some(active_subs),
+                        subs: Some(&subs),
+                        subquery_executor: Some(&statement_subqueries),
                         catalog: Some(&catalog),
                         sequences: Some(&seq),
                         ..super::eval::NO_HOOKS
@@ -71396,18 +71379,9 @@ pub(crate) fn delete<'a>(
         return sql_fail(error);
     }
 
-    let subs = match super::query::subquery_hooks(
-        &[statement.where_clause],
-        storage,
-        txn.txid,
-        arena,
-        params,
-        Some(&crate::sql::sequence::SeqEval::new(
-            storage,
-            seq_session,
-            txn.txid,
-        )),
-    ) {
+    let statement_subqueries =
+        super::query::DmlSubqueries::new(storage, txn.txid, txn.command_id());
+    let subs = match statement_subqueries.values(statement.where_clause, arena) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -71417,7 +71391,7 @@ pub(crate) fn delete<'a>(
         group: None,
         aggs: None,
         subs: Some(&subs),
-        subquery_executor: None,
+        subquery_executor: Some(&statement_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -79074,6 +79048,30 @@ fn dml_leaf_slots_for<'a>(
     Ok(&slots[..n])
 }
 
+/// Whether a column or whole-row reference in a single-table `UPDATE` or
+/// `DELETE` names its target row. Without an enclosing scope every name is
+/// the target's; with one, a name the target lacks belongs to that scope.
+fn dml_target_column<Definition0: crate::storage::DefinitionBacking>(
+    expression: &Expr<'_>,
+    def: &crate::storage::TableDefinition<Definition0>,
+    alias: Option<&str>,
+    enclosed: bool,
+) -> bool {
+    let target = alias.unwrap_or(def.name.as_str());
+    match expression {
+        Expr::Column {
+            qualifier: None,
+            name,
+        } => !enclosed || def.column_index(name).is_some(),
+        Expr::Column {
+            qualifier: Some(qualifier),
+            ..
+        } => !enclosed || *qualifier == target,
+        Expr::WholeRow(name) => !enclosed || *name == target,
+        _ => true,
+    }
+}
+
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
 pub(super) fn collect_matches<'a>(
     storage: &Storage,
@@ -79094,6 +79092,18 @@ pub(super) fn collect_matches<'a>(
     scratch.clear();
     let mut images = DmlRowImages::new(arena);
     let def = (*storage.table_def(table_index, txid)).clone();
+    let target_column =
+        |expression: &Expr<'_>| dml_target_column(expression, &def, alias, transition.is_some());
+    if !super::query::one_time_filter_passes_by(
+        where_clause,
+        &target_column,
+        arena,
+        params,
+        hooks,
+        transition,
+    )? {
+        return images.finish();
+    }
     if def.kind == crate::storage::TableKind::Foreign {
         images.capture_layout(table_index, &def, &def, capture, arena, storage, txid)?;
         crate::sql::foreign::visit_mutable_rows(
@@ -79259,6 +79269,18 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
     let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
     let mut images = DmlRowImages::new(arena);
+    // Every column counts as the statement's: the target's and the FROM
+    // items' names are not told apart here.
+    if !super::query::one_time_filter_passes_by(
+        where_clause,
+        &|_| true,
+        arena,
+        params,
+        hooks,
+        None,
+    )? {
+        return images.finish();
+    }
     if def.kind == crate::storage::TableKind::Foreign {
         images.capture_layout(table_index, def, def, capture, arena, storage, txid)?;
         crate::sql::foreign::visit_mutable_rows(
@@ -79297,7 +79319,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                     params,
                     &context,
                     &mut |_| Ok(()),
-                    None,
+                    hooks,
                 )? {
                     scratch
                         .push(PhysicalRow::Foreign {
@@ -79365,7 +79387,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                             params,
                             &context,
                             &mut |_| Ok(()),
-                            None,
+                            hooks,
                         )
                     })();
                     // SAFETY: joined predicates retain no decoded values or front scratch.
@@ -79424,6 +79446,18 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
     let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
     let mut images = DmlRowImages::new(arena);
+    // Every column counts as the statement's: the target's and the FROM
+    // items' names are not told apart here.
+    if !super::query::one_time_filter_passes_by(
+        where_clause,
+        &|_| true,
+        arena,
+        params,
+        hooks,
+        None,
+    )? {
+        return images.finish();
+    }
     if def.kind == crate::storage::TableKind::Foreign {
         images.capture_layout(table_index, def, def, capture, arena, storage, txid)?;
         crate::sql::foreign::visit_mutable_rows(
@@ -79466,7 +79500,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                     params,
                     &scope,
                     &mut |_| Ok(()),
-                    None,
+                    hooks,
                 )? {
                     scratch
                         .push(PhysicalRow::Foreign {
@@ -79536,7 +79570,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                             params,
                             &scope,
                             &mut |_| Ok(()),
-                            None,
+                            hooks,
                         )
                     })();
                     // SAFETY: joined predicates retain no decoded values or front scratch.

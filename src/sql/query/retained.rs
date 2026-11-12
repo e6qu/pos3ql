@@ -3687,7 +3687,8 @@ impl<'a> RetainedSelect<'a> {
             matches!(self.plan.bounds(), RowBounds::Active { .. }),
             "statement bounds must be prepared"
         );
-        if self.filtered_out {
+        // `LIMIT 0`, or a filter that was not true, reads no input.
+        if self.filtered_out || self.limit_reached() {
             return Ok(false);
         }
         let first = self.subqueries.is_none();
@@ -3698,6 +3699,7 @@ impl<'a> RetainedSelect<'a> {
                 self.sublinks,
                 storage,
                 txid,
+                None,
                 state_arena,
             )
             .map_err(|_| {

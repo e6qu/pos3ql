@@ -311,7 +311,15 @@ analysed, so `'zz' IN (SELECT int_column ...)` fails even when no row reaches
 it. A `WHERE` conjunct that reads no column of its query runs once before
 the scan, as PostgreSQL's one-time filter: `SELECT id, payload FROM orders
 WHERE id > (SELECT max(id) - 1000 FROM orders)` streams, and a false one
-returns no rows without reading any. A wait inside a subquery runs it again. A sorted or grouped stream keeps
+returns no rows without reading any. `UPDATE`, `DELETE`, `INSERT ... VALUES`
+and `ON CONFLICT DO UPDATE` plan their subqueries the same way
+(`DmlSubqueries` in `src/sql/query/subquery.rs`): an uncorrelated one runs
+when first read, a correlated one (reading the target, `FROM`/`USING` or
+`excluded` row) for each row that reads it, and their one-time filters run
+before the target scan. Every one reads as of the statement's command, so a
+subquery first run after the statement wrote rows does not see them. A
+FROM-less `SELECT` (an `INSERT ... SELECT` source included) also runs its
+subqueries when first read. A wait inside a subquery runs it again. A sorted or grouped stream keeps
 them too: they count as stable, as PostgreSQL's initPlans are, so a sort
 evaluates them before it orders the rows. Correlated subqueries, and
 subqueries in a `UNION ALL` query or in a declared cursor, still spool or

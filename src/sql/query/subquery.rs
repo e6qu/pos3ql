@@ -2309,7 +2309,7 @@ pub(super) fn prepare_outer_subqueries<'a>(
         initplans: None,
         bindings: &[],
     };
-    base.initplans = UncorrelatedSubqueries::plans(plans.as_slice(), storage, txid, arena)?;
+    base.initplans = UncorrelatedSubqueries::plans(plans.as_slice(), storage, txid, None, arena)?;
     base.bindings = bind_correlated_subqueries(corr.as_slice(), storage, txid, arena, row_types)?;
     Ok(OuterSubs {
         base,
@@ -2323,6 +2323,9 @@ pub(super) struct UncorrelatedSubqueries {
     /// The engine's storage, which outlives every statement and reader.
     storage: *const Storage,
     txid: u32,
+    /// The command whose own writes a data-modifying statement's subqueries
+    /// do not see, however late they first run.
+    command: Option<u32>,
 }
 
 impl UncorrelatedSubqueries {
@@ -2331,6 +2334,7 @@ impl UncorrelatedSubqueries {
         nodes: &[&'a Expr<'a>],
         storage: &Storage,
         txid: u32,
+        command: Option<u32>,
         arena: &'a Arena,
     ) -> Result<Option<InitPlans<'a>>, SqlError> {
         if nodes.is_empty() {
@@ -2346,7 +2350,11 @@ impl UncorrelatedSubqueries {
                 .map_err(|_| arena_full())?;
         }
         let runner: &'a Self = arena
-            .alloc(Self { storage, txid })
+            .alloc(Self {
+                storage,
+                txid,
+                command,
+            })
             .map_err(|_| arena_full())?;
         Ok(Some(InitPlans {
             plans: plans.as_slice(),
@@ -2368,6 +2376,9 @@ impl InitPlanRunner for UncorrelatedSubqueries {
         // and stays immutable for this call; the result is kept in the
         // arena before any borrow of it escapes.
         let storage: &'a Storage = unsafe { &*self.storage };
+        let _snapshot = self
+            .command
+            .map(|command| storage.dml_expression_snapshot(command));
         let values = eval_subquery_nodes(
             &[node],
             storage,
@@ -4486,6 +4497,94 @@ pub(super) fn detach_subquery_values<'a>(
         initplans: None,
         bindings: &[],
     })
+}
+
+/// The subqueries of a data-modifying statement's expressions. Each runs
+/// when an expression first reads it, as PostgreSQL's initPlans and subplans
+/// do: an uncorrelated one once, keeping its value for the statement, and a
+/// correlated one for each row that reads it. All of them read the tables as
+/// of the statement's start, so one first run after the statement has
+/// written rows does not see them.
+pub(crate) struct DmlSubqueries {
+    /// The engine's storage, which outlives every statement. The statement
+    /// writes through its own exclusive borrow between evaluations; this
+    /// executor reads only while an expression is evaluated, when no write
+    /// is in progress.
+    storage: *const Storage,
+    txid: u32,
+    command: u32,
+}
+
+impl DmlSubqueries {
+    pub(crate) fn new(storage: &Storage, txid: u32, command: u32) -> Self {
+        Self {
+            storage,
+            txid,
+            command,
+        }
+    }
+
+    /// Lazy plans for the uncorrelated subqueries of `exprs`; the correlated
+    /// ones run through this executor.
+    pub(crate) fn values<'a>(
+        &self,
+        exprs: impl IntoIterator<Item = &'a Expr<'a>>,
+        arena: &'a Arena,
+    ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+        // SAFETY: see the field invariant; no write is in progress.
+        let storage: &'a Storage = unsafe { &*self.storage };
+        lazy_subqueries(exprs, storage, self.txid, Some(self.command), arena)
+    }
+}
+
+/// Lazy plans for the uncorrelated subqueries of `exprs`, each run when an
+/// expression first reads it and kept for the rest of the statement. The
+/// correlated ones are left to the evaluation's subquery executor, which
+/// runs them for each row that reads them. `command` is the data-modifying
+/// command whose own writes the plans do not see.
+pub(super) fn lazy_subqueries<'a>(
+    exprs: impl IntoIterator<Item = &'a Expr<'a>>,
+    storage: &'a Storage,
+    txid: u32,
+    command: Option<u32>,
+    arena: &'a Arena,
+) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    let mut nodes = ArenaList::new(arena);
+    for expression in exprs {
+        collect_subqueries(expression, &mut nodes)?;
+    }
+    let mut plans = ArenaList::new(arena);
+    for &node in nodes.as_slice() {
+        if !subquery_node_correlated(node, storage, txid, arena)? {
+            plans.push(node).map_err(|_| arena_full())?;
+        }
+    }
+    Ok(SubqueryValues {
+        scalars: &[],
+        lists: &[],
+        initplans: UncorrelatedSubqueries::plans(plans.as_slice(), storage, txid, command, arena)?,
+        bindings: &[],
+    })
+}
+
+impl super::super::eval::SubqueryExecution for DmlSubqueries {
+    fn evaluate<'a>(
+        &self,
+        expression: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        outer: &dyn ColumnLookup<'a>,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    ) -> Result<super::super::eval::SubqueryResult<'a>, SqlError> {
+        // SAFETY: see the field invariant; an expression is being evaluated.
+        let storage: &Storage = unsafe { &*self.storage };
+        let _snapshot = storage.dml_expression_snapshot(self.command);
+        ProceduralSubqueries {
+            storage,
+            txid: self.txid,
+        }
+        .evaluate(expression, arena, params, outer, sequences)
+    }
 }
 
 pub(crate) struct ProceduralSubqueries<'s> {

@@ -59,7 +59,8 @@ use scan::{
 };
 pub(crate) use scan::{
     IndexAccessPlan, OrderedIndexAccessPlan, dml_index_access_plan, dml_indexed_candidates,
-    index_access_plan, ordered_index_access_plan, parameterized_index_access_plan,
+    index_access_plan, one_time_filter_passes_by, ordered_index_access_plan,
+    parameterized_index_access_plan,
 };
 pub(crate) use scan::{
     RowSecurityExpression, RowSecurityPlan, conjoin_row_security, plan_row_security,
@@ -838,10 +839,12 @@ use plan::{postpone_cost, reorder_qual, simplify_qual, where_passes};
 mod subquery;
 #[cfg(test)]
 pub(crate) use subquery::subquery_analyses;
-pub(crate) use subquery::{ProceduralSubqueries, SubqueryBinding, subquery_expression_type};
+pub(crate) use subquery::{
+    DmlSubqueries, ProceduralSubqueries, SubqueryBinding, subquery_expression_type,
+};
 use subquery::{
-    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
-    prepare_outer_subqueries, subquery_witness,
+    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, lazy_subqueries,
+    merge_correlated, prepare_outer_subqueries, subquery_witness,
 };
 pub(crate) use subquery::{expression_has_correlated_subquery, subquery_hooks_outer};
 pub use subquery::{prepare_subqueries, subquery_hooks};
@@ -7189,7 +7192,7 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<AggregateHookData<'a>>, SqlError> {
     let pass = match statement.where_clause {
-        Some(w) => where_passes(w, arena, params, row, hooks)?,
+        Some(w) => fromless_where_passes(w, arena, params, row, hooks)?,
         None => true,
     };
     if !statement.group_by.is_empty() && !pass {
@@ -10568,11 +10571,27 @@ fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<srf::ProjectSet<'a>, SqlError> {
     if let Some(predicate) = statement.where_clause
-        && !where_passes(predicate, arena, params, row, hooks)?
+        && !fromless_where_passes(predicate, arena, params, row, hooks)?
     {
         return Ok(srf::ProjectSet::empty());
     }
     prepare_project_set(statement.items, storage, txid, arena, params, row, hooks)
+}
+
+/// The `WHERE` of a query's one virtual row. PostgreSQL folds a condition
+/// with a constant-false conjunct to false before planning, so none of its
+/// other conjuncts runs.
+fn fromless_where_passes<'a, R: ColumnLookup<'a>>(
+    predicate: &Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<bool, SqlError> {
+    if plan_time_bool(predicate, arena) == Some(false) {
+        return Ok(false);
+    }
+    where_passes(predicate, arena, params, row, hooks)
 }
 
 /// FROM-less `SELECT` (one virtual row, no columns). Item and WHERE
@@ -10705,15 +10724,12 @@ pub(crate) fn constant_select_resumable<'a>(
             sub_exprs[1 + i] = Some(expression);
         }
     }
-    let subs = match prepare_subqueries(
-        &sub_exprs,
+    let subs = match lazy_subqueries(
+        sub_exprs.iter().flatten().copied(),
         storage,
         txid,
-        arena,
-        params,
-        SUBQUERY_DEPTH,
         None,
-        seq,
+        arena,
     ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
@@ -10756,7 +10772,7 @@ pub(crate) fn constant_select_resumable<'a>(
         group: None,
         aggs: None,
         subs: Some(&subs),
-        subquery_executor: None,
+        subquery_executor: Some(&bound_queries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -11507,22 +11523,20 @@ fn select_into_rows_mode<'a>(
                     sub_exprs[2 + i] = Some(expression);
                 }
             }
-            let subs = prepare_subqueries(
-                &sub_exprs,
+            let subs = lazy_subqueries(
+                sub_exprs.iter().flatten().copied(),
                 storage,
                 txid,
+                None,
                 arena,
-                params,
-                SUBQUERY_DEPTH,
-                outer,
-                seq,
             )?;
+            let fromless_queries = ProceduralSubqueries { storage, txid };
             let hooks = EvalHooks {
                 group: None,
                 aggs: None,
                 sequences: seq,
                 subs: Some(&subs),
-                subquery_executor: None,
+                subquery_executor: Some(&fromless_queries),
                 windows: None,
                 catalog: Some(&catalog),
                 srf_index: None,
@@ -11712,21 +11726,19 @@ fn select_into_rows_mode<'a>(
         let cols: &dyn ColumnLookup = outer.unwrap_or(&super::eval::NoColumns);
         // FROM-less: one row (or zero, when WHERE is false), unless a
         // set-returning function in the list expands it to several.
-        let subs = prepare_subqueries(
-            sub_exprs,
+        let subs = lazy_subqueries(
+            sub_exprs.iter().flatten().copied(),
             storage,
             txid,
+            None,
             arena,
-            params,
-            SUBQUERY_DEPTH,
-            outer,
-            seq,
         )?;
+        let fromless_queries = ProceduralSubqueries { storage, txid };
         let hooks = EvalHooks {
             group: None,
             aggs: None,
             subs: Some(&subs),
-            subquery_executor: None,
+            subquery_executor: Some(&fromless_queries),
             windows: None,
             catalog: Some(&catalog),
             srf_index: None,
@@ -14508,6 +14520,8 @@ fn expr_contains_node<'a>(e: &'a Expr<'a>, target: *const Expr<'a>) -> bool {
 /// `from`, resolving the target row's columns through `target` (as the outer
 /// scope), and invokes `on_match` with a combined lookup for the FIRST joined
 /// row that satisfies `where_clause`. Returns whether any match was found.
+/// `hooks` carries the statement's subqueries: the uncorrelated ones planned
+/// once, and an executor for the ones reading the target or FROM rows.
 #[allow(clippy::too_many_arguments)]
 pub fn first_from_match<'a>(
     storage: &'a Storage,
@@ -14519,7 +14533,7 @@ pub fn first_from_match<'a>(
     params: &[Datum<'a>],
     target: &dyn ColumnLookup<'a>,
     on_match: &mut dyn FnMut(&dyn ColumnLookup<'a>) -> Result<(), SqlError>,
-    sequences: Option<&dyn SequenceAccess>,
+    hooks: &EvalHooks<'_, 'a>,
 ) -> Result<bool, SqlError> {
     let scope = QueryScope::resolve_exec_outer(
         storage,
@@ -14528,41 +14542,9 @@ pub fn first_from_match<'a>(
         txid,
         arena,
         params,
-        sequences,
+        hooks.sequences,
         Some(target),
     )?;
-    let subquery_expressions = arena
-        .alloc_slice_with(1 + 2 * scope.n, |_| None)
-        .map_err(|_| arena_full())?;
-    subquery_expressions[0] = where_clause;
-    collect_table_sample_expressions(from, &mut subquery_expressions[1..]);
-    let subs = subquery_hooks(
-        subquery_expressions,
-        storage,
-        txid,
-        arena,
-        params,
-        sequences,
-    )?;
-    let catalog = StorageCatalog {
-        storage,
-        routine_workspace: arena,
-        txid,
-        invocations: None,
-        statement_arena: None,
-    };
-    let hooks = EvalHooks {
-        group: None,
-        aggs: None,
-        subs: Some(&subs),
-        subquery_executor: None,
-        windows: None,
-        catalog: Some(&catalog),
-        srf_index: None,
-        project_sets: None,
-        sequences,
-        merge_action: None,
-    };
     let mut found = false;
     let mut expressions = [&Expr::Null; MAX_PROJ + 1];
     let mut expression_count = 0usize;
@@ -14584,7 +14566,7 @@ pub fn first_from_match<'a>(
         where_clause,
         arena,
         params,
-        &hooks,
+        hooks,
         Some(target),
         pax_columns,
         &retain_match,

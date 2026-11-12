@@ -505,12 +505,22 @@ fn unique_violation(
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     columns: &[u16],
     values: &[Datum],
+    site: UniqueViolationSite,
 ) -> SqlError {
     let names = columns
         .iter()
         .map(|column| def.columns()[*column as usize].name.as_str());
     let keys = columns.iter().map(|column| values[*column as usize]);
-    described_unique_violation(name, def, &mut { names }, &mut { keys })
+    described_unique_violation(name, def, &mut { names }, &mut { keys }, site)
+}
+
+/// Where a duplicate key was found, which picks PostgreSQL's wording.
+#[derive(Clone, Copy)]
+enum UniqueViolationSite {
+    /// A written row matches an existing key.
+    Write,
+    /// Building or rebuilding the index found two rows with one key.
+    IndexBuild,
 }
 
 fn described_unique_violation<'v>(
@@ -518,8 +528,13 @@ fn described_unique_violation<'v>(
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     names: &mut dyn Iterator<Item = &str>,
     keys: &mut dyn Iterator<Item = Datum<'v>>,
+    site: UniqueViolationSite,
 ) -> SqlError {
-    let detail = match key_detail(names, keys, format_args!(" already exists.")) {
+    let suffix = match site {
+        UniqueViolationSite::Write => " already exists.",
+        UniqueViolationSite::IndexBuild => " is duplicated.",
+    };
+    let detail = match key_detail(names, keys, format_args!("{suffix}")) {
         Ok(detail) => detail,
         Err(error) => return error,
     };
@@ -531,11 +546,18 @@ fn described_unique_violation<'v>(
             name.as_str(),
         ),
     );
-    sql_err!(
-        sqlstate::UNIQUE_VIOLATION,
-        "duplicate key value violates unique constraint \"{}\"",
-        name.as_str()
-    )
+    match site {
+        UniqueViolationSite::Write => sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "duplicate key value violates unique constraint \"{}\"",
+            name.as_str()
+        ),
+        UniqueViolationSite::IndexBuild => sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "could not create unique index \"{}\"",
+            name.as_str()
+        ),
+    }
 }
 
 /// Whether the row `rowid`'s committed key equals `values` under this index's
@@ -848,6 +870,7 @@ fn enforce_expression_index_uniqueness<'a>(
     nulls_not_distinct: bool,
     name: SqlName,
     predicate: Option<&'a Expr<'a>>,
+    site: UniqueViolationSite,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let decoder =
@@ -866,7 +889,7 @@ fn enforce_expression_index_uniqueness<'a>(
             expression_texts[position].unwrap_or(def.columns()[*column as usize].name.as_str())
         });
         let values = keys[..columns.len()].iter().copied();
-        described_unique_violation(name, def, &mut { names }, &mut { values })
+        described_unique_violation(name, def, &mut { names }, &mut { values }, site)
     };
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
         if let Some(predicate) = predicate
@@ -958,6 +981,11 @@ fn enforce_key_uniqueness(
     name: SqlName,
     source: UniqueKeySource,
 ) -> Result<(), SqlError> {
+    // Reading every row validates a key being built or rebuilt.
+    let site = match source {
+        UniqueKeySource::Cache => UniqueViolationSite::Write,
+        UniqueKeySource::Rows => UniqueViolationSite::IndexBuild,
+    };
     if !nulls_not_distinct && columns.iter().any(|&c| values[c as usize].is_null()) {
         return Ok(());
     }
@@ -973,6 +1001,7 @@ fn enforce_key_uniqueness(
             txid,
             def,
             name,
+            site,
         )?;
         return pending_scan_uniqueness(
             storage,
@@ -985,6 +1014,7 @@ fn enforce_key_uniqueness(
             txid,
             def,
             name,
+            site,
         );
     }
     if storage.has_pending_table_def(table_index, txid) {
@@ -1000,6 +1030,7 @@ fn enforce_key_uniqueness(
                 txid,
                 def,
                 name,
+                site,
             )?;
         }
         return pending_scan_uniqueness(
@@ -1013,6 +1044,7 @@ fn enforce_key_uniqueness(
             txid,
             def,
             name,
+            site,
         );
     }
 
@@ -1073,7 +1105,7 @@ fn enforce_key_uniqueness(
                     ),
                 };
                 match matched {
-                    Ok(true) => result = Err(unique_violation(name, def, columns, values)),
+                    Ok(true) => result = Err(unique_violation(name, def, columns, values, site)),
                     Ok(false) => {}
                     Err(e) => result = Err(e),
                 }
@@ -1094,6 +1126,7 @@ fn enforce_key_uniqueness(
             txid,
             def,
             name,
+            site,
         )?;
     }
     pending_scan_uniqueness(
@@ -1107,6 +1140,7 @@ fn enforce_key_uniqueness(
         txid,
         def,
         name,
+        site,
     )
 }
 
@@ -1130,6 +1164,7 @@ fn committed_scan_uniqueness(
     txid: u32,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     name: SqlName,
+    site: UniqueViolationSite,
 ) -> Result<(), SqlError> {
     let decoder =
         crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
@@ -1157,7 +1192,7 @@ fn committed_scan_uniqueness(
                 )
             })?;
             if matched {
-                return Err(unique_violation(name, def, columns, values));
+                return Err(unique_violation(name, def, columns, values, site));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -1181,6 +1216,7 @@ fn pending_scan_uniqueness(
     txid: u32,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     name: SqlName,
+    site: UniqueViolationSite,
 ) -> Result<(), SqlError> {
     let decoder =
         crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
@@ -1213,7 +1249,7 @@ fn pending_scan_uniqueness(
                     "statement is waiting for a concurrent unique-key writer"
                 ));
             }
-            return Err(unique_violation(name, def, columns, values));
+            return Err(unique_violation(name, def, columns, values, site));
         }
         Ok(ControlFlow::Continue(()))
     })?;
@@ -1280,7 +1316,13 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 matches(&other)
             })?;
             if matched {
-                return Err(unique_violation(name, def, columns, values));
+                return Err(unique_violation(
+                    name,
+                    def,
+                    columns,
+                    values,
+                    UniqueViolationSite::Write,
+                ));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -1307,7 +1349,13 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 "statement is waiting for a concurrent unique-key writer"
             ));
         }
-        Err(unique_violation(name, def, columns, values))
+        Err(unique_violation(
+            name,
+            def,
+            columns,
+            values,
+            UniqueViolationSite::Write,
+        ))
     })?;
     Ok(())
 }
@@ -1821,6 +1869,11 @@ pub fn check_unique_indexes(
                 index.nulls_not_distinct,
                 name,
                 predicate,
+                if matches!(check, UniqueIndexCheck::Rebuild { .. }) {
+                    UniqueViolationSite::IndexBuild
+                } else {
+                    UniqueViolationSite::Write
+                },
                 arena,
             )?;
             continue;

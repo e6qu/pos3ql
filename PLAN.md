@@ -125,13 +125,22 @@ is owned.
     subqueries and the other scalar ones are analysed again for each outer
     row. Over 2000 outer rows and a 50-row inner table in a debug build on a
     loaded 8-core workstation, `sum((SELECT max(v) ... WHERE v <= o.id))`
-    takes 1.4 s, the matching `EXISTS` 1.1 s and `IN` 1.3 s (3.5 s, 3.0 s and
+    takes 1.2 s, the matching `EXISTS` 1.0 s and `IN` 1.1 s (1.4 s, 1.1 s and 1.3 s
+    before single-pass visibility collection; 3.5 s, 3.0 s and
     3.5 s before comparisons of non-collatable values skipped collation
     resolution and scans stopped rebuilding each row's column types), where
     PostgreSQL takes about 1 to 9 ms. In the `EXISTS` profile the inner scan's
-    visibility passes (counting, then collecting visible rows before sorting
-    them into insertion order) take a third, the comparison a third, and the
-    per-row scope and subquery preparation under a tenth. Rewinding a
+    visibility passes took a third, the comparison a third, and the per-row
+    scope and subquery preparation under a tenth; a scan now collects up to
+    64 visible rows in one visibility pass before sorting them into
+    insertion order, and counts a larger table's rows first. A grouped query
+    reclaims each input row's subquery values once a plain-data aggregate
+    (`count`, `sum`/`avg` of integers, floats or intervals, fixed-width
+    `min`/`max`, `bool_and`, float statistics) folds them; other aggregates,
+    and a derived table materialized in local mode, keep every row's
+    evaluation scratch until the statement ends, so a correlated subquery
+    over about 60000 such rows exhausts a 32 MiB `sql_arena_bytes` with
+    `54000`. Rewinding a
     retained child tree per outer row removes the analysis,
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
@@ -336,16 +345,17 @@ rejected with `0A000`, and a label-qualified loop variable (`<<l>> FOR i IN
 1..2 LOOP ... l.i`) fails as an unknown table; exception conditions are
 limited to a fixed list of names (`SQLSTATE` codes work for every condition);
 trigger functions cannot open cursors (`OPEN`, cursor `FOR` loops) and fail
-with `0A000`. `UPDATE` and `DELETE` run their
-subqueries once per statement, so a subquery correlated with the target table
-fails as a missing FROM-clause entry, and an aggregate of the target table in
-one is not rejected as PostgreSQL's `aggregate functions are not allowed in
-UPDATE`. Their subqueries, and those of `INSERT ... SELECT`, run before
-the first row is written, where PostgreSQL runs an uncorrelated one at its
-first use: `UPDATE t SET v = (SELECT 1/x FROM z) WHERE id > 5` fails with
-`22012` here and updates no rows in PostgreSQL. Running them later needs row
-visibility by command within a transaction, so a subquery run after the
-statement's first write still reads the rows as they were before it. A SQL function whose earlier
+with `0A000`. A subquery in `ON CONFLICT DO UPDATE` that reads `excluded`
+(`SET v = (SELECT y FROM z WHERE x = excluded.id)`) fails as a missing
+FROM-clause entry: the dependency analysis of conflict assignments resolves
+`excluded` only outside subqueries. An aggregate of the target table inside
+an `UPDATE` or `DELETE` subquery (`SET v = (SELECT sum(t.v) FROM z)`) is not
+rejected as PostgreSQL's `aggregate functions are not allowed in UPDATE`.
+`RETURNING *` in `UPDATE ... FROM` and `DELETE ... USING` returns only the
+target's columns, where PostgreSQL appends the `FROM` items' columns. `ALTER TABLE ... ADD PRIMARY KEY` or `ADD UNIQUE` over duplicate rows
+reports a write's `duplicate key value violates unique constraint` and `Key
+... already exists.` where PostgreSQL reports `could not create unique index`
+and `Key ... is duplicated.` (`CREATE UNIQUE INDEX` and `REINDEX` match). A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

@@ -245,3 +245,100 @@ fn rows_compare_with_row_subqueries_and_literal_fields() {
         &["ERROR 22P02: invalid input syntax for type integer: \"zz\""],
     );
 }
+
+/// A correlated subquery run for each of 100000 input rows reclaims its
+/// allocations after each row folds into a plain-data aggregate or passes the
+/// condition, so a 2 MiB statement arena holds the whole statement.
+#[test]
+fn per_row_correlated_subqueries_reclaim_their_allocations() {
+    let (mut e, mut b) = test_engine();
+    let mut t = TxnState::new(&mut b, 256).unwrap();
+    for sql in [
+        "CREATE TABLE pr_big (id int)",
+        "CREATE TABLE pr_z (x int)",
+        "INSERT INTO pr_big SELECT g FROM generate_series(1, 100) g",
+        "INSERT INTO pr_z VALUES (1)",
+    ] {
+        run_txn(&mut e, &mut b, &mut t, sql);
+    }
+    let subquery = "(SELECT x FROM pr_z WHERE x <= pr_big.id)";
+    let from = "pr_big, generate_series(1, 1000) g";
+    for (sql, expected) in [
+        (
+            format!("SELECT sum({subquery}) FROM {from}"),
+            vec!["100000"],
+        ),
+        (
+            format!("SELECT max({subquery}) FROM {from} GROUP BY g % 2 ORDER BY 1"),
+            vec!["1", "1"],
+        ),
+        (
+            format!("SELECT count(*) FROM {from} WHERE {subquery} = 1 GROUP BY g % 2"),
+            vec!["50000", "50000"],
+        ),
+    ] {
+        assert_eq!(rows(&mut e, &mut b, &mut t, &sql), expected, "{sql}");
+    }
+}
+
+/// Data-modifying statements run their subqueries when first read, and every
+/// one reads as of the statement's start. Expected values were read from
+/// PostgreSQL 18.6 (`initdb --locale=C`).
+#[test]
+fn dml_subqueries_run_when_first_read_as_of_the_statement() {
+    let (mut e, mut b) = test_engine();
+    let mut t = TxnState::new(&mut b, 256).unwrap();
+    for sql in [
+        "CREATE TABLE dq_t (id int PRIMARY KEY, v int)",
+        "CREATE TABLE dq_z (x int, y int)",
+        "CREATE TABLE dq_zero (x int)",
+        "INSERT INTO dq_t VALUES (1, 10), (2, 20), (3, 30)",
+        "INSERT INTO dq_z VALUES (1, 5), (3, 7)",
+        "INSERT INTO dq_zero VALUES (0)",
+    ] {
+        run_txn(&mut e, &mut b, &mut t, sql);
+    }
+    let mut check = |sql: &str, expected: &[&str]| {
+        assert_eq!(rows(&mut e, &mut b, &mut t, sql), expected, "{sql}");
+    };
+    let zero = "ERROR 22012: division by zero";
+    check(
+        "UPDATE dq_t SET v = (SELECT 1/x FROM dq_zero) WHERE id > 100 RETURNING id",
+        &[],
+    );
+    check(
+        "DELETE FROM dq_t WHERE id > 100 AND v IN (SELECT 1/x FROM dq_zero) RETURNING id",
+        &[],
+    );
+    check(
+        "UPDATE dq_t SET v = v WHERE id > 100 AND (SELECT 1/x FROM dq_zero) > 0 RETURNING id",
+        &[zero],
+    );
+    check(
+        "DELETE FROM dq_t WHERE id / 0 > 1 AND (SELECT count(*) FROM dq_zero) > 5 RETURNING id",
+        &[],
+    );
+    check(
+        "INSERT INTO dq_t SELECT 9, 9 WHERE 1 = ANY (SELECT 1/x FROM dq_zero) AND false RETURNING id",
+        &[],
+    );
+    // A subquery first run after the statement wrote rows reads them as
+    // they were when it started.
+    check(
+        "UPDATE dq_t SET v = CASE WHEN id = 3 THEN (SELECT sum(v) FROM dq_t) ELSE v + 100 END RETURNING id, v",
+        &["1|110", "2|120", "3|60"],
+    );
+    check(
+        "INSERT INTO dq_t VALUES (7, 0), (8, (SELECT count(*) FROM dq_t)) RETURNING id, v",
+        &["7|0", "8|3"],
+    );
+    // Correlated subqueries read the target and FROM rows.
+    check(
+        "UPDATE dq_t SET v = (SELECT y FROM dq_z WHERE x = dq_t.id) WHERE EXISTS (SELECT 1 FROM dq_z WHERE x = dq_t.id) RETURNING id, v",
+        &["1|5", "3|7"],
+    );
+    check(
+        "UPDATE dq_t SET v = s.y + 1 FROM dq_z s WHERE s.x = dq_t.id AND dq_t.v >= (SELECT min(y) FROM dq_z WHERE x = s.x) RETURNING dq_t.id, dq_t.v",
+        &["1|6", "3|8"],
+    );
+}

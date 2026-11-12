@@ -8,6 +8,7 @@ SELECT id, (SELECT count(*) FROM (SELECT x FROM rli_z) d WHERE d.x <= t.id AND d
 SELECT id, (SELECT x FROM rli_z WHERE x <= t.id UNION SELECT (SELECT nextval('rli_s'))::int ORDER BY 1 LIMIT 1), currval('rli_s') FROM rli_t t ORDER BY id;
 SELECT id, l.m FROM rli_t t, LATERAL (SELECT max(x) + (SELECT nextval('rli_s')) m FROM rli_z WHERE x <= t.id) l ORDER BY id;
 SELECT id, (SELECT max(x) FROM rli_z WHERE (x, 1) IN (SELECT t.id, (SELECT nextval('rli_s'))::int % 1 + 1)) FROM rli_t t ORDER BY id;
+SELECT id, g FROM rli_t t, LATERAL generate_series(t.id, t.id + (SELECT nextval('rli_s'))::int % 1) g ORDER BY 1, 2;
 SELECT currval('rli_s');
 SELECT (SELECT 1.5 FROM rli_z LIMIT 1), (SELECT max(x::numeric) FROM rli_z), (SELECT avg(x) FROM rli_z WHERE x > 10);
 SELECT id, (SELECT sum(x::bigint) FROM rli_z WHERE x <= t.id), ARRAY(SELECT x::numeric FROM rli_z WHERE x <= t.id) FROM rli_t t ORDER BY id;

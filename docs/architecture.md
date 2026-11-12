@@ -333,8 +333,8 @@ row-source executor runs it, its result type, collations and aggregate calls
 once per statement, before any outer row, and copies the bound aggregate
 states for each outer row (`bind_correlated_subqueries` in
 `src/sql/query/subquery.rs`). An uncorrelated subquery nested in a
-correlated one or a `LATERAL` FROM subquery, at any depth and in set
-operation branches, takes a slot the outermost statement reserves before its
+correlated one, a `LATERAL` FROM subquery or a FROM function's arguments,
+at any depth and in set operation branches, takes a slot the outermost statement reserves before its
 scan (`InitPlans::nested`), so it runs once for the statement as
 PostgreSQL's initPlan does: `SELECT (SELECT x + (SELECT nextval('s')) FROM z
 WHERE x <= t.id) FROM t` reads one sequence value, and 100000 outer rows do

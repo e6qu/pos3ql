@@ -2368,21 +2368,43 @@ pub(super) fn prepare_outer_subqueries<'a>(
         }
     }
     let runner = UncorrelatedSubqueries::runner(storage, txid, None, arena)?;
-    // A LATERAL subquery runs for each row of the items to its left.
+    // A LATERAL subquery, or a function in FROM (implicitly lateral), runs
+    // for each row of the items to its left.
+    fn function_arguments<'a>(
+        table: &'a crate::sql::ast::TableRef<'a>,
+        found: &mut ArenaList<'a, &'a Expr<'a>>,
+    ) -> Result<(), SqlError> {
+        for argument in table.func_args.unwrap_or(&[]) {
+            collect_subqueries(argument, found)?;
+        }
+        for function in table.rows_from.unwrap_or(&[]) {
+            function_arguments(function, found)?;
+        }
+        Ok(())
+    }
     let mut lateral = ArenaList::new(arena);
+    let mut arguments = ArenaList::new(arena);
     if let Some(from) = from {
         for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
             if let Some(select) = table.subquery.filter(|_| table.lateral) {
                 lateral.push(select).map_err(|_| arena_full())?;
             }
+            function_arguments(table, &mut arguments)?;
         }
     }
     let nested = match row_types.statement_initplans() {
         Some(nested) => Some(nested),
-        None if corr.is_empty() && join_corr.is_empty() && lateral.is_empty() => None,
+        None if corr.is_empty()
+            && join_corr.is_empty()
+            && lateral.is_empty()
+            && arguments.is_empty() =>
+        {
+            None
+        }
         None => Some(nested_initplans(
             corr.as_slice().iter().chain(join_corr.as_slice()),
             lateral.as_slice(),
+            arguments.as_slice(),
             storage,
             txid,
             runner,
@@ -2490,12 +2512,28 @@ fn new_initplan<'a>(
 fn nested_initplans<'a>(
     correlated: impl IntoIterator<Item = &'a &'a Expr<'a>>,
     lateral: &[&'a Select<'a>],
+    // The subqueries in FROM function arguments, which may read the items
+    // to the function's left.
+    arguments: &[&'a Expr<'a>],
     storage: &'a Storage,
     txid: u32,
     runner: &'a dyn InitPlanRunner,
     arena: &'a Arena,
 ) -> Result<&'a [InitPlan<'a>], SqlError> {
     let mut found = ArenaList::new(arena);
+    for &node in arguments {
+        if subquery_node_correlated(node, storage, txid, arena)? {
+            if let Some(select) = sublink_select(node) {
+                collect_nested_uncorrelated(select, &mut found, storage, txid, arena)?;
+            }
+        } else if !found
+            .as_slice()
+            .iter()
+            .any(|&seen| core::ptr::eq(seen, node))
+        {
+            found.push(node).map_err(|_| arena_full())?;
+        }
+    }
     let correlated = correlated
         .into_iter()
         .filter_map(|node| sublink_select(node));
@@ -4950,6 +4988,7 @@ pub(super) fn lazy_subqueries<'a>(
     } else {
         Some(nested_initplans(
             correlated.as_slice(),
+            &[],
             &[],
             storage,
             txid,

@@ -437,10 +437,9 @@ fn held_aggregate_values_and_derived_tables_reclaim_row_scratch() {
 
 /// An uncorrelated subquery keeps its statement slot when the query around it
 /// is rewritten for each outer row (an `IN` operand over a merged FROM
-/// subquery), sits in a set-operation branch, a `LATERAL` FROM subquery or a
-/// row-valued `IN`, so it runs once and 20000 outer rows share one value.
-/// Scalar subquery columns are described with their declared type. Expected
-/// values were read from PostgreSQL 18.6 (`initdb --locale=C`).
+/// subquery), sits in a set-operation branch, a `LATERAL` FROM subquery, a
+/// FROM function's arguments or a row-valued `IN`, so it runs once and 20000
+/// outer rows share one value. Expected values were read from PostgreSQL 18.6 (`initdb --locale=C`).
 #[test]
 fn rewritten_and_lateral_nested_subqueries_share_their_slot() {
     let (mut e, mut b) = test_engine();
@@ -482,7 +481,12 @@ fn rewritten_and_lateral_nested_subqueries_share_their_slot() {
              FROM rw_big WHERE id <= 3 ORDER BY id",
             vec!["1|1", "2|2", "3|NULL"],
         ),
-        ("SELECT last_value FROM rw_s", vec!["4"]),
+        (
+            "SELECT id, g FROM rw_big, LATERAL generate_series(id, id + (SELECT nextval('rw_s'))::int % 1) g \
+             WHERE id <= 2 ORDER BY id",
+            vec!["1|1", "2|2"],
+        ),
+        ("SELECT last_value FROM rw_s", vec!["5"]),
     ] {
         assert_eq!(rows(&mut e, &mut b, &mut t, sql), expected, "{sql}");
     }

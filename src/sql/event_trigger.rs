@@ -4420,6 +4420,23 @@ pub(crate) fn collect<'a>(
             let Some((reference, Mutation::Drop)) = mutation(storage, entry) else {
                 continue;
             };
+            // A dropped materialized view reports itself, not its backing table.
+            if let ObjectRef::Table(table) = reference
+                && undo
+                    .iter()
+                    .cloned()
+                    .zip(undo_origins)
+                    .any(|(other, &other_origin)| {
+                        other_origin == origin
+                            && matches!(
+                                mutation(storage, other),
+                                Some((ObjectRef::MaterializedView(matview), Mutation::Drop))
+                                    if usize::from(storage.matview(matview).backing_table) == table
+                            )
+                    })
+            {
+                continue;
+            }
             let original = before.original_drops.contains(&reference);
             if original != original_pass {
                 continue;

@@ -353,7 +353,11 @@ the `pg_depend` walk that `DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`,
 `SEQUENCE`, `FUNCTION`, `TYPE`, `DOMAIN`, `SCHEMA`, `OPERATOR`, `COLLATION`,
 `SERVER`, `FOREIGN DATA WRAPPER` and text search objects share, and
 `pg_event_trigger_dropped_objects` is built by each statement rather than from
-that walk; `pg_depend` still lacks PostgreSQL's rows for TOAST tables, types
+that walk, so a cascade lists its objects in the order the statement drops
+them (`DROP TABLE t CASCADE` lists a view over a materialized view of `t`
+before the materialized view) where PostgreSQL follows the walk; the walk's
+objects would have to be described before they are dropped, into a fixed
+per-statement buffer; `pg_depend` still lacks PostgreSQL's rows for TOAST tables, types
 named only inside
 expressions (a cast in a default or routine body) and the column-level
 rows of views that read a sequence. `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145

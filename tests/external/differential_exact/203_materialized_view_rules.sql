@@ -42,3 +42,11 @@ SELECT obj_description(oid, 'pg_rewrite') FROM pg_rewrite WHERE ev_class = 'mv':
 CREATE VIEW v2 AS SELECT * FROM mv;
 DROP TABLE t;
 DROP TABLE t CASCADE;
+CREATE TABLE et (a int);
+CREATE FUNCTION ev() RETURNS event_trigger LANGUAGE plpgsql AS $$ DECLARE r record; BEGIN FOR r IN SELECT * FROM pg_event_trigger_dropped_objects() WHERE object_identity NOT LIKE 'pg_toast%' LOOP RAISE NOTICE '% % % % % %', r.classid::regclass, r.object_type, r.object_identity, r.address_names, r.original, r.normal; END LOOP; END $$;
+CREATE EVENT TRIGGER e ON sql_drop EXECUTE FUNCTION ev();
+CREATE MATERIALIZED VIEW mve AS SELECT a FROM et;
+DROP MATERIALIZED VIEW mve;
+DROP EVENT TRIGGER e;
+DROP FUNCTION ev();
+DROP TABLE et;

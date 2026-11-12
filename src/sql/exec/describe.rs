@@ -3657,6 +3657,16 @@ fn record_shape_metadata_dyn(
             record_shape_metadata_dyn(argument, columns, visit)
         }
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if row_preserving_syntax(name)
+            && let Some(typed) = first_typed_argument(args) =>
+        {
+            record_shape_metadata_dyn(typed, columns, visit)
+        }
+        Expr::Call {
             kind,
             name,
             bound_oid,
@@ -3872,6 +3882,37 @@ pub fn record_field_metadata(
             );
         }
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if row_preserving_syntax(name)
+            && let Some(typed) = first_typed_argument(args) =>
+        {
+            return record_field_metadata(typed, field, columns).map_err(|error| {
+                if error.sqlstate != sqlstate::UNDEFINED_COLUMN {
+                    return error;
+                }
+                // PostgreSQL names the common row type, not the argument.
+                match infer_type_res(typed, columns).and_then(|(type_oid, _)| {
+                    if type_oid == oid::RECORD {
+                        Ok(None)
+                    } else {
+                        columns.type_name_fixed(type_oid)
+                    }
+                }) {
+                    Ok(Some(type_name)) => sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" not found in data type {}",
+                        field,
+                        type_name.as_str()
+                    ),
+                    Ok(None) => error,
+                    Err(error) => error,
+                }
+            });
+        }
+        Expr::Call {
             kind,
             name,
             bound_oid,
@@ -3999,6 +4040,22 @@ pub fn record_field_metadata(
         }
         _ => could_not_identify(field),
     })
+}
+
+/// `COALESCE`, `NULLIF`, `GREATEST` and `LEAST` return their arguments'
+/// common type, so a row result keeps the first argument's fields and their
+/// declared types: `(coalesce(NEW, OLD)).label` has the column's domain.
+fn row_preserving_syntax(name: &str) -> bool {
+    matches!(name, "coalesce" | "nullif" | "greatest" | "least")
+}
+
+/// The first argument that is not an untyped `NULL`, which decides the
+/// common type when the others are.
+fn first_typed_argument<'e, 'a>(arguments: &'e [&'e Expr<'a>]) -> Option<&'e Expr<'a>> {
+    arguments
+        .iter()
+        .copied()
+        .find(|argument| !matches!(argument, Expr::Null))
 }
 
 pub fn record_field_type(

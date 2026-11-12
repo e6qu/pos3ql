@@ -391,9 +391,10 @@ fails during analysis with `42704` or `42883` where PostgreSQL fails when the
 call runs (`0A000` for PL/pgSQL, `39P01` for built-in trigger functions).
 A trigger's returned row is checked by column type identity only: a
 `varchar(5)` column accepts a returned `varchar(10)` field where PostgreSQL
-also compares type modifiers. A field selected from a function's row result
-(`(coalesce(NEW, OLD)).label`) has its storage type, not a domain column's
-declared type. `ROW(...)::t` for a table's row type fails with `42846`.
+also compares type modifiers. `ROW(...)::t` for a table's row type fails
+with `42846`, and `COALESCE` of two different tables' rows is accepted where
+PostgreSQL fails with `42846` (`COALESCE could not convert type b to a`).
+A field selection error (`(1).x`) has no cursor position.
 A `RETURNING` list routed through a rule's `RETURNING` list reads the rule's
 relation only: `UPDATE v ... FROM o RETURNING o.label`, `*` beside `FROM` or
 `USING` sources, and subqueries in that list fail with `0A000` where

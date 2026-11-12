@@ -2394,8 +2394,9 @@ pub(super) fn prepare_outer_subqueries<'a>(
 }
 
 /// Uncorrelated scalar subqueries `nodes` that run when an expression first
-/// reads them and keep their values in `arena`'s retained bytes, as
-/// PostgreSQL's initPlans do. Nothing runs here.
+/// reads them, as PostgreSQL's initPlans do. Nothing runs here. Their state
+/// and results live in `arena`'s persistent tail and retained bytes, which a
+/// reader's per-row rewinds and resumed attempts do not reclaim.
 pub(super) fn first_read_subqueries<'a>(
     nodes: &[&'a Expr<'a>],
     storage: &Storage,
@@ -2410,17 +2411,57 @@ pub(super) fn first_read_subqueries<'a>(
     // keeps these subqueries, and each run detaches its result before any
     // borrow of storage escapes.
     let storage: &'a Storage = unsafe { &*(storage as *const Storage) };
-    eval_subquery_nodes(
-        nodes,
-        storage,
-        txid,
-        arena,
-        &[],
-        SUBQUERY_DEPTH,
-        None,
-        None,
-        SubqueryTiming::FirstRead,
-    )
+    let executor: &'a dyn super::super::eval::SubqueryExecution = &arena
+        .alloc_persistent_slice_with(1, |_| {
+            StatementSubqueries(ProceduralSubqueries { storage, txid })
+        })
+        .map_err(|_| arena_full())?[0];
+    let caches = arena
+        .alloc_persistent_slice_with(nodes.len(), |_| {
+            super::super::eval::DeferredSubqueryCache::default()
+        })
+        .map_err(|_| arena_full())?;
+    let caches = core::cell::Cell::from_mut(caches).as_slice_of_cells();
+    let deferred = arena
+        .alloc_persistent_slice_with(nodes.len(), |index| super::super::eval::DeferredSubquery {
+            node: (nodes[index] as *const Expr).cast(),
+            executor,
+            owner: arena,
+            cache: Some(&caches[index]),
+        })
+        .map_err(|_| arena_full())?;
+    Ok(SubqueryValues {
+        scalars: &[],
+        lists: &[],
+        deferred,
+    })
+}
+
+/// Runs a top-level statement's uncorrelated subqueries: they read no row
+/// of the statement, so the row an expression is evaluated over is not
+/// passed on.
+#[derive(Clone, Copy)]
+struct StatementSubqueries<'s>(ProceduralSubqueries<'s>);
+
+impl super::super::eval::SubqueryExecution for StatementSubqueries<'_> {
+    fn evaluate<'a>(
+        &self,
+        expression: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        _outer: &dyn ColumnLookup<'a>,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+        retained: bool,
+    ) -> Result<super::super::eval::SubqueryResult<'a>, SqlError> {
+        self.0.evaluate(
+            expression,
+            arena,
+            params,
+            &crate::sql::eval::NoColumns,
+            sequences,
+            retained,
+        )
+    }
 }
 
 /// The exact scratch sizes `merge_correlated` fills for `base` + `correlated`

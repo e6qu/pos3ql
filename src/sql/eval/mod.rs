@@ -3506,7 +3506,9 @@ pub struct DeferredSubquery<'h> {
 /// members in rows of at most [`LIST_CACHE_CHUNK`] values.
 #[derive(Clone, Copy, Default)]
 pub struct DeferredSubqueryCache {
-    pub(crate) bytes: Option<crate::mem::arena::FrozenArenaSliceHandle<u8>>,
+    /// The encoded result in `owner`'s persistent tail, as an address and
+    /// length; `None` until the subquery has run.
+    pub(crate) bytes: Option<(usize, usize)>,
     pub(crate) list: bool,
     /// A list's comparison collations in `owner`'s persistent tail, as an
     /// address and length so the cache does not fix the hooks' lifetime.
@@ -3527,12 +3529,11 @@ impl<'h> DeferredSubquery<'h> {
         sequences: Option<&dyn SequenceAccess>,
     ) -> Result<SubqueryResult<'a>, SqlError> {
         if let Some(saved) = self.cache.map(core::cell::Cell::get)
-            && let Some(handle) = saved.bytes
+            && let Some((address, length)) = saved.bytes
         {
-            let bytes = self
-                .owner
-                .retained_slice(handle)
-                .map_err(|_| arena_full())?;
+            // SAFETY: the bytes were written into `owner`'s persistent tail,
+            // which per-row rewinds and resumed attempts do not reclaim.
+            let bytes: &[u8] = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
             let bytes = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
             // SAFETY: the collations were copied into `owner`'s persistent
             // tail, which lives as long as `owner` is not reset.
@@ -3594,13 +3595,9 @@ impl<'h> DeferredSubquery<'h> {
         for chunk in core::iter::once(&header[..]).chain(members.chunks(LIST_CACHE_CHUNK)) {
             length += 4 + crate::sql::exec::projected_row_len(chunk)?;
         }
-        let handle = self
+        let bytes = self
             .owner
-            .retain_slice_with(length, |_| 0u8)
-            .map_err(|_| arena_full())?;
-        let mut bytes = self
-            .owner
-            .retained_slice_mut(handle)
+            .alloc_persistent_slice_with(length, |_| 0u8)
             .map_err(|_| arena_full())?;
         let mut at = 0usize;
         for chunk in core::iter::once(&header[..]).chain(members.chunks(LIST_CACHE_CHUNK)) {
@@ -3611,7 +3608,6 @@ impl<'h> DeferredSubquery<'h> {
             crate::sql::exec::encode_projected_into(chunk, &mut bytes[at..at + chunk_length])?;
             at += chunk_length;
         }
-        drop(bytes);
         let collations = self
             .owner
             .alloc_persistent_slice_with(collations.len(), |index| collations[index])
@@ -3621,11 +3617,7 @@ impl<'h> DeferredSubquery<'h> {
             .alloc_persistent_slice_with(column_types.len(), |index| column_types[index])
             .map_err(|_| arena_full())?;
         Ok(DeferredSubqueryCache {
-            bytes: Some(
-                self.owner
-                    .freeze_retained_slice(handle)
-                    .map_err(|_| arena_full())?,
-            ),
+            bytes: Some((bytes.as_ptr() as usize, bytes.len())),
             list,
             collations: (collations.as_ptr() as usize, collations.len()),
             column_types: (column_types.as_ptr() as usize, column_types.len()),

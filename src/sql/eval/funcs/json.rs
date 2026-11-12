@@ -1241,6 +1241,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Array { .. } => true,
                     Datum::Null => {
                         matches!(*args[0], Expr::Null)
+                            || matches!(declared, Some(crate::sql::types::ColType::Array(_)))
                             || matches!(
                                 crate::sql::eval::static_type_pub(args[0], row),
                                 Some(crate::sql::types::ColType::Array(_))

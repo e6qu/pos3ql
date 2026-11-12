@@ -27765,6 +27765,10 @@ where
         // A table's row variable has the table's row type.
         if qualifier.is_none()
             && let Some(index) = self.local_index(name)
+            && matches!(
+                self.locals[index].record_shape,
+                Some(PlpgsqlRecordShape::Table { .. })
+            )
         {
             return Some(self.locals[index].declared_type());
         }
@@ -32346,7 +32350,7 @@ fn coerce_plpgsql_local<'a>(
     sequences: &dyn crate::sql::eval::SequenceAccess,
 ) -> Result<Datum<'a>, SqlError> {
     let value = match local.record_shape {
-        Some(PlpgsqlRecordShape::Table { slot, .. }) => {
+        Some(PlpgsqlRecordShape::Table { slot, row_type }) => {
             let definition = storage.table_def(usize::from(slot), txid);
             let mut target_oids = [0; MAX_COLUMNS];
             for (oid, column) in target_oids.iter_mut().zip(definition.columns()) {
@@ -32359,7 +32363,14 @@ fn coerce_plpgsql_local<'a>(
                 txid,
                 arena,
             )?;
-            coerce_plpgsql_table_rowtype(slot, value, storage, txid, arena, sequences)?
+            // The value carries the table's row type, as the variable does.
+            match coerce_plpgsql_table_rowtype(slot, value, storage, txid, arena, sequences)? {
+                Datum::Record(fields) => Datum::Composite {
+                    slot: row_type,
+                    fields,
+                },
+                value => value,
+            }
         }
         None if let ColType::Composite(Some(creation)) = local.ctype
             && match value {

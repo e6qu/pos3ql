@@ -2949,6 +2949,36 @@ fn describe_cursor_rows(
     Ok(backward)
 }
 
+/// Settles the default scrollability of a cursor whose query streams, from
+/// the same plan shape as one that runs at its first read.
+fn retained_cursor_plan_scroll(
+    cursors: &mut cursor::CursorPool,
+    at: usize,
+    storage: &Storage,
+    txid: u32,
+    work: &Arena,
+) -> Result<(), SqlError> {
+    let backward = cursors
+        .execution_parts(at)
+        .0
+        .with_query(|parsed, _, _| match parsed {
+            cursor::CursorStatement::Select(select) => {
+                query::expand_ctes(select, storage, txid, work)
+                    .map(|select| query::select_scans_backward(select, storage, txid))
+            }
+            cursor::CursorStatement::SetQuery(query) => {
+                Ok(query::set_query_scans_backward(query, storage, txid))
+            }
+        })??;
+    let eliminated = cursors
+        .execution_parts(at)
+        .0
+        .source()
+        .is_some_and(query::RetainedSelect::eliminated);
+    cursors.set_plan_scroll(at, backward && !eliminated);
+    Ok(())
+}
+
 /// Runs a pending read-only cursor query whole into its saved rows, with the
 /// snapshot the cursor opened with. Its description follows the opening one,
 /// which [`cursor::CursorPool::end_fill`] checks it against.
@@ -25642,7 +25672,7 @@ impl Engine {
                         )
                     };
                     match prepared {
-                        Ok(true) => Ok(()),
+                        Ok(true) => retained_cursor_plan_scroll(cursors, at, storage, txid, work),
                         Ok(false) => {
                             describe_cursor_rows(cursors, at, storage, txid, work).map(|_| ())
                         }

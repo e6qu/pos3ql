@@ -3407,6 +3407,7 @@ fn cursor_queries_run_at_their_first_read_with_the_opening_snapshot() {
         data_rows(&reader.success(&mut engine, "FETCH ALL FROM later", true)),
         ["4", "3", "2", "1"]
     );
+    reader.success(&mut engine, "CLOSE later", true);
     assert_eq!(engine.storage.oldest_snapshot(), None);
     reader.success(&mut engine, "ROLLBACK", true);
     // An error the query raises is reported by the read that runs it.

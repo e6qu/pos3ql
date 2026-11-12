@@ -100,6 +100,10 @@ is owned.
   values where PostgreSQL evaluates a volatile output list again, and a
   row-locking cursor over a join, or ordered by an expression that is not a
   source column, locks all its rows at that first read.
+  `pg_cursors.statement` shows the `DECLARE` statement alone, where PostgreSQL
+  shows the client's whole query string (several statements, the trailing
+  semicolon); keeping it needs that text in the cursor's startup-sized
+  storage.
   PL/pgSQL bound cursor declarations (`c CURSOR FOR ...` in `DECLARE`) are
   rejected with `0A000`; a `refcursor` opened with `OPEN ... FOR` works. Saving a held cursor at
   commit yields during storage waits. Cursors keep declared record and domain
@@ -315,7 +319,12 @@ A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. A trigger fired
 inside a writing statement cannot `FETCH` from a session cursor that
 evaluates rows as fetched, or first read one whose data-modifying `WITH`
-queries have not run (`0A000`). A SQL `PREPARE`
+queries have not run (`0A000`). A `LATERAL`
+subquery that reads an earlier item's column fails when its own output
+column has the same name (`SELECT * FROM generate_series(1,2) g, LATERAL
+(SELECT g) x` reports `column reference "g" is ambiguous`) or when that item
+renames its columns (`generate_series(1,2) g(c), LATERAL (SELECT c) x` reports
+`column "c" does not exist`); PostgreSQL returns the rows. A SQL `PREPARE`
 without declared parameter types does not infer them from their use, so
 `PREPARE p AS SELECT * FROM t WHERE label > $1; EXECUTE p(2)` compares text
 with an integer and fails where PostgreSQL types `$1` as `text`. `pg_sleep` and its

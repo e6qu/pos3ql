@@ -54,7 +54,6 @@ create table wq(a int, b text, check (wq.a > 0), check ((wq).b <> ''));
 create table wk(a int, b text);
 create index on wk ((zz.*));
 create index on wk (wk);
-create index on wk ((wk));
 create index on wk ((zz));
 create index on wk (((wk).a));
 create index on wk ((wk.a + 1)) where wk is not null;

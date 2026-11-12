@@ -558,7 +558,9 @@ columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
-PostgreSQL types it as the table's row type `t`. A row constructor casts to a table's row type
+PostgreSQL types it as the table's row type `t`. An index key that is a whole row (`CREATE INDEX ON t ((t))`) fails with
+`0A000`, where PostgreSQL indexes the row: evaluation yields an anonymous
+record, which the row encoding cannot store as a key. A row constructor casts to a table's row type
 (`ROW(1, 'a')::t`) but not to a view's, and an array of a table's row type
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or

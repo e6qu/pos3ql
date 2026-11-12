@@ -65865,7 +65865,7 @@ pub fn create_index(
             match catalog_column_type(storage, txn.txid, type_oid) {
                 // Expression keys are stored in the row encoding, which keeps
                 // row values only as columns of a named composite type.
-                Some((ColType::Record, _) | (ColType::Composite(_), None)) => {
+                Some((ColType::Record | ColType::Composite(_), _)) => {
                     // A whole row of an unknown relation is the analysis
                     // error PostgreSQL reports first.
                     fn unknown_whole_row(

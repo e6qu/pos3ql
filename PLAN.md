@@ -117,6 +117,12 @@ is owned.
   after the sort), retained groupings, and cursors ordered by source columns,
   hand each call off on its row. Removing the restart needs those shapes retained (above): the
   general executor cannot run a routine body inside expression evaluation.
+- **Catalog history:** a transaction that changes a catalog relation
+  synthesizes that whole relation twice (its committed and its private image)
+  in the statement arena to capture the changed rows, so `CREATE FUNCTION`
+  needs room for every `pg_proc` row, built-in ones included (more than
+  1 MiB). Capturing only the rows the transaction's changes name would bound
+  it by the change.
 - **Write phases:** a write keeps its changed rows across storage and lock
   waits and continues at the unfinished row, at top level and in `CALL` and
   `DO` bodies (see the

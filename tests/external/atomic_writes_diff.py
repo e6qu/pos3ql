@@ -183,7 +183,7 @@ class Node:
             "row_history_slots": 65536,
             "max_connections": 4, "query_workspace_slots": 2,
             "memtable_bytes": "4MiB", "wal_bytes": "4MiB", "wal_buffer_bytes": "256KiB",
-            "sql_arena_bytes": "1MiB", "work_arena_bytes": "8MiB",
+            "sql_arena_bytes": "4MiB", "work_arena_bytes": "8MiB",
             "object_store": "on", "object_store_endpoint": endpoint,
             "object_store_bucket": "atomic-write-test", "object_store_prefix": prefix,
             "object_store_region": "test-region", "object_store_access_key": "test-access",

@@ -2706,6 +2706,29 @@ impl<'a> Parser<'a> {
                     index_expression_source(expression, self.text[start..self.peek_at].trim());
                 self.expect_op(")")?;
                 StatisticsKey::Expression(StatisticsExpression { expression, source })
+            } else if matches!(self.peeked, Tok::Ident(_) | Tok::QuotedIdent(_)) && {
+                // PostgreSQL's `stats_param` also takes a bare function call.
+                let mut lexer = self.lexer.clone();
+                matches!(
+                    lexer
+                        .next_token()
+                        .map_err(|error| ParseError::lexical(error, self.text))?,
+                    Tok::Op("(") | Tok::Op(".")
+                )
+            } {
+                let start = self.peek_at;
+                let expression = self.prefix()?;
+                if !matches!(
+                    expression,
+                    Expr::Call {
+                        kind: crate::sql::ast::CallKind::Routine,
+                        ..
+                    }
+                ) {
+                    return Err(self.syntax_error_here());
+                }
+                let source = self.text[start..self.peek_at].trim();
+                StatisticsKey::Expression(StatisticsExpression { expression, source })
             } else {
                 StatisticsKey::Column(self.col_ident("column name")?)
             };

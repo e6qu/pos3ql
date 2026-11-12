@@ -122,7 +122,19 @@ Row types:
   parameters (`PREPARE q(orders) AS SELECT $1.note`) behave as in PostgreSQL. A routine
   or column using the row type blocks `DROP TABLE orders`; `CASCADE` drops the
   routine or column. Comparing two composite values uses PostgreSQL's record
-  ordering, so `ROW(1, NULL)::orders = ROW(1, NULL)::orders` is true.
+  ordering, so `ROW(1, NULL)::orders = ROW(1, NULL)::orders` is true, and a
+  row `IS NULL`/`IS NOT NULL` test reads every field: an `orders` row with
+  one NULL column is neither.
+- `CHECK` constraints, index keys and index predicates may use the whole row
+  (`CHECK (orders IS NOT NULL)`, `CREATE INDEX ON orders (total_of(orders.*))`)
+  with PostgreSQL's constraint names, `conkey`, `pg_depend` rows and printed
+  definitions; `(orders).total` and `orders.total` mean the column itself.
+  Copying such a constraint or index with `LIKE`, `INHERITS` or `PARTITION OF`
+  fails with PostgreSQL's `0A000` `cannot convert whole-row table reference`,
+  and an extended statistics expression cannot use it. Two renames are
+  refused with `0A000` because index keys and predicates are stored as text:
+  renaming a table one of whose indexes reads the whole row, and renaming a
+  column an index expression or predicate uses.
 - A view's row type has the view's column types, modifiers and collations as
   they were when the view was created or replaced: `CREATE VIEW totals AS
   SELECT sum(amount) AS total FROM orders` keeps `total numeric` even if a later
@@ -597,7 +609,12 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
   Cost estimates and `EXPLAIN` text differ from PostgreSQL.
 - Logical copies are separate durable databases updated asynchronously; there
   are no shared-storage replicas or multiple writers.
-- Monitoring fields for absent subsystems report empty or zero values.
+- Monitoring fields for absent subsystems report empty or zero values. A
+  session has no memory contexts because every pool is reserved at startup:
+  `pg_backend_memory_contexts` is empty, and
+  `pg_log_backend_memory_contexts(pid)` returns true for a session's PID after
+  logging `logging memory contexts of PID n` and an empty grand total, or warns
+  `PID n is not a PostgreSQL server process` and returns false.
 - XPath and some definition breadths are smaller subsets, as listed above.
 - Compatibility with earlier pos3ql versions is not required; unsupported
   stored formats fail explicitly.

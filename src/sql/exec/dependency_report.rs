@@ -613,8 +613,17 @@ pub(crate) fn report_drop(
         return Ok(None);
     }
     let mark = arena.mark();
-    let reported = walk(storage, txid, originals, arena)
-        .and_then(|walked| report(storage, txid, &walked, originals, cascade, arena));
+    let reported = walk(storage, txid, originals, arena).and_then(|walked| {
+        let reported = report(storage, txid, &walked, originals, cascade, arena)?;
+        crate::sql::event_trigger::record_drop_order(
+            walked
+                .targets
+                .iter()
+                .rev()
+                .map(|target| (target.object.class, target.object.object, target.object.sub)),
+        );
+        Ok(reported)
+    });
     // SAFETY: the report is a value; nothing borrows the walk's memory.
     unsafe { arena.rewind_to(mark) };
     reported.map(Some)

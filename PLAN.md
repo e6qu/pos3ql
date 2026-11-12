@@ -292,15 +292,21 @@ statement runs. Column defaults, CHECK constraints, routine parameter defaults
 conditions are printed in PostgreSQL's analyzed form (`'x'::text`,
 `((k >= 1) AND (k <= 5))`), but only for literals, columns, parameters,
 operators, `IN`, `LIKE`, `IS NULL`, `IS [NOT] DISTINCT FROM`, `IS [NOT]
-TRUE/FALSE`, `CASE`, casts, SQL value functions and built-in function calls;
-other expressions (subqueries, user-defined function calls, `$n` parameters,
-array constructors outside a quantified comparison, and whole-row
-references) are still printed as stored. A whole-row reference in an index
-expression or `CHECK` (`CREATE INDEX ON t (f(t.*))`) fails with `0A000`
-until column dependencies record whole-row users, and a view passing `t.*`
-to a function taking the table's row type fails with `42883` because view
-dependency recording still types the reference as `record` (the bare `t`
-spelling works). `pg_get_viewdef` uses PostgreSQL's
+TRUE/FALSE`, `CASE`, casts, SQL value functions, positional calls of
+built-in and user-defined functions, `ROW(...)` and whole-row references;
+other expressions (subqueries, named-argument calls, `$n` parameters and
+array constructors outside a quantified comparison) are still printed as
+stored. Index keys and predicates are stored as text, so renaming a table
+whose index reads the whole row, or a column an index expression or predicate
+uses, fails with `0A000`; storing them with bound column positions, as
+catalog expression nodes already are, would let both renames proceed. Index
+expressions and predicates reject non-immutable built-in functions with
+`42P17`, but not a cast PostgreSQL implements with a stable function
+(`CREATE INDEX ON t ((stamp::date))` on a `timestamptz` column succeeds) or a
+non-immutable user function that PostgreSQL would not inline into its SQL
+body. A
+partition created or attached after a partitioned index does not receive its
+copy of that index. `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their
@@ -315,7 +321,14 @@ type, function or failed constant (`SELECT * FROM missing_table` reports
 position 15), maps a syntax error inside a SQL function body to its place in the
 `CREATE FUNCTION` text, and reports dynamic SQL failures (`EXECUTE 'SELEC 1'`)
 with an internal query and position (`q`, `p`) plus a `CONTEXT` line, which
-pos3ql does not send. An echoed token longer than the 96-byte parser message is
+pos3ql does not send; notices carry no position either (`''::tsquery` points
+at the literal in PostgreSQL). Built-in calls with constant arguments are not
+folded once while planning: `SELECT timestamptypmodin('{7}') FROM
+generate_series(1, 3)` warns three times where PostgreSQL warns once, and a
+later constant error (`SELECT timestamptypmodin('{7}'), 1/0`) is reported
+without the warning PostgreSQL's folding raised first. Folding needs each
+statement to keep its folded values for every later evaluation, including
+after a pause, before it can replace the per-row evaluation. An echoed token longer than the 96-byte parser message is
 cut short. The scanner does not read Unicode-escape literals (`U&'\0041'`,
 `U&"\0041"`, `UESCAPE`), so `SELECT U&'\0041'` fails as an unknown column
 `u`, and an identifier longer than 63 bytes is rejected (`name ... is longer
@@ -348,13 +361,17 @@ classes and families, extensions, policies, triggers, rules, indexes and
 the `pg_depend` walk that `DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`,
 `SEQUENCE`, `FUNCTION`, `TYPE`, `DOMAIN`, `SCHEMA`, `OPERATOR`, `COLLATION`,
 `SERVER`, `FOREIGN DATA WRAPPER` and text search objects share, and
-`pg_event_trigger_dropped_objects` is built by each statement rather than from
-that walk, so a cascade lists its objects in the order the statement drops
-them (`DROP TABLE t CASCADE` lists a view over a materialized view of `t`
-before the materialized view) where PostgreSQL follows the walk; the walk's
-objects would have to be described before they are dropped, into a fixed
-per-statement buffer. `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
-`_RETURN` rules, at OID `reltype + 1`, and `pg_settings_u`/`pg_settings_n`),
+`pg_event_trigger_dropped_objects` describes each statement's own objects
+and orders them by the walk only for the statements on it. A TOAST table
+shares its table's creation stamp, so it is listed just after the table's
+array type rather than after its `NOT NULL` constraints, and `ALTER TABLE ...
+DROP COLUMN ... CASCADE` lists the column after its dependents instead of
+first. `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
+`_RETURN` rules, at OID `reltype + 1`, and `pg_settings_u`/`pg_settings_n`)
+and has no `ev_qual` or `ev_action` column (selecting one fails with `42703`);
+they would carry the rule's condition and actions as `pos3ql-catalog-expression-v1`
+nodes, derived from the retained rule body so that the nine-field
+`pg_rewrite` image keeps its shape,
 and `ALTER VIEW` and `ALTER MATERIALIZED VIEW` accept only their own actions,
 so `ALTER VIEW v DISABLE RULE r` fails with `42601` where PostgreSQL reports
 `42809` `ALTER action DISABLE RULE cannot be performed on relation "v"`. A partition key that is an

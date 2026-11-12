@@ -235,3 +235,129 @@ fn relation_row_type_columns_and_signatures_survive_recovery() {
         );
     }
 }
+
+#[test]
+fn whole_row_constraints_and_indexes_name_depend_and_print_like_postgresql() {
+    let (mut engine, mut budget) = test_engine();
+    for sql in [
+        "CREATE TABLE wr(a int, b text)",
+        "CREATE FUNCTION wr_f(wr) RETURNS int LANGUAGE sql IMMUTABLE AS 'select $1.a'",
+        "CREATE INDEX wr_i ON wr (wr_f(wr))",
+        "ALTER TABLE wr ADD CHECK (wr_f(wr.*) > 0)",
+        "ALTER TABLE wr ADD CHECK (wr IS NOT NULL)",
+        "ALTER TABLE wr ADD CHECK (ROW(wr.*) IS NOT NULL)",
+        "CREATE TABLE ww(a int, b int, c int, CHECK (c > b AND a > 0 AND ww IS NOT NULL))",
+        "CREATE VIEW wv AS SELECT wr_f(wr.*) FROM wr",
+    ] {
+        rows(&mut engine, &mut budget, sql);
+    }
+    for (sql, expected) in [
+        (
+            "SELECT conname, conkey::text, pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE conrelid IN ('wr'::regclass, 'ww'::regclass) ORDER BY 1",
+            vec![
+                "wr_check|{0}|CHECK ((wr_f(wr.*) > 0))",
+                "wr_check1|{0}|CHECK ((wr.* IS NOT NULL))",
+                "wr_check2|{1,2}|CHECK ((ROW(a, b) IS NOT NULL))",
+                "ww_check|{3,2,1,0}|CHECK (((c > b) AND (a > 0) AND (ww.* IS NOT NULL)))",
+            ],
+        ),
+        (
+            "SELECT pg_get_indexdef('wr_i'::regclass)",
+            vec!["CREATE INDEX wr_i ON public.wr USING btree (wr_f(wr.*))"],
+        ),
+        (
+            "SELECT refobjsubid, deptype FROM pg_depend WHERE objid = 'wr_i'::regclass \
+             AND refobjid = 'wr'::regclass",
+            vec!["0|a"],
+        ),
+        ("SELECT * FROM wv", vec![]),
+    ] {
+        assert_eq!(rows(&mut engine, &mut budget, sql), expected, "{sql}");
+    }
+    // A row null test reads every field.
+    assert_eq!(
+        sqlstate(&mut engine, &mut budget, "INSERT INTO wr VALUES (1, NULL)"),
+        "23514"
+    );
+    for (sql, state) in [
+        ("CREATE TABLE wq (LIKE wr INCLUDING CONSTRAINTS)", "0A000"),
+        ("CREATE TABLE wc () INHERITS (wr)", "0A000"),
+        ("CREATE STATISTICS ws ON (wr IS NULL), a FROM wr", "0A000"),
+        ("CREATE TABLE wbad(a int, CHECK (zz.a > 0))", "42P01"),
+        ("ALTER TABLE wr RENAME TO wr2", "0A000"),
+    ] {
+        assert_eq!(sqlstate(&mut engine, &mut budget, sql), state, "{sql}");
+    }
+    rows(&mut engine, &mut budget, "DROP INDEX wr_i");
+    rows(&mut engine, &mut budget, "ALTER TABLE wr RENAME TO wr2");
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE conname = 'wr_check1'",
+        ),
+        vec!["CHECK ((wr2.* IS NOT NULL))"]
+    );
+}
+
+#[test]
+fn index_names_follow_postgresql_column_name_choice() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE k(a int, b text, c int)",
+    );
+    for sql in [
+        "CREATE INDEX ON k (a, (a + 1))",
+        "CREATE INDEX ON k (a, a)",
+        "CREATE INDEX ON k (a) INCLUDE (b, c)",
+        "CREATE INDEX ON k ((a + 1), (a + 2))",
+        "CREATE INDEX ON k ((k.c))",
+        "CREATE INDEX ON k ((k))",
+    ] {
+        rows(&mut engine, &mut budget, sql);
+    }
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT c.relname, string_agg(a.attname, ',' ORDER BY a.attnum) \
+             FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid \
+             WHERE c.relname LIKE 'k\\_%' AND c.relkind = 'i' GROUP BY 1 ORDER BY 1",
+        ),
+        vec![
+            "k_a_a1_idx|a,a1",
+            "k_a_b_c_idx|a,b,c",
+            "k_a_expr_idx|a,expr",
+            "k_c_idx|c",
+            "k_expr_expr1_idx|expr,expr1",
+            "k_k_idx|k",
+        ]
+    );
+}
+
+#[test]
+fn memory_context_logging_answers_only_for_server_processes() {
+    let (mut engine, mut budget) = test_engine();
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_log_backend_memory_contexts(1), pg_log_backend_memory_contexts(NULL)",
+        ),
+        vec!["f|NULL"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_log_backend_memory_contexts(1)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("PID 1 is not a PostgreSQL server process"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}

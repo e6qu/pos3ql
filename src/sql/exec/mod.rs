@@ -994,8 +994,8 @@ pub(crate) use projected::{pack_projected_rows_into, projected_rows_len};
 
 mod ddl;
 mod dependency_report;
-pub(crate) use ddl::check_referenced_columns;
 use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build_def};
+pub(crate) use ddl::{check_referenced_columns, visit_expression_variables};
 
 pub(crate) mod constraints;
 use constraints::{
@@ -1420,7 +1420,7 @@ fn create_table_kind(
     };
     // A copied constraint lands before the explicitly written ones, so a
     // duplicate primary key is caught with PostgreSQL's own message.
-    if let Err(e) = copy_like_constraints(storage, &mut def, statement, txn.txid) {
+    if let Err(e) = copy_like_constraints(storage, &mut def, statement, txn.txid, arena) {
         return sql_fail(e);
     }
     if let Err(e) = reject_multiple_primary(&def) {
@@ -3667,6 +3667,9 @@ fn build_partitioned_table_def(
                     "a partition cannot declare columns or table constraints"
                 ));
             }
+            for check in parent_def.checks() {
+                ddl::require_convertible_check(&parent_def, check, arena)?;
+            }
             let mut def = TableDefBuilder::from_definition(&parent_def);
             def.name = SqlName::parse(statement.name.name)?;
             def.schema = storage.creation_schema(
@@ -3820,7 +3823,7 @@ fn build_inherited_table_def(
                 definition.n_columns = count;
             }
         }
-        inherit_table_checks(&parent_definition, &mut definition, false)?;
+        inherit_table_checks(&parent_definition, &mut definition, false, arena)?;
         definition.inheritance.append(parent)?;
     }
     for column in own.columns() {
@@ -3945,6 +3948,7 @@ fn inherit_table_checks<Definition0: crate::storage::DefinitionBacking>(
     parent: &crate::storage::TableDefinition<Definition0>,
     child: &mut TableDefBuilder,
     require_existing: bool,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     for inherited in parent.checks() {
         if let Some(existing) = child
@@ -3974,6 +3978,7 @@ fn inherit_table_checks<Definition0: crate::storage::DefinitionBacking>(
                 "too many check constraints"
             ));
         }
+        ddl::require_convertible_check(parent, inherited, arena)?;
         child.checks[child.n_checks] = *inherited;
         child.checks[child.n_checks].identity = None;
         child.n_checks += 1;
@@ -5031,6 +5036,7 @@ fn copy_like_constraints(
     def: &mut TableDefBuilder,
     statement: &CreateTable,
     txid: u32,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     for like in statement.likes {
         let source = (*like_source(storage, like, txid)?).clone();
@@ -5043,6 +5049,7 @@ fn copy_like_constraints(
                         crate::storage::MAX_CHECKS
                     ));
                 }
+                ddl::require_convertible_check(&source, check, arena)?;
                 let mut copied = *check;
                 copied.identity = None;
                 def.checks[def.n_checks] = copied;
@@ -5238,6 +5245,12 @@ fn copy_like_indexes<Definition0: crate::storage::DefinitionBacking>(
             source_def.name.as_str(),
             txn.txid,
         )) {
+            ddl::require_convertible_index(
+                &source_def,
+                &index,
+                index.name_for(txn.txid).as_str(),
+                arena,
+            )?;
             *copy = CopiedIndex {
                 method: index.method,
                 columns: index.columns,
@@ -5266,17 +5279,16 @@ fn copy_like_indexes<Definition0: crate::storage::DefinitionBacking>(
             let columns = remap_columns(def, &source, &index.columns[..index.n_cols])?;
             let include_columns =
                 remap_columns(def, &source, &index.include_columns[..index.n_include_cols])?;
-            let name = if let Some(expression) = index.expressions[0] {
-                let parsed = crate::sql::parser::parse_expr(expression.as_str(), arena)?;
-                generated_index_name_for_key(storage, def, index_name_key(parsed), txn.txid)?
-            } else {
-                generated_index_name_for_key(
-                    storage,
-                    def,
-                    def.columns()[columns[0] as usize].name.as_str(),
-                    txn.txid,
-                )?
-            };
+            // `generateClonedIndexStmt` keeps the source index's column names.
+            let name = copied_index_name(
+                storage,
+                def,
+                &index.expressions[..index.n_cols],
+                &columns[..index.n_cols],
+                &include_columns[..index.n_include_cols],
+                txn.txid,
+                arena,
+            )?;
             let slot = storage.create_index(
                 IndexDef {
                     database: storage.current_database_oid(),
@@ -55451,45 +55463,157 @@ pub(crate) fn drop_view(
     })
 }
 
+#[inline(never)]
 fn generated_index_name<Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     table: &crate::storage::TableDefinition<Definition0>,
     columns: &[crate::sql::ast::IndexColumn<'_>],
+    include_columns: &[&str],
     txid: u32,
 ) -> Result<SqlName, SqlError> {
-    let key = index_name_key(columns[0].expression);
-    generated_index_name_for_key(storage, table, key, txid)
+    let mut names = IndexColumnNames::new();
+    for column in columns {
+        names.push(match column.column {
+            Some(name) => name,
+            None => index_expression_column_name(column.expression),
+        })?;
+    }
+    for column in include_columns {
+        names.push(column)?;
+    }
+    generated_index_name_for_columns(storage, table, &names, txid)
 }
 
-fn index_name_key<'a>(expression: &Expr<'a>) -> &'a str {
-    match expression {
-        Expr::Column { name, .. } => name,
-        Expr::Call { name, .. } if crate::sql::ast::catalog_operator_call(name).is_none() => name,
-        _ => "expr",
+/// The generated name of an index copied onto `def`, from the source
+/// index's keys mapped to `def`'s columns.
+#[inline(never)]
+fn copied_index_name<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    def: &crate::storage::TableDefinition<Definition0>,
+    expressions: &[Option<StackStr<{ crate::storage::INDEX_EXPRESSION_MAX }>>],
+    columns: &[u16],
+    include_columns: &[u16],
+    txid: u32,
+    arena: &Arena,
+) -> Result<SqlName, SqlError> {
+    let mut names = IndexColumnNames::new();
+    for (expression, column) in expressions.iter().zip(columns) {
+        match expression {
+            Some(expression) => {
+                let parsed = crate::sql::parser::parse_expr(expression.as_str(), arena)?;
+                names.push(index_expression_column_name(parsed))?;
+            }
+            None => names.push(def.columns()[usize::from(*column)].name.as_str())?,
+        }
+    }
+    for column in include_columns {
+        names.push(def.columns()[usize::from(*column)].name.as_str())?;
+    }
+    generated_index_name_for_columns(storage, def, &names, txid)
+}
+
+/// PostgreSQL's `FigureIndexColname`: the name a select list would give the
+/// written expression, or `expr` when nothing names it.
+pub(crate) fn index_expression_column_name<'a>(expression: &Expr<'a>) -> &'a str {
+    match derived_name(expression) {
+        "?column?" => "expr",
+        name => name,
     }
 }
 
-fn generated_index_name_for_key<Definition0: crate::storage::DefinitionBacking>(
-    storage: &Storage,
-    table: &crate::storage::TableDefinition<Definition0>,
-    key: &str,
-    txid: u32,
-) -> Result<SqlName, SqlError> {
-    use core::fmt::Write as _;
-    for ordinal in 0..=storage.index_count() {
-        let mut name = StackStr::<64>::new();
-        let _ = write!(name, "{}_{}_idx", table.name.as_str(), key);
-        if ordinal != 0 {
-            let _ = write!(name, "{}", ordinal);
+/// PostgreSQL's `ChooseIndexColumnNames`: the key and INCLUDE column names
+/// of an index, with the first free numeric suffix appended to a repeat.
+pub(crate) struct IndexColumnNames {
+    names: [StackStr<64>; crate::storage::MAX_INDEX_COLS],
+    count: usize,
+}
+
+impl IndexColumnNames {
+    pub(crate) fn new() -> Self {
+        Self {
+            names: [StackStr::new(); crate::storage::MAX_INDEX_COLS],
+            count: 0,
         }
-        if name.is_truncated() {
+    }
+
+    pub(crate) fn push(&mut self, name: &str) -> Result<(), SqlError> {
+        use core::fmt::Write as _;
+        if self.count == crate::storage::MAX_INDEX_COLS {
             return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "generated index name is too long"
+                sqlstate::TOO_MANY_COLUMNS,
+                "cannot use more than {} columns in an index",
+                crate::storage::MAX_INDEX_COLS
             ));
         }
+        let mut chosen = StackStr::<64>::from_str(name);
+        let mut suffix = 0u32;
+        while self.names[..self.count]
+            .iter()
+            .any(|existing| existing.as_str() == chosen.as_str())
+        {
+            suffix += 1;
+            let digits = crate::stack_format!(12, "{}", suffix);
+            let mut length = name.len().min(63 - digits.len());
+            while !name.is_char_boundary(length) {
+                length -= 1;
+            }
+            chosen = StackStr::new();
+            let _ = chosen.write_str(&name[..length]);
+            let _ = chosen.write_str(digits.as_str());
+        }
+        self.names[self.count] = chosen;
+        self.count += 1;
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, index: usize) -> &str {
+        self.names[index].as_str()
+    }
+
+    /// `ChooseIndexNameAddition`: the names joined by `_`, cut at 63 bytes.
+    fn addition(&self) -> StackStr<128> {
+        use core::fmt::Write as _;
+        let mut addition = StackStr::<128>::new();
+        for name in &self.names[..self.count] {
+            if !addition.is_empty() {
+                let _ = addition.write_char('_');
+            }
+            let room = 63usize.saturating_sub(addition.len());
+            let mut length = name.len().min(room);
+            while !name.as_str().is_char_boundary(length) {
+                length -= 1;
+            }
+            let _ = addition.write_str(&name.as_str()[..length]);
+            if addition.len() >= 64 {
+                break;
+            }
+        }
+        addition
+    }
+}
+
+/// `ChooseRelationName(table, addition, "idx")`: the first free name in the
+/// table's schema, numbering the label on a collision.
+fn generated_index_name_for_columns<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    table: &crate::storage::TableDefinition<Definition0>,
+    names: &IndexColumnNames,
+    txid: u32,
+) -> Result<SqlName, SqlError> {
+    let addition = names.addition();
+    for ordinal in 0..=storage.index_count() {
+        let label = if ordinal == 0 {
+            crate::stack_format!(16, "idx")
+        } else {
+            crate::stack_format!(16, "idx{}", ordinal)
+        };
+        let name = crate::storage::constraint_names::generated(
+            table.name.as_str(),
+            (!addition.is_empty()).then_some(addition.as_str()),
+            label.as_str(),
+        )?;
         if !storage.relation_name_taken(table.schema.as_str(), name.as_str(), txid) {
-            return SqlName::parse(name.as_str());
+            return Ok(name);
         }
     }
     Err(sql_err!(
@@ -55674,7 +55798,21 @@ pub fn create_statistics(
                 ) {
                     return sql_fail(error);
                 }
-                match crate::storage::extended_statistics_expression(expression.source) {
+                // PostgreSQL's `CreateStatistics` treats a whole-row variable
+                // like a system column.
+                match ddl::expression_variables(expression.expression, &table_definition) {
+                    Ok(variables) if variables.has_whole_row() => {
+                        return sql_fail(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "statistics creation on system columns is not supported"
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => return sql_fail(error),
+                }
+                match ddl::stored_relation_expression(expression.source, &table_definition, arena)
+                    .and_then(crate::storage::extended_statistics_expression)
+                {
                     Ok(expression) => ExtendedStatisticsKey::Expression(expression),
                     Err(error) => return sql_fail(error),
                 }
@@ -56495,6 +56633,14 @@ pub fn create_index(
                 "argument of WHERE must be type boolean"
             ));
         }
+        if let Err(error) = ddl::require_immutable_index_expression(
+            predicate_expression,
+            storage,
+            txn.txid,
+            "predicate",
+        ) {
+            return sql_fail(error);
+        }
     }
     if command.columns.is_empty() || command.columns.len() > MAX_INDEX_COLS {
         return sql_fail(sql_err!(
@@ -56696,14 +56842,31 @@ pub fn create_index(
     let mut operator_class_options =
         [crate::storage::IndexOperatorClassOptions::DEFAULT; MAX_INDEX_COLS];
     for (i, index_column) in command.columns.iter().enumerate() {
-        let (input, type_oid) = if let Some(column_name) = index_column.column {
-            let Some(column_index) = tdef.column_index(column_name) else {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    column_name
-                ));
-            };
+        // PostgreSQL makes a key that analyzes to a plain column (`(t.a)`,
+        // `((t).a)`) a simple column; a parenthesized relation name is the
+        // whole row, while a bare one must name a column.
+        let simple_column = match index_column.column {
+            Some(column_name) => match tdef.column_index(column_name) {
+                Some(column_index) => Some(column_index),
+                None if index_column.expression_text.starts_with('(')
+                    && column_name == tdef.name.as_str() =>
+                {
+                    None
+                }
+                None => {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        column_name
+                    ));
+                }
+            },
+            None => match ddl::plain_column_reference(index_column.expression, &tdef) {
+                Ok(column) => column,
+                Err(error) => return sql_fail(error),
+            },
+        };
+        let (input, type_oid) = if let Some(column_index) = simple_column {
             columns[i] = column_index as u16;
             let column = tdef.columns()[column_index];
             let Some(type_oid) = storage.routine_type_oid(column.ctype, column.user_type, txn.txid)
@@ -56731,11 +56894,23 @@ pub fn create_index(
                 Ok(result) => result,
                 Err(error) => return sql_fail(error),
             };
-            expressions[i] =
-                match crate::storage::index_expression_stackstr(index_column.expression_text) {
-                    Ok(expression) => Some(expression),
+            if let Err(error) = ddl::require_immutable_index_expression(
+                index_column.expression,
+                storage,
+                txn.txid,
+                "expression",
+            ) {
+                return sql_fail(error);
+            }
+            let stored =
+                match ddl::stored_relation_expression(index_column.expression_text, &tdef, arena) {
+                    Ok(stored) => stored,
                     Err(error) => return sql_fail(error),
                 };
+            expressions[i] = match crate::storage::index_expression_stackstr(stored) {
+                Ok(expression) => Some(expression),
+                Err(error) => return sql_fail(error),
+            };
             expression_refs[i] = Some(index_column.expression);
             match catalog_column_type(storage, txn.txid, type_oid) {
                 Some((ctype, user_type)) => {
@@ -57185,7 +57360,13 @@ pub fn create_index(
             Ok(name) => name,
             Err(error) => return sql_fail(error),
         },
-        None => match generated_index_name(storage, &tdef, command.columns, txn.txid) {
+        None => match generated_index_name(
+            storage,
+            &tdef,
+            command.columns,
+            command.include_columns,
+            txn.txid,
+        ) {
             Ok(name) => name,
             Err(error) => return sql_fail(error),
         },
@@ -57214,7 +57395,9 @@ pub fn create_index(
         ));
     }
     let predicate = match command.predicate_text {
-        Some(text) => match crate::storage::index_predicate_stackstr(text) {
+        Some(text) => match ddl::stored_relation_expression(text, &tdef, arena)
+            .and_then(crate::storage::index_predicate_stackstr)
+        {
             Ok(predicate) => Some(predicate),
             Err(error) => return sql_fail(error),
         },
@@ -57314,6 +57497,7 @@ pub fn create_index(
                 root_index: slot,
                 root: def,
                 columns: command.columns,
+                include_columns: command.include_columns,
                 arena,
             },
         )
@@ -57699,6 +57883,7 @@ struct PartitionIndexCreate<'a> {
     root_index: usize,
     root: crate::storage::IndexDef,
     columns: &'a [crate::sql::ast::IndexColumn<'a>],
+    include_columns: &'a [&'a str],
     arena: &'a Arena,
 }
 
@@ -57709,6 +57894,16 @@ fn create_partition_index_children(
     command: PartitionIndexCreate<'_>,
 ) -> Result<(), SqlError> {
     use crate::storage::IndexDef;
+    if (0..storage.table_count())
+        .any(|slot| partition_depth_from(storage, slot, command.root_table, txn.txid) == Some(1))
+    {
+        ddl::require_convertible_index(
+            &storage.table_def(command.root_table, txn.txid),
+            &command.root,
+            command.root.name.as_str(),
+            command.arena,
+        )?;
+    }
     for depth in 1..storage.table_count() {
         for table_slot in 0..storage.table_count() {
             if partition_depth_from(storage, table_slot, command.root_table, txn.txid)
@@ -57753,7 +57948,13 @@ fn create_partition_index_children(
                         )
                     })?
             };
-            let name = generated_index_name(storage, &table, command.columns, txn.txid)?;
+            let name = generated_index_name(
+                storage,
+                &table,
+                command.columns,
+                command.include_columns,
+                txn.txid,
+            )?;
             let definition = crate::storage::IndexMutableDefinition {
                 parent: Some(parent_index as u16),
                 kind: if table.partition.is_partitioned() {
@@ -74083,6 +74284,7 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
     mode: PartitionInheritance,
     transaction: u32,
     child_slot: usize,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     if parent.n_columns != child.n_columns {
         return Err(sql_err!(
@@ -74224,6 +74426,7 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
                 "too many check constraints"
             ));
         }
+        ddl::require_convertible_check(parent, constraint, arena)?;
         child.checks[child.n_checks] = *constraint;
         child.checks[child.n_checks].identity = None;
         child.n_checks += 1;
@@ -74578,6 +74781,7 @@ fn alter_table_inheritance(
     responder: &mut Responder,
     emit_completion: bool,
     tag: &'static str,
+    arena: &Arena,
 ) -> Outcome {
     let child = child_target.table();
     let Some(crate::storage::ResolvedRelation::Table(parent)) =
@@ -74662,7 +74866,7 @@ fn alter_table_inheritance(
                 ));
             }
         }
-        if let Err(error) = inherit_table_checks(&parent_definition, &mut updated, true) {
+        if let Err(error) = inherit_table_checks(&parent_definition, &mut updated, true, arena) {
             return sql_fail(error);
         }
         if let Err(error) = updated.inheritance.append(parent) {
@@ -74869,6 +75073,7 @@ fn alter_partition_attachment(
             PartitionInheritance::Attach,
             txn.txid,
             child,
+            arena,
         ) {
             return sql_fail(error);
         }
@@ -75237,6 +75442,7 @@ fn alter_partition_attachment(
                     PartitionInheritance::ParentAlter,
                     txn.txid,
                     descendant,
+                    arena,
                 ) {
                     return sql_fail(error);
                 }
@@ -75343,7 +75549,10 @@ fn detached_partition_constraint_name<Definition0: crate::storage::DefinitionBac
     for key in &scheme.keys[..usize::from(scheme.n_keys)] {
         referenced.insert(usize::from(*key));
     }
-    ddl::auto_check_name(storage, child, referenced, transaction, Some(child_slot))
+    let single_column = (referenced.count_ones() == 1)
+        .then(|| referenced.first())
+        .flatten();
+    ddl::auto_check_name(storage, child, single_column, transaction, Some(child_slot))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -75979,6 +76188,7 @@ fn alter_table_relation(
             responder,
             emit_completion,
             tag,
+            arena,
         );
     }
 
@@ -76716,6 +76926,34 @@ fn alter_table_relation(
                     Ok(n) => n,
                     Err(e) => return sql_fail(e),
                 };
+                // Index expressions are not versioned with the table, so an
+                // index that reads the whole row cannot follow the new name.
+                for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid) {
+                    match ddl::index_reads_whole_row(&def, &index, arena) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            return sql_fail(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "cannot rename table \"{}\" because index \"{}\" contains a whole-row table reference",
+                                def.name.as_str(),
+                                index.name_for(txn.txid).as_str()
+                            ));
+                        }
+                        Err(error) => return sql_fail(error),
+                    }
+                }
+                let renamed = new_def.name;
+                for check in new_def.checks.iter_mut().take(new_def.n_checks) {
+                    check.expression = match ddl::rename_whole_row_references(
+                        &check.expression,
+                        def.name.as_str(),
+                        renamed.as_str(),
+                        arena,
+                    ) {
+                        Ok(expression) => expression,
+                        Err(error) => return sql_fail(error),
+                    };
+                }
             }
             AlterAction::RenameColumn { from, to } => {
                 let Some(i) = new_def.column_index(from) else {
@@ -76732,6 +76970,27 @@ fn alter_table_relation(
                     Ok(n) => n,
                     Err(e) => return sql_fail(e),
                 };
+                // Index expressions are stored as text that is not versioned
+                // with the table, so they cannot follow a column rename yet.
+                if let Some(column) = def.column_index(from) {
+                    for index in
+                        storage.indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid)
+                    {
+                        match ddl::index_expression_columns(&def, &index, arena) {
+                            Ok(columns) if !columns.contains(column) => {}
+                            Ok(_) => {
+                                return sql_fail(sql_err!(
+                                    sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "cannot rename column \"{}\" of table \"{}\" because index \"{}\" uses it in an expression or predicate",
+                                    from,
+                                    def.name.as_str(),
+                                    index.name_for(txn.txid).as_str()
+                                ));
+                            }
+                            Err(error) => return sql_fail(error),
+                        }
+                    }
+                }
                 column_renames[n_column_renames] = (new_def.columns[i].name, to);
                 n_column_renames += 1;
                 if let Err(error) =
@@ -78740,6 +78999,7 @@ fn alter_table_relation(
                                 PartitionInheritance::ParentAlter,
                                 txn.txid,
                                 descendant,
+                                arena,
                             ) {
                                 return sql_fail(error);
                             }

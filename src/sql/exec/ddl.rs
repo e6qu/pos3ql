@@ -622,25 +622,478 @@ pub(super) fn resolve_cols<Definition0: crate::storage::DefinitionBacking>(
     Ok((out, names.len()))
 }
 
-/// Validates that every column reference in a CHECK predicate names a real
-/// column of the table being defined, and that the predicate uses no subquery
-/// (which PostgreSQL forbids in CHECK). Each referenced column's index is OR'd
-/// into `cols` (bit `i` = column `i`), so the caller can name the constraint
-/// the way PostgreSQL does — `<table>_<column>_check` when the predicate
-/// references exactly one column, `<table>_check` otherwise.
+/// The distinct variables of an expression over one relation. A whole-row
+/// reference (`t.*`, or the bare relation name) is attribute 0; `ROW(t.*)`
+/// and `(t).column` read the named columns instead.
+pub(crate) struct ExpressionVariables<'v> {
+    columns: ColumnSet,
+    whole_row: bool,
+    count: usize,
+    /// The first variable: `Some(column)`, or `None` for the whole row.
+    first: Option<Option<usize>>,
+    /// Sees each variable once, in the order PostgreSQL's `pull_var_clause`
+    /// first meets it.
+    visit: Option<&'v mut dyn FnMut(Option<usize>)>,
+}
+
+impl ExpressionVariables<'_> {
+    pub(crate) const fn columns(&self) -> ColumnSet {
+        self.columns
+    }
+
+    pub(crate) const fn has_whole_row(&self) -> bool {
+        self.whole_row
+    }
+
+    /// PostgreSQL names a CHECK after its column only when the predicate has
+    /// exactly one variable and that variable is a column.
+    pub(crate) fn single_column(&self) -> Option<usize> {
+        if self.count == 1 {
+            self.first.flatten()
+        } else {
+            None
+        }
+    }
+
+    fn add(&mut self, variable: Option<usize>) {
+        let new = match variable {
+            Some(column) => !self.columns.contains(column),
+            None => !self.whole_row,
+        };
+        if !new {
+            return;
+        }
+        match variable {
+            Some(column) => self.columns.insert(column),
+            None => self.whole_row = true,
+        }
+        self.first.get_or_insert(variable);
+        self.count += 1;
+        if let Some(visit) = self.visit.as_mut() {
+            visit(variable);
+        }
+    }
+
+    fn add_column(&mut self, column: usize) {
+        self.add(Some(column));
+    }
+
+    fn add_whole_row(&mut self) {
+        self.add(None);
+    }
+}
+
+/// Respells the whole-row references (`old.*`) of a stored single-relation
+/// expression after its relation is renamed; PostgreSQL's analyzed form
+/// refers to the relation itself rather than to its name.
+pub(crate) fn rename_whole_row_references<const N: usize>(
+    text: &StackStr<N>,
+    old: &str,
+    new: &str,
+    arena: &Arena,
+) -> Result<StackStr<N>, SqlError> {
+    use crate::sql::lexer::{Lexer, Tok};
+    use core::fmt::Write as _;
+    let mark = arena.mark();
+    let result = (|| {
+        let source = text.as_str();
+        let mut lexer = Lexer::new(source, arena);
+        let mut previous = None;
+        let mut copied = 0;
+        let mut output = StackStr::<N>::new();
+        let invalid = |error: crate::sql::lexer::LexError| {
+            sql_err!(
+                error.kind.sqlstate(),
+                "invalid stored expression: {}",
+                error.message
+            )
+        };
+        loop {
+            let token = lexer.next_token().map_err(invalid)?;
+            if token == Tok::Eof {
+                break;
+            }
+            let (start, end) = (lexer.token_start(), lexer.token_end());
+            let mut ahead = lexer.clone();
+            let whole_row = matches!(token, Tok::Ident(name) | Tok::QuotedIdent(name) if name == old)
+                && previous != Some(Tok::Op("."))
+                && ahead.next_token().map_err(invalid)? == Tok::Op(".")
+                && ahead.next_token().map_err(invalid)? == Tok::Op("*");
+            if whole_row {
+                let _ = output.write_str(&source[copied..start]);
+                crate::sql::catalog::write_identifier(&mut output, new);
+                copied = end;
+            }
+            previous = Some(token);
+        }
+        let _ = output.write_str(&source[copied..]);
+        if output.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "renamed stored expression exceeds {} bytes",
+                N
+            ));
+        }
+        Ok(output)
+    })();
+    // SAFETY: the lexer's folded identifiers do not outlive this call.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+/// The variables a stored index's key expressions and predicate read.
+fn index_expression_variables<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
+    index: &crate::storage::IndexDef,
+    arena: &Arena,
+) -> Result<(ColumnSet, bool), SqlError> {
+    let mut columns = ColumnSet::EMPTY;
+    let mut whole_row = false;
+    for text in index
+        .expressions
+        .iter()
+        .flatten()
+        .map(|expression| expression.as_str())
+        .chain(index.predicate.as_ref().map(|predicate| predicate.as_str()))
+    {
+        let mark = arena.mark();
+        let found = crate::sql::parser::parse_expr(text, arena)
+            .and_then(|expression| expression_variables(expression, table))
+            .map(|variables| (variables.columns(), variables.has_whole_row()));
+        // SAFETY: nothing parsed above outlives this check.
+        unsafe { arena.rewind_to(mark) };
+        let (found_columns, found_whole_row) = found?;
+        columns |= found_columns;
+        whole_row |= found_whole_row;
+    }
+    Ok((columns, whole_row))
+}
+
+/// Whether a stored index key or predicate reads the whole row.
+pub(crate) fn index_reads_whole_row<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
+    index: &crate::storage::IndexDef,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    Ok(index_expression_variables(table, index, arena)?.1)
+}
+
+/// The columns a stored index's key expressions and predicate read.
+pub(crate) fn index_expression_columns<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
+    index: &crate::storage::IndexDef,
+    arena: &Arena,
+) -> Result<ColumnSet, SqlError> {
+    Ok(index_expression_variables(table, index, arena)?.0)
+}
+
+/// PostgreSQL's `MergeAttributes` cannot map a whole-row variable of a
+/// copied CHECK constraint onto the new relation's row type.
+pub(crate) fn require_convertible_check<Definition0: crate::storage::DefinitionBacking>(
+    source: &crate::storage::TableDefinition<Definition0>,
+    check: &CheckConstraint,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mark = arena.mark();
+    let whole_row = crate::sql::parser::parse_expr(check.expression.as_str(), arena)
+        .and_then(|expression| expression_variables(expression, source))
+        .map(|variables| variables.has_whole_row());
+    // SAFETY: nothing parsed above outlives this check.
+    unsafe { arena.rewind_to(mark) };
+    if whole_row? {
+        return Err(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot convert whole-row table reference"
+            ),
+            format_args!(
+                "Constraint \"{}\" contains a whole-row reference to table \"{}\".",
+                check.name.as_str(),
+                source.name.as_str()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The same refusal for an index that `LIKE ... INCLUDING INDEXES` or a new
+/// partition would copy (`generateClonedIndexStmt`).
+pub(crate) fn require_convertible_index<Definition0: crate::storage::DefinitionBacking>(
+    source: &crate::storage::TableDefinition<Definition0>,
+    index: &crate::storage::IndexDef,
+    name: &str,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if index_reads_whole_row(source, index, arena)? {
+        return Err(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot convert whole-row table reference"
+            ),
+            format_args!("Index \"{}\" contains a whole-row table reference.", name),
+        ));
+    }
+    Ok(())
+}
+
+/// PostgreSQL's `CheckMutability` for an index key or predicate: a built-in
+/// function it calls must be immutable (`42P17`). `what` is `expression` or
+/// `predicate`. User-defined functions are not judged here: PostgreSQL first
+/// inlines a simple SQL function, so its declared volatility alone does not
+/// decide.
+pub(crate) fn require_immutable_index_expression(
+    expression: &Expr,
+    storage: &Storage,
+    txid: u32,
+    what: &str,
+) -> Result<(), SqlError> {
+    if expression
+        .contains_nonimmutable_function_with(&|name| {
+            storage.builtin_routine_name_is_nonimmutable(name, txid)
+        })
+        .is_some()
+    {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "functions in index {} must be marked IMMUTABLE",
+            what
+        ));
+    }
+    Ok(())
+}
+
+/// The column a single-relation expression is when it is nothing but a
+/// column reference: `t.a`, `(t).a`, `(t.*).a`, or a column cast to its own
+/// type.
+pub(crate) fn plain_column_reference<Definition0: crate::storage::DefinitionBacking>(
+    expression: &Expr,
+    def: &crate::storage::TableDefinition<Definition0>,
+) -> Result<Option<usize>, SqlError> {
+    match expression {
+        // A cast to the column's own unconstrained built-in type is no
+        // conversion: the parser keeps the column itself.
+        Expr::Cast {
+            operand,
+            type_name,
+            type_mod: -1,
+            ..
+        } => {
+            let column = match operand {
+                Expr::Column {
+                    qualifier: None,
+                    name,
+                } => def.column_index(name),
+                _ => plain_column_reference(operand, def)?,
+            };
+            Ok(column.filter(|&column| {
+                let meta = def.columns()[column];
+                meta.user_type.is_none()
+                    && meta.type_mod < 0
+                    && ColType::from_sql_name(type_name) == Some(meta.ctype)
+            }))
+        }
+        Expr::Column {
+            qualifier: Some(qualifier),
+            name,
+        } => {
+            relation_qualifier(qualifier, def)?;
+            Ok(def.column_index(name))
+        }
+        Expr::Field { base, field } if *field != "*" && names_relation(base, def)? => {
+            Ok(def.column_index(field))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The stored spelling of a validated single-relation expression (a CHECK
+/// predicate, index key or index predicate). Column references lose their
+/// relation qualifier and a whole-row reference is spelled `relation.*`, so
+/// the text survives being copied to another relation and adding a column
+/// that shares the relation's name, as PostgreSQL's analyzed form does.
+pub(crate) fn stored_relation_expression<'a, Definition0: crate::storage::DefinitionBacking>(
+    text: &'a str,
+    def: &crate::storage::TableDefinition<Definition0>,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    use crate::sql::lexer::{Lexer, Tok};
+    use core::fmt::Write as _;
+    let full = crate::sql::eval::arena_full;
+    let (_, sources) = crate::sql::parser::parse_expr_with_column_sources(text, arena)?;
+    let mut tokens = crate::mem::arena::ArenaList::new(arena);
+    let mut lexer = Lexer::new(text, arena);
+    loop {
+        let token = lexer.next_token().map_err(|error| {
+            sql_err!(
+                error.kind.sqlstate(),
+                "invalid stored expression: {}",
+                error.message
+            )
+        })?;
+        if token == Tok::Eof {
+            break;
+        }
+        tokens
+            .push((token, lexer.token_start(), lexer.token_end()))
+            .map_err(|_| full())?;
+    }
+    let tokens = tokens.as_slice();
+    let token = |index: usize| tokens.get(index).map(|(token, _, _)| *token);
+    let relation = |index: usize| {
+        matches!(token(index), Some(Tok::Ident(name) | Tok::QuotedIdent(name))
+            if name == def.name.as_str())
+    };
+    let field = |index: usize| {
+        matches!(token(index), Some(Tok::Ident(_) | Tok::QuotedIdent(_)))
+            && token(index + 1) != Some(Tok::Op("("))
+    };
+    // A bare relation name the parser read as a column reference.
+    let bare = |index: usize| {
+        def.column_index(def.name.as_str()).is_none()
+            && sources.iter().any(|source| {
+                source.qualifier_parts == 0
+                    && source.start == tokens[index].1
+                    && source.name == def.name.as_str()
+            })
+    };
+    let qualified = |index: usize| {
+        sources
+            .iter()
+            .any(|source| source.qualifier_parts == 1 && source.start == tokens[index].1)
+    };
+    let mut output = crate::mem::arena::ArenaString::new(arena);
+    let mut copied = 0;
+    let mut index = 0;
+    while index < tokens.len() {
+        let (_, start, _) = tokens[index];
+        // `(t).a` and `(t.*).a` select a column; `t.a` qualifies one; a
+        // bare `t` is the whole row.
+        let (skip_end, replacement, next) = if token(index) == Some(Tok::Op("("))
+            && relation(index + 1)
+            && bare(index + 1)
+            && token(index + 2) == Some(Tok::Op(")"))
+            && token(index + 3) == Some(Tok::Op("."))
+            && field(index + 4)
+        {
+            (tokens[index + 4].1, false, index + 4)
+        } else if token(index) == Some(Tok::Op("("))
+            && relation(index + 1)
+            && token(index + 2) == Some(Tok::Op("."))
+            && token(index + 3) == Some(Tok::Op("*"))
+            && token(index + 4) == Some(Tok::Op(")"))
+            && token(index + 5) == Some(Tok::Op("."))
+            && field(index + 6)
+        {
+            (tokens[index + 6].1, false, index + 6)
+        } else if relation(index)
+            && token(index + 1) == Some(Tok::Op("."))
+            && field(index + 2)
+            && qualified(index + 2)
+        {
+            (tokens[index + 2].1, false, index + 2)
+        } else if relation(index) && bare(index) {
+            (tokens[index].2, true, index + 1)
+        } else {
+            index += 1;
+            continue;
+        };
+        output.write_str(&text[copied..start]).map_err(|_| full())?;
+        if replacement {
+            let mut name = crate::util::StackStr::<130>::new();
+            crate::sql::catalog::write_identifier(&mut name, def.name.as_str());
+            output.write_str(name.as_str()).map_err(|_| full())?;
+            output.write_str(".*").map_err(|_| full())?;
+        }
+        copied = skip_end;
+        index = next;
+    }
+    output.write_str(&text[copied..]).map_err(|_| full())?;
+    Ok(output.as_str())
+}
+
+/// Validates that every column reference in a CHECK predicate, index
+/// expression or predicate names a real column of the table being defined,
+/// and that the predicate uses no subquery (which PostgreSQL forbids there).
+/// Returns the referenced columns; a whole-row reference adds none.
 pub(crate) fn check_referenced_columns<Definition0: crate::storage::DefinitionBacking>(
     expression: &Expr,
     def: &crate::storage::TableDefinition<Definition0>,
 ) -> Result<ColumnSet, SqlError> {
-    let mut columns = ColumnSet::EMPTY;
-    validate_check_refs(expression, def, &mut columns)?;
-    Ok(columns)
+    Ok(expression_variables(expression, def)?.columns())
+}
+
+/// [`check_referenced_columns`] with the whole-row reference and the variable
+/// count PostgreSQL's generated constraint names use.
+pub(crate) fn expression_variables<Definition0: crate::storage::DefinitionBacking>(
+    expression: &Expr,
+    def: &crate::storage::TableDefinition<Definition0>,
+) -> Result<ExpressionVariables<'static>, SqlError> {
+    let mut variables = ExpressionVariables {
+        columns: ColumnSet::EMPTY,
+        whole_row: false,
+        count: 0,
+        first: None,
+        visit: None,
+    };
+    validate_check_refs(expression, def, &mut variables)?;
+    Ok(variables)
+}
+
+/// Visits each distinct variable of `expression` once, in the order
+/// PostgreSQL's `pull_var_clause` first meets it (its `conkey` order).
+pub(crate) fn visit_expression_variables<Definition0: crate::storage::DefinitionBacking>(
+    expression: &Expr,
+    def: &crate::storage::TableDefinition<Definition0>,
+    visit: &mut dyn FnMut(Option<usize>),
+) -> Result<(), SqlError> {
+    let mut variables = ExpressionVariables {
+        columns: ColumnSet::EMPTY,
+        whole_row: false,
+        count: 0,
+        first: None,
+        visit: Some(visit),
+    };
+    validate_check_refs(expression, def, &mut variables)
+}
+
+/// Whether `name` spells the relation itself rather than one of its columns:
+/// PostgreSQL resolves a bare name that is no column to the whole row.
+fn names_relation<Definition0: crate::storage::DefinitionBacking>(
+    expression: &Expr,
+    def: &crate::storage::TableDefinition<Definition0>,
+) -> Result<bool, SqlError> {
+    match expression {
+        Expr::WholeRow(table) => {
+            relation_qualifier(table, def)?;
+            Ok(true)
+        }
+        Expr::Column {
+            qualifier: None,
+            name,
+        } => Ok(def.column_index(name).is_none() && *name == def.name.as_str()),
+        _ => Ok(false),
+    }
+}
+
+fn relation_qualifier<Definition0: crate::storage::DefinitionBacking>(
+    table: &str,
+    def: &crate::storage::TableDefinition<Definition0>,
+) -> Result<(), SqlError> {
+    if table == def.name.as_str() {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "missing FROM-clause entry for table \"{}\"",
+            table
+        ))
+    }
 }
 
 fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
     expression: &Expr,
     def: &crate::storage::TableDefinition<Definition0>,
-    cols: &mut ColumnSet,
+    variables: &mut ExpressionVariables<'_>,
 ) -> Result<(), SqlError> {
     match expression {
         Expr::SchemaColumn { table, .. } => {
@@ -650,22 +1103,35 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
                 table
             ));
         }
-        Expr::WholeRow(t) => {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "whole-row reference to \"{}\" is not supported in CHECK",
-                t
-            ));
+        Expr::WholeRow(table) => {
+            relation_qualifier(table, def)?;
+            variables.add_whole_row();
         }
-        Expr::Column { name, .. } => {
-            let Some(index) = def.column_index(name) else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
-                ));
-            };
-            cols.insert(index);
+        Expr::Column { qualifier, name } => {
+            if let Some(qualifier) = qualifier {
+                relation_qualifier(qualifier, def)?;
+            }
+            match def.column_index(name) {
+                Some(index) => variables.add_column(index),
+                None if qualifier.is_none() && *name == def.name.as_str() => {
+                    variables.add_whole_row()
+                }
+                None => {
+                    if let Some(qualifier) = qualifier {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column {}.{} does not exist",
+                            qualifier,
+                            name
+                        ));
+                    }
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    ));
+                }
+            }
         }
         Expr::RoutineParam { .. } => {}
         Expr::RecursiveState { .. } => {}
@@ -687,20 +1153,38 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
             ..
         }
         | Expr::Collate { operand, .. }
-        | Expr::IsNull { operand, .. } => validate_check_refs(operand, def, cols)?,
+        | Expr::IsNull { operand, .. } => validate_check_refs(operand, def, variables)?,
         Expr::Binary { left, right, .. } => {
-            validate_check_refs(left, def, cols)?;
-            validate_check_refs(right, def, cols)?;
+            validate_check_refs(left, def, variables)?;
+            validate_check_refs(right, def, variables)?;
+        }
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
+            // `ROW(t.*)` and `ROW((t).*)` expand to the relation's columns.
+            for argument in *args {
+                let expansion = match argument {
+                    Expr::WholeRow(_) => Some(*argument),
+                    Expr::Field { base, field: "*" } => Some(*base),
+                    _ => None,
+                };
+                match expansion {
+                    Some(base) if names_relation(base, def)? => {
+                        for column in 0..def.n_columns {
+                            variables.add_column(column);
+                        }
+                    }
+                    _ => validate_check_refs(argument, def, variables)?,
+                }
+            }
         }
         Expr::Call { args, .. } => {
             for a in *args {
-                validate_check_refs(a, def, cols)?;
+                validate_check_refs(a, def, variables)?;
             }
         }
         Expr::InList { operand, list, .. } => {
-            validate_check_refs(operand, def, cols)?;
+            validate_check_refs(operand, def, variables)?;
             for a in *list {
-                validate_check_refs(a, def, cols)?;
+                validate_check_refs(a, def, variables)?;
             }
         }
         Expr::Like {
@@ -709,8 +1193,8 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
         | Expr::Match {
             operand, pattern, ..
         } => {
-            validate_check_refs(operand, def, cols)?;
-            validate_check_refs(pattern, def, cols)?;
+            validate_check_refs(operand, def, variables)?;
+            validate_check_refs(pattern, def, variables)?;
         }
         Expr::Case {
             operand,
@@ -719,14 +1203,14 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
             ..
         } => {
             if let Some(o) = operand {
-                validate_check_refs(o, def, cols)?;
+                validate_check_refs(o, def, variables)?;
             }
             for (w, t) in *whens {
-                validate_check_refs(w, def, cols)?;
-                validate_check_refs(t, def, cols)?;
+                validate_check_refs(w, def, variables)?;
+                validate_check_refs(t, def, variables)?;
             }
             if let Some(o) = otherwise {
-                validate_check_refs(o, def, cols)?;
+                validate_check_refs(o, def, variables)?;
             }
         }
         Expr::Null
@@ -741,28 +1225,40 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
         | Expr::DefaultMarker => {}
         Expr::Array(items) => {
             for e in *items {
-                validate_check_refs(e, def, cols)?;
+                validate_check_refs(e, def, variables)?;
             }
         }
         Expr::Subscript { base, index } => {
-            validate_check_refs(base, def, cols)?;
-            validate_check_refs(index, def, cols)?;
+            validate_check_refs(base, def, variables)?;
+            validate_check_refs(index, def, variables)?;
         }
         Expr::Slice { base, lower, upper } => {
-            validate_check_refs(base, def, cols)?;
+            validate_check_refs(base, def, variables)?;
             if let Some(e) = lower {
-                validate_check_refs(e, def, cols)?;
+                validate_check_refs(e, def, variables)?;
             }
             if let Some(e) = upper {
-                validate_check_refs(e, def, cols)?;
+                validate_check_refs(e, def, variables)?;
             }
         }
+        // `(t).column` selects that column of the relation's row.
+        Expr::Field { base, field } if *field != "*" && names_relation(base, def)? => {
+            let Some(index) = def.column_index(field) else {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column {}.{} does not exist",
+                    def.name.as_str(),
+                    field
+                ));
+            };
+            variables.add_column(index);
+        }
         Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => {
-            validate_check_refs(base, def, cols)?
+            validate_check_refs(base, def, variables)?
         }
         Expr::AnyAll { operand, array, .. } => {
-            validate_check_refs(operand, def, cols)?;
-            validate_check_refs(array, def, cols)?;
+            validate_check_refs(operand, def, variables)?;
+            validate_check_refs(array, def, variables)?;
         }
     }
     Ok(())
@@ -914,7 +1410,7 @@ pub(super) fn attach_constraints(
                 text,
                 validation,
             } => {
-                let referenced_cols = check_referenced_columns(expression, def)?;
+                let single_column = expression_variables(expression, def)?.single_column();
                 if text.len() > crate::storage::CHECK_SQL_MAX {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -931,7 +1427,7 @@ pub(super) fn attach_constraints(
                 }
                 let constraint_name = match name {
                     Some(n) => SqlName::parse(n)?,
-                    None => auto_check_name(storage, def, referenced_cols, txid, exclude)?,
+                    None => auto_check_name(storage, def, single_column, txid, exclude)?,
                 };
                 if constraint_name_taken(def, constraint_name.as_str()) {
                     return Err(sql_err!(
@@ -947,7 +1443,8 @@ pub(super) fn attach_constraints(
                     expression: crate::util::StackStr::new(),
                     validation: storage_validation(*validation),
                 };
-                let _ = core::fmt::Write::write_str(&mut c.expression, text);
+                let stored = stored_relation_expression(text, def, arena)?;
+                let _ = core::fmt::Write::write_str(&mut c.expression, stored);
                 if c.expression.is_truncated() {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1141,19 +1638,15 @@ pub(super) fn auto_key_name<Definition0: crate::storage::DefinitionBacking>(
 pub(super) fn auto_check_name<Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     def: &crate::storage::TableDefinition<Definition0>,
-    referenced_cols: ColumnSet,
+    single_column: Option<usize>,
     transaction: u32,
     exclude: Option<usize>,
 ) -> Result<SqlName, SqlError> {
-    let column = [referenced_cols.first().unwrap_or(0) as u16];
+    let column = single_column.map(|column| [column as u16]);
     auto_key_name(
         storage,
         def,
-        if referenced_cols.count_ones() == 1 {
-            &column
-        } else {
-            &[]
-        },
+        column.as_ref().map_or(&[][..], |column| &column[..]),
         "check",
         transaction,
         exclude,

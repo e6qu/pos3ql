@@ -171,6 +171,102 @@ impl Context<'_> {
         found
     }
 
+    /// The relation a whole-row reference names, with the name it is exposed
+    /// under: `t.*`, or a bare `t` that is neither a column nor a parameter.
+    fn whole_row(&self, expression: &Expr<'_>) -> Option<(&str, &TableDef)> {
+        let (name, bare) = match expression {
+            Expr::WholeRow(name) => (*name, false),
+            Expr::Column {
+                qualifier: None,
+                name,
+            } if !self
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name.as_str() == *name) =>
+            {
+                (*name, true)
+            }
+            _ => return None,
+        };
+        if self.joined.is_empty() {
+            let table = self.table?;
+            return (name == table.name.as_str() && !(bare && table.column_index(name).is_some()))
+                .then_some((table.name.as_str(), table));
+        }
+        if bare
+            && self
+                .joined
+                .iter()
+                .any(|(_, table)| table.column_index(name).is_some())
+        {
+            return None;
+        }
+        self.joined
+            .iter()
+            .find(|(exposed, _)| *exposed == name)
+            .map(|(exposed, table)| (*exposed, *table))
+    }
+
+    fn row_type(&self, table: &TableDef) -> Option<i32> {
+        self.storage
+            .find_visible(table.schema.as_str(), table.name.as_str(), self.txid)
+            .map(|slot| super::table_row_type_oid(self.storage, slot, false))
+    }
+
+    /// `(t).column`, which PostgreSQL resolves to the column itself.
+    fn row_field<'e>(&self, expression: &Expr<'e>) -> Option<&'e str> {
+        match expression {
+            Expr::Field { base, field } if *field != "*" && self.whole_row(base).is_some() => {
+                Some(field)
+            }
+            _ => None,
+        }
+    }
+
+    /// A user-defined function selected for a positional call.
+    fn selected_routine(
+        &self,
+        expression: &Expr<'_>,
+    ) -> Result<Option<(usize, crate::storage::RoutineDef)>, SqlError> {
+        let Expr::Call {
+            kind: CallKind::Routine,
+            name,
+            args,
+            argument_names,
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by: [],
+            over: None,
+            filter: None,
+            ..
+        } = expression
+        else {
+            return Ok(None);
+        };
+        if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS
+            || argument_names.iter().any(Option::is_some)
+        {
+            return Ok(None);
+        }
+        let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (target, argument) in argument_oids.iter_mut().zip(*args) {
+            *target = self.type_of(argument)?.unwrap_or(oid::UNKNOWN);
+        }
+        let crate::storage::RoutineCallSelection::Stored(slot) = self.storage.select_routine_call(
+            name,
+            &[],
+            &argument_oids[..args.len()],
+            false,
+            self.txid,
+            crate::storage::RoutineCallKind::Function,
+        ) else {
+            return Ok(None);
+        };
+        let routine = self.storage.routine_for(slot, self.txid);
+        Ok((routine.argument_count == args.len()).then_some((slot, routine)))
+    }
+
     fn named_type(&self, type_name: &str) -> Option<i32> {
         ColType::from_sql_name(type_name)
             .map(ColType::oid)
@@ -194,7 +290,19 @@ impl Context<'_> {
             | Expr::Like { .. }
             | Expr::Match { .. } => Some(oid::BOOL),
             Expr::Str(_) | Expr::Null => None,
+            _ if self.whole_row(expression).is_some() => self
+                .whole_row(expression)
+                .and_then(|(_, table)| self.row_type(table)),
             Expr::Column { qualifier, name } => self.column_type(*qualifier, name)?,
+            Expr::Field { .. } => match self.row_field(expression) {
+                Some(field) => self.column_type(None, field)?,
+                None => None,
+            },
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name,
+                ..
+            } if name.eq_ignore_ascii_case("row") => Some(oid::RECORD),
             Expr::Cast { type_name, .. } => self.named_type(type_name),
             Expr::Unary {
                 operator: UnaryOp::Not,
@@ -246,9 +354,13 @@ impl Context<'_> {
                 star: true,
                 ..
             } => Some(oid::INT8),
-            Expr::Call { .. } => self
-                .selected_builtin(expression)?
-                .map(|routine| routine.result_oid),
+            Expr::Call { .. } => match self.selected_builtin(expression)? {
+                Some(routine) => Some(routine.result_oid),
+                None => self.selected_routine(expression)?.and_then(|(_, routine)| {
+                    self.storage
+                        .routine_function_result_oid(&routine, self.txid)
+                }),
+            },
             _ => None,
         })
     }
@@ -529,6 +641,64 @@ impl Context<'_> {
             Expr::Float(_) => output.unsupported(),
             Expr::NumericLit(text) => self.constant(text, oid::NUMERIC, output),
             Expr::Bool(value) => output.push(if *value { "true" } else { "false" }),
+            // `get_variable` prints a whole-row variable as `t.*`.
+            _ if self.whole_row(expression).is_some() => {
+                let exposed = self
+                    .whole_row(expression)
+                    .map_or("", |(exposed, _)| exposed);
+                let mut identifier = crate::util::StackStr::<260>::new();
+                write_identifier(&mut identifier, exposed);
+                let _ = identifier.write_str(".*");
+                output.push(identifier.as_str())
+            }
+            Expr::Field { .. } if self.row_field(expression).is_some() => {
+                let field = self.row_field(expression).unwrap_or_default();
+                self.bare(
+                    &Expr::Column {
+                        qualifier: None,
+                        name: field,
+                    },
+                    output,
+                )
+            }
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name,
+                args,
+                ..
+            } if name.eq_ignore_ascii_case("row") => {
+                // The parser expands `ROW(t.*)` into the relation's columns.
+                output.push("ROW(")?;
+                let mut first = true;
+                for argument in *args {
+                    let expansion = match argument {
+                        Expr::WholeRow(_) => self.whole_row(argument),
+                        Expr::Field { base, field: "*" } => self.whole_row(base),
+                        _ => None,
+                    };
+                    let columns = match expansion {
+                        Some((_, table)) => table.columns(),
+                        None => &[],
+                    };
+                    for column in columns {
+                        if !first {
+                            output.push(", ")?;
+                        }
+                        first = false;
+                        let mut identifier = crate::util::StackStr::<260>::new();
+                        write_identifier(&mut identifier, column.name.as_str());
+                        output.push(identifier.as_str())?;
+                    }
+                    if expansion.is_none() {
+                        if !first {
+                            output.push(", ")?;
+                        }
+                        first = false;
+                        self.write(argument, None, output)?;
+                    }
+                }
+                output.push(")")
+            }
             Expr::Column { qualifier, name } => {
                 if self.column_type(*qualifier, name)?.is_none() {
                     return output.unsupported();
@@ -791,6 +961,48 @@ impl Context<'_> {
                 over: None,
                 ..
             } => output.push("count(*)"),
+            Expr::Call { name, args, .. } if self.selected_builtin(expression)?.is_none() => {
+                let Some((slot, routine)) = self.selected_routine(expression)? else {
+                    return output.unsupported();
+                };
+                let mut identifier = crate::util::StackStr::<260>::new();
+                // `generate_function_name` qualifies a function the bare
+                // name would not select.
+                let argument_oids = |index: usize| {
+                    let argument = routine.arguments[index];
+                    self.storage
+                        .routine_type_oid(argument.ctype, argument.user_type, self.txid)
+                };
+                let mut parameter_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                for (index, target) in parameter_oids.iter_mut().enumerate().take(args.len()) {
+                    let Some(found) = argument_oids(index) else {
+                        return output.unsupported();
+                    };
+                    *target = found;
+                }
+                if self.storage.select_routine_call(
+                    name,
+                    &[],
+                    &parameter_oids[..args.len()],
+                    false,
+                    self.txid,
+                    crate::storage::RoutineCallKind::Function,
+                ) != crate::storage::RoutineCallSelection::Stored(slot)
+                {
+                    write_identifier(&mut identifier, routine.schema.as_str());
+                    let _ = identifier.write_char('.');
+                }
+                write_identifier(&mut identifier, routine.name.as_str());
+                output.push(identifier.as_str())?;
+                output.push("(")?;
+                for (index, argument) in args.iter().enumerate() {
+                    if index != 0 {
+                        output.push(", ")?;
+                    }
+                    self.write(argument, Some(parameter_oids[index]), output)?;
+                }
+                output.push(")")
+            }
             Expr::Call { name, args, .. } => {
                 let Some(routine) = self.selected_builtin(expression)? else {
                     return output.unsupported();
@@ -1028,6 +1240,8 @@ fn simple(expression: &Expr<'_>, parent: Parent, first: bool) -> bool {
     };
     match expression {
         Expr::Column { .. }
+        | Expr::WholeRow(_)
+        | Expr::Field { .. }
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::NumericLit(_)
@@ -1100,6 +1314,23 @@ fn sql_value_function(name: &str) -> Option<(&'static str, i32)> {
         "current_schema" => ("CURRENT_SCHEMA", oid::NAME),
         _ => return None,
     })
+}
+
+/// `looks_like_function`: a call written in function syntax, which an index
+/// definition prints without surrounding parentheses.
+pub(crate) fn looks_like_function(expression: &Expr<'_>) -> bool {
+    match expression {
+        Expr::Call {
+            kind: CallKind::Routine,
+            ..
+        } => true,
+        Expr::Call {
+            kind: CallKind::SqlSyntax,
+            name,
+            ..
+        } => is_conditional(name) || sql_value_function(name).is_some(),
+        _ => false,
+    }
 }
 
 fn is_conditional(name: &str) -> bool {
@@ -1258,8 +1489,26 @@ pub(crate) fn view_definition<'a>(
         } else {
             let natural = context.type_of(expression)?;
             context.write(expression, natural, &mut target)?;
+            // `get_variable` casts a top-level whole-row variable to its row
+            // type so that it is not read back as a `*` expansion.
+            if context.whole_row(expression).is_some() {
+                match natural {
+                    Some(row_type) => {
+                        match super::user_type_name_fixed(context.storage, context.txid, row_type)?
+                        {
+                            Some(name) => {
+                                target.push("::")?;
+                                target.push(name.as_str())?;
+                            }
+                            None => target.unsupported()?,
+                        }
+                    }
+                    None => target.unsupported()?,
+                }
+            }
         }
-        let bare_column = matches!(expression, Expr::Column { name: column, .. } if column == name);
+        let bare_column = context.whole_row(expression).is_none()
+            && matches!(expression, Expr::Column { name: column, .. } if column == name);
         if !bare_column {
             target.push(" AS ")?;
             let mut identifier = crate::util::StackStr::<130>::new();

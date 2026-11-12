@@ -70639,7 +70639,7 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
             "SELECT indexdef FROM pg_indexes WHERE tablename = 'copied_cover'",
         )),
         [
-            "CREATE UNIQUE INDEX copied_cover_key_idx ON public.copied_cover USING btree (key) INCLUDE (payload, note)"
+            "CREATE UNIQUE INDEX copied_cover_key_payload_note_idx ON public.copied_cover USING btree (key) INCLUDE (payload, note)"
         ]
     );
     run_with(
@@ -79878,8 +79878,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
         )),
         [
             "lifecycle_default_idx|i|f|NULL",
-            "lifecycle_high_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
-            "lifecycle_low_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_high_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_low_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
             "lifecycle_value_idx|I|f|{fillfactor=80,deduplicate_items=off}",
             "2",
         ]
@@ -80023,8 +80023,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
             &mut replayed,
             &mut replay_budget,
             "SELECT relname, relkind, relispartition, reloptions FROM pg_class \
-             WHERE relname IN ('lifecycle_value_idx', 'lifecycle_low_id_idx', \
-                               'lifecycle_high_id_idx', 'lifecycle_expression_idx') \
+             WHERE relname IN ('lifecycle_value_idx', 'lifecycle_low_id_value_payload_idx', \
+                               'lifecycle_high_id_value_payload_idx', 'lifecycle_expression_idx') \
              ORDER BY relname; \
              SELECT attstattarget FROM pg_attribute \
              WHERE attrelid = 'lifecycle_expression_idx'::regclass AND attnum = 1; \
@@ -80037,8 +80037,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
         )),
         [
             "lifecycle_expression_idx|i|f|{fillfactor=70,deduplicate_items=on}",
-            "lifecycle_high_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
-            "lifecycle_low_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_high_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_low_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
             "lifecycle_value_idx|I|f|{fillfactor=80,deduplicate_items=off}",
             "77",
             "lifecycle_space_renamed|{random_page_cost=2,seq_page_cost=1.5,effective_io_concurrency=8}",
@@ -80067,7 +80067,7 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
             &mut replayed,
             &mut replay_budget,
             "SELECT count(*) FROM pg_indexes WHERE indexname IN \
-             ('lifecycle_value_idx', 'lifecycle_low_id_idx', 'lifecycle_high_id_idx')",
+             ('lifecycle_value_idx', 'lifecycle_low_id_value_payload_idx', 'lifecycle_high_id_value_payload_idx')",
         )),
         ["0"]
     );

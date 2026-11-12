@@ -3959,6 +3959,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .request_backend_signal(backend_pid, terminate, self.txid)
     }
 
+    fn log_backend_memory_contexts(&self, backend_pid: i32) -> Result<bool, SqlError> {
+        self.storage.log_backend_memory_contexts(backend_pid)
+    }
+
     fn listening_channel_count(&self) -> usize {
         self.storage
             .listening_channel_count(self.storage.current_connection_id())

@@ -5921,7 +5921,9 @@ pub fn infer_type_res(
             "pg_backend_pid" => of(ColType::Int4),
             "brin_summarize_new_values" | "brin_summarize_range" => of(ColType::Int4),
             "brin_desummarize_range" => of(ColType::Void),
-            "pg_cancel_backend" | "pg_terminate_backend" => of(ColType::Bool),
+            "pg_cancel_backend" | "pg_terminate_backend" | "pg_log_backend_memory_contexts" => {
+                of(ColType::Bool)
+            }
             "pg_listening_channels" => of(ColType::Text),
             "pg_notification_queue_usage" => of(ColType::Float8),
             "pg_blocking_pids" => of(ColType::Array(crate::sql::types::ArrElem::Int4)),

@@ -1528,6 +1528,7 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     intrinsic!(2561, "pg_blocking_pids", 1007, "23", 1, "v"),
     intrinsic!(2171, "pg_cancel_backend", 16, "23", 1, "v"),
     intrinsic!(2096, "pg_terminate_backend", 16, "23 20", 2, "v"),
+    intrinsic!(4543, "pg_log_backend_memory_contexts", 16, "23", 1, "v"),
     intrinsic!(3035, "pg_listening_channels", 25, "", 0, "s"),
     intrinsic!(3296, "pg_notification_queue_usage", 701, "", 0, "v"),
     intrinsic!(2880, "pg_advisory_lock", 2278, "20", 1, "v"),
@@ -11746,13 +11747,70 @@ const fn foreign_key_action_routine(action: crate::storage::FkAction, update: bo
     }
 }
 
+/// `pg_get_statisticsobj_worker`: the key columns in attribute order, then
+/// each expression, parenthesized unless it looks like a function call.
+fn write_statistics_keys<const N: usize>(
+    output: &mut StackStr<N>,
+    storage: &Storage,
+    txid: u32,
+    statistics: &crate::storage::ExtendedStatisticsDef,
+    table: &crate::storage::TableDef,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+    let keys = statistics.keys_for(txid);
+    let mut first = true;
+    let mut separator = |output: &mut StackStr<N>| {
+        if !first {
+            let _ = output.write_str(", ");
+        }
+        first = false;
+    };
+    for column in 0..table.n_columns {
+        let name = table.columns()[column].name;
+        if keys.contains(&crate::storage::ExtendedStatisticsKey::Column(name)) {
+            separator(output);
+            write_identifier(output, name.as_str());
+        }
+    }
+    for key in keys {
+        let crate::storage::ExtendedStatisticsKey::Expression(source) = key else {
+            continue;
+        };
+        separator(output);
+        let mark = arena.mark();
+        let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+        let deparsed = deparse::deparse(
+            &deparse::Context {
+                storage,
+                txid,
+                table: Some(table),
+                parameters: &[],
+                joined: &[],
+                pretty: true,
+            },
+            source.as_str(),
+            deparse::Destination::Value,
+            arena,
+        )?
+        .unwrap_or(source.as_str());
+        if deparse::looks_like_function(expression) {
+            let _ = output.write_str(deparsed);
+        } else {
+            let _ = write!(output, "({deparsed})");
+        }
+        // SAFETY: the deparsed text was copied into `output`.
+        unsafe { arena.rewind_to(mark) };
+    }
+    Ok(())
+}
+
 pub(crate) fn extended_statistics_columns_by_oid<'a>(
     storage: &Storage,
     txid: u32,
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    use core::fmt::Write as _;
     let Some((_, statistics)) = storage
         .extended_statistics_visible(txid)
         .find(|(_, statistics)| statistics.oid() == oid)
@@ -11760,19 +11818,8 @@ pub(crate) fn extended_statistics_columns_by_oid<'a>(
         return Ok(None);
     };
     let mut output = StackStr::<8192>::new();
-    for (position, key) in statistics.keys_for(txid).iter().enumerate() {
-        if position != 0 {
-            let _ = output.write_str(", ");
-        }
-        match key {
-            crate::storage::ExtendedStatisticsKey::Column(column) => {
-                write_identifier(&mut output, column.as_str());
-            }
-            crate::storage::ExtendedStatisticsKey::Expression(expression) => {
-                let _ = output.write_str(expression.as_str());
-            }
-        }
-    }
+    let table = storage.table_def(usize::from(statistics.table), txid);
+    write_statistics_keys(&mut output, storage, txid, &statistics, &table, arena)?;
     if output.is_truncated() {
         return Err(catalog_capacity_exceeded("pg_statistic_ext"));
     }
@@ -11820,19 +11867,7 @@ pub(crate) fn extended_statistics_definition_by_oid<'a>(
         let _ = output.write_char(')');
     }
     let _ = output.write_str(" ON ");
-    for (position, key) in statistics.keys_for(txid).iter().enumerate() {
-        if position != 0 {
-            let _ = output.write_str(", ");
-        }
-        match key {
-            crate::storage::ExtendedStatisticsKey::Column(column) => {
-                write_identifier(&mut output, column.as_str());
-            }
-            crate::storage::ExtendedStatisticsKey::Expression(expression) => {
-                let _ = output.write_str(expression.as_str());
-            }
-        }
-    }
+    write_statistics_keys(&mut output, storage, txid, &statistics, &table, arena)?;
     let _ = output.write_str(" FROM ");
     if !matches!(
         storage.resolve_relation(None, table.name.as_str(), txid),
@@ -11867,7 +11902,21 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
     let mut count = 0usize;
     for key in statistics.keys_for(txid) {
         if let crate::storage::ExtendedStatisticsKey::Expression(expression) = key {
-            values[count] = text(expression.as_str(), arena)?;
+            let table = storage.table_def(usize::from(statistics.table), txid);
+            let deparsed = deparse::deparse(
+                &deparse::Context {
+                    storage,
+                    txid,
+                    table: Some(&table),
+                    parameters: &[],
+                    joined: &[],
+                    pretty: false,
+                },
+                expression.as_str(),
+                deparse::Destination::Value,
+                arena,
+            )?;
+            values[count] = text(deparsed.unwrap_or(expression.as_str()), arena)?;
             count += 1;
         }
     }
@@ -18309,6 +18358,9 @@ pub fn index_def_text<'a>(
                             )
                         })?;
                     return Ok(Some(index_expression_display(
+                        storage,
+                        txid,
+                        &def,
                         expression.as_str(),
                         pretty,
                         arena,
@@ -18360,6 +18412,9 @@ pub fn index_def_text<'a>(
                         )
                     })?;
                 let _ = s.write_str(index_expression_display(
+                    storage,
+                    txid,
+                    &def,
                     expression.as_str(),
                     pretty,
                     arena,
@@ -18424,19 +18479,80 @@ pub fn index_def_text<'a>(
     Ok(None)
 }
 
+/// The names of an index's attributes, as `ChooseIndexColumnNames` chose
+/// them.
+#[inline(never)]
+fn index_attribute_names(
+    storage: &Storage,
+    info: &IdxInfo,
+    table: &crate::storage::TableDef,
+    txid: u32,
+    arena: &Arena,
+) -> Result<super::exec::IndexColumnNames, SqlError> {
+    let mut names = super::exec::IndexColumnNames::new();
+    for attribute in 0..info.n_cols + info.n_include_cols {
+        match (attribute < info.n_cols && info.expression_keys[attribute])
+            .then(|| index_expression_source(storage, info, attribute, txid))
+            .flatten()
+        {
+            Some(source) => {
+                let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
+                let expression = crate::sql::parser::parse_expr(source, arena)?;
+                names.push(super::exec::index_expression_column_name(expression))?;
+            }
+            None => {
+                let column = if attribute < info.n_cols {
+                    info.columns[attribute]
+                } else {
+                    info.include_columns[attribute - info.n_cols]
+                };
+                names.push(table.columns()[usize::from(column)].name.as_str())?;
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// `pg_get_indexdef_worker`: an expression key is parenthesized unless it
+/// looks like a function call. A shape the deparser cannot type keeps its
+/// canonical source spelling.
 fn index_expression_display<'a>(
+    storage: &Storage,
+    txid: u32,
+    table: &crate::storage::TableDef,
     source: &str,
     pretty: bool,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     use core::fmt::Write;
     let expression = super::parser::parse_expr(source, arena)?;
-    let display = super::enum_values::checks::canonical_display(source, arena)?;
-    if matches!(expression, super::ast::Expr::Call { .. }) || pretty {
-        return Ok(display);
+    let deparsed = deparse::deparse(
+        &deparse::Context {
+            storage,
+            txid,
+            table: Some(table),
+            parameters: &[],
+            joined: &[],
+            pretty,
+        },
+        source,
+        deparse::Destination::Value,
+        arena,
+    )?;
+    let Some(deparsed) = deparsed else {
+        let display = super::enum_values::checks::canonical_display(source, arena)?;
+        if matches!(expression, super::ast::Expr::Call { .. }) || pretty {
+            return Ok(display);
+        }
+        let mut output = crate::mem::arena::ArenaString::new(arena);
+        write!(output, "({display})").map_err(|_| arena_full())?;
+        return Ok(output.as_str());
+    };
+    if deparse::looks_like_function(expression) {
+        return Ok(deparsed);
     }
     let mut output = crate::mem::arena::ArenaString::new(arena);
-    write!(output, "({display})").map_err(|_| arena_full())?;
+    write!(output, "({deparsed})").map_err(|_| arena_full())?;
     Ok(output.as_str())
 }
 
@@ -22641,15 +22757,20 @@ fn pg_constraint_values<'a>(
             let inherited = inheritance_count != 0;
             let table = storage.table_def(slot, txid);
             let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
-            let referenced = super::exec::check_referenced_columns(expression, &table)?;
-            let mut columns = [0; MAX_COLUMNS];
-            let mut count = 0;
-            for column in 0..table.n_columns {
-                if referenced.contains(column) {
-                    columns[count] = column as u16;
-                    count += 1;
-                }
+            // PostgreSQL's `StoreRelCheck` lists each distinct variable in
+            // first-use order; a whole-row reference is attribute 0.
+            let mut attributes = crate::mem::arena::ArenaList::new(arena);
+            let mut full = false;
+            super::exec::visit_expression_variables(expression, &table, &mut |variable| {
+                let attribute =
+                    variable.map_or(0, |column| i32::from(table.attribute_number(column)));
+                full |= attributes.push(Datum::Int4(attribute)).is_err();
+            })?;
+            if full {
+                return Err(arena_full());
             }
+            let attributes = attributes.as_slice();
+            let count = attributes.len();
             out[n] = row(
                 &[
                     Datum::Int4(check.oid()),
@@ -22670,7 +22791,10 @@ fn pg_constraint_values<'a>(
                     if count == 0 {
                         Datum::Null
                     } else {
-                        attnum_array(&columns[..count], &table, arena)?
+                        Datum::Array {
+                            element: super::types::ArrElem::Int4,
+                            raw: super::array::build(attributes, arena)?,
+                        }
                     },
                     empty_int_array(arena)?,
                     Datum::Int4(2606),
@@ -24022,6 +24146,7 @@ fn pg_attribute<'a>(
     }
     for info in indexes {
         let table = storage.table_def(info.table_slot, txid);
+        let names = index_attribute_names(storage, info, &table, txid, arena)?;
         for attribute in 0..info.n_cols + info.n_include_cols {
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attribute"));
@@ -24048,7 +24173,7 @@ fn pg_attribute<'a>(
                         )
                     })?;
                 (
-                    super::exec::derived_name(expression),
+                    names.get(attribute),
                     ctype,
                     type_oid,
                     if user_type.is_some() {
@@ -24066,7 +24191,7 @@ fn pg_attribute<'a>(
                 };
                 let column = &table.columns()[column_index as usize];
                 (
-                    column.name.as_str(),
+                    names.get(attribute),
                     column.ctype,
                     catalog_column_type_oid(storage, column, txid)?,
                     catalog_column_type_mod(column),
@@ -32635,7 +32760,7 @@ fn alloc_rendered<'a, const N: usize>(
     arena.alloc_str(rendered.as_str()).map_err(|_| arena_full())
 }
 
-fn write_identifier(out: &mut impl core::fmt::Write, name: &str) {
+pub(crate) fn write_identifier(out: &mut impl core::fmt::Write, name: &str) {
     if !ident_needs_quotes(name) {
         let _ = out.write_str(name);
         return;

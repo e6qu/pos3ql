@@ -1837,6 +1837,14 @@ pub trait CatalogAccess {
             "backend signaling is unavailable"
         ))
     }
+    /// `pg_log_backend_memory_contexts`: logs the memory contexts of a
+    /// server process and reports whether `backend_pid` named one.
+    fn log_backend_memory_contexts(&self, _backend_pid: i32) -> Result<bool, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "backend signaling is unavailable"
+        ))
+    }
     fn listening_channel_count(&self) -> usize {
         0
     }
@@ -5434,7 +5442,27 @@ fn eval_full_inner<'a>(
             // `IS NOT NULL` only when every field is non-null — so a mixed row
             // is false for both (PostgreSQL's row null-test, not a plain
             // negation).
-            if let Datum::Record(fields) = v {
+            let fields = match v {
+                Datum::Record(fields) | Datum::Composite { fields, .. } => Some(fields),
+                Datum::CompositeText {
+                    slot,
+                    physical_fields,
+                    text,
+                } => {
+                    let catalog = hooks.catalog.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "named composite catalog access is unavailable"
+                        )
+                    })?;
+                    match catalog.materialize_composite(slot, physical_fields, text, arena)? {
+                        Datum::Composite { fields, .. } => Some(fields),
+                        _ => unreachable!("catalog materializes named composites"),
+                    }
+                }
+                _ => None,
+            };
+            if let Some(fields) = fields {
                 let result = if negated {
                     fields.iter().all(|f| !f.value.is_null())
                 } else {

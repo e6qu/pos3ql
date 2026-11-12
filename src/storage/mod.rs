@@ -19270,6 +19270,35 @@ impl Storage {
         inspect(self.backend_state().activities.as_slice())
     }
 
+    /// PostgreSQL's `pg_log_backend_memory_contexts`. A pos3ql session draws
+    /// only from pools reserved at startup and has no memory contexts of its
+    /// own (`pg_backend_memory_contexts` is empty), so the log holds the
+    /// header and an empty grand total.
+    pub(crate) fn log_backend_memory_contexts(&self, pid: i32) -> Result<bool, SqlError> {
+        if !self
+            .backend_state()
+            .activities
+            .iter()
+            .any(|activity| activity.pid == pid)
+        {
+            crate::sql::eval::raise_eval_message(
+                crate::sql::eval::EvalMessageLevel::Warning,
+                sqlstate::WARNING,
+                format_args!("PID {pid} is not a PostgreSQL server process"),
+            )?;
+            return Ok(false);
+        }
+        crate::logging::info_args(
+            "backend_memory_contexts",
+            format_args!("logging memory contexts of PID {pid}"),
+        );
+        crate::logging::info(
+            "backend_memory_contexts",
+            "Grand total: 0 bytes in 0 blocks; 0 free (0 chunks); 0 used",
+        );
+        Ok(true)
+    }
+
     pub(crate) fn request_backend_signal(
         &self,
         pid: i32,

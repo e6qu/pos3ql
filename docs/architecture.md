@@ -143,7 +143,21 @@ sends nothing before its first page, so its reads yield throughout.
 A paged portal whose statement can stream opens its stream before the
 statement runs: its attempt would stop at its first row anyway, so a sort,
 grouping or hash table is built once, in the stream, and its input reads
-resume instead of restarting the statement on each cold read.
+resume instead of restarting the statement on each cold read. In
+object-store mode a join or grouping (including plain `DISTINCT`) opens its
+stream before running under every protocol, for the same reason: its first
+row reads a whole input. Such a stream opens however small its result, so
+it counts in `pos3ql_result_streams_total`.
+
+A statement that does not stream restarts from its start after each cold
+read, finding the objects its earlier attempts read only in the block
+caches. Once it has restarted more times than the caches and the object
+read slots hold blocks (`block_cache_bytes`, `disk_cache_bytes` and
+`object_store_get_slots`), its next attempt reads storage synchronously,
+blocking the worker, instead of restarting again: its input may have
+outgrown the caches, so each attempt could evict blocks the next one needs
+and it would never finish. A result stream resumes from its read position
+and never restarts this way.
 
 A forward `FETCH n` or `FETCH ALL` (simple Query or unpaged `Execute`) from
 a cursor that reads as it fetches and saves no history opens such a stream
@@ -237,7 +251,11 @@ t) s WHERE x <> 0` filters before it divides, and an output column nothing
 reads is never computed. A subquery is merged only when that is exact: no
 grouping, aggregates, window functions, `DISTINCT`, `ORDER BY`, `LIMIT`,
 locking, set-returning or volatile output, security-barrier view, or name the
-merge could rebind. Under an outer join that can null its rows it merges only
+merge could rebind. A table among its FROM items whose name another item of
+the query already has (a `NOT MATERIALIZED` CTE read twice, a self-join
+through two derived tables) takes a name no SQL text can spell, longer than
+the 63 bytes kept of an identifier, as PostgreSQL tells such items apart by
+position. Under an outer join that can null its rows it merges only
 without a `WHERE` (which would otherwise run per joined pair) and when each
 output it substitutes is null whenever its columns are (PostgreSQL substitutes
 those without a placeholder). A view merges when the caller holds `SELECT` on all of it.

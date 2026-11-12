@@ -115,9 +115,8 @@ is owned.
     index-probed joins, `RIGHT` and `FULL` joins of more than two items or
     over generator calls, grouping sets,
     subqueries other than the simple FROM subqueries merged into their query
-    (scalar, `IN`/`EXISTS`, grouped or bounded derived tables, scans of CTEs
-    that run once, and derived tables whose FROM names collide with the outer
-    query's, such as a `NOT MATERIALIZED` CTE read twice),
+    (scalar, `IN`/`EXISTS`, grouped or bounded derived tables, and scans of
+    CTEs that run once),
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs
@@ -321,7 +320,14 @@ rejected with `0A000`, and a label-qualified loop variable (`<<l>> FOR i IN
 1..2 LOOP ... l.i`) fails as an unknown table; exception conditions are
 limited to a fixed list of names (`SQLSTATE` codes work for every condition);
 trigger functions cannot open cursors (`OPEN`, cursor `FOR` loops) and fail
-with `0A000`. A SQL function whose earlier
+with `0A000`. An aggregate inside a subquery whose arguments read only an
+outer query's columns belongs to that outer query in PostgreSQL (`SELECT
+(SELECT max(t.id) FROM u) FROM t` aggregates `t`), but is computed per outer
+row here. An uncorrelated subquery runs before the query's first row,
+where PostgreSQL runs it at its first use (an initPlan) unless it sits in a
+`WHERE` or `HAVING` conjunct that reads no column of the query (a one-time
+filter): `SELECT (SELECT 1/x FROM z) FROM empty_table` fails with `22012`
+here and returns no rows in PostgreSQL. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

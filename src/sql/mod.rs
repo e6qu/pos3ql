@@ -656,6 +656,12 @@ pub struct Engine {
     max_spill_generations_per_table: usize,
     result_streams_opened: u64,
     result_streams_spooled: [u64; 3],
+    /// Cold-read restarts after which a statement attempt reads the rest
+    /// synchronously: more than the block caches and read slots hold, so
+    /// the next attempt could not find every block the last one read.
+    restart_read_bound: u32,
+    /// The current attempt is past that bound.
+    complete_reads: bool,
     ckpt: Option<Checkpointer>,
     temporary_spiller: Option<TemporarySpiller>,
     /// A durable, installed manifest whose heap and journal cleanup remains.
@@ -2879,6 +2885,18 @@ impl Engine {
         let _ = self.replace_read_owner(Some(identity.read_owner()));
     }
 
+    /// See `restart_read_bound`.
+    pub(crate) fn restart_read_bound(&self) -> u32 {
+        self.restart_read_bound
+    }
+
+    /// Makes the next statement attempt read synchronously: it restarted
+    /// after more cold reads than the caches hold, so restarting again could
+    /// evict the blocks it needs and never finish.
+    pub(crate) fn set_complete_reads(&mut self, complete: bool) {
+        self.complete_reads = complete;
+    }
+
     pub(crate) fn bind_query_connection(&mut self, connection_id: i32) {
         self.work.bind_connection(connection_id);
         let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
@@ -4334,6 +4352,20 @@ impl Engine {
             max_spill_generations_per_table: config.max_spill_generations_per_table,
             result_streams_opened: 0,
             result_streams_spooled: [0; 3],
+            restart_read_bound: {
+                let plan = crate::store::StackPlan::resolve(
+                    config.block_cache_bytes,
+                    config.disk_cache_bytes,
+                );
+                u32::try_from(
+                    plan.ram
+                        .units
+                        .saturating_add(plan.disk.units)
+                        .saturating_add(config.object_store_get_slots),
+                )
+                .unwrap_or(u32::MAX)
+            },
+            complete_reads: false,
             commit_progress: CommitProgressMode::Inline,
             inflight_publication: None,
             publication_failed: false,
@@ -19266,7 +19298,10 @@ impl Engine {
         // storage reads before an effect, while its writes block.
         let retained_body =
             reset_workspace && matches!(statement, Stmt::Call { .. } | Stmt::Do { .. });
-        let _atomic_reads = if statement_writes(statement) && !retained_body {
+        let _atomic_reads = if (statement_writes(statement)
+            || reset_workspace && self.complete_reads)
+            && !retained_body
+        {
             self.ckpt
                 .as_ref()
                 .map(Checkpointer::atomic_block_read_scope)

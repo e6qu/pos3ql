@@ -492,6 +492,9 @@ pub struct Conn {
     /// Each resource has its own wake condition; cache progress cannot retry
     /// an unrelated object download.
     parked_wait: crate::sql::StatementWait,
+    /// Times the parked message restarted after a cold read; past the
+    /// engine's bound its next attempt reads synchronously.
+    object_restarts: u32,
     /// Absolute deadline for the current lock acquisition. `None` means
     /// `lock_timeout = 0`; the reactor uses this to wake an otherwise idle
     /// server and retry the retained frontend message as a timeout error.
@@ -670,6 +673,7 @@ impl Conn {
             parked: false,
             parked_generation: 0,
             parked_wait: crate::sql::StatementWait::Lock,
+            object_restarts: 0,
             parked_deadline: None,
             resume_statement: 0,
             respool_statement: None,
@@ -1369,6 +1373,13 @@ impl Conn {
             return None;
         }
         self.parked = false;
+        // A stream resumes from its read position; any other cold-read wait
+        // reruns the message from its start.
+        if self.parked_wait == crate::sql::StatementWait::ObjectIo
+            && !self.result_streams.is_active()
+        {
+            self.object_restarts = self.object_restarts.saturating_add(1);
+        }
         let output_mark = self.output_mark();
         self.publication_hold = Some(output_mark);
         let mut resuming = true;
@@ -1379,11 +1390,18 @@ impl Conn {
                 self.park(crate::sql::StatementWait::ClientOutput, 0);
                 break After::Continue;
             }
+            let resumed = resuming;
             resuming = false;
+            engine
+                .set_complete_reads(resumed && self.object_restarts > engine.restart_read_bound());
             let step = match self.phase {
                 Phase::AwaitLoginCommit => self.finish_startup(engine, cancel_key),
                 _ => self.process_message(engine),
             };
+            engine.set_complete_reads(false);
+            if !resumed || !matches!(step, Step::Parked) {
+                self.object_restarts = 0;
+            }
             match step {
                 Step::Close => break After::Close,
                 Step::NeedMoreData | Step::Parked => break After::Continue,

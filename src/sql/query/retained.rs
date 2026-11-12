@@ -82,12 +82,18 @@ pub(crate) enum LockedRow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StreamSource {
     /// One ordinary table: its retained read position grows with its rows.
-    Table(usize),
+    /// `builds` when the stream reads the whole table (a grouping or sort)
+    /// before its first row.
+    Table { table: usize, builds: bool },
     /// A builtin set-returning function: only its next value is retained.
     Generated,
-    /// A nested-loop join: the read positions of its physical tables; literal
-    /// and generated items retain their rows or next value.
+    /// A join: the read positions of its physical tables; literal and
+    /// generated items retain their rows or next value. Its first row may
+    /// read a whole level (a hash build, an inner rescan).
     Join([Option<usize>; MAX_RETAINED_SOURCES]),
+    /// A `UNION ALL` read as one appended stream: the read positions of
+    /// every query's physical tables.
+    Appended([Option<usize>; MAX_RETAINED_SOURCES]),
 }
 
 /// One ORDER BY key of a sorted locking cursor: a source column.
@@ -2532,6 +2538,7 @@ impl<'a> RetainedSelect<'a> {
         else {
             return Ok(None);
         };
+        let builds = aggregates.is_some() || sort::sorts(statement);
         if aggregates.is_none() {
             for expression in statement
                 .items
@@ -2582,7 +2589,7 @@ impl<'a> RetainedSelect<'a> {
         if storage.row_security_applies(table, role, txid) {
             return Ok(None);
         }
-        Ok(Some(StreamSource::Table(table)))
+        Ok(Some(StreamSource::Table { table, builds }))
     }
 
     /// [`Self::stream_source`] of a `UNION ALL` read as one appended
@@ -2613,12 +2620,12 @@ impl<'a> RetainedSelect<'a> {
                 return Ok(None);
             }
             let leaf_tables = match Self::stream_source(storage, txid, leaf, arena)? {
-                Some(StreamSource::Table(table)) => {
+                Some(StreamSource::Table { table, .. }) => {
                     [Some(table), None, None, None, None, None, None, None]
                 }
                 Some(StreamSource::Generated) => [None; MAX_RETAINED_SOURCES],
                 Some(StreamSource::Join(tables)) => tables,
-                None => return Ok(None),
+                Some(StreamSource::Appended(_)) | None => return Ok(None),
             };
             for table in leaf_tables.into_iter().flatten() {
                 let Some(target) = tables.get_mut(count) else {
@@ -2656,7 +2663,7 @@ impl<'a> RetainedSelect<'a> {
                 return Ok(None);
             }
         }
-        Ok(Some(StreamSource::Join(tables)))
+        Ok(Some(StreamSource::Appended(tables)))
     }
 
     pub(crate) fn open(

@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 pub(crate) struct HttpObjectServer {
     stop: Arc<AtomicBool>,
     pub(super) requests: Arc<AtomicUsize>,
+    /// Every distinct key an object GET read.
+    pub(super) fetched: Arc<crate::mem::mutex::Mutex<std::collections::HashSet<String>>>,
     pub(super) uploads: Arc<AtomicUsize>,
     pub(super) hold_response: Arc<AtomicBool>,
     hold_upload_response: Arc<AtomicBool>,
@@ -52,19 +54,28 @@ impl HttpObjectServer {
         fixture_config.object_store_prefix.clear();
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
+        let fetched = Arc::new(crate::mem::mutex::Mutex::new(
+            std::collections::HashSet::new(),
+        ));
         let uploads = Arc::new(AtomicUsize::new(0));
         let hold_response = Arc::new(AtomicBool::new(false));
         let hold_upload_response = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let server_requests = Arc::clone(&requests);
+        let server_fetched = Arc::clone(&fetched);
         let server_uploads = Arc::clone(&uploads);
         let server_hold_response = Arc::clone(&hold_response);
         let server_hold_upload_response = Arc::clone(&hold_upload_response);
         let server = std::thread::spawn(move || {
             let mut fixture_budget =
                 Budget::new(crate::object_store::Client::budget_bytes(&fixture_config));
-            let mut backing =
-                crate::object_store::Client::new(&fixture_config, &mut fixture_budget).unwrap();
+            let backing = Arc::new(crate::mem::mutex::Mutex::new(
+                crate::object_store::Client::new(&fixture_config, &mut fixture_budget).unwrap(),
+            ));
+            // Each connection is served on its own thread, as a real service
+            // serves them concurrently: a synchronous upload must not wait
+            // behind a reactor-owned GET whose request is not yet written.
+            let mut connections = Vec::new();
             while !server_stop.load(Ordering::Acquire) {
                 let mut stream = match listener.accept() {
                     Ok((stream, _)) => stream,
@@ -74,11 +85,20 @@ impl HttpObjectServer {
                     }
                     Err(error) => panic!("accept object read: {error}"),
                 };
+                let backing = Arc::clone(&backing);
+                let prefix = prefix.clone();
+                let server_stop = Arc::clone(&server_stop);
+                let server_requests = Arc::clone(&server_requests);
+                let server_fetched = Arc::clone(&server_fetched);
+                let server_uploads = Arc::clone(&server_uploads);
+                let server_hold_response = Arc::clone(&server_hold_response);
+                let server_hold_upload_response = Arc::clone(&server_hold_upload_response);
+                connections.push(std::thread::spawn(move || {
                 let mut request = [0u8; 8192];
                 let Some((received, header_end)) =
                     crate::test_wait::read_request_head(&mut stream, &mut request, &server_stop)
                 else {
-                    break;
+                    return;
                 };
                 let headers = std::str::from_utf8(&request[..header_end]).unwrap();
                 let mut words = headers.lines().next().unwrap().split_whitespace();
@@ -113,7 +133,7 @@ impl HttpObjectServer {
                     }
                 };
                 assert!(
-                    length <= backing.response_capacity(),
+                    length <= backing.lock().unwrap().response_capacity(),
                     "fixture request body is too large"
                 );
                 let mut body = vec![0u8; length];
@@ -127,8 +147,8 @@ impl HttpObjectServer {
                 if let Some(query) = query {
                     assert_eq!(method, "GET");
                     assert_eq!(path, prefix.trim_end_matches('/'));
-                    reply_object_list(&mut backing, &mut stream, query);
-                    continue;
+                    reply_object_list(&mut backing.lock().unwrap(), &mut stream, query);
+                    return;
                 }
                 let key = decode_http_component(key.expect("fixture object path"));
                 let key = key.as_str();
@@ -140,7 +160,8 @@ impl HttpObjectServer {
                             (None, None) => crate::object_store::Precondition::None,
                             _ => panic!("unsupported conditional request"),
                         };
-                        match backing.put(key, &body, condition) {
+                        let stored = backing.lock().unwrap().put(key, &body, condition);
+                        match stored {
                             Ok(tag) => {
                                 server_uploads.fetch_add(1, Ordering::Relaxed);
                                 while server_hold_upload_response.load(Ordering::Acquire)
@@ -149,7 +170,7 @@ impl HttpObjectServer {
                                     std::thread::sleep(Duration::from_millis(1));
                                 }
                                 if server_stop.load(Ordering::Acquire) {
-                                    break;
+                                    return;
                                 }
                                 write!(stream, "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", tag.as_str()).unwrap();
                             }
@@ -165,27 +186,31 @@ impl HttpObjectServer {
                         }
                     }
                     "DELETE" => {
-                        backing.delete(key).unwrap();
+                        backing.lock().unwrap().delete(key).unwrap();
                         stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                     }
                     "GET" => {
+                        let mut backing = backing.lock().unwrap();
                         let metadata = match backing.get(key, None) {
                             Ok(metadata) => metadata,
                             Err(error) if error.is_not_found() => {
                                 reply_object_error(&mut stream, 404, "NoSuchKey", "object missing");
-                                continue;
+                                return;
                             }
                             Err(error) => panic!("fixture object read failed: {error}"),
                         };
-                        let data = backing.body_bytes();
+                        let data = backing.body_bytes().to_vec();
+                        drop(backing);
+                        let data = data.as_slice();
                         server_requests.fetch_add(1, Ordering::Relaxed);
+                        server_fetched.lock().unwrap().insert(key.to_owned());
                         while server_hold_response.load(Ordering::Acquire)
                             && !server_stop.load(Ordering::Acquire)
                         {
                             std::thread::sleep(Duration::from_millis(1));
                         }
                         if server_stop.load(Ordering::Acquire) {
-                            break;
+                            return;
                         }
                         if let Some(range) = range {
                             let (first, last) = range
@@ -197,7 +222,7 @@ impl HttpObjectServer {
                             let last: usize = last.parse().unwrap();
                             if first >= data.len() || last < first {
                                 write!(stream, "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", data.len()).unwrap();
-                                continue;
+                                return;
                             }
                             let last = last.min(data.len() - 1);
                             let selected = &data[first..=last];
@@ -210,11 +235,18 @@ impl HttpObjectServer {
                     }
                     _ => panic!("unsupported fixture method: {method}"),
                 }
+                }));
+            }
+            for connection in connections {
+                connection
+                    .join()
+                    .expect("HTTP object fixture connection failed");
             }
         });
         Self {
             stop,
             requests,
+            fetched,
             uploads,
             hold_response,
             hold_upload_response,
@@ -507,14 +539,21 @@ pub(super) fn reply(stream: &mut TcpStream, request: &str, body: &[u8]) {
 }
 
 pub(super) fn replace_uncached_blocks(engine: &mut Engine, config: &Config) {
+    replace_blocks(engine, config, 0);
+}
+
+/// Replaces the engine's block stack with one reading `config`'s object
+/// endpoint through a RAM cache of `cache_bytes` and no disk tier.
+pub(super) fn replace_blocks(engine: &mut Engine, config: &Config, cache_bytes: usize) {
     use crate::store::{OwnedObjectStore, StackPlan};
     let blocks = engine.ckpt.as_ref().unwrap().block_stack();
-    let mut budget = Budget::new(OwnedObjectStore::budget_bytes(config));
+    let plan = StackPlan::resolve(cache_bytes, 0);
+    let mut budget = Budget::new(OwnedObjectStore::budget_bytes(config) + plan.ram_budget_bytes());
     let provider = OwnedObjectStore::new(config, &mut budget, "blocks/").unwrap();
     *blocks.lock().unwrap() = crate::store::build_tiers(
         &mut budget,
         provider,
-        StackPlan::resolve(0, 0),
+        plan,
         std::path::Path::new(&config.data_dir),
     )
     .unwrap();

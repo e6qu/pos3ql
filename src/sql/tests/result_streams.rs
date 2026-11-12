@@ -1,7 +1,7 @@
 //! Result streams yield on cold object reads after delivering rows, while
 //! other sessions keep running.
 
-use super::object_reads::{advance, read_request, replace_uncached_blocks, reply};
+use super::object_reads::{HttpObjectServer, advance, replace_uncached_blocks};
 use super::*;
 use crate::pg::conn::{After, AuthContext, Conn};
 use std::io::{Read, Write};
@@ -117,6 +117,27 @@ enum ColdRequest {
     Cte,
     /// A view, expanded under its owner's privileges and merged.
     View,
+    /// A paged portal of a hash join of the cold table with itself.
+    Join,
+    /// A simple Query of the same join.
+    JoinQuery,
+    /// A paged portal of a RIGHT join of the cold table with itself.
+    RightJoin,
+    /// A simple Query of the same RIGHT join.
+    RightJoinQuery,
+    /// A simple Query of a grouping, which reads its whole input first.
+    GroupedQuery,
+    /// A join with a bounded derived table, which the general executor
+    /// materializes in an external run written to object storage. With no
+    /// block cache, each restart after a cold read loses the blocks the last
+    /// attempt read: past the restart bound the attempt reads synchronously
+    /// and finishes.
+    SpooledJoin,
+    /// A `NOT MATERIALIZED` CTE read twice: both reads merge into one join
+    /// of the table with itself, the second under a fresh name.
+    CteTwice,
+    /// The same self-join through two derived tables.
+    DerivedSelfJoin,
 }
 
 #[test]
@@ -169,10 +190,64 @@ fn distinct_paged_portals_yield_on_cold_reads_and_read_each_object_once() {
     cold_result_stream("result-stream-cold-distinct", ColdRequest::Distinct);
 }
 
+#[test]
+fn paged_joins_stream_cold_tables() {
+    cold_result_stream("result-stream-cold-join", ColdRequest::Join);
+}
+
+#[test]
+fn joins_stream_cold_tables() {
+    cold_result_stream("result-stream-cold-join-query", ColdRequest::JoinQuery);
+}
+
+#[test]
+fn paged_right_joins_stream_cold_tables() {
+    cold_result_stream("result-stream-cold-right-join", ColdRequest::RightJoin);
+}
+
+#[test]
+fn right_joins_stream_cold_tables() {
+    cold_result_stream(
+        "result-stream-cold-right-join-query",
+        ColdRequest::RightJoinQuery,
+    );
+}
+
+#[test]
+fn groupings_open_their_stream_before_running() {
+    cold_result_stream(
+        "result-stream-cold-grouped-query",
+        ColdRequest::GroupedQuery,
+    );
+}
+
+#[test]
+fn spooled_joins_write_external_runs_to_object_storage() {
+    cold_result_stream("result-stream-cold-spooled-join", ColdRequest::SpooledJoin);
+}
+
+#[test]
+fn ctes_read_twice_merge_and_stream() {
+    cold_result_stream("result-stream-cold-cte-twice", ColdRequest::CteTwice);
+}
+
+#[test]
+fn derived_self_joins_merge_and_stream() {
+    cold_result_stream(
+        "result-stream-cold-derived-self",
+        ColdRequest::DerivedSelfJoin,
+    );
+}
+
 fn cold_result_stream(name: &str, request: ColdRequest) {
     let paged = matches!(
         request,
-        ColdRequest::Paged | ColdRequest::Grouped | ColdRequest::Distinct | ColdRequest::Union
+        ColdRequest::Paged
+            | ColdRequest::Grouped
+            | ColdRequest::Distinct
+            | ColdRequest::Union
+            | ColdRequest::Join
+            | ColdRequest::RightJoin
     );
     let mut config = test_config(name);
     config.object_store_on = true;
@@ -188,7 +263,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
     config.memtable_bytes = 8 << 20;
     config.result_stream_bytes = 256 << 10;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 229);
+    let _namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 229);
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -227,15 +302,11 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut other = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
+    // The object service runs on its own thread, as a real one would: a
+    // spooled result's external runs write synchronously.
     let mut network = config.clone();
-    network.object_store_sim = false;
-    network.object_store_endpoint = listener.local_addr().unwrap().to_string();
-    network.object_store_access_key = "test-access".to_owned();
-    network.object_store_secret_key = "test-secret".to_owned();
+    let objects = HttpObjectServer::start(&mut network);
     replace_uncached_blocks(&mut engine, &network);
-    let prefix = format!("/{}/", config.object_store_bucket);
 
     let mut conn = Conn::new(&config, &mut budget).unwrap();
     let (mut client, server) = socket_pair();
@@ -268,6 +339,35 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
                 50,
             ),
             ColdRequest::Paged => paged_request(sql, 50),
+            ColdRequest::RightJoinQuery => query(
+                "SELECT b.id, b.code FROM cold_orders a RIGHT JOIN cold_orders b ON a.id = b.id",
+            ),
+            ColdRequest::SpooledJoin => query(
+                "SELECT a.id, a.code FROM cold_orders a \
+                 JOIN (SELECT id FROM cold_orders OFFSET 0) b ON a.id = b.id",
+            ),
+            ColdRequest::CteTwice => query(
+                "WITH c AS NOT MATERIALIZED (SELECT id, code FROM cold_orders) \
+                 SELECT a.id, a.code FROM c a JOIN c b ON a.id = b.id",
+            ),
+            ColdRequest::DerivedSelfJoin => query(
+                "SELECT a.id, a.code FROM (SELECT id, code FROM cold_orders) a \
+                 JOIN (SELECT id FROM cold_orders) b ON a.id = b.id",
+            ),
+            ColdRequest::GroupedQuery => {
+                query("SELECT id, max(code), count(*) FROM cold_orders GROUP BY id")
+            }
+            ColdRequest::Join => paged_request(
+                "SELECT a.id, a.code FROM cold_orders a JOIN cold_orders b ON a.id = b.id",
+                50,
+            ),
+            ColdRequest::JoinQuery => {
+                query("SELECT a.id, a.code FROM cold_orders a JOIN cold_orders b ON a.id = b.id")
+            }
+            ColdRequest::RightJoin => paged_request(
+                "SELECT b.id, b.code FROM cold_orders a RIGHT JOIN cold_orders b ON a.id = b.id",
+                50,
+            ),
             ColdRequest::Copy => query("COPY cold_orders TO STDOUT"),
             ColdRequest::Distinct => paged_request("SELECT DISTINCT id, code FROM cold_orders", 50),
             ColdRequest::Grouped => paged_request(
@@ -291,7 +391,6 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
     let mut yielded_after_rows = false;
     // The second query of a UNION ALL starts its own cold scan.
     let mut second_query_yielded = false;
-    let mut fetched = std::collections::HashSet::new();
     let mut gets = 0usize;
     let mut deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -309,7 +408,10 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         );
         // A grouping reads its whole input before its first row: its waits
         // come before any row.
-        let grouped = matches!(request, ColdRequest::Grouped | ColdRequest::Distinct);
+        let grouped = matches!(
+            request,
+            ColdRequest::Grouped | ColdRequest::Distinct | ColdRequest::GroupedQuery
+        );
         if conn.parked_wait() == Some(StatementWait::ObjectIo)
             && conn.result_stream_active()
             && (grouped || !paged || delivered > 50)
@@ -332,27 +434,10 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         {
             second_query_yielded = true;
         }
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let request = read_request(&mut engine, &mut stream);
-                let key = request
-                    .lines()
-                    .next()
-                    .unwrap()
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap()
-                    .strip_prefix(&prefix)
-                    .unwrap()
-                    .to_owned();
-                gets += 1;
-                fetched.insert(key.clone());
-                let body = namespace.borrow().object_bytes(&key).unwrap().to_vec();
-                reply(&mut stream, &request, &body);
-                deadline = Instant::now() + Duration::from_secs(10);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => panic!("accept object GET: {error}"),
+        let served = objects.requests.load(std::sync::atomic::Ordering::Relaxed);
+        if served != gets {
+            gets = served;
+            deadline = Instant::now() + Duration::from_secs(10);
         }
         advance(&mut engine);
         assert_eq!(
@@ -368,6 +453,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         }
         std::thread::yield_now();
     }
+    let fetched = objects.fetched.lock().unwrap().len();
     let response = messages(&received);
     let kinds: Vec<u8> = response.iter().map(|message| message.0).collect();
     assert_eq!(
@@ -384,18 +470,23 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             // position survives each wait. Its one repeated GET matches an
             // ungrouped paged stream of the same table; a restarted
             // statement would read every object again.
-            assert!(
-                gets <= fetched.len() + 1,
-                "{gets} GETs of {}",
-                fetched.len()
-            );
+            assert!(gets <= fetched + 1, "{gets} GETs of {}", fetched);
         }
-        ColdRequest::Paged | ColdRequest::Union => {
+        ColdRequest::Paged | ColdRequest::Union | ColdRequest::Join | ColdRequest::RightJoin => {
             // Each full page suspends; the unlimited Execute returns the rest.
             assert_eq!(kinds.iter().filter(|kind| **kind == b's').count(), 3);
             assert_eq!(response[kinds.len() - 2].1, b"SELECT 170\0");
         }
-        ColdRequest::Select | ColdRequest::Derived | ColdRequest::Cte | ColdRequest::View => {
+        ColdRequest::Select
+        | ColdRequest::Derived
+        | ColdRequest::Cte
+        | ColdRequest::View
+        | ColdRequest::JoinQuery
+        | ColdRequest::RightJoinQuery
+        | ColdRequest::GroupedQuery
+        | ColdRequest::SpooledJoin
+        | ColdRequest::CteTwice
+        | ColdRequest::DerivedSelfJoin => {
             assert_eq!(kinds.iter().filter(|kind| **kind == b'T').count(), 1);
             assert_eq!(response[kinds.len() - 2].1, b"SELECT 320\0");
         }
@@ -404,11 +495,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             assert_eq!(response[kinds.len() - 2].1, b"SELECT 320\0");
             // Each query reads the table once, in the stream; an attempt
             // run before it would have read every object a second time.
-            assert!(
-                gets <= 2 * fetched.len() + 2,
-                "{gets} GETs of {}",
-                fetched.len()
-            );
+            assert!(gets <= 2 * fetched + 2, "{gets} GETs of {}", fetched);
         }
         ColdRequest::Copy => {
             assert_eq!(kinds[0], b'H');
@@ -438,19 +525,32 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         let values = fields(row.1);
         assert_eq!(values[0], (index + 1).to_string().as_bytes());
         assert_eq!(checksum(values[1]), expected[index]);
-        if request == ColdRequest::Grouped {
+        if matches!(request, ColdRequest::Grouped | ColdRequest::GroupedQuery) {
             assert_eq!(values[2], b"1");
         }
     }
-    assert!(
-        yielded_after_rows,
-        "a cold read after delivered rows, or a grouping's input read, must yield instead of blocking"
-    );
-    assert!(engine.result_stream_metrics().opened >= 1);
+    let metrics = engine.result_stream_metrics();
+    if request == ColdRequest::SpooledJoin {
+        // It ran in the general executor, which wrote its derived table's run.
+        assert_eq!(metrics.opened, 0);
+        assert!(objects.uploads.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    } else {
+        assert!(
+            yielded_after_rows,
+            "a cold read after delivered rows, or a grouping's input read, must yield instead of blocking"
+        );
+        // Every shape here streams; one that silently spooled would read
+        // and hold its whole result first.
+        assert_eq!(metrics.opened, 1);
+        assert_eq!(
+            metrics.spooled_shape + metrics.spooled_capacity + metrics.spooled_effects,
+            0
+        );
+    }
     if matches!(request, ColdRequest::Union | ColdRequest::UnionQuery) {
         assert!(second_query_yielded, "the second query's cold scan yields");
     }
     drop(conn.close());
-    drop((other, engine));
+    drop((other, engine, objects));
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }

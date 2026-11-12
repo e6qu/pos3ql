@@ -124,6 +124,9 @@ is owned.
     resolves its FROM scope and evaluates its operators unbound for each outer
     row; correlated row subqueries, row-valued `IN`, set operations and
     subqueries rewritten for each row are analysed again for each outer row.
+    An uncorrelated subquery nested in them runs once for the statement,
+    except a copy of one written twice (a `BETWEEN` operand) that a per-row
+    rewrite also copies, which runs for each outer row.
     Over 2000 outer rows and a 50-row inner table in a debug build on a
     loaded 8-core workstation, `sum((SELECT max(v) ... WHERE v <= o.id))`
     takes 1.2 s, the matching `EXISTS` 1.0 s and `IN` 1.1 s (1.4 s, 1.1 s and 1.3 s

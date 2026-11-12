@@ -728,10 +728,22 @@ fn select_output_width(
             }
         }
     }
+    // A routine's variables are the levels around a stored body's query.
+    let outer = context.transition.map(super::scope::ResolverColumns);
     let scope = select
         .from
         .as_ref()
-        .map(|from| super::QueryScope::resolve_schema(storage, from, txid, arena, None))
+        .map(|from| {
+            super::QueryScope::resolve_schema(
+                storage,
+                from,
+                txid,
+                arena,
+                outer
+                    .as_ref()
+                    .map(|outer| outer as &dyn crate::sql::eval::ColumnLookup<'_>),
+            )
+        })
         .transpose()?;
     let columns = DependencyTypes {
         hidden: None,

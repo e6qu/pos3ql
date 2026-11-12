@@ -73257,6 +73257,7 @@ pub(crate) fn update<'a>(
             collect_join_matches_with_transition(
                 storage,
                 table_index,
+                statement.inheritance,
                 def,
                 statement.alias,
                 schema,
@@ -73277,6 +73278,7 @@ pub(crate) fn update<'a>(
             collect_join_matches(
                 storage,
                 table_index,
+                statement.inheritance,
                 def,
                 statement.alias,
                 schema,
@@ -73297,6 +73299,7 @@ pub(crate) fn update<'a>(
         collect_matches(
             storage,
             table_index,
+            statement.inheritance,
             statement.alias,
             txn.txid,
             schema,
@@ -74501,6 +74504,7 @@ pub(crate) fn delete<'a>(
             collect_join_matches_with_transition(
                 storage,
                 table_index,
+                statement.inheritance,
                 def,
                 statement.alias,
                 schema,
@@ -74522,6 +74526,7 @@ pub(crate) fn delete<'a>(
             collect_join_matches(
                 storage,
                 table_index,
+                statement.inheritance,
                 def,
                 statement.alias,
                 schema,
@@ -74543,6 +74548,7 @@ pub(crate) fn delete<'a>(
         collect_matches(
             storage,
             table_index,
+            statement.inheritance,
             statement.alias,
             txn.txid,
             schema,
@@ -82119,24 +82125,6 @@ fn row_matches_values<'a, Definition0: crate::storage::DefinitionBacking>(
     }
 }
 
-/// Resolves a writable target once into its physical leaves. The arena is
-/// statement-bounded and the catalog capacity is fixed at startup, so parent
-/// DML cannot create an unbounded work list.
-fn dml_leaf_slots<'a>(
-    storage: &Storage,
-    table_index: usize,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<&'a [usize], SqlError> {
-    dml_leaf_slots_for(
-        storage,
-        table_index,
-        crate::sql::ast::RelationInheritance::Descendants,
-        txid,
-        arena,
-    )
-}
-
 /// Resolves a writable target according to the parsed inheritance contract.
 /// `ONLY` remains a distinct state until this boundary, so an insert action can
 /// still use the logical target while match/update/delete scans use its chosen
@@ -82175,6 +82163,7 @@ fn dml_leaf_slots_for<'a>(
 pub(super) fn collect_matches<'a>(
     storage: &Storage,
     table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
     alias: Option<&str>,
     txid: u32,
     schema: &[ColType],
@@ -82255,7 +82244,7 @@ pub(super) fn collect_matches<'a>(
     } else {
         None
     };
-    for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
+    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
         let access = indexed.as_ref().filter(|_| leaf == table_index);
         if access.is_none_or(|access| access.scan_executed()) {
@@ -82340,6 +82329,7 @@ pub(super) fn collect_matches<'a>(
 fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
     def: &crate::storage::TableDefinition<Definition0>,
     alias: Option<&str>,
     schema: &[ColType],
@@ -82436,7 +82426,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
         scratch.sort_unstable_by_key(|row| row.sort_key());
         return images.finish();
     }
-    for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
+    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
         let physical = (*storage.table_def(leaf, txid)).clone();
@@ -82542,6 +82532,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
 fn collect_join_matches_with_transition<'a, Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
     def: &crate::storage::TableDefinition<Definition0>,
     alias: Option<&str>,
     schema: &[ColType],
@@ -82643,7 +82634,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
         scratch.sort_unstable_by_key(|row| row.sort_key());
         return images.finish();
     }
-    for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
+    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
         let physical = (*storage.table_def(leaf, txid)).clone();

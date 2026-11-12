@@ -92152,6 +92152,7 @@ fn dml_target_bytes_survive_rollback_table_reuse_and_storage_removal() {
         crate::sql::exec::collect_matches(
             &engine.storage,
             table,
+            crate::sql::ast::RelationInheritance::Descendants,
             None,
             session.transaction.txid,
             &[ColType::Int4, ColType::Text],

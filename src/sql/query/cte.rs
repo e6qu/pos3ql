@@ -5699,6 +5699,7 @@ fn subst_update<'a>(
     Ok(Update {
         source_position: statement.source_position,
         table: rewrite_stored_relation_name(statement.table, context, arena)?,
+        inheritance: statement.inheritance,
         alias: statement.alias,
         assignments: subst_assignments(statement.assignments, context, arena)?,
         from: match statement.from {
@@ -5724,6 +5725,7 @@ fn subst_delete<'a>(
 ) -> Result<Delete<'a>, SqlError> {
     Ok(Delete {
         table: rewrite_stored_relation_name(statement.table, context, arena)?,
+        inheritance: statement.inheritance,
         alias: statement.alias,
         using: match statement.using {
             Some(using) => Some(

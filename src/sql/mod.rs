@@ -15864,6 +15864,7 @@ impl Engine {
                             let rewritten = match arena.alloc(Update {
                                 source_position: rewritten.source_position,
                                 table: view.base,
+                                inheritance: view.base_inheritance,
                                 alias: update.alias,
                                 assignments: rewritten.assignments,
                                 from: rewritten.from,
@@ -15947,6 +15948,7 @@ impl Engine {
                             };
                             match arena.alloc(Delete {
                                 table: view.base,
+                                inheritance: view.base_inheritance,
                                 alias: delete.alias,
                                 using: rewritten.using,
                                 where_clause,

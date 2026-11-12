@@ -4981,6 +4981,8 @@ pub struct OnConflictTarget<'a> {
 pub struct Update<'a> {
     pub source_position: SourcePosition,
     pub table: QualName<'a>,
+    /// `UPDATE ONLY` leaves inheritance children out.
+    pub inheritance: RelationInheritance,
     pub alias: Option<&'a str>,
     pub assignments: &'a [(&'a str, &'a Expr<'a>)],
     /// Extra tables joined for the assignment/WHERE (`UPDATE t SET ... FROM e`).
@@ -4992,6 +4994,8 @@ pub struct Update<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Delete<'a> {
     pub table: QualName<'a>,
+    /// `DELETE FROM ONLY` leaves inheritance children out.
+    pub inheritance: RelationInheritance,
     pub alias: Option<&'a str>,
     /// Extra tables joined for the WHERE (`DELETE FROM t USING e`).
     pub using: Option<&'a FromClause<'a>>,

@@ -8287,6 +8287,8 @@ pub struct UpdatableView<'a> {
     /// The base table, fully qualified from the view's own resolution so the
     /// rewritten DML binds the same table regardless of the session's path.
     pub base: QualName<'a>,
+    /// Whether the view reads the base table's inheritance children.
+    pub base_inheritance: crate::sql::ast::RelationInheritance,
     pub where_clause: Option<&'a Expr<'a>>,
     pub columns: &'a [&'a str],
     /// Base relation names in the same ordinal positions as `columns`.
@@ -8425,6 +8427,7 @@ pub fn resolve_view_for_dml<'a>(
         .alloc_slice_copy(&base_columns[..n])
         .map_err(|_| arena_full())?;
     Ok(Some(UpdatableView {
+        base_inheritance: from.base.inheritance,
         base,
         where_clause: sel.where_clause,
         columns,

@@ -1396,6 +1396,15 @@ pub(crate) fn validate_dml_assignment_casts(
                     insert_values(insert.columns, row)?;
                 }
                 if let Some(select) = insert.select {
+                    check_insert_counts(
+                        select,
+                        insert.columns,
+                        target.n_columns,
+                        storage,
+                        txid,
+                        arena,
+                        transition.as_ref().map(|columns| columns.row),
+                    )?;
                     super::subquery::check_select_literals(select, None, storage, txid, arena)?;
                     validate_insert_projection(
                         select,
@@ -1499,6 +1508,63 @@ pub(crate) fn validate_dml_assignment_casts(
     // Validation returns no arena-backed values or catalog owners.
     unsafe { arena.rewind_to(mark) };
     result
+}
+
+/// PostgreSQL compares the numbers of target columns and query outputs of an
+/// `INSERT ... SELECT` before converting any value, positioning the error at
+/// the first target or expression without a partner. Targets with subscripts
+/// or fields are counted as written.
+fn check_insert_counts(
+    select: &Select<'_>,
+    names: &[&str],
+    table_columns: usize,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
+) -> Result<(), SqlError> {
+    let (source, targets) = match select.from {
+        Some(FromClause {
+            base:
+                TableRef {
+                    alias: Some(crate::sql::ast::INSERT_SUBSCRIPT_SOURCE),
+                    subquery: Some(written),
+                    col_alias: Some(written_targets),
+                    ..
+                },
+            ..
+        }) => (written, written_targets.len()),
+        _ if names.is_empty() => (select, table_columns),
+        _ => (select, names.len()),
+    };
+    let mut width = 0usize;
+    visit_projection_types(source, storage, txid, arena, outer, &mut |_, _| {
+        width += 1;
+        Ok(())
+    })?;
+    if width > targets {
+        let error = sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "INSERT has more expressions than target columns"
+        );
+        return Err(
+            match crate::sql::exec::select_output_expression(source, targets) {
+                Some(expression) => crate::sql::error_position::at_expression(error, expression),
+                None => error,
+            },
+        );
+    }
+    if width < targets && !names.is_empty() {
+        let error = sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "INSERT has more target columns than expressions"
+        );
+        return Err(match names.get(width).filter(|_| names.len() == targets) {
+            Some(column) => crate::sql::error_position::at_reference(error, column),
+            None => error,
+        });
+    }
+    Ok(())
 }
 
 fn validate_insert_projection(

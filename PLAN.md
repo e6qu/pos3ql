@@ -283,8 +283,10 @@ caret) for syntax errors and for unknown relations, columns, types, functions
 and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
 constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
-`INSERT has more target columns than expressions` without its position; other
-target and expression count errors are positioned. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
+`INSERT has more target columns than expressions` without its position, and
+`INSERT INTO t (a[1], b) VALUES (1)` reports the first value's type mismatch
+instead; other target and expression count errors are positioned and come
+before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL
 does; a cursor's query with data-modifying `WITH` queries runs at its first
 read. Remaining: a PL/pgSQL write with `WITH` queries whose nested AFTER

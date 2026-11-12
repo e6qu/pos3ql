@@ -512,6 +512,10 @@ pub struct TxnState {
     constraint_renames: FixedVec<ConstraintLifecycle>,
     trigger_events: crate::sql::trigger_events::TriggerEventQueue,
     pending_row_events: PendingRowEvents,
+    /// Where the event log ended when recent commands began, so a statement's
+    /// end scans only the events queued since. A command not listed scans
+    /// from the start.
+    command_event_starts: [(u32, u64); COMMAND_EVENT_STARTS],
     large_object_descriptors: FixedVec<LargeObjectDescriptor>,
 }
 
@@ -937,6 +941,8 @@ pub const DEFERRED_TRIGGER_BYTES: usize = 256 * 1024;
 /// Foreign key checks one written row may hold before its AFTER triggers are
 /// queued: its own foreign keys and those referencing its table.
 const PENDING_ROW_EVENTS: usize = 64;
+/// Recent commands whose first queued event position is remembered.
+const COMMAND_EVENT_STARTS: usize = 16;
 /// Old referenced keys those checks carry.
 const PENDING_ROW_EVENT_BYTES: usize = 64 * 1024;
 
@@ -1414,6 +1420,7 @@ impl TxnState {
                 capacity.trigger_event_spill_pages,
             )?,
             pending_row_events: PendingRowEvents::new(budget)?,
+            command_event_starts: [(0, 0); COMMAND_EVENT_STARTS],
             large_object_descriptors,
         })
     }
@@ -1889,6 +1896,8 @@ impl TxnState {
         let command = self.next_command_identity()?;
         self.command_counter = command;
         self.command_id = command;
+        self.command_event_starts.copy_within(1.., 0);
+        self.command_event_starts[COMMAND_EVENT_STARTS - 1] = (command, self.trigger_events.end());
         self.awaited_parent_read = None;
         Ok(())
     }
@@ -2672,6 +2681,10 @@ impl TxnState {
         }
         self.trigger_events.rewind(trigger_events);
         self.pending_row_events.rewind(pending_row_events);
+        let end = self.trigger_events.end();
+        for (_, start) in &mut self.command_event_starts {
+            *start = (*start).min(end);
+        }
     }
 
     pub(crate) fn queue_constraint_trigger(
@@ -2838,6 +2851,15 @@ impl TxnState {
         id: u64,
     ) -> Result<(DeferredTriggerEvent, u64, bool), SqlError> {
         self.trigger_events.event(id)
+    }
+
+    /// The first event `command` can have queued.
+    pub(crate) fn trigger_events_from(&self, command: u32) -> u64 {
+        self.command_event_starts
+            .iter()
+            .rev()
+            .find(|(started, _)| *started == command)
+            .map_or(0, |(_, start)| *start)
     }
 
     /// The identity one past the last queued event.
@@ -3622,6 +3644,7 @@ impl TxnState {
         self.constraint_renames.clear();
         self.trigger_events.clear();
         self.pending_row_events.clear();
+        self.command_event_starts = [(0, 0); COMMAND_EVENT_STARTS];
         for descriptor in self.large_object_descriptors.iter_mut() {
             descriptor.active = false;
         }

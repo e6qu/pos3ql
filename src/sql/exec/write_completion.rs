@@ -42,7 +42,7 @@ pub(super) struct QueuedFiring {
 pub(super) struct AfterRowCursor {
     depth: u16,
     command: u32,
-    next: u64,
+    next: Option<u64>,
 }
 
 impl AfterRowCursor {
@@ -51,7 +51,7 @@ impl AfterRowCursor {
         Self {
             depth,
             command,
-            next: 0,
+            next: None,
         }
     }
 
@@ -60,10 +60,14 @@ impl AfterRowCursor {
         context: &mut TriggerExecContext<'_, '_, '_>,
     ) -> Result<Option<QueuedFiring>, SqlError> {
         context.txn.queue_all_pending_row_events()?;
-        while self.next < context.txn.trigger_events_end() {
-            let index = self.next;
+        let mut cursor = self
+            .next
+            .unwrap_or_else(|| context.txn.trigger_events_from(self.command));
+        while cursor < context.txn.trigger_events_end() {
+            let index = cursor;
             let (event, next, fired) = context.txn.trigger_event(index)?;
-            self.next = next;
+            cursor = next;
+            self.next = Some(next);
             if fired {
                 continue;
             }

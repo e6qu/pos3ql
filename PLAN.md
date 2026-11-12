@@ -312,9 +312,11 @@ PostgreSQL types it as the table's row type `t`. A row constructor casts to a ta
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. In a trigger function,
-`FETCH ... INTO NEW.col`, a write's `RETURNING ... INTO NEW.col`, any
-`INTO OLD.col`, and assigning `NEW` in an AFTER trigger fail with `0A000`,
-where PostgreSQL assigns the field; `SELECT` and `EXECUTE ... INTO NEW.col`
+`FETCH ... INTO NEW.col`, any `INTO OLD.col`, and assigning `NEW` in an AFTER
+trigger fail with `0A000`, and a write's `RETURNING ... INTO NEW.col` fails
+with `42601` (`"new.a" is not a known variable`), where PostgreSQL assigns the
+field; `OPEN` and `FETCH` in a trigger fired by an ordinary statement fail with
+`0A000` (`SQL cursors are not available in trigger execution`); `SELECT` and `EXECUTE ... INTO NEW.col`
 in a BEFORE trigger work. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY

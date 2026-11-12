@@ -86446,6 +86446,17 @@ pub fn resolve_order_expr_pub<'a>(
     expression: &'a Expr<'a>,
     items: &'a [SelectItem<'a>],
 ) -> Result<&'a Expr<'a>, SqlError> {
+    resolve_output_name(expression, items, "ORDER BY")
+}
+
+/// A bare name matching one output column (by alias or derived name) binds
+/// to that column's expression; `clause` names the clause in the ambiguity
+/// error.
+pub fn resolve_output_name<'a>(
+    expression: &'a Expr<'a>,
+    items: &'a [SelectItem<'a>],
+    clause: &str,
+) -> Result<&'a Expr<'a>, SqlError> {
     // An unqualified name that matches a SELECT-list output column binds to
     // that output column, as in PostgreSQL (output names win over input
     // columns for a simple ORDER BY name). Matching two or more output columns
@@ -86473,7 +86484,8 @@ pub fn resolve_order_expr_pub<'a>(
                         Some(f) if *f != **item_expr => {
                             return Err(sql_err!(
                                 crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
-                                "ORDER BY \"{}\" is ambiguous",
+                                "{} \"{}\" is ambiguous",
+                                clause,
                                 name
                             ));
                         }

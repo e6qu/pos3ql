@@ -1704,12 +1704,21 @@ fn appended_select<'a>(
 }
 
 /// The query a stream reads for `select`: the appending form of a
-/// `UNION ALL`, else `select` itself.
+/// `UNION ALL`, else `select` with its simple FROM subqueries pulled up, as
+/// the general executor runs it.
 pub(crate) fn stream_query<'a>(
     select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    Ok(appended_select(select, arena)?.unwrap_or(select))
+    match appended_select(select, arena)? {
+        Some(appended) => Ok(appended),
+        None if select.from.is_some() => {
+            super::pullup::pull_up_subqueries(select, storage, txid, arena, None)
+        }
+        None => Ok(select),
+    }
 }
 
 /// The Select form of a top-level set query, as subqueries carry one.

@@ -107,6 +107,12 @@ enum ColdRequest {
     /// A paged portal of a UNION ALL whose second query reads the table
     /// again from cold storage after the first query's rows were delivered.
     Union,
+    /// The same UNION ALL as a simple Query: its stream opens before the
+    /// statement runs, so no attempt reads the table first.
+    UnionQuery,
+    /// A simple Query over a derived table, which is merged into its query
+    /// and streams as the table scan it became.
+    Derived,
 }
 
 #[test]
@@ -132,6 +138,16 @@ fn grouped_paged_portals_yield_on_cold_reads_and_read_each_object_once() {
 #[test]
 fn union_all_streams_yield_on_cold_reads_in_each_query() {
     cold_result_stream("result-stream-cold-union", ColdRequest::Union);
+}
+
+#[test]
+fn union_all_queries_open_their_stream_before_running() {
+    cold_result_stream("result-stream-cold-union-query", ColdRequest::UnionQuery);
+}
+
+#[test]
+fn merged_derived_tables_stream_like_their_table() {
+    cold_result_stream("result-stream-cold-derived", ColdRequest::Derived);
 }
 
 #[test]
@@ -215,6 +231,13 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
     client
         .write_all(&match request {
             ColdRequest::Select => query(sql),
+            ColdRequest::UnionQuery => query(
+                "SELECT id, code FROM cold_orders WHERE id <= 160 UNION ALL \
+                 SELECT id, code FROM cold_orders WHERE id > 160",
+            ),
+            ColdRequest::Derived => {
+                query("SELECT id, code FROM (SELECT id, code FROM cold_orders) s")
+            }
             ColdRequest::Union => paged_request(
                 "SELECT id, code FROM cold_orders WHERE id <= 160 UNION ALL \
                  SELECT id, code FROM cold_orders WHERE id > 160",
@@ -348,9 +371,20 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             assert_eq!(kinds.iter().filter(|kind| **kind == b's').count(), 3);
             assert_eq!(response[kinds.len() - 2].1, b"SELECT 170\0");
         }
-        ColdRequest::Select => {
+        ColdRequest::Select | ColdRequest::Derived => {
             assert_eq!(kinds.iter().filter(|kind| **kind == b'T').count(), 1);
             assert_eq!(response[kinds.len() - 2].1, b"SELECT 320\0");
+        }
+        ColdRequest::UnionQuery => {
+            assert_eq!(kinds.iter().filter(|kind| **kind == b'T').count(), 1);
+            assert_eq!(response[kinds.len() - 2].1, b"SELECT 320\0");
+            // Each query reads the table once, in the stream; an attempt
+            // run before it would have read every object a second time.
+            assert!(
+                gets <= 2 * fetched.len() + 2,
+                "{gets} GETs of {}",
+                fetched.len()
+            );
         }
         ColdRequest::Copy => {
             assert_eq!(kinds[0], b'H');
@@ -389,7 +423,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         "a cold read after delivered rows, or a grouping's input read, must yield instead of blocking"
     );
     assert!(engine.result_stream_metrics().opened >= 1);
-    if request == ColdRequest::Union {
+    if matches!(request, ColdRequest::Union | ColdRequest::UnionQuery) {
         assert!(second_query_yielded, "the second query's cold scan yields");
     }
     drop(conn.close());

@@ -327,14 +327,15 @@ impl CursorQuery {
         // A stream appends the queries of a UNION ALL itself.
         let statement = match (bound.statement, reader_use) {
             (CursorStatement::Select(statement), crate::sql::query::RetainedUse::Stream) => {
-                crate::sql::query::stream_query(statement, &self.arena)
+                crate::sql::query::stream_query(statement, storage, txid, &self.arena)
             }
             (CursorStatement::Select(statement), crate::sql::query::RetainedUse::Cursor) => {
                 Ok(statement)
             }
             (CursorStatement::SetQuery(query), crate::sql::query::RetainedUse::Stream) => {
-                crate::sql::query::set_query_select(query, &self.arena)
-                    .and_then(|select| crate::sql::query::stream_query(select, &self.arena))
+                crate::sql::query::set_query_select(query, &self.arena).and_then(|select| {
+                    crate::sql::query::stream_query(select, storage, txid, &self.arena)
+                })
             }
             (CursorStatement::SetQuery(_), crate::sql::query::RetainedUse::Cursor) => {
                 return Ok(false);

@@ -2805,7 +2805,7 @@ impl<'d> QueryScope<'d> {
         }
     }
 
-    fn entry_index(&self, name: &str) -> Result<usize, SqlError> {
+    pub(crate) fn entry_index(&self, name: &str) -> Result<usize, SqlError> {
         let mut found = None;
         for t in 0..self.n {
             if self.entry_answers_to(t, name) {

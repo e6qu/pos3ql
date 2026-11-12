@@ -3631,13 +3631,21 @@ fn build_partitioned_table_def(
                 txid,
                 crate::storage::SchemaObjectKind::Relation,
             )?;
-            def.not_null_names = [None; MAX_COLUMNS];
-            for column in def.columns.iter_mut().take(def.n_columns) {
-                column.not_null = if column.not_null.is_required() {
-                    crate::storage::NotNullOrigin::Inherited
+            // A partition's NOT NULL constraints are inherited and keep
+            // their parent's names.
+            def.not_null_name_edits = crate::storage::ColumnSet::EMPTY;
+            for (column, name) in def
+                .columns
+                .iter_mut()
+                .zip(def.not_null_names.iter_mut())
+                .take(def.n_columns)
+            {
+                if column.not_null.is_required() {
+                    column.not_null = crate::storage::NotNullOrigin::Inherited;
                 } else {
-                    crate::storage::NotNullOrigin::Nullable
-                };
+                    column.not_null = crate::storage::NotNullOrigin::Nullable;
+                    *name = None;
+                }
             }
             for index in 0..def.n_uniques {
                 let constraint = def.uniques[index];
@@ -3713,6 +3721,10 @@ fn build_inherited_table_def(
     let mut definition = own.clone();
     definition.n_columns = 0;
     definition.columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
+    // NOT NULL names follow the merged column positions: an inherited-only
+    // constraint keeps its parent's name, a local one the child's.
+    definition.not_null_names = [None; MAX_COLUMNS];
+    definition.not_null_name_edits = crate::storage::ColumnSet::EMPTY;
     definition.inheritance = crate::storage::TableInheritance::NONE;
     for parent_name in parents {
         let parent = resolve_dml_table(storage, parent_name, txid)?;
@@ -3740,7 +3752,7 @@ fn build_inherited_table_def(
                 parent_definition.name.as_str()
             ));
         }
-        for parent_column in parent_definition.columns() {
+        for (parent_position, parent_column) in parent_definition.columns().iter().enumerate() {
             let mut inherited = *parent_column;
             inherited.not_null =
                 if inherited.not_null.is_required() && inherited.not_null_inheritable {
@@ -3774,12 +3786,24 @@ fn build_inherited_table_def(
                 let mut count = definition.n_columns;
                 push_column(&mut definition, &mut count, inherited)?;
                 definition.n_columns = count;
+                if inherited.not_null.is_required() {
+                    definition.not_null_names[count - 1] =
+                        parent_definition.not_null_names.as_ref()[parent_position];
+                }
             }
         }
         inherit_table_checks(&parent_definition, &mut definition, false, arena)?;
         definition.inheritance.append(parent)?;
     }
-    for column in own.columns() {
+    for (own_position, column) in own.columns().iter().enumerate() {
+        let own_not_null_name = |definition: &mut TableDefBuilder, position: usize| match own
+            .not_null_names[own_position]
+        {
+            Some(name) if own.not_null_name_edits.contains(own_position) => {
+                definition.set_not_null_constraint_name(position, name);
+            }
+            name => definition.not_null_names[position] = name,
+        };
         if let Some(existing) = definition.column_index(column.name.as_str()) {
             let inherited = definition.columns[existing];
             if inherited.ctype != column.ctype
@@ -3813,11 +3837,13 @@ fn build_inherited_table_def(
                 definition.columns[existing].not_null =
                     definition.columns[existing].not_null.add_local();
                 definition.columns[existing].not_null_inheritable = column.not_null_inheritable;
+                own_not_null_name(&mut definition, existing);
             }
         } else {
             let mut count = definition.n_columns;
             push_column(&mut definition, &mut count, *column)?;
             definition.n_columns = count;
+            own_not_null_name(&mut definition, count - 1);
         }
     }
     for index in 0..definition.n_uniques {
@@ -75447,12 +75473,6 @@ fn alter_table_inheritance(
                 "circular inheritance is not allowed"
             ));
         }
-        if parent_definition.n_columns > updated.n_columns {
-            return sql_fail(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
-                "child table has fewer columns than parent table"
-            ));
-        }
         for expected in parent_definition.columns() {
             let Some(index) = updated.column_index(expected.name.as_str()) else {
                 return sql_fail(sql_err!(
@@ -75462,14 +75482,19 @@ fn alter_table_inheritance(
                 ));
             };
             let actual = updated.columns[index];
-            if actual.name != expected.name
-                || actual.ctype != expected.ctype
-                || actual.type_mod != expected.type_mod
-                || actual.collation != expected.collation
-            {
+            if actual.ctype != expected.ctype || actual.type_mod != expected.type_mod {
                 return sql_fail(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
-                    "child table has different definition for column \"{}\"",
+                    "child table \"{}\" has different type for column \"{}\"",
+                    updated.name.as_str(),
+                    expected.name.as_str()
+                ));
+            }
+            if actual.collation != expected.collation {
+                return sql_fail(sql_err!(
+                    sqlstate::COLLATION_MISMATCH,
+                    "child table \"{}\" has different collation for column \"{}\"",
+                    updated.name.as_str(),
                     expected.name.as_str()
                 ));
             }
@@ -75479,8 +75504,9 @@ fn alter_table_inheritance(
             {
                 return sql_fail(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
-                    "column \"{}\" in child table must be marked NOT NULL",
-                    expected.name.as_str()
+                    "column \"{}\" in child table \"{}\" must be marked NOT NULL",
+                    expected.name.as_str(),
+                    updated.name.as_str()
                 ));
             }
             if expected.not_null.is_required()
@@ -75488,9 +75514,12 @@ fn alter_table_inheritance(
                 && !actual.not_null_inheritable
             {
                 return sql_fail(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "not-null constraint on column \"{}\" in child table must be inheritable",
-                    expected.name.as_str()
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "constraint \"{}\" conflicts with non-inherited constraint on child table \"{}\"",
+                    updated.not_null_names[index]
+                        .as_ref()
+                        .map_or("", |name| name.as_str()),
+                    updated.name.as_str()
                 ));
             }
         }
@@ -77729,6 +77758,21 @@ fn alter_table_relation(
                         Err(error) => return sql_fail(error),
                     };
                     new_def.set_not_null_constraint_name(index, name);
+                } else if inheritance_scope == AlterInheritanceScope::Propagated
+                    && meta.not_null.is_required()
+                {
+                    // A propagated NOT NULL keeps the name its parent, altered
+                    // first, chose.
+                    let inherited_name =
+                        new_def.inheritance.parents_ref().iter().find_map(|parent| {
+                            let parent = storage.table_def(usize::from(*parent), txn.txid);
+                            parent
+                                .column_index(c.name)
+                                .and_then(|column| parent.not_null_names.as_ref()[column])
+                        });
+                    if let Some(name) = inherited_name {
+                        new_def.set_not_null_constraint_name(index, name);
+                    }
                 }
                 source[index] = ColSource::FillDefault(index);
                 if let Some(raw) = c.default_text.or(c.generated_text)

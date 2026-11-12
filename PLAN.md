@@ -321,9 +321,13 @@ partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
 its parent's plain unique index, so attaching such a partition builds a
 separate copy where PostgreSQL reuses the constraint's index; constraint
 indexes need a durable link to a parent index first. A partitioned table's
-multi-column `UNIQUE` constraint has its index but no `pg_constraint` row, and
-a child's inherited `NOT NULL` constraint is named after the child
-(`c_k_not_null`) where PostgreSQL keeps the parent's name. `CHECK ... NO
+A table's key indexes and constraints take their OIDs column keys first
+(`CREATE TABLE t (a int, b int, c int UNIQUE, UNIQUE (a, b), UNIQUE (b),
+PRIMARY KEY (c, a))` numbers `t_b_key`, `t_c_key`, `t_a_b_key`, `t_pkey`),
+where PostgreSQL numbers the primary key first and the rest in declaration
+order, so catalog queries ordered by OID list them differently; the
+declaration order of a single-column table `UNIQUE` is not retained.
+`CHECK ... NO
 INHERIT` fails with `42601`; an exclusion constraint over a B-tree index fails
 with `42601`, and `box` has no default GiST operator class. `ALTER TABLE ...
 CLUSTER ON` and `REPLICA IDENTITY USING INDEX` reject an index that backs a

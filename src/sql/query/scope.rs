@@ -589,6 +589,12 @@ impl<'d> QueryScope<'d> {
             arena,
         )?;
         scope.slots[0] = usize::MAX;
+        // The RETURNING row has the target relation's row type.
+        scope.row_types[0] = storage
+            .find_visible(definition.schema.as_str(), definition.name.as_str(), txid)
+            .map(|slot| {
+                storage.relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot))
+            });
         scope.n = 1;
         scope.target_aliases = arena
             .alloc_slice_copy(output_aliases)

@@ -752,16 +752,44 @@ pub trait ColumnLookup<'a> {
     fn whole_row_type(&self, _table: &str) -> Option<ColType> {
         None
     }
+
+    /// The stored relation whose row a whole-row reference to `table` reads,
+    /// as its qualified name, when this lookup knows only its definition.
+    /// [`declared_whole_row_type`] gives such a row the relation's row type.
+    fn whole_row_relation(&self, _table: &str) -> Option<(&str, &str)> {
+        None
+    }
+}
+
+/// A whole-row reference's declared type: the lookup's own answer, or the
+/// row type of the stored relation it names.
+pub(crate) fn declared_whole_row_type<'a>(
+    row: &(impl ColumnLookup<'a> + ?Sized),
+    catalog: Option<&dyn CatalogAccess>,
+    table: &str,
+) -> Option<ColType> {
+    let declared = row.whole_row_type(table)?;
+    if declared != ColType::Record {
+        return Some(declared);
+    }
+    Some(
+        row.whole_row_relation(table)
+            .and_then(|(schema, name)| catalog?.relation_row_type(schema, name))
+            .map_or(ColType::Record, |creation| {
+                ColType::Composite(Some(creation))
+            }),
+    )
 }
 
 /// A whole-row reference to a relation has the relation's row type; any other
 /// FROM item yields an anonymous record.
 fn whole_row_value<'a>(
     row: &dyn ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
     table: &str,
     fields: &'a [RecordField<'a>],
 ) -> Datum<'a> {
-    match row.whole_row_type(table) {
+    match declared_whole_row_type(row, catalog, table) {
         Some(ColType::Composite(Some(slot))) => Datum::Composite { slot, fields },
         _ => Datum::Record(fields),
     }
@@ -1193,6 +1221,13 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         } else {
             self.row
                 .resolve_column_type(qualifier, name)
+                .map(|ctype| match (ctype, qualifier) {
+                    // A bare relation name is its whole row.
+                    (ColType::Record, None) if self.row.col_type(None, name).is_none() => {
+                        declared_whole_row_type(self.row, self.catalog, name).unwrap_or(ctype)
+                    }
+                    _ => ctype,
+                })
                 .or_else(|error| {
                     match qualifier.and_then(|variable| {
                         row_variable_field(self.row, self.catalog, variable, name)
@@ -1206,6 +1241,11 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 
     fn is_whole_row(&self, name: &str) -> bool {
         self.row.whole_row_type(name).is_some()
+    }
+
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        declared_whole_row_type(self.row, self.catalog, name)
+            .filter(|ctype| matches!(ctype, ColType::Composite(_)))
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
@@ -1454,6 +1494,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         (**self).whole_row_type(table)
+    }
+
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        (**self).whole_row_relation(table)
     }
 
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
@@ -1750,6 +1794,15 @@ pub enum RoutineCallAccess {
 }
 
 pub trait CatalogAccess {
+    /// The row type of the stored table or view `schema.name`.
+    fn relation_row_type(
+        &self,
+        _schema: &str,
+        _name: &str,
+    ) -> Option<crate::storage::TypeCreation> {
+        None
+    }
+
     fn validate_enum_input_literal(&self, _text: &str, _target_oid: i32) -> Result<(), SqlError> {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -4928,7 +4981,7 @@ fn eval_full_inner<'a>(
             Some(fields) if row.whole_row_is_scalar(table) => {
                 Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
             }
-            Some(fields) => Ok(whole_row_value(row, table, fields)),
+            Some(fields) => Ok(whole_row_value(row, hooks.catalog, table, fields)),
             None => Ok(Datum::Null), // outer-join null row
         },
         Expr::Bool(b) => Ok(Datum::Bool(b)),
@@ -4953,7 +5006,7 @@ fn eval_full_inner<'a>(
                     Ok(Some(fields)) if row.whole_row_is_scalar(name) => {
                         Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
                     }
-                    Ok(Some(fields)) => Ok(whole_row_value(row, name, fields)),
+                    Ok(Some(fields)) => Ok(whole_row_value(row, hooks.catalog, name, fields)),
                     Ok(None) => Ok(Datum::Null),
                     Err(_) => Err(e),
                 }

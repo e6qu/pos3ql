@@ -491,6 +491,10 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         crate::sql::eval::qualifier_answers_target(self.def, self.alias, table)
             .then_some(ColType::Record)
     }
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        crate::sql::eval::qualifier_answers_target(self.def, self.alias, table)
+            .then(|| (self.def.schema.as_str(), self.def.name.as_str()))
+    }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if let Some(q) = qualifier
@@ -665,6 +669,13 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
         .column_type_mod(qualifier, name)
     }
 
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        self.whole_row_type(table)?;
+        Some((
+            self.definition.schema.as_str(),
+            self.definition.name.as_str(),
+        ))
+    }
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         (self.image(table).is_some()
             || crate::sql::eval::qualifier_answers_target(
@@ -19765,6 +19776,13 @@ where
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         (table == "old" || table == "new").then_some(ColType::Record)
+    }
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        self.whole_row_type(table)?;
+        Some((
+            self.definition.schema.as_str(),
+            self.definition.name.as_str(),
+        ))
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {

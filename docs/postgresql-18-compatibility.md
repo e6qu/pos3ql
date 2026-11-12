@@ -116,7 +116,8 @@ Row types:
 - Every table, partitioned table, foreign table, materialized view and view has
   a row type named like the relation. `ROW(1, 'a')::orders`, `'(1,a)'::orders`,
   `orders[]`, whole-row references (`SELECT o FROM orders o` has type
-  `orders`), routine parameters and results (`RETURNS SETOF orders`) and table
+  `orders`, as do `orders.*` and `orders` in `UPDATE`/`DELETE` conditions and
+  `RETURNING`), routine parameters and results (`RETURNS SETOF orders`) and table
   columns (`CREATE TABLE archive(o orders)`) and prepared statement
   parameters (`PREPARE q(orders) AS SELECT $1.note`) behave as in PostgreSQL. A routine
   or column using the row type blocks `DROP TABLE orders`; `CASCADE` drops the

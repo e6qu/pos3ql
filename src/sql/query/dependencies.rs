@@ -2914,6 +2914,19 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     }
 
     fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        // RETURNING's OLD/NEW rows and ON CONFLICT's EXCLUDED row have the
+        // target relation's row type.
+        if let Some(definition) = self.output_definition(name) {
+            let slot = self.storage.find_visible(
+                definition.schema.as_str(),
+                definition.name.as_str(),
+                self.txid,
+            )?;
+            return Some(ColType::Composite(Some(
+                self.storage
+                    .relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)),
+            )));
+        }
         self.scope?
             .whole_row_type(name)
             .filter(|ctype| matches!(ctype, ColType::Composite(_)))

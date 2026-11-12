@@ -3800,6 +3800,14 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn relation_row_type(&self, schema: &str, name: &str) -> Option<crate::storage::TypeCreation> {
+        let slot = self.storage.find_visible(schema, name, self.txid)?;
+        Some(
+            self.storage
+                .relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)),
+        )
+    }
+
     fn builtin_routine_privileges_present(&self) -> bool {
         self.txid != 0 && self.storage.builtin_routine_count() != 0
     }

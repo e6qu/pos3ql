@@ -962,6 +962,24 @@ impl ColTypeResolver for CatalogCols<'_> {
             })
     }
 
+    /// The target relation's own row type, found by the definition's
+    /// qualified name; an unnamed definition stays an anonymous record.
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        let definition = self.definition?;
+        if !crate::sql::eval::qualifier_answers_target(definition, self.alias, name) {
+            return None;
+        }
+        let slot = self.storage.find_visible(
+            definition.schema.as_str(),
+            definition.name.as_str(),
+            self.txid,
+        )?;
+        Some(ColType::Composite(Some(
+            self.storage
+                .relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)),
+        )))
+    }
+
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
         let definition = self.definition?;
         (self.output_aliases.contains(&name)
@@ -4192,6 +4210,10 @@ impl<'a> ColumnLookup<'a> for DefCols<'_> {
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         ColTypeResolver::is_whole_row(self, table).then_some(ColType::Record)
     }
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        ColTypeResolver::is_whole_row(self, table)
+            .then(|| (self.0.schema.as_str(), self.0.name.as_str()))
+    }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.resolve(qualifier, name)?;
@@ -4306,6 +4328,14 @@ impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         ColTypeResolver::is_whole_row(self, table).then_some(ColType::Record)
+    }
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        ColTypeResolver::is_whole_row(self, table).then(|| {
+            (
+                self.definition.schema.as_str(),
+                self.definition.name.as_str(),
+            )
+        })
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {

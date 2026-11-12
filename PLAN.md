@@ -294,10 +294,13 @@ conditions are printed in PostgreSQL's analyzed form (`'x'::text`,
 operators, `IN`, `LIKE`, `IS NULL`, `IS [NOT] DISTINCT FROM`, `IS [NOT]
 TRUE/FALSE`, `CASE`, casts, SQL value functions and built-in function calls;
 other expressions (subqueries, user-defined function calls, `$n` parameters,
-array constructors and whole-row references) are still printed as stored, and
-an index expression or view that passes a whole-row reference to a function
-taking the table's row type (`CREATE INDEX ON t (f(t.*))`) fails with `42883`
-because its validation types the reference as `record`. `pg_get_viewdef` uses PostgreSQL's
+array constructors outside a quantified comparison, and whole-row
+references) are still printed as stored. A whole-row reference in an index
+expression or `CHECK` (`CREATE INDEX ON t (f(t.*))`) fails with `0A000`
+until column dependencies record whole-row users, and a view passing `t.*`
+to a function taking the table's row type fails with `42883` because view
+dependency recording still types the reference as `record` (the bare `t`
+spelling works). `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their

@@ -3011,6 +3011,20 @@ impl TxnState {
             storage.finish_table_drop(undo, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
+        // Every path that drops a foreign table, including a cascade from its
+        // partitioned parent or schema, drops its `pg_foreign_table` binding.
+        if let Ok(table) = u16::try_from(undo.slot())
+            && let Some((binding, _)) = storage.foreign_table(table, self.txid)
+        {
+            let class = crate::storage::foreign::ForeignObjectClass::Table;
+            storage.foreign_catalog_drop(class, binding, self.txid);
+            if let Err(error) =
+                self.record_ddl(storage, DdlUndo::ForeignTableDropped(binding as u32))
+            {
+                storage.foreign_catalog_rollback_drop(class, binding, self.txid);
+                return Err(error);
+            }
+        }
         Ok(())
     }
 

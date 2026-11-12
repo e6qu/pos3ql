@@ -51141,6 +51141,91 @@ impl Storage {
             })
     }
 
+    /// Recovery check of the current database's partitioned indexes, in the
+    /// committed catalog: an attached index's parent index lives on its
+    /// table's direct partitioned parent, and a valid partitioned index has
+    /// exactly one attached index on every partition that can hold one.
+    /// Earlier releases could commit partitions created or attached without
+    /// their copy, which left unique indexes unenforced there; such a state
+    /// is refused rather than served.
+    pub(crate) fn validate_restored_partition_indexes(&self) -> Result<(), SqlError> {
+        let invalid = |message: core::fmt::Arguments<'_>| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "restored partitioned index {}",
+                message
+            )
+        };
+        for slot in 0..self.index_count() {
+            let Some(index) = self.index_visible_to(slot, 0) else {
+                continue;
+            };
+            let Some(table) = self.index_table_slot_to(slot, 0) else {
+                continue;
+            };
+            let definition = index.mutable_for(0);
+            if let Some(parent) = definition.parent {
+                let parent = usize::from(parent);
+                let attached_under = self
+                    .table_def(table, 0)
+                    .partition
+                    .attachment
+                    .map(|attachment| usize::from(attachment.parent));
+                let parent_index = self.index_visible_to(parent, 0);
+                if !parent_index.is_some_and(|parent| parent.mutable_for(0).kind.is_partitioned())
+                    || attached_under.is_none()
+                    || self.index_table_slot_to(parent, 0) != attached_under
+                {
+                    return Err(invalid(format_args!(
+                        "attachment of \"{}\" does not follow its table's partition parent",
+                        index.name.as_str()
+                    )));
+                }
+            }
+            if definition.kind != (IndexKind::Partitioned { valid: true }) {
+                continue;
+            }
+            for partition in 0..self.table_count() {
+                if !self.table_slot_visible_to(partition, 0) {
+                    continue;
+                }
+                let partition_def = self.table_def(partition, 0);
+                if partition_def.kind == TableKind::Foreign
+                    || !partition_def
+                        .partition
+                        .attachment
+                        .is_some_and(|attachment| usize::from(attachment.parent) == table)
+                {
+                    continue;
+                }
+                let copies = (0..self.index_count())
+                    .filter(|child| {
+                        self.index_table_slot_to(*child, 0) == Some(partition)
+                            && self.index_visible_to(*child, 0).is_some_and(|child| {
+                                child.mutable_for(0).parent == Some(slot as u16)
+                            })
+                    })
+                    .count();
+                if copies != 1 {
+                    return Err(invalid(format_args!(
+                        "\"{}\" has {} attached indexes on partition \"{}\"; exactly one is required",
+                        index.name.as_str(),
+                        copies,
+                        partition_def.name.as_str()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Recreates the committed state an earlier release could write: a
+    /// partition index no longer attached to its partitioned parent index.
+    #[cfg(test)]
+    pub(crate) fn detach_committed_index_parent_for_test(&self, slot: usize) {
+        self.index_catalog()[slot].mutable.parent = None;
+    }
+
     pub(crate) fn index_visible_to(&self, slot: usize, txid: u32) -> Option<IndexDef> {
         let index = self.index_catalog().get(slot).copied();
         index

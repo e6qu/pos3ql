@@ -4187,6 +4187,7 @@ impl Engine {
             storage.rebind_user_type_declarations()?;
             storage.rebind_routine_types()?;
             storage.rebind_all_stored_query_dependencies(0)?;
+            storage.validate_restored_partition_indexes()?;
         }
         for (_, metadata) in prepared_transactions.entries() {
             storage.select_database_for_recovery(metadata.database)?;
@@ -20665,6 +20666,7 @@ impl Engine {
                 txn,
                 exec::DropIndexCommand {
                     names,
+                    arena,
                     if_exists: *if_exists,
                     build: *build,
                     cascade: *cascade,

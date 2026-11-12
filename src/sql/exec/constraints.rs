@@ -340,12 +340,29 @@ pub(crate) fn check_domain_constraints(
     Ok(())
 }
 
+const UNIQUE_VIOLATION_PREFIX: &str = "duplicate key value violates unique constraint ";
+
 fn unique_violation(name: SqlName) -> SqlError {
     sql_err!(
         sqlstate::UNIQUE_VIOLATION,
-        "duplicate key value violates unique constraint \"{}\"",
+        "{}\"{}\"",
+        UNIQUE_VIOLATION_PREFIX,
         name.as_str()
     )
+}
+
+/// PostgreSQL reports duplicates found while building or rebuilding a unique
+/// index as `could not create unique index "name"`, not as a write's
+/// violation of it.
+pub(crate) fn unique_build_failure(error: SqlError) -> SqlError {
+    match error.message.as_str().strip_prefix(UNIQUE_VIOLATION_PREFIX) {
+        Some(name) if error.sqlstate == sqlstate::UNIQUE_VIOLATION => sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "could not create unique index {}",
+            name
+        ),
+        _ => error,
+    }
 }
 
 /// Whether the row `rowid`'s committed key equals `values` under this index's

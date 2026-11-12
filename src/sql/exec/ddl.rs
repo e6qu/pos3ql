@@ -836,23 +836,39 @@ pub(crate) fn require_convertible_index<Definition0: crate::storage::DefinitionB
     Ok(())
 }
 
-/// PostgreSQL's `CheckMutability` for an index key or predicate: a built-in
-/// function it calls must be immutable (`42P17`). `what` is `expression` or
-/// `predicate`. User-defined functions are not judged here: PostgreSQL first
-/// inlines a simple SQL function, so its declared volatility alone does not
-/// decide.
-pub(crate) fn require_immutable_index_expression(
+/// PostgreSQL's `CheckMutability` for an index key or predicate (`42P17`):
+/// after the planner's SQL-function inlining, every function, operator and
+/// cast it runs must be immutable, so `stamp::date` on a `timestamptz` column
+/// and a PL/pgSQL `STABLE` function are refused. `what` is `expression` or
+/// `predicate`. A step with no known implementation keeps the name rule for
+/// built-in non-immutable functions.
+pub(crate) fn require_immutable_index_expression<Definition0: crate::storage::DefinitionBacking>(
     expression: &Expr,
+    table: &crate::storage::TableDefinition<Definition0>,
     storage: &Storage,
     txid: u32,
     what: &str,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
-    if expression
-        .contains_nonimmutable_function_with(&|name| {
-            storage.builtin_routine_name_is_nonimmutable(name, txid)
-        })
-        .is_some()
-    {
+    let columns = super::CatalogCols {
+        definition: Some(crate::storage::RelationDefinition::from_definition(table)),
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let mutable = match crate::sql::planner_inputs::inline::index_expression_is_mutable(
+        expression, &columns, storage, txid, arena,
+    )? {
+        Some(mutable) => mutable,
+        None => expression
+            .contains_nonimmutable_function_with(&|name| {
+                storage.builtin_routine_name_is_nonimmutable(name, txid)
+            })
+            .is_some(),
+    };
+    if mutable {
         return Err(sql_err!(
             sqlstate::INVALID_OBJECT_DEFINITION,
             "functions in index {} must be marked IMMUTABLE",

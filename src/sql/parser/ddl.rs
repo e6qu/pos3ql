@@ -4112,8 +4112,14 @@ impl<'a> Parser<'a> {
                 return Err(self.syntax_error_here());
             }
         }
-        let language =
-            language.ok_or_else(|| self.invalid_function_definition("no language specified"))?;
+        // PostgreSQL's CreateFunction: a SQL-standard body implies LANGUAGE SQL.
+        let language = match (language, body) {
+            (Some(language), _) => language,
+            (None, Some(body)) if !matches!(body, crate::sql::ast::RoutineBody::String(_)) => {
+                crate::sql::ast::RoutineLanguage::Sql
+            }
+            (None, _) => return Err(self.invalid_function_definition("no language specified")),
+        };
         if body.is_some_and(|body| {
             !matches!(body, crate::sql::ast::RoutineBody::String(_))
                 && language != crate::sql::ast::RoutineLanguage::Sql

@@ -1616,6 +1616,19 @@ fn create_table_kind(
         Err(e) => return sql_fail(e),
     };
     def = TableDefBuilder::from_definition(&storage.table_def(created_slot, txn.txid));
+    if let Some(attachment) = def.partition.attachment
+        && let Err(error) = ensure_partition_indexes(
+            storage,
+            wal,
+            txn,
+            usize::from(attachment.parent),
+            created_slot,
+            PartitionJoin::Create,
+            arena,
+        )
+    {
+        return sql_fail(error);
+    }
     if foreign.is_none()
         && let Err(e) =
             copy_like_statistics(storage, wal, txn, statement, &def, created_slot, arena)
@@ -2888,7 +2901,6 @@ fn drop_foreign_table_slot(
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
     seq_session: &crate::sql::guc::SeqSession,
-    binding_slot: usize,
     definition: crate::storage::foreign::ForeignTableDefinition,
     cascade: bool,
     arena: &Arena,
@@ -2921,27 +2933,10 @@ fn drop_foreign_table_slot(
         )
     });
     match outcome {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => return sql_fail(error),
-        Err(error) => return Err(error),
+        Ok(Ok(())) => sql_ok(),
+        Ok(Err(error)) => sql_fail(error),
+        Err(error) => Err(error),
     }
-    storage.foreign_catalog_drop(
-        crate::storage::foreign::ForeignObjectClass::Table,
-        binding_slot,
-        txn.txid,
-    );
-    if let Err(error) = txn.record_ddl(
-        storage,
-        super::txn::DdlUndo::ForeignTableDropped(binding_slot as u32),
-    ) {
-        storage.foreign_catalog_rollback_drop(
-            crate::storage::foreign::ForeignObjectClass::Table,
-            binding_slot,
-            txn.txid,
-        );
-        return sql_fail(error);
-    }
-    sql_ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2990,7 +2985,7 @@ fn mark_foreign_server_drop(
                 return sql_fail(error);
             }
         }
-        while let Some((binding, definition)) =
+        while let Some((_, definition)) =
             storage.first_foreign_table_for_server(slot as u16, txn.txid)
         {
             match drop_foreign_table_slot(
@@ -2999,7 +2994,6 @@ fn mark_foreign_server_drop(
                 txn,
                 &mut *scratch,
                 seq_session,
-                binding,
                 definition,
                 true,
                 arena,
@@ -3312,26 +3306,7 @@ pub(crate) fn drop_foreign_table(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
-    let mut bindings = [usize::MAX; 16];
-    let mut count = 0usize;
-    for name in statement.names {
-        if let Some(crate::storage::ResolvedRelation::Table(table)) =
-            storage.resolve_relation(name.schema, name.name, txn.txid)
-            && storage.table_def(table, txn.txid).kind == crate::storage::TableKind::Foreign
-        {
-            let Some((binding, _)) = storage.foreign_table(table as u16, txn.txid) else {
-                return sql_fail(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "foreign table has no typed catalog binding"
-                ));
-            };
-            if !bindings[..count].contains(&binding) {
-                bindings[count] = binding;
-                count += 1;
-            }
-        }
-    }
-    match drop_table_kind_with_columns(
+    drop_table_kind_with_columns(
         storage,
         wal,
         txn,
@@ -3344,29 +3319,7 @@ pub(crate) fn drop_foreign_table(
             seq_session,
         },
         responder,
-    ) {
-        Ok(Ok(())) => {}
-        other => return other,
-    }
-    for binding in &bindings[..count] {
-        storage.foreign_catalog_drop(
-            crate::storage::foreign::ForeignObjectClass::Table,
-            *binding,
-            txn.txid,
-        );
-        if let Err(error) = txn.record_ddl(
-            storage,
-            super::txn::DdlUndo::ForeignTableDropped(*binding as u32),
-        ) {
-            storage.foreign_catalog_rollback_drop(
-                crate::storage::foreign::ForeignObjectClass::Table,
-                *binding,
-                txn.txid,
-            );
-            return sql_fail(error);
-        }
-    }
-    sql_ok()
+    )
 }
 
 pub(crate) struct ForeignTableAlterRuntime<'a> {
@@ -12940,6 +12893,7 @@ pub(crate) fn drop_owned(
                     txn,
                     DropIndexCommand {
                         names: core::slice::from_ref(&qualified),
+                        arena,
                         if_exists: false,
                         build: crate::sql::ast::IndexBuildMode::Blocking,
                         cascade,
@@ -15669,7 +15623,15 @@ pub(crate) fn drop_schema(
             match o {
                 SchemaObject::Table(t) => {
                     let def = storage.table_def(*t, txn.txid);
-                    let _ = write!(out, "table ");
+                    let _ = write!(
+                        out,
+                        "{}",
+                        if def.kind == crate::storage::TableKind::Foreign {
+                            "foreign table "
+                        } else {
+                            "table "
+                        }
+                    );
                     write_rel(out, &def.schema, &def.name);
                 }
                 SchemaObject::View(v) => {
@@ -27468,6 +27430,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     txn,
                     super::exec::DropIndexCommand {
                         names,
+                        arena: context.arena,
                         if_exists: *if_exists,
                         build: *build,
                         cascade: *cascade,
@@ -56635,9 +56598,11 @@ pub fn create_index(
         }
         if let Err(error) = ddl::require_immutable_index_expression(
             predicate_expression,
+            &tdef,
             storage,
             txn.txid,
             "predicate",
+            arena,
         ) {
             return sql_fail(error);
         }
@@ -56896,9 +56861,11 @@ pub fn create_index(
             };
             if let Err(error) = ddl::require_immutable_index_expression(
                 index_column.expression,
+                &tdef,
                 storage,
                 txn.txid,
                 "expression",
+                arena,
             ) {
                 return sql_fail(error);
             }
@@ -57288,25 +57255,13 @@ pub fn create_index(
         nulls_first[i] = index_column.nulls_first;
     }
     if command.unique
-        && let Some(scheme) = tdef.partition.scheme
+        && let Err(error) = require_unique_index_partition_keys(
+            &tdef,
+            &columns[..command.columns.len()],
+            &expressions[..command.columns.len()],
+        )
     {
-        for &partition_column in &scheme.keys[..usize::from(scheme.n_keys)] {
-            if !columns[..command.columns.len()]
-                .iter()
-                .enumerate()
-                .any(|(position, column)| {
-                    expressions[position].is_none() && *column == partition_column
-                })
-            {
-                return sql_fail(SqlError {
-                    sqlstate: crate::sql::eval::SqlState::known(sqlstate::FEATURE_NOT_SUPPORTED),
-                    message: stack_format!(
-                        192,
-                        "unique constraint on partitioned table must include all partitioning columns"
-                    ),
-                });
-            }
-        }
+        return sql_fail(error);
     }
     let mut collations = match constraints::index_key_collations(
         storage,
@@ -57488,18 +57443,14 @@ pub fn create_index(
     }
     if tdef.partition.is_partitioned()
         && command.scope == crate::sql::ast::IndexTargetScope::Recurse
-        && let Err(error) = create_partition_index_children(
+        && let Err(error) = ensure_partition_index_children(
             storage,
             wal,
             txn,
-            PartitionIndexCreate {
-                root_table: table_index,
-                root_index: slot,
-                root: def,
-                columns: command.columns,
-                include_columns: command.include_columns,
-                arena,
-            },
+            slot,
+            table_index,
+            PartitionIndexMatch::AnyEquivalent,
+            arena,
         )
     {
         return sql_fail(error);
@@ -57819,7 +57770,7 @@ fn validate_index_rows(
             // SAFETY: validation returns only an owned error or success; key
             // values and parsed expressions are consumed before returning.
             unsafe { arena.rewind_to(row_mark) };
-            result
+            result.map_err(constraints::unique_build_failure)
         };
         let scan = storage.index_validation_scan_in(table_index, txid, arena)?;
         let mut rows = 0u64;
@@ -57878,106 +57829,381 @@ fn validate_index_rows(
     result
 }
 
-struct PartitionIndexCreate<'a> {
-    root_table: usize,
-    root_index: usize,
-    root: crate::storage::IndexDef,
-    columns: &'a [crate::sql::ast::IndexColumn<'a>],
-    include_columns: &'a [&'a str],
-    arena: &'a Arena,
+/// Which existing partition indexes may stand in for a parent's copy.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartitionIndexMatch {
+    /// `CREATE INDEX` on a partitioned table (PostgreSQL's `DefineIndex`):
+    /// any unattached equivalent index, an invalid one making its parent
+    /// invalid.
+    AnyEquivalent,
+    /// `ATTACH PARTITION` (PostgreSQL's `AttachPartitionEnsureIndexes`):
+    /// only a valid unattached equivalent index.
+    ValidEquivalent,
 }
 
-fn create_partition_index_children(
+/// PostgreSQL's unique-index partition-key rule for a partitioned table:
+/// every partition key column must be a plain key column of the index.
+fn require_unique_index_partition_keys<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
+    columns: &[u16],
+    expressions: &[Option<StackStr<{ crate::storage::INDEX_EXPRESSION_MAX }>>],
+) -> Result<(), SqlError> {
+    let Some(scheme) = table.partition.scheme else {
+        return Ok(());
+    };
+    for &partition_column in &scheme.keys[..usize::from(scheme.n_keys)] {
+        if !columns
+            .iter()
+            .zip(expressions)
+            .any(|(column, expression)| expression.is_none() && *column == partition_column)
+        {
+            return Err(crate::sql::eval::with_detail(
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "unique constraint on partitioned table must include all partitioning columns"
+                ),
+                format_args!(
+                    "UNIQUE constraint on table \"{}\" lacks column \"{}\" which is part of the partition key.",
+                    table.name.as_str(),
+                    table.columns()[usize::from(partition_column)].name.as_str()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The visible direct partitions of `table`, in catalog slot order.
+fn direct_partition_slots<'a>(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    let partitions = arena
+        .alloc_slice_with(storage.table_count(), |_| usize::MAX)
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    for candidate in 0..storage.table_count() {
+        if storage.table_slot_visible_to(candidate, txid)
+            && storage
+                .table_def(candidate, txid)
+                .partition
+                .attachment
+                .is_some_and(|attachment| usize::from(attachment.parent) == table)
+        {
+            partitions[count] = candidate;
+            count += 1;
+        }
+    }
+    Ok(&partitions[..count])
+}
+
+/// The partitioned indexes of `table` in OID order, PostgreSQL's
+/// `RelationGetIndexList` order for cloning them onto a partition.
+fn partitioned_index_slots<'a>(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    let slots = arena
+        .alloc_slice_with(storage.index_count(), |_| usize::MAX)
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    for slot in 0..storage.index_count() {
+        if storage.index_table_slot_to(slot, txid) == Some(table)
+            && storage
+                .index_visible_to(slot, txid)
+                .is_some_and(|index| index.mutable_for(txid).kind.is_partitioned())
+        {
+            slots[count] = slot;
+            count += 1;
+        }
+    }
+    let slots = &mut slots[..count];
+    slots.sort_unstable_by_key(|slot| {
+        storage
+            .index_visible_to(*slot, txid)
+            .map_or(i32::MAX, |index| index.relation_oid())
+    });
+    Ok(slots)
+}
+
+/// Gives every partition of `table` its copy of the partitioned index at
+/// `parent_index`, then records whether all of them are valid.
+fn ensure_partition_index_children(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    command: PartitionIndexCreate<'_>,
+    parent_index: usize,
+    table: usize,
+    matching: PartitionIndexMatch,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for &partition in direct_partition_slots(storage, table, txn.txid, arena)? {
+        ensure_partition_index(storage, wal, txn, parent_index, partition, matching, arena)?;
+    }
+    refresh_partitioned_index_validity(storage, wal, txn, parent_index)
+}
+
+/// PostgreSQL's per-partition index step of `DefineIndex` and
+/// `AttachPartitionEnsureIndexes`: attach the first unattached equivalent
+/// index of `partition` to `parent_index`, or build a copy (recursing into a
+/// partitioned partition). A copy is built and checked like any new index, so
+/// a unique copy rejects duplicate rows already in the partition.
+fn ensure_partition_index(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    parent_index: usize,
+    partition: usize,
+    matching: PartitionIndexMatch,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mark = arena.mark();
+    let result =
+        ensure_partition_index_in(storage, wal, txn, parent_index, partition, matching, arena);
+    // SAFETY: catalog, journal and undo state copy what they keep; parsed
+    // expressions, names and slot lists of this partition end here, so a
+    // large partition tree runs in a fixed statement arena.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+fn ensure_partition_index_in(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    parent_index: usize,
+    partition: usize,
+    matching: PartitionIndexMatch,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     use crate::storage::IndexDef;
-    if (0..storage.table_count())
-        .any(|slot| partition_depth_from(storage, slot, command.root_table, txn.txid) == Some(1))
+    let parent = storage
+        .index_visible_to(parent_index, txn.txid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?
+        .definition_for(txn.txid);
+    let parent_table = storage
+        .index_table_slot_to(parent_index, txn.txid)
+        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index has no table"))?;
+    let parent_def = (*storage.table_def(parent_table, txn.txid)).clone();
+    let table = (*storage.table_def(partition, txn.txid)).clone();
+    if table.kind == crate::storage::TableKind::Foreign {
+        if parent.unique {
+            return Err(crate::sql::eval::with_detail(
+                sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "cannot create unique index on partitioned table \"{}\"",
+                    parent_def.name.as_str()
+                ),
+                format_args!(
+                    "Table \"{}\" contains partitions that are foreign tables.",
+                    parent_def.name.as_str()
+                ),
+            ));
+        }
+        return Ok(());
+    }
+    ddl::require_convertible_index(
+        &parent_def,
+        &parent,
+        parent.name_for(txn.txid).as_str(),
+        arena,
+    )?;
+    let mut columns = parent.columns;
+    for (column, expression) in columns
+        .iter_mut()
+        .zip(&parent.expressions)
+        .take(parent.n_cols)
     {
-        ddl::require_convertible_index(
-            &storage.table_def(command.root_table, txn.txid),
-            &command.root,
-            command.root.name.as_str(),
-            command.arena,
+        if expression.is_none() {
+            *column = remap_columns(&table, &parent_def, core::slice::from_ref(column))?[0];
+        }
+    }
+    let include_columns = remap_columns(
+        &table,
+        &parent_def,
+        &parent.include_columns[..parent.n_include_cols],
+    )?;
+    let copy = IndexDef {
+        created_at: 0,
+        schema: table.schema,
+        name: parent.name,
+        pending_name: None,
+        table: table.name,
+        table_binding: None,
+        pending_table: None,
+        columns,
+        include_columns,
+        mutable: crate::storage::IndexMutableDefinition {
+            tablespace: parent.mutable.tablespace,
+            options: parent.mutable.options,
+            parent: Some(
+                u16::try_from(parent_index)
+                    .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many indexes"))?,
+            ),
+            kind: if table.partition.is_partitioned() {
+                crate::storage::IndexKind::Partitioned { valid: true }
+            } else {
+                crate::storage::IndexKind::Ordinary
+            },
+            ..crate::storage::IndexMutableDefinition::DEFAULT
+        },
+        pending_definition: None,
+        ddl_state: crate::storage::CatalogDdlState::Present,
+        pending_parent_drop_txid: None,
+        ..parent
+    };
+    let existing = (0..storage.index_count()).find(|slot| {
+        storage.index_table_slot_to(*slot, txn.txid) == Some(partition)
+            && storage
+                .index_visible_to(*slot, txn.txid)
+                .is_some_and(|candidate| {
+                    let candidate = candidate.definition_for(txn.txid);
+                    let definition = candidate.mutable_for(txn.txid);
+                    definition.parent.is_none()
+                        && definition.kind.live()
+                        && (matching == PartitionIndexMatch::AnyEquivalent
+                            || definition.kind.valid())
+                        && index_definitions_compatible(&copy, &candidate)
+                })
+    });
+    if let Some(slot) = existing {
+        let mut definition = storage
+            .index_visible_to(slot, txn.txid)
+            .expect("matched partition index is visible")
+            .mutable_for(txn.txid);
+        definition.parent = copy.mutable.parent;
+        return stage_index_definition(storage, wal, txn, slot, definition);
+    }
+    if copy.unique {
+        require_unique_index_partition_keys(
+            &table,
+            &copy.columns[..copy.n_cols],
+            &copy.expressions[..copy.n_cols],
         )?;
     }
-    for depth in 1..storage.table_count() {
-        for table_slot in 0..storage.table_count() {
-            if partition_depth_from(storage, table_slot, command.root_table, txn.txid)
-                != Some(depth)
-            {
-                continue;
-            }
-            let table = (*storage.table_def(table_slot, txn.txid)).clone();
-            let parent_table = usize::from(
-                table
-                    .partition
-                    .attachment
-                    .expect("partition descendant has a direct parent")
-                    .parent,
-            );
-            let parent_index = if parent_table == command.root_table {
-                command.root_index
-            } else {
-                (0..storage.index_count())
-                    .find(|slot| {
-                        storage.index_table_slot_to(*slot, txn.txid) == Some(parent_table)
-                            && storage
-                                .index_visible_to(*slot, txn.txid)
-                                .is_some_and(|index| {
-                                    let mut ancestor = index.mutable_for(txn.txid).parent;
-                                    for _ in 0..storage.index_count() {
-                                        let Some(slot) = ancestor else { return false };
-                                        if usize::from(slot) == command.root_index {
-                                            return true;
-                                        }
-                                        ancestor = storage
-                                            .index_visible_to(usize::from(slot), txn.txid)
-                                            .and_then(|parent| parent.mutable_for(txn.txid).parent);
-                                    }
-                                    false
-                                })
-                    })
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "partition index parent is missing"
-                        )
-                    })?
-            };
-            let name = generated_index_name(
-                storage,
-                &table,
-                command.columns,
-                command.include_columns,
-                txn.txid,
-            )?;
-            let definition = crate::storage::IndexMutableDefinition {
-                parent: Some(parent_index as u16),
-                kind: if table.partition.is_partitioned() {
-                    crate::storage::IndexKind::Partitioned { valid: true }
-                } else {
-                    crate::storage::IndexKind::Ordinary
-                },
-                ..command.root.mutable
-            };
-            let index = IndexDef {
-                created_at: 0,
-                schema: table.schema,
-                name,
-                pending_name: None,
-                table: table.name,
-                mutable: definition,
-                pending_definition: None,
-                ddl_state: crate::storage::CatalogDdlState::Present,
-                ..command.root
-            };
-            let slot = storage.create_index(index, txn.txid)?;
-            finish_index_creation(storage, wal, txn, slot, table_slot, command.arena)?;
+    let name = copied_index_name(
+        storage,
+        &table,
+        &copy.expressions[..copy.n_cols],
+        &copy.columns[..copy.n_cols],
+        &copy.include_columns[..copy.n_include_cols],
+        txn.txid,
+        arena,
+    )?;
+    let slot = storage.create_index(IndexDef { name, ..copy }, txn.txid)?;
+    finish_index_creation(storage, wal, txn, slot, partition, arena)?;
+    if table.partition.is_partitioned() {
+        ensure_partition_index_children(
+            storage,
+            wal,
+            txn,
+            slot,
+            partition,
+            PartitionIndexMatch::AnyEquivalent,
+            arena,
+        )?;
+    }
+    Ok(())
+}
+
+/// PostgreSQL's `DetachPartitionFinalize` for indexes: the detached
+/// partition's copies of `parent`'s indexes become independent indexes.
+fn detach_partition_indexes(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    parent: usize,
+    partition: usize,
+) -> Result<(), SqlError> {
+    for slot in 0..storage.index_count() {
+        if storage.index_table_slot_to(slot, txn.txid) != Some(partition) {
+            continue;
         }
+        let Some(index) = storage.index_visible_to(slot, txn.txid) else {
+            continue;
+        };
+        let mut definition = index.mutable_for(txn.txid);
+        let Some(parent_index) = definition.parent else {
+            continue;
+        };
+        if storage.index_table_slot_to(usize::from(parent_index), txn.txid) != Some(parent) {
+            continue;
+        }
+        definition.parent = None;
+        stage_index_definition(storage, wal, txn, slot, definition)?;
+    }
+    Ok(())
+}
+
+/// How a partition joins its partitioned parent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartitionJoin {
+    Create,
+    Attach,
+}
+
+/// Gives a partition just created or attached under `parent` a copy of each
+/// of the parent's partitioned indexes. A foreign partition takes no index
+/// copies and is refused when the parent has a unique one.
+fn ensure_partition_indexes(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    parent: usize,
+    partition: usize,
+    join: PartitionJoin,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let parent_indexes = partitioned_index_slots(storage, parent, txn.txid, arena)?;
+    if storage.table_def(partition, txn.txid).kind == crate::storage::TableKind::Foreign
+        && parent_indexes.iter().any(|slot| {
+            storage
+                .index_visible_to(*slot, txn.txid)
+                .is_some_and(|index| index.unique)
+        })
+    {
+        let parent_name = storage.table_def(parent, txn.txid).name;
+        let partition_name = storage.table_def(partition, txn.txid).name;
+        return Err(match join {
+            PartitionJoin::Create => crate::sql::eval::with_detail(
+                sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "cannot create foreign partition of partitioned table \"{}\"",
+                    parent_name.as_str()
+                ),
+                format_args!(
+                    "Table \"{}\" contains indexes that are unique.",
+                    parent_name.as_str()
+                ),
+            ),
+            PartitionJoin::Attach => crate::sql::eval::with_detail(
+                sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "cannot attach foreign table \"{}\" as partition of partitioned table \"{}\"",
+                    partition_name.as_str(),
+                    parent_name.as_str()
+                ),
+                format_args!(
+                    "Partitioned table \"{}\" contains unique indexes.",
+                    parent_name.as_str()
+                ),
+            ),
+        });
+    }
+    for &index in parent_indexes {
+        ensure_partition_index(
+            storage,
+            wal,
+            txn,
+            index,
+            partition,
+            PartitionIndexMatch::ValidEquivalent,
+            arena,
+        )?;
     }
     Ok(())
 }
@@ -59933,6 +60159,7 @@ fn stage_index_rename(
 
 pub struct DropIndexCommand<'a> {
     pub names: &'a [QualName<'a>],
+    pub arena: &'a Arena,
     pub if_exists: bool,
     pub build: crate::sql::ast::IndexBuildMode,
     pub cascade: bool,
@@ -59948,6 +60175,7 @@ pub fn drop_index(
 ) -> Outcome {
     let DropIndexCommand {
         names,
+        arena,
         if_exists,
         build,
         cascade,
@@ -60009,11 +60237,25 @@ pub fn drop_index(
                     storage.table_def(table, txn.txid).name.as_str(),
                 ));
             }
-            if definition.mutable_for(txn.txid).parent.is_some() {
-                return sql_fail(sql_err!(
-                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                    "cannot drop index \"{}\" because another object requires it",
-                    name.name
+            if let Some(parent) = definition.mutable_for(txn.txid).parent {
+                use crate::sql::catalog::dependencies::ObjectAddress;
+                let parent = storage
+                    .index_visible_to(usize::from(parent), txn.txid)
+                    .expect("an attached index's parent index is visible");
+                return sql_fail(dependency_report::required_by(
+                    storage,
+                    txn.txid,
+                    ObjectAddress::new(
+                        crate::sql::catalog::PG_CLASS_OID,
+                        crate::sql::catalog::explicit_index_oid(&definition),
+                        0,
+                    ),
+                    ObjectAddress::new(
+                        crate::sql::catalog::PG_CLASS_OID,
+                        crate::sql::catalog::explicit_index_oid(&parent),
+                        0,
+                    ),
+                    arena,
                 ));
             }
             if build == crate::sql::ast::IndexBuildMode::Concurrent
@@ -75494,6 +75736,29 @@ fn alter_partition_attachment(
                 }
             }
         }
+    }
+    if attaching
+        && let Err(error) = ensure_partition_indexes(
+            storage,
+            wal,
+            txn,
+            parent,
+            child,
+            PartitionJoin::Attach,
+            arena,
+        )
+    {
+        return sql_fail(error);
+    }
+    if !attaching
+        && storage
+            .table_def(child, txn.txid)
+            .partition
+            .attachment
+            .is_none()
+        && let Err(error) = detach_partition_indexes(storage, wal, txn, parent, child)
+    {
+        return sql_fail(error);
     }
     if attaching {
         let trigger_count = storage.triggers_with_slots_visible_to(txn.txid).count();

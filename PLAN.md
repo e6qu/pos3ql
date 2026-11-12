@@ -299,14 +299,11 @@ array constructors outside a quantified comparison) are still printed as
 stored. Index keys and predicates are stored as text, so renaming a table
 whose index reads the whole row, or a column an index expression or predicate
 uses, fails with `0A000`; storing them with bound column positions, as
-catalog expression nodes already are, would let both renames proceed. Index
-expressions and predicates reject non-immutable built-in functions with
-`42P17`, but not a cast PostgreSQL implements with a stable function
-(`CREATE INDEX ON t ((stamp::date))` on a `timestamptz` column succeeds) or a
-non-immutable user function that PostgreSQL would not inline into its SQL
-body. A
-partition created or attached after a partitioned index does not receive its
-copy of that index. `pg_get_viewdef` uses PostgreSQL's
+catalog expression nodes already are, would let both renames proceed. A
+partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
+its parent's plain unique index, so attaching such a partition builds a
+separate copy where PostgreSQL reuses the constraint's index; constraint
+indexes need a durable link to a parent index first. `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their

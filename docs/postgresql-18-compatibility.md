@@ -110,6 +110,20 @@ Identity, inheritance, and partitions:
 - Ordinary `INHERITS` does not inherit identity generation. Partitions use the
   parent's sequence, but `pg_get_serial_sequence` returns NULL for a child.
   Detaching a partition clears its inherited identity; rolling back restores it.
+- A partition created with `PARTITION OF` or attached with `ATTACH PARTITION`
+  receives a copy of each index of its partitioned parent, as in PostgreSQL:
+  an equivalent valid index it already has is attached, otherwise a new one is
+  built (a unique copy fails with `23505` `could not create unique index` over
+  duplicate rows), and a partitioned partition passes the copy on to its own
+  partitions. So after `CREATE UNIQUE INDEX ON orders (id)`, a partition added
+  later rejects a duplicate `id`. Detaching a partition keeps its copies as
+  independent indexes. A foreign partition takes no copies and is refused when
+  the parent has a unique index. One difference remains: an equivalent
+  `UNIQUE` or `PRIMARY KEY` constraint of the new partition is not attached to
+  a parent's plain unique index, so pos3ql builds a separate copy where
+  PostgreSQL reuses the constraint's index. Startup refuses (`22000`) a saved
+  catalog in which a valid partitioned index lacks its copy on a partition, a
+  state earlier pos3ql releases could commit.
 
 Row types:
 
@@ -135,6 +149,12 @@ Row types:
   refused with `0A000` because index keys and predicates are stored as text:
   renaming a table one of whose indexes reads the whole row, and renaming a
   column an index expression or predicate uses.
+- Index keys and predicates must be immutable (`42P17` `functions in index
+  expression must be marked IMMUTABLE`), judged as PostgreSQL does after
+  inlining simple SQL functions: `CREATE INDEX ON orders ((placed_at::date))`
+  is refused for a `timestamptz` column because that cast depends on the
+  `TimeZone` setting, and so is a `STABLE` PL/pgSQL function, while a
+  `VOLATILE` SQL function whose body is `SELECT $1` is accepted.
 - A view's row type has the view's column types, modifiers and collations as
   they were when the view was created or replaced: `CREATE VIEW totals AS
   SELECT sum(amount) AS total FROM orders` keeps `total numeric` even if a later

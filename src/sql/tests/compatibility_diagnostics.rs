@@ -1598,3 +1598,57 @@ fn data_change_subquery_constants_convert_before_rows_are_read() {
         }
     });
 }
+
+/// A missing column's error carries PostgreSQL's spelling suggestion from the
+/// failing query and the queries enclosing it, and a virtual generated
+/// column, PostgreSQL 18's default kind, is rejected rather than stored.
+#[test]
+fn missing_columns_suggest_spellings_and_virtual_columns_are_rejected() {
+    with_engine("missing-column-suggestions", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE TABLE t (abc int, xyz text, abe int); CREATE TABLE u (abc int, qqq int)",
+        );
+        for (sql, expected) in [
+            (
+                "SELECT xyy FROM t",
+                "ERROR 42703 column \"xyy\" does not exist @8 hint: Perhaps you meant to \
+                 reference the column \"t.xyz\".",
+            ),
+            (
+                "SELECT abd FROM t",
+                "ERROR 42703 column \"abd\" does not exist @8 hint: Perhaps you meant to \
+                 reference the column \"t.abc\" or the column \"t.abe\".",
+            ),
+            (
+                "SELECT abf FROM t, u",
+                "ERROR 42703 column \"abf\" does not exist @8",
+            ),
+            (
+                "SELECT t.qqq FROM t, u",
+                "ERROR 42703 column t.qqq does not exist @8 hint: Perhaps you meant to \
+                 reference the column \"u.qqq\".",
+            ),
+            (
+                "SELECT (SELECT xyy FROM u) FROM t",
+                "ERROR 42703 column \"xyy\" does not exist @16 hint: Perhaps you meant to \
+                 reference the column \"t.xyz\".",
+            ),
+            (
+                "CREATE TABLE v (a int, b int GENERATED ALWAYS AS (a + 1))",
+                "ERROR 0A000 virtual generated columns are not supported",
+            ),
+            (
+                "CREATE TABLE v (a int, b int GENERATED ALWAYS AS (a + 1) VIRTUAL)",
+                "ERROR 0A000 virtual generated columns are not supported",
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [expected],
+                "{sql}"
+            );
+        }
+    });
+}

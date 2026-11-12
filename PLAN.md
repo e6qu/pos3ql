@@ -300,8 +300,12 @@ GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
 `CREATE OR REPLACE RULE "_RETURN"` replaces a view's query only when every
 column keeps its type modifier; PostgreSQL also accepts an unmodified type
 (`numeric` for a `numeric(5,2)` column). A
-missing column error never carries PostgreSQL's spelling-suggestion hint
-(`Perhaps you meant to reference the column "t.v".`). A derived table computes output
+missing column's spelling suggestion (`Perhaps you meant to reference the
+column "t.v".`) is missing for a reference inside a `LIMIT`/`OFFSET`
+subquery and in `COPY ... WHERE`, and a set operation's later branch does
+not offer the earlier branches' columns (`*SELECT* 1`); an index
+expression's missing column has the suggestion but no cursor position. Virtual generated columns, PostgreSQL 18's
+default when `STORED` is not written, fail with `0A000`. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
@@ -311,9 +315,9 @@ PostgreSQL types it as the table's row type `t`. A row constructor casts to a ta
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. A trigger fired
-inside a writing statement cannot `FETCH` from a session cursor that locks
-its rows or calls a user-defined routine for each fetched row, or first read
-one whose data-modifying `WITH` queries have not run (`0A000`). A `LATERAL`
+inside a writing statement cannot `FETCH` from a session cursor that calls
+a user-defined routine for each fetched row, or first read one whose
+data-modifying `WITH` queries have not run (`0A000`). A `LATERAL`
 subquery that reads an earlier item's column fails when its own output
 column has the same name (`SELECT * FROM generate_series(1,2) g, LATERAL
 (SELECT g) x` reports `column reference "g" is ambiguous`) or when that item
@@ -323,9 +327,13 @@ protocol-level `Parse` message checks only syntax and parameter types, so
 analysis errors (`SELECT current_date + $1`, `SELECT 1 WHERE 'x'`) arrive at
 `Bind` or `Execute` where PostgreSQL reports them at `Parse`, and
 `pg_prepared_statements` lists only SQL `PREPARE` statements, not protocol
-ones. An unknown-type literal passed to a function argument (`int4pl(a,
-'p')`) converts only when the function runs, and a failed element of a
-constant array cast (`ARRAY['1', 'x']::int[]`) has no cursor position.
+ones. An unknown-type literal passed to an overloaded builtin function
+(`substr('abc', 'x')`) converts only when the function runs, and one whose
+candidates PostgreSQL resolves by preferred type fails as an unknown
+function (`abs('x')` reports `function abs(text) does not exist` where
+PostgreSQL converts `'x'` to `double precision`). Without `FROM`
+(`SELECT int4pl(1, 'p')`), in `VALUES` lists and in set operations, a failed
+unknown-literal conversion has no cursor position.
 `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY

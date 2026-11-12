@@ -4437,7 +4437,27 @@ impl Chained<'_, '_> {
     }
 }
 
+impl Chained<'_, '_> {
+    /// A missing column's error with the spelling suggestion this scope and
+    /// every enclosing one give.
+    fn suggested(&self, qualifier: Option<&str>, name: &str, error: SqlError) -> SqlError {
+        let mut suggestion = crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
+        self.suggest_columns(&mut suggestion);
+        crate::sql::error_position::with_column_suggestion(error, &suggestion)
+    }
+}
+
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        self.inner.suggest_columns(suggestion);
+        if let Some(outer) = self.outer {
+            outer.suggest_columns(suggestion);
+        }
+    }
+
     fn check_unassigned_row_field(
         &self,
         qualifier: &str,
@@ -4511,9 +4531,9 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
                     .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
             {
                 match self.outer {
-                    Some(outer) if !outer.is_empty_scope() => {
-                        outer.resolve_column_type(qualifier, name)
-                    }
+                    Some(outer) if !outer.is_empty_scope() => outer
+                        .resolve_column_type(qualifier, name)
+                        .map_err(|error| self.suggested(qualifier, name, error)),
                     _ => Err(error),
                 }
             }
@@ -4605,7 +4625,9 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
                 Err(e)
             }
             Err(e) => match self.outer {
-                Some(o) => o.lookup(q, name),
+                Some(o) => o
+                    .lookup(q, name)
+                    .map_err(|error| self.suggested(q, name, error)),
                 None => Err(e),
             },
         }

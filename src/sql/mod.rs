@@ -17,6 +17,7 @@ mod concurrent_index;
 pub(crate) use concurrent_index::CommitPhase as IndexCommitPhaseForTests;
 pub(crate) mod array_assignment;
 pub(crate) mod assignment_path;
+pub(crate) mod column_suggestion;
 pub mod copy;
 pub mod cursor;
 pub mod datetime;
@@ -3089,14 +3090,17 @@ fn fetch_saves_row(
 /// engine's storage, and returns the row count as [`Engine::fetch_cursor`].
 /// A pending read-only query runs here with the cursor's snapshot, and a
 /// cursor that evaluates its rows as fetched reads them with the workspace's
-/// scan buffers, as the trigger's own queries run. A cursor that locks its
-/// rows, and one whose data-modifying `WITH` queries have not run, need the
-/// session's engine.
+/// scan buffers, as the trigger's own queries run, and a cursor that locks
+/// its rows locks each one as it is fetched (`repeatable` says whether the
+/// transaction's snapshot is fixed). A cursor whose data-modifying `WITH`
+/// queries have not run needs the session's engine.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fetch_trigger_cursor(
     storage: &Storage,
     services: &mut exec::TriggerServices<'_>,
     arena: &Arena,
     txid: u32,
+    repeatable: bool,
     name: &str,
     motion: cursor::FetchMotion,
     move_only: bool,
@@ -3154,17 +3158,11 @@ pub(crate) fn fetch_trigger_cursor(
             });
         }
         if let Some((at, needed)) = cursors.read_request(name, motion, move_only)? {
-            if cursors.locks_rows(at) {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cursor \"{}\" locks its rows when fetched, which is not supported in trigger execution",
-                    name
-                ));
-            }
+            let locks = cursors.locks_rows(at);
             cursors.begin_fetch(at, motion, move_only)?;
             while cursors.produced_rows(at) < needed {
                 let saved = fetch_saves_row(cursors, at, needed, motion, move_only);
-                let produced = TriggerCursorRead {
+                let mut read = TriggerCursorRead {
                     storage,
                     sequence: &sequence,
                     owner: cursors.plan_owner(at)?,
@@ -3175,8 +3173,12 @@ pub(crate) fn fetch_trigger_cursor(
                     name,
                     at,
                     render,
-                }
-                .advance(saved)?;
+                };
+                let produced = if locks {
+                    read.advance_locking(saved, repeatable)?
+                } else {
+                    read.advance(saved)?
+                };
                 if !produced {
                     break;
                 }
@@ -3304,7 +3306,7 @@ impl TriggerCursorRead<'_, '_> {
         if self.cursors.plan_owner(self.at)? != self.owner {
             return Err(changed());
         }
-        if self.cursors.execution_parts(self.at).0.skip_row() {
+        if output != CursorRowSink::Locking && self.cursors.execution_parts(self.at).0.skip_row() {
             return Ok(false);
         }
         if output == CursorRowSink::SaveReplacing {
@@ -3359,6 +3361,108 @@ impl TriggerCursorRead<'_, '_> {
                 None => return Ok(false),
                 Some(true) => return Ok(true),
                 Some(false) => {}
+            }
+        }
+    }
+
+    /// [`Engine::advance_locking_cursor`] for a trigger's FETCH or MOVE.
+    fn advance_locking(&mut self, saved: bool, repeatable: bool) -> Result<bool, SqlError> {
+        let source_snapshot = self.storage.read_snapshot();
+        let (storage, txid, at) = (self.storage, self.txid, self.at);
+        while self.cursors.sort_pending(at) {
+            let sorted = self.with_row_scratch(source_snapshot, |read| {
+                if !read.prepare_source_row()? {
+                    read.cursors.finish_sorting(at, storage, txid)?;
+                    return Ok(true);
+                }
+                if read.evaluate_row(true, CursorRowSink::FilterOnly)? {
+                    read.cursors.save_pending_input(at)?;
+                }
+                read.cursors.execution_parts(at).0.finish_row(false);
+                Ok(false)
+            })?;
+            if sorted {
+                break;
+            }
+        }
+        let sorted = self.cursors.sorted_source(at);
+        loop {
+            self.storage.set_read_snapshot(source_snapshot);
+            if self.cursors.locked_output(at).is_none() {
+                let passed = self.with_row_scratch(source_snapshot, |read| {
+                    let ready = if sorted {
+                        read.cursors.prepare_sorted_row(at)?
+                    } else {
+                        read.prepare_source_row()?
+                    };
+                    if !ready {
+                        return Ok(None);
+                    }
+                    let mark = read.cursors.output_mark(at);
+                    let filter = !sorted || read.cursors.needs_recheck(at);
+                    let passed = read.evaluate_row(filter, CursorRowSink::Locking)?;
+                    if passed {
+                        read.cursors.set_locked_output(at, mark);
+                    } else {
+                        read.cursors.execution_parts(at).0.finish_row(false);
+                        read.cursors.finish_locked_row(at);
+                    }
+                    Ok(Some(passed))
+                })?;
+                match passed {
+                    None => return Ok(false),
+                    Some(false) => continue,
+                    Some(true) => {}
+                }
+            }
+            let locked = self
+                .cursors
+                .execution_parts(at)
+                .0
+                .lock_pending(storage, txid)?;
+            let recheck = if locked {
+                self.cursors
+                    .execution_parts(at)
+                    .0
+                    .recheck_pending(storage, txid)?
+            } else {
+                query::LockedRow::Skip
+            };
+            match recheck {
+                query::LockedRow::Unchanged => {}
+                query::LockedRow::Updated if repeatable => {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "could not serialize access due to concurrent update"
+                    ));
+                }
+                query::LockedRow::Deleted if repeatable => {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "could not serialize access due to concurrent delete"
+                    ));
+                }
+                query::LockedRow::Updated => {
+                    // The latest version is filtered and projected again.
+                    self.cursors.drop_locked_output(at);
+                    self.cursors.set_recheck(at);
+                    continue;
+                }
+                query::LockedRow::Skip | query::LockedRow::Deleted => {
+                    self.cursors.drop_locked_output(at);
+                    self.cursors.execution_parts(at).0.finish_row(false);
+                    self.cursors.finish_locked_row(at);
+                    continue;
+                }
+            }
+            let skipped = self.cursors.execution_parts(at).0.skip_row();
+            if skipped || !saved {
+                self.cursors.drop_locked_output(at);
+            }
+            self.cursors.execution_parts(at).0.finish_row(!skipped);
+            self.cursors.finish_locked_row(at);
+            if !skipped {
+                return Ok(true);
             }
         }
     }

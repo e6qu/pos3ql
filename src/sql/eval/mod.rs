@@ -529,6 +529,14 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
 
+    /// Offers this scope's FROM items, then the enclosing queries' ones, to
+    /// a missing column's spelling suggestion.
+    fn suggest_columns(
+        &self,
+        _suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+    }
+
     /// The `plpgsql.variable_conflict` rule of the PL/pgSQL variable this
     /// scope or an enclosing one names `qualifier.name`, or None when no
     /// variable answers to it. A scope that puts a relation's columns in front
@@ -1214,6 +1222,13 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 /// A reference to a lookup is itself a lookup, so `&dyn ColumnLookup` can be
 /// passed to the generic `eval`/`where_passes` helpers.
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        (**self).suggest_columns(suggestion);
+    }
+
     fn procedural_variable(
         &self,
         qualifier: Option<&str>,
@@ -3897,9 +3912,29 @@ fn eval_binary_values<'a>(
         });
     }
     Ok(OperatorEvaluation {
-        value: binary(operator, l, r, left_unknown, right_unknown, arena)?,
+        value: binary(operator, l, r, left_unknown, right_unknown, arena).map_err(|error| {
+            unknown_operand_input_failure(error, [(left, left_unknown), (right, right_unknown)])
+        })?,
         first_argument: l,
     })
+}
+
+/// Positions the failed input of an unknown-type literal operand at the
+/// literal, as PostgreSQL's analysis coerces it to the operator's input type.
+fn unknown_operand_input_failure(error: SqlError, operands: [(&Expr<'_>, bool); 2]) -> SqlError {
+    for (operand, unknown) in operands {
+        if let (true, Expr::Str(text)) = (unknown, operand)
+            && error
+                .message
+                .as_str()
+                .strip_suffix('"')
+                .and_then(|message| message.strip_suffix(*text))
+                .is_some_and(|message| message.ends_with(": \""))
+        {
+            return crate::sql::error_position::at_subject(error, text);
+        }
+    }
+    error
 }
 
 fn materialize_acl_value<'a>(

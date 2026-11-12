@@ -4564,7 +4564,9 @@ fn build_def_with_likes(
             push_column(
                 &mut def,
                 &mut n,
-                build_column(column, storage, txid, arena)?,
+                crate::sql::error_position::with_analysis(|| {
+                    build_column(column, storage, txid, arena)
+                })?,
             )?;
             if let Some(name) = column.not_null_name {
                 def.set_not_null_constraint_name(n - 1, SqlName::parse(name)?);
@@ -4572,6 +4574,9 @@ fn build_def_with_likes(
         }
     }
     def.n_columns = n;
+    crate::sql::error_position::with_analysis(|| {
+        ddl::validate_generated_refs(&def, Some(statement.columns), storage, txid, arena)
+    })?;
     Ok(def)
 }
 
@@ -31069,6 +31074,11 @@ fn execute_trigger_step_in<'a>(
                                     services,
                                     arena,
                                     context.txn.txid,
+                                    matches!(
+                                        context.txn.isolation,
+                                        super::ast::TransactionIsolation::RepeatableRead
+                                            | super::ast::TransactionIsolation::Serializable
+                                    ),
                                     name,
                                     motion,
                                     statement.move_only,
@@ -31703,6 +31713,11 @@ fn execute_trigger_step_in<'a>(
                                         services,
                                         arena,
                                         context.txn.txid,
+                                        matches!(
+                                            context.txn.isolation,
+                                            super::ast::TransactionIsolation::RepeatableRead
+                                                | super::ast::TransactionIsolation::Serializable
+                                        ),
                                         name,
                                         *motion,
                                         false,
@@ -45248,6 +45263,7 @@ fn alter_view_inner(
                 Err(error) => return sql_fail(error),
             };
             let default = match ddl::resolve_default(
+                column,
                 Some(parsed),
                 Some(expression),
                 ctype,
@@ -45991,10 +46007,23 @@ impl RuleConditionColumns<'_> {
                 ),
             },
         };
-        Err(crate::sql::error_position::at_reference(
-            error,
-            qualifier.unwrap_or(name),
+        let mut suggestion = crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
+        self.suggest_rule_rows(&mut suggestion);
+        Err(crate::sql::error_position::with_column_suggestion(
+            crate::sql::error_position::at_reference(error, qualifier.unwrap_or(name)),
+            &suggestion,
         ))
+    }
+
+    /// The rule's OLD and NEW entries, in PostgreSQL's order, for a missing
+    /// column's spelling suggestion.
+    fn suggest_rule_rows(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        for row in ["old", "new"] {
+            suggestion.relation(row, self.names[..self.count].iter().copied());
+        }
     }
 
     /// PostgreSQL's check, after analysing one action, that it uses only the
@@ -46021,6 +46050,13 @@ impl RuleConditionColumns<'_> {
 }
 
 impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        self.suggest_rule_rows(suggestion);
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -79550,6 +79586,7 @@ fn alter_table_relation(
                 // A literal-only default folds to a constant; a call-bearing one
                 // is stored as text and evaluated per row — CREATE TABLE's path.
                 let default = match ddl::resolve_default(
+                    column,
                     Some(value),
                     Some(value_text),
                     ctype,
@@ -80411,8 +80448,9 @@ fn alter_table_relation(
     if let Err(error) = validate_partitioned_unique_keys(&new_def) {
         return sql_fail(error);
     }
-    if generated_changed
-        && let Err(error) = crate::sql::exec::ddl::validate_generated_refs(&new_def, arena)
+    if (generated_changed || added_any)
+        && let Err(error) =
+            crate::sql::exec::ddl::validate_generated_refs(&new_def, None, storage, txn.txid, arena)
     {
         return sql_fail(error);
     }

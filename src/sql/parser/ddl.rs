@@ -5516,7 +5516,15 @@ impl<'a> Parser<'a> {
                 let _ = self.expression(0)?;
                 let text = self.text[start..self.peek_at].trim_end();
                 self.expect_op(")")?;
-                self.expect_ident("stored")?;
+                if !self.eat_ident("stored")? {
+                    // PostgreSQL 18 makes VIRTUAL the default.
+                    let at = self.peek_at;
+                    let _ = self.eat_ident("virtual")?;
+                    let mut error =
+                        ParseError::new(at, "virtual generated columns are not supported");
+                    error.sqlstate = sqlstate::FEATURE_NOT_SUPPORTED;
+                    return Err(error);
+                }
                 return Ok(ColGen::Generated(text));
             }
             true

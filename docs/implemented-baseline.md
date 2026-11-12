@@ -236,6 +236,10 @@ INSERT INTO t VALUES (3);
 FETCH ALL FROM c;  -- includes 3
 ```
 
+A trigger can also `FETCH` from a session cursor declared `FOR UPDATE` or
+`FOR SHARE`: each fetched row is locked then, and a fetch that meets another
+transaction's lock waits for it without repeating or skipping a row.
+
 Rows the transaction changes after `DECLARE`, and later commits, stay
 invisible. Until its query has run, the cursor holds its snapshot in a
 statement snapshot slot; each server reserves `max_connections` ×

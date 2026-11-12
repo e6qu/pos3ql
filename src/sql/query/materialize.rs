@@ -405,6 +405,13 @@ fn materialized_value_at<'a>(
 /// and bare ungrouped references remain the same error.
 pub(crate) struct ScopeSchema<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        self.0.suggest_columns(suggestion);
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         crate::sql::exec::ColTypeResolver::column_meta(&super::ScopeCols(self.0), qualifier, name)
             .map_or(-1, |column| column.type_mod)

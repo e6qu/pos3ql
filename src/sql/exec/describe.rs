@@ -4095,10 +4095,16 @@ impl ColTypeResolver for DefCols<'_> {
         }
         match self.0.column_index(name) {
             Some(i) => Ok(self.0.columns()[i].ctype),
-            None => Err(sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "column \"{}\" does not exist",
-                name
+            None => Err(crate::sql::column_suggestion::from_relation(
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                ),
+                q,
+                name,
+                self.0.name.as_str(),
+                &self.0.columns()[..self.0.n_columns],
             )),
         }
     }
@@ -4206,18 +4212,27 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
         self.definition
             .column_index(name)
             .map(|index| self.definition.columns()[index].ctype)
-            .ok_or_else(|| match qualifier {
-                Some(qualifier) => sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column {}.{} does not exist",
+            .ok_or_else(|| {
+                let error = match qualifier {
+                    Some(qualifier) => sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column {}.{} does not exist",
+                        qualifier,
+                        name
+                    ),
+                    None => sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    ),
+                };
+                crate::sql::column_suggestion::from_relation(
+                    error,
                     qualifier,
-                    name
-                ),
-                None => sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
-                ),
+                    name,
+                    self.alias.unwrap_or(self.definition.name.as_str()),
+                    &self.definition.columns()[..self.definition.n_columns],
+                )
             })
     }
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {

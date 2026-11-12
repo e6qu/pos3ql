@@ -1416,9 +1416,9 @@ impl<'b> Responder<'b> {
         let count = i16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
         self.result_columns = count;
         let mut at = 2usize;
-        for column in 0..count {
+        for type_oid in &mut self.result_type_oids[..count] {
             let name_end = payload[at..].iter().position(|byte| *byte == 0).unwrap() + at + 1;
-            self.result_type_oids[column] =
+            *type_oid =
                 i32::from_be_bytes(payload[name_end + 6..name_end + 10].try_into().unwrap());
             at = name_end + 18;
         }
@@ -2358,9 +2358,11 @@ impl<'b> Responder<'b> {
                             m.u8(b'D');
                             m.cstr(detail.as_str());
                         }
-                        Some(crate::sql::error_position::AnalysisNote::Hint(hint))
-                            if analysis_hint.is_none()
-                                && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
+                        Some(
+                            crate::sql::error_position::AnalysisNote::Hint(hint)
+                            | crate::sql::error_position::AnalysisNote::Suggestion(hint),
+                        ) if analysis_hint.is_none()
+                            && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
                         {
                             m.u8(b'H');
                             m.cstr(hint.as_str());

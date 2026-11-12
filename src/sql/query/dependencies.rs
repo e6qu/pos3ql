@@ -3048,10 +3048,25 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                 .column_index(name)
                 .map(|index| definition.columns()[index].ctype)
                 .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column excluded.{} does not exist",
-                        name
+                    let mut suggestion =
+                        crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
+                    if let Some(scope) = self.scope {
+                        scope.suggest_columns(&mut suggestion);
+                    }
+                    suggestion.relation(
+                        "excluded",
+                        definition
+                            .columns()
+                            .iter()
+                            .map(|column| column.name.as_str()),
+                    );
+                    crate::sql::error_position::with_column_suggestion(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column excluded.{} does not exist",
+                            name
+                        ),
+                        &suggestion,
                     )
                 });
         }

@@ -1,0 +1,42 @@
+-- A missing column's error carries PostgreSQL's spelling suggestion: the
+-- closest column by Levenshtein distance among the FROM items of the query
+-- and the queries enclosing it, or two equally close ones, or none.
+create table t303 (abc int, xyz text, abe int);
+create table u303 (abc int, qqq int);
+select abd from t303;
+select abf from t303, u303;
+select t303.qqq from t303, u303;
+select tt.abc from t303 tt;
+select x.abc from t303 tt;
+select ab from t303;
+select xyy from t303;
+select xyy from t303 where abc = 1;
+select abc from t303 where xyy = 1;
+select (select xyy) from t303;
+select (select xyy from u303) from t303;
+select * from t303 where exists (select 1 from u303 where u303.qq = t303.abc);
+select * from t303 where exists (select 1 from u303 where qqx = t303.abc);
+select * from t303 join u303 on t303.abc = u303.qqx;
+select * from (select abc from t303) s where s.abd = 1;
+select * from (select abc from t303) where abd = 1;
+select * from t303, lateral (select xyy) s;
+select * from t303, (select xyz) s;
+select * from t303 t1 join u303 on t1.abc = u303.abc join t303 t2 on t2.xyy = 1;
+select qqq + 1 from t303;
+select abd from t303 group by abd;
+select abc from t303 order by xyy;
+update t303 set abc = 1 where xyy = 1;
+update t303 set abd = 1;
+delete from t303 where xyy = 1;
+insert into t303 (abd) values (1);
+select * from generate_series(1,2) g where g.gg = 1;
+select * from generate_series(1,2) g where gg = 1;
+select * from (values (1)) v where column2 = 1;
+select * from t303 natural join u303 where abcd = 1;
+select * from (t303 join u303 using (abc)) j where j.abd = 1;
+select * from t303 join u303 using (abd);
+with c as (select abc from t303) select abd from c;
+select "ABC" from t303;
+select xyz from t303 t1, t303 t2;
+select t1.xyy from t303 t1, t303 t2;
+select ab_ from t303;

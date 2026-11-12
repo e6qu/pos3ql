@@ -7747,8 +7747,9 @@ pub(crate) fn analyse_select<'a>(
     }
     let scope = QueryScope::resolve_schema(storage, from, txid, arena, outer)?;
     check_select_types(select, &scope, storage, txid, arena, outer)?;
-    check_select_constants(select, arena, storage, txid)?;
+    // Unknown literals convert during analysis, before constants fold.
     check_key_types(select, &scope, arena, storage, txid)?;
+    check_select_constants(select, arena, storage, txid)?;
     let schema = ScopeSchema(&scope);
     let row = Chained {
         inner: &schema,
@@ -8263,6 +8264,88 @@ pub(crate) fn check_literal_operands_typed<'a>(
             }
             Ok(())
         }
+        Expr::Call {
+            name: "nullif",
+            args: [left, right],
+            over: None,
+            ..
+        } => {
+            check_literal_operands_typed(left, infer, arena)?;
+            check_literal_operands_typed(right, infer, arena)?;
+            match (left, right) {
+                (Expr::Str(_), Expr::Str(_)) => Ok(()),
+                (Expr::Str(literal), other) => convert_operand(literal, other, &BinaryOp::Eq, true),
+                (other, Expr::Str(literal)) => {
+                    convert_operand(literal, other, &BinaryOp::Eq, false)
+                }
+                _ => Ok(()),
+            }
+        }
+        // An array constructor's unknown elements take its element type.
+        Expr::Array(items)
+            if items.iter().any(|item| matches!(item, Expr::Str(_)))
+                && items.iter().any(|item| !matches!(item, Expr::Str(_))) =>
+        {
+            match infer(expression) {
+                Some(ColType::Array(element)) => {
+                    convert_array_elements(expression, element.to_coltype(), infer, arena)
+                }
+                _ => walk_children(expression, &mut |child| {
+                    check_literal_operands_typed(child, infer, arena)
+                }),
+            }
+        }
+        // `ARRAY['1', 'x']::int[]` converts each unknown element to the
+        // element type, as PostgreSQL coerces the array constructor.
+        Expr::Cast {
+            operand: operand @ Expr::Array(_),
+            type_name,
+            ..
+        } => match ColType::from_sql_name(type_name) {
+            Some(ColType::Array(element)) => {
+                convert_array_elements(operand, element.to_coltype(), infer, arena)
+            }
+            _ => check_literal_operands_typed(operand, infer, arena),
+        },
+        // An unknown literal passed to a builtin function with one signature
+        // of that arity converts to its parameter's type, once the other
+        // arguments have that signature's types.
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::Routine,
+            name,
+            args,
+            argument_names: [],
+            variadic: false,
+            star: false,
+            over: None,
+            ..
+        } if args.iter().any(|argument| matches!(argument, Expr::Str(_))) => {
+            for argument in *args {
+                if !matches!(argument, Expr::Str(_)) {
+                    check_literal_operands_typed(argument, infer, arena)?;
+                }
+            }
+            let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+            let mut candidates = super::catalog::builtin_callable_signatures(name)
+                .filter(|signature| signature.arguments.len() == args.len());
+            let (Some(signature), None) = (candidates.next(), candidates.next()) else {
+                return Ok(());
+            };
+            if signature.variadic_element.is_some()
+                || args.iter().zip(signature.arguments).any(|(argument, oid)| {
+                    !matches!(argument, Expr::Str(_))
+                        && infer(argument).map(ColType::oid) != Some(*oid)
+                })
+            {
+                return Ok(());
+            }
+            for (argument, oid) in args.iter().zip(signature.arguments) {
+                if let Expr::Str(literal) = argument {
+                    convert_literal(literal, ColType::from_oid(*oid), arena)?;
+                }
+            }
+            Ok(())
+        }
         Expr::Case {
             operand: None,
             whens,
@@ -8293,6 +8376,27 @@ pub(crate) fn check_literal_operands_typed<'a>(
             check_literal_operands_typed(child, infer, arena)
         }),
     }
+}
+
+/// Converts the unknown literals of a (nested) array constructor to its
+/// element type.
+fn convert_array_elements<'a>(
+    constructor: &'a Expr<'a>,
+    element: ColType,
+    infer: &dyn Fn(&'a Expr<'a>) -> Option<ColType>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let Expr::Array(items) = constructor else {
+        return check_literal_operands_typed(constructor, infer, arena);
+    };
+    for item in *items {
+        match item {
+            Expr::Str(literal) => convert_literal(literal, Some(element), arena)?,
+            Expr::Array(_) => convert_array_elements(item, element, infer, arena)?,
+            item => check_literal_operands_typed(item, infer, arena)?,
+        }
+    }
+    Ok(())
 }
 
 /// Converts an unknown-type literal to the builtin type analysis gave it,
@@ -8365,6 +8469,26 @@ fn check_key_types<'a>(
         )
     {
         check_literal_operands(expression, scope, arena)?;
+    }
+    for key in statement.distinct_on {
+        check_literal_operands(key, scope, arena)?;
+    }
+    let mut window_literals = |spec: &'a crate::sql::ast::WindowSpec<'a>| {
+        for key in spec
+            .partition_by
+            .iter()
+            .copied()
+            .chain(spec.order_by.iter().map(|key| key.expression))
+        {
+            check_literal_operands(key, scope, arena)?;
+        }
+        Ok(())
+    };
+    for spec in statement.windows {
+        window_literals(spec)?;
+    }
+    for expression in select_window_owners(statement) {
+        for_each_inline_window(expression, &mut window_literals)?;
     }
     let noncomparable = |e: &Expr<'a>| {
         infer_scope_type(e, scope)
@@ -10083,9 +10207,6 @@ fn check_select_types<'a>(
         check(w)?;
         check_where_type(w, columns, storage, txid, arena)?;
     }
-    for g in statement.group_by {
-        check(g)?;
-    }
     if let Some(h) = statement.having {
         check(h)?;
     }
@@ -10099,7 +10220,71 @@ fn check_select_types<'a>(
             txid,
         )?)?;
     }
+    for g in statement.group_by {
+        check(g)?;
+    }
+    for key in statement.distinct_on {
+        check(resolve_order_target(
+            key,
+            statement.items,
+            scope,
+            arena,
+            storage,
+            txid,
+        )?)?;
+    }
+    // PostgreSQL analyses window definitions last: the WINDOW clause's, then
+    // each inline OVER (...) as the select list and ORDER BY reach it.
+    for spec in statement.windows {
+        check_window_spec(spec, &check)?;
+    }
+    for expression in select_window_owners(statement) {
+        for_each_inline_window(expression, &mut |spec| check_window_spec(spec, &check))?;
+    }
     Ok(())
+}
+
+/// The expressions of a query that may hold window function calls.
+fn select_window_owners<'s, 'a>(
+    statement: &'s Select<'a>,
+) -> impl Iterator<Item = &'a Expr<'a>> + 's {
+    statement
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .chain(statement.order_by.iter().map(|key| key.expression))
+}
+
+fn check_window_spec<'a>(
+    spec: &'a crate::sql::ast::WindowSpec<'a>,
+    check: &dyn Fn(&'a Expr<'a>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    for key in spec.partition_by {
+        check(key)?;
+    }
+    for key in spec.order_by {
+        check(key.expression)?;
+    }
+    Ok(())
+}
+
+/// Visits every `OVER (...)` written in `expression`, outside subqueries.
+fn for_each_inline_window<'a>(
+    expression: &'a Expr<'a>,
+    visit: &mut dyn FnMut(&'a crate::sql::ast::WindowSpec<'a>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    if let Expr::Call {
+        over: Some(spec), ..
+    } = expression
+    {
+        visit(spec)?;
+    }
+    walk_children(expression, &mut |child| {
+        for_each_inline_window(child, visit)
+    })
 }
 
 /// Surfaces plan-time constant errors (e.g. `1/0`) across every expression
@@ -10153,8 +10338,28 @@ pub fn check_select_constants<'a>(
     for ob in statement.order_by {
         super::eval::check_constant_errors(ob.expression, arena, Some(&catalog))?;
     }
+    for key in statement.distinct_on {
+        super::eval::check_constant_errors(key, arena, Some(&catalog))?;
+    }
     for bound in [statement.limit, statement.offset].into_iter().flatten() {
         super::eval::check_constant_errors(bound, arena, Some(&catalog))?;
+    }
+    let mut window_constants = |spec: &crate::sql::ast::WindowSpec<'a>| {
+        for key in spec
+            .partition_by
+            .iter()
+            .copied()
+            .chain(spec.order_by.iter().map(|key| key.expression))
+        {
+            super::eval::check_constant_errors(key, arena, Some(&catalog))?;
+        }
+        Ok(())
+    };
+    for spec in statement.windows {
+        window_constants(spec)?;
+    }
+    for expression in select_window_owners(statement) {
+        for_each_inline_window(expression, &mut window_constants)?;
     }
     Ok(())
 }
@@ -14437,6 +14642,15 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
                     super::exec::ColTypeResolver::resolve(outer, qualifier, name)
                 })
                 .unwrap_or(Err(error))
+                .map_err(|error| {
+                    let mut suggestion =
+                        crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
+                    self.scope.suggest_columns(&mut suggestion);
+                    if let Some(outer) = self.outer {
+                        outer.suggest_columns(&mut suggestion);
+                    }
+                    crate::sql::error_position::with_column_suggestion(error, &suggestion)
+                })
             }
             Err(error) => Err(error),
         }

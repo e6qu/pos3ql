@@ -115,10 +115,13 @@ pub(crate) struct Annotation {
 pub(crate) enum AnalysisNote {
     Detail(crate::util::StackStr<NOTE_BYTES>),
     Hint(crate::util::StackStr<NOTE_BYTES>),
+    /// A missing column's spelling suggestion: a later search over more
+    /// enclosing queries replaces it.
+    Suggestion(crate::util::StackStr<NOTE_BYTES>),
 }
 
 /// Two quoted identifiers of `NAMEDATALEN - 1` bytes plus the wording.
-const NOTE_BYTES: usize = 2 * crate::sql::lexer::MAX_IDENTIFIER_BYTES + 128;
+pub(crate) const NOTE_BYTES: usize = 2 * crate::sql::lexer::MAX_IDENTIFIER_BYTES + 128;
 
 /// Attaches a computed DETAIL to `error`.
 pub(crate) fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> SqlError {
@@ -128,6 +131,42 @@ pub(crate) fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> 
 /// Attaches a computed HINT to `error`.
 pub(crate) fn with_computed_hint(error: SqlError, hint: core::fmt::Arguments<'_>) -> SqlError {
     note(error, AnalysisNote::Hint(note_text(hint)))
+}
+
+/// Attaches PostgreSQL's spelling suggestion for a missing column to
+/// `error`, replacing an earlier suggestion; an explanation already attached
+/// (why an existing column is out of reach) stays.
+pub(crate) fn with_column_suggestion(
+    error: SqlError,
+    suggestion: &crate::sql::column_suggestion::ColumnSuggestion<'_>,
+) -> SqlError {
+    if error.sqlstate.as_str() != crate::sql::eval::sqlstate::UNDEFINED_COLUMN
+        || error.sqlstate.internal_control().is_some()
+    {
+        return error;
+    }
+    let message_hash = message_hash(&error.message);
+    PENDING.with(|pending| {
+        let known = pending
+            .get()
+            .filter(|known| known.sqlstate == error.sqlstate && known.message_hash == message_hash);
+        if known.is_some_and(|known| {
+            matches!(
+                known.note,
+                Some(AnalysisNote::Detail(_) | AnalysisNote::Hint(_))
+            ) || known.hint.is_some()
+        }) {
+            return;
+        }
+        pending.set(Some(Pending {
+            sqlstate: error.sqlstate,
+            message_hash,
+            position: known.and_then(|known| known.position),
+            hint: None,
+            note: suggestion.hint().map(AnalysisNote::Suggestion),
+        }))
+    });
+    error
 }
 
 fn note_text(text: core::fmt::Arguments<'_>) -> crate::util::StackStr<NOTE_BYTES> {

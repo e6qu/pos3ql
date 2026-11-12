@@ -675,6 +675,19 @@ fn target_hint(error: SqlError, table: &str, qualifier: Option<&str>, name: &str
 }
 
 impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        // The FROM items before the derived table are in the enclosing
+        // query already, reachable or not.
+        self.siblings
+            .suggest_columns_before(self.preceding, suggestion);
+        if let Some(enclosing) = self.enclosing {
+            enclosing.suggest_columns(suggestion);
+        }
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         if self.sibling_column(qualifier, name) {
             return super::ScopeSchema(self.siblings).lookup(qualifier, name);
@@ -879,6 +892,13 @@ struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
 pub(crate) struct OuterColumnTypes<'s, 'row>(pub(crate) &'s dyn ColumnLookup<'row>);
 
 impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        self.0.suggest_columns(suggestion);
+    }
+
     fn whole_row_field_metadata(
         &self,
         table: &str,
@@ -934,6 +954,13 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        self.0.suggest_columns(suggestion);
+    }
+
     fn whole_row_field_metadata(
         &self,
         table: &str,
@@ -3324,7 +3351,80 @@ impl<'d> QueryScope<'d> {
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
         self.find_column_unpositioned(qualifier, name)
-            .map_err(|error| crate::sql::error_position::column_reference(error, qualifier, name))
+            .map_err(|error| {
+                let mut suggestion =
+                    crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
+                self.suggest_columns(&mut suggestion);
+                crate::sql::error_position::with_column_suggestion(
+                    crate::sql::error_position::column_reference(error, qualifier, name),
+                    &suggestion,
+                )
+            })
+    }
+
+    /// Offers every FROM item, a parenthesized join through its members, to
+    /// a missing column's spelling suggestion.
+    pub(crate) fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        self.suggest_columns_before(self.n, suggestion);
+    }
+
+    /// [`Self::suggest_columns`] for the first `end` FROM items.
+    pub(crate) fn suggest_columns_before(
+        &self,
+        end: usize,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        for table in 0..end.min(self.n) {
+            let Some(definition) = self.defs.get(table) else {
+                continue;
+            };
+            let mut members = self
+                .members
+                .iter()
+                .filter(|member| member.table == table)
+                .peekable();
+            if let Some((_, origins)) = self
+                .hidden_origins
+                .iter()
+                .find(|(entry, _)| *entry == table)
+            {
+                // An aliased parenthesized join: PostgreSQL searches the
+                // tables inside it, each with the merged USING columns.
+                let names = |member: &'d str| {
+                    origins
+                        .iter()
+                        .enumerate()
+                        .filter(move |(_, origin)| origin.is_none_or(|origin| origin == member))
+                        .map(|(column, _)| self.defs.column_name(table, column))
+                };
+                for (index, origin) in origins.iter().enumerate() {
+                    if let Some(member) = origin
+                        && !origins[..index].contains(&Some(member))
+                    {
+                        suggestion.relation(member, names(member));
+                    }
+                }
+                continue;
+            }
+            if members.peek().is_none() {
+                suggestion.relation(
+                    self.names[table],
+                    (0..definition.n_columns).map(|column| self.defs.column_name(table, column)),
+                );
+                continue;
+            }
+            for member in members {
+                suggestion.relation(
+                    member.name,
+                    definition.columns[member.first..member.first + member.n_columns]
+                        .iter()
+                        .map(|column| column.name.as_str()),
+                );
+            }
+        }
     }
 
     fn find_column_unpositioned(

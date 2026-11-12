@@ -127,8 +127,9 @@ is owned.
   synchronously: a step's foreign key check that waited resumed the step at a
   completion position past its last row and then waited again without a new
   GET, a loop the download bound does not see. A data-modifying `WITH`
-  sub-statement's `AFTER` events fire with the main statement's, after them
-  when the sub-statement ran first; PostgreSQL runs a referenced
+  sub-statement's `AFTER` events fire at the end of the whole statement,
+  before the main statement's own because the sub-statement runs first;
+  PostgreSQL runs a referenced
   sub-statement as the main statement reads its rows (their events
   interleave) and an unreferenced one after the main statement, last one
   first. Matching that order needs sub-statements that run as their rows are

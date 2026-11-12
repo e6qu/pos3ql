@@ -15447,9 +15447,9 @@ mod tests {
                     definition: (&definition).into(),
                 }
             ));
-            assert_eq!(current.readable()[0], 17);
+            assert_eq!(current.readable()[0], TABLE_DEF_PAYLOAD_VERSION);
             assert!(decode_table_payload(current.readable()).is_some());
-            for version in (0..17).chain(core::iter::once(u8::MAX)) {
+            for version in (0..TABLE_DEF_PAYLOAD_VERSION).chain(core::iter::once(u8::MAX)) {
                 incompatible.clear();
                 assert!(incompatible.append(&[version]));
                 assert!(incompatible.append(&current.readable()[1..]));

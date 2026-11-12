@@ -6,7 +6,7 @@ use crate::sql::types::ColType;
 use crate::util::StackStr;
 
 mod expression_copy;
-pub(crate) use expression_copy::duplicate_expression;
+pub(crate) use expression_copy::{duplicate_expression, map_expression};
 
 /// A normalized PostgreSQL configuration parameter identity.  Configuration
 /// parameters are not SQL objects: they may be dotted and their spelling is

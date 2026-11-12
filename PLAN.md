@@ -111,7 +111,9 @@ is owned.
   - More retained shapes, by the
     [retained plan tree design](docs/architecture.md#retained-plan-tree):
     index-probed joins, RIGHT and FULL joins, grouping sets,
-    subqueries, set operations other than `UNION ALL` (and `UNION ALL` under
+    subqueries other than the simple FROM subqueries merged into their query
+    (scalar, `IN`/`EXISTS`, grouped or bounded derived tables, CTE scans),
+    set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs
     with a run reader per stream; a large ordered `SELECT` there still
@@ -129,11 +131,6 @@ is owned.
     over a join, or ordered by such an expression, locks its rows at `DECLARE`.
     Cursors over retained joins already read as they fetch; declared cursors
     do not yet use the retained sort.
-  - A simple-Query, unpaged or `COPY` `UNION ALL` stream reopens only after
-    the general executor's attempt overflowed, and that attempt materializes
-    every query first, so the result is computed twice. Opening it before
-    running, as paged portals do, needs the command snapshot taken without
-    running the statement.
   - Scrollable cursors whose revisited rows are evaluated again (volatile
     output or filter), ordered scrollable cursors and held cursors still save
     their history in `cursor_bytes`. A scrollable cursor moving back rereads
@@ -355,7 +352,9 @@ found when the function runs. An error raised while PostgreSQL inlines a SQL fun
 variable could win. PostgreSQL fixes a function's `plpgsql.variable_conflict`
 when its creating session validates it at `CREATE FUNCTION`; pos3ql reads it
 at the backend's first call. A function-qualified parameter (`f.a` in function `f`)
-fails as a missing FROM-clause entry, and PL/pgSQL `INSERT`, `UPDATE` and
+fails as a missing FROM-clause entry, as does a subquery in FROM that reads a
+column of an enclosing query (`EXISTS (SELECT 1 FROM (SELECT 10 / t.x) s)`,
+which PostgreSQL evaluates per outer row), and PL/pgSQL `INSERT`, `UPDATE` and
 `DELETE ... RETURNING ... INTO` fail with a syntax error at `INTO`. A constant compared
 with a column inside a subquery (`SELECT (SELECT a FROM t WHERE a = 'q')`) is
 checked only when a row is compared, so an empty table returns NULL where

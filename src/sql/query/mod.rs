@@ -87,6 +87,7 @@ pub(crate) use type_inputs::{
     capture_contextual_type_inputs, visit_planner_calls, visit_planner_expression,
 };
 pub(super) mod predicate_safety;
+mod pullup;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
@@ -7760,10 +7761,23 @@ fn resolve_group_ordinals<'a>(
         }
         Ok(())
     };
+    // A bare name that no FROM column answers names an output column, as
+    // PostgreSQL's findTargetlistEntrySQL92 allows for GROUP BY.
+    let output_name = |grouping: &Expr<'_>| match grouping {
+        Expr::Column {
+            qualifier: None,
+            name,
+        } => scope.is_none_or(|scope| {
+            matches!(scope.find_column(None, name),
+                Err(error) if error.sqlstate == sqlstate::UNDEFINED_COLUMN)
+                && scope.table_index(name).is_err()
+        }),
+        _ => false,
+    };
     let has_ordinals = statement
         .group_by
         .iter()
-        .any(|grouping| matches!(grouping, Expr::Int(_)));
+        .any(|grouping| matches!(grouping, Expr::Int(_)) || output_name(grouping));
     let resolved: &[&Expr] = if has_ordinals {
         let resolved = arena
             .alloc_slice_with(statement.group_by.len(), |_| &Expr::Null)
@@ -7779,6 +7793,12 @@ fn resolve_group_ordinals<'a>(
                     txid,
                     "GROUP BY",
                 )?,
+                _ if output_name(grouping) => {
+                    super::exec::resolve_output_name(grouping, statement.items, "GROUP BY")
+                        .map_err(|error| {
+                            crate::sql::error_position::at_expression(error, grouping)
+                        })?
+                }
                 _ => grouping,
             };
         }
@@ -9718,7 +9738,9 @@ pub(crate) fn select_query_resumable<'a>(
     statement_arena: Option<&Arena>,
     responder: &mut Responder,
 ) -> Outcome {
-    let statement = match expand_select_record_calls(statement, storage, txid, arena, None) {
+    let statement = match expand_select_record_calls(statement, storage, txid, arena, None)
+        .and_then(|statement| pullup::pull_up_subqueries(statement, storage, txid, arena, None))
+    {
         Ok(statement) => statement,
         Err(error) => return sql_fail(error),
     };
@@ -11108,6 +11130,7 @@ fn select_into_rows_mode<'a>(
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     let statement = expand_select_record_calls(statement, storage, txid, arena, outer)?;
+    let statement = pullup::pull_up_subqueries(statement, storage, txid, arena, outer)?;
     let bound_catalog = storage_catalog(storage, arena, txid);
     let bound_queries = ProceduralSubqueries { storage, txid };
     let bound_hooks = crate::sql::eval::EvalHooks {

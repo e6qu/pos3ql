@@ -107,7 +107,8 @@ stream sorts itself (local mode), or a **retained grouping** of such a
 source (`GROUP BY`, `HAVING`, aggregates and plain `DISTINCT`, below), or
 `DISTINCT ON` the stream sorts (local mode), or a `UNION ALL` of such
 queries without its own `ORDER BY` (below);
-without grouping sets, other set operations, subqueries, CTEs, row locking or row security, whose read position (one
+without grouping sets, other set operations, subqueries (a simple subquery in
+FROM is merged into its query first, below), CTEs, row locking or row security, whose read position (one
 record per resident row of each table plus the query text) fits
 `result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins
 whose `ON`/`USING` conditions are scalar, non-volatile and call no
@@ -224,6 +225,28 @@ resumes. The filter, projection and limit at the top run in the statement
 driver itself, so a routine call there hands off on its row; a filter under a
 sort or grouping runs as that node reads its input
 (`src/sql/query/retained/tree.rs`).
+
+**Subqueries in FROM.** Before a query is planned, each simple subquery in its
+FROM clause is merged into it, as PostgreSQL's `pull_up_subqueries` does: the
+subquery's FROM items join the outer query in its place, its `WHERE` joins the
+outer restrictions, and every reference to one of its output columns
+becomes that column's expression. So `SELECT * FROM (SELECT 10/x AS q, x FROM
+t) s WHERE x <> 0` filters before it divides, and an output column nothing
+reads is never computed. A subquery is merged only when that is exact: no
+grouping, aggregates, window functions, `DISTINCT`, `ORDER BY`, `LIMIT`,
+locking, set-returning or volatile output, security-barrier view, or name the
+merge could rebind. Under an outer join that can null its rows it merges only
+without a `WHERE` (which would otherwise run per joined pair) and when each
+output it substitutes is null whenever its columns are (PostgreSQL substitutes
+those without a placeholder). A view merges when the caller holds `SELECT` on all of it.
+`USING` and `NATURAL` joins of the outer query are first spelled out as `ON`
+joins. A subquery that stays in place receives each outer `WHERE` conjunct
+that reads only its columns, under the view-filter safety rules (no bounds,
+volatile, window or `DISTINCT ON` hazards); and every query moves `HAVING`
+conjuncts without aggregates, volatile calls or subqueries into `WHERE`, so
+they filter rows before aggregation. This happens in the general executor and
+in stream admission alike, so a merged derived table streams like the query it
+became (`src/sql/query/pullup.rs`).
 
 Every other shape runs in the general executor, which materializes in the
 statement arena and cannot pause after its first byte. New node kinds are the
@@ -359,10 +382,10 @@ no routine body; its values are coerced to the combined column types (as the
 general executor coerces them) before the row goes up. The physical tables
 of all queries together are limited to eight, as a retained join's are. A
 `LIMIT` or `OFFSET` on the whole `UNION ALL` applies to the combined rows.
-A paged portal opens it before running; a simple Query, unpaged Execute or
-`COPY` first runs the general executor's attempt, which materializes every
-query (in external runs in object-store mode) before its first row can
-overflow, so such a result is computed twice.
+Every protocol opens it before running (a simple Query, an unpaged or paged
+Execute and `COPY`), since the general executor's attempt would materialize
+every query before its first row could overflow; a result that small still
+streams, and one without a free stream slot spools for `capacity`.
 
 **Built: sorts in local mode.** At its first row a sort reads its whole input
 (yielding on storage waits with the rows saved so far kept), filters it, and

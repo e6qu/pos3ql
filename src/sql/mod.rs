@@ -11992,8 +11992,21 @@ impl Engine {
                     cursors,
                     responder,
                 );
+                // A stream opened before its statement runs reads under this
+                // statement's snapshot, taken here as an extended Execute
+                // takes it before running. If it cannot be taken, the
+                // statement runs instead and reports why where it would.
+                let mut _stream_snapshot = None;
+                if fetch_stream.is_none() && responder.stream_requested() && plan_owner.is_ok() {
+                    match self.begin_command_snapshot(txn, true, true, true, false) {
+                        Ok(snapshot) => _stream_snapshot = Some(snapshot),
+                        Err(_) => {
+                            responder.decline_promotion(crate::pg::respond::SpoolReason::Shape)
+                        }
+                    }
+                }
                 let executed = match plan_owner {
-                    // A streamed FETCH or paged portal evaluates its rows
+                    // A streamed FETCH or early stream evaluates its rows
                     // only in the stream.
                     Ok(_) if fetch_stream.is_some() || responder.stream_requested() => {
                         Err(WireFull)

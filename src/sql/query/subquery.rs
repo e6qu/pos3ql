@@ -368,6 +368,7 @@ fn external_list_subquery<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryList<'a>, SqlError> {
+    let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -515,6 +516,7 @@ fn streaming_scalar_subquery<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
+    let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -609,6 +611,7 @@ fn streaming_array_subquery<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
+    let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -1505,6 +1508,7 @@ fn subquery_exists<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<bool, SqlError> {
+    let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -3030,6 +3034,7 @@ fn run_row_subquery<'a>(
     row_arity: usize,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
+    let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -3069,6 +3074,7 @@ fn run_subquery<'a>(
     row_arity: usize,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
+    let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,

@@ -770,7 +770,8 @@ fn joins_stream_rows_as_the_client_reads() {
             "{sql}"
         );
         // The same statement through the general executor returns the same
-        // rows: compare every column.
+        // rows: compare every column. OFFSET 0 keeps the subquery from
+        // merging into a query that would stream again.
         let mut streamed: Vec<Vec<Option<Vec<u8>>>> = response
             .iter()
             .filter(|message| message.0 == b'D')
@@ -781,7 +782,7 @@ fn joins_stream_rows_as_the_client_reads() {
             &mut other,
             &mut fixture.engine,
             &mut other_client,
-            &format!("SELECT * FROM ({sql}) q ORDER BY 1"),
+            &format!("SELECT * FROM ({sql} OFFSET 0) q ORDER BY 1"),
         );
         let general: Vec<Vec<Option<Vec<u8>>>> = messages(&general)
             .iter()
@@ -1022,11 +1023,12 @@ fn builds_that_outgrow_plan_build_bytes_spool_instead() {
             "{sql}"
         );
         let mut rows = data_rows(&response);
+        // OFFSET 0 keeps the subquery in place, in the general executor.
         let general = run(
             &mut other,
             &mut fixture.engine,
             &mut other_client,
-            &format!("SELECT * FROM ({sql}) q"),
+            &format!("SELECT * FROM ({sql} OFFSET 0) q"),
         );
         let mut general = data_rows(&messages(&general));
         if sql != sorted {

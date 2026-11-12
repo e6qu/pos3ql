@@ -8,7 +8,7 @@
 //! scan machinery can resolve against, which is what is synthesized here.
 
 use crate::mem::arena::{Arena, ArenaList, ArenaString};
-use crate::sql::ast::{Expr, Select, SelectItem, TableRef};
+use crate::sql::ast::{Expr, Select, SelectItem, SetTree, TableRef};
 use crate::sql::eval::{ColumnLookup, EvalHooks, ProjectSetValue, SqlError, eval_full, sqlstate};
 use crate::sql::exec::MAX_PROJ;
 
@@ -2309,6 +2309,81 @@ pub(super) fn preserve_projection_type_identities(
     Ok(())
 }
 
+/// A record column of a set operation has the field shape of its leftmost
+/// query's expression, as PostgreSQL resolves `(u.tail).f1` through the
+/// first query's target list.
+fn register_set_record_shapes<'a>(
+    storage: &Storage,
+    tree: &SetTree<'_>,
+    txid: u32,
+    arena: &'a Arena,
+    descriptors: &mut [ColDesc<'a>],
+) -> Result<(), SqlError> {
+    let mut leaf = tree;
+    while let SetTree::Op { left, .. } = leaf {
+        leaf = left;
+    }
+    let SetTree::Select(leaf) = leaf else {
+        unreachable!("set tree leaf");
+    };
+    if leaf.set_body.is_some()
+        || !descriptors
+            .iter()
+            .any(|column| column.type_oid == crate::sql::types::oid::RECORD)
+    {
+        return Ok(());
+    }
+    let scope = leaf
+        .from
+        .as_ref()
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, None))
+        .transpose()?;
+    let scoped = scope.as_ref().map(|scope| super::CatalogScopeCols {
+        scope,
+        outer_scope: None,
+        storage,
+        txid,
+        arena,
+    });
+    let fromless = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let columns: &dyn crate::sql::exec::ColTypeResolver = match scoped.as_ref() {
+        Some(columns) => columns,
+        None => &fromless,
+    };
+    let mut slot = 0usize;
+    for item in leaf.items {
+        match item {
+            SelectItem::Wildcard => slot += scope.as_ref().map_or(0, QueryScope::star_columns),
+            SelectItem::TableWildcard(name) => {
+                if let Some(scope) = scope.as_ref() {
+                    slot += scope.qualified_star_columns(name)?;
+                }
+            }
+            SelectItem::RecordStar(base) => {
+                slot += record_star_width(base, scope.as_ref(), storage, txid, arena)?;
+            }
+            SelectItem::Expr { expression, .. } => {
+                if let Some(column) = descriptors.get_mut(slot)
+                    && column.type_oid == crate::sql::types::oid::RECORD
+                    && let Some(handle) =
+                        crate::sql::exec::register_shape_for(expression, columns, arena)?
+                {
+                    column.type_mod = handle;
+                }
+                slot += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Describes a derived table without retaining a maximum-width arena image.
 /// FROM-less LATERAL projections use the preceding tables' column types.
 pub(crate) fn describe_derived_definition<'a>(
@@ -2335,16 +2410,20 @@ pub(crate) fn describe_derived_definition<'a>(
     let mut type_oids = [0_i32; MAX_PROJ];
     let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
     let n_cols = match sub.set_body {
-        Some(tree) => describe_set_body(
-            storage,
-            tree,
-            txid,
-            &mut descriptors,
-            arena,
-            Some(&mut type_oids),
-            crate::sql::exec::DescriptionTarget::Sql,
-            None,
-        )?,
+        Some(tree) => {
+            let n = describe_set_body(
+                storage,
+                tree,
+                txid,
+                &mut descriptors,
+                arena,
+                Some(&mut type_oids),
+                crate::sql::exec::DescriptionTarget::Sql,
+                None,
+            )?;
+            register_set_record_shapes(storage, tree, txid, arena, &mut descriptors[..n])?;
+            n
+        }
         None => match &sub.from {
             Some(f) => {
                 let ss = QueryScope::resolve_schema(storage, f, txid, arena, outer_columns)?;

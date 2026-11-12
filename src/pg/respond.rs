@@ -801,6 +801,12 @@ impl<'b> Responder<'b> {
         }
     }
 
+    /// Rows only: the cursor already holds this result's description.
+    pub(crate) fn without_row_description(mut self) -> Self {
+        self.suppress_row_description = true;
+        self
+    }
+
     /// Describe on a portal: RowDescription is emitted with the portal's
     /// result-format codes so the client decodes DataRows correctly.
     pub fn for_describe(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {

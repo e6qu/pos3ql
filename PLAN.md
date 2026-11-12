@@ -286,10 +286,12 @@ constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` repor
 `INSERT has more target columns than expressions` without its position; other
 target and expression count errors are positioned. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL
-does. Remaining: `OPEN ... FOR` a query with data-modifying `WITH` queries
-fails with `0A000` (the cursor reruns its query at each `FETCH` and cannot
-keep the written rows); and a PL/pgSQL write with `WITH` queries whose nested
-AFTER trigger waits fails with `0A000` instead of resuming. A `LATERAL` item on the right of
+does; a cursor's query with data-modifying `WITH` queries runs at its first
+read. Remaining: a PL/pgSQL write with `WITH` queries whose nested AFTER
+trigger waits fails with `0A000` instead of resuming; and a data-modifying
+`WITH` query runs whole before the main query reads it, so a trigger's or
+called function's notices arrive in a different order than PostgreSQL's
+interleaved execution. A `LATERAL` item on the right of
 a `RIGHT` or `FULL` join that reads only FROM items outside that join
 (`SELECT * FROM b, a RIGHT JOIN LATERAL (SELECT b.y) s ON true`) fails with
 `0A000` where PostgreSQL accepts it. A derived table computes output

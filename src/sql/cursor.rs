@@ -143,6 +143,20 @@ pub(crate) struct CursorInfo<'a> {
     pub created_at: i64,
 }
 
+/// A cursor whose query has data-modifying `WITH` queries runs that query
+/// whole when it is first read, as PostgreSQL fills such a portal's store.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteFill {
+    /// The query streams, or already ran when the cursor opened.
+    None,
+    /// Opened and described; nothing has read it yet.
+    Pending,
+    /// Its query is running and has its row storage.
+    Running,
+    /// Its rows are stored and its query is released.
+    Done,
+}
+
 struct CursorSlot {
     active: bool,
     plan_generation: Option<core::num::NonZeroU64>,
@@ -168,6 +182,7 @@ struct CursorSlot {
     scan: Option<ScrollScan>,
     /// A held scroll cursor is saving its rows at commit.
     holding: bool,
+    write_fill: WriteFill,
     locking: RowLocking,
     /// Logical input rows before the first saved row of the current fetch.
     row_base: usize,
@@ -564,6 +579,7 @@ impl CursorPool {
                 spans: RowIndex::new(row_capacity),
                 scan: None,
                 holding: false,
+                write_fill: WriteFill::None,
                 locking: RowLocking::default(),
                 row_base: 0,
                 produced: 0,
@@ -670,6 +686,7 @@ impl CursorPool {
         slot.produced = 0;
         slot.request = None;
         slot.position = 0;
+        slot.write_fill = WriteFill::None;
         Ok(at)
     }
 
@@ -831,6 +848,9 @@ impl CursorPool {
                 CursorScroll::NoScroll
             };
         }
+        if slot.query.writes() {
+            slot.write_fill = WriteFill::Pending;
+        }
         slot.scan = slot
             .query
             .retained
@@ -869,6 +889,68 @@ impl CursorPool {
             FetchMotion::BackwardZero => slot.position.max(0) as usize,
         };
         Ok(Some((at, needed)))
+    }
+
+    /// The open cursor `name` whose writing query has not run yet.
+    pub(crate) fn pending_write_fill(&self, name: &str) -> Result<Option<usize>, SqlError> {
+        let Some(at) = self.find(name) else {
+            return Ok(None);
+        };
+        let slot = &self.slots[at];
+        slot.require_runnable()?;
+        match slot.write_fill {
+            WriteFill::Pending => Ok(Some(at)),
+            WriteFill::Running => Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "portal \"{}\" cannot be run",
+                slot.name.as_str()
+            )),
+            WriteFill::None | WriteFill::Done => Ok(None),
+        }
+    }
+
+    /// Lends the row storage of a pending writing cursor to the run that
+    /// fills it, with its query parsed again into `arena`.
+    pub(crate) fn begin_write_fill<'w>(
+        &mut self,
+        at: usize,
+        arena: &'w Arena,
+    ) -> Result<(query::ReparsedQuery<'w>, FixedBuf, FixedBuf), SqlError> {
+        let slot = &mut self.slots[at];
+        let query = slot.query.reparse_into(arena)?;
+        slot.write_fill = WriteFill::Running;
+        slot.reset_rows();
+        let description = core::mem::replace(&mut slot.description, FixedBuf::detached());
+        let rows = core::mem::replace(&mut slot.rows, FixedBuf::detached());
+        Ok((query, description, rows))
+    }
+
+    /// Returns lent storage. When `filled`, the rows become the cursor's
+    /// whole result and its query is released; otherwise the cursor waits to
+    /// run again.
+    pub(crate) fn end_write_fill(
+        &mut self,
+        at: usize,
+        description: FixedBuf,
+        rows: FixedBuf,
+        filled: bool,
+    ) -> Result<(), SqlError> {
+        let slot = &mut self.slots[at];
+        slot.description = description;
+        slot.rows = rows;
+        if !filled {
+            slot.reset_rows();
+            slot.write_fill = WriteFill::Pending;
+            return Ok(());
+        }
+        let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
+        let columns = description_type_oids(slot.description.readable(), &mut types)?;
+        seal_rows(&slot.rows, columns, &mut slot.spans)?;
+        slot.produced = slot.spans.len();
+        slot.row_base = 0;
+        slot.query.finish_source();
+        slot.write_fill = WriteFill::Done;
+        Ok(())
     }
 
     pub(crate) fn produced_rows(&self, at: usize) -> usize {

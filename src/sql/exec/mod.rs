@@ -19489,23 +19489,6 @@ fn finish_plpgsql_dml_ctes<'a>(
     )
 }
 
-/// A cursor reruns its query from saved text at each FETCH, so it cannot
-/// keep the rows of `WITH` queries that write when it opens.
-fn reject_writing_cursor_query(statement: &Stmt<'_>) -> Result<(), SqlError> {
-    let with = match statement {
-        Stmt::Select(select) => select.with,
-        Stmt::SetQuery(query) => query.with,
-        _ => &[],
-    };
-    if with.iter().any(|cte| cte.dml.is_some()) {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "OPEN of a query with data-modifying WITH queries is not supported"
-        ));
-    }
-    Ok(())
-}
-
 /// The first identifier in `source` naming `target` (its label when
 /// qualified), after the top-level `keyword` when one is given.
 fn plpgsql_target_text<'s>(
@@ -29704,7 +29687,6 @@ fn execute_trigger_step_in<'a>(
                                         },
                                     )?;
                                 }
-                                reject_writing_cursor_query(parsed)?;
                                 match parsed {
                                     Stmt::Select(_) | Stmt::SetQuery(_) => (
                                         source,
@@ -29734,7 +29716,6 @@ fn execute_trigger_step_in<'a>(
                                     DynamicCommandKind::Cursor,
                                 )?;
                                 let bound = resolve_plpgsql_dynamic_prepared(context, bound)?;
-                                reject_writing_cursor_query(bound.statement)?;
                                 if !matches!(bound.statement, Stmt::Select(_) | Stmt::SetQuery(_)) {
                                     return Err(sql_err!(
                                         sqlstate::SYNTAX_ERROR,
@@ -29852,7 +29833,7 @@ fn execute_trigger_step_in<'a>(
                         ));
                     };
                     let arena = context.arena;
-                    let (count, rows) = {
+                    let fetch = |context: &mut TriggerExecContext<'_, '_, '_>| {
                         let PlpgsqlExecHost::Routine {
                             engine,
                             cursors,
@@ -29880,12 +29861,25 @@ fn execute_trigger_step_in<'a>(
                                 responder: context.responder,
                             },
                         )?;
-                        *completed = true;
                         let rows = arena
                             .alloc_slice_copy(cursors.emitted())
                             .map_err(|_| super::query::arena_full_pub())?;
-                        (count, rows)
+                        Ok((count, rows))
                     };
+                    // A query with data-modifying WITH queries runs on its
+                    // first read, in a new command as PostgreSQL runs it.
+                    let fills = match &context.host {
+                        PlpgsqlExecHost::Routine { cursors, .. } => {
+                            cursors.pending_write_fill(name)?.is_some()
+                        }
+                        PlpgsqlExecHost::Atomic { .. } => false,
+                    };
+                    let (count, rows) = if fills {
+                        in_new_plpgsql_command(context, fetch)?
+                    } else {
+                        fetch(context)?
+                    };
+                    *completed = true;
                     if !statement.move_only {
                         if count > 1 {
                             return Err(sql_err!(
@@ -29931,14 +29925,8 @@ fn execute_trigger_step_in<'a>(
                             }
                             count
                         };
-                        if !record_target && column_count != statement.targets.len() {
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "cursor returned {} columns but FETCH INTO expects {}",
-                                column_count,
-                                statement.targets.len()
-                            ));
-                        }
+                        // As with SELECT INTO, extra columns are ignored and
+                        // missing ones leave their targets NULL.
                         let mut values = [Datum::Null; MAX_COLUMNS];
                         let mut decoded = [Datum::Null; MAX_COLUMNS];
                         if let Some(row) = rows.first().copied() {

@@ -1622,6 +1622,10 @@ restart_p3_fresh || exit 1
 echo "=== exact-error corpora (message wording must match) ==="
 for f in "$EXT"/differential_exact/*.sql; do
   n=$(basename "$f" .sql)
+  # Each fixture starts from an empty catalog on both servers, so objects a
+  # fixture leaves behind neither fill the fixed budgets nor show up in a
+  # later fixture's catalog queries.
+  reset_corpus_pair
   run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f" verbose || exit 1
   run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f" verbose || exit 1
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "exact errors: $n"

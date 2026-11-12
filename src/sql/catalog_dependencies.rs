@@ -1455,7 +1455,9 @@ fn stored_column_number(
                 .table_def(usize::from(dependency.slot), txid)
                 .attribute_number(column),
         ),
-        crate::storage::DependencyClass::View => column as i32 + 1,
+        crate::storage::DependencyClass::View | crate::storage::DependencyClass::Sequence => {
+            column as i32 + 1
+        }
         _ => unreachable!("only relation dependencies contain column positions"),
     }
 }

@@ -9,7 +9,7 @@
 //! into SSTs, so it is versioned by the column count against the schema.
 
 use crate::sql::eval::{SqlError, sqlstate};
-use crate::sql::types::{ColType, Datum, EnumMemberId};
+use crate::sql::types::{ColType, Datum, EnumMemberId, PseudoType};
 use crate::sql_err;
 
 /// PostgreSQL 18's transient tuple/target-list boundary
@@ -413,6 +413,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         }
         ColType::Text
         | ColType::Refcursor
+        | ColType::Pseudo(PseudoType::Cstring)
         | ColType::AclItem
         | ColType::Name
         | ColType::Varchar
@@ -521,9 +522,20 @@ pub(crate) fn decode<'a>(
         // int2/float4/varchar/bpchar share the byte layout of their storage
         // type (int4/float8/text), so they decode through the same arm.
         match schema[i] {
-            ColType::Void | ColType::Internal | ColType::PgDdlCommand | ColType::Pseudo(_) => {
-                return Err(corrupt());
-            }
+            // `cstring` decodes as text below: it occurs only inside transient
+            // `cstring[]` values, never as a stored column.
+            ColType::Void | ColType::Internal | ColType::PgDdlCommand => return Err(corrupt()),
+            ColType::Pseudo(
+                PseudoType::Any
+                | PseudoType::Trigger
+                | PseudoType::EventTrigger
+                | PseudoType::LanguageHandler
+                | PseudoType::FdwHandler
+                | PseudoType::IndexAmHandler
+                | PseudoType::TableAmHandler
+                | PseudoType::TsmHandler
+                | PseudoType::Unknown,
+            ) => return Err(corrupt()),
             ColType::Int2Vector | ColType::OidVector => {
                 let length = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let len = u32::from_le_bytes(length.try_into().unwrap()) as usize;
@@ -751,6 +763,7 @@ pub(crate) fn decode<'a>(
             }
             ColType::Text
             | ColType::Refcursor
+            | ColType::Pseudo(PseudoType::Cstring)
             | ColType::Varchar
             | ColType::Bpchar
             | ColType::Name => {

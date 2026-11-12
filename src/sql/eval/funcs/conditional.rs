@@ -127,6 +127,19 @@ pub(crate) fn dispatch<'a>(
                 let mut widest = 0u8;
                 let (common, declared) =
                     super::array::common_argument_type(args, arena, row, hooks)?;
+                // PostgreSQL looks up the common type's btree comparison
+                // before evaluating anything; arrays find theirs and fail per
+                // element when compared.
+                if let Some(common) = common
+                    && !matches!(common, ColType::Array(_))
+                    && !common.has_builtin_ordering()
+                {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "could not identify a comparison function for type {}",
+                        common.name()
+                    ));
+                }
                 for (a, declared) in args.iter().zip(declared) {
                     if let Some(t) = static_type(a, row) {
                         widest = widest.max(static_rank(t));

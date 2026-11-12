@@ -660,6 +660,24 @@ pub(crate) fn expression_type_identity<'a>(
     {
         return Ok(ExpressionTypeIdentity::Known(type_oid));
     }
+    // A field of a NULL row-typed variable has its declared field type.
+    if let Expr::Column {
+        qualifier: Some(variable),
+        name,
+    } = expression
+        && let Some(ColType::Composite(creation)) = row.col_type(None, variable)
+        && let Some(catalog) = hooks.catalog
+    {
+        let mut found = None;
+        catalog.visit_composite_fields(creation, &mut |field, meta| {
+            if field == *name && found.is_none() {
+                found = Some(meta.type_oid);
+            }
+        });
+        if let Some(type_oid) = found {
+            return Ok(ExpressionTypeIdentity::Known(type_oid));
+        }
+    }
     if let Expr::Column { qualifier, name } = expression
         && let Some(identity) = row.column_user_type(*qualifier, name)
     {
@@ -3314,7 +3332,8 @@ fn validate_enum_operator_types<'a>(
 }
 
 /// `cstring` has no operators of its own: PostgreSQL only concatenates it
-/// with text through `anytextcat`, so `'a'::cstring = 'a'::cstring` and
+/// with text through `anytextcat` and with `cstring[]` through the array
+/// operators, so `'a'::cstring = 'a'::cstring` and
 /// `'a'::cstring || 1` fail with `42883`.
 fn validate_cstring_operator_types<'a>(
     operator: &str,
@@ -3325,13 +3344,17 @@ fn validate_cstring_operator_types<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<(), SqlError> {
     use super::types::oid;
-    // Only casts and calls produce `cstring`; other operands skip the lookup.
+    // Only casts, calls and array constructors produce `cstring` or
+    // `cstring[]`; other operands skip the lookup.
     let may_be_cstring = |expression: &Expr<'_>| match expression {
-        Expr::Cast { type_name, .. } => {
-            ColType::from_sql_name(type_name)
-                == Some(ColType::Pseudo(super::types::PseudoType::Cstring))
-        }
-        Expr::Call { .. } => true,
+        Expr::Cast { type_name, .. } => matches!(
+            ColType::from_sql_name(type_name),
+            Some(
+                ColType::Pseudo(super::types::PseudoType::Cstring)
+                    | ColType::Array(super::types::ArrElem::Cstring)
+            )
+        ),
+        Expr::Call { .. } | Expr::Array(_) => true,
         _ => false,
     };
     if !may_be_cstring(left) && !may_be_cstring(right) {
@@ -3339,6 +3362,31 @@ fn validate_cstring_operator_types<'a>(
     }
     let left_type = expression_type_identity(left, row, hooks)?.routine_argument_oid();
     let right_type = expression_type_identity(right, row, hooks)?.routine_argument_oid();
+    let name = |type_oid: i32| {
+        if type_oid == oid::UNKNOWN {
+            "unknown"
+        } else {
+            ColType::from_oid(type_oid).map_or("unknown", ColType::name)
+        }
+    };
+    // `cstring[]` concatenates only with `cstring` elements and arrays; its
+    // comparisons fail per element when they run.
+    if concatenation && (left_type == oid::CSTRING_ARRAY || right_type == oid::CSTRING_ARRAY) {
+        let other = if left_type == oid::CSTRING_ARRAY {
+            right_type
+        } else {
+            left_type
+        };
+        if matches!(other, oid::CSTRING | oid::CSTRING_ARRAY | oid::UNKNOWN) {
+            return Ok(());
+        }
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} || {}",
+            name(left_type),
+            name(right_type)
+        ));
+    }
     if left_type != oid::CSTRING && right_type != oid::CSTRING {
         return Ok(());
     }
@@ -3347,21 +3395,15 @@ fn validate_cstring_operator_types<'a>(
     } else {
         left_type
     };
+    // `cstring[] || cstring` appends through `anycompatiblearray`.
     if concatenation
         && matches!(
             other,
-            oid::TEXT | oid::UNKNOWN | oid::VARCHAR | oid::BPCHAR | oid::NAME
+            oid::TEXT | oid::UNKNOWN | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::CSTRING_ARRAY
         )
     {
         return Ok(());
     }
-    let name = |type_oid: i32| {
-        if type_oid == oid::UNKNOWN {
-            "unknown"
-        } else {
-            ColType::from_oid(type_oid).map_or("unknown", ColType::name)
-        }
-    };
     Err(sql_err!(
         sqlstate::UNDEFINED_FUNCTION,
         "operator does not exist: {} {} {}",
@@ -3444,7 +3486,7 @@ fn require_builtin_operator_execute<'a>(
 }
 
 /// The fields of a `ROW(...)` or `(a, b)` constructor.
-fn row_constructor_fields<'a>(expression: &Expr<'a>) -> Option<&'a [&'a Expr<'a>]> {
+pub(crate) fn row_constructor_fields<'a>(expression: &Expr<'a>) -> Option<&'a [&'a Expr<'a>]> {
     match expression {
         Expr::Call {
             kind: super::ast::CallKind::SqlSyntax,
@@ -4714,11 +4756,48 @@ fn eval_full_inner<'a>(
             if let Some(ColType::Pseudo(kind)) = target_type {
                 return pseudo_type_cast(kind, v, source_identity()?.routine_argument_oid(), arena);
             }
-            if source_identity()?.routine_argument_oid() == super::types::oid::CSTRING
-                && !matches!(
-                    target_type,
-                    Some(ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name)
+            // `cstring` converts only to the string types, element by element
+            // for arrays; an array constructor converts each `cstring` item.
+            let accepts_cstring = |target: Option<ColType>| {
+                matches!(
+                    target,
+                    Some(
+                        ColType::Text
+                            | ColType::Varchar
+                            | ColType::Bpchar
+                            | ColType::Name
+                            | ColType::Pseudo(super::types::PseudoType::Cstring)
+                    )
                 )
+            };
+            if let (Expr::Array(items), Some(element)) = (operand, constructor_element)
+                && !accepts_cstring(Some(element.to_coltype()))
+            {
+                for item in *items {
+                    if matches!(item, Expr::Cast { .. } | Expr::Call { .. })
+                        && expression_type_identity(item, row, hooks)?.routine_argument_oid()
+                            == super::types::oid::CSTRING
+                    {
+                        return Err(sql_err!(
+                            sqlstate::CANNOT_COERCE,
+                            "cannot cast type cstring to {}",
+                            element.to_coltype().name()
+                        ));
+                    }
+                }
+            }
+            if let Some(ColType::Array(element)) = target_type
+                && !accepts_cstring(Some(element.to_coltype()))
+                && source_identity()?.routine_argument_oid() == super::types::oid::CSTRING_ARRAY
+            {
+                return Err(sql_err!(
+                    sqlstate::CANNOT_COERCE,
+                    "cannot cast type cstring[] to {}",
+                    ColType::Array(element).name()
+                ));
+            }
+            if source_identity()?.routine_argument_oid() == super::types::oid::CSTRING
+                && !accepts_cstring(target_type)
             {
                 let error = match target_type {
                     Some(target) => sql_err!(
@@ -10317,6 +10396,21 @@ fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
         (Datum::Array { element: left, .. }, Datum::Array { element: right, .. }) => {
             super::types::common_array_element(*left, *right).map_err(|_| invalid())?
         }
+        // A `cstring` element is text-shaped; operator resolution admitted it.
+        (
+            Datum::Array {
+                element: ArrElem::Cstring,
+                ..
+            },
+            Datum::Text(_),
+        )
+        | (
+            Datum::Text(_),
+            Datum::Array {
+                element: ArrElem::Cstring,
+                ..
+            },
+        ) => ArrElem::Cstring,
         (Datum::Array { element, .. }, scalar) | (scalar, Datum::Array { element, .. }) => {
             match ArrElem::from_datum(scalar) {
                 Some(scalar) => {
@@ -11666,6 +11760,136 @@ fn division_by_zero() -> SqlError {
 /// [`type_mismatch`] for callers outside this module (table-function args).
 /// Assigning through an array subscript (`SET a[1] = 9`) is not implemented;
 /// it must not fall through to jsonb subscripting.
+/// `base[i][j] := value` for an array base (`__jsonb_subscript_set` with an
+/// array first argument): PostgreSQL's `array_set_element`. A NULL or empty
+/// base becomes an array holding only the value at the given subscripts; a
+/// one-dimensional array grows to the subscript, padding with NULLs; a
+/// multidimensional array only replaces an existing element. Returns `None`
+/// when the base is not an array.
+pub(crate) fn assign_array_element<'a>(
+    args: &[&'a Expr<'a>],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<Datum<'a>>, SqlError> {
+    let declared =
+        ColType::from_oid(expression_type_identity(args[0], row, hooks)?.routine_argument_oid());
+    if let Some(declared) = declared
+        && !matches!(
+            declared,
+            ColType::Array(_) | ColType::Jsonb | ColType::Geometry(_)
+        )
+    {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "cannot subscript type {} because it does not support subscripting",
+            declared.name()
+        ));
+    }
+    let base = eval_full(args[0], arena, params, row, hooks)?;
+    let (element, raw) = match (base, declared) {
+        (Datum::Array { element, raw }, _) => (element, Some(raw)),
+        (Datum::Null, Some(ColType::Array(element))) => (element, None),
+        _ => return Ok(None),
+    };
+    let subscripts = &args[2..];
+    if subscripts.len() > super::array::MAX_DIMENSIONS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "number of array dimensions ({}) exceeds the maximum allowed ({})",
+            subscripts.len(),
+            super::array::MAX_DIMENSIONS
+        ));
+    }
+    let mut indexes = [0i32; super::array::MAX_DIMENSIONS];
+    for (slot, expression) in indexes.iter_mut().zip(subscripts) {
+        *slot = match eval_full(expression, arena, params, row, hooks)? {
+            Datum::Int2(index) => i32::from(index),
+            Datum::Int4(index) => index,
+            Datum::Int8(index) => i32::try_from(index)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range"))?,
+            Datum::Null => {
+                return Err(sql_err!(
+                    sqlstate::NULL_VALUE_NOT_ALLOWED,
+                    "array subscript in assignment must not be null"
+                ));
+            }
+            other => return Err(type_mismatch("array subscript must be integer", &other)),
+        };
+    }
+    let indexes = &indexes[..subscripts.len()];
+    let value = eval_full(args[1], arena, params, row, hooks)?;
+    let value = if value.is_null() || ArrElem::from_datum(&value) == Some(element) {
+        value
+    } else {
+        match element {
+            ArrElem::Enum(_) | ArrElem::Composite(_) | ArrElem::Domain { .. } | ArrElem::Record => {
+                return Err(array_element_assignment_unsupported());
+            }
+            _ => cast_to(value, element.to_coltype(), arena)?,
+        }
+    };
+    let shape = raw.map_or_else(super::array::Shape::empty, |raw| {
+        super::array::shape(raw).expect("array datum invariant")
+    });
+    if shape.dimension_count() == 0 {
+        let dimensions = [1usize; super::array::MAX_DIMENSIONS];
+        let shape = super::array::Shape::new(&dimensions[..indexes.len()], indexes)?;
+        let raw = super::array::build_shaped(core::slice::from_ref(&value), shape, arena)?;
+        return Ok(Some(Datum::Array { element, raw }));
+    }
+    let raw = raw.expect("a shaped array has a datum");
+    if indexes.len() != shape.dimension_count() {
+        return Err(sql_err!(
+            sqlstate::ARRAY_SUBSCRIPT_ERROR,
+            "wrong number of array subscripts"
+        ));
+    }
+    let lower = shape.lower_bound(0).expect("dimension exists");
+    let length = shape.dimension(0).expect("dimension exists") as i64;
+    if indexes.len() == 1 {
+        let index = i64::from(indexes[0]);
+        let (lower, upper) = (i64::from(lower), i64::from(lower) + length - 1);
+        let new_lower = lower.min(index);
+        let new_upper = upper.max(index);
+        let count = usize::try_from(new_upper - new_lower + 1).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "array size exceeds the maximum allowed"
+            )
+        })?;
+        let items = super::array::alloc_items(arena, count)?;
+        for (offset, old) in super::array::elements(raw, element).enumerate() {
+            items[(lower + offset as i64 - new_lower) as usize] = old;
+        }
+        items[(index - new_lower) as usize] = value;
+        let shape = super::array::Shape::new(&[count], &[new_lower as i32])?;
+        let raw = super::array::build_shaped(items, shape, arena)?;
+        return Ok(Some(Datum::Array { element, raw }));
+    }
+    let mut position = 0usize;
+    for (dimension, index) in indexes.iter().enumerate() {
+        let lower = shape.lower_bound(dimension).expect("dimension exists");
+        let length = shape.dimension(dimension).expect("dimension exists");
+        let offset = i64::from(*index) - i64::from(lower);
+        if offset < 0 || offset >= length as i64 {
+            return Err(sql_err!(
+                sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                "array subscript out of range"
+            ));
+        }
+        position = position * length + offset as usize;
+    }
+    let items = super::array::alloc_items(arena, shape.element_count())?;
+    for (slot, old) in items.iter_mut().zip(super::array::elements(raw, element)) {
+        *slot = old;
+    }
+    items[position] = value;
+    let raw = super::array::build_shaped(items, shape, arena)?;
+    Ok(Some(Datum::Array { element, raw }))
+}
+
 pub(crate) fn array_element_assignment_unsupported() -> SqlError {
     sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,

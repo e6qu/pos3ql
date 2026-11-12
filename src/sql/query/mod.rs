@@ -7709,6 +7709,14 @@ fn check_key_types<'a>(
             _ => None,
         });
     require_select_routine_execute(statement, scope, arena, storage, txid)?;
+    let scope_type = |e: &Expr<'a>| {
+        infer_scope_type(e, scope)
+            .ok()
+            .and_then(|(oid, _)| ColType::from_oid(oid))
+    };
+    for expression in aggregate_bearing_expressions(statement) {
+        check_aggregate_key_types(expression, &scope_type)?;
+    }
     let catalog = storage_catalog(storage, arena, txid);
     for key in statement
         .group_by
@@ -7783,6 +7791,61 @@ fn check_key_types<'a>(
         }
     }
     Ok(())
+}
+
+/// An aggregate's `DISTINCT` arguments and `ORDER BY` keys need their types'
+/// default equality and ordering, exactly as a statement's keys do.
+fn check_aggregate_key_types<'a>(
+    expression: &'a Expr<'a>,
+    type_of: &dyn Fn(&Expr<'a>) -> Option<ColType>,
+) -> Result<(), SqlError> {
+    if let Expr::Call {
+        distinct,
+        args,
+        order_by,
+        over: None,
+        ..
+    } = expression
+    {
+        for argument in args.iter().filter(|_| *distinct) {
+            if let Some(ctype) = type_of(argument).filter(|ctype| !ctype.has_default_equality()) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "could not identify an equality operator for type {}",
+                    ctype.name()
+                ));
+            }
+        }
+        for order in *order_by {
+            if let Some(ctype) =
+                type_of(order.expression).filter(|ctype| !ctype.has_builtin_ordering())
+            {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "could not identify an ordering operator for type {}",
+                    ctype.name()
+                ));
+            }
+        }
+    }
+    walk_children(expression, &mut |child| {
+        check_aggregate_key_types(child, type_of)
+    })
+}
+
+/// The expressions of one query level that can hold aggregate calls.
+fn aggregate_bearing_expressions<'a>(
+    statement: &'a Select<'a>,
+) -> impl Iterator<Item = &'a Expr<'a>> {
+    statement
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .chain(statement.having)
+        .chain(statement.order_by.iter().map(|order| order.expression))
 }
 
 /// `GROUP BY <n>` names the *n*th select-list column, exactly as `ORDER BY <n>`
@@ -8400,15 +8463,9 @@ pub fn and_where<'a>(
 /// Rejects pseudo-type view outputs after the query-descriptor boundary.
 pub fn validate_view_columns(columns: &[ColDesc<'_>]) -> Result<(), SqlError> {
     for column in columns {
-        if matches!(
-            column.type_oid,
-            super::types::oid::RECORD | super::types::oid::RECORD_ARRAY
-        ) {
-            let type_name = if column.type_oid == super::types::oid::RECORD {
-                "record"
-            } else {
-                "record[]"
-            };
+        if let Some(type_name) =
+            ColType::from_oid(column.type_oid).and_then(ColType::rejected_column_pseudo_type)
+        {
             return Err(sql_err!(
                 sqlstate::INVALID_TABLE_DEFINITION,
                 "column \"{}\" has pseudo-type {}",
@@ -10497,6 +10554,16 @@ pub(crate) fn constant_select_resumable<'a>(
     if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
     }
+    let constant_type = |e: &Expr| {
+        super::exec::infer_type_res(e, &resolved_columns)
+            .ok()
+            .and_then(|(oid, _)| ColType::from_oid(oid))
+    };
+    for expression in aggregate_bearing_expressions(statement) {
+        if let Err(e) = check_aggregate_key_types(expression, &constant_type) {
+            return sql_fail(e);
+        }
+    }
     // DISTINCT compares whole rows with each type's default equality.
     if statement.distinct
         && statement.distinct_on.is_empty()
@@ -10793,6 +10860,24 @@ pub(crate) fn constant_select_resumable<'a>(
             return sql_fail(sql_err!(
                 sqlstate::INVALID_COLUMN_REFERENCE,
                 "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+            ));
+        }
+    }
+    // Sorting one row still needs each key type's ordering operator.
+    for (j, ob) in statement.order_by.iter().enumerate() {
+        let key_type = match order_item[j] {
+            Some(column) => columns.get(column).map(|column| column.type_oid),
+            None => super::exec::infer_type_res(ob.expression, &resolved_columns)
+                .ok()
+                .map(|(type_oid, _)| type_oid),
+        };
+        if let Some(ctype) = key_type.and_then(ColType::from_oid)
+            && !ctype.has_builtin_ordering()
+        {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "could not identify an ordering operator for type {}",
+                ctype.name()
             ));
         }
     }

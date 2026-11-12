@@ -269,10 +269,11 @@ Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: renaming or moving a
 built-in function fails with `0A000` where PostgreSQL changes the catalog
 entry (every built-in name lookup must consult a renamed or moved row);
-arrays of `cstring` (`ARRAY['a'::cstring]`, `'{a}'::cstring[]`) fail with
-`0A000`, and `SELECT DISTINCT`, `ORDER BY`, `IN` and `GREATEST` over
-`cstring` values succeed where PostgreSQL reports that `cstring` has no
-equality or ordering operator; `pg_type` lists all 473
+`x IN (SELECT c ...)` and `x = ANY (SELECT c ...)` over a `cstring` column
+`c` succeed where PostgreSQL reports `operator does not exist: cstring =
+cstring` (the subquery list carries a value witness, which has no `cstring`
+form, rather than the column's type), and the type-modifier input functions
+(`numerictypmodin(cstring[])`) fail with `0A000`; `pg_type` lists all 473
 `pg_catalog` types but of `information_schema`'s 148 only its domains and their
 arrays (the row types of its views, whose OIDs initdb assigns after importing
 the platform's collations, need the pinned reference image); a
@@ -321,7 +322,9 @@ cut short. The scanner does not read Unicode-escape literals (`U&'\0041'`,
 `U&"\0041"`, `UESCAPE`), so `SELECT U&'\0041'` fails as an unknown column
 `u`, and an identifier longer than 63 bytes is rejected (`name ... is longer
 than 63 bytes`) where PostgreSQL truncates it with a `NOTICE`. Assigning to an
-array element or slice (`UPDATE t SET a[1] = 9`) fails with `0A000`. A slice
+array slice (`UPDATE t SET a[1:2] = '{3,4}'`, `x[1:2] := ...` in PL/pgSQL)
+fails (`42601` in `UPDATE`, `0A000` in PL/pgSQL); element assignment
+(`a[5] = 1`, `r.f[1] := x`) works. A slice
 followed by an index (`a[1:1][1]`) indexes the slice where PostgreSQL treats the
 whole list as a slice, and a subscripted scalar subquery is named `?column?`
 where PostgreSQL names it after the subquery's column.
@@ -335,12 +338,9 @@ reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
 PL/pgSQL `CALL` in a trigger function fails with `0A000`, and a procedure
 called from PL/pgSQL that waits for storage or a lock runs again from its
 start when its statement resumes (finished effects replay from the statement
-journal) instead of resuming at a saved position inside the procedure. A view
-dropped by the cascade of a function, sequence, collation, operator, text
-search object or type (`DROP FUNCTION f CASCADE` where view `v` calls `f`)
-fails with `0A000` while another table's column, a composite attribute or a
-domain uses the view's row type; PostgreSQL drops those users too. A
-subscripted field assignment in PL/pgSQL (`r.f[1] := x`) fails with `0A000`.
+journal) instead of resuming at a saved position inside the procedure.
+`pg_typeof(r.f)` of a field of an unassigned row-typed PL/pgSQL variable fails
+with `42P01` where PostgreSQL reports the field's declared type.
 `ALTER COLUMN ... TYPE` is refused for columns that a
 view, rule, trigger `WHEN` condition, policy or SQL-standard routine body
 reads or a stored `INSERT` or `UPDATE` writes (including a materialized
@@ -357,10 +357,7 @@ that walk, so a cascade lists its objects in the order the statement drops
 them (`DROP TABLE t CASCADE` lists a view over a materialized view of `t`
 before the materialized view) where PostgreSQL follows the walk; the walk's
 objects would have to be described before they are dropped, into a fixed
-per-statement buffer; `pg_depend` still lacks PostgreSQL's rows for types named only inside
-expressions (a cast to a domain in a default or routine body) and the
-column-level rows of views that read a sequence (`SELECT last_value FROM sq`
-depends on `column last_value of sequence sq`). `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
+per-statement buffer. `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
 `_RETURN` rules, at OID `reltype + 1`, and `pg_settings_u`/`pg_settings_n`),
 and `ALTER VIEW` and `ALTER MATERIALIZED VIEW` accept only their own actions,
 so `ALTER VIEW v DISABLE RULE r` fails with `42601` where PostgreSQL reports

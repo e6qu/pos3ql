@@ -131,15 +131,11 @@ Row types:
 - While a column uses the row type, `ALTER TABLE orders ADD COLUMN ... DEFAULT`
   and `ALTER COLUMN ... TYPE` fail with `0A000` as in PostgreSQL, and `ALTER
   COLUMN ... TYPE` also fails while a view, rule, policy or SQL-standard routine
-  body reads the column. `DROP TABLE` and `DROP VIEW` with `CASCADE` drop
-  other tables' columns and domains of the dropped relation's row type.
-  Dropping a relation through `DROP SCHEMA ... CASCADE`, `DROP MATERIALIZED
-  VIEW`, `DROP FOREIGN TABLE ... CASCADE` or the cascade of another object
-  (`DROP FUNCTION`) while another schema's column or domain uses its row type
-  fails with `0A000` instead of dropping that column or domain.
-- A composite type attribute of a relation's row type (`CREATE TYPE wrap AS
-  (o orders)`) fails with `42704`, and a PL/pgSQL variable of a relation's row
-  type with `0A000`.
+  body reads the column. Every drop with `CASCADE` that removes a relation,
+  including the cascade of another object (`DROP FUNCTION f CASCADE` where
+  view `v` calls `f`, `DROP SCHEMA`, `DROP OWNED`), also drops other tables'
+  columns, composite type attributes (`CREATE TYPE wrap AS (o orders)`) and
+  domains of the relation's row type, as PostgreSQL does.
 
 Functions and expressions:
 
@@ -249,9 +245,18 @@ Functions and expressions:
   `name_column::cstring` and `'abc'::unknown` are values of those types, as in
   PostgreSQL, and a cast to `"any"` keeps its operand; other sources fail
   with `42846` (`cannot cast type integer to cstring`). A `cstring` only
-  concatenates with text (`'a'::cstring || 'b'` is `ab`); comparing or
-  matching it (`'a'::cstring = 'a'`) fails with `42883`. Limits: renaming or
-  moving a built-in fails with `0A000`; `cstring` arrays fail with `0A000`.
+  concatenates with text (`'a'::cstring || 'b'` is `ab`) and with `cstring[]`;
+  comparing or matching it (`'a'::cstring = 'a'`), sorting, grouping or
+  removing duplicates over it (`SELECT DISTINCT`, `ORDER BY`, `count(DISTINCT
+  ...)`), `IN` lists and `GREATEST`/`LEAST` fail with PostgreSQL's `42883`
+  messages. `cstring[]` values (`'{a,b}'::cstring[]`, `ARRAY['a'::cstring]`,
+  `'{a}'::_cstring`) work with the array functions that need no element
+  comparison, and a SQL routine may take or return one; a table or view
+  column of either type fails with `42P16`. Limits: renaming or moving a
+  built-in fails with `0A000`; `x IN (SELECT c ...)` and `x = ANY (SELECT c
+  ...)` over a `cstring` column `c` are accepted where PostgreSQL reports
+  `42883`; the type-modifier input functions (`numerictypmodin`) fail with
+  `0A000`.
   Dropping a built-in fails with `2BP01`, as in PostgreSQL.
 - PostgreSQL 18.6's predefined roles exist from the start, with their
   OIDs, and initdb's memberships of `pg_monitor` in `pg_read_all_settings`,
@@ -324,6 +329,11 @@ Functions and expressions:
   `'missing'::text::order_status` converts only when run.
 - `aclitem[]` must be one-dimensional (`22023`, `ACL arrays must be
   one-dimensional`); `aclexplode(NULL)` returns no rows.
+- Assigning an array element (`UPDATE t SET a[5] = 1`, `x[2][1] := 8` or a
+  record field's element `r.f[1] := 3` in PL/pgSQL) works as in PostgreSQL: a
+  one-dimensional array grows to the subscript and fills the gap with NULLs,
+  a NULL array becomes `[5:5]={1}`, and a multidimensional array fails with
+  `2202E` outside its bounds. Assigning a slice (`a[1:2] = ...`) fails.
 - Point coordinates use `(point(1,2))[0]`. Converting an open path to a polygon
   fails with `22023`.
 - An unmatched PL/pgSQL `CASE` without `ELSE` raises `20000` (`case not found`,

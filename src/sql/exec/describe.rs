@@ -1666,6 +1666,10 @@ fn cast_target_name(type_name: &str) -> Option<&str> {
             .map(ColType::internal_name)
             .or_else(|| type_name.trim_end_matches("[]").rsplit('.').next());
     }
+    // An array type written by its `pg_type` name (`_int4`) keeps that name.
+    if let Some(ColType::Array(_)) = ColType::from_sql_name(type_name) {
+        return type_name.rsplit('.').next();
+    }
     ColType::from_sql_name(type_name)
         .map(ColType::internal_name)
         .or_else(|| type_name.rsplit('.').next())
@@ -4390,6 +4394,26 @@ fn comparable(a: ColType, b: ColType) -> bool {
         || (stringy(a) && stringy(b))
 }
 
+/// An untyped literal compared with a type that has no comparison operators
+/// (`json`, `refcursor`, `cstring`) finds no operator to adopt a type from:
+/// PostgreSQL reports `json = unknown`.
+fn untyped_comparison_undefined(left: i32, operator: &str, right: i32) -> Option<SqlError> {
+    let typed = match (left, right) {
+        (oid::UNKNOWN, oid::UNKNOWN) => return None,
+        (oid::UNKNOWN, typed) | (typed, oid::UNKNOWN) => coltype_of_oid(typed)?,
+        _ => return None,
+    };
+    if matches!(typed, ColType::Array(_)) || typed.has_builtin_equality() {
+        return None;
+    }
+    let unknown = ColType::Pseudo(crate::sql::types::PseudoType::Unknown);
+    Some(if left == oid::UNKNOWN {
+        operator_undefined(unknown, operator, typed)
+    } else {
+        operator_undefined(typed, operator, unknown)
+    })
+}
+
 fn operator_undefined(l: ColType, operator: &str, r: ColType) -> SqlError {
     use core::fmt::Write;
     let mut left = crate::util::StackStr::<64>::new();
@@ -4683,6 +4707,11 @@ pub(crate) fn builtin_binary_type(
     let is_bit = |o: i32| matches!(o, oid::BIT | oid::VARBIT);
     Ok(match operator {
         Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+            if let Some(error) =
+                untyped_comparison_undefined(lo, operator.operator_name().unwrap_or("?"), ro)
+            {
+                return Err(error);
+            }
             // Unknown coerces; two concrete types must be comparable.
             if lo != oid::UNKNOWN
                 && ro != oid::UNKNOWN
@@ -5327,6 +5356,23 @@ pub fn infer_type_res(
             use crate::sql::ast::BinaryOp::*;
             let lo = infer_type_res(left, columns)?.0;
             let ro = infer_type_res(right, columns)?.0;
+            // PostgreSQL compares two row constructors field by field, each
+            // pair through its own operator.
+            if matches!(operator, Eq | NotEq | Lt | LtEq | Gt | GtEq)
+                && let (Some(left_fields), Some(right_fields)) = (
+                    crate::sql::eval::row_constructor_fields(left),
+                    crate::sql::eval::row_constructor_fields(right),
+                )
+                && left_fields.len() == right_fields.len()
+            {
+                for (left, right) in left_fields.iter().zip(right_fields.iter()) {
+                    builtin_binary_type(
+                        operator,
+                        infer_type_res(left, columns)?.0,
+                        infer_type_res(right, columns)?.0,
+                    )?;
+                }
+            }
             if let Some(result) = operator.operator_name().and_then(|name| {
                 crate::sql::eval::funcs::geometry::operator_result(name, &[lo, ro])
             }) {
@@ -5439,7 +5485,8 @@ pub fn infer_type_res(
         }
         Expr::IsNull { .. } => of(ColType::Bool),
         Expr::InList { operand, list, .. } => {
-            let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
+            let left_oid = infer_type_res(operand, columns)?.0;
+            let left = coltype_of_oid(left_oid);
             for item in *list {
                 validate_declared_enum_comparison(
                     crate::sql::ast::BinaryOp::Eq,
@@ -5447,7 +5494,18 @@ pub fn infer_type_res(
                     infer_routine_argument_oid(item, columns)?,
                     columns,
                 )?;
-                let right = coltype_of_oid(infer_type_res(item, columns)?.0);
+                let right_oid = infer_type_res(item, columns)?.0;
+                // One item is a plain `=`; a longer list first takes one
+                // common type, which an untyped item adopts.
+                let right_oid = if list.len() > 1 && right_oid == oid::UNKNOWN {
+                    left_oid
+                } else {
+                    right_oid
+                };
+                if let Some(error) = untyped_comparison_undefined(left_oid, "=", right_oid) {
+                    return Err(error);
+                }
+                let right = coltype_of_oid(right_oid);
                 if let (Some(left), Some(right)) = (left, right)
                     && !comparable(left, right)
                 {
@@ -5464,7 +5522,8 @@ pub fn infer_type_res(
             ..
         } => {
             if let Some(operand) = operand {
-                let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
+                let left_oid = infer_type_res(operand, columns)?.0;
+                let left = coltype_of_oid(left_oid);
                 for (when, _) in *whens {
                     validate_declared_enum_comparison(
                         crate::sql::ast::BinaryOp::Eq,
@@ -5472,7 +5531,11 @@ pub fn infer_type_res(
                         infer_routine_argument_oid(when, columns)?,
                         columns,
                     )?;
-                    let right = coltype_of_oid(infer_type_res(when, columns)?.0);
+                    let right_oid = infer_type_res(when, columns)?.0;
+                    if let Some(error) = untyped_comparison_undefined(left_oid, "=", right_oid) {
+                        return Err(error);
+                    }
+                    let right = coltype_of_oid(right_oid);
                     if let (Some(left), Some(right)) = (left, right)
                         && !comparable(left, right)
                     {
@@ -5587,7 +5650,8 @@ pub fn infer_type_res(
             array,
             ..
         } => {
-            let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
+            let left_oid = infer_type_res(operand, columns)?.0;
+            let left = coltype_of_oid(left_oid);
             let right = coltype_of_oid(infer_type_res(array, columns)?.0).and_then(|ctype| {
                 if let ColType::Array(element) = ctype {
                     Some(element.to_coltype())
@@ -5601,6 +5665,15 @@ pub fn infer_type_res(
                     _ => None,
                 })
                 .unwrap_or(oid::UNKNOWN);
+            if element_oid != oid::UNKNOWN
+                && let Some(error) = untyped_comparison_undefined(
+                    left_oid,
+                    operator.operator_name().unwrap_or("?"),
+                    element_oid,
+                )
+            {
+                return Err(error);
+            }
             validate_declared_enum_comparison(
                 *operator,
                 infer_routine_argument_oid(operand, columns)?,
@@ -5925,11 +5998,6 @@ pub fn infer_type_res(
                     .first()
                     .map(|base| infer_type_res(base, columns))
                     .transpose()?;
-                if base.is_some_and(|(oid, _)| {
-                    matches!(ColType::from_oid(oid), Some(ColType::Array(_)))
-                }) {
-                    return Err(crate::sql::eval::array_element_assignment_unsupported());
-                }
                 base.unwrap_or_else(|| of(ColType::Jsonb))
             }
             name if name.starts_with("__json_query_") => {

@@ -4090,6 +4090,7 @@ pub(crate) fn builtin_operator_input_oids(
 /// Match exact inputs before PostgreSQL's same-category preferred types.
 pub(crate) fn builtin_nullif_input_oids(left: i32, right: i32) -> Result<(i32, i32), SqlError> {
     use super::types::oid;
+    let (written_left, written_right) = (left, right);
     let (left, right) = match (left, right) {
         (oid::UNKNOWN, oid::UNKNOWN) => (oid::TEXT, oid::TEXT),
         (oid::UNKNOWN, right) => (right, right),
@@ -4163,20 +4164,28 @@ pub(crate) fn builtin_nullif_input_oids(left: i32, right: i32) -> Result<(i32, i
             ambiguous = true;
         }
     }
+    // PostgreSQL names the operands as written, before unknown resolution.
+    let name = |type_oid: i32| {
+        if type_oid == oid::UNKNOWN {
+            "unknown"
+        } else {
+            ColType::from_oid(type_oid).map_or("record", ColType::name)
+        }
+    };
     if ambiguous {
         Err(sql_err!(
             sqlstate::AMBIGUOUS_FUNCTION,
-            "operator is not unique for NULLIF input types {} and {}",
-            left,
-            right
+            "operator is not unique: {} = {}",
+            name(written_left),
+            name(written_right)
         ))
     } else {
         best.ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
-                "operator does not exist for NULLIF input types {} and {}",
-                left,
-                right
+                "operator does not exist: {} = {}",
+                name(written_left),
+                name(written_right)
             )
         })
     }

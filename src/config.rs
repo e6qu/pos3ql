@@ -306,6 +306,10 @@ pub struct Config {
     /// object cache, this store is authoritative only for the running process:
     /// it is recreated empty at startup and never published to object storage.
     pub temporary_spill_bytes: usize,
+    /// Local-disk file shared by all connections for queued AFTER trigger
+    /// and foreign key events past each connection's `deferred_trigger_bytes`.
+    /// Recreated empty at startup; 0 keeps every queue in memory.
+    pub trigger_event_spill_bytes: usize,
     /// Durable object storage on/off. When on, checkpoints snapshot to the
     /// configured bucket and prefix and a wiped node cold-starts from them.
     pub object_store_on: bool,
@@ -536,6 +540,7 @@ impl Config {
             block_cache_bytes: 128 * MIB,
             disk_cache_bytes: GIB,
             temporary_spill_bytes: GIB,
+            trigger_event_spill_bytes: GIB,
             object_store_on: false,
             object_store_sim: false,
             wal_upload: false,
@@ -1119,6 +1124,10 @@ impl Config {
                     config.disk_cache_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
                 }
+                "trigger_event_spill_bytes" => {
+                    config.trigger_event_spill_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?;
+                }
                 "temporary_spill_bytes" => {
                     config.temporary_spill_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
@@ -1582,6 +1591,27 @@ impl Config {
                 0,
                 "checkpoint_delete_objects_per_beat must not exceed checkpoint_garbage_batch_objects"
                     .to_string(),
+            ));
+        }
+        if config.trigger_event_spill_bytes != 0
+            && config.trigger_event_spill_bytes
+                < crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES
+        {
+            return Err(ConfigError::at(
+                0,
+                format!(
+                    "trigger_event_spill_bytes must be 0 or at least {} bytes",
+                    crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES
+                ),
+            ));
+        }
+        if config.deferred_trigger_bytes < crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES {
+            return Err(ConfigError::at(
+                0,
+                format!(
+                    "deferred_trigger_bytes must be at least {} bytes",
+                    crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES
+                ),
             ));
         }
         if config.temporary_spill_bytes != 0

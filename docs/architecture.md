@@ -103,11 +103,29 @@ in the scan, would select different rows, so such a write reads its rows
 synchronously and a lock wait runs it again from its first start. A wait inside a routine body run for a row keeps the body's progress
 and continues it.
 
+**AFTER events queue in one spilling log.** Every queued `AFTER ROW`
+trigger, constraint trigger and foreign key check is a record in the
+transaction's event log, fired at its statement's end (or at `SET
+CONSTRAINTS` and commit when deferred) as PostgreSQL's after-trigger queue
+does. A written row's foreign key checks, its own references and the NO
+ACTION and RESTRICT checks of keys it removes, wait beside the row until its
+`AFTER` triggers are queued and take their places among them by the name of
+PostgreSQL's `RI_ConstraintTrigger_c_<oid>`/`_a_<oid>` triggers. A referencing
+check reads the row's current version, so a row deleted before the check is
+not checked; a referenced check carries the old key, and NO ACTION passes
+when another row provides that key again. The log is cut into 64 KiB pages:
+`deferred_trigger_bytes` of them stay in memory per connection and older
+pages move to the `trigger_event_spill_bytes` file shared by all
+connections, recreated empty at startup. Only when both are full does
+queuing fail with `54000`. A fired event carries the number of its firing,
+so a rollback to a statement or savepoint re-arms exactly the events fired
+after it.
+
 **Work after a write's last row resumes too.** A top-level `INSERT`,
 `UPDATE`, `DELETE` or `MERGE` keeps its finished `AFTER` work across a
 wait: queued `AFTER ROW` events, then the transaction's immediate
-constraint checks (deferrable foreign key, unique and exclusion
-constraints in `IMMEDIATE` mode), then `AFTER STATEMENT` triggers. An event
+constraint checks (deferrable unique and exclusion constraints in
+`IMMEDIATE` mode), then `AFTER STATEMENT` triggers. An event
 stays selected until it completes. A wait inside a PL/pgSQL trigger body
 keeps the body and continues at its waiting statement; a wait before the
 body starts runs the same event again, replaying its sequence values from

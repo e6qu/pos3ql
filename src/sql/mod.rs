@@ -78,6 +78,7 @@ pub(crate) mod statistics;
 pub mod timezone;
 mod timezone_abbreviation_data;
 pub mod to_char;
+pub mod trigger_events;
 pub(crate) mod two_phase;
 pub mod txn;
 pub(crate) mod type_input_plans;
@@ -257,6 +258,7 @@ pub enum EngineSetupError {
     /// data exceeds the configured value-index capacity.
     Storage(SqlError),
     ForeignTransport(String),
+    TriggerEventSpill(trigger_events::TriggerEventSpillError),
 }
 
 impl From<SqlError> for EngineSetupError {
@@ -275,6 +277,7 @@ impl std::fmt::Display for EngineSetupError {
             Self::Checkpoint(e) => write!(f, "{e}"),
             Self::Storage(e) => write!(f, "{}", e.message.as_str()),
             Self::ForeignTransport(e) => write!(f, "{e}"),
+            Self::TriggerEventSpill(e) => write!(f, "{e}"),
         }
     }
 }
@@ -657,6 +660,8 @@ pub struct Engine {
     result_streams_spooled: [u64; 3],
     ckpt: Option<Checkpointer>,
     temporary_spiller: Option<TemporarySpiller>,
+    /// Shared overflow file for connections' queued AFTER trigger events.
+    trigger_event_spill: Option<trigger_events::SharedTriggerEventSpill>,
     /// A durable, installed manifest whose heap and journal cleanup remains.
     /// Cleanup retries preserve the publication's captured log boundary.
     local_cleanup: Option<LocalCleanup>,
@@ -2849,7 +2854,19 @@ fn cursor_description_too_large() -> SqlError {
     )
 }
 
+/// A wait inside commit-time trigger work: the statement runs again on
+/// resume instead of ending the transaction.
+fn is_commit_wait(error: &SqlError) -> bool {
+    error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+}
+
 impl Engine {
+    /// The shared overflow file connections attach their AFTER trigger
+    /// queues to, when `trigger_event_spill_bytes` is not 0.
+    pub(crate) fn trigger_event_spill(&self) -> Option<trigger_events::SharedTriggerEventSpill> {
+        self.trigger_event_spill.clone()
+    }
+
     /// Selects one exclusively leased startup-reserved query workspace.
     pub(crate) fn select_query_workspace(&mut self, workspace: QueryWorkspaceId) {
         self.work.select(workspace);
@@ -4028,6 +4045,7 @@ impl Engine {
             } else {
                 TemporarySpiller::budget_bytes(config)
             },
+            trigger_events::TriggerEventSpill::budget_bytes(config.trigger_event_spill_bytes),
             if config.object_store_on {
                 crate::storage::SpillReader::budget_bytes(
                     true,
@@ -4097,6 +4115,17 @@ impl Engine {
         storage.load_extension_packages(config)?;
         let temporary_spiller = (config.temporary_spill_bytes != 0)
             .then(|| TemporarySpiller::new(config, budget))
+            .transpose()?;
+        let trigger_event_spill = (config.trigger_event_spill_bytes != 0)
+            .then(|| {
+                trigger_events::TriggerEventSpill::open(
+                    budget,
+                    &std::path::Path::new(&config.data_dir).join("trigger-event-spill"),
+                    config.trigger_event_spill_bytes,
+                )
+                .map(|spill| std::sync::Arc::new(crate::mem::mutex::Mutex::new(spill)))
+                .map_err(EngineSetupError::TriggerEventSpill)
+            })
             .transpose()?;
         let mut ckpt = if config.object_store_on {
             Some(Checkpointer::new(config, budget)?)
@@ -4315,6 +4344,7 @@ impl Engine {
             wal,
             ckpt,
             temporary_spiller,
+            trigger_event_spill,
             local_cleanup: None,
             checkpoint_failure: None,
             cache_capacity_generation: 0,
@@ -5891,7 +5921,7 @@ impl Engine {
         self.wal.truncate_stage(txn.txid, mark);
         // The retained admission keeps the completed command's clock on waits.
         datetime::end_transaction();
-        if txn.has_deferred_triggers() {
+        if txn.has_deferred_triggers()? {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "commit reached durability before queued constraint triggers fired"
@@ -8071,10 +8101,14 @@ impl Engine {
             responder,
             exec::TriggerQueueBoundary::Transaction,
         ) {
-            if let Some(context) = &mut cursors {
-                context.on_rollback();
+            // A deferred foreign key check waiting for a row lock keeps the
+            // events fired so far; COMMIT continues at that check.
+            if !is_commit_wait(&error) {
+                if let Some(context) = &mut cursors {
+                    context.on_rollback();
+                }
+                self.rollback_txn(txn, guc);
             }
-            self.rollback_txn(txn, guc);
             return Err(error);
         }
         if let Some(context) = &mut cursors
@@ -8099,10 +8133,14 @@ impl Engine {
             responder,
             exec::TriggerQueueBoundary::Transaction,
         ) {
-            if let Some(context) = &mut cursors {
-                context.on_rollback();
+            // A deferred foreign key check waiting for a row lock keeps the
+            // events fired so far; COMMIT continues at that check.
+            if !is_commit_wait(&error) {
+                if let Some(context) = &mut cursors {
+                    context.on_rollback();
+                }
+                self.rollback_txn(txn, guc);
             }
-            self.rollback_txn(txn, guc);
             return Err(error);
         }
         let result = self.finish_txn(txn, guc, target);
@@ -8354,6 +8392,9 @@ impl Engine {
             exec::TriggerQueueBoundary::Transaction,
         ) {
             self.prepared_transactions.release(slot);
+            if is_commit_wait(&error) {
+                return Err(error);
+            }
             return Err(fail(self, txn, cursors, error));
         }
         // PREPARE TRANSACTION assigns a full XID even when the transaction did
@@ -8756,9 +8797,8 @@ impl Engine {
             mark.constraint_completions,
             mark.constraint_modes,
             mark.constraint_renames,
-            mark.deferred_triggers,
-            mark.deferred_trigger_completions,
-            mark.deferred_trigger_bytes,
+            mark.trigger_events,
+            mark.pending_row_events,
         );
         txn.rewind_notifications(
             mark.notifications,

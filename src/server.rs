@@ -1154,6 +1154,14 @@ impl Server {
             None
         };
 
+        if let Some(spill) = engine.trigger_event_spill() {
+            for slot in slots.iter_mut() {
+                slot.conn.attach_trigger_event_spill(spill.clone());
+            }
+            for worker in subscriptions.iter_mut() {
+                worker.apply.attach_trigger_event_spill(spill.clone());
+            }
+        }
         let memory_reserved_bytes = budget.total();
         Ok(Self {
             reactor,

@@ -306,6 +306,13 @@ impl SubscriptionApply {
             ))
     }
 
+    pub(crate) fn attach_trigger_event_spill(
+        &mut self,
+        spill: crate::sql::trigger_events::SharedTriggerEventSpill,
+    ) {
+        self.txn.attach_trigger_event_spill(spill);
+    }
+
     pub(crate) fn new(
         budget: &mut Budget,
         stream: crate::storage::SubscriptionStream,

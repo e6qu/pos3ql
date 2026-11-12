@@ -122,17 +122,13 @@ is owned.
   yield and roll back to the step's start is not enough: with empty caches
   each retried selection issued a new GET and never finished (a rule action
   joining a cold table), so the step must keep the blocks it downloaded
-  across its attempts. Deferrable foreign key checks in `IMMEDIATE` mode run
-  after all of the statement's `AFTER ROW` triggers, where PostgreSQL runs
-  them among each row's triggers in name order, so a failing check can
-  follow notices and writes PostgreSQL never reaches. A non-deferrable
-  foreign key is checked as each row is written, where PostgreSQL checks it
-  in that same AFTER order at the statement's end: `INSERT INTO tree VALUES
-  (2, 1), (1, NULL)` on a self-referencing table, or a row whose parent an
-  `AFTER` trigger inserts, fails with `23503` where PostgreSQL succeeds.
-  Queuing every check as an AFTER event needs an event queue that spills,
-  because the fixed deferred-constraint capacity would otherwise limit how
-  many rows one statement may write.
+  across its attempts. `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and
+  `SET DEFAULT` still rewrite the referencing rows as the parent row is
+  written, without firing the referencing table's triggers, where
+  PostgreSQL runs them as SQL from its `AFTER` event at the statement's end.
+  A data-modifying `WITH` sub-statement fires its `AFTER` events and foreign
+  key checks at its own end, so `WITH d AS (DELETE FROM p ...) INSERT INTO p
+  SELECT ...` fails a NO ACTION check PostgreSQL passes.
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written

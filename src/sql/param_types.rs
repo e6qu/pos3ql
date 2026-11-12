@@ -164,6 +164,18 @@ impl ParameterInference<'_> {
                 None => self.infer_resolved_select_params(cte.query, txid, arena, oids),
             }
         }
+        // Derived tables (and LATERAL bodies) are analyzed before the query
+        // that reads them, item by item, as PostgreSQL's transformFromClause
+        // does, so their parameters take the types their own operators need.
+        if let Some(from) = select.from {
+            for table in
+                core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table))
+            {
+                if let Some(subquery) = table.subquery {
+                    self.infer_resolved_select_params(subquery, txid, arena, oids);
+                }
+            }
+        }
 
         let scope = match select.from.as_ref() {
             Some(from) => {

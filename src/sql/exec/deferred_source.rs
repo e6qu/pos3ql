@@ -321,6 +321,14 @@ fn split_leaf<'a>(
     {
         return Ok(None);
     }
+    // A set-returning call expands the output list into several rows, so
+    // the list cannot be computed again one inserted row at a time.
+    if select.items.iter().any(|item| {
+        matches!(item, SelectItem::Expr { expression, .. }
+            if crate::sql::query::expression_has_project_set(expression, storage, txid))
+    }) {
+        return Ok(None);
+    }
     let mut items = ArenaList::new(arena);
     let mut hidden = ArenaList::new(arena);
     for (index, item) in select.items.iter().enumerate() {

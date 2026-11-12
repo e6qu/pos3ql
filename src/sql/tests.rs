@@ -19013,17 +19013,20 @@ fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
         (
             "deferred-metadata",
             2,
-            4096,
+            crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES,
             "INSERT INTO bounded_deferred VALUES(1, 'x'), (2, 'x'), (3, 'x')",
         ),
         (
+            // One in-memory page and no spill file: an event larger than the
+            // page cannot be queued.
             "deferred-row-images",
             8,
-            128,
-            "INSERT INTO bounded_deferred VALUES(1, repeat('x', 256))",
+            crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES,
+            "INSERT INTO bounded_deferred VALUES(1, repeat('x', 70000))",
         ),
     ] {
         let mut config = test_config(label);
+        config.trigger_event_spill_bytes = 0;
         config.max_deferred_constraints_per_transaction = metadata;
         config.deferred_trigger_bytes = row_bytes;
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));

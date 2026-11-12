@@ -573,6 +573,15 @@ impl Conn {
         }
     }
 
+    /// Lets this connection's AFTER trigger queue overflow into the engine's
+    /// shared spill file.
+    pub(crate) fn attach_trigger_event_spill(
+        &mut self,
+        spill: crate::sql::trigger_events::SharedTriggerEventSpill,
+    ) {
+        self.txn.attach_trigger_event_spill(spill);
+    }
+
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         let empty = SqlName::parse("").expect("empty name fits");
         let mut prepared = Vec::with_capacity(config.max_prepared);

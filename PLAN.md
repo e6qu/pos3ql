@@ -296,10 +296,22 @@ TRUE/FALSE`, `CASE`, casts, SQL value functions, positional calls of
 built-in and user-defined functions, `ROW(...)` and whole-row references;
 other expressions (subqueries, named-argument calls, `$n` parameters and
 array constructors outside a quantified comparison) are still printed as
-stored. Index keys and predicates are stored as text, so renaming a table
-whose index reads the whole row, or a column an index expression or predicate
-uses, fails with `0A000`; storing them with bound column positions, as
-catalog expression nodes already are, would let both renames proceed. A
+stored. Column defaults, CHECK and exclusion predicates, index keys and
+predicates, statistics expressions, trigger `WHEN` conditions, domain
+constraints keep routine and type names as SQL text, so renaming or moving a
+routine or type one of them names, or renaming an enum value it casts to,
+fails with `0A000` (PostgreSQL stores them bound by OID and follows the
+rename); views, rules, policies and procedure bodies are bound and follow it.
+A SQL-standard function whose body is a `SELECT` (`BEGIN ATOMIC SELECT
+s.f(1); END`) is not: after `s.f` or a type its body casts to is renamed, the
+call fails with `42883` or a `42P13` return-type mismatch. `pg_get_viewdef` of a view with an enum literal (`'b'::e`) prints its
+bound query as spaced tokens with a doubled cast instead of PostgreSQL's
+form. An index key whose value is a row
+(`CREATE INDEX ON t ((t))`) fails with `0A000`, since row values have no stored
+key encoding. A rule action that names its table's renamed column without
+`NEW.` or `OLD.` fails the rename with `0A000`. After a table rename,
+`pg_get_viewdef` of a view it cannot deparse still prints the old table name
+from the stored query text. A
 partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
 its parent's plain unique index, so attaching such a partition builds a
 separate copy where PostgreSQL reuses the constraint's index; constraint

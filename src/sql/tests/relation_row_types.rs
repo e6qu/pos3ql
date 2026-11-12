@@ -285,11 +285,11 @@ fn whole_row_constraints_and_indexes_name_depend_and_print_like_postgresql() {
         ("CREATE TABLE wc () INHERITS (wr)", "0A000"),
         ("CREATE STATISTICS ws ON (wr IS NULL), a FROM wr", "0A000"),
         ("CREATE TABLE wbad(a int, CHECK (zz.a > 0))", "42P01"),
-        ("ALTER TABLE wr RENAME TO wr2", "0A000"),
+        // A row-typed key has no stored encoding.
+        ("CREATE INDEX wr_row ON wr ((wr))", "0A000"),
     ] {
         assert_eq!(sqlstate(&mut engine, &mut budget, sql), state, "{sql}");
     }
-    rows(&mut engine, &mut budget, "DROP INDEX wr_i");
     rows(&mut engine, &mut budget, "ALTER TABLE wr RENAME TO wr2");
     assert_eq!(
         rows(
@@ -300,6 +300,15 @@ fn whole_row_constraints_and_indexes_name_depend_and_print_like_postgresql() {
         ),
         vec!["CHECK ((wr2.* IS NOT NULL))"]
     );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_indexdef('wr_i'::regclass)"
+        ),
+        vec!["CREATE INDEX wr_i ON public.wr2 USING btree (wr_f(wr2.*))"]
+    );
+    rows(&mut engine, &mut budget, "INSERT INTO wr2 VALUES (1, 'x')");
 }
 
 #[test]
@@ -316,7 +325,7 @@ fn index_names_follow_postgresql_column_name_choice() {
         "CREATE INDEX ON k (a) INCLUDE (b, c)",
         "CREATE INDEX ON k ((a + 1), (a + 2))",
         "CREATE INDEX ON k ((k.c))",
-        "CREATE INDEX ON k ((k))",
+        "CREATE INDEX ON k ((k.a + k.c))",
     ] {
         rows(&mut engine, &mut budget, sql);
     }
@@ -334,7 +343,7 @@ fn index_names_follow_postgresql_column_name_choice() {
             "k_a_expr_idx|a,expr",
             "k_c_idx|c",
             "k_expr_expr1_idx|expr,expr1",
-            "k_k_idx|k",
+            "k_expr_idx|expr",
         ]
     );
 }

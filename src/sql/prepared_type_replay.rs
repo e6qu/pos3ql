@@ -250,11 +250,16 @@ pub(super) fn stage_type_record(
             schema,
             name,
             definition,
+            expressions,
+            predicate,
         } => {
             let slot = storage
                 .index_slot(schema, name, txid)
                 .ok_or_else(|| missing("index"))?;
+            let (expressions, predicate) =
+                crate::storage::index_expression_image(*expressions, *predicate)?;
             let prior = storage.alter_index_definition(slot, *definition, txid)?;
+            storage.alter_index_expressions(slot, expressions, predicate, txid)?;
             transaction.record_catalog_change(
                 storage,
                 DdlUndo::IndexAltered {

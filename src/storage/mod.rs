@@ -57,9 +57,11 @@ mod query_relation_sources;
 pub(crate) use query_relation_sources::RelationReference;
 mod routine_lifecycles;
 mod schema_names;
+mod stored_text_names;
 pub(crate) use matview_lifecycles::MatviewDdlUndo;
 pub(crate) use matview_lifecycles::MatviewQueryUndo;
 pub(crate) use schema_names::{SchemaIdentity, SchemaNameUndo};
+pub(crate) use stored_text_names::StoredTextName;
 mod routine_resolution;
 pub(crate) use crate::sql::eval::RoutineCallSelection;
 pub(crate) use routine_resolution::builtin_compatible_element_oid;
@@ -12517,6 +12519,56 @@ impl IndexMutableDefinition {
         clustered: false,
         replica_identity: false,
     };
+}
+
+/// Key expressions and predicate as stored by an index.
+pub(crate) type IndexExpressionImage = (
+    [Option<StackStr<INDEX_EXPRESSION_MAX>>; MAX_INDEX_COLS],
+    Option<StackStr<INDEX_PREDICATE_MAX>>,
+);
+
+/// Admits journaled key expressions and predicate; over-long text is corrupt.
+pub(crate) fn index_expression_image(
+    expressions: [Option<&str>; MAX_INDEX_COLS],
+    predicate: Option<&str>,
+) -> Result<IndexExpressionImage, SqlError> {
+    let corrupt = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "journal index expression exceeds its stored limit"
+        )
+    };
+    let mut image = [None; MAX_INDEX_COLS];
+    for (target, source) in image.iter_mut().zip(expressions) {
+        *target = source
+            .map(|text| {
+                let stored = StackStr::from_str(text);
+                (!stored.is_truncated())
+                    .then_some(stored)
+                    .ok_or_else(corrupt)
+            })
+            .transpose()?;
+    }
+    let predicate = predicate
+        .map(|text| {
+            let stored = StackStr::from_str(text);
+            (!stored.is_truncated())
+                .then_some(stored)
+                .ok_or_else(corrupt)
+        })
+        .transpose()?;
+    Ok((image, predicate))
+}
+
+/// The journal form of an index's key expressions and predicate.
+pub(crate) fn index_expression_text(
+    image: &IndexExpressionImage,
+) -> ([Option<&str>; MAX_INDEX_COLS], Option<&str>) {
+    let mut expressions = [None; MAX_INDEX_COLS];
+    for (target, source) in expressions.iter_mut().zip(&image.0) {
+        *target = source.as_ref().map(|text| text.as_str());
+    }
+    (expressions, image.1.as_ref().map(|text| text.as_str()))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -50903,6 +50955,32 @@ impl Storage {
             definition,
             expressions: current.expressions,
             predicate: current.predicate,
+        });
+        Ok(prior)
+    }
+
+    /// Stages rewritten key expressions and predicate (a renamed column,
+    /// table or schema they name), keeping the index's other settings.
+    pub(crate) fn alter_index_expressions(
+        &self,
+        slot: usize,
+        expressions: [Option<StackStr<INDEX_EXPRESSION_MAX>>; MAX_INDEX_COLS],
+        predicate: Option<StackStr<INDEX_PREDICATE_MAX>>,
+        txid: u32,
+    ) -> Result<Option<PendingIndexDefinition>, SqlError> {
+        let mut catalog = self.index_catalog();
+        let index = catalog[slot];
+        if let Some(owner) = index.pending_owner_other_than(txid) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, index.name.as_str()));
+        }
+        let prior = index.pending_definition;
+        catalog[slot].pending_definition = Some(PendingIndexDefinition {
+            txid,
+            revision: self.catalog_sequence.next()?,
+            definition: index.mutable_for(txid),
+            expressions,
+            predicate,
         });
         Ok(prior)
     }

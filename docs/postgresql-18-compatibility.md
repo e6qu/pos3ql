@@ -145,10 +145,19 @@ Row types:
   definitions; `(orders).total` and `orders.total` mean the column itself.
   Copying such a constraint or index with `LIKE`, `INHERITS` or `PARTITION OF`
   fails with PostgreSQL's `0A000` `cannot convert whole-row table reference`,
-  and an extended statistics expression cannot use it. Two renames are
-  refused with `0A000` because index keys and predicates are stored as text:
-  renaming a table one of whose indexes reads the whole row, and renaming a
-  column an index expression or predicate uses.
+  and an extended statistics expression cannot use it. Renaming the table or
+  a column rewrites the stored keys and predicates, as PostgreSQL's printed
+  definitions show. An index key that is the row itself
+  (`CREATE INDEX ON orders ((orders))`) fails with `0A000`.
+- Renaming or moving a function or type, or renaming an enum value, fails
+  with `0A000` while a column default or generated expression, `CHECK` or
+  exclusion predicate, index key or predicate, statistics expression, trigger
+  `WHEN` condition or domain constraint names it, because those are stored
+  as SQL text; for example, after
+  `CREATE TABLE t (a int CHECK (f(a) > 0))`, `ALTER FUNCTION f(int) RENAME TO g`
+  is refused. Views, rules, policies and SQL-standard procedure bodies follow
+  the rename, and so do enum literals that a domain constraint or an enum
+  column's default binds.
 - Index keys and predicates must be immutable (`42P17` `functions in index
   expression must be marked IMMUTABLE`), judged as PostgreSQL does after
   inlining simple SQL functions: `CREATE INDEX ON orders ((placed_at::date))`

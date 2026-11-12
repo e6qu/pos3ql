@@ -683,13 +683,15 @@ impl ExpressionVariables<'_> {
     }
 }
 
-/// Respells the whole-row references (`old.*`) of a stored single-relation
-/// expression after its relation is renamed; PostgreSQL's analyzed form
-/// refers to the relation itself rather than to its name.
+/// Respells a stored single-relation expression's references to its relation
+/// after the relation is renamed: qualifiers (`old.c`, `old.*`, `s.old.c`)
+/// and bare whole-row references (`f(old)`), which a column of the same name
+/// would shadow. PostgreSQL's analyzed form names the relation, not its name.
 pub(crate) fn rename_whole_row_references<const N: usize>(
     text: &StackStr<N>,
     old: &str,
     new: &str,
+    shadowed: bool,
     arena: &Arena,
 ) -> Result<StackStr<N>, SqlError> {
     use crate::sql::lexer::{Lexer, Tok};
@@ -698,7 +700,7 @@ pub(crate) fn rename_whole_row_references<const N: usize>(
     let result = (|| {
         let source = text.as_str();
         let mut lexer = Lexer::new(source, arena);
-        let mut previous = None;
+        let mut previous = [Tok::Eof; 3];
         let mut copied = 0;
         let mut output = StackStr::<N>::new();
         let invalid = |error: crate::sql::lexer::LexError| {
@@ -715,16 +717,22 @@ pub(crate) fn rename_whole_row_references<const N: usize>(
             }
             let (start, end) = (lexer.token_start(), lexer.token_end());
             let mut ahead = lexer.clone();
-            let whole_row = matches!(token, Tok::Ident(name) | Tok::QuotedIdent(name) if name == old)
-                && previous != Some(Tok::Op("."))
-                && ahead.next_token().map_err(invalid)? == Tok::Op(".")
-                && ahead.next_token().map_err(invalid)? == Tok::Op("*");
-            if whole_row {
+            let next = ahead.next_token().map_err(invalid)?;
+            let named = matches!(token, Tok::Ident(name) | Tok::QuotedIdent(name) if name == old);
+            // A name after a dot is a field or column unless the dot follows
+            // a lone schema qualifier (`s.old.c`).
+            let after_dot = previous[0] == Tok::Op(".")
+                && !(matches!(previous[1], Tok::Ident(_) | Tok::QuotedIdent(_))
+                    && previous[2] != Tok::Op(".")
+                    && next == Tok::Op("."));
+            let relation =
+                named && !after_dot && next != Tok::Op("(") && (next == Tok::Op(".") || !shadowed);
+            if relation {
                 let _ = output.write_str(&source[copied..start]);
                 crate::sql::catalog::write_identifier(&mut output, new);
                 copied = end;
             }
-            previous = Some(token);
+            previous = [token, previous[0], previous[1]];
         }
         let _ = output.write_str(&source[copied..]);
         if output.is_truncated() {
@@ -776,15 +784,6 @@ pub(crate) fn index_reads_whole_row<Definition0: crate::storage::DefinitionBacki
     arena: &Arena,
 ) -> Result<bool, SqlError> {
     Ok(index_expression_variables(table, index, arena)?.1)
-}
-
-/// The columns a stored index's key expressions and predicate read.
-pub(crate) fn index_expression_columns<Definition0: crate::storage::DefinitionBacking>(
-    table: &crate::storage::TableDefinition<Definition0>,
-    index: &crate::storage::IndexDef,
-    arena: &Arena,
-) -> Result<ColumnSet, SqlError> {
-    Ok(index_expression_variables(table, index, arena)?.0)
 }
 
 /// PostgreSQL's `MergeAttributes` cannot map a whole-row variable of a

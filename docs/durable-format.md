@@ -111,6 +111,7 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 158 | Inherited trigger change | Flags byte, then expected/replacement images: four-byte clone stamp, ten-byte trigger position, ten-byte table position, one-byte enabled mode. |
 | 159 | Built-in routine attributes | Four-byte database identifier, four-byte built-in routine OID, then strict, volatility, parallel, security-definer and leakproof bytes, cost and rows as IEEE-754 bits, a settings count (at most 16) and each `SET` setting's name and value, each after a one-byte length. Owner and privileges use the object owner and ACL kinds with the routine OID. |
 | 160 | Trigger alteration | Ten-byte position, prior name, target kind, table schema and name, new name, enabled mode, then the complete `WHEN` condition (two-byte length plus one, zero when absent). Kind 57, without the condition, is rejected. |
+| 161 | Index alteration | Schema, index name and mutable settings, then the complete key expressions (four-byte presence mask over the 32 key positions; each present expression as a two-byte length and text) and predicate (flag byte, then two-byte length and text). Kind 71, without the expressions, is rejected. |
 
 Other payload rules:
 

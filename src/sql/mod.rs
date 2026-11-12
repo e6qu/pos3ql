@@ -19873,6 +19873,7 @@ impl Engine {
                     identity: routine,
                     actions,
                     guc: Some(guc),
+                    arena,
                 },
                 responder,
             ),
@@ -19882,6 +19883,7 @@ impl Engine {
                 txn,
                 aggregate,
                 *action,
+                arena,
                 responder,
             ),
             Stmt::DropFunction {
@@ -28165,6 +28167,8 @@ fn apply_wal_op(
             schema,
             name,
             definition,
+            expressions,
+            predicate,
         } => {
             let slot = storage.index_slot(schema, name, 0).ok_or_else(|| {
                 sql_err!(
@@ -28173,7 +28177,10 @@ fn apply_wal_op(
                     name
                 )
             })?;
+            let (expressions, predicate) =
+                crate::storage::index_expression_image(expressions, predicate)?;
             storage.alter_index_definition(slot, definition, 0)?;
+            storage.alter_index_expressions(slot, expressions, predicate, 0)?;
             storage.commit_index_definition(slot)?;
         }
         WalOp::CreateTablespace {

@@ -22,30 +22,33 @@ CREATE STATISTICS rw.t_stat ON rw.f(w), v FROM rw.t;
 CREATE RULE t_rule AS ON DELETE TO rw.t WHERE rw.f(OLD.w) > 100 DO INSTEAD NOTHING;
 INSERT INTO rw.t (k, v, w, dd) VALUES (1, 5, 1, 3), (2, 6, 200, 4);
 ALTER SCHEMA rw RENAME TO rw2;
-ALTER TABLE rw2.t RENAME COLUMN w TO w2;"#;
+ALTER TABLE rw2.t RENAME COLUMN w TO w2;
+ALTER TABLE rw2.t RENAME COLUMN v TO v2;
+CREATE INDEX t_qual ON rw2.t ((t.k + 1));
+ALTER TABLE rw2.t RENAME TO t2;"#;
 
 const PROBE: &str = "
-SELECT pg_get_indexdef('rw2.t_expr'::regclass);
-SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'rw2.t'::regclass AND contype = 'c' ORDER BY conname;
+SELECT indexdef FROM pg_indexes WHERE schemaname = 'rw2' ORDER BY indexname;
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'rw2.t2'::regclass AND contype = 'c' ORDER BY conname;
 SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contypid = 'rw2.d'::regtype;
-SELECT attname, pg_get_expr(adbin, adrelid) FROM pg_attrdef JOIN pg_attribute ON attrelid = adrelid AND attnum = adnum WHERE adrelid = 'rw2.t'::regclass ORDER BY adnum;
+SELECT attname, pg_get_expr(adbin, adrelid) FROM pg_attrdef JOIN pg_attribute ON attrelid = adrelid AND attnum = adnum WHERE adrelid = 'rw2.t2'::regclass ORDER BY adnum;
 SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 't_when';
 SELECT pg_get_statisticsobjdef(oid) FROM pg_statistic_ext WHERE stxname = 't_stat';
 SELECT pg_get_ruledef(oid) FROM pg_rewrite WHERE rulename = 't_rule';
-SELECT k FROM rw2.t WHERE rw2.f(v) = 7 AND rw2.f(k) > 0;";
+SELECT k FROM rw2.t2 WHERE rw2.f(v2) = 7 AND rw2.f(k) > 0;";
 
-const EXPECTED: [&str; 12] = [
-    "CREATE INDEX t_expr ON rw2.t USING btree (rw2.f(v)) WHERE (rw2.f(k) > 0)",
-    "CHECK ((rw2.f(v) > 0))",
+const EXPECTED: [&str; 14] = [
+    "CREATE INDEX t_expr ON rw2.t2 USING btree (rw2.f(v2)) WHERE (rw2.f(k) > 0)",
+    "CREATE UNIQUE INDEX t_pkey ON rw2.t2 USING btree (k)",
+    "CREATE INDEX t_qual ON rw2.t2 USING btree (((k + 1)))",
+    "CHECK ((rw2.f(v2) > 0))",
     "CHECK ((w2 >= 0))",
     "CHECK ((VALUE > rw2.f(1)))",
-    "v|rw2.f(0)",
+    "v2|rw2.f(0)",
     "g|rw2.f(k)",
-    "CREATE TRIGGER t_when BEFORE UPDATE ON rw2.t FOR EACH ROW WHEN ((rw2.f(new.w2) > old.w2)) EXECUTE FUNCTION rw2.trg()",
-    "CREATE STATISTICS rw2.t_stat ON v, rw2.f(w2) FROM rw2.t",
-    "CREATE RULE t_rule AS
-    ON DELETE TO rw2.t
-   WHERE (rw2.f(old.w2) > 100) DO INSTEAD NOTHING;",
+    "CREATE TRIGGER t_when BEFORE UPDATE ON rw2.t2 FOR EACH ROW WHEN ((rw2.f(new.w2) > old.w2)) EXECUTE FUNCTION rw2.trg()",
+    "CREATE STATISTICS rw2.t_stat ON v2, rw2.f(w2) FROM rw2.t2",
+    "CREATE RULE t_rule AS\n    ON DELETE TO rw2.t2\n   WHERE (rw2.f(old.w2) > 100) DO INSTEAD NOTHING;",
     "2",
     "1|5|1",
     // The rule's condition keeps the second row from being deleted.
@@ -91,12 +94,12 @@ fn renamed_stored_expressions_survive_journal_and_checkpoint_recovery() {
                     // Rule and trigger conditions fire after recovery.
                     session.success(
                         engine,
-                        "UPDATE rw2.t SET w2 = w2 WHERE k = 1; DELETE FROM rw2.t WHERE k = 2",
+                        "UPDATE rw2.t2 SET w2 = w2 WHERE k = 1; DELETE FROM rw2.t2 WHERE k = 2",
                         false,
                     );
                     rows.extend(data_rows(&session.success(
                         engine,
-                        "SELECT k, v, w2 FROM rw2.t ORDER BY k",
+                        "SELECT k, v2, w2 FROM rw2.t2 ORDER BY k",
                         false,
                     )));
                     rows

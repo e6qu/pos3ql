@@ -60755,6 +60755,18 @@ fn enums_order_and_enforce() {
     );
     // DROP RESTRICT fails while a column depends on the enum.
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP TYPE mood")).contains("2BP01"));
+    // A column default's cast names the type and its labels as text, so
+    // label and type renames are refused until that table is gone.
+    for refused in [
+        "ALTER TYPE mood RENAME VALUE 'sad' TO 'blue'",
+        "ALTER TYPE mood RENAME TO feeling",
+    ] {
+        assert!(
+            String::from_utf8_lossy(&run_with(&mut e, &mut b, refused)).contains("0A000"),
+            "{refused}"
+        );
+    }
+    run_with(&mut e, &mut b, "DROP TABLE enum_defaults");
     // Renames rewrite inline scalar/array labels while preserving sort order,
     // then move the type identity (including its generated array type).
     run_with(

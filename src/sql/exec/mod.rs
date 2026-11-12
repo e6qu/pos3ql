@@ -26405,6 +26405,7 @@ fn execute_bound_plpgsql_utility<'a>(
                         identity: routine,
                         actions,
                         guc: Some(guc),
+                        arena: context.arena,
                     },
                     responder,
                 ),
@@ -26414,6 +26415,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     txn,
                     aggregate,
                     *action,
+                    context.arena,
                     responder,
                 ),
                 Stmt::DropFunction {
@@ -41380,6 +41382,7 @@ pub fn alter_aggregate(
     txn: &mut TxnState,
     identity: &super::ast::AggregateIdentity<'_>,
     action: super::ast::AlterRoutineAction<'_>,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     alter_routine(
@@ -41391,6 +41394,7 @@ pub fn alter_aggregate(
             identity: &identity.routine(),
             actions: core::slice::from_ref(&action),
             guc: None,
+            arena,
         },
         responder,
     )
@@ -41757,6 +41761,7 @@ pub struct AlterRoutineCommand<'command, 'sql> {
     pub identity: &'command super::ast::RoutineIdentity<'sql>,
     pub actions: &'command [crate::sql::ast::AlterRoutineAction<'sql>],
     pub guc: Option<&'command crate::sql::guc::GucState>,
+    pub arena: &'command Arena,
 }
 
 pub fn alter_routine(
@@ -41771,6 +41776,7 @@ pub fn alter_routine(
         identity,
         actions,
         guc,
+        arena,
     } = command;
     let Some(&action) = actions.first() else {
         return sql_fail(sql_err!(
@@ -42023,6 +42029,16 @@ pub fn alter_routine(
         Ok(signature) => signature,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = storage.require_unnamed_by_stored_text(
+        crate::storage::StoredTextName::Routine {
+            schema: old_schema,
+            name: old_name,
+        },
+        txn.txid,
+        arena,
+    ) {
+        return sql_fail(error);
+    }
     let target = match storage.prepare_routine_edit(slot, txn.txid) {
         Ok(target) => target,
         Err(error) => return sql_fail(error),
@@ -49398,6 +49414,16 @@ pub fn alter_domain(
                 domain_name.as_str()
             ));
         }
+        if let Err(error) = storage.require_unnamed_by_stored_text(
+            crate::storage::StoredTextName::Type {
+                schema: current.schema,
+                name: current.name,
+            },
+            txn.txid,
+            arena,
+        ) {
+            return sql_fail(error);
+        }
         let prior = match storage.stage_domain_identity(edit_target, schema, domain_name, txn.txid)
         {
             Ok(prior) => prior,
@@ -53302,6 +53328,16 @@ pub fn alter_type(
                 Ok(name) => name,
                 Err(e) => return sql_fail(e),
             };
+            if let Err(error) = storage.require_unnamed_by_stored_text(
+                crate::storage::StoredTextName::Type {
+                    schema: current_schema,
+                    name: current_name,
+                },
+                txn.txid,
+                arena,
+            ) {
+                return sql_fail(error);
+            }
             let members = match copy_enum_members(&current, arena) {
                 Ok(members) => members,
                 Err(_) => {
@@ -53380,6 +53416,16 @@ pub fn alter_type(
                     current.name.as_str()
                 ));
             }
+            if let Err(error) = storage.require_unnamed_by_stored_text(
+                crate::storage::StoredTextName::Type {
+                    schema: current_schema,
+                    name: current_name,
+                },
+                txn.txid,
+                arena,
+            ) {
+                return sql_fail(error);
+            }
             let members = match copy_enum_members(&current, arena) {
                 Ok(members) => members,
                 Err(_) => {
@@ -53425,6 +53471,16 @@ pub fn alter_type(
             };
             let current_schema = current.schema;
             let current_name = current.name;
+            if let Err(error) = storage.require_unnamed_by_stored_text(
+                crate::storage::StoredTextName::EnumLabels {
+                    schema: current_schema,
+                    name: current_name,
+                },
+                txn.txid,
+                arena,
+            ) {
+                return sql_fail(error);
+            }
             let Some(member_index) = current
                 .members()
                 .position(|member| member.label.as_str() == *from)
@@ -53734,6 +53790,18 @@ fn alter_composite_type(
             altered.fields[index] = replacement;
         }
     }
+    if prior_names != (altered.schema, altered.name)
+        && let Err(error) = storage.require_unnamed_by_stored_text(
+            crate::storage::StoredTextName::Type {
+                schema: prior_names.0,
+                name: prior_names.1,
+            },
+            txn.txid,
+            arena,
+        )
+    {
+        return sql_fail(error);
+    }
     let prior = match storage.stage_composite_alter(edit_target, altered, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
@@ -53983,6 +54051,122 @@ fn rewrite_table_policy_column_references<Definition0: crate::storage::Definitio
             },
         ) {
             storage.rollback_policy_alter(slot, prior);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Index keys and predicates are stored as text naming the table's columns
+/// and, for a whole-row reference, the table itself. A rename rewrites each
+/// affected index and journals its complete expressions.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_table_index_expressions<Definition0: crate::storage::DefinitionBacking>(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    original: &crate::storage::TableDefinition<Definition0>,
+    renames: &[(SqlName, SqlName)],
+    table_rename: Option<(SqlName, SqlName)>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if renames.is_empty() && table_rename.is_none() {
+        return Ok(());
+    }
+    for slot in 0..storage.index_count() {
+        if storage.index_table_slot_to(slot, txn.txid) != Some(table) {
+            continue;
+        }
+        let Some(index) = storage.index_visible_to(slot, txn.txid) else {
+            continue;
+        };
+        let current = index.definition_for(txn.txid);
+        let mut expressions = current.expressions;
+        let mut predicate = current.predicate;
+        let mut shape = TableDefBuilder::from_definition(original);
+        for &(from, to) in renames {
+            let Some(column) = shape.column_index(from.as_str()) else {
+                continue;
+            };
+            let mut renamed = shape.clone();
+            renamed.columns[column].name = to;
+            let rename = CompositeFieldRename { from, to };
+            for expression in expressions.iter_mut().flatten() {
+                *expression = rewrite_table_column_reference(
+                    expression.as_str(),
+                    &shape,
+                    &renamed,
+                    rename,
+                    (&*storage, txn.txid),
+                    arena,
+                )?;
+            }
+            if let Some(text) = &mut predicate {
+                *text = rewrite_table_column_reference(
+                    text.as_str(),
+                    &shape,
+                    &renamed,
+                    rename,
+                    (&*storage, txn.txid),
+                    arena,
+                )?;
+            }
+            shape = renamed;
+        }
+        if let Some((old, new)) = table_rename {
+            let shadowed = shape.column_index(old.as_str()).is_some();
+            for expression in expressions.iter_mut().flatten() {
+                *expression = ddl::rename_whole_row_references(
+                    expression,
+                    old.as_str(),
+                    new.as_str(),
+                    shadowed,
+                    arena,
+                )?;
+            }
+            if let Some(text) = &mut predicate {
+                *text = ddl::rename_whole_row_references(
+                    text,
+                    old.as_str(),
+                    new.as_str(),
+                    shadowed,
+                    arena,
+                )?;
+            }
+        }
+        if expressions == current.expressions && predicate == current.predicate {
+            continue;
+        }
+        let prior = storage.alter_index_expressions(slot, expressions, predicate, txn.txid)?;
+        if original.persistence != crate::storage::RelationPersistence::Temporary {
+            let image = (expressions, predicate);
+            let (expressions, predicate) = crate::storage::index_expression_text(&image);
+            let name = index.name_for(txn.txid);
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::AlterIndexDefinition {
+                    schema: index.schema.as_str(),
+                    name: name.as_str(),
+                    definition: index.mutable_for(txn.txid),
+                    expressions,
+                    predicate,
+                },
+            ) {
+                storage.rollback_index_definition(slot, prior);
+                return Err(error);
+            }
+        }
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::IndexAltered {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
+            storage.rollback_index_definition(slot, prior);
             return Err(error);
         }
     }
@@ -57035,6 +57219,14 @@ pub fn create_index(
             };
             expression_refs[i] = Some(index_column.expression);
             match catalog_column_type(storage, txn.txid, type_oid) {
+                // Expression keys are stored in the row encoding, which keeps
+                // row values only as columns of a named composite type.
+                Some((ColType::Record | ColType::Composite(_), _)) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "index expressions of a row type are not supported"
+                    ));
+                }
                 Some((ctype, user_type)) => {
                     (crate::storage::RoutineResult { ctype, user_type }, type_oid)
                 }
@@ -57649,6 +57841,8 @@ pub(super) fn stage_index_definition(
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
     let schema = index.schema;
     let name = index.name_for(txn.txid);
+    let staged = index.definition_for(txn.txid);
+    let image = (staged.expressions, staged.predicate);
     let prior = storage.alter_index_definition(slot, definition, txn.txid)?;
     let temporary = storage
         .index_table_slot_to(slot, txn.txid)
@@ -57657,6 +57851,7 @@ pub(super) fn stage_index_definition(
                 == crate::storage::RelationPersistence::Temporary
         });
     if !temporary {
+        let (expressions, predicate) = crate::storage::index_expression_text(&image);
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage_reserved(
             txn.txid,
@@ -57665,6 +57860,8 @@ pub(super) fn stage_index_definition(
                 schema: schema.as_str(),
                 name: name.as_str(),
                 definition,
+                expressions,
+                predicate,
             },
         ) {
             storage.rollback_index_definition(slot, prior);
@@ -77348,28 +77545,14 @@ fn alter_table_relation(
                     Ok(n) => n,
                     Err(e) => return sql_fail(e),
                 };
-                // Index expressions are not versioned with the table, so an
-                // index that reads the whole row cannot follow the new name.
-                for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid) {
-                    match ddl::index_reads_whole_row(&def, &index, arena) {
-                        Ok(false) => {}
-                        Ok(true) => {
-                            return sql_fail(sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "cannot rename table \"{}\" because index \"{}\" contains a whole-row table reference",
-                                def.name.as_str(),
-                                index.name_for(txn.txid).as_str()
-                            ));
-                        }
-                        Err(error) => return sql_fail(error),
-                    }
-                }
                 let renamed = new_def.name;
+                let shadowed = new_def.column_index(def.name.as_str()).is_some();
                 for check in new_def.checks.iter_mut().take(new_def.n_checks) {
                     check.expression = match ddl::rename_whole_row_references(
                         &check.expression,
                         def.name.as_str(),
                         renamed.as_str(),
+                        shadowed,
                         arena,
                     ) {
                         Ok(expression) => expression,
@@ -77392,27 +77575,6 @@ fn alter_table_relation(
                     Ok(n) => n,
                     Err(e) => return sql_fail(e),
                 };
-                // Index expressions are stored as text that is not versioned
-                // with the table, so they cannot follow a column rename yet.
-                if let Some(column) = def.column_index(from) {
-                    for index in
-                        storage.indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid)
-                    {
-                        match ddl::index_expression_columns(&def, &index, arena) {
-                            Ok(columns) if !columns.contains(column) => {}
-                            Ok(_) => {
-                                return sql_fail(sql_err!(
-                                    sqlstate::FEATURE_NOT_SUPPORTED,
-                                    "cannot rename column \"{}\" of table \"{}\" because index \"{}\" uses it in an expression or predicate",
-                                    from,
-                                    def.name.as_str(),
-                                    index.name_for(txn.txid).as_str()
-                                ));
-                            }
-                            Err(error) => return sql_fail(error),
-                        }
-                    }
-                }
                 column_renames[n_column_renames] = (new_def.columns[i].name, to);
                 n_column_renames += 1;
                 if let Err(error) = rewrite_table_owned_column_references(
@@ -78707,6 +78869,21 @@ fn alter_table_relation(
     let mut new_schema = [ColType::Bool; MAX_COLUMNS];
     new_def.schema(&mut new_schema);
     let new_schema = &new_schema[..new_def.n_columns];
+
+    // Index keys and predicates follow a rename before the rows are checked
+    // against the new definition, which evaluates them by column name.
+    if let Err(error) = rewrite_table_index_expressions(
+        storage,
+        wal,
+        txn,
+        table_index,
+        &def,
+        &column_renames[..n_column_renames],
+        (def.name != new_def.name).then_some((def.name, new_def.name)),
+        arena,
+    ) {
+        return sql_fail(error);
+    }
 
     // When no row image changes (rename / constraint / default / drop-not-null /
     // set-not-null over an unchanged column), the new definition — including its

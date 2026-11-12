@@ -25832,7 +25832,7 @@ fn execute_nested_data_modification<'a>(
         context.arena,
         None,
     )?;
-    if let Some(command) = rewritten_write_target(context.storage(), statement, context.txn) {
+    if let Some(command) = rewritten_write_target(context.storage(), statement, context.txn)? {
         return execute_rewritten_nested_write(
             context, statement, arguments, capture, pending, progress, command,
         );
@@ -28037,12 +28037,16 @@ fn routine_utility_outcome(outcome: Outcome) -> Result<(), SqlError> {
 }
 
 /// Whether rules for its event rewrite a write into several steps.
-fn rewritten_into_steps(storage: &Storage, statement: &Stmt<'_>, txn: &TxnState) -> bool {
+fn rewritten_into_steps(
+    storage: &Storage,
+    statement: &Stmt<'_>,
+    txn: &TxnState,
+) -> Result<bool, SqlError> {
     let (relation, event) = match statement {
         Stmt::Insert(insert) => (insert.table, crate::storage::RewriteEvent::Insert),
         Stmt::Update(update) => (update.table, crate::storage::RewriteEvent::Update),
         Stmt::Delete(delete) => (delete.table, crate::storage::RewriteEvent::Delete),
-        _ => return false,
+        _ => return Ok(false),
     };
     let target = match storage.resolve_relation(relation.schema, relation.name, txn.txid) {
         Some(crate::storage::ResolvedRelation::View(slot)) => {
@@ -28051,12 +28055,13 @@ fn rewritten_into_steps(storage: &Storage, statement: &Stmt<'_>, txn: &TxnState)
         Some(crate::storage::ResolvedRelation::Table(slot)) => {
             crate::storage::RuleTarget::Table(slot as u16)
         }
-        _ => return false,
+        _ => return Ok(false),
     };
-    storage
-        .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+    let replication_role = crate::sql::guc::active_session_replication_role()?;
+    Ok(storage
+        .firing_rules_for(target, event, replication_role, txn.txid)
         .next()
-        .is_some()
+        .is_some())
 }
 
 /// The command of a routine's `INSERT`, `UPDATE` or `DELETE` whose target
@@ -28065,26 +28070,29 @@ fn rewritten_write_target(
     storage: &Storage,
     statement: &Stmt<'_>,
     txn: &TxnState,
-) -> Option<&'static str> {
+) -> Result<Option<&'static str>, SqlError> {
     let (relation, event, command) = match statement {
         Stmt::Insert(insert) => (insert.table, crate::storage::RewriteEvent::Insert, "INSERT"),
         Stmt::Update(update) => (update.table, crate::storage::RewriteEvent::Update, "UPDATE"),
         Stmt::Delete(delete) => (delete.table, crate::storage::RewriteEvent::Delete, "DELETE"),
-        _ => return None,
+        _ => return Ok(None),
     };
-    match storage.resolve_relation(relation.schema, relation.name, txn.txid)? {
-        crate::storage::ResolvedRelation::View(_) => Some(command),
-        crate::storage::ResolvedRelation::Table(slot) => storage
-            .firing_rules_for(
-                crate::storage::RuleTarget::Table(slot as u16),
-                event,
-                txn.replication_apply,
-                txn.txid,
-            )
-            .next()
-            .map(|_| command),
-        crate::storage::ResolvedRelation::Catalog => None,
-    }
+    let replication_role = crate::sql::guc::active_session_replication_role()?;
+    Ok(
+        match storage.resolve_relation(relation.schema, relation.name, txn.txid) {
+            Some(crate::storage::ResolvedRelation::View(_)) => Some(command),
+            Some(crate::storage::ResolvedRelation::Table(slot)) => storage
+                .firing_rules_for(
+                    crate::storage::RuleTarget::Table(slot as u16),
+                    event,
+                    replication_role,
+                    txn.txid,
+                )
+                .next()
+                .map(|_| command),
+            Some(crate::storage::ResolvedRelation::Catalog) | None => None,
+        },
+    )
 }
 
 /// The routine's variables, and a trigger's `NEW` and `OLD` rows, as values
@@ -28268,9 +28276,8 @@ fn execute_rewritten_nested_write<'a>(
     // A statement rules rewrite into several steps finishes each step's
     // AFTER triggers before the next step runs, so none of them can hand
     // its completion to the caller.
-    let boundary = context
-        .nested_write_boundary()
-        .filter(|_| !rewritten_into_steps(context.storage(), statement, context.txn));
+    let steps = rewritten_into_steps(context.storage(), statement, context.txn)?;
+    let boundary = context.nested_write_boundary().filter(|_| !steps);
     let PlpgsqlExecHost::Routine { engine, guc, .. } = &mut context.host else {
         return Err(engine_triggers::engine_required(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -31848,7 +31855,7 @@ fn execute_trigger_step_in<'a>(
                 statement: TriggerDml::Insert(statement),
                 into,
             } => execute_trigger_statement(|| {
-                if rewritten_write_target(context.storage(), &Stmt::Insert(statement), context.txn)
+                if rewritten_write_target(context.storage(), &Stmt::Insert(statement), context.txn)?
                     .is_some()
                 {
                     let transition = TriggerTransition {
@@ -32084,7 +32091,7 @@ fn execute_trigger_step_in<'a>(
                 statement: TriggerDml::Update(statement),
                 into,
             } => execute_trigger_statement(|| {
-                if rewritten_write_target(context.storage(), &Stmt::Update(statement), context.txn)
+                if rewritten_write_target(context.storage(), &Stmt::Update(statement), context.txn)?
                     .is_some()
                 {
                     let transition = TriggerTransition {
@@ -32273,7 +32280,7 @@ fn execute_trigger_step_in<'a>(
                 statement: TriggerDml::Delete(statement),
                 into,
             } => execute_trigger_statement(|| {
-                if rewritten_write_target(context.storage(), &Stmt::Delete(statement), context.txn)
+                if rewritten_write_target(context.storage(), &Stmt::Delete(statement), context.txn)?
                     .is_some()
                 {
                     let transition = TriggerTransition {
@@ -33843,11 +33850,8 @@ fn fire_row_trigger_slot<'a, Definition0: crate::storage::DefinitionBacking>(
                 .partition_trigger_enabled_to(trigger_slot, table, context.txn.txid)
         },
     );
-    if !(if context.txn.replication_apply {
-        enabled.fires_for_replication()
-    } else {
-        enabled.fires_for_origin()
-    }) || !matches!(trigger.level, TriggerLevel::Row)
+    if !enabled.fires_in(crate::sql::guc::active_session_replication_role()?)
+        || !matches!(trigger.level, TriggerLevel::Row)
         || trigger.timing
             != if matches!(target, crate::storage::TriggerTarget::View(_)) {
                 TriggerTiming::InsteadOf
@@ -34513,7 +34517,8 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
     rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
     let mut cursor = write_completion::StatementTriggerCursor::new();
-    while let Some((slot, trigger)) = cursor.next(&context, target, event, before, updated_columns)
+    while let Some((slot, trigger)) =
+        cursor.next(&context, target, event, before, updated_columns)?
     {
         execute_statement_trigger(
             &mut context,
@@ -34628,7 +34633,7 @@ fn fire_statement_triggers<'a, Definition0: crate::storage::DefinitionBacking>(
     updated_columns: ColumnSet,
 ) -> Result<(), SqlError> {
     if before
-        && (!write_completion::has_statement_triggers(&context, table.into(), event, true)
+        && (!write_completion::has_statement_triggers(&context, table.into(), event, true)?
             || !context.txn.claim_before_statement(table as u16, event)?)
     {
         return Ok(());
@@ -34648,15 +34653,12 @@ fn transition_capture_required(
     storage: &Storage,
     table: usize,
     txid: u32,
-    replication_apply: bool,
+    replication_role: crate::sql::guc::SessionReplicationRole,
     event: u8,
 ) -> bool {
     storage.triggers_for_table(table, txid).any(|(_, trigger)| {
-        (if replication_apply {
-            trigger.enabled_to(txid).fires_for_replication()
-        } else {
-            trigger.enabled_to(txid).fires_for_origin()
-        }) && matches!(trigger.timing, TriggerTiming::After)
+        trigger.enabled_to(txid).fires_in(replication_role)
+            && matches!(trigger.timing, TriggerTiming::After)
             && trigger.events.contains(event)
             && !matches!(
                 trigger.transition_tables,
@@ -62912,11 +62914,12 @@ pub(crate) fn copy_statement_end(
     let definition = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;
+    let replication_role = crate::sql::guc::active_session_replication_role()?;
     let mut transition_capture = if transition_capture_required(
         storage,
         setup.table_index,
         txn.txid,
-        txn.replication_apply,
+        replication_role,
         TriggerEvents::INSERT,
     ) {
         Some(TransitionCapture::new(arena, 0, inserted.len())?)
@@ -63453,11 +63456,12 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                     &values[..physical.n_columns],
                 )?;
             }
+            let replication_role = crate::sql::guc::active_session_replication_role()?;
             if transition_capture_required(
                 storage,
                 logical_table,
                 txn.txid,
-                txn.replication_apply,
+                replication_role,
                 TriggerEvents::INSERT,
             ) {
                 let logical_values = partition_insert::logical_insert_values(
@@ -67645,12 +67649,16 @@ pub(crate) fn merge<'a>(
     } else {
         unsafe { core::slice::from_raw_parts(source_rows_ptr, n_source) }
     };
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut insert_transitions = if merge_events & TriggerEvents::INSERT != 0
         && transition_capture_required(
             storage,
             table_index,
             txn.txid,
-            txn.replication_apply,
+            replication_role,
             TriggerEvents::INSERT,
         ) {
         match TransitionCapture::new(arena, 0, n_source) {
@@ -67930,12 +67938,16 @@ pub(crate) fn merge<'a>(
     // A matched target row can be acted on at most once by MERGE's cardinality
     // rule, so target cardinality is the exact bounded capture capacity for
     // UPDATE and DELETE transition relations.
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut update_transitions = if merge_events & TriggerEvents::UPDATE != 0
         && transition_capture_required(
             storage,
             table_index,
             txn.txid,
-            txn.replication_apply,
+            replication_role,
             TriggerEvents::UPDATE,
         ) {
         match TransitionCapture::new(arena, n_target, n_target) {
@@ -67945,12 +67957,16 @@ pub(crate) fn merge<'a>(
     } else {
         None
     };
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut delete_transitions = if merge_events & TriggerEvents::DELETE != 0
         && transition_capture_required(
             storage,
             table_index,
             txn.txid,
-            txn.replication_apply,
+            replication_role,
             TriggerEvents::DELETE,
         ) {
         match TransitionCapture::new(arena, n_target, 0) {
@@ -70371,8 +70387,7 @@ pub(crate) fn instead_of_view_dml<'a>(
     if !storage
         .triggers_for_target(target, txn.txid)
         .any(|(_, trigger)| {
-            trigger.enabled_to(txn.txid).fires_for_origin()
-                && matches!(trigger.level, TriggerLevel::Row)
+            matches!(trigger.level, TriggerLevel::Row)
                 && matches!(trigger.timing, TriggerTiming::InsteadOf)
                 && trigger.events.contains(event)
         })
@@ -71886,11 +71901,15 @@ where
             Ok(g) => g,
             Err(e) => return sql_fail(e),
         };
+        let replication_role = match crate::sql::guc::active_session_replication_role() {
+            Ok(role) => role,
+            Err(error) => return sql_fail(error),
+        };
         let mut transition_capture = if transition_capture_required(
             storage,
             table_index,
             txn.txid,
-            txn.replication_apply,
+            replication_role,
             TriggerEvents::INSERT,
         ) {
             match TransitionCapture::new(arena, 0, count).and_then(|mut capture| {
@@ -71905,12 +71924,16 @@ where
         } else {
             None
         };
+        let replication_role = match crate::sql::guc::active_session_replication_role() {
+            Ok(role) => role,
+            Err(error) => return sql_fail(error),
+        };
         let mut conflict_transition_capture = if conflict_update_columns.is_some()
             && transition_capture_required(
                 storage,
                 table_index,
                 txn.txid,
-                txn.replication_apply,
+                replication_role,
                 TriggerEvents::UPDATE,
             ) {
             match TransitionCapture::new(arena, count, count).and_then(|mut capture| {
@@ -72199,11 +72222,15 @@ where
             transitions: [None; row_progress::CAPTURES],
         },
     };
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut transition_capture = if transition_capture_required(
         storage,
         table_index,
         txn.txid,
-        txn.replication_apply,
+        replication_role,
         TriggerEvents::INSERT,
     ) {
         match TransitionCapture::new(arena, 0, statement.rows.len()).and_then(|mut capture| {
@@ -72218,12 +72245,16 @@ where
     } else {
         None
     };
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut conflict_transition_capture = if conflict_update_columns.is_some()
         && transition_capture_required(
             storage,
             table_index,
             txn.txid,
-            txn.replication_apply,
+            replication_role,
             TriggerEvents::UPDATE,
         ) {
         match TransitionCapture::new(arena, statement.rows.len(), statement.rows.len()).and_then(
@@ -73445,11 +73476,15 @@ pub(crate) fn update<'a>(
         },
         None => (0, 0, None),
     };
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut transition_capture = if transition_capture_required(
         storage,
         table_index,
         txn.txid,
-        txn.replication_apply,
+        replication_role,
         TriggerEvents::UPDATE,
     ) {
         match TransitionCapture::new(arena, scratch.len(), scratch.len()).and_then(|mut capture| {
@@ -74704,11 +74739,15 @@ pub(crate) fn delete<'a>(
             Err(e) => return sql_fail(e),
         }
     }
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut transition_capture = if transition_capture_required(
         storage,
         table_index,
         txn.txid,
-        txn.replication_apply,
+        replication_role,
         TriggerEvents::DELETE,
     ) {
         match TransitionCapture::new(arena, scratch.len(), 0).and_then(|mut capture| {

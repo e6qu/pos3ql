@@ -5726,12 +5726,13 @@ impl RuleEnabled {
         }
     }
 
-    pub(crate) const fn fires_for_origin(self) -> bool {
-        matches!(self, Self::Origin | Self::Always)
-    }
-
-    pub(crate) const fn fires_for_replication(self) -> bool {
-        matches!(self, Self::Replica | Self::Always)
+    /// PostgreSQL's firing test under `session_replication_role`.
+    pub(crate) const fn fires_in(self, role: crate::sql::guc::SessionReplicationRole) -> bool {
+        if role.is_replica() {
+            matches!(self, Self::Replica | Self::Always)
+        } else {
+            matches!(self, Self::Origin | Self::Always)
+        }
     }
 }
 
@@ -10313,12 +10314,13 @@ impl TriggerEnabled {
         }
     }
 
-    pub(crate) const fn fires_for_origin(self) -> bool {
-        matches!(self, Self::Origin | Self::Always)
-    }
-
-    pub(crate) const fn fires_for_replication(self) -> bool {
-        matches!(self, Self::Replica | Self::Always)
+    /// PostgreSQL's firing test under `session_replication_role`.
+    pub(crate) const fn fires_in(self, role: crate::sql::guc::SessionReplicationRole) -> bool {
+        if role.is_replica() {
+            matches!(self, Self::Replica | Self::Always)
+        } else {
+            matches!(self, Self::Origin | Self::Always)
+        }
     }
 }
 
@@ -54621,18 +54623,13 @@ impl Storage {
         &self,
         target: RuleTarget,
         event: RewriteEvent,
-        replication_apply: bool,
+        role: crate::sql::guc::SessionReplicationRole,
         txid: u32,
     ) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
         self.rules_for(target, event, txid)
             .filter(move |(_, rule)| {
                 let definition = rule.definition_for(txid);
-                definition.is_view_return()
-                    || if replication_apply {
-                        definition.enabled.fires_for_replication()
-                    } else {
-                        definition.enabled.fires_for_origin()
-                    }
+                definition.is_view_return() || definition.enabled.fires_in(role)
             })
     }
 

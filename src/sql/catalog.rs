@@ -31917,6 +31917,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "synchronize_seqscans" => "on",
             "track_functions" => "none",
             "plpgsql.variable_conflict" => "error",
+            "session_replication_role" => "origin",
             "TimeZone" => "UTC",
             "work_mem" => "4096",
             "transaction_isolation" => "read committed",
@@ -31947,6 +31948,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "password_encryption"
                 | "track_functions"
                 | "plpgsql.variable_conflict"
+                | "session_replication_role"
                 | "xmloption"
         ) {
             "enum"
@@ -31980,7 +31982,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "postmaster"
         } else if matches!(
             name,
-            "event_triggers" | "track_functions" | "plpgsql.variable_conflict"
+            "event_triggers"
+                | "track_functions"
+                | "plpgsql.variable_conflict"
+                | "session_replication_role"
         ) {
             "superuser"
         } else {
@@ -32051,6 +32056,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         let enum_names: &[&str] = match name {
             "track_functions" => &["none", "pl", "all"],
             "plpgsql.variable_conflict" => &crate::sql::guc::VariableConflict::NAMES,
+            "session_replication_role" => &crate::sql::guc::SessionReplicationRole::NAMES,
             _ => &[],
         };
         let enum_values = if enum_names.is_empty() {
@@ -32079,15 +32085,22 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                         "track_functions" => "Statistics / Monitoring",
                         "work_mem" => "Resource Usage / Memory",
                         "plpgsql.variable_conflict" => "Customized Options",
+                        "session_replication_role" => {
+                            "Client Connection Defaults / Statement Behavior"
+                        }
                         _ => "Client Connection Defaults",
                     },
                     arena,
                 )?,
                 text(
-                    if name == "plpgsql.variable_conflict" {
-                        "Sets handling of conflicts between PL/pgSQL variable names and table column names."
-                    } else {
-                        ""
+                    match name {
+                        "plpgsql.variable_conflict" => {
+                            "Sets handling of conflicts between PL/pgSQL variable names and table column names."
+                        }
+                        "session_replication_role" => {
+                            "Sets the session's behavior for triggers and rewrite rules."
+                        }
+                        _ => "",
                     },
                     arena,
                 )?,

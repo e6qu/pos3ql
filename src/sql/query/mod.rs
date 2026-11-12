@@ -6487,6 +6487,23 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         )
     }
 
+    fn may_set_parameter(&self, parameter: &str) -> Result<bool, SqlError> {
+        Ok(self
+            .storage
+            .current_role_slot(self.txid)
+            .is_none_or(|role| {
+                self.storage.role(role).attributes_to(self.txid).superuser
+                    || crate::sql::ast::ParameterName::parse(parameter).is_some_and(|parameter| {
+                        self.storage.has_parameter_privilege(
+                            parameter,
+                            role,
+                            crate::sql::ast::ParameterPrivileges::SET,
+                            self.txid,
+                        )
+                    })
+            }))
+    }
+
     fn has_parameter_privilege(
         &self,
         role: Option<&str>,

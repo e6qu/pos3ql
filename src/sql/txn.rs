@@ -434,9 +434,9 @@ pub struct TxnState {
     pub read_only: bool,
     pub deferrable: bool,
     sources: TransactionSources,
-    /// True only while pgoutput applies one remote transaction. Trigger
-    /// dispatch reads this typed execution origin instead of guessing from a
-    /// connection or statement string.
+    /// True only while pgoutput applies one remote transaction: subscription
+    /// bookkeeping and target checks require it. Trigger, rule and foreign key
+    /// selection follow the worker's `session_replication_role` instead.
     pub replication_apply: bool,
     extension_script: bool,
     snapshot_lsn: Option<u64>,

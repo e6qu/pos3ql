@@ -309,6 +309,24 @@ pub(crate) fn active_track_functions() -> TrackFunctions {
     })
 }
 
+/// The active session's `session_replication_role`, read where triggers,
+/// rules and foreign key checks are selected. Every statement, COMMIT and
+/// replication apply installs its session settings first.
+pub(crate) fn active_session_replication_role() -> Result<SessionReplicationRole, SqlError> {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "trigger selection has no session settings"
+            ));
+        }
+        // SAFETY: `enter_eval_scope` or `enter_settings_scope` owns the
+        // pointer's dynamic extent.
+        Ok(unsafe { &*pointer }.session_replication_role())
+    })
+}
+
 pub fn set_active_config(
     name: &str,
     value: Option<&str>,
@@ -766,6 +784,7 @@ struct GucValues {
     password_encryption: PasswordEncryption,
     track_functions: TrackFunctions,
     plpgsql_variable_conflict: VariableConflict,
+    session_replication_role: SessionReplicationRole,
 }
 
 /// `plpgsql.variable_conflict` and a PL/pgSQL body's `#variable_conflict`:
@@ -794,6 +813,40 @@ impl VariableConflict {
         [Self::Error, Self::UseVariable, Self::UseColumn]
             .into_iter()
             .find(|mode| value.eq_ignore_ascii_case(mode.as_str()))
+    }
+}
+
+/// PostgreSQL's `session_replication_role`: which triggers and rewrite rules
+/// fire. `replica` fires only those enabled REPLICA or ALWAYS, the mode logical
+/// replication workers run in; `origin` and `local` fire those enabled ORIGIN
+/// (the default) or ALWAYS. Foreign key triggers are ORIGIN, so `replica`
+/// skips foreign key checks and actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionReplicationRole {
+    Origin,
+    Replica,
+    Local,
+}
+
+impl SessionReplicationRole {
+    pub(crate) const NAMES: [&'static str; 3] = ["origin", "replica", "local"];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Origin => "origin",
+            Self::Replica => "replica",
+            Self::Local => "local",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        [Self::Origin, Self::Replica, Self::Local]
+            .into_iter()
+            .find(|role| value.eq_ignore_ascii_case(role.as_str()))
+    }
+
+    pub(crate) const fn is_replica(self) -> bool {
+        matches!(self, Self::Replica)
     }
 }
 
@@ -892,7 +945,8 @@ impl GucValues {
             default_transaction_deferrable,
             password_encryption,
             track_functions,
-            plpgsql_variable_conflict
+            plpgsql_variable_conflict,
+            session_replication_role
         )
     }
 
@@ -926,6 +980,7 @@ impl GucValues {
             password_encryption: PasswordEncryption::ScramSha256,
             track_functions: TrackFunctions::None,
             plpgsql_variable_conflict: VariableConflict::Error,
+            session_replication_role: SessionReplicationRole::Origin,
         };
         let _ = write!(values.datestyle, "ISO, MDY");
         let _ = write!(values.timezone, "UTC");
@@ -967,7 +1022,8 @@ const GUC_LC_MONETARY: u32 = 1 << 26;
 const GUC_TRACK_FUNCTIONS: u32 = 1 << 27;
 const GUC_WORK_MEM: u32 = 1 << 28;
 const GUC_PLPGSQL_VARIABLE_CONFLICT: u32 = 1 << 29;
-const GUC_SETTING_COUNT: usize = 30;
+const GUC_SESSION_REPLICATION_ROLE: u32 = 1 << 30;
+const GUC_SETTING_COUNT: usize = 31;
 const GUC_ALL: u32 = (1 << GUC_SETTING_COUNT) - 1;
 
 #[derive(Clone, Copy)]
@@ -1073,6 +1129,8 @@ fn guc_bit(name: &str) -> u32 {
         GUC_WORK_MEM
     } else if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
         GUC_PLPGSQL_VARIABLE_CONFLICT
+    } else if name.eq_ignore_ascii_case("session_replication_role") {
+        GUC_SESSION_REPLICATION_ROLE
     } else {
         0
     }
@@ -1086,6 +1144,7 @@ pub(crate) fn requires_set_privilege(name: &str) -> bool {
     name.eq_ignore_ascii_case("event_triggers")
         || name.eq_ignore_ascii_case("track_functions")
         || name.eq_ignore_ascii_case("plpgsql.variable_conflict")
+        || name.eq_ignore_ascii_case("session_replication_role")
 }
 
 fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
@@ -1132,6 +1191,7 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
     );
     copy!(GUC_PASSWORD_ENCRYPTION, password_encryption);
     copy!(GUC_TRACK_FUNCTIONS, track_functions);
+    copy!(GUC_SESSION_REPLICATION_ROLE, session_replication_role);
     copy!(GUC_PLPGSQL_VARIABLE_CONFLICT, plpgsql_variable_conflict);
 }
 
@@ -1767,6 +1827,10 @@ impl GucState {
         self.store.borrow().current.track_functions
     }
 
+    pub(crate) fn session_replication_role(&self) -> SessionReplicationRole {
+        self.store.borrow().current.session_replication_role
+    }
+
     pub(crate) fn plpgsql_variable_conflict(&self) -> VariableConflict {
         self.store.borrow().current.plpgsql_variable_conflict
     }
@@ -2384,6 +2448,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.password_encryption = defaults.password_encryption;
     } else if name.eq_ignore_ascii_case("track_functions") {
         values.track_functions = defaults.track_functions;
+    } else if name.eq_ignore_ascii_case("session_replication_role") {
+        values.session_replication_role = defaults.session_replication_role;
     } else if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
         values.plpgsql_variable_conflict = defaults.plpgsql_variable_conflict;
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
@@ -2656,6 +2722,12 @@ fn apply_setting(
         };
         return Ok(());
     }
+    if name.eq_ignore_ascii_case("session_replication_role") {
+        values.session_replication_role = SessionReplicationRole::parse(v).ok_or_else(|| {
+            invalid_enum_value("session_replication_role", v, "origin, replica, local")
+        })?;
+        return Ok(());
+    }
     if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
         values.plpgsql_variable_conflict = VariableConflict::parse(v).ok_or_else(|| {
             invalid_enum_value(
@@ -2818,6 +2890,8 @@ fn owned_setting(values: &GucValues, name: &str) -> Option<StackStr<256>> {
         }))
     } else if name.eq_ignore_ascii_case("track_functions") {
         Some(StackStr::from_str(values.track_functions.as_str()))
+    } else if name.eq_ignore_ascii_case("session_replication_role") {
+        Some(StackStr::from_str(values.session_replication_role.as_str()))
     } else if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
         Some(StackStr::from_str(
             values.plpgsql_variable_conflict.as_str(),

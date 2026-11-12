@@ -2559,6 +2559,15 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
+    /// Whether the current role may set the superuser-only `parameter`: a
+    /// superuser, or a role granted SET on it.
+    fn may_set_parameter(&self, _parameter: &str) -> Result<bool, SqlError> {
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "parameter privileges require the session catalog"
+        ))
+    }
+
     /// The comment text on the object with this OID and column `subid` (0 for
     /// the object itself), or `None`. `catalog_name` selects the owning
     /// catalog (`pg_class`, `pg_namespace`, or `pg_type`). Backs

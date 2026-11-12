@@ -127,7 +127,13 @@ fn startup_option_word(
     Ok(Some(word))
 }
 
-fn apply_startup_options(guc: &GucState, options: &str, superuser: bool) -> Result<(), SqlError> {
+/// Applies `-c name=value` startup options. `may_set` answers whether the
+/// login role may set a superuser-only parameter.
+fn apply_startup_options(
+    guc: &GucState,
+    options: &str,
+    may_set: &dyn Fn(&str) -> bool,
+) -> Result<(), SqlError> {
     let mut words = options.chars().peekable();
     while let Some(word) = startup_option_word(&mut words)? {
         let separate;
@@ -163,15 +169,27 @@ fn apply_startup_options(guc: &GucState, options: &str, superuser: bool) -> Resu
                 "startup configuration parameter name is empty"
             ));
         }
-        if name.eq_ignore_ascii_case("event_triggers") && !superuser {
-            return Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied to set parameter \"event_triggers\""
-            ));
-        }
-        guc.set_config(name, Some(value), false)?;
+        set_startup_parameter(guc, name, value, may_set)?;
     }
     Ok(())
+}
+
+/// Sets one startup parameter, rejecting a superuser-only one the login role
+/// may not set, as PostgreSQL does for both `options` and packet keys.
+fn set_startup_parameter(
+    guc: &GucState,
+    name: &str,
+    value: &str,
+    may_set: &dyn Fn(&str) -> bool,
+) -> Result<(), SqlError> {
+    if crate::sql::guc::requires_set_privilege(name) && !may_set(name) {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to set parameter \"{}\"",
+            name
+        ));
+    }
+    guc.set_config(name, Some(value), false).map(|_| ())
 }
 
 struct Prepared {
@@ -1621,7 +1639,6 @@ impl Conn {
 
         let session_user = self.guc.session_user();
         let startup_login = engine.role_login(session_user.as_str());
-        let startup_superuser = startup_login.is_some_and(|role| role.superuser);
         self.auth_database = engine.database_login(self.database.as_str());
         if let Some(database) = self.auth_database {
             if engine.select_database(database.oid).is_err() {
@@ -1640,6 +1657,9 @@ impl Conn {
                 return Step::Close;
             }
         }
+        let may_set = |name: &str| {
+            startup_login.is_some_and(|role| engine.login_may_set_parameter(&role, name))
+        };
         let mut msg = MsgIn::new(payload);
         loop {
             let Ok(key) = msg.cstr() else {
@@ -1652,16 +1672,10 @@ impl Conn {
                 return Step::Close;
             };
             let result = match key {
-                "options" => apply_startup_options(&self.guc, value, startup_superuser),
+                "options" => apply_startup_options(&self.guc, value, &may_set),
                 "user" | "database" | "replication" => Ok(()),
                 _ if key.starts_with("_pq_.") => Ok(()),
-                _ if key.eq_ignore_ascii_case("event_triggers") && !startup_superuser => {
-                    Err(sql_err!(
-                        sqlstate::INSUFFICIENT_PRIVILEGE,
-                        "permission denied to set parameter \"event_triggers\""
-                    ))
-                }
-                _ => self.guc.set_config(key, Some(value), false).map(|_| ()),
+                _ => set_startup_parameter(&self.guc, key, value, &may_set),
             };
             if let Err(error) = result {
                 let mut responder = output(&mut self.send, &mut self.overflow);
@@ -10358,12 +10372,20 @@ mod tests {
     #[test]
     fn startup_event_trigger_escape_hatch_is_superuser_only() {
         let guc = GucState::new();
-        let error = apply_startup_options(&guc, "-c event_triggers=off", false)
-            .expect_err("ordinary roles cannot disable login event triggers");
+        for name in ["event_triggers", "session_replication_role"] {
+            let error = set_startup_parameter(&guc, name, "off", &|_| false)
+                .expect_err("ordinary roles cannot set superuser-only parameters");
+            assert_eq!(error.sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
+        }
+        let error = apply_startup_options(&guc, "-c session_replication_role=replica", &|_| false)
+            .expect_err("ordinary roles cannot skip triggers");
         assert_eq!(error.sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
-        apply_startup_options(&guc, "-c event_triggers=off", true)
+        apply_startup_options(&guc, "-c event_triggers=off", &|_| true)
             .expect("a superuser may disable login event triggers");
         assert!(!guc.event_triggers());
+        apply_startup_options(&guc, "-c session_replication_role=replica", &|_| true)
+            .expect("a superuser may load as a replica");
+        assert!(guc.session_replication_role().is_replica());
     }
 
     #[test]
@@ -10535,10 +10557,10 @@ mod tests {
         let guc = GucState::new();
         let oversized = format!("-c application_name={}", "x".repeat(257));
         crate::mem::guard::forbid_alloc(|| {
-            let error =
-                apply_startup_options(&guc, "-c application_name='one two'", true).unwrap_err();
+            let error = apply_startup_options(&guc, "-c application_name='one two'", &|_| true)
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
-            let error = apply_startup_options(&guc, &oversized, true).unwrap_err();
+            let error = apply_startup_options(&guc, &oversized, &|_| true).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         });
     }

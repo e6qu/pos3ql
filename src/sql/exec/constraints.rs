@@ -2637,6 +2637,10 @@ fn check_or_defer_fk_child(
     mut txn: Option<&mut TxnState>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    // A written row's checks are RI triggers; validating existing rows is not.
+    if row.validation_read().is_none() && !foreign_key_triggers_fire()? {
+        return Ok(());
+    }
     for fk in def.fkeys() {
         if !fk.validation.enforced()
             || fk
@@ -2710,6 +2714,15 @@ fn check_or_defer_fk_child(
         }
     }
     Ok(())
+}
+
+/// Whether foreign key checks and actions fire for rows written now. Their
+/// RI triggers fire on ORIGIN, as PostgreSQL creates them, so
+/// `session_replication_role = replica` (a subscription's apply worker, or a
+/// superuser loading data) skips them; validating existing rows does not.
+fn foreign_key_triggers_fire() -> Result<bool, SqlError> {
+    Ok(crate::storage::TriggerEnabled::Origin
+        .fires_in(crate::sql::guc::active_session_replication_role()?))
 }
 
 /// How a referencing row's check reads its parent row.
@@ -3827,6 +3840,9 @@ pub(crate) fn apply_fk_parent_actions(
     new_parent: Option<&[Datum]>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    if !foreign_key_triggers_fire()? {
+        return Ok(());
+    }
     let parent_index = storage
         .find_visible(parent_schema, parent_name, txn.txid)
         .ok_or_else(|| {
@@ -4437,7 +4453,8 @@ fn rewrite_sets_no_tag(
     let target = crate::storage::RuleTarget::Table(child_index as u16);
     let mut suppressed = false;
     let mut replaced = false;
-    for (_, rule) in storage.firing_rules_for(target, event, false, txid) {
+    let replication_role = crate::sql::guc::active_session_replication_role()?;
+    for (_, rule) in storage.firing_rules_for(target, event, replication_role, txid) {
         let definition = rule.definition_for(txid);
         if definition.mode != crate::storage::RewriteMode::Instead {
             continue;

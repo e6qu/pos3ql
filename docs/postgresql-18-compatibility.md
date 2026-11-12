@@ -190,6 +190,14 @@ Syntax and errors:
   earlier writes, runs once for its row as in PostgreSQL: the write stops at
   that row, the whole trigger body runs, and the write continues with the
   row the body returned. Its notices, sequence values and writes appear once.
+- `session_replication_role` (superusers, or roles granted `SET` on it)
+  chooses which triggers and rules fire, as in PostgreSQL: `replica` fires
+  those enabled `REPLICA` or `ALWAYS`; `origin` (the default) and `local`
+  fire those enabled `ORIGIN` or `ALWAYS`. Foreign key checks and actions are
+  `ORIGIN` triggers, so `SET session_replication_role = replica` loads rows
+  without them, for example an order line before its order. A view's
+  `INSTEAD OF` trigger that does not fire leaves the row unwritten without an
+  error.
 - A trigger's `NEW` and `OLD` have the table's row type in every firing. One
   without a row (`OLD` in an `INSERT` trigger, `NEW` in a `DELETE` trigger,
   both in a statement trigger) is NULL, and so are its fields; a field the

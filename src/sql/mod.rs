@@ -1723,11 +1723,7 @@ fn has_event_trigger(
             .any(|(_, trigger)| {
                 trigger.event == event
                     && trigger.tags.matches(tag)
-                    && if txn.replication_apply {
-                        trigger.enabled.fires_for_replication()
-                    } else {
-                        trigger.enabled.fires_for_origin()
-                    }
+                    && trigger.enabled.fires_in(guc.session_replication_role())
             })
 }
 
@@ -3809,6 +3805,20 @@ impl Engine {
             connection_limit: attributes.connection_limit,
             password: attributes.password,
         })
+    }
+
+    /// Whether login role `role` may set the superuser-only parameter `name`
+    /// before its session starts: a superuser, or a role granted SET on it.
+    pub(crate) fn login_may_set_parameter(&self, role: &RoleLogin, name: &str) -> bool {
+        role.superuser
+            || crate::sql::ast::ParameterName::parse(name).is_some_and(|parameter| {
+                self.storage.has_parameter_privilege(
+                    parameter,
+                    usize::from(role.slot),
+                    crate::sql::ast::ParameterPrivileges::SET,
+                    0,
+                )
+            })
     }
 
     pub(crate) fn database_login(&self, name: &str) -> Option<DatabaseLogin> {
@@ -14584,7 +14594,7 @@ impl Engine {
                 .firing_rules_for(
                     target,
                     crate::storage::RewriteEvent::Insert,
-                    txn.replication_apply,
+                    guc.session_replication_role(),
                     txn.txid,
                 )
                 .next()
@@ -14593,7 +14603,7 @@ impl Engine {
                     .firing_rules_for(
                         target,
                         crate::storage::RewriteEvent::Update,
-                        txn.replication_apply,
+                        guc.session_replication_role(),
                         txn.txid,
                     )
                     .next()
@@ -14606,7 +14616,7 @@ impl Engine {
             }
         }
         if storage
-            .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+            .firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
             .next()
             .is_none()
         {
@@ -14850,7 +14860,7 @@ impl Engine {
                 Err(error) => return Ok(Err(error)),
             };
         let suppress_original = storage
-            .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+            .firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
             .any(|(_, rule)| {
                 let definition = rule.definition_for(txn.txid);
                 definition.mode == crate::storage::RewriteMode::Instead
@@ -14859,7 +14869,7 @@ impl Engine {
         if outer_returns_rows
             && suppress_original
             && !storage
-                .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+                .firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
                 .any(|(_, rule)| rule.definition_for(txn.txid).returning_action.is_some())
         {
             return Ok(Err(sql_err!(
@@ -14870,7 +14880,7 @@ impl Engine {
         }
         if outer_returns_rows
             && storage
-                .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+                .firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
                 .filter(|(_, rule)| rule.definition_for(txn.txid).returning_action.is_some())
                 .nth(1)
                 .is_some()
@@ -14883,7 +14893,7 @@ impl Engine {
         let insert_event = event == crate::storage::RewriteEvent::Insert;
         let mut original_filter: Option<&Expr<'a>> = None;
         for (rule_slot, rule) in
-            storage.firing_rules_for(target, event, txn.replication_apply, txn.txid)
+            storage.firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
         {
             let definition = rule.definition_for(txn.txid);
             if definition.mode != crate::storage::RewriteMode::Instead
@@ -15036,7 +15046,7 @@ impl Engine {
         let mut instead_rows = None;
         loop {
             let selected = storage
-                .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+                .firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
                 .filter(|(_, rule)| {
                     last_name.is_none_or(|last| {
                         rule.definition_for(txn.txid).name.as_str() > last.as_str()
@@ -15719,6 +15729,7 @@ impl Engine {
                         .any(|(_, trigger)| {
                             matches!(trigger.level, ast::TriggerLevel::Row)
                                 && matches!(trigger.timing, ast::TriggerTiming::InsteadOf)
+                                && trigger.events.contains(ast::TriggerEvents::INSERT)
                         })
                 {
                     return exec::instead_of_view_dml(
@@ -15812,6 +15823,7 @@ impl Engine {
                         .any(|(_, trigger)| {
                             matches!(trigger.level, ast::TriggerLevel::Row)
                                 && matches!(trigger.timing, ast::TriggerTiming::InsteadOf)
+                                && trigger.events.contains(ast::TriggerEvents::UPDATE)
                         })
                 {
                     return exec::instead_of_view_dml(
@@ -15906,6 +15918,7 @@ impl Engine {
                         .any(|(_, trigger)| {
                             matches!(trigger.level, ast::TriggerLevel::Row)
                                 && matches!(trigger.timing, ast::TriggerTiming::InsteadOf)
+                                && trigger.events.contains(ast::TriggerEvents::DELETE)
                         })
                 {
                     return exec::instead_of_view_dml(
@@ -16510,7 +16523,7 @@ impl Engine {
                         .firing_rules_for(
                             crate::storage::RuleTarget::Table(table as u16),
                             event,
-                            txn.replication_apply,
+                            guc.session_replication_role(),
                             txn.txid,
                         )
                         .next()
@@ -19243,11 +19256,7 @@ impl Engine {
             .filter(|(_, trigger)| {
                 trigger.event == event
                     && trigger.tags.matches(tag)
-                    && if txn.replication_apply {
-                        trigger.enabled.fires_for_replication()
-                    } else {
-                        trigger.enabled.fires_for_origin()
-                    }
+                    && trigger.enabled.fires_in(guc.session_replication_role())
                     && last_name.is_none_or(|last: SqlName| trigger.name.as_str() > last.as_str())
             })
             .min_by(|(_, left), (_, right)| left.name.as_str().cmp(right.name.as_str()))
@@ -25070,6 +25079,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "server_encoding",
     "server_version",
     "server_version_num",
+    "session_replication_role",
     "standard_conforming_strings",
     "statement_timeout",
     "synchronize_seqscans",
@@ -30001,7 +30011,8 @@ fn check_cte_rules(storage: &Storage, dml: &Stmt<'_>, txn: &TxnState) -> Result<
         }
         _ => return Ok(()),
     };
-    let rules = || storage.firing_rules_for(target, event, txn.replication_apply, txn.txid);
+    let replication_role = crate::sql::guc::active_session_replication_role()?;
+    let rules = || storage.firing_rules_for(target, event, replication_role, txn.txid);
     if rules().next().is_none() {
         return Ok(());
     }

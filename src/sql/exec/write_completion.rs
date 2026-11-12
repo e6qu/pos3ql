@@ -180,7 +180,8 @@ impl StatementTriggerCursor {
         event: u8,
         before: bool,
         columns: ColumnSet,
-    ) -> Option<(u16, crate::storage::TriggerDef)> {
+    ) -> Result<Option<(u16, crate::storage::TriggerDef)>, SqlError> {
+        let replication_role = crate::sql::guc::active_session_replication_role()?;
         while let Some((slot, trigger)) = context
             .storage()
             .triggers_for_target(target, context.txn.txid)
@@ -195,11 +196,10 @@ impl StatementTriggerCursor {
             })
         {
             self.last_name = Some(trigger.name_to(context.txn.txid));
-            if !(if context.txn.replication_apply {
-                trigger.enabled_to(context.txn.txid).fires_for_replication()
-            } else {
-                trigger.enabled_to(context.txn.txid).fires_for_origin()
-            }) || !matches!(trigger.level, TriggerLevel::Statement)
+            if !trigger
+                .enabled_to(context.txn.txid)
+                .fires_in(replication_role)
+                || !matches!(trigger.level, TriggerLevel::Statement)
                 || trigger.timing
                     != if before {
                         TriggerTiming::Before
@@ -213,9 +213,9 @@ impl StatementTriggerCursor {
             {
                 continue;
             }
-            return Some((slot as u16, trigger));
+            return Ok(Some((slot as u16, trigger)));
         }
-        None
+        Ok(None)
     }
 }
 
@@ -886,12 +886,12 @@ impl WriteCompletion {
                     )?;
                 }
             }
-            if !has_statement_triggers(context, target, event, false) {
+            if !has_statement_triggers(context, target, event, false)? {
                 continue;
             }
             let start = context.txn.begin_after_statement_triggers(table, event)?;
             let mut cursor = StatementTriggerCursor::new();
-            while let Some((slot, trigger)) = cursor.next(context, target, event, false, columns) {
+            while let Some((slot, trigger)) = cursor.next(context, target, event, false, columns)? {
                 if row_trigger_when_passes(context, &trigger, relation, None, None)? {
                     context
                         .txn
@@ -1002,10 +1002,10 @@ pub(super) fn has_statement_triggers(
     target: crate::storage::TriggerTarget,
     event: u8,
     before: bool,
-) -> bool {
-    StatementTriggerCursor::new()
-        .next(context, target, event, before, ColumnSet::all(MAX_COLUMNS))
-        .is_some()
+) -> Result<bool, SqlError> {
+    Ok(StatementTriggerCursor::new()
+        .next(context, target, event, before, ColumnSet::all(MAX_COLUMNS))?
+        .is_some())
 }
 
 #[cfg(test)]

@@ -22654,7 +22654,8 @@ fn pg_constraint_values<'a>(
                 text(" ", arena)?,
                 Datum::Bool(info.constraint_parent.is_none()),
                 Datum::Int4(i32::from(info.constraint_parent.is_some())),
-                Datum::Bool(false),
+                // `index_constraint_create`: only a partition's copy inherits.
+                Datum::Bool(info.constraint_parent.is_none()),
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,

@@ -75,6 +75,31 @@ pub(crate) fn resolve<'a>(
     })
 }
 
+/// `enum_in`'s error, naming the type as `format_type_be` does: qualified
+/// unless its schema's search path finds it.
+pub(crate) fn invalid_input(
+    storage: &Storage,
+    txid: u32,
+    creation: crate::storage::TypeCreation,
+    label: &str,
+) -> SqlError {
+    let name = crate::sql::catalog::user_type_name_fixed(
+        storage,
+        txid,
+        crate::sql::types::oid::enum_oid(creation),
+    );
+    match name {
+        Ok(Some(name)) => sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "invalid input value for enum {}: \"{}\"",
+            name.as_str(),
+            label
+        ),
+        Ok(None) => sql_err!(sqlstate::INTERNAL_ERROR, "enum type has no catalog name"),
+        Err(error) => error,
+    }
+}
+
 pub(crate) fn sort(value: Datum<'_>, storage: &Storage, txid: u32) -> Result<f64, SqlError> {
     let Datum::Enum {
         slot,
@@ -311,14 +336,7 @@ pub(crate) fn bind_query<const N: usize>(
                             member.label.as_str() == label
                         }
                     })
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INVALID_TEXT_REPRESENTATION,
-                            "invalid input value for enum {}: \"{}\"",
-                            definition.name.as_str(),
-                            label
-                        )
-                    })?;
+                    .ok_or_else(|| invalid_input(storage, txid, definition.creation(), label))?;
                 if !legacy {
                     super::exec::ensure_enum_value_is_safe(storage, creation, label, txid)?;
                 }

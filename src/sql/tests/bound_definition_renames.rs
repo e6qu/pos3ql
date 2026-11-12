@@ -111,3 +111,24 @@ fn assert_recovered(prefix: &str, setup: &str, probe: &str, expected: &[&str]) {
         std::fs::remove_dir_all(&config.data_dir).unwrap();
     }
 }
+
+/// `enum_in` names the type as `format_type_be` does, qualified when the
+/// search path does not find it.
+#[test]
+fn enum_input_errors_qualify_types_off_the_search_path() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA es; CREATE TYPE es.e AS ENUM ('a'); CREATE TABLE et (x es.e, t text); \
+         INSERT INTO et VALUES ('a', 'c')",
+    );
+    for statement in ["INSERT INTO et VALUES ('b')", "SELECT t::es.e FROM et"] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("invalid input value for enum es.e: \""),
+            "{statement}: {text}"
+        );
+    }
+}

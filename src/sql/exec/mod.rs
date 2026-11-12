@@ -82606,11 +82606,11 @@ pub(crate) fn coerce_enum_value<'a>(
         .members()
         .position(|member| member.label.as_str() == label)
     else {
-        return Err(sql_err!(
-            sqlstate::INVALID_TEXT_REPRESENTATION,
-            "invalid input value for enum {}: \"{}\"",
-            def.name.as_str(),
-            label
+        return Err(super::enum_values::invalid_input(
+            storage,
+            txid,
+            def.creation(),
+            label,
         ));
     };
     ensure_enum_value_is_safe(storage, slot, label, txid)?;

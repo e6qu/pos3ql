@@ -247,12 +247,7 @@ fn bind_expression<const N: usize>(
                         }
                     })
                     .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INVALID_TEXT_REPRESENTATION,
-                            "invalid input value for enum {}: \"{}\"",
-                            definition.name.as_str(),
-                            label
-                        )
+                        super::invalid_input(storage, txid, definition.creation(), label)
                     })?;
                 if !legacy {
                     crate::sql::exec::ensure_enum_value_is_safe(storage, slot, label, txid)?;

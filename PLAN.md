@@ -302,7 +302,14 @@ constraints keep routine and type names as SQL text, so renaming or moving a
 routine or type one of them names, or renaming an enum value it casts to,
 fails with `0A000` (PostgreSQL stores them bound by OID and follows the
 rename); views, rules, policies and SQL-standard routine bodies are bound and
-follow it. Renaming an enum value that a cast literal in a SQL-standard routine
+follow it. Those expressions also resolve unqualified names under the
+session's search path when they run, so `CHECK (f(v) > 0)` created with
+`search_path = s` fails with `42883` once the path lacks `s`. Binding them
+means storing, with each expression, the dependency list captured under the
+creator's path (as `stored_query_dependencies` does for views and policies),
+binding it with `bind_stored_expression` wherever it is evaluated or printed,
+journaling and checkpointing that list with its owner, and then dropping the
+rename refusals. Renaming an enum value that a cast literal in a SQL-standard routine
 body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
 call fails with `22P02`. An index key whose value is a row
 (`CREATE INDEX ON t ((t))`) fails with `0A000`, since row values have no stored
@@ -313,7 +320,18 @@ names from the stored query text. A
 partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
 its parent's plain unique index, so attaching such a partition builds a
 separate copy where PostgreSQL reuses the constraint's index; constraint
-indexes need a durable link to a parent index first. `pg_get_viewdef` uses PostgreSQL's
+indexes need a durable link to a parent index first. A partitioned table's
+multi-column `UNIQUE` constraint has its index but no `pg_constraint` row, and
+a child's inherited `NOT NULL` constraint is named after the child
+(`c_k_not_null`) where PostgreSQL keeps the parent's name. `CHECK ... NO
+INHERIT` fails with `42601`; an exclusion constraint over a B-tree index fails
+with `42601`, and `box` has no default GiST operator class. `ALTER TABLE ...
+CLUSTER ON` and `REPLICA IDENTITY USING INDEX` reject an index that backs a
+`PRIMARY KEY` or `UNIQUE` constraint (`42704`), since those indexes have no
+separate index slot to mark. A view's `reloptions` list `security_barrier`
+before `check_option` and omit `security_invoker=false`, where PostgreSQL keeps
+the options as written; keeping them needs the written order in the view's
+journal records and checkpoint image. `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their

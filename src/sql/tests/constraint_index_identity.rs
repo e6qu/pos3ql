@@ -851,3 +851,33 @@ fn constraint_identities_survive_replaced_indexes_and_keep_exact_catalog_edges()
         );
     }
 }
+
+/// PostgreSQL's `index_constraint_create` marks a key constraint
+/// non-inheritable unless it is a partition's copy of its parent's.
+#[test]
+fn key_constraints_are_noinherit_unless_copied_to_a_partition() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE ni (k int PRIMARY KEY, u int UNIQUE); \
+         CREATE TABLE ni_part (k int PRIMARY KEY) PARTITION BY RANGE (k); \
+         CREATE TABLE ni_part1 PARTITION OF ni_part FOR VALUES FROM (0) TO (10)",
+    );
+    assert!(error_sqlstates(&output).is_empty(), "{output:?}");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT conname, connoinherit, conislocal, coninhcount FROM pg_constraint \
+             WHERE conrelid IN ('ni'::regclass, 'ni_part'::regclass, 'ni_part1'::regclass) \
+             AND contype IN ('p', 'u') ORDER BY conname",
+        )),
+        [
+            "ni_part1_pkey|f|f|1",
+            "ni_part_pkey|t|t|0",
+            "ni_pkey|t|t|0",
+            "ni_u_key|t|t|0",
+        ]
+    );
+}

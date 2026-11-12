@@ -995,6 +995,99 @@ fn append_rule_input_from<'a>(
     Ok(FromClause { base, joins })
 }
 
+/// A query whose FROM and expressions are those of a data-modifying
+/// statement's own scope (its target under its alias, `FROM`/`USING` sources,
+/// and `excluded` for ON CONFLICT), for parameter type inference only: its
+/// items are the assignments, conflict and RETURNING expressions and its
+/// WHERE the statement's conditions. It is never executed.
+pub(crate) fn dml_parameter_scope_query<'a>(
+    statement: &Stmt<'a>,
+    arena: &'a Arena,
+) -> Result<Option<&'a Select<'a>>, SqlError> {
+    let (target, alias, extra, assignments, condition, returning, excluded) = match statement {
+        Stmt::Update(update) => (
+            update.table,
+            update.alias,
+            update.from,
+            update.assignments,
+            update.where_clause,
+            update.returning,
+            false,
+        ),
+        Stmt::Delete(delete) => (
+            delete.table,
+            delete.alias,
+            delete.using,
+            &[][..],
+            delete.where_clause,
+            delete.returning,
+            false,
+        ),
+        Stmt::Insert(insert) => (
+            insert.table,
+            insert.alias,
+            None,
+            insert
+                .on_conflict
+                .and_then(|conflict| conflict.update)
+                .unwrap_or(&[]),
+            insert
+                .on_conflict
+                .and_then(|conflict| conflict.update_where),
+            insert.returning,
+            insert
+                .on_conflict
+                .is_some_and(|conflict| conflict.update.is_some()),
+        ),
+        _ => return Ok(None),
+    };
+    let returned = returning
+        .items
+        .iter()
+        .filter(|item| matches!(item, SelectItem::Expr { .. } | SelectItem::RecordStar(_)))
+        .count();
+    if assignments.is_empty() && condition.is_none() && returned == 0 {
+        return Ok(None);
+    }
+    let mut from = append_rule_input_from(rule_relation_ref(target, alias), extra, arena)?;
+    if excluded {
+        let joins = arena
+            .alloc_slice_with(from.joins.len() + 1, |index| {
+                if index < from.joins.len() {
+                    from.joins[index]
+                } else {
+                    Join {
+                        table: rule_relation_ref(target, Some("excluded")),
+                        kind: JoinKind::Comma,
+                        on: None,
+                        using: None,
+                        natural: false,
+                    }
+                }
+            })
+            .map_err(|_| arena_full())?;
+        from.joins = joins;
+    }
+    let mut items: ArenaList<'a, SelectItem<'a>> = ArenaList::new(arena);
+    for (_, expression) in assignments {
+        items
+            .push(SelectItem::Expr {
+                expression,
+                alias: None,
+            })
+            .map_err(|_| arena_full())?;
+    }
+    for item in returning.items {
+        if matches!(item, SelectItem::Expr { .. } | SelectItem::RecordStar(_)) {
+            items.push(*item).map_err(|_| arena_full())?;
+        }
+    }
+    let select = arena
+        .alloc(rule_select(items.as_slice(), Some(from), condition))
+        .map_err(|_| arena_full())?;
+    Ok(Some(&*select))
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RuleTransitionSource<'a> {
     pub source: TableRef<'a>,
@@ -5660,6 +5753,7 @@ fn subst_insert<'a>(
     Ok(Insert {
         source_position: statement.source_position,
         table: rewrite_stored_relation_name(statement.table, context, arena)?,
+        alias: statement.alias,
         columns: statement.columns,
         rows,
         select,

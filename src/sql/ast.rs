@@ -5124,6 +5124,9 @@ impl<'a> Returning<'a> {
 pub struct Insert<'a> {
     pub source_position: SourcePosition,
     pub table: QualName<'a>,
+    /// `INSERT INTO t AS alias`: the target's only name in ON CONFLICT and
+    /// RETURNING once given.
+    pub alias: Option<&'a str>,
     /// Empty means "all columns in table order".
     pub columns: &'a [&'a str],
     /// `VALUES` rows. Empty when the source is a `SELECT` (`select` is set).

@@ -6050,6 +6050,8 @@ fn find_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
 /// names to the arena-owned outer snapshot.
 struct ExcludedCtx<'o, 's, 'e, 'x, 'v, 'd> {
     def: crate::storage::RelationDefinition<'d>,
+    /// `INSERT INTO t AS alias`: the target's only name.
+    alias: Option<&'x str>,
     existing: &'e [Datum<'v>],
     excluded: &'x [Datum<'v>],
     outer: Option<&'o TriggerDmlSnapshot<'s>>,
@@ -6099,7 +6101,7 @@ where
         RowCtx {
             def: self.def,
             values: self.existing,
-            alias: None,
+            alias: self.alias,
         }
         .resolve_column_type(qualifier, name)
     }
@@ -6128,12 +6130,10 @@ where
                 .lookup(qualifier, name);
         } else {
             if let Some(q) = qualifier
-                && !crate::sql::eval::qualifier_answers_single(self.def, q)
+                && !crate::sql::eval::qualifier_answers_target(self.def, self.alias, q)
             {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "missing FROM-clause entry for table \"{}\"",
-                    q
+                return Err(crate::sql::eval::unknown_target_qualifier(
+                    self.def, self.alias, q,
                 ));
             }
             self.existing
@@ -6272,6 +6272,7 @@ fn handle_conflict<
     schema: &[ColType],
     values: &[Datum<'a>],
     on_conflict: &Option<super::ast::OnConflict<'a>>,
+    alias: Option<&'a str>,
     arbiter: &Arbiter<'a>,
     checks: &ParsedChecks,
     view_check: Option<ViewCheck<'a>>,
@@ -6377,6 +6378,7 @@ where
         )?;
         let context = ExcludedCtx {
             def: crate::storage::RelationDefinition::from_definition(logical_definition),
+            alias,
             existing: logical_existing,
             excluded: logical_excluded,
             outer,
@@ -68578,6 +68580,7 @@ where
                     &schema[..definition.n_columns],
                     &values[..definition.n_columns],
                     &statement.on_conflict,
+                    statement.alias,
                     arbiter,
                     checks,
                     view_check,
@@ -68617,6 +68620,7 @@ where
                                 storage,
                                 txn,
                                 logical_definition,
+                                statement.alias,
                                 new,
                                 statement.returning,
                                 Some(old),
@@ -68727,7 +68731,7 @@ where
                         storage,
                         txn,
                         logical_definition,
-                        None,
+                        statement.alias,
                         logical_values,
                         statement.returning,
                         None,
@@ -69927,14 +69931,20 @@ where
         return sql_fail(error);
     }
     let conflict_read_columns = match (|| -> Result<ColumnSet, SqlError> {
-        let mut columns =
-            returning_dml_target_columns(statement.returning, def, None, storage, txn.txid, arena)?;
+        let mut columns = returning_dml_target_columns(
+            statement.returning,
+            def,
+            statement.alias,
+            storage,
+            txn.txid,
+            arena,
+        )?;
         if let Some(conflict) = statement.on_conflict {
             for target in conflict.target {
                 columns |= expression_dml_target_columns(
                     target.expression,
                     def,
-                    None,
+                    statement.alias,
                     storage,
                     txn.txid,
                     arena,
@@ -69943,13 +69953,24 @@ where
             if let Some(assignments) = conflict.update {
                 for (_, expression) in assignments {
                     columns |= expression_dml_target_columns(
-                        expression, def, None, storage, txn.txid, arena,
+                        expression,
+                        def,
+                        statement.alias,
+                        storage,
+                        txn.txid,
+                        arena,
                     )?;
                 }
             }
             if let Some(expression) = conflict.update_where {
-                columns |=
-                    expression_dml_target_columns(expression, def, None, storage, txn.txid, arena)?;
+                columns |= expression_dml_target_columns(
+                    expression,
+                    def,
+                    statement.alias,
+                    storage,
+                    txn.txid,
+                    arena,
+                )?;
             }
         }
         Ok(columns)
@@ -70083,7 +70104,7 @@ where
         match describe_returning_items(
             statement.returning,
             Some(def),
-            None,
+            statement.alias,
             Some(storage),
             txn.txid,
             arena,
@@ -70558,6 +70579,7 @@ fn emit_conflict_returning<Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     txn: &TxnState,
     def: &crate::storage::TableDefinition<Definition0>,
+    alias: Option<&str>,
     row_bytes: &[u8],
     returning: crate::sql::ast::Returning<'_>,
     old: Option<&[Datum]>,
@@ -70577,7 +70599,7 @@ fn emit_conflict_returning<Definition0: crate::storage::DefinitionBacking>(
         storage,
         txn,
         def,
-        None,
+        alias,
         &updated[..def.n_columns],
         returning,
         old,

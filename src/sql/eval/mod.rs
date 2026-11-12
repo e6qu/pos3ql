@@ -1329,6 +1329,36 @@ pub fn qualifier_answers_target(
     }
 }
 
+/// PostgreSQL's error for `qualifier`, which names no source of a DML
+/// statement whose only source is its target: the target's own name hidden
+/// by `alias` is out of reach, with a hint naming the alias.
+pub(crate) fn unknown_target_qualifier(
+    def: crate::storage::RelationDefinition<'_>,
+    alias: Option<&str>,
+    qualifier: &str,
+) -> SqlError {
+    match alias {
+        Some(alias) if qualifier_answers_single(def, qualifier) => {
+            crate::sql::error_position::with_computed_hint(
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    qualifier
+                ),
+                format_args!(
+                    "Perhaps you meant to reference the table alias \"{}\".",
+                    alias
+                ),
+            )
+        }
+        _ => sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "missing FROM-clause entry for table \"{}\"",
+            qualifier
+        ),
+    }
+}
+
 pub struct NoColumns;
 
 /// The column lookup a parameter reference skips when its variable wins: it

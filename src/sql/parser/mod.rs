@@ -7925,6 +7925,11 @@ impl<'a> Parser<'a> {
         self.expect_ident("insert")?;
         self.expect_ident("into")?;
         let table = self.qual_name("table name")?;
+        let alias = if self.eat_ident("as")? {
+            Some(self.col_ident("table alias")?)
+        } else {
+            None
+        };
         // `(` starts the column list unless it opens a parenthesized query.
         let targets = if self.peeked == Tok::Op("(")
             && !matches!(
@@ -8114,6 +8119,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Insert(Insert {
             source_position,
             table,
+            alias,
             columns,
             rows: rows.as_slice(),
             select,

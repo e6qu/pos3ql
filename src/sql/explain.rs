@@ -1442,7 +1442,7 @@ pub(super) fn plan_modification<'a>(
             false,
             insert.select,
             None,
-            None,
+            insert.alias,
             false,
         ),
         Stmt::Update(update) => (

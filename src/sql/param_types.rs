@@ -84,6 +84,10 @@ impl ParameterInference<'_> {
                 if let Some(select) = insert.select {
                     self.infer_resolved_select_params(select, txid, arena, oids);
                 }
+                self.infer_dml_scope_params(statement, txid, arena, oids);
+            }
+            Stmt::Update(_) | Stmt::Delete(_) => {
+                self.infer_dml_scope_params(statement, txid, arena, oids);
             }
             Stmt::Call {
                 name,
@@ -145,6 +149,20 @@ impl ParameterInference<'_> {
                 self.infer_resolved_set_tree_params(left, txid, arena, oids);
                 self.infer_resolved_set_tree_params(right, txid, arena, oids);
             }
+        }
+    }
+
+    /// Parameters in a data-modifying statement's own expressions, typed
+    /// against the target's columns as a query over the same scope would.
+    fn infer_dml_scope_params<'a>(
+        &'a self,
+        statement: &'a Stmt<'a>,
+        txid: u32,
+        arena: &'a Arena,
+        oids: &mut [i32],
+    ) {
+        if let Ok(Some(select)) = query::dml_parameter_scope_query(statement, arena) {
+            self.infer_resolved_select_params(select, txid, arena, oids);
         }
     }
 
@@ -434,6 +452,15 @@ impl ParameterInference<'_> {
                 }
                 if let Some(select) = ins.select {
                     self.infer_select_source_params(select, txid, oids);
+                }
+                for (column, value) in ins
+                    .on_conflict
+                    .and_then(|conflict| conflict.update)
+                    .unwrap_or(&[])
+                {
+                    if let Some(ty) = self.parameter_type_oid(&ins.table, column, txid) {
+                        set(oids, value, ty);
+                    }
                 }
             }
             Stmt::Update(u) => {

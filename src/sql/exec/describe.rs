@@ -335,7 +335,7 @@ pub(crate) fn describe_data_modification_columns<'a>(
     let (target, returning, target_alias, from) = match statement {
         Stmt::Insert(insert) => {
             let insert = *insert;
-            (insert.table, insert.returning, None, None)
+            (insert.table, insert.returning, insert.alias, None)
         }
         Stmt::Update(update) => {
             let update = *update;
@@ -365,7 +365,7 @@ pub(crate) fn describe_data_modification_columns<'a>(
                     arena,
                 )?;
                 let (returning, target_alias, from) = match rewritten {
-                    Stmt::Insert(insert) => (insert.returning, None, None),
+                    Stmt::Insert(insert) => (insert.returning, insert.alias, None),
                     Stmt::Update(update) => (update.returning, update.alias, update.from),
                     Stmt::Delete(delete) => (delete.returning, delete.alias, delete.using),
                     _ => unreachable!("view rewrite keeps its statement kind"),
@@ -4163,10 +4163,10 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
             && !self.output_aliases.contains(&qualifier)
             && !crate::sql::eval::qualifier_answers_target(self.definition, self.alias, qualifier)
         {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "missing FROM-clause entry for table \"{}\"",
-                qualifier
+            return Err(crate::sql::eval::unknown_target_qualifier(
+                self.definition,
+                self.alias,
+                qualifier,
             ));
         }
         self.definition

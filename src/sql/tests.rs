@@ -28284,6 +28284,20 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
         )
         .unwrap();
     assert_eq!(inferred[..2], [domain_oid, enum_oid]);
+    // Parameters inside a data-modifying statement's own expressions take
+    // the type their target-scope operands give them, through an alias too.
+    let inferred = engine
+        .infer_param_types(
+            "UPDATE protocol_types AS t SET count = t.count + $1 \
+             WHERE t.count + $2 > 0 RETURNING t.count * $3",
+            &arena,
+            &transaction,
+            3,
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(inferred[..3], [crate::sql::types::oid::INT4; 3]);
     let inferred = engine
         .infer_param_types(
             "SELECT p.state, count(*) FROM protocol_types p \

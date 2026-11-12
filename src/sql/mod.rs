@@ -15490,6 +15490,7 @@ impl Engine {
                             let rewritten = match arena.alloc(Insert {
                                 source_position: rewritten.source_position,
                                 table: view.base,
+                                alias: rewritten.alias,
                                 columns,
                                 rows: rewritten.rows,
                                 select: rewritten.select,

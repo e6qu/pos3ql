@@ -291,7 +291,15 @@ read. Remaining: a PL/pgSQL write with `WITH` queries whose nested AFTER
 trigger waits fails with `0A000` instead of resuming; and a data-modifying
 `WITH` query runs whole before the main query reads it, so a trigger's or
 called function's notices arrive in a different order than PostgreSQL's
-interleaved execution. A `LATERAL` item on the right of
+interleaved execution. `ALTER TABLE` subcommands other than column, constraint and
+storage-option ones (`ENABLE TRIGGER`, `SET LOGGED`, `CLUSTER ON`, `INHERIT`,
+`OF`, `REPLICA IDENTITY`, row security) must be written alone, where
+PostgreSQL accepts them in a comma-separated list, and `ALTER TABLE` on a view
+rejects view options (`SET (security_barrier = true)`) as unknown storage
+parameters. A set operation's type or column-count error and a misplaced
+`DEFAULT` are reported without their cursor position. A cursor whose query
+cannot stream runs it at `DECLARE` or `OPEN`, so a volatile function's side
+effects happen before the first `FETCH` rather than at it. A `LATERAL` item on the right of
 a `RIGHT` or `FULL` join that reads only FROM items outside that join
 (`SELECT * FROM b, a RIGHT JOIN LATERAL (SELECT b.y) s ON true`) fails with
 `0A000` where PostgreSQL accepts it. A derived table computes output

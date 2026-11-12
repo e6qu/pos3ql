@@ -5435,7 +5435,7 @@ fn eval_full_inner<'a>(
         }
         Expr::DefaultMarker => Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
-            "DEFAULT is only allowed as a DML assignment value"
+            "DEFAULT is not allowed in this context"
         )),
         Expr::Subquery(_) | Expr::RowSubquery { .. } | Expr::ArraySubquery(_) => {
             if let Some(subs) = hooks.subs {

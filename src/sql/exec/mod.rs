@@ -3102,6 +3102,28 @@ pub(crate) fn alter_foreign_table(
     runtime: ForeignTableAlterRuntime<'_>,
     responder: &mut Responder,
 ) -> Outcome {
+    alter_foreign_table_as(
+        storage,
+        wal,
+        txn,
+        statement,
+        runtime,
+        responder,
+        "ALTER FOREIGN TABLE",
+    )
+}
+
+/// `ALTER FOREIGN TABLE`, or `ALTER TABLE` naming a foreign table, which
+/// completes with its own tag.
+fn alter_foreign_table_as(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    statement: &AlterTable<'_>,
+    runtime: ForeignTableAlterRuntime<'_>,
+    responder: &mut Responder,
+    tag: &'static str,
+) -> Outcome {
     let ForeignTableAlterRuntime {
         scratch,
         arena,
@@ -3125,7 +3147,7 @@ pub(crate) fn alter_foreign_table(
                     )
                     .as_str(),
                 )?;
-                responder.command_complete("ALTER FOREIGN TABLE")?;
+                responder.command_complete(tag)?;
                 return sql_ok();
             }
             Some(_) => {
@@ -3141,6 +3163,13 @@ pub(crate) fn alter_foreign_table(
         storage.table_access_object(table, txn.txid),
         txn.txid,
         "foreign table",
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = require_alter_actions_supported(
+        statement.actions,
+        AlterRelationKind::ForeignTable,
+        statement.table.name,
     ) {
         return sql_fail(error);
     }
@@ -3234,7 +3263,7 @@ pub(crate) fn alter_foreign_table(
             responder,
             false,
             Some(crate::storage::TableKind::Foreign),
-            "ALTER FOREIGN TABLE",
+            tag,
             AlterInheritanceScope::Direct,
         ) {
             Ok(Ok(())) => {}
@@ -3264,7 +3293,7 @@ pub(crate) fn alter_foreign_table(
             return sql_fail(error);
         }
     }
-    responder.command_complete("ALTER FOREIGN TABLE")?;
+    responder.command_complete(tag)?;
     sql_ok()
 }
 
@@ -7709,12 +7738,7 @@ pub(crate) fn alter_materialized_view(
         None if if_exists => {
             responder.notice(
                 sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(
-                    160,
-                    "materialized view \"{}\" does not exist, skipping",
-                    name.name
-                )
-                .as_str(),
+                stack_format!(160, "relation \"{}\" does not exist, skipping", name.name).as_str(),
             )?;
             responder.command_complete("ALTER MATERIALIZED VIEW")?;
             return sql_ok();
@@ -43354,6 +43378,321 @@ fn stored_query_uses_temporary_relation(
         })
 }
 
+/// The relation kinds PostgreSQL's `ALTER TABLE` subcommands distinguish
+/// beyond ordinary tables.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlterRelationKind {
+    Table,
+    PartitionedTable,
+    View,
+    MaterializedView,
+    ForeignTable,
+}
+
+/// PostgreSQL's name for an `ALTER TABLE` subcommand and whether it may run
+/// on a view or a materialized view (`ATSimplePermissions`).
+fn alter_action_support(action: &AlterAction<'_>) -> (&'static str, bool, bool, bool) {
+    use crate::sql::ast::{RowLevelSecurityAlteration, TriggerEnableMode, TriggerEnableTarget};
+    match action {
+        AlterAction::RenameTable(_)
+        | AlterAction::RenameColumn { .. }
+        | AlterAction::SetSchema(_) => ("", true, true, true),
+        AlterAction::RenameConstraint { .. } => ("RENAME CONSTRAINT", true, true, true),
+        AlterAction::SetForeignOptions(_) => ("OPTIONS", false, false, true),
+        AlterAction::SetColumnForeignOptions { .. } => {
+            ("ALTER COLUMN ... OPTIONS", false, false, true)
+        }
+        AlterAction::AddColumn { .. } => ("ADD COLUMN", false, false, true),
+        AlterAction::DropColumn { .. } => ("DROP COLUMN", false, false, true),
+        AlterAction::SetDefault { .. } | AlterAction::DropDefault { .. } => {
+            ("ALTER COLUMN ... SET DEFAULT", true, false, true)
+        }
+        AlterAction::AddIdentity { .. } => ("ALTER COLUMN ... ADD IDENTITY", true, false, true),
+        AlterAction::DropIdentity { .. } => ("ALTER COLUMN ... DROP IDENTITY", true, false, true),
+        AlterAction::SetIdentityMode { .. } | AlterAction::AlterIdentitySequence { .. } => {
+            ("ALTER COLUMN ... SET", true, false, true)
+        }
+        AlterAction::SetGeneratedExpression { .. } => {
+            ("ALTER COLUMN ... SET EXPRESSION", false, false, true)
+        }
+        AlterAction::DropGeneratedExpression { .. } => {
+            ("ALTER COLUMN ... DROP EXPRESSION", false, false, true)
+        }
+        AlterAction::SetNotNull { .. } | AlterAction::SetNotNullInheritance { .. } => {
+            ("ALTER COLUMN ... SET NOT NULL", false, false, true)
+        }
+        AlterAction::DropNotNull { .. } => ("ALTER COLUMN ... DROP NOT NULL", false, false, true),
+        AlterAction::SetStatistics { .. } => ("ALTER COLUMN ... SET STATISTICS", false, true, true),
+        AlterAction::SetStatisticsOptions { .. } => ("ALTER COLUMN ... SET", false, true, true),
+        AlterAction::ResetStatisticsOptions { .. } => ("ALTER COLUMN ... RESET", false, true, true),
+        AlterAction::SetStorage { .. } | AlterAction::ResetStorage { .. } => {
+            ("ALTER COLUMN ... SET STORAGE", false, true, true)
+        }
+        AlterAction::SetCompression { .. } => {
+            ("ALTER COLUMN ... SET COMPRESSION", false, true, false)
+        }
+        AlterAction::AlterColumnType { .. } => {
+            ("ALTER COLUMN ... SET DATA TYPE", false, false, true)
+        }
+        AlterAction::AddConstraint(_) | AlterAction::AttachIndexConstraint { .. } => {
+            ("ADD CONSTRAINT", false, false, true)
+        }
+        AlterAction::DropConstraint { .. } => ("DROP CONSTRAINT", false, false, true),
+        AlterAction::AlterConstraint { .. } => ("ALTER CONSTRAINT", false, false, false),
+        AlterAction::ValidateConstraint(_) => ("VALIDATE CONSTRAINT", false, false, true),
+        AlterAction::SetTriggerEnabled { target, enabled } => (
+            match (target, enabled) {
+                (TriggerEnableTarget::All, TriggerEnableMode::Disabled) => "DISABLE TRIGGER ALL",
+                (TriggerEnableTarget::All, _) => "ENABLE TRIGGER ALL",
+                (TriggerEnableTarget::User, TriggerEnableMode::Disabled) => "DISABLE TRIGGER USER",
+                (TriggerEnableTarget::User, _) => "ENABLE TRIGGER USER",
+                (TriggerEnableTarget::Name(_), TriggerEnableMode::Origin) => "ENABLE TRIGGER",
+                (TriggerEnableTarget::Name(_), TriggerEnableMode::Always) => {
+                    "ENABLE ALWAYS TRIGGER"
+                }
+                (TriggerEnableTarget::Name(_), TriggerEnableMode::Replica) => {
+                    "ENABLE REPLICA TRIGGER"
+                }
+                (TriggerEnableTarget::Name(_), TriggerEnableMode::Disabled) => "DISABLE TRIGGER",
+            },
+            false,
+            false,
+            true,
+        ),
+        AlterAction::SetRuleEnabled { enabled, .. } => (
+            match enabled {
+                TriggerEnableMode::Origin => "ENABLE RULE",
+                TriggerEnableMode::Always => "ENABLE ALWAYS RULE",
+                TriggerEnableMode::Replica => "ENABLE REPLICA RULE",
+                TriggerEnableMode::Disabled => "DISABLE RULE",
+            },
+            false,
+            false,
+            false,
+        ),
+        AlterAction::SetRowLevelSecurity(alteration) => (
+            match alteration {
+                RowLevelSecurityAlteration::Enable => "ENABLE ROW SECURITY",
+                RowLevelSecurityAlteration::Disable => "DISABLE ROW SECURITY",
+                RowLevelSecurityAlteration::Force => "FORCE ROW SECURITY",
+                RowLevelSecurityAlteration::NoForce => "NO FORCE ROW SECURITY",
+            },
+            false,
+            false,
+            false,
+        ),
+        AlterAction::SetPersistence(persistence) => (
+            if *persistence == crate::sql::ast::RelationPersistence::Unlogged {
+                "SET UNLOGGED"
+            } else {
+                "SET LOGGED"
+            },
+            false,
+            false,
+            false,
+        ),
+        AlterAction::SetStorageOptions(_) => ("SET", true, true, false),
+        AlterAction::ResetStorageOptions(_) => ("RESET", true, true, false),
+        AlterAction::SetInheritance { inherit, .. } => (
+            if *inherit { "INHERIT" } else { "NO INHERIT" },
+            false,
+            false,
+            true,
+        ),
+        AlterAction::SetTablespace(_) => ("SET TABLESPACE", false, true, false),
+        AlterAction::SetAccessMethod(_) | AlterAction::ResetAccessMethod => {
+            ("SET ACCESS METHOD", false, true, false)
+        }
+        AlterAction::SetCluster(_) => ("CLUSTER ON", false, true, false),
+        AlterAction::ClearCluster => ("SET WITHOUT CLUSTER", false, true, false),
+        AlterAction::SetWithoutOids => ("SET WITHOUT OIDS", false, false, true),
+        AlterAction::SetTypeMembership(of) => (
+            if of.is_some() { "OF" } else { "NOT OF" },
+            false,
+            false,
+            false,
+        ),
+        AlterAction::SetReplicaIdentity(_) => ("REPLICA IDENTITY", false, true, false),
+        AlterAction::AttachPartition { .. } => ("ATTACH PARTITION", false, false, false),
+        AlterAction::DetachPartition { .. } => ("DETACH PARTITION", false, false, false),
+    }
+}
+
+/// Rejects, before any of them runs, the first subcommand PostgreSQL does
+/// not perform on a relation of `kind`.
+pub(crate) fn require_alter_actions_supported(
+    actions: &[AlterAction<'_>],
+    kind: AlterRelationKind,
+    relation: &str,
+) -> Result<(), SqlError> {
+    for action in actions {
+        let (name, view, materialized_view, foreign_table) = alter_action_support(action);
+        let supported = match kind {
+            // Only foreign tables have generic options.
+            AlterRelationKind::Table | AlterRelationKind::PartitionedTable => !matches!(
+                action,
+                AlterAction::SetForeignOptions(_) | AlterAction::SetColumnForeignOptions { .. }
+            ),
+            AlterRelationKind::View => view,
+            AlterRelationKind::MaterializedView => materialized_view,
+            AlterRelationKind::ForeignTable => foreign_table,
+        };
+        if !supported {
+            crate::sql::eval::stash_diagnostic(
+                Some(crate::util::StackStr::from_str(match kind {
+                    AlterRelationKind::Table => "This operation is not supported for tables.",
+                    AlterRelationKind::PartitionedTable => {
+                        "This operation is not supported for partitioned tables."
+                    }
+                    AlterRelationKind::View => "This operation is not supported for views.",
+                    AlterRelationKind::MaterializedView => {
+                        "This operation is not supported for materialized views."
+                    }
+                    AlterRelationKind::ForeignTable => {
+                        "This operation is not supported for foreign tables."
+                    }
+                })),
+                None,
+            );
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "ALTER action {} cannot be performed on relation \"{}\"",
+                name,
+                relation
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Runs `ALTER TABLE` subcommands PostgreSQL permits on a view, after
+/// [`require_alter_actions_supported`]; they share one completion.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn alter_view_table_actions(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: QualName<'_>,
+    slot: usize,
+    actions: &[AlterAction<'_>],
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::sql::ast::AlterViewAction;
+    let relation_column_missing = |column: &str| {
+        sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" of relation \"{}\" does not exist",
+            column,
+            name.name
+        )
+    };
+    for action in actions {
+        let action = match *action {
+            AlterAction::SetDefault {
+                column, value_text, ..
+            } => AlterViewAction::SetDefault {
+                column,
+                expression: value_text,
+            },
+            AlterAction::DropDefault { column } => AlterViewAction::DropDefault { column },
+            AlterAction::RenameColumn { from, to } => AlterViewAction::RenameColumn { from, to },
+            AlterAction::RenameTable(to) => AlterViewAction::RenameTo(to),
+            AlterAction::SetSchema(schema) => AlterViewAction::SetSchema(schema),
+            AlterAction::RenameConstraint { from, .. } => {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "constraint \"{}\" for table \"{}\" does not exist",
+                    from,
+                    name.name
+                ));
+            }
+            // A view has no storage parameters; resetting one is a no-op.
+            AlterAction::ResetStorageOptions(_) => continue,
+            AlterAction::SetStorageOptions(options) => {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unrecognized parameter \"{}\"",
+                    if options.fillfactor.is_some() {
+                        "fillfactor"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            // Identity subcommands reach their columns, which on a view are
+            // never NOT NULL and never identities.
+            AlterAction::AddIdentity { column, .. }
+            | AlterAction::DropIdentity { column, .. }
+            | AlterAction::SetIdentityMode { column, .. }
+            | AlterAction::AlterIdentitySequence { column, .. } => {
+                if !storage
+                    .view(slot)
+                    .columns_for(txn.txid)
+                    .names()
+                    .iter()
+                    .any(|stored| stored.as_str() == column)
+                {
+                    return sql_fail(relation_column_missing(column));
+                }
+                if let AlterAction::DropIdentity {
+                    if_exists: true, ..
+                } = action
+                {
+                    responder.notice(
+                        sqlstate::SUCCESSFUL_COMPLETION,
+                        stack_format!(
+                            192,
+                            "column \"{}\" of relation \"{}\" is not an identity column, skipping",
+                            column,
+                            name.name
+                        )
+                        .as_str(),
+                    )?;
+                    continue;
+                }
+                return sql_fail(if matches!(action, AlterAction::AddIdentity { .. }) {
+                    sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column \"{}\" of relation \"{}\" must be declared NOT NULL before identity can be added",
+                        column,
+                        name.name
+                    )
+                } else {
+                    sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column \"{}\" of relation \"{}\" is not an identity column",
+                        column,
+                        name.name
+                    )
+                });
+            }
+            _ => {
+                return sql_fail(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "unchecked ALTER subcommand reached a view"
+                ));
+            }
+        };
+        if let Err(error) = alter_view_inner(
+            storage,
+            wal,
+            txn,
+            AlterViewCommand {
+                name,
+                if_exists: false,
+                action,
+            },
+            arena,
+            responder,
+            false,
+        )? {
+            return sql_fail(error);
+        }
+    }
+    sql_ok()
+}
+
 /// Applies the view options whose behavior is already modeled by the stored
 /// query execution boundary.  Every other PostgreSQL spelling reaches a
 /// closed AST variant and fails before it can create catalog state that the
@@ -43365,6 +43704,18 @@ pub fn alter_view(
     command: AlterViewCommand<'_>,
     arena: &Arena,
     responder: &mut Responder,
+) -> Outcome {
+    alter_view_inner(storage, wal, txn, command, arena, responder, true)
+}
+
+fn alter_view_inner(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: AlterViewCommand<'_>,
+    arena: &Arena,
+    responder: &mut Responder,
+    complete: bool,
 ) -> Outcome {
     use crate::sql::ast::{AlterViewAction, ViewOption, ViewOptionName};
     let AlterViewCommand {
@@ -43386,9 +43737,11 @@ pub fn alter_view(
         {
             responder.notice(
                 sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(160, "view \"{}\" does not exist, skipping", name.name).as_str(),
+                stack_format!(160, "relation \"{}\" does not exist, skipping", name.name).as_str(),
             )?;
-            responder.command_complete("ALTER VIEW")?;
+            if complete {
+                responder.command_complete("ALTER VIEW")?;
+            }
             return sql_ok();
         }
         return sql_fail(
@@ -43424,9 +43777,27 @@ pub fn alter_view(
     ) {
         return sql_fail(error);
     }
+    if let AlterViewAction::TableActions(actions) = action {
+        if let Err(error) =
+            require_alter_actions_supported(actions, AlterRelationKind::View, name.name)
+        {
+            return sql_fail(error);
+        }
+        if let Err(error) =
+            alter_view_table_actions(storage, wal, txn, name, slot, actions, arena, responder)?
+        {
+            return sql_fail(error);
+        }
+        if complete {
+            responder.command_complete("ALTER VIEW")?;
+        }
+        return sql_ok();
+    }
     if let crate::sql::ast::AlterViewAction::SetSchema(new_schema) = action {
         if new_schema == storage.view(slot).schema_for(txn.txid).as_str() {
-            responder.command_complete("ALTER VIEW")?;
+            if complete {
+                responder.command_complete("ALTER VIEW")?;
+            }
             return sql_ok();
         }
         if storage.view(slot).persistence == crate::storage::RelationPersistence::Temporary
@@ -43493,7 +43864,9 @@ pub fn alter_view(
             storage.rollback_view_alter(prior);
             return sql_fail(error);
         }
-        responder.command_complete("ALTER VIEW")?;
+        if complete {
+            responder.command_complete("ALTER VIEW")?;
+        }
         return sql_ok();
     }
     let mut options = storage.view(slot).options_for(txn.txid);
@@ -43555,7 +43928,12 @@ pub fn alter_view(
                 .iter()
                 .position(|name| name.as_str() == column)
             else {
-                return sql_fail(undefined_column(column));
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    column,
+                    name.name
+                ));
             };
             if let Err(error) = super::query::resolve_view_for_dml(storage, name, txn.txid, arena) {
                 return sql_fail(error);
@@ -43672,7 +44050,9 @@ pub fn alter_view(
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            responder.command_complete("ALTER VIEW")?;
+            if complete {
+                responder.command_complete("ALTER VIEW")?;
+            }
             return sql_ok();
         }
         AlterViewAction::DropDefault { column } => {
@@ -43682,7 +44062,12 @@ pub fn alter_view(
                 .iter()
                 .position(|name| name.as_str() == column)
             else {
-                return sql_fail(undefined_column(column));
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    column,
+                    name.name
+                ));
             };
             let columns = match current.with_default(index, crate::storage::ColumnDefault::NONE) {
                 Ok(columns) => columns,
@@ -43745,7 +44130,9 @@ pub fn alter_view(
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            responder.command_complete("ALTER VIEW")?;
+            if complete {
+                responder.command_complete("ALTER VIEW")?;
+            }
             return sql_ok();
         }
         AlterViewAction::RenameColumn { from, to } => {
@@ -43826,7 +44213,9 @@ pub fn alter_view(
             ) {
                 return sql_fail(error);
             }
-            responder.command_complete("ALTER VIEW")?;
+            if complete {
+                responder.command_complete("ALTER VIEW")?;
+            }
             return sql_ok();
         }
         AlterViewAction::RenameTo(new_name) => {
@@ -43878,13 +44267,19 @@ pub fn alter_view(
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            responder.command_complete("ALTER VIEW")?;
+            if complete {
+                responder.command_complete("ALTER VIEW")?;
+            }
             return sql_ok();
         }
-        AlterViewAction::SetSchema(_) => unreachable!("handled before option staging"),
+        AlterViewAction::SetSchema(_) | AlterViewAction::TableActions(_) => {
+            unreachable!("handled before option staging")
+        }
     }
     if options == storage.view(slot).options_for(txn.txid) {
-        responder.command_complete("ALTER VIEW")?;
+        if complete {
+            responder.command_complete("ALTER VIEW")?;
+        }
         return sql_ok();
     }
     let (schema, view_name) = {
@@ -43925,7 +44320,9 @@ pub fn alter_view(
         storage.rollback_view_alter(prior);
         return sql_fail(error);
     }
-    responder.command_complete("ALTER VIEW")?;
+    if complete {
+        responder.command_complete("ALTER VIEW")?;
+    }
     sql_ok()
 }
 
@@ -73407,6 +73804,26 @@ pub(crate) fn alter_table(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
+    // ALTER TABLE reaches every relation kind; each subcommand checks the
+    // kinds it supports.
+    if let Some(crate::storage::ResolvedRelation::Table(table)) =
+        storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid)
+        && storage.table_def(table, txn.txid).kind == crate::storage::TableKind::Foreign
+    {
+        return alter_foreign_table_as(
+            storage,
+            wal,
+            txn,
+            statement,
+            ForeignTableAlterRuntime {
+                scratch,
+                arena,
+                sequence: seq_session,
+            },
+            responder,
+            "ALTER TABLE",
+        );
+    }
     alter_table_inner(
         storage,
         wal,
@@ -73754,7 +74171,7 @@ fn alter_table_trigger_enabled(
     if !matched && let crate::sql::ast::TriggerEnableTarget::Name(name) = trigger_target {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
-            "trigger \"{}\" for relation \"{}\" does not exist",
+            "trigger \"{}\" for table \"{}\" does not exist",
             name,
             relation
         ));
@@ -75282,12 +75699,7 @@ fn alter_table_relation(
     let table_index =
         match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
             Some(crate::storage::ResolvedRelation::Table(i)) => i,
-            Some(crate::storage::ResolvedRelation::View(view))
-                if matches!(
-                    statement.actions,
-                    [AlterAction::SetRuleEnabled { .. } | AlterAction::SetTriggerEnabled { .. }]
-                ) =>
-            {
+            Some(crate::storage::ResolvedRelation::View(view)) => {
                 if emit_completion
                     && let Err(error) = storage.require_owner(
                         crate::storage::AccessObject {
@@ -75300,12 +75712,12 @@ fn alter_table_relation(
                 {
                     return sql_fail(error);
                 }
-                let lock_mode = if matches!(statement.actions, [AlterAction::SetRuleEnabled { .. }])
-                {
-                    crate::sql::ast::TableLockMode::AccessExclusive
-                } else {
-                    crate::sql::ast::TableLockMode::ShareRowExclusive
-                };
+                let lock_mode =
+                    if matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]) {
+                        crate::sql::ast::TableLockMode::ShareRowExclusive
+                    } else {
+                        crate::sql::ast::TableLockMode::AccessExclusive
+                    };
                 if let Err(error) = storage.lock_object(
                     txn.txid,
                     crate::storage::ObjectLockTarget::View(view),
@@ -75314,11 +75726,29 @@ fn alter_table_relation(
                 ) {
                     return sql_fail(error);
                 }
-                return sql_fail(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "\"{}\" is not a table",
-                    statement.table.name
-                ));
+                if let Err(error) = require_alter_actions_supported(
+                    statement.actions,
+                    AlterRelationKind::View,
+                    statement.table.name,
+                ) {
+                    return sql_fail(error);
+                }
+                if let Err(error) = alter_view_table_actions(
+                    storage,
+                    wal,
+                    txn,
+                    statement.table,
+                    view,
+                    statement.actions,
+                    arena,
+                    responder,
+                )? {
+                    return sql_fail(error);
+                }
+                if emit_completion {
+                    responder.command_complete(tag)?;
+                }
+                return sql_ok();
             }
             None if statement.if_exists => {
                 responder.notice(
@@ -75363,6 +75793,20 @@ fn alter_table_relation(
     if let Err(error) = storage.lock_table(txn.txid, table_index, lock_mode, false) {
         return sql_fail(error);
     }
+    // Internal cascades (emit_completion off) edit a materialized view's
+    // backing columns directly; only commands are checked.
+    if emit_completion
+        && storage
+            .matview_slot_for_table(table_index, txn.txid)
+            .is_some()
+        && let Err(error) = require_alter_actions_supported(
+            statement.actions,
+            AlterRelationKind::MaterializedView,
+            statement.table.name,
+        )
+    {
+        return sql_fail(error);
+    }
     if !matches!(
         statement.actions,
         [AlterAction::RenameTable(_)
@@ -75391,19 +75835,23 @@ fn alter_table_relation(
             }
         ));
     }
-    let changes_rule_mode = matches!(statement.actions, [AlterAction::SetRuleEnabled { .. }]);
-    let changes_trigger_mode = matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]);
-    if (changes_rule_mode || changes_trigger_mode)
-        && (storage
+    if emit_completion
+        && storage
             .matview_slot_for_table(table_index, txn.txid)
-            .is_some()
-            || changes_rule_mode && def.kind == crate::storage::TableKind::Foreign)
+            .is_none()
+        && let Err(error) = require_alter_actions_supported(
+            statement.actions,
+            if def.kind == crate::storage::TableKind::Foreign {
+                AlterRelationKind::ForeignTable
+            } else if def.partition.is_partitioned() {
+                AlterRelationKind::PartitionedTable
+            } else {
+                AlterRelationKind::Table
+            },
+            statement.table.name,
+        )
     {
-        return sql_fail(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "\"{}\" is not a table",
-            statement.table.name
-        ));
+        return sql_fail(error);
     }
 
     let identity_mode_restriction = if def.partition.attachment.is_some() {
@@ -75699,10 +76147,19 @@ fn alter_table_relation(
         let Some(index_slot) = storage.index_slot(schema, index.name, txn.txid) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
-                "index \"{}\" does not exist",
-                index.name
+                "index \"{}\" for table \"{}\" does not exist",
+                index.name,
+                def.name.as_str()
             ));
         };
+        if storage.index_table_slot_to(index_slot, txn.txid) != Some(table_index) {
+            return sql_fail(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "\"{}\" is not an index for table \"{}\"",
+                index.name,
+                def.name.as_str()
+            ));
+        }
         if let Err(error) = set_clustered_index(storage, wal, txn, table_index, Some(index_slot)) {
             return sql_fail(error);
         }
@@ -76958,7 +77415,7 @@ fn alter_table_relation(
                             crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
                             stack_format!(
                                 192,
-                                "column \"{}\" of relation \"{}\" is not a stored generated column, skipping",
+                                "column \"{}\" of relation \"{}\" is not a generated column, skipping",
                                 column,
                                 statement.table.name
                             )
@@ -76968,7 +77425,7 @@ fn alter_table_relation(
                     }
                     return sql_fail(sql_err!(
                         sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                        "column \"{}\" of relation \"{}\" is not a stored generated column",
+                        "column \"{}\" of relation \"{}\" is not a generated column",
                         column,
                         statement.table.name
                     ));
@@ -77408,6 +77865,13 @@ fn alter_table_relation(
                         new_def.fkeys[index].validation =
                             crate::storage::ConstraintValidation::EnforcedValidated;
                     }
+                } else if !new_def.has_constraint_named(name) {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "constraint \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        new_def.name.as_str()
+                    ));
                 } else {
                     return sql_fail(sql_err!(
                         sqlstate::WRONG_OBJECT_TYPE,

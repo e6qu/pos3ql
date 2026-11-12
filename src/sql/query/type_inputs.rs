@@ -303,6 +303,44 @@ fn discover_defaults(
         }
         return Ok(());
     }
+    // A view's column defaults, written as ALTER VIEW's own action or as
+    // ALTER TABLE subcommands on a view.
+    let view_defaults = match statement {
+        Stmt::AlterView {
+            name,
+            action: ast::AlterViewAction::SetDefault { column, expression },
+            ..
+        } => {
+            return discover_view_default(
+                parser, name, column, expression, storage, txid, arena, visit,
+            );
+        }
+        Stmt::AlterView {
+            name,
+            action: ast::AlterViewAction::TableActions(actions),
+            ..
+        } => Some((name, *actions)),
+        Stmt::AlterTable(alter) => Some((&alter.table, alter.actions)),
+        _ => None,
+    };
+    if let Some((name, actions)) = view_defaults {
+        if matches!(
+            storage.resolve_relation(name.schema, name.name, txid),
+            Some(crate::storage::ResolvedRelation::View(_))
+        ) {
+            for action in actions {
+                if let ast::AlterAction::SetDefault {
+                    column, value_text, ..
+                } = action
+                {
+                    discover_view_default(
+                        parser, name, column, value_text, storage, txid, arena, visit,
+                    )?;
+                }
+            }
+        }
+        return Ok(());
+    }
     let (source, target, type_mod) = match statement {
         Stmt::CreateDomain(domain) => {
             let Some(source) = domain.default_text else {
@@ -336,47 +374,6 @@ fn discover_defaults(
                 domain.base_type_mod,
             )
         }
-        Stmt::AlterView {
-            name,
-            action: ast::AlterViewAction::SetDefault { column, expression },
-            ..
-        } => {
-            let Some(crate::storage::ResolvedRelation::View(slot)) =
-                storage.resolve_relation(name.schema, name.name, txid)
-            else {
-                return Ok(());
-            };
-            let view = storage.view(slot);
-            let Some(index) = view
-                .columns_for(txid)
-                .names()
-                .iter()
-                .position(|name| name.as_str() == *column)
-            else {
-                return Ok(());
-            };
-            let descriptions = arena
-                .alloc_slice_with(view.columns_for(txid).len(), |_| {
-                    crate::sql::types::ColDesc::new("", 0, 0)
-                })
-                .map_err(|_| super::arena_full())?;
-            let count =
-                crate::sql::catalog::describe_view(storage, txid, &view, arena, descriptions)?;
-            let description = descriptions
-                .get(index)
-                .filter(|_| index < count)
-                .ok_or_else(|| {
-                    sql_err!(
-                        super::sqlstate::INTERNAL_ERROR,
-                        "view default output type is missing"
-                    )
-                })?;
-            (
-                *expression,
-                Some(description.type_oid),
-                description.type_mod,
-            )
-        }
         _ => return Ok(()),
     };
     let Some(target) = target else {
@@ -387,6 +384,62 @@ fn discover_defaults(
     };
     discover_default_source(
         parser, source, target, type_mod, storage, txid, arena, visit,
+    )
+}
+
+/// A view column default's checked inputs, typed by the view's output column.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "default discovery keeps its original source, view column, catalog and admission callback explicit"
+)]
+fn discover_view_default(
+    parser: &crate::sql::parser::Parser<'_>,
+    name: &ast::QualName<'_>,
+    column: &str,
+    expression: &str,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    visit: &mut Visit<'_>,
+) -> Result<(), SqlError> {
+    let Some(crate::storage::ResolvedRelation::View(slot)) =
+        storage.resolve_relation(name.schema, name.name, txid)
+    else {
+        return Ok(());
+    };
+    let view = storage.view(slot);
+    let Some(index) = view
+        .columns_for(txid)
+        .names()
+        .iter()
+        .position(|name| name.as_str() == column)
+    else {
+        return Ok(());
+    };
+    let descriptions = arena
+        .alloc_slice_with(view.columns_for(txid).len(), |_| {
+            crate::sql::types::ColDesc::new("", 0, 0)
+        })
+        .map_err(|_| super::arena_full())?;
+    let count = crate::sql::catalog::describe_view(storage, txid, &view, arena, descriptions)?;
+    let description = descriptions
+        .get(index)
+        .filter(|_| index < count)
+        .ok_or_else(|| {
+            sql_err!(
+                super::sqlstate::INTERNAL_ERROR,
+                "view default output type is missing"
+            )
+        })?;
+    discover_default_source(
+        parser,
+        expression,
+        description.type_oid,
+        description.type_mod,
+        storage,
+        txid,
+        arena,
+        visit,
     )
 }
 

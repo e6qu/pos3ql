@@ -166,6 +166,9 @@ pub enum AlterViewAction<'a> {
     SetSchema(&'a str),
     SetOptions(&'a [ViewOption]),
     ResetOptions(&'a [ViewOptionName]),
+    /// `ALTER TABLE` subcommands; execution rejects those PostgreSQL does
+    /// not perform on a view.
+    TableActions(&'a [AlterAction<'a>]),
 }
 
 /// `ALTER MATERIALIZED VIEW` deliberately exposes only operations whose
@@ -3207,6 +3210,29 @@ pub struct Select<'a> {
     /// `FOR UPDATE`/`FOR SHARE`/… row-locking clauses, in written order. Empty
     /// when the query carries none.
     pub locking: &'a [LockClause<'a>],
+}
+
+impl Select<'_> {
+    /// A query level with no items or clauses, for building one field by field.
+    pub const EMPTY: Self = Self {
+        items: &[],
+        distinct: false,
+        distinct_on: &[],
+        windows: &[],
+        from: None,
+        where_clause: None,
+        group_by: &[],
+        grouping_set_quantifier: GroupingSetQuantifier::All,
+        grouping_sets: &[],
+        having: None,
+        order_by: &[],
+        limit: None,
+        offset: None,
+        with_ties: false,
+        with: &[],
+        set_body: None,
+        locking: &[],
+    };
 }
 
 /// A variable-width bitmap over a query's flat `GROUP BY` expression list.

@@ -123,7 +123,10 @@ is owned.
   from a restartable statement read synchronously. A step's foreign key
   check that waits and resumes the step at a completion position past its
   last row loops with empty caches: each attempt waits again without a new
-  GET, so it also needs the step-local block pinning below. Letting the next step's selection
+  GET, so it also needs the step-local block pinning below. With no block or
+  disk cache, a `SELECT` whose `UNION ALL` branches read three tables saved
+  to object storage in one test also never finished, where each branch read
+  alone does. Letting the next step's selection
   yield and roll back to the step's start is not enough: with empty caches
   each retried selection issued a new GET and never finished (a rule action
   joining a cold table), so the step must keep the blocks it downloaded

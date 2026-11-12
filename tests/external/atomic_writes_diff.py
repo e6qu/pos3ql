@@ -202,6 +202,7 @@ class Node:
             "result_stream_slots": "2",
             "plan_build_bytes": "16MiB", "plan_build_leases": 64,
             "index_statistics_slots": 4096,
+            "trigger_event_spill_bytes": "64MiB",
             "max_ddl_per_transaction": 16, "max_value_indexes": 8,
             "max_indexes": 8, "max_extended_statistics": 64,
             "max_casts": 8, "max_operators": 8,

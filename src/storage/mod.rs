@@ -210,8 +210,9 @@ pub(crate) use row_images::{
 };
 use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::{RowEntries, RowMap, RowOverlayPool};
+use row_reads::RowReadView;
+pub(crate) use row_reads::RowReadVisitor;
 pub(crate) use row_reads::{LockedRowRecheck, RowRead, RowSelfChange};
-use row_reads::{RowReadView, RowReadVisitor};
 pub(crate) use row_scans::cursor::{CursorRow, RowCursor, RowCursorBuffers};
 pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
 #[cfg(test)]
@@ -52228,6 +52229,20 @@ impl Storage {
     pub(crate) fn same_statement_snapshot(&self) -> ReadSnapshotScope {
         ReadSnapshotScope {
             previous: execution_visibility(),
+            thread: core::marker::PhantomData,
+        }
+    }
+
+    /// Lets a referential check see every change of its own transaction,
+    /// including those of the running command, as PostgreSQL's checks do.
+    pub(crate) fn own_changes_snapshot(&self) -> ReadSnapshotScope {
+        let previous = execution_visibility();
+        replace_execution_visibility(VisibilityContext {
+            read_snapshot: SNAPSHOT_ALL,
+            ..previous
+        });
+        ReadSnapshotScope {
+            previous,
             thread: core::marker::PhantomData,
         }
     }

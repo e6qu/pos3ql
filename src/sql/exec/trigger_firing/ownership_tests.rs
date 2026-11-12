@@ -110,6 +110,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     config.execution_control_leases = 64;
     config.row_work_bytes = 64 << 10;
     config.row_work_leases = 32;
+    config.trigger_event_spill_bytes = 0;
     let mut budget = crate::storage::tests::test_budget(&config);
     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
     let controls = std::sync::Arc::clone(&storage.execution_control);

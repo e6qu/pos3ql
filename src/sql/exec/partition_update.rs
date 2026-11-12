@@ -15,11 +15,9 @@ pub(super) fn prepare_move<'arena>(
     generated: &[Option<&'arena Expr<'arena>>],
     values: &mut [Datum<'arena>],
     arena: &'arena Arena,
-    params: &[Datum<'arena>],
     services: &mut TriggerServices<'_>,
     responder: &mut Responder,
 ) -> Result<bool, SqlError> {
-    let seq_session = services.seq_session;
     let (old_table, rowid, _) = selected.local_parts();
     if !fire_partition_row_triggers(
         storage,
@@ -83,9 +81,6 @@ pub(super) fn prepare_move<'arena>(
                 old_values,
                 None,
                 arena,
-                params,
-                seq_session,
-                MAX_FK_CASCADE_DEPTH,
             )?;
         }
         fire_partition_row_triggers(

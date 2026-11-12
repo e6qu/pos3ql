@@ -1154,6 +1154,14 @@ impl Server {
             None
         };
 
+        if let Some(spill) = engine.trigger_event_spill() {
+            for slot in slots.iter_mut() {
+                slot.conn.attach_trigger_event_spill(spill.clone());
+            }
+            for worker in subscriptions.iter_mut() {
+                worker.apply.attach_trigger_event_spill(spill.clone());
+            }
+        }
         let memory_reserved_bytes = budget.total();
         Ok(Self {
             reactor,
@@ -3084,8 +3092,8 @@ impl Server {
     }
 
     fn release(&mut self, index: usize) {
-        self.engine
-            .cancel_read_owner(self.slots[index].conn.execution_identity().read_owner());
+        let owner = self.slots[index].conn.execution_identity().read_owner();
+        self.engine.cancel_read_owner(owner);
         if self.slots[index].conn.txn.staged_commit().is_some() {
             assert!(!self.slots[index].query_dispatch_pending);
             let handoff = self.query_workspaces.cancel(index);

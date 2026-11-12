@@ -633,6 +633,7 @@ pub mod sqlstate {
     pub const EXCLUSION_VIOLATION: &str = "23P01";
     pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
     pub const FOREIGN_KEY_VIOLATION: &str = "23503";
+    pub const RESTRICT_VIOLATION: &str = "23001";
     pub const INVALID_FOREIGN_KEY: &str = "42830";
     pub const INVALID_PRECEDING_OR_FOLLOWING_SIZE: &str = "22013";
     pub const INVALID_RECURSION: &str = "42P19";

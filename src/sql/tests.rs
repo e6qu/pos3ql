@@ -28,6 +28,7 @@ mod dependency_rows;
 mod drop_dependency_reports;
 mod error_report_fields;
 mod evaluation_timing;
+mod foreign_key_lookups;
 mod foreign_parent_admission;
 mod function_progress;
 mod geometric_casts;
@@ -19177,17 +19178,20 @@ fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
         (
             "deferred-metadata",
             2,
-            4096,
+            crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES,
             "INSERT INTO bounded_deferred VALUES(1, 'x'), (2, 'x'), (3, 'x')",
         ),
         (
+            // One in-memory page and no spill file: an event larger than the
+            // page cannot be queued.
             "deferred-row-images",
             8,
-            128,
-            "INSERT INTO bounded_deferred VALUES(1, repeat('x', 256))",
+            crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES,
+            "INSERT INTO bounded_deferred VALUES(1, repeat('x', 70000))",
         ),
     ] {
         let mut config = test_config(label);
+        config.trigger_event_spill_bytes = 0;
         config.max_deferred_constraints_per_transaction = metadata;
         config.deferred_trigger_bytes = row_bytes;
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
@@ -19201,6 +19205,56 @@ fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
             String::from_utf8_lossy(&exhausted)
         );
         assert_eq!(data_rows(&session.success(&mut engine, "ROLLBACK TO before_exhaustion; SELECT count(*) FROM bounded_deferred; INSERT INTO bounded_deferred VALUES(1, 'x'); COMMIT; SELECT count(*) FROM bounded_deferred_audit; BEGIN; INSERT INTO bounded_deferred VALUES(2, 'x'); COMMIT; SELECT count(*) FROM bounded_deferred_audit", true)), ["0", "1", "2"]);
+    }
+}
+
+/// Queued foreign key checks past one in-memory page move to the shared
+/// spill file; without it the queue fails with a named `54000`, and a
+/// rollback leaves the transaction usable.
+#[test]
+fn foreign_key_events_spill_past_memory_and_fail_named_without_spill() {
+    for spill in [true, false] {
+        let mut config = test_config(if spill {
+            "trigger-events-spill"
+        } else {
+            "trigger-events-memory"
+        });
+        config.deferred_trigger_bytes = crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES;
+        config.trigger_event_spill_bytes = if spill { 1 << 24 } else { 0 };
+        config.txn_rows = 4096;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        if let Some(file) = engine.trigger_event_spill() {
+            session.transaction.attach_trigger_event_spill(file);
+        }
+        session.success(
+            &mut engine,
+            "CREATE TABLE spill_parent(id int PRIMARY KEY); \
+             CREATE TABLE spill_child(id int, parent int REFERENCES spill_parent); \
+             INSERT INTO spill_parent SELECT generate_series(1, 1500)",
+            false,
+        );
+        let output = session.execute(
+            &mut engine,
+            "INSERT INTO spill_child SELECT g, g FROM generate_series(1, 1500) g",
+            true,
+        );
+        if spill {
+            assert!(error_sqlstates(&output).is_empty());
+            let output = session.execute(
+                &mut engine,
+                "INSERT INTO spill_child SELECT g, g + 1 FROM generate_series(1490, 1500) g",
+                true,
+            );
+            assert_eq!(error_sqlstates(&output), ["23503"]);
+        } else {
+            assert_eq!(error_sqlstates(&output), ["54000"]);
+        }
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT count(*) FROM spill_child", true)),
+            [if spill { "1500" } else { "0" }]
+        );
     }
 }
 

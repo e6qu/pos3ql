@@ -373,6 +373,13 @@ impl RowProgress {
             ));
         }
         steps.running = true;
+        // A wait in this step's selection rolls back to the step's start and
+        // keeps the finished steps, so its reads yield again after the
+        // earlier step's resumable rows made the statement's reads block.
+        if self.rows_resumable {
+            query::reopen_reads_after_kept_work();
+        }
+        let steps = &mut self.steps[level];
         match &mut steps.start {
             Some(start) => {
                 txn.resume_command(start.command);

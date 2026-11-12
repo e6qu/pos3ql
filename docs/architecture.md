@@ -103,17 +103,42 @@ in the scan, would select different rows, so such a write reads its rows
 synchronously and a lock wait runs it again from its first start. A wait inside a routine body run for a row keeps the body's progress
 and continues it.
 
+**AFTER events queue in one spilling log.** Every queued `AFTER ROW`
+trigger, constraint trigger and foreign key check is a record in the
+transaction's event log, fired at its statement's end (or at `SET
+CONSTRAINTS` and commit when deferred) as PostgreSQL's after-trigger queue
+does. A written row's foreign key checks, its own references and the NO
+ACTION and RESTRICT checks of keys it removes, wait beside the row until its
+`AFTER` triggers are queued and take their places among them by the name of
+PostgreSQL's `RI_ConstraintTrigger_c_<oid>`/`_a_<oid>` triggers. A referencing
+check reads the row's current version, so a row deleted before the check is
+not checked; a referenced check carries the old key, and NO ACTION passes
+when another row provides that key again. Checks see every change of their
+transaction, and those of a data-modifying `WITH` sub-statement wait for the
+end of the whole statement, so `WITH d AS (DELETE FROM p ...) INSERT INTO p
+SELECT ...` passes as in PostgreSQL. The log is cut into 64 KiB pages:
+`deferred_trigger_bytes` of them stay in memory per connection and older
+pages move to the `trigger_event_spill_bytes` file shared by all
+connections, recreated empty at startup. Only when both are full does
+queuing fail with `54000`. A fired event carries the number of its firing,
+so a rollback to a statement or savepoint re-arms exactly the events fired
+after it.
+
 **Work after a write's last row resumes too.** A top-level `INSERT`,
 `UPDATE`, `DELETE` or `MERGE` keeps its finished `AFTER` work across a
 wait: queued `AFTER ROW` events, then the transaction's immediate
-constraint checks (deferrable foreign key, unique and exclusion
-constraints in `IMMEDIATE` mode), then `AFTER STATEMENT` triggers. An event
+constraint checks (deferrable unique and exclusion constraints in
+`IMMEDIATE` mode), then `AFTER STATEMENT` triggers. An event
 stays selected until it completes. A wait inside a PL/pgSQL trigger body
 keeps the body and continues at its waiting statement; a wait before the
 body starts runs the same event again, replaying its sequence values from
 the event's start. Each event's reads yield until its own first effect
 (a write, sequence call or routine call in its body), after which the rest
-of that event reads synchronously; the next event yields again. Cancellation, a statement or lock timeout, an error and
+of that event reads synchronously; the next event yields again. A write in
+a `CALL` or `DO` body keeps its `AFTER` work the same way in the body's
+frame. The steps of a multi-step write (rule actions, data-modifying `WITH`)
+run their `AFTER` work inline and synchronously.
+Cancellation, a statement or lock timeout, an error and
 the end of the transaction release the kept progress.
 
 **Routine calls keep a write's changed rows.** A row expression, row trigger
@@ -328,7 +353,8 @@ BY id` sorts first, so its output queues in the spool instead.
 | Writes after their first row change, also in a `CALL` or `DO` body: each row's index maintenance, constraint checks, trigger bodies and `RETURNING`, until an effect a rerun would not repeat identically | Yields; only the unfinished row rolls back (see above) |
 | A write's row after an effect a rerun would not repeat, or every row when such an effect ran in its scan | Blocks until the next step's rows or the statement's end |
 | A top-level write's `AFTER ROW` events, immediate constraint checks and `AFTER STATEMENT` triggers | Yields; finished events are kept (see above). An event's reads after its first effect block until that event ends |
-| The next step's row selection in a multi-step write; `AFTER` triggers between the steps of a rule-rewritten write, and `AFTER` work of writes inside routine bodies | Blocks until the next step's rows or that work ends |
+| A rule action's row selection after the rule's earlier steps, when their rows could resume | Yields; the step rolls back to its start and the finished steps are kept |
+| A data-modifying `WITH` main statement's row selection; `AFTER` triggers between the steps of a rule-rewritten write, and `AFTER` work of writes inside routine bodies | Blocks until the next step's rows or that work ends |
 | Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, rule actions, `INSTEAD OF` view triggers): row expressions, row triggers, `RETURNING`; `BEFORE` and `INSTEAD OF` trigger bodies that need the engine | Run on the engine between attempts; the write keeps its changed rows and finished steps and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
 | DDL and `COPY FROM` | Blocks for the whole statement |
 | Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |

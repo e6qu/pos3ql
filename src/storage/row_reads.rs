@@ -321,7 +321,7 @@ pub(crate) struct RowRead<'a> {
     captured_roots: Option<&'a CapturedSpillRoots<'a>>,
 }
 
-pub(super) type RowReadVisitor<'a> = dyn for<'row> FnMut(
+pub(crate) type RowReadVisitor<'a> = dyn for<'row> FnMut(
         u64,
         RowRead<'row>,
     ) -> Result<core::ops::ControlFlow<()>, crate::sql::eval::SqlError>

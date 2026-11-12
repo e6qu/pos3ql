@@ -129,26 +129,38 @@ is owned.
   `DO` bodies (see the
   [execution model](docs/architecture.md#execution-model)). Remaining: a
   write whose scan ran a volatile built-in reads its rows synchronously.
-  A top-level write's `AFTER` events and immediate constraint checks
-  yield; reads after an event's first effect block until that event ends,
+  A top-level write's `AFTER` events, foreign key checks and immediate
+  constraint checks yield; reads after an event's first effect block until that event ends,
   so a trigger body that writes and then reads cold data still blocks.
-  The next step's selection in a multi-step write, `AFTER` triggers between
-  the steps of a rule-rewritten write, and `AFTER` work of writes inside
-  routine bodies read synchronously. Letting the next step's selection
-  yield and roll back to the step's start is not enough: with empty caches
-  each retried selection issued a new GET and never finished (a rule action
-  joining a cold table), so the step must keep the blocks it downloaded
-  across its attempts. Deferrable foreign key checks in `IMMEDIATE` mode run
-  after all of the statement's `AFTER ROW` triggers, where PostgreSQL runs
-  them among each row's triggers in name order, so a failing check can
-  follow notices and writes PostgreSQL never reaches. A non-deferrable
-  foreign key is checked as each row is written, where PostgreSQL checks it
-  in that same AFTER order at the statement's end: `INSERT INTO tree VALUES
-  (2, 1), (1, NULL)` on a self-referencing table, or a row whose parent an
-  `AFTER` trigger inserts, fails with `23503` where PostgreSQL succeeds.
-  Queuing every check as an AFTER event needs an event queue that spills,
-  because the fixed deferred-constraint capacity would otherwise limit how
-  many rows one statement may write.
+  Writes in `CALL` and `DO` bodies keep their `AFTER` work the same way. The
+  selection of a rule action after the rule's earlier steps yields and rolls
+  back to the step's start (a data-modifying `WITH` main statement after its
+  sub-statements still reads synchronously); a
+  statement whose restarts download evicted blocks again falls back to
+  synchronous reads (see the
+  [execution model](docs/architecture.md#execution-model)), so it finishes
+  with empty caches. The `AFTER` work (foreign key checks included) of those steps and
+  of writes inside functions called from a restartable statement still reads
+  synchronously: a step's foreign key check that waited resumed the step at a
+  completion position past its last row and then waited again without a new
+  GET, a loop the refetch fallback does not see. `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and
+  `SET DEFAULT` run as queued events at the statement's end, as
+  PostgreSQL 18.6's `RI_ConstraintTrigger_a_*` events (never deferred), but
+  rewrite the referencing rows directly. PostgreSQL runs each as a `DELETE`
+  or `UPDATE` of the referencing table: rules rewrite it (a `DO INSTEAD
+  NOTHING` rule fails it with `XX000`), its `BEFORE` triggers fire then,
+  `BEFORE STATEMENT` once per table and operation in the statement, and its
+  `AFTER ROW` and `AFTER STATEMENT` events join the end of the statement's
+  queue (`AFTER STATEMENT` once per table and operation, after the last such
+  change, with the merged transition rows); an error inside it carries the
+  action query as `CONTEXT`. That needs the action to run through the
+  nested write path with its events tagged at the outer statement's depth,
+  and statement triggers queued as events. `ON DELETE SET NULL (columns)`
+  and `SET DEFAULT (columns)` fail with `42601` (no column list is stored).
+  A data-modifying `WITH` sub-statement fires
+  its `AFTER ROW` and `AFTER STATEMENT` triggers at its own end, where
+  PostgreSQL fires them after the main statement's rows (its foreign key
+  checks already wait for the statement's end).
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written
@@ -524,6 +536,9 @@ the expression in `CONTEXT`. Selecting a field of a named composite cast to
 `record` (`(ROW(1, 2)::t::record).id`) fails as an unknown field. Reading a
 field of a NULL `record` parameter names the expression in `CONTEXT`, which
 PostgreSQL omits because it raises the error while evaluating, not planning.
+PostgreSQL evaluates them.
+A foreign key between two different composite types fails with `0A000`
+where PostgreSQL compares them field by field.
 A user table's `tableoid` system column fails with `0A000`
 (`SELECT tableoid::regclass FROM partitioned` names no partition); catalogs
 expose it. COPY to or from a server file or program,

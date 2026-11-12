@@ -19035,9 +19035,10 @@ fn trigger_assignment_operator(
 }
 
 /// Resolves a PL/pgSQL assignment target and lowers any chained subscripts to
-/// the same JSONB setter used by UPDATE. Keeping one setter boundary gives
-/// trigger-row and local-variable assignment identical container creation,
-/// padding, and traversal errors.
+/// the same setters UPDATE uses: the element setter, or the array setter
+/// when a subscript is a slice. Keeping one setter boundary gives trigger-row
+/// and local-variable assignment identical container creation, padding, and
+/// traversal errors.
 fn parse_plpgsql_assignment_target<'a>(
     target: &'a str,
     value: &'a Expr<'a>,
@@ -19045,12 +19046,26 @@ fn parse_plpgsql_assignment_target<'a>(
 ) -> Result<(Option<&'a str>, SqlName, &'a Expr<'a>), SqlError> {
     let target = parse_plpgsql_expression(target, arena)?;
     let mut current = target;
+    // Innermost subscript last; each is an element or a slice's bounds.
     let mut subscripts = ArenaList::new(arena);
-    while let Expr::Subscript { base, index } = current {
-        subscripts
-            .push(index)
-            .map_err(|_| super::query::arena_full_pub())?;
-        current = base;
+    let mut sliced = false;
+    loop {
+        match *current {
+            Expr::Subscript { base, index } => {
+                subscripts
+                    .push((Some(index), None, false))
+                    .map_err(|_| super::query::arena_full_pub())?;
+                current = base;
+            }
+            Expr::Slice { base, lower, upper } => {
+                sliced = true;
+                subscripts
+                    .push((lower, upper, true))
+                    .map_err(|_| super::query::arena_full_pub())?;
+                current = base;
+            }
+            _ => break,
+        }
     }
     let Expr::Column { qualifier, name } = current else {
         return Err(unsupported_trigger_body());
@@ -19066,10 +19081,46 @@ fn parse_plpgsql_assignment_target<'a>(
     arg_list
         .push(value)
         .map_err(|_| super::query::arena_full_pub())?;
-    for subscript in subscripts.as_slice().iter().rev() {
-        arg_list
-            .push(*subscript)
+    // Element subscripts serve arrays and jsonb alike; a slice is array-only
+    // and the call carries each subscript's kind, as SQL assignment does.
+    let name = if sliced {
+        let mut kinds = StackStr::<16>::new();
+        for &(lower, upper, slice) in subscripts.as_slice().iter().rev() {
+            use core::fmt::Write as _;
+            let _ = kinds.write_char(match (slice, lower, upper) {
+                (false, _, _) => 'e',
+                (true, Some(_), Some(_)) => 's',
+                (true, Some(_), None) => 'l',
+                (true, None, Some(_)) => 'u',
+                (true, None, None) => 'a',
+            });
+        }
+        if kinds.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "number of array dimensions ({}) exceeds the maximum allowed (6)",
+                subscripts.len()
+            ));
+        }
+        let kinds = arena
+            .alloc_str(kinds.as_str())
             .map_err(|_| super::query::arena_full_pub())?;
+        let kinds = arena
+            .alloc(Expr::Str(kinds))
+            .map_err(|_| super::query::arena_full_pub())?;
+        arg_list
+            .push(&*kinds)
+            .map_err(|_| super::query::arena_full_pub())?;
+        "__array_subscript_set"
+    } else {
+        "__jsonb_subscript_set"
+    };
+    for &(lower, upper, _) in subscripts.as_slice().iter().rev() {
+        for bound in [lower, upper].into_iter().flatten() {
+            arg_list
+                .push(bound)
+                .map_err(|_| super::query::arena_full_pub())?;
+        }
     }
     let args = arg_list.as_slice();
     let expression = arena
@@ -19078,7 +19129,7 @@ fn parse_plpgsql_assignment_target<'a>(
             bound_oid: None,
             bound_strict: None,
             source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-            name: "__jsonb_subscript_set",
+            name,
             args,
             argument_names: &[],
             variadic: false,
@@ -24531,8 +24582,8 @@ fn folds_to_constant(expression: &Expr<'_>) -> bool {
     }
 }
 
-/// PL/pgSQL converts a value assigned to an array element as it converts one
-/// assigned to a variable: with an assignment cast when one exists and
+/// PL/pgSQL converts a value assigned to an array element or slice as it
+/// converts one assigned to a variable: with an assignment cast when one exists and
 /// otherwise through text, so `x[1] := true` for an integer array fails with
 /// `invalid input syntax for type integer: "t"`. The value is evaluated once
 /// here and the element setter receives the converted value.
@@ -24547,7 +24598,7 @@ fn plpgsql_element_assignment<'a>(
     scope: &TriggerLocalScope<'_, 'a>,
 ) -> Result<(&'a Expr<'a>, bool), SqlError> {
     let Expr::Call {
-        name: "__jsonb_subscript_set",
+        name: name @ ("__jsonb_subscript_set" | "__array_subscript_set"),
         args,
         ..
     } = assignment.expression
@@ -24562,12 +24613,18 @@ fn plpgsql_element_assignment<'a>(
         Some((ColType::Array(element), None)) => element,
         _ => return Ok((assignment.expression, true)),
     };
+    // A slice receives an array of the variable's type.
+    let target = if *name == "__array_subscript_set" {
+        ColType::Array(element).oid()
+    } else {
+        element.element_oid()
+    };
     let source = args[1];
     let original = eval_procedural_expression(context, source, scope, None)?;
     let arena = context.arena;
     let value = plpgsql_conversion_input(
         original,
-        Some(element.element_oid()),
+        Some(target),
         context.storage(),
         context.txn.txid,
         arena,
@@ -29667,11 +29724,29 @@ fn execute_trigger_step_in<'a>(
                 ) {
                     eval_procedural_expression(context, assignment.expression, &scope, None)?
                 } else {
+                    // The element's constant fails its conversion where it
+                    // is written.
+                    let literal = match assigned_value(assignment.expression) {
+                        Expr::Str(literal)
+                        | Expr::BoundLiteral {
+                            source: Expr::Str(literal),
+                            ..
+                        } => Some(*literal),
+                        _ => None,
+                    };
                     in_procedural_query(
                         statement,
                         crate::sql::error_context::QueryMode::Assignment,
                         false,
-                        || eval_procedural_expression(context, assignment.expression, &scope, None),
+                        || {
+                            eval_procedural_expression(context, assignment.expression, &scope, None)
+                                .map_err(|error| match literal {
+                                    Some(literal) if error.sqlstate.as_str().starts_with("22") => {
+                                        crate::sql::error_position::at_subject(error, literal)
+                                    }
+                                    _ => error,
+                                })
+                        },
                     )?
                 };
                 in_procedural_query(
@@ -65384,12 +65459,63 @@ fn reject_generated_write<Definition0: crate::storage::DefinitionBacking>(
 /// A two-table column lookup for MERGE's ON / WHEN-condition / SET expressions:
 /// a qualified name resolves to the target or source half; an unqualified name
 /// searches both (ambiguous if in both, 42702).
+/// The FROM items inside an unaliased parenthesized join used as a MERGE
+/// source, which PostgreSQL keeps visible by name. The source's row is the
+/// join's own columns (`visible` of them) followed by each member's.
+#[derive(Clone, Copy)]
+struct MergeSourceMembers<'d> {
+    /// Each member's name, first source column and column count.
+    members: &'d [(&'d str, usize, usize)],
+    visible: usize,
+}
+
+impl MergeSourceMembers<'_> {
+    const NONE: Self = Self {
+        members: &[],
+        visible: usize::MAX,
+    };
+
+    /// The source column `qualifier.name` names, if `qualifier` is a member.
+    fn column(
+        self,
+        source: &crate::storage::RelationDefinition<'_>,
+        qualifier: &str,
+        name: &str,
+    ) -> Option<Option<usize>> {
+        let &(_, first, count) = self
+            .members
+            .iter()
+            .find(|(member, _, _)| *member == qualifier)?;
+        Some((first..first + count).find(|index| source.columns()[*index].name.as_str() == name))
+    }
+
+    /// The source columns of member `name`.
+    fn range(self, name: &str) -> Option<core::ops::Range<usize>> {
+        self.members
+            .iter()
+            .find(|(member, _, _)| *member == name)
+            .map(|&(_, first, count)| first..first + count)
+    }
+
+    /// An unqualified name reaches only the join's own columns.
+    fn unqualified(
+        self,
+        source: &crate::storage::RelationDefinition<'_>,
+        name: &str,
+    ) -> Option<usize> {
+        source
+            .column_index(name)
+            .filter(|index| *index < self.visible)
+    }
+}
+
 struct MergeLookup<'d, 'v> {
     target_def: crate::storage::RelationDefinition<'d>,
     target_alias: &'d str,
     target: &'v [Datum<'v>],
     source_def: &'d crate::storage::RelationDefinition<'d>,
     source_alias: &'d str,
+    source_members: MergeSourceMembers<'d>,
     /// A target-only candidate deliberately has no source namespace. This is
     /// PostgreSQL-visible: referring to the source there is a missing
     /// FROM-clause entry, not a NULL-valued row.
@@ -65439,6 +65565,18 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
                     q
                 )),
             },
+            Some(q) if let Some(index) = self.source_members.column(self.source_def, q, name) => {
+                let index = index.ok_or_else(|| undefined_column(name))?;
+                match self.source {
+                    Some(source) => Ok(source[index]),
+                    None if self.source_namespace_when_absent => Ok(Datum::Null),
+                    None => Err(sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "missing FROM-clause entry for table \"{}\"",
+                        q
+                    )),
+                }
+            }
             Some(q) => Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
                 "missing FROM-clause entry for table \"{}\"",
@@ -65447,7 +65585,7 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
             None => match (
                 self.target_def.column_index(name),
                 (self.source.is_some() || self.source_namespace_when_absent)
-                    .then(|| self.source_def.column_index(name))
+                    .then(|| self.source_members.unqualified(self.source_def, name))
                     .flatten(),
             ) {
                 (Some(_), Some(_)) => Err(sql_err!(
@@ -65464,6 +65602,41 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
                 (None, None) => Err(undefined_column(name)),
             },
         }
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.source_members.range(table).map(|_| ColType::Record)
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<Option<&'v [RecordField<'v>]>, SqlError> {
+        let Some(columns) = self.source_members.range(table) else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "missing FROM-clause entry for table \"{}\"",
+                table
+            ));
+        };
+        let Some(source) = self.source else {
+            return Ok(None);
+        };
+        let first = columns.start;
+        let fields = arena
+            .alloc_slice_with(columns.len(), |index| RecordField {
+                name: "",
+                type_oid: self.source_def.columns()[first + index].ctype.oid(),
+                value: source[first + index],
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        for (field, column) in fields.iter_mut().zip(&self.source_def.columns()[columns]) {
+            field.name = arena
+                .alloc_str(column.name.as_str())
+                .map_err(|_| super::query::arena_full_pub())?;
+        }
+        Ok(Some(&*fields))
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
@@ -65513,11 +65686,16 @@ impl<'d> MergeLookup<'d, '_> {
                         .flatten()
                 })
                 .map(|index| &self.source_def.columns()[index]),
-            Some(_) => None,
+            Some(qualifier) => self
+                .source_members
+                .column(self.source_def, qualifier, name)
+                .flatten()
+                .filter(|_| self.source.is_some() || self.source_namespace_when_absent)
+                .map(|index| &self.source_def.columns()[index]),
             None => match (
                 self.target_def.column_index(name),
                 (self.source.is_some() || self.source_namespace_when_absent)
-                    .then(|| self.source_def.column_index(name))
+                    .then(|| self.source_members.unqualified(self.source_def, name))
                     .flatten(),
             ) {
                 (Some(index), None) => Some(&self.target_def.columns()[index]),
@@ -65632,6 +65810,52 @@ fn merge_source_demand(
             complete
         }
     }
+}
+
+/// The members of an unaliased parenthesized join used as a MERGE source,
+/// with the source columns each one's star occupies.
+fn merge_source_members<'a>(
+    storage: &Storage,
+    statement: &crate::sql::ast::Merge<'a>,
+    source_all: &crate::sql::ast::Select<'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<MergeSourceMembers<'a>, SqlError> {
+    let (None, Some(members)) = (statement.source.alias, statement.source.join_members) else {
+        return Ok(MergeSourceMembers::NONE);
+    };
+    let width = |items: &'a [SelectItem<'a>]| {
+        super::query::describe_derived_definition(
+            storage,
+            &crate::sql::ast::Select {
+                items,
+                ..*source_all
+            },
+            "",
+            None,
+            txid,
+            arena,
+            None,
+        )
+        .map(|definition| definition.n_columns)
+    };
+    let visible = width(&source_all.items[..1])?;
+    let mut first = visible;
+    let ranges = arena
+        .alloc_slice_with(members.len(), |_| ("", 0, 0))
+        .map_err(|_| super::query::arena_full_pub())?;
+    for (range, member) in ranges.iter_mut().zip(members) {
+        let item = arena
+            .alloc_slice_copy(&[SelectItem::TableWildcard(member.name)])
+            .map_err(|_| super::query::arena_full_pub())?;
+        let n_columns = width(item)?;
+        *range = (member.name, first, n_columns);
+        first += n_columns;
+    }
+    Ok(MergeSourceMembers {
+        members: ranges,
+        visible,
+    })
 }
 
 fn merge_source_columns(
@@ -65893,6 +66117,12 @@ fn describe_joined_returning<'a>(
             )?;
         } else if let Some(star) = star.filter(|_| matches!(item, SelectItem::Wildcard(_))) {
             for star_item in star {
+                // An unnamed item (an unaliased parenthesized join) is
+                // named by the scope.
+                let star_item = match star_item {
+                    SelectItem::TableWildcard("") => &SelectItem::TableWildcard(scope.names[1]),
+                    item => item,
+                };
                 count += super::query::describe_scope_items(
                     core::slice::from_ref(star_item),
                     &scope,
@@ -66306,9 +66536,15 @@ pub(crate) fn merge<'a>(
         base: statement.source,
         joins: &[],
     };
-    let star = match arena.alloc_slice_copy(&[SelectItem::Wildcard(
-        crate::sql::ast::SourcePosition::UNKNOWN,
-    )]) {
+    // An unaliased parenthesized join's members follow its own columns.
+    let members = match (statement.source.alias, statement.source.join_members) {
+        (None, Some(members)) => members,
+        _ => &[],
+    };
+    let star = match arena.alloc_slice_with(1 + members.len(), |index| match index {
+        0 => SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN),
+        index => SelectItem::TableWildcard(members[index - 1].name),
+    }) {
         Ok(s) => &*s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
@@ -66345,6 +66581,11 @@ pub(crate) fn merge<'a>(
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
+    let source_members =
+        match merge_source_members(storage, statement, &source_all_select, txn.txid, arena) {
+            Ok(members) => members,
+            Err(error) => return sql_fail(error),
+        };
     let source_select = match merge_source_columns(statement, source_alias, &source_all_def) {
         Some(columns) => {
             let mut items =
@@ -66845,6 +67086,7 @@ pub(crate) fn merge<'a>(
                 target: target_vals[j],
                 source_def,
                 source_alias,
+                source_members,
                 source: (!by_source).then_some(sv),
                 source_namespace_when_absent: false,
                 old_name: None,
@@ -67084,6 +67326,7 @@ pub(crate) fn merge<'a>(
                                 target_vals[j],
                                 source_def,
                                 source_alias,
+                                source_members,
                                 (!by_source).then_some(sv),
                                 statement.returning,
                                 Some(deleted_values),
@@ -67553,6 +67796,7 @@ pub(crate) fn merge<'a>(
                                 &new_values[..def.n_columns],
                                 source_def,
                                 source_alias,
+                                source_members,
                                 (!by_source).then_some(sv),
                                 statement.returning,
                                 Some(target_vals[j]),
@@ -67650,6 +67894,7 @@ pub(crate) fn merge<'a>(
                                         inserted,
                                         source_def,
                                         source_alias,
+                                        source_members,
                                         Some(sv),
                                         statement.returning,
                                         None,
@@ -70482,6 +70727,7 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
     target: &[Datum<'a>],
     source_def: &crate::storage::RelationDefinition<'_>,
     source_alias: &str,
+    source_members: MergeSourceMembers<'_>,
     source: Option<&[Datum<'a>]>,
     returning: crate::sql::ast::Returning<'a>,
     old: Option<&[Datum<'a>]>,
@@ -70499,6 +70745,7 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
         target,
         source_def,
         source_alias,
+        source_members,
         source,
         source_namespace_when_absent: true,
         old_name: Some(returning.old_name()),
@@ -70552,7 +70799,7 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
     for item in items {
         match item {
             SelectItem::Wildcard(_) => {
-                for index in 0..source_def.n_columns {
+                for index in 0..source_def.n_columns.min(source_members.visible) {
                     projected[n] = source.map_or(Datum::Null, |values| values[index]);
                     n += 1;
                 }
@@ -70581,7 +70828,15 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
                 }
             }
             SelectItem::TableWildcard(qualifier) if *qualifier == source_alias => {
-                for index in 0..source_def.n_columns {
+                for index in 0..source_def.n_columns.min(source_members.visible) {
+                    projected[n] = source.map_or(Datum::Null, |values| values[index]);
+                    n += 1;
+                }
+            }
+            SelectItem::TableWildcard(qualifier)
+                if let Some(columns) = source_members.range(qualifier) =>
+            {
+                for index in columns {
                     projected[n] = source.map_or(Datum::Null, |values| values[index]);
                     n += 1;
                 }

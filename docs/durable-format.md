@@ -61,6 +61,11 @@ changing the code, this table and the tests together.
   records leave the manifest, commit head and writer fence unchanged.
 - Missing, duplicate, zero, out-of-range or truncated identities are rejected;
   recovery never guesses or regenerates a missing identity.
+- Recovery fails with `22000` when a valid partitioned index lacks exactly one
+  attached index on a partition that can hold one, or an index is attached to
+  a parent index outside its table's partition parent. Earlier releases could
+  save partitions without their copy of a partitioned unique index, leaving
+  duplicates unchecked there; such a state is refused, not repaired.
 
 ### Change checklist
 

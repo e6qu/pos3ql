@@ -2777,6 +2777,7 @@ pub(crate) fn validate_constraint_obligation(
     rowid: u64,
     txid: u32,
     isolation: crate::sql::ast::TransactionIsolation,
+    current: ValidationRead,
     arena: &Arena,
 ) -> Result<Option<crate::storage::ConstraintTiming>, SqlError> {
     let crate::sql::txn::ConstraintIdentity::Table { table, name, .. } = constraint else {
@@ -2864,10 +2865,7 @@ pub(crate) fn validate_constraint_obligation(
                         &foreign_key,
                         values,
                         txid,
-                        ParentRead::Write {
-                            isolation,
-                            current: storage.validation_read(),
-                        },
+                        ParentRead::Write { isolation, current },
                         Some(arena),
                     )?;
                 }
@@ -3045,14 +3043,25 @@ pub(crate) fn validate_deferred_constraints(
             index += 1;
             continue;
         }
-        validate_constraint_obligation(
+        // A check that waited for its parent row's lock runs again under
+        // the snapshot it started with, as in-row checks do.
+        let read = txn
+            .take_awaited_parent_read(current)
+            .unwrap_or_else(|| storage.validation_read());
+        if let Err(error) = validate_constraint_obligation(
             storage,
             current,
             obligation.rowid,
             txn.txid,
             txn.isolation,
+            read,
             arena,
-        )?;
+        ) {
+            if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
+                txn.await_parent_read(current, read);
+            }
+            return Err(error);
+        }
         txn.complete_deferred_constraint(index)?;
         index += 1;
     }

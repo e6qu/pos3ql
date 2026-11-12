@@ -1545,6 +1545,14 @@ pub(crate) fn set_resumable_row(running: bool) {
 /// until its own first effect that a rollback cannot undo.
 pub(crate) fn reopen_statement_reads() {
     set_resumable_row(true);
+    reopen_reads_after_kept_work();
+}
+
+/// A write's post-row work starts a unit that a wait reruns or resumes on
+/// its own (an AFTER event, the immediate constraint checks): the work
+/// before it finished and is kept, so reads yield until that unit's own
+/// first effect.
+pub(crate) fn reopen_reads_after_kept_work() {
     ACTIVE_READ_EFFECTS.with(|active| {
         if let Some(reads) = active.get() {
             // As in `protect_statement_effects`, the scope's borrow pins it.

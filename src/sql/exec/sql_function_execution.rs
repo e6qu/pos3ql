@@ -438,6 +438,7 @@ impl SqlExecution {
             command: context.txn.command_id(),
             depth: context.txn.trigger_depth(),
             retained: self.policy == query::RoutineExecution::Retained,
+            statement_end: false,
         });
         let name = self.source.name;
         let frame = crate::sql::error_context::SqlFunctionFrame {

@@ -91,6 +91,10 @@ pub(super) struct WriteCompletionBoundary {
     /// statement that restarts on a wait still takes its writes' AFTER work,
     /// so those triggers run on the engine, but nothing in it is retained.
     pub(super) retained: bool,
+    /// The write is a top-level statement: its completion also runs the
+    /// transaction's immediate constraint checks, so a wait in them keeps
+    /// the finished AFTER events instead of running the statement again.
+    pub(super) statement_end: bool,
 }
 
 impl TxnState {

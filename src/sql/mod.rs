@@ -9859,6 +9859,7 @@ impl Engine {
                             obligation.rowid,
                             txn.txid,
                             txn.isolation,
+                            self.storage.validation_read(),
                             arena,
                         ) {
                             return Ok(Err(error));
@@ -12942,7 +12943,10 @@ impl Engine {
                                         }
                                         self.storage.preserve_advisory_statement();
                                         self.rollback_waiting_statement(txn, statement_mark);
-                                        if !lock_timeout_expired {
+                                        // The statement runs again from its start, so
+                                        // its earlier attempt's output is withdrawn.
+                                        let withdrawn = responder.truncate_to(output_mark);
+                                        if withdrawn.is_ok() && !lock_timeout_expired {
                                             return Ok(ExtendedExecutionStatus::Blocked {
                                                 wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
                                                     StatementWait::ObjectIo
@@ -12953,10 +12957,12 @@ impl Engine {
                                         }
                                         self.storage
                                             .rollback_locks_to(txn.txid, statement_mark.lock);
-                                        e = sql_err!(
-                                            sqlstate::LOCK_NOT_AVAILABLE,
-                                            "canceling statement due to lock timeout"
-                                        );
+                                        e = withdrawn.err().unwrap_or_else(|| {
+                                            sql_err!(
+                                                sqlstate::LOCK_NOT_AVAILABLE,
+                                                "canceling statement due to lock timeout"
+                                            )
+                                        });
                                     } else {
                                         txn.procedure_restart = false;
                                         e = sql_err!(
@@ -16459,6 +16465,7 @@ impl Engine {
                 command: txn.command_id(),
                 depth: txn.trigger_depth(),
                 retained: true,
+                statement_end: true,
             });
             let prior_handoff = core::mem::replace(&mut txn.write_completion_boundary, boundary);
             let outcome = {

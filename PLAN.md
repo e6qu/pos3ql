@@ -113,11 +113,19 @@ is owned.
   `DO` bodies (see the
   [execution model](docs/architecture.md#execution-model)). Remaining: a
   write whose scan ran a volatile built-in reads its rows synchronously.
-  Reads after a write's last row (statement-level and `AFTER` triggers,
-  foreign key checks queued as constraint events, transition tables, the
-  next step's selection) read synchronously. The write completion already
-  runs an event that waited again instead of skipping it; those reads still
-  need to leave the statement's effect protection so they can wait.
+  A top-level write's `AFTER` events and immediate constraint checks
+  yield; reads after an event's first effect block until that event ends,
+  so a trigger body that writes and then reads cold data still blocks.
+  The next step's selection in a multi-step write, `AFTER` triggers between
+  the steps of a rule-rewritten write, and `AFTER` work of writes inside
+  routine bodies read synchronously. Letting the next step's selection
+  yield and roll back to the step's start is not enough: with empty caches
+  each retried selection issued a new GET and never finished (a rule action
+  joining a cold table), so the step must keep the blocks it downloaded
+  across its attempts. Deferrable foreign key checks in `IMMEDIATE` mode run
+  after all of the statement's `AFTER ROW` triggers, where PostgreSQL runs
+  them among each row's triggers in name order, so a failing check can
+  follow notices and writes PostgreSQL never reaches.
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written

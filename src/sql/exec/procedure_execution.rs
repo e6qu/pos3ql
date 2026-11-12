@@ -155,6 +155,7 @@ fn run<'a>(
         command: context.txn.command_id(),
         depth: context.txn.trigger_depth(),
         retained: true,
+        statement_end: false,
     });
     context.txn.running_procedures = context
         .txn

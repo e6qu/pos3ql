@@ -1384,25 +1384,6 @@ fn expression_waits_resume_procedural_statements() {
     }
 }
 
-fn notice_messages(bytes: &[u8]) -> Vec<String> {
-    let mut messages = Vec::new();
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let length = u32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
-        if bytes[offset] == b'N' {
-            let payload = &bytes[offset + 5..offset + 1 + length];
-            if let Some(message) = payload
-                .split(|byte| *byte == 0)
-                .find(|field| field.first() == Some(&b'M'))
-            {
-                messages.push(String::from_utf8(message[1..].to_vec()).unwrap());
-            }
-        }
-        offset += 1 + length;
-    }
-    messages
-}
-
 /// A SQL function that waits, called once per row, counts each completed call
 /// once in `pg_stat_user_functions`.
 #[test]

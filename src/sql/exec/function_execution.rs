@@ -661,6 +661,7 @@ fn run_body<'a>(
         command: context.txn.command_id(),
         depth: context.txn.trigger_depth(),
         retained,
+        statement_end: false,
     });
     let definition = crate::storage::RelationDefinition::EMPTY;
     let result = (|| {

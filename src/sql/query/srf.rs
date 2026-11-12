@@ -2517,7 +2517,7 @@ pub(crate) fn describe_derived_definition<'a>(
                             }
                         }
                         SelectItem::Expr { expression, .. } => {
-                            ss.expression_collation(storage, arena, expression)?;
+                            ss.enclosed_expression_collation(storage, arena, expression, outer)?;
                         }
                         SelectItem::Wildcard(_) | SelectItem::RecordStar(_) => {}
                     }

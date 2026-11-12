@@ -961,6 +961,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                                             self.from.joins[table - 1].kind,
                                             crate::sql::ast::JoinKind::Inner
                                                 | crate::sql::ast::JoinKind::Cross
+                                                | crate::sql::ast::JoinKind::Comma
                                         )
                                     {
                                         return Ok(None);
@@ -1000,6 +1001,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                                     self.from.joins[table - 1].kind,
                                     crate::sql::ast::JoinKind::Inner
                                         | crate::sql::ast::JoinKind::Cross
+                                        | crate::sql::ast::JoinKind::Comma
                                 ))
                         {
                             return Ok(None);

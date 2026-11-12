@@ -520,9 +520,17 @@ impl<'a> DerivedTableOuter<'_, '_, '_, 'a> {
         if self.visible_from >= self.preceding {
             return None;
         }
+        // A name an out-of-reach item also answers fails as that item's
+        // invalid reference instead.
+        if qualifier.is_none()
+            && (0..self.visible_from.min(self.preceding))
+                .any(|table| self.siblings.visible_column_owner(table, name).is_some())
+        {
+            return None;
+        }
         match self
             .siblings
-            .find_column_prefix(self.preceding, qualifier, name)
+            .find_column_in(0..self.preceding, qualifier, name)
         {
             Err(error) if error.sqlstate == sqlstate::AMBIGUOUS_COLUMN => Some(
                 crate::sql::error_position::column_reference(error, qualifier, name),
@@ -545,7 +553,7 @@ impl<'a> DerivedTableOuter<'_, '_, '_, 'a> {
         }
         match self
             .siblings
-            .find_column_prefix(self.preceding, qualifier, name)
+            .find_column_in(0..self.preceding, qualifier, name)
         {
             Ok(ResolvedColumn::Table(table, _)) if self.reachable(table) => {
                 Some(qualifier.or(Some(self.siblings.names[table])))
@@ -3128,6 +3136,29 @@ impl<'d> QueryScope<'d> {
         )
     }
 
+    /// [`Self::expression_collation`] for a query nested in others, whose
+    /// expressions may read the enclosing queries' columns.
+    pub(crate) fn enclosed_expression_collation(
+        &self,
+        storage: &Storage,
+        arena: &Arena,
+        expression: &Expr<'_>,
+        outer: Option<&dyn ColumnLookup<'_>>,
+    ) -> Result<crate::sql::ast::Collation, SqlError> {
+        let catalog = super::storage_catalog(storage, arena, self.txid);
+        let outer_types = outer.map(OuterColumnTypes);
+        crate::sql::eval::resolved_expression_collation(
+            expression,
+            &super::Chained {
+                inner: &ScopeTypes(self),
+                outer: outer_types
+                    .as_ref()
+                    .map(|types| types as &dyn ColumnLookup<'_>),
+            },
+            Some(&catalog),
+        )
+    }
+
     pub(crate) fn described_expression_collation(
         &self,
         storage: &Storage,
@@ -3526,7 +3557,17 @@ impl<'d> QueryScope<'d> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
-        self.find_relation_column(visible, qualifier, name)
+        self.find_column_in(0..visible, qualifier, name)
+    }
+
+    /// Resolves a name among the FROM items in `items` only.
+    fn find_column_in(
+        &self,
+        items: core::ops::Range<usize>,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_relation_column(items, qualifier, name)
             .map_err(|error| {
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                     && self.names_system_column(qualifier, name)
@@ -3567,18 +3608,18 @@ impl<'d> QueryScope<'d> {
 
     fn find_relation_column(
         &self,
-        visible: usize,
+        items: core::ops::Range<usize>,
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
-        let visible = visible.min(self.n);
+        let items = items.start..items.end.min(self.n);
         // A merged column is visible when every item it merges is.
         let entry_visible = |entry: ResolvedColumn| match entry {
-            ResolvedColumn::Table(table, _) => table < visible,
+            ResolvedColumn::Table(table, _) => items.contains(&table),
             ResolvedColumn::Merged(merged) => self.merged[merged]
                 .parts
                 .iter()
-                .all(|&(table, _)| table < visible),
+                .all(|&(table, _)| items.contains(&table)),
         };
         match qualifier {
             Some(q) => {
@@ -3597,7 +3638,7 @@ impl<'d> QueryScope<'d> {
                         });
                 }
                 let source = self.source(q)?;
-                if source.table >= visible {
+                if !items.contains(&source.table) {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,
                         "missing FROM-clause entry for table \"{}\"",
@@ -3683,7 +3724,7 @@ impl<'d> QueryScope<'d> {
                         });
                 }
                 let mut found = None;
-                for t in 0..visible {
+                for t in items.clone() {
                     if let Some(c) = self.scope_column_index(t, name) {
                         let duplicated = || {
                             self.defs

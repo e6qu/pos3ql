@@ -597,7 +597,7 @@ fn simple_subquery<'a>(
             || join.natural
             || !matches!(
                 join.kind,
-                JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+                JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left
             )
     }) {
         return None;

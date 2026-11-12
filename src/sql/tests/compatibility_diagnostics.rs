@@ -1465,6 +1465,12 @@ fn a_lateral_body_reads_only_the_items_to_its_left() {
                  RETURNING lt.id, lt.v",
                 &["1|15"],
             ),
+            // A comma ends the join tree: `lw` crosses `lt a RIGHT JOIN lu s`.
+            (
+                "SELECT count(*) FROM lw, lt a RIGHT JOIN lu s ON true",
+                &["2"],
+            ),
+            ("DELETE FROM lt USING lw WHERE false RETURNING *", &[]),
         ] {
             assert_eq!(data_rows(&run_with(engine, budget, sql)), rows, "{sql}");
         }
@@ -1484,18 +1490,6 @@ fn a_lateral_body_reads_only_the_items_to_its_left() {
                 "ERROR 42P10 invalid reference to FROM-clause entry for table \"lt\" @48 \
                  hint: There is an entry for table \"lt\", but it cannot be referenced from \
                  this part of the query."
-                    .to_string(),
-            ),
-            (
-                "SELECT count(*) FROM lw, lt a RIGHT JOIN lu s ON true",
-                "ERROR 0A000 a RIGHT or FULL JOIN after a comma-separated FROM item is not \
-                 supported"
-                    .to_string(),
-            ),
-            (
-                "DELETE FROM lt USING lw WHERE false RETURNING *",
-                "ERROR 0A000 RETURNING * is not supported with UPDATE ... FROM or DELETE ... \
-                 USING"
                     .to_string(),
             ),
         ] {

@@ -331,7 +331,10 @@ CLUSTER ON` and `REPLICA IDENTITY USING INDEX` reject an index that backs a
 separate index slot to mark. A view's `reloptions` list `security_barrier`
 before `check_option` and omit `security_invoker=false`, where PostgreSQL keeps
 the options as written; keeping them needs the written order in the view's
-journal records and checkpoint image. `pg_get_viewdef` uses PostgreSQL's
+journal records and checkpoint image. `pg_operator` lists 27 `=` operators
+where PostgreSQL lists 63, so a foreign key's `conpfeqop`, `conppeqop` and
+`conffeqop` are NULL where PostgreSQL lists each key column's equality
+operator (`{96}`); they need the complete built-in operator rows first. `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their

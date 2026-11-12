@@ -881,3 +881,35 @@ fn key_constraints_are_noinherit_unless_copied_to_a_partition() {
         ]
     );
 }
+
+/// Columns a constraint kind does not use are NULL, not empty arrays.
+#[test]
+fn unused_constraint_arrays_are_null() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE na (k int PRIMARY KEY, u int UNIQUE, v int CHECK (v > 0)); \
+         CREATE TABLE nb (k int REFERENCES na); \
+         CREATE DOMAIN nd AS int CHECK (VALUE > 0)",
+    );
+    assert!(error_sqlstates(&output).is_empty(), "{output:?}");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT conname, conkey IS NULL, confkey IS NULL, conpfeqop IS NULL, \
+                    conppeqop IS NULL, conffeqop IS NULL, confdelsetcols IS NULL, \
+                    conexclop IS NULL \
+               FROM pg_constraint \
+              WHERE (conrelid IN ('na'::regclass, 'nb'::regclass) OR contypid = 'nd'::regtype) \
+                AND contype NOT IN ('n', 'f') ORDER BY conname",
+        )),
+        [
+            "na_pkey|f|t|t|t|t|t|t",
+            "na_u_key|f|t|t|t|t|t|t",
+            "na_v_check|f|t|t|t|t|t|t",
+            "nd_check|t|t|t|t|t|t|t",
+        ]
+    );
+}

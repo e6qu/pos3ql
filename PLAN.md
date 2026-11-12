@@ -296,8 +296,11 @@ constraint cannot be named by `CLUSTER ON`, `CLUSTER ... USING` or `REPLICA
 IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 `reloptions` lists its options in a fixed order (`security_invoker`,
 `security_barrier`, `check_option`) where PostgreSQL keeps the order they were
-set, and omits an explicit `security_invoker=false`. A set operation's type or column-count error and a misplaced
-`DEFAULT` are reported without their cursor position. A cursor whose query
+set, and omits an explicit `security_invoker=false`. A rewrite rule whose `INSERT` action writes `DEFAULT`
+(`DO ALSO INSERT INTO log VALUES (NEW.a, DEFAULT)`) fails with `42601`
+(`DEFAULT is not allowed in this context`) when it fires: the action runs as an
+`INSERT ... SELECT` over the rule's source rows, which has no column-default
+marker. A cursor whose query
 cannot stream runs it at `DECLARE` or `OPEN`, so a volatile function's side
 effects happen before the first `FETCH` rather than at it. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1

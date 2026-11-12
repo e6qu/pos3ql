@@ -369,6 +369,10 @@ pub struct Parser<'a> {
     defer_analysis_errors: bool,
     /// The first analysis error in the statement being parsed.
     analysis_error: Option<ParseError>,
+    /// The first `DEFAULT` of the statement not written as a whole
+    /// INSERT value or assigned value, and the most recent `DEFAULT`.
+    misplaced_default: Option<usize>,
+    last_default: usize,
     /// The type a deferred "type modifier is not allowed" error names, which
     /// PostgreSQL reports as unknown instead when no such type exists.
     analysis_error_type: Option<&'a str>,
@@ -1024,6 +1028,8 @@ impl<'a> Parser<'a> {
             truncation_reported_to: 0,
             defer_analysis_errors: false,
             analysis_error: None,
+            misplaced_default: None,
+            last_default: 0,
             analysis_error_type: None,
             rejected_statement: None,
             analysis_error_reported: false,
@@ -1432,7 +1438,19 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Eof {
             return Ok(None);
         }
+        self.misplaced_default = None;
         let statement = self.statement()?;
+        if let Some(at) = self.misplaced_default.take() {
+            self.analysis_error(ParseError {
+                at,
+                message: StackStr::from_str("DEFAULT is not allowed in this context"),
+                sqlstate: sqlstate::SYNTAX_ERROR,
+                cursor: Some(at),
+                hint: None,
+                near: None,
+                detail: None,
+            })?;
+        }
         match self.peeked {
             Tok::Op(";") | Tok::Eof => match self.analysis_error.take() {
                 Some(error) => {
@@ -7983,11 +8001,15 @@ impl<'a> Parser<'a> {
             self.push(&mut rows, &[])?;
         } else {
             self.expect_ident("values")?;
+            let mut first_default = None;
             loop {
                 self.expect_op("(")?;
                 let mut row = ArenaList::new(self.arena);
                 loop {
-                    let value = self.expression(0)?;
+                    let value = self.value_or_default()?;
+                    if matches!(value, Expr::DefaultMarker) {
+                        first_default.get_or_insert(self.last_default);
+                    }
                     self.push(&mut row, value)?;
                     if !self.eat_op(",")? {
                         break;
@@ -8008,6 +8030,11 @@ impl<'a> Parser<'a> {
                     "union" | "intersect" | "except" | "order" | "limit" | "offset" | "fetch"
                 )
             ) {
+                // A query's VALUES cannot hold DEFAULT.
+                if let Some(at) = first_default {
+                    self.misplaced_default =
+                        Some(self.misplaced_default.map_or(at, |first| first.min(at)));
+                }
                 let query = self.insert_values_query(rows.as_slice())?;
                 select = Some(
                     self.arena
@@ -8345,7 +8372,7 @@ impl<'a> Parser<'a> {
             let name_count = names.len();
             let mut values = ArenaList::new(self.arena);
             let value_count = if !multiple {
-                let value = self.expression(0)?;
+                let value = self.value_or_default()?;
                 self.push(&mut values, value)?;
                 1
             } else if self.eat_ident("row")? {
@@ -8676,12 +8703,22 @@ impl<'a> Parser<'a> {
 
     /// Parses the comma-separated body after a multi-column assignment's
     /// opening parenthesis and consumes its closing parenthesis.
+    /// One INSERT or assigned value, where a whole `DEFAULT` is allowed.
+    fn value_or_default(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let value = self.expression(0)?;
+        if matches!(value, Expr::DefaultMarker) && self.misplaced_default == Some(self.last_default)
+        {
+            self.misplaced_default = None;
+        }
+        Ok(value)
+    }
+
     fn assignment_row_values(
         &mut self,
         values: &mut ArenaList<'a, &'a Expr<'a>>,
     ) -> Result<(), ParseError> {
         loop {
-            let value = self.expression(0)?;
+            let value = self.value_or_default()?;
             self.push(values, value)?;
             if !self.eat_op(",")? {
                 break;
@@ -8944,7 +8981,7 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let mut vals = ArenaList::new(self.arena);
         loop {
-            let value = self.expression(0)?;
+            let value = self.value_or_default()?;
             self.push(&mut vals, value)?;
             if !self.eat_op(",")? {
                 break;

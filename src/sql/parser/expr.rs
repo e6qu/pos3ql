@@ -936,7 +936,10 @@ impl<'a> Parser<'a> {
                 self.arena_expr_at(Expr::Exists(boxed), exists_at)
             }
             Tok::Ident("default") => {
+                let at = self.peek_at;
                 self.advance()?;
+                self.last_default = at;
+                self.misplaced_default.get_or_insert(at);
                 self.arena_expr(Expr::DefaultMarker)
             }
             Tok::Ident("case") => {

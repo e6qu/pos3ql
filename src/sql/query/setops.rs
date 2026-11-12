@@ -1025,6 +1025,73 @@ pub(super) fn collect_set_leaves<'a>(
     }
 }
 
+/// The set operation that combines a leaf with the leaves before it, which
+/// names it in PostgreSQL's errors.
+#[derive(Clone, Copy)]
+enum SetJoin {
+    Operator(SetOp),
+    Values,
+}
+
+impl SetJoin {
+    fn name(join: Option<Self>) -> &'static str {
+        match join {
+            Some(Self::Operator(SetOp::Intersect)) => "INTERSECT",
+            Some(Self::Operator(SetOp::Except)) => "EXCEPT",
+            Some(Self::Values) => "VALUES",
+            Some(Self::Operator(SetOp::Union)) | None => "UNION",
+        }
+    }
+}
+
+/// For each leaf in order, the operation of the node where it first meets an
+/// earlier leaf: the node whose right input it leads.
+fn collect_set_joins<'a>(
+    tree: &'a SetTree<'a>,
+    joined: Option<SetJoin>,
+    out: &mut ArenaList<'a, Option<SetJoin>>,
+) -> Result<(), SqlError> {
+    match tree {
+        SetTree::Select(_) => out.push(joined).map_err(|_| arena_full()),
+        SetTree::Op {
+            syntax,
+            operator,
+            left,
+            right,
+            ..
+        } => {
+            collect_set_joins(left, joined, out)?;
+            collect_set_joins(
+                right,
+                Some(match syntax {
+                    crate::sql::ast::SetOperationSyntax::Values => SetJoin::Values,
+                    crate::sql::ast::SetOperationSyntax::Explicit => SetJoin::Operator(*operator),
+                }),
+                out,
+            )
+        }
+    }
+}
+
+/// PostgreSQL positions a set operation's column error at the right input's
+/// column, which a leaf written without a star names directly.
+fn at_leaf_column(error: SqlError, leaf: &Select<'_>, column: usize) -> SqlError {
+    if leaf.set_body.is_some()
+        || leaf
+            .items
+            .iter()
+            .any(|item| !matches!(item, SelectItem::Expr { .. }))
+    {
+        return error;
+    }
+    match leaf.items.get(column) {
+        Some(SelectItem::Expr { expression, .. }) => {
+            crate::sql::error_position::at_expression(error, expression)
+        }
+        _ => error,
+    }
+}
+
 /// Whether a set-operation leaf's `c`-th output column is an untyped UNKNOWN
 /// (a bare NULL or parameter), which the describe path coerces to text but a
 /// set operation should let adopt another branch's type.
@@ -1525,6 +1592,9 @@ where
     let mut leaves = ArenaList::new(arena);
     collect_set_leaves(tree, &mut leaves)?;
     let leaves = leaves.as_slice();
+    let mut joins = ArenaList::new(arena);
+    collect_set_joins(tree, None, &mut joins)?;
+    let joins = joins.as_slice();
     let leaf0 = leaves.first().copied().expect(">=1 leaf");
     let mut leaf_types = [0; MAX_PROJ];
     let n_cols = describe_leaf(storage, leaf0, txid, columns, arena, &mut leaf_types, outer)?;
@@ -1569,11 +1639,20 @@ where
     for (leaf_index, leaf) in leaves[1..].iter().enumerate() {
         let mut lc = [ColDesc::new("", 0, 0); MAX_PROJ];
         let ln = describe_leaf(storage, leaf, txid, &mut lc, arena, &mut leaf_types, outer)?;
+        let join = joins[leaf_index + 1];
         if ln != n_cols {
-            return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "each UNION query must have the same number of columns"
-            ));
+            let error = match join {
+                Some(SetJoin::Values) => sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "VALUES lists must all be the same length"
+                ),
+                join => sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "each {} query must have the same number of columns",
+                    SetJoin::name(join)
+                ),
+            };
+            return Err(at_leaf_column(error, leaf, 0));
         }
         let leaf_ref = *leaf;
         for c in 0..n_cols {
@@ -1608,12 +1687,14 @@ where
                 Some(existing) => match unify_set_type(existing, lt) {
                     Some(t) => target[c] = Some(t),
                     None => {
-                        return Err(sql_err!(
+                        let error = sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
-                            "UNION types {} and {} cannot be matched",
+                            "{} types {} and {} cannot be matched",
+                            SetJoin::name(join),
                             existing.name(),
                             lt.name()
-                        ));
+                        );
+                        return Err(at_leaf_column(error, leaf, c));
                     }
                 },
             }

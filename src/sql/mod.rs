@@ -10711,14 +10711,23 @@ impl Engine {
                 for (index, target) in all.iter_mut().enumerate() {
                     *target = match types.get(index) {
                         Some(declared) => *declared,
-                        None => ColType::from_oid(parameter_oids[index]).ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "parameter ${} has unsupported type OID {}",
-                                index + 1,
-                                parameter_oids[index]
-                            )
-                        })?,
+                        // A domain parameter is held as its base type; the
+                        // recorded parameter type stays the domain.
+                        None => ColType::from_oid(parameter_oids[index])
+                            .or_else(|| {
+                                eval::CatalogAccess::domain_base_type(
+                                    &query::storage_catalog(&self.storage, arena, txn.txid),
+                                    parameter_oids[index],
+                                )
+                            })
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "parameter ${} has unsupported type OID {}",
+                                    index + 1,
+                                    parameter_oids[index]
+                                )
+                            })?,
                     };
                 }
                 Ok(all)

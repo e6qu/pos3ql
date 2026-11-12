@@ -305,7 +305,10 @@ marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
 `pg_constraint` omits the system catalogs' own not-null constraints. A rewrite rule `INSERT` action whose `VALUES` rows write
 `DEFAULT` in different columns runs as one insert per pattern, so `RETURNING`
-from such an action fails with `0A000`. A derived table computes output
+from such an action fails with `0A000`, its statement triggers fire once per
+pattern, and its rows are inserted pattern by pattern; a multi-row `VALUES`
+action also inserts each `VALUES` row for every source row in turn, where
+PostgreSQL inserts every `VALUES` row for one source row before the next. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
@@ -326,7 +329,9 @@ renames its columns (`generate_series(1,2) g(c), LATERAL (SELECT c) x` reports
 parameter of a built-in operator whose overloads PostgreSQL ranks by type
 category takes the other operand's type (`jsonb -> $1` reads `jsonb` where
 PostgreSQL reads `text`), and an ambiguous one (`date + $1`) reports
-`operator does not exist` instead of `operator is not unique`. `PREPARE`
+`operator does not exist` instead of `operator is not unique`. A `PREPARE`
+parameter inferred as a domain (`$1::pos`) is checked as the domain but
+listed in `pg_prepared_statements` as its base type. `PREPARE`
 converts a constant (`'a'::int`) and checks a `WHERE` without `FROM` when the
 statement is executed, where PostgreSQL rejects them at `PREPARE`. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.

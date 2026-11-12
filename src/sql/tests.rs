@@ -82450,7 +82450,7 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
 }
 
 #[test]
-fn array_element_assignment_is_rejected_instead_of_treated_as_jsonb() {
+fn array_element_assignment_sets_elements_instead_of_treating_them_as_jsonb() {
     let config = test_config("array-element-assignment");
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -82460,18 +82460,14 @@ fn array_element_assignment_is_rejected_instead_of_treated_as_jsonb() {
         "CREATE TABLE element_targets (a int[], j jsonb); \
          INSERT INTO element_targets VALUES ('{1,2}', '{}'), (NULL, NULL)",
     );
-    for statement in [
-        "UPDATE element_targets SET a[1] = 9 WHERE a IS NOT NULL",
-        "UPDATE element_targets SET a[1] = 9 WHERE a IS NULL",
-    ] {
-        let output = run_with(&mut engine, &mut budget, statement);
-        assert_eq!(error_sqlstates(&output), ["0A000"], "{statement}");
-        assert!(
-            String::from_utf8_lossy(&output)
-                .contains("assignment to array elements and slices is not supported"),
-            "{statement}"
-        );
-    }
+    // PostgreSQL grows a one-dimensional array and makes a NULL array hold
+    // only the assigned element.
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE element_targets SET a[3] = 9 RETURNING a::text",
+    );
+    assert_eq!(data_rows(&output), ["{1,2,9}", "[3:3]={9}"]);
     let output = run_with(
         &mut engine,
         &mut budget,

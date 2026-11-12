@@ -348,9 +348,12 @@ Functions and expressions:
 - `x LIKE ANY (SELECT ...)`, `NOT LIKE ALL` and `ILIKE` match against a
   subquery's rows as they do against an array. The operator spellings `~~`,
   `!~~`, `~~*` and `!~~*` are `LIKE`, `NOT LIKE`, `ILIKE` and `NOT ILIKE`,
-  quantified forms included (`x ~~ ANY (array['a%'])`). A pattern match
-  between non-string operands (`1 LIKE 'a'`) fails with `42883` (`operator
-  does not exist: integer ~~ unknown`).
+  quantified forms included (`x ~~ ANY (array['a%'])`). The POSIX operators
+  `~`, `~*`, `!~` and `!~*` quantify the same way (`x ~ ANY (array['^a'])`),
+  as does `OPERATOR(pg_catalog.~) ANY (...)`; a quantified user-defined
+  operator fails with `0A000`. A pattern match between non-string operands
+  (`1 LIKE 'a'`, or `1 ~ ANY (array['a'])` over an empty array too) fails
+  with `42883` (`operator does not exist: integer ~~ unknown`).
 - An unmatched PL/pgSQL `CASE` without `ELSE` raises `20000` (`case not found`,
   hint `CASE statement is missing ELSE part.`).
 - User error codes such as `PZ001` behave as ordinary errors: `WHEN SQLSTATE

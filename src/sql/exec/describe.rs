@@ -4803,7 +4803,8 @@ pub(crate) fn builtin_binary_type(
             }
             of(ColType::Bool)
         }
-        And | Or | Like | ILike => of(ColType::Bool),
+        And | Or | Like | ILike | RegexMatch | RegexIMatch | NotLike | NotILike | RegexNotMatch
+        | RegexNotIMatch => of(ColType::Bool),
         TextSearchMatch => of(ColType::Bool),
         TextSearchPhrase => of(ColType::TsQuery),
         Overlaps if lo == oid::TSQUERY || ro == oid::TSQUERY => of(ColType::TsQuery),

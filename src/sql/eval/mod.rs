@@ -3693,6 +3693,60 @@ fn pattern_operator_undefined<'a>(
     ))
 }
 
+/// A quantified `LIKE`/`ILIKE`/`~`/`~*` resolves its operator from the
+/// declared operand and element types before reading an element, so an empty
+/// array still fails for a non-string side.
+fn validate_quantified_pattern<'a>(
+    operator: BinaryOp,
+    operand: &Expr<'a>,
+    element: super::types::ArrElem,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(), SqlError> {
+    use super::types::oid;
+    if !matches!(
+        operator,
+        BinaryOp::Like
+            | BinaryOp::ILike
+            | BinaryOp::RegexMatch
+            | BinaryOp::RegexIMatch
+            | BinaryOp::NotLike
+            | BinaryOp::NotILike
+            | BinaryOp::RegexNotMatch
+            | BinaryOp::RegexNotIMatch
+    ) {
+        return Ok(());
+    }
+    let base = |type_oid: i32| {
+        hooks
+            .catalog
+            .and_then(|catalog| catalog.domain_base_type(type_oid))
+            .map_or(type_oid, ColType::oid)
+    };
+    let left = base(expression_type_identity(operand, row, hooks)?.routine_argument_oid());
+    let right = base(element.element_oid());
+    let string = |type_oid: i32| {
+        matches!(
+            type_oid,
+            oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::UNKNOWN
+        )
+    };
+    let valid = (string(left) && string(right))
+        || (matches!(operator, BinaryOp::Like | BinaryOp::NotLike)
+            && matches!(left, oid::BYTEA | oid::UNKNOWN)
+            && right == oid::BYTEA);
+    if valid {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "operator does not exist: {} {} {}",
+        operator_type_name(left),
+        operator.operator_name().unwrap_or("?"),
+        operator_type_name(right)
+    ))
+}
+
 /// `x IN (SELECT c ...)` and `x op ANY/ALL (SELECT c ...)` compare through
 /// an operator that PostgreSQL resolves from the declared types before any
 /// row is read, and `cstring` has none, so either side being `cstring` fails
@@ -6342,7 +6396,45 @@ fn eval_full_inner<'a>(
                     let raw = super::array::parse_literal(s, element, arena)?;
                     (element, raw)
                 }
-                _ => return Err(type_mismatch("ANY/ALL requires an array", &array)),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "op ANY/ALL (array) requires array on right side"
+                    ));
+                }
+            };
+            validate_quantified_pattern(operator, operand, element, row, hooks)?;
+            // An unknown literal operand takes the element type, as PostgreSQL
+            // resolves `'1' = ANY (integer[])`.
+            let lhs = match lhs {
+                Datum::Text(_)
+                    if is_unknown_literal(operand)
+                        && !matches!(
+                            element,
+                            super::types::ArrElem::Text
+                                | super::types::ArrElem::Varchar
+                                | super::types::ArrElem::Bpchar
+                                | super::types::ArrElem::Name
+                                | super::types::ArrElem::Enum(_)
+                        )
+                        && operators::Comparison::from_binary(operator).is_some() =>
+                {
+                    use super::types::GeometryKind;
+                    // Points, paths and polygons have no comparison operators.
+                    if let super::types::ArrElem::Geometry(
+                        GeometryKind::Point | GeometryKind::Path | GeometryKind::Polygon,
+                    ) = element
+                    {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "operator does not exist: unknown {} {}",
+                            operator.operator_name().unwrap_or("?"),
+                            operator_type_name(element.element_oid())
+                        ));
+                    }
+                    cast_to(lhs, element.to_coltype(), arena)?
+                }
+                lhs => lhs,
             };
             let mut saw_null = false;
             for el in super::array::elements(raw, element) {

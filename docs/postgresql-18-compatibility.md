@@ -547,6 +547,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | `commit_queue_slots` | Commits waiting for durability |
 | `memtable_bytes` (≤ `u32::MAX`) | Two heap buffers are reserved; reclamation returns `54000` while both are retained |
 | `object_store_get_slots`, `object_store_put_slots`, `object_store_block_put_slots`, `wal_upload_buffer_bytes` | Concurrent object-store requests; see [object storage](object-storage.md) |
+| `statement_restart_waits` (optional, default 64) | Blocks one statement's restarts may download, per read owner, before a restart without progress reads the rest synchronously; see [execution model](architecture.md#execution-model) |
 | `checkpoint_manifest_bytes` and backup/merge/cleanup rosters | Maintenance work per step |
 
 Fixed per-query-workspace limits: 1,024 snapshot and file-owner slots, 64 scan

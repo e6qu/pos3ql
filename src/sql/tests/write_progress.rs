@@ -1107,3 +1107,111 @@ fn after_row_reads_yield_after_storage_waits() {
         }
     }
 }
+
+/// With no block or disk cache, every restartable statement shape finishes:
+/// an attempt after a wait that would download a block the statement already
+/// downloaded reads the rest of the statement synchronously, so restarts
+/// cannot repeat without progress. Results match PostgreSQL 18.6; both
+/// transaction modes and both protocols.
+#[test]
+fn restartable_statements_finish_without_block_caches() {
+    let statements: &[(&str, &[&str])] = &[
+        (
+            "SELECT 'i', id FROM cold_items WHERE id <= 2 UNION ALL \
+             SELECT 'm', id FROM cold_more WHERE id <= 2 UNION ALL \
+             SELECT 'e', id FROM cold_extra WHERE id <= 2",
+            &["e|1", "e|2", "i|1", "i|2", "m|1", "m|2"],
+        ),
+        (
+            "SELECT i.id, m.id + e.id FROM cold_items i \
+             JOIN cold_more m ON m.id = i.id JOIN cold_extra e ON e.id = m.id \
+             WHERE i.id <= 2",
+            &["1|2", "2|4"],
+        ),
+        (
+            "SELECT id, (SELECT count(*) FROM cold_more), \
+             (SELECT max(id) FROM cold_extra WHERE id < i.id + 5) \
+             FROM cold_items i WHERE id IN (SELECT id FROM cold_more WHERE id <= 2)",
+            &["1|40|5", "2|40|6"],
+        ),
+        (
+            "INSERT INTO seen_log SELECT 'u' || id FROM (SELECT id FROM cold_items \
+             UNION ALL SELECT id FROM cold_more UNION ALL SELECT id FROM cold_extra) u \
+             WHERE id = 1 RETURNING stage",
+            &["u1", "u1", "u1"],
+        ),
+        (
+            "UPDATE cold_items SET code = 'x' || m.id FROM cold_more m, cold_extra e \
+             WHERE cold_items.id = m.id AND m.id = e.id AND cold_items.id <= 2 \
+             RETURNING cold_items.id, code",
+            &["1|x1", "2|x2"],
+        ),
+        (
+            "DELETE FROM cold_more WHERE id IN (SELECT id FROM cold_extra WHERE id > 38) \
+             RETURNING id",
+            &["39", "40"],
+        ),
+        // The rule action's selection is a later step: it yields too.
+        ("INSERT INTO ruled VALUES (3) RETURNING id", &["3"]),
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for extended in [false, true] {
+            let mut cold = cold_table(
+                &format!("uncached-{extended}"),
+                mode,
+                "CREATE TABLE hot_log(stage text); CREATE TABLE seen_log(stage text); \
+                 CREATE TABLE cold_more(id integer PRIMARY KEY); \
+                 INSERT INTO cold_more SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_extra(id integer PRIMARY KEY); \
+                 INSERT INTO cold_extra SELECT generate_series(1, 40); \
+                 CREATE TABLE ruled(id integer); \
+                 CREATE RULE ruled_log AS ON INSERT TO ruled DO ALSO \
+                 INSERT INTO seen_log SELECT 'r' || i.id || m.id || e.id FROM cold_items i \
+                 JOIN cold_more m USING (id) JOIN cold_extra e USING (id) WHERE id = NEW.id",
+            );
+            for &(sql, returned) in statements {
+                let context = format!("{mode:?} extended={extended}: {sql}");
+                let before = cold.server.requests.load(Ordering::Acquire);
+                let waits = cold.run(sql, extended, other_client_progresses);
+                let gets = cold.server.requests.load(Ordering::Acquire) - before;
+                assert!(waits > 0, "{context}: the statement must wait");
+                let output = cold.writer.send.readable().to_vec();
+                assert!(
+                    error_sqlstates(&output).is_empty(),
+                    "{context}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                let mut rows = data_rows(&output);
+                rows.sort();
+                assert_eq!(rows, returned, "{context}");
+                // Reading synchronously from the start downloads each block
+                // the plan reads; each wait adds at most its own GET and one
+                // repeat before the statement reads synchronously.
+                cold.writer.success(&mut cold.engine, "BEGIN", true);
+                cold.engine
+                    .ckpt
+                    .as_mut()
+                    .unwrap()
+                    .disable_async_block_reads();
+                let before = cold.server.requests.load(Ordering::Acquire);
+                cold.writer.success(&mut cold.engine, sql, true);
+                let synchronous_gets = cold.server.requests.load(Ordering::Acquire) - before;
+                cold.writer.success(&mut cold.engine, "ROLLBACK", true);
+                cold.engine.enable_async_block_reads();
+                assert!(
+                    gets <= synchronous_gets + 2 * waits,
+                    "{context}: {gets} GETs over {waits} waits, {synchronous_gets} synchronously"
+                );
+            }
+            assert_eq!(
+                cold.rows("SELECT string_agg(stage, ',' ORDER BY stage) FROM seen_log"),
+                ["r333,u1,u1,u1"],
+                "{mode:?} extended={extended}"
+            );
+            cold.finish();
+        }
+    }
+}

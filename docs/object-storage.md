@@ -113,6 +113,7 @@ being published gets the terminal `08007` error described above.
 | Read deadline | 30 seconds per request. |
 | Upload deadline | 30 seconds per attempt. |
 | Attempts | At most 3 for retryable failures, with 200 ms then 400 ms backoff. |
+| `statement_restart_waits` | Distinct blocks one statement may download while it restarts after waits; a restarted attempt past it, or one downloading a block a third time without progress, reads the rest of the statement synchronously (see [statement restarts](architecture.md#execution-model)). Default `64`. |
 | `object_store_hedge_after_ms` | If nonzero, a read still pending after this many milliseconds is also sent on a spare read slot; the first response wins. Default `0` (off). |
 
 Retries apply only to typed retryable outcomes and resend the same conditional

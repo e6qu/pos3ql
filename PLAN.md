@@ -117,20 +117,15 @@ is owned.
   constraint checks yield; reads after an event's first effect block until that event ends,
   so a trigger body that writes and then reads cold data still blocks.
   Writes in `CALL` and `DO` bodies keep their `AFTER` work the same way. The
-  next step's selection in a multi-step write, the `AFTER` work (foreign key
-  checks included) of its steps (rule actions, the statements of a
-  data-modifying `WITH`), and `AFTER` work of writes inside functions called
-  from a restartable statement read synchronously. A step's foreign key
-  check that waits and resumes the step at a completion position past its
-  last row loops with empty caches: each attempt waits again without a new
-  GET, so it also needs the step-local block pinning below. With no block or
-  disk cache, a `SELECT` whose `UNION ALL` branches read three tables saved
-  to object storage in one test also never finished, where each branch read
-  alone does. Letting the next step's selection
-  yield and roll back to the step's start is not enough: with empty caches
-  each retried selection issued a new GET and never finished (a rule action
-  joining a cold table), so the step must keep the blocks it downloaded
-  across its attempts. `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and
+  next step's selection in a multi-step write (a rule action, a statement of
+  a data-modifying `WITH`) yields and rolls back to the step's start; a
+  statement whose restarts repeat downloads without progress reads the rest
+  synchronously (`statement_restart_waits`), so it finishes with empty
+  caches. The `AFTER` work (foreign key checks included) of those steps and
+  of writes inside functions called from a restartable statement still reads
+  synchronously: a step's foreign key check that waited resumed the step at a
+  completion position past its last row and then waited again without a new
+  GET, a loop the download bound does not see. `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and
   `SET DEFAULT` still rewrite the referencing rows as the parent row is
   written, without firing the referencing table's triggers or rules.
   PostgreSQL 18.6 runs each as a `DELETE` or `UPDATE` of the referencing

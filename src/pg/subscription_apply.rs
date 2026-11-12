@@ -711,11 +711,13 @@ impl SubscriptionApply {
     }
 
     fn abort(&mut self, engine: &mut crate::sql::Engine) {
-        engine.cancel_read_owner(crate::store::ReadOwner(
+        let owner = crate::store::ReadOwner(
             (2u128 << 96)
                 | ((self.stream.database_oid().get() as u32 as u128) << 64)
                 | self.stream.slot() as u128,
-        ));
+        );
+        engine.cancel_read_owner(owner);
+        engine.forget_statement_reads(owner);
         if self.txn.staged_commit().is_some() {
             // The commit boundary is irreversible. Its startup queue owner
             // survives a disconnected publisher until publication resolves.

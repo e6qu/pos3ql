@@ -2703,6 +2703,36 @@ impl Checkpointer {
             .set_read_owner(owner);
     }
 
+    pub(crate) fn begin_statement_reads(
+        &mut self,
+        owner: crate::store::ReadOwner,
+        restarted: bool,
+        progress: usize,
+    ) -> Result<(), SqlError> {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .base_mut()
+            .begin_statement_reads(owner, restarted, progress)
+            .map_err(|error| sst_to_sql(crate::store::SstError::Store(error)))
+    }
+
+    pub(crate) fn statement_progressed(&mut self, owner: crate::store::ReadOwner) {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .base_mut()
+            .statement_progressed(owner);
+    }
+
+    pub(crate) fn forget_statement_reads(&mut self, owner: crate::store::ReadOwner) {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .base_mut()
+            .forget_statement_reads(owner);
+    }
+
     pub(crate) fn cancel_read_owner(&mut self, owner: crate::store::ReadOwner) {
         self.blocks
             .lock()

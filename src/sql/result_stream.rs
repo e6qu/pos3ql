@@ -398,6 +398,7 @@ impl Engine {
                     }
                     row_attempted = false;
                     state.emitted += u64::from(emitted);
+                    self.statement_progressed();
                 }
                 Ok(None) => {
                     if let Err(error) = sequence_scope.finish(guc.seq_session()) {

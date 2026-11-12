@@ -179,6 +179,29 @@ pub(crate) struct OwnedObjectStore {
     hedge_after: Option<Duration>,
     read_owner: Option<ReadOwner>,
     read_capacity_generation: u64,
+    restart_reads: FixedVec<RestartReads>,
+}
+
+/// The blocks one read owner's statement downloaded since it last made
+/// progress. A statement that waits restarts from its start (or reselects a
+/// write's rows), so without a cache that keeps those blocks each attempt can
+/// download them again and wait once more; the read slots keep only the
+/// responses not yet consumed. An attempt after a restart that would download
+/// a block a third time, or a block past `statement_restart_waits` distinct
+/// ones, reads the rest of its statement synchronously. Each block is thus
+/// downloaded at most twice with waits between progress, which bounds the
+/// restarts that make none.
+struct RestartReads {
+    /// `None` while the entry is free.
+    owner: Option<ReadOwner>,
+    /// The statement's current attempt follows a wait.
+    restarted: bool,
+    /// The rest of the statement reads with the atomic client.
+    synchronous: bool,
+    /// The statement's progress position when its current attempt started.
+    progress: usize,
+    /// Each downloaded block and how often it was downloaded.
+    downloads: FixedVec<(BlockId, u8)>,
 }
 
 struct ObjectReadSlot {
@@ -207,6 +230,10 @@ impl OwnedObjectStore {
             .saturating_add(config.object_store_get_slots.saturating_mul(
                 core::mem::size_of::<ObjectReadSlot>()
                     + Self::owner_capacity(config) * core::mem::size_of::<ReadOwner>(),
+            ))
+            .saturating_add(Self::owner_capacity(config).saturating_mul(
+                core::mem::size_of::<RestartReads>()
+                    + config.statement_restart_waits * core::mem::size_of::<(BlockId, u8)>(),
             ))
             .saturating_add(super::BLOCK_SIZE)
             .saturating_add(core::mem::size_of::<AtomicReadScopes>())
@@ -268,10 +295,33 @@ impl OwnedObjectStore {
                 })
                 .expect("object read slots sized from configuration");
         }
+        let mut restart_reads = FixedVec::new(
+            budget,
+            "statement restart read owners",
+            Self::owner_capacity(config),
+        )
+        .map_err(crate::object_store::SetupError::Budget)?;
+        for _ in 0..Self::owner_capacity(config) {
+            restart_reads
+                .push(RestartReads {
+                    owner: None,
+                    restarted: false,
+                    synchronous: false,
+                    progress: 0,
+                    downloads: FixedVec::new(
+                        budget,
+                        "statement_restart_waits",
+                        config.statement_restart_waits,
+                    )
+                    .map_err(crate::object_store::SetupError::Budget)?,
+                })
+                .expect("restart read owners sized from configuration");
+        }
         budget
             .draw(super::BLOCK_SIZE, "object_store_block_scratch")
             .map_err(crate::object_store::SetupError::Budget)?;
         Ok(Self {
+            restart_reads,
             atomic_client,
             slots,
             prefix,
@@ -340,6 +390,154 @@ impl OwnedObjectStore {
             .stats
             .object_read_micros
             .saturating_add(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+    }
+
+    /// A top-level statement attempt starts for `owner` at `progress`, a
+    /// position that moves when the statement keeps work across a wait. A new
+    /// statement (`restarted` false) forgets the previous statement's
+    /// downloads, and so does an attempt that made progress.
+    pub(crate) fn begin_statement_reads(
+        &mut self,
+        owner: ReadOwner,
+        restarted: bool,
+        progress: usize,
+    ) -> Result<(), StoreError> {
+        if !restarted {
+            self.forget_statement_reads(owner);
+        }
+        let index = self.restart_entry(owner)?;
+        let entry = &mut self.restart_reads[index];
+        if entry.progress != progress {
+            entry.downloads.clear();
+            entry.synchronous = false;
+        }
+        entry.restarted = restarted;
+        entry.progress = progress;
+        Ok(())
+    }
+
+    /// The owner's statement made progress it keeps across waits (a
+    /// delivered result row): blocks it downloads again are new work.
+    pub(crate) fn statement_progressed(&mut self, owner: ReadOwner) {
+        if let Some(entry) = self
+            .restart_reads
+            .iter_mut()
+            .find(|entry| entry.owner == Some(owner))
+        {
+            entry.downloads.clear();
+            entry.synchronous = false;
+        }
+    }
+
+    /// The owner's session ended; its entry becomes free.
+    pub(crate) fn forget_statement_reads(&mut self, owner: ReadOwner) {
+        if let Some(entry) = self
+            .restart_reads
+            .iter_mut()
+            .find(|entry| entry.owner == Some(owner))
+        {
+            entry.owner = None;
+            entry.restarted = false;
+            entry.synchronous = false;
+            entry.progress = 0;
+            entry.downloads.clear();
+        }
+    }
+
+    fn restart_entry(&mut self, owner: ReadOwner) -> Result<usize, StoreError> {
+        if let Some(index) = self
+            .restart_reads
+            .iter()
+            .position(|entry| entry.owner == Some(owner))
+        {
+            return Ok(index);
+        }
+        let index = self
+            .restart_reads
+            .iter()
+            .position(|entry| entry.owner.is_none())
+            .ok_or(StoreError::ReadOwnersExhausted)?;
+        self.restart_reads[index].owner = Some(owner);
+        Ok(index)
+    }
+
+    /// Whether the owner's statement already reads synchronously.
+    fn statement_reads_synchronously(&self, owner: Option<ReadOwner>) -> bool {
+        owner.is_some_and(|owner| {
+            self.restart_reads
+                .iter()
+                .any(|entry| entry.owner == Some(owner) && entry.synchronous)
+        })
+    }
+
+    /// Called before a restartable read issues a new GET for `id`: whether
+    /// the statement reads synchronously from now on because it would repeat
+    /// downloads without progress.
+    fn statement_repeats_download(&mut self, owner: Option<ReadOwner>, id: &BlockId) -> bool {
+        let Some(owner) = owner else {
+            return false;
+        };
+        let Some(entry) = self
+            .restart_reads
+            .iter_mut()
+            .find(|entry| entry.owner == Some(owner))
+        else {
+            return false;
+        };
+        let repeats = entry
+            .downloads
+            .iter()
+            .find(|(block, _)| block == id)
+            .map(|(_, count)| *count);
+        if entry.restarted
+            && (repeats.is_some_and(|count| count >= 2)
+                || (repeats.is_none() && entry.downloads.len() == entry.downloads.capacity()))
+        {
+            entry.synchronous = true;
+        }
+        entry.synchronous
+    }
+
+    /// Records that the owner's statement issued a GET for `id`.
+    fn record_statement_download(
+        &mut self,
+        owner: Option<ReadOwner>,
+        id: &BlockId,
+    ) -> Result<(), StoreError> {
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        let index = self.restart_entry(owner)?;
+        let downloads = &mut self.restart_reads[index].downloads;
+        if let Some((_, count)) = downloads.iter_mut().find(|(block, _)| block == id) {
+            *count = count.saturating_add(1);
+        } else if downloads.len() < downloads.capacity() {
+            // A full history is not extended: after a restart the next new
+            // download reads synchronously instead.
+            downloads
+                .push((*id, 1))
+                .expect("the statement download history has room");
+        }
+        Ok(())
+    }
+
+    /// Gives up the owner's share of slots for `id` before it reads the block
+    /// synchronously.
+    fn release_owner_reads(&mut self, owner: Option<ReadOwner>, id: &BlockId, packed: bool) {
+        let Some(owner) = owner else {
+            return;
+        };
+        for index in 0..self.slots.len() {
+            let slot = &self.slots[index];
+            if slot.packed == packed
+                && (slot.pending_id == Some(*id)
+                    || slot.ready_id == Some(*id)
+                    || slot.error_id == Some(*id))
+                && slot.owners.contains(&owner)
+            {
+                self.consume(index, Some(owner));
+            }
+        }
     }
 
     pub(crate) fn enter_atomic_reads(&mut self) {
@@ -486,7 +684,7 @@ impl OwnedObjectStore {
         }
     }
 
-    fn demand_slot(&mut self, owner: Option<ReadOwner>) -> Option<&mut ObjectReadSlot> {
+    fn demand_slot(&mut self, owner: Option<ReadOwner>) -> Option<usize> {
         let free = self.slots.iter().position(Self::slot_is_free);
         let index = free.or_else(|| {
             // A caller may abandon its own lookahead to make a demand read.
@@ -499,7 +697,7 @@ impl OwnedObjectStore {
             Self::clear_slot(&mut self.slots[index]);
             self.read_capacity_generation = self.read_capacity_generation.wrapping_add(1);
         }
-        Some(&mut self.slots[index])
+        Some(index)
     }
 
     fn release_siblings(&mut self, id: BlockId, winner: usize) -> Result<(), StoreError> {
@@ -676,6 +874,14 @@ impl BlockStore for OwnedObjectStore {
             return result;
         }
         if self.read_mode == ObjectReadMode::Restartable
+            && self.statement_reads_synchronously(owner)
+        {
+            self.release_owner_reads(owner, id, false);
+            let started = Instant::now();
+            let read = get_block(&mut self.atomic_client, self.prefix, id, into);
+            return self.finish_read(started, read);
+        }
+        if self.read_mode == ObjectReadMode::Restartable
             && self
                 .slots
                 .iter()
@@ -707,14 +913,18 @@ impl BlockStore for OwnedObjectStore {
         {
             return Err(StoreError::NotReady);
         }
+        let synchronous = self.read_mode == ObjectReadMode::Restartable
+            && self.statement_repeats_download(owner, id);
         let started = Instant::now();
         let prefix = self.prefix;
-        let read = if self.read_mode == ObjectReadMode::Atomic {
+        let read = if self.read_mode == ObjectReadMode::Atomic || synchronous {
             get_block(&mut self.atomic_client, prefix, id, into)
         } else {
-            let Some(slot) = self.demand_slot(owner) else {
+            let Some(index) = self.demand_slot(owner) else {
                 return Err(StoreError::NotReady);
             };
+            self.record_statement_download(owner, id)?;
+            let slot = &mut self.slots[index];
             Self::join_owner(slot, owner)?;
             let read = get_block(&mut slot.client, prefix, id, into);
             if matches!(&read, ObjectBlockRead::Pending) {
@@ -755,6 +965,21 @@ impl BlockStore for OwnedObjectStore {
             return result;
         }
         if self.read_mode == ObjectReadMode::Restartable
+            && self.statement_reads_synchronously(owner)
+        {
+            self.release_owner_reads(owner, expected, true);
+            let started = Instant::now();
+            let read = get_packed_block(
+                &mut self.atomic_client,
+                self.prefix,
+                container,
+                range,
+                expected,
+                into,
+            );
+            return self.finish_read(started, read);
+        }
+        if self.read_mode == ObjectReadMode::Restartable
             && self
                 .slots
                 .iter()
@@ -780,9 +1005,11 @@ impl BlockStore for OwnedObjectStore {
         {
             return Err(StoreError::NotReady);
         }
+        let synchronous = self.read_mode == ObjectReadMode::Restartable
+            && self.statement_repeats_download(owner, expected);
         let started = Instant::now();
         let prefix = self.prefix;
-        let read = if self.read_mode == ObjectReadMode::Atomic {
+        let read = if self.read_mode == ObjectReadMode::Atomic || synchronous {
             get_packed_block(
                 &mut self.atomic_client,
                 prefix,
@@ -792,9 +1019,11 @@ impl BlockStore for OwnedObjectStore {
                 into,
             )
         } else {
-            let Some(slot) = self.demand_slot(owner) else {
+            let Some(index) = self.demand_slot(owner) else {
                 return Err(StoreError::NotReady);
             };
+            self.record_statement_download(owner, expected)?;
+            let slot = &mut self.slots[index];
             Self::join_owner(slot, owner)?;
             let read = get_packed_block(&mut slot.client, prefix, container, range, expected, into);
             if matches!(&read, ObjectBlockRead::Pending) {
@@ -811,7 +1040,7 @@ impl BlockStore for OwnedObjectStore {
 
     fn prefetch(&mut self, id: &BlockId) -> Result<PrefetchState, StoreError> {
         let owner = self.request_owner()?;
-        if owner.is_none() {
+        if owner.is_none() || self.statement_reads_synchronously(owner) {
             return Ok(PrefetchState::Unavailable);
         }
         if self.slots.iter().any(|slot| {

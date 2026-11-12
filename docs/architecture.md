@@ -64,6 +64,18 @@ worker. Completion or failure releases unused read-ahead requests. Commit does
 so as soon as its row images are in the journal, so an abandoned speculative
 download cannot hold up the next checkpoint.
 
+**Restarts always finish.** A statement that restarts after a wait reads its
+blocks again; a block it already consumed survives only in the block or disk
+cache. When the caches are off or smaller than the statement's blocks, every
+attempt could download them again and wait again, so the read path counts,
+per statement, how often it downloaded each block since the statement last
+kept progress (rows a resumed write kept, a delivered result row). An attempt
+after a wait that would download a block a third time, or one more distinct
+block than `statement_restart_waits` (default 64), reads the rest of the
+statement synchronously. With `block_cache_bytes = 0` and `disk_cache_bytes =
+0`, `SELECT ... UNION ALL ...` over three cold tables therefore waits a few
+times and then finishes, where it used to restart forever.
+
 The rule for statements: a statement can yield until it performs its first
 **effect** — something a restart could not undo or repeat. Effects are calling
 a volatile function or a user routine body, issuing `nextval`/`setval`, and
@@ -264,7 +276,8 @@ BY id` sorts first, so its output queues in the spool instead.
 | Writes after their first row change, also in a `CALL` or `DO` body: each row's index maintenance, constraint checks, trigger bodies and `RETURNING`, until an effect a rerun would not repeat identically | Yields; only the unfinished row rolls back (see above) |
 | A write's row after an effect a rerun would not repeat, or every row when such an effect ran in its scan | Blocks until the next step's rows or the statement's end |
 | A top-level write's `AFTER ROW` events, immediate constraint checks and `AFTER STATEMENT` triggers | Yields; finished events are kept (see above). An event's reads after its first effect block until that event ends |
-| The next step's row selection in a multi-step write; `AFTER` triggers between the steps of a rule-rewritten write, and `AFTER` work of writes inside routine bodies | Blocks until the next step's rows or that work ends |
+| The next step's row selection in a multi-step write (a rule action, a data-modifying `WITH` statement) after earlier rows that could resume | Yields; the step rolls back to its start and the finished steps are kept |
+| `AFTER` triggers between the steps of a rule-rewritten write, and `AFTER` work of writes inside routine bodies | Blocks until the next step's rows or that work ends |
 | Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, rule actions, `INSTEAD OF` view triggers): row expressions, row triggers, `RETURNING`; `BEFORE` and `INSTEAD OF` trigger bodies that need the engine | Run on the engine between attempts; the write keeps its changed rows and finished steps and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
 | DDL and `COPY FROM` | Blocks for the whole statement |
 | Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |

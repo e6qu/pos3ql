@@ -2903,6 +2903,20 @@ impl Engine {
         core::mem::replace(&mut self.read_owner, owner)
     }
 
+    /// The running statement kept progress across waits (a delivered row).
+    pub(crate) fn statement_progressed(&mut self) {
+        if let (Some(checkpointer), Some(owner)) = (&mut self.ckpt, self.read_owner) {
+            checkpointer.statement_progressed(owner);
+        }
+    }
+
+    /// The owner's session ended: its statement's download history is freed.
+    pub(crate) fn forget_statement_reads(&mut self, owner: crate::store::ReadOwner) {
+        if let Some(checkpointer) = &mut self.ckpt {
+            checkpointer.forget_statement_reads(owner);
+        }
+    }
+
     pub(crate) fn cancel_read_owner(&mut self, owner: crate::store::ReadOwner) {
         if let Some(checkpointer) = &mut self.ckpt {
             checkpointer.cancel_read_owner(owner);
@@ -5798,6 +5812,16 @@ impl Engine {
         if resume_statement && resumed.is_none() {
             // A write's progress belongs to the statement that waited.
             txn.release_retained_write();
+        }
+        if resume_statement
+            && let (Some(checkpointer), Some(owner)) = (&mut self.ckpt, self.read_owner)
+        {
+            // Rows a resumed write kept move its journal position.
+            checkpointer.begin_statement_reads(
+                owner,
+                resumed.is_some(),
+                self.wal.stage_mark(txn.txid),
+            )?;
         }
         if let Some(lease) = resumed.as_ref().and_then(|state| state.lease.as_ref()) {
             lease.validate_storage(&self.storage)?;

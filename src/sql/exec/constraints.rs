@@ -2746,11 +2746,14 @@ fn check_fk_child_one_at(
     else {
         return Err(missing_parent_key(def, fk, values));
     };
+    let mut child_types = [ColType::Bool; MAX_COLUMNS];
+    def.schema(&mut child_types);
     if parent_has_key(
         storage,
         parent_index,
         fk.parent_cols(),
         fk.columns(),
+        &child_types[..def.n_columns],
         values,
         txid,
         read,
@@ -3443,6 +3446,96 @@ pub(crate) fn resolve_constraint_name(
     ))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Parent rows the worker's foreign key checks examined.
+    pub(crate) static PARENT_ROWS_VISITED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Most rows one parent key hash names before a foreign key check scans the
+/// parent instead: the hash of a unique key rarely collides.
+const PARENT_KEY_CANDIDATES: usize = 16;
+
+/// Visits the parent rows that can hold the child's key: the unique key
+/// cache's candidates for its hash and the rows with pending changes.
+/// Returns `false`, visiting nothing, when the cache cannot answer (no
+/// complete cache for exactly these columns, a column type that hashes
+/// differently in the child, or more candidates than
+/// [`PARENT_KEY_CANDIDATES`]); the caller then scans the parent.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a parent probe maps the child's key onto the parent's physical columns"
+)]
+fn parent_key_candidates(
+    storage: &Storage,
+    row_table: usize,
+    parent_definition: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    parent_cols: &[u16],
+    mapped: &[u16],
+    child_cols: &[u16],
+    child_types: &[ColType],
+    child_values: &[Datum],
+    txid: u32,
+    visit: &mut crate::storage::RowReadVisitor<'_>,
+) -> Result<bool, SqlError> {
+    let mut values = [Datum::Null; MAX_COLUMNS];
+    let mut collations = [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS];
+    if parent_cols.len() > collations.len() {
+        return Ok(false);
+    }
+    for (position, (&parent_column, &child_column)) in
+        parent_cols.iter().zip(child_cols).enumerate()
+    {
+        let value = child_values[usize::from(child_column)];
+        let column = &parent_definition.columns()[usize::from(parent_column)];
+        if value.is_null() || child_types[usize::from(child_column)] != column.ctype {
+            return Ok(false);
+        }
+        values[usize::from(parent_column)] = value;
+        collations[position] = column.collation;
+    }
+    let hash = crate::sql::eval::hash_key_collated_catalog(
+        storage,
+        txid,
+        &values,
+        parent_cols,
+        &collations[..parent_cols.len()],
+    )?;
+    let mut candidates = [0u64; PARENT_KEY_CANDIDATES];
+    let mut count = 0usize;
+    let mut overflow = false;
+    // Durable candidates borrow an index block, so rows are read after the
+    // probe returns.
+    let served = storage.probe_value(row_table, mapped, hash, |rowid, _| {
+        if count < candidates.len() {
+            candidates[count] = rowid;
+            count += 1;
+        } else {
+            overflow = true;
+        }
+        Ok(())
+    })?;
+    if !served || overflow {
+        return Ok(false);
+    }
+    for &rowid in &candidates[..count] {
+        if let Some(state) = storage.row_state(row_table, rowid)?
+            && visit(rowid, state)?.is_break()
+        {
+            return Ok(true);
+        }
+    }
+    // The cache holds committed keys; the transaction's own changes and
+    // other in-progress ones are visited as changed rows.
+    storage.for_each_pending_row_change(row_table, &mut |rowid, _, _| match storage
+        .row_state(row_table, rowid)?
+    {
+        Some(state) => visit(rowid, state),
+        None => Ok(core::ops::ControlFlow::Continue(())),
+    })?;
+    Ok(true)
+}
+
 /// Whether a parent row has, in `parent_cols`, the tuple the child row
 /// carries in `child_cols`. A write locks that parent row (see [`ParentRead`]).
 #[allow(clippy::too_many_arguments)]
@@ -3451,6 +3544,7 @@ fn parent_has_key(
     parent_index: usize,
     parent_cols: &[u16],
     child_cols: &[u16],
+    child_types: &[ColType],
     child_values: &[Datum],
     txid: u32,
     read: ParentRead,
@@ -3510,6 +3604,8 @@ fn parent_has_key(
         let mapped = super::remap_columns(&physical, &parent_definition, parent_cols)?;
         let mut visit = |rowid: u64, state: crate::storage::RowRead<'_>| {
             use core::ops::ControlFlow;
+            #[cfg(test)]
+            PARENT_ROWS_VISITED.with(|visited| visited.set(visited.get() + 1));
             let moved_out = state.committed.is_none() && state.committed_moved_out;
             let home = match latest {
                 Some(read) => read.visible_row_home(storage, row_table, rowid, state, txid)?,
@@ -3549,6 +3645,25 @@ fn parent_has_key(
             }
             Ok(ControlFlow::Continue(()))
         };
+        // A current read finds the key through the parent's unique key cache
+        // and its pending changes instead of scanning every parent row.
+        if latest.is_some()
+            && !partitioned_parent
+            && parent_key_candidates(
+                storage,
+                row_table,
+                &parent_definition,
+                parent_cols,
+                &mapped[..parent_cols.len()],
+                child_cols,
+                child_types,
+                child_values,
+                txid,
+                &mut visit,
+            )?
+        {
+            return Ok(());
+        }
         match latest {
             Some(read) => read.for_each_row_state(storage, row_table, &mut visit)?,
             None => storage.for_each_row_state(row_table, &mut visit)?,
@@ -4139,6 +4254,7 @@ fn check_referenced_key(
             declared_index,
             fk.parent_cols(),
             parent_columns,
+            &parent_schema[..physical_parent.n_columns],
             old_parent,
             txid,
             ParentRead::Write {

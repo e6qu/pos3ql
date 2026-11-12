@@ -44,6 +44,7 @@ jobs:
           - { name: lib-f, shards: "lib:5-of-6", needs_pg18: false }
           # Each external group repeats the instrumented and release builds.
           - { name: protocol, shards: "run:proto", needs_pg18_client: true }
+          - { name: result-streams, shards: "run:streams", needs_pg18_client: true }
           - { name: durability, shards: "run:dur", needs_pg18_client: true }
           - { name: spill-overlay, shards: "runtest:overlay", needs_pg18: false }
           - { name: ingest, shards: "runtest:ingest", needs_pg18: false }
@@ -55,7 +56,7 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install native debugger for library and protocol failure diagnostics
-        if: startsWith(matrix.shards, 'lib:') || matrix.name == 'protocol' || matrix.name == 'durability'
+        if: startsWith(matrix.shards, 'lib:') || matrix.name == 'protocol' || matrix.name == 'durability' || matrix.name == 'result-streams'
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends gdb

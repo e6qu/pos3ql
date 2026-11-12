@@ -78754,11 +78754,18 @@ pub fn eval_offset_pub<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<u64, SqlError> {
     let Some(expression) = offset else {
         return Ok(0);
     };
-    match eval_full(expression, arena, params, &NoColumns, hooks)? {
+    match eval_full(
+        expression,
+        arena,
+        params,
+        &outer.unwrap_or(&NoColumns),
+        hooks,
+    )? {
         Datum::Null => Ok(0),
         Datum::Int2(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
@@ -78842,11 +78849,18 @@ pub fn eval_limit_pub<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<u64, SqlError> {
     let Some(expression) = limit else {
         return Ok(u64::MAX);
     };
-    match eval_full(expression, arena, params, &NoColumns, hooks)? {
+    match eval_full(
+        expression,
+        arena,
+        params,
+        &outer.unwrap_or(&NoColumns),
+        hooks,
+    )? {
         Datum::Null => Ok(u64::MAX),
         Datum::Int2(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),

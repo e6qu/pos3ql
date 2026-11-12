@@ -2408,7 +2408,6 @@ pub(crate) fn describe_derived_definition<'a>(
         .map(|schema| schema as &dyn ColumnLookup<'_>);
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let mut type_oids = [0_i32; MAX_PROJ];
-    let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
     let n_cols = match sub.set_body {
         Some(tree) => {
             let n = describe_set_body(
@@ -2500,31 +2499,11 @@ pub(crate) fn describe_derived_definition<'a>(
                         }
                     }
                 }
-                let mut slot = 0usize;
+                // Output collations come from the item descriptions; an
+                // item mixing conflicting implicit collations still fails here.
                 for item in sub.items {
-                    match item {
-                        SelectItem::Wildcard => {
-                            for position in 0..ss.star_columns() {
-                                output_collations[slot] =
-                                    ss.output_collation(ss.star_entry(position));
-                                slot += 1;
-                            }
-                        }
-                        SelectItem::TableWildcard(name) => {
-                            for index in 0..ss.qualified_star_columns(name)? {
-                                output_collations[slot] =
-                                    ss.output_collation(ss.qualified_star_entry(name, index)?);
-                                slot += 1;
-                            }
-                        }
-                        SelectItem::RecordStar(base) => {
-                            slot += record_star_width(base, Some(&ss), storage, txid, arena)?;
-                        }
-                        SelectItem::Expr { expression, .. } => {
-                            output_collations[slot] =
-                                ss.expression_collation(storage, arena, expression)?;
-                            slot += 1;
-                        }
+                    if let SelectItem::Expr { expression, .. } = item {
+                        ss.expression_collation(storage, arena, expression)?;
                     }
                 }
                 preserve_projection_type_identities(
@@ -2622,12 +2601,65 @@ pub(crate) fn describe_derived_definition<'a>(
             }
         },
     };
-    for (output, description) in output_collations[..n_cols]
-        .iter_mut()
-        .zip(&descriptors[..n_cols])
-    {
-        *output = description.collation;
+    derived_definition_from(
+        storage,
+        exposed,
+        col_alias,
+        txid,
+        arena,
+        &descriptors[..n_cols],
+        &type_oids[..n_cols],
+    )
+}
+
+/// Describes a derived table whose body reads columns around it: the
+/// enclosing query's row, or for `LATERAL` the FROM items to its left. Set
+/// operations and nested FROM items see those columns as PostgreSQL's outer
+/// references.
+pub(crate) fn describe_contextual_derived_definition<'a>(
+    storage: &'a Storage,
+    sub: &'a Select<'a>,
+    exposed: &str,
+    col_alias: Option<&[&str]>,
+    txid: u32,
+    arena: &'a Arena,
+    visible: &dyn ColumnLookup<'a>,
+) -> Result<RelationDefinition<'a>, SqlError> {
+    let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let n_cols = super::describe_select(
+        sub,
+        storage,
+        txid,
+        arena,
+        &mut descriptors,
+        crate::sql::exec::DescriptionTarget::Sql,
+        Some(visible),
+    )?;
+    let mut type_oids = [0_i32; MAX_PROJ];
+    for (output, description) in type_oids.iter_mut().zip(&descriptors[..n_cols]) {
+        *output = description.type_oid;
     }
+    derived_definition_from(
+        storage,
+        exposed,
+        col_alias,
+        txid,
+        arena,
+        &descriptors[..n_cols],
+        &type_oids[..n_cols],
+    )
+}
+
+fn derived_definition_from<'a>(
+    storage: &Storage,
+    exposed: &str,
+    col_alias: Option<&[&str]>,
+    txid: u32,
+    arena: &'a Arena,
+    descriptors: &[ColDesc<'_>],
+    type_oids: &[i32],
+) -> Result<RelationDefinition<'a>, SqlError> {
+    let n_cols = descriptors.len();
     if n_cols > MAX_COLUMNS {
         return Err(sql_err!(
             sqlstate::TOO_MANY_COLUMNS,
@@ -2637,18 +2669,20 @@ pub(crate) fn describe_derived_definition<'a>(
     }
     // A column-alias list renames the output columns; PostgreSQL requires it to
     // supply no more names than the derived table has columns.
-    if let Some(aliases) = col_alias {
-        if aliases.len() > n_cols {
-            return Err(super::scope::derived_alias_mismatch(
-                exposed,
-                n_cols,
-                aliases.len(),
-            ));
-        }
-        for (i, alias) in aliases.iter().enumerate() {
-            descriptors[i].name = alias;
-        }
+    if let Some(aliases) = col_alias
+        && aliases.len() > n_cols
+    {
+        return Err(super::scope::derived_alias_mismatch(
+            exposed,
+            n_cols,
+            aliases.len(),
+        ));
     }
+    let name = |index: usize| {
+        col_alias
+            .and_then(|aliases| aliases.get(index).copied())
+            .unwrap_or(descriptors[index].name)
+    };
     let blank = ColumnMeta {
         name: SqlName::parse("").expect("empty name is valid"),
         ctype: ColType::Bool,
@@ -2675,16 +2709,16 @@ pub(crate) fn describe_derived_definition<'a>(
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "derived table column \"{}\" type (oid {}) is not supported",
-                    descriptors[i].name,
+                    name(i),
                     type_oids[i]
                 )
             })?;
         columns[i] = ColumnMeta {
-            name: SqlName::parse(descriptors[i].name)?,
+            name: SqlName::parse(name(i))?,
             ctype,
             type_mod: descriptors[i].type_mod,
             collation: if ctype.is_collatable() {
-                match output_collations[i] {
+                match descriptors[i].collation {
                     crate::sql::ast::Collation::None => crate::sql::ast::Collation::Default,
                     collation => collation,
                 }

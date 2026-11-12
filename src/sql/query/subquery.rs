@@ -168,7 +168,7 @@ fn spooled_column_witness<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
-            None,
+            outer,
         )?;
         if let Some((ColType::Composite(slot), _)) =
             crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
@@ -1050,7 +1050,7 @@ fn subquery_collations<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
-            None,
+            outer,
         )?;
         if count == 1
             && let Some((ColType::Composite(slot), _)) =
@@ -1179,7 +1179,7 @@ fn row_subquery_witness<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
-            None,
+            outer,
         )?;
         for (index, column) in columns[..count].iter().enumerate() {
             let value = catalog_type_witness(storage, txid, column.type_oid)?;
@@ -1567,11 +1567,13 @@ fn subquery_exists<'a>(
         sequences,
     )?;
     let catalog = super::storage_catalog(storage, arena, txid);
+    // Subqueries in join conditions run for each pair of rows compared.
+    let join_subqueries = ProceduralSubqueries { storage, txid };
     let hooks = EvalHooks {
         group: None,
         aggs: None,
         subs: Some(&inner_subs),
-        subquery_executor: None,
+        subquery_executor: Some(&join_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -1711,24 +1713,69 @@ fn needs_row_source<'a>(
 }
 
 /// A chain of query scopes from innermost outward, used to decide whether a
-/// subquery references a column belonging to an enclosing query.
-struct ScopeChain<'s, 'd> {
-    scope: Option<&'s QueryScope<'d>>,
-    parent: Option<&'s ScopeChain<'s, 'd>>,
+/// subquery references a column belonging to an enclosing query. Each level
+/// only answers name lookups, so levels of different lifetimes chain.
+struct ScopeChain<'s> {
+    scope: Option<&'s dyn ResolvesColumns>,
+    parent: Option<&'s ScopeChain<'s>>,
 }
 
-impl ScopeChain<'_, '_> {
+trait ResolvesColumns {
+    fn resolves(&self, qualifier: Option<&str>, name: &str) -> bool;
+}
+
+impl ResolvesColumns for QueryScope<'_> {
+    fn resolves(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.find_column(qualifier, name).is_ok()
+    }
+}
+
+impl ScopeChain<'_> {
     /// True if the name resolves at this scope or any enclosing scope.
     fn resolves(&self, qualifier: Option<&str>, name: &str) -> bool {
         if self
             .scope
-            .is_some_and(|scope| scope.find_column(qualifier, name).is_ok())
+            .is_some_and(|scope| scope.resolves(qualifier, name))
         {
             return true;
         }
         self.parent
             .is_some_and(|parent| parent.resolves(qualifier, name))
     }
+}
+
+/// Whether `select` reads a column that neither its own FROM items nor
+/// `visible` (the FROM items to the left of a `LATERAL` body) provide: a
+/// column of an enclosing query, such as `t.x` in `(SELECT 10 / t.x)` used
+/// as a derived table inside a subquery of `t`.
+pub(super) fn select_reads_enclosing<'a>(
+    select: &'a Select<'a>,
+    visible: Option<&QueryScope<'_>>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    let mark = arena.mark();
+    let result = (|| {
+        let scope = select
+            .from
+            .as_ref()
+            .map(|from| correlation_schema(storage, txid, from, arena))
+            .transpose()?
+            .flatten();
+        let visible = ScopeChain {
+            scope: visible.map(|scope| scope as &dyn ResolvesColumns),
+            parent: None,
+        };
+        let chain = ScopeChain {
+            scope: scope.as_ref().map(|scope| scope as &dyn ResolvesColumns),
+            parent: Some(&visible),
+        };
+        select_has_outer_ref(select, &chain, storage, txid, arena)
+    })();
+    // SAFETY: only the boolean answer escapes; the analysis scopes do not.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 /// Whether a top-level subquery node references any column from the enclosing
@@ -1755,7 +1802,7 @@ pub(super) fn subquery_node_correlated<'a>(
         .transpose()?
         .flatten();
     let chain = ScopeChain {
-        scope: scope.as_ref(),
+        scope: scope.as_ref().map(|scope| scope as &dyn ResolvesColumns),
         parent: None,
     };
     select_has_outer_ref(select, &chain, storage, txid, arena)
@@ -1786,10 +1833,16 @@ fn correlation_schema<'a>(
     from: &'a crate::sql::ast::FromClause<'a>,
     arena: &'a Arena,
 ) -> Result<Option<QueryScope<'a>>, SqlError> {
-    let references_outer =
-        |table: &crate::sql::ast::TableRef<'_>| table.lateral || table.is_function_source();
-    if references_outer(&from.base) || from.joins.iter().any(|join| references_outer(&join.table)) {
-        return Ok(None);
+    for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+        if table.lateral
+            || table.is_function_source()
+            || match table.subquery {
+                Some(select) => select_reads_enclosing(select, None, storage, txid, arena)?,
+                None => false,
+            }
+        {
+            return Ok(None);
+        }
     }
     QueryScope::resolve_schema(storage, from, txid, arena, None).map(Some)
 }
@@ -1798,7 +1851,7 @@ fn correlation_schema<'a>(
 /// within `chain` (which already includes this select's own scope).
 fn select_has_outer_ref<'a>(
     select: &'a Select<'a>,
-    chain: &ScopeChain<'_, 'a>,
+    chain: &ScopeChain<'_>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
@@ -1841,7 +1894,7 @@ fn select_has_outer_ref<'a>(
     }
     for item in select.items {
         if match item {
-            SelectItem::Expr { expression, .. } => {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                 expr_has_outer_ref(expression, chain, storage, txid, arena)?
             }
             _ => false,
@@ -1849,7 +1902,71 @@ fn select_has_outer_ref<'a>(
             return Ok(true);
         }
     }
-    Ok(false)
+    for expression in select
+        .distinct_on
+        .iter()
+        .copied()
+        .chain(select.limit)
+        .chain(select.offset)
+    {
+        if expr_has_outer_ref(expression, chain, storage, txid, arena)? {
+            return Ok(true);
+        }
+    }
+    // A WITH body sees the enclosing levels, not this query's FROM items.
+    let enclosing = ScopeChain {
+        scope: None,
+        parent: chain.parent,
+    };
+    for cte in select.with {
+        if select_reads_beyond(cte.query, &enclosing, storage, txid, arena)? {
+            return Ok(true);
+        }
+    }
+    match select.set_body {
+        Some(tree) => set_tree_reads_beyond(tree, chain, storage, txid, arena),
+        None => Ok(false),
+    }
+}
+
+/// [`select_has_outer_ref`] for a query nested directly in `chain`'s level,
+/// such as a set-operation branch or a `WITH` body: it pushes its own scope.
+fn select_reads_beyond<'a>(
+    select: &'a Select<'a>,
+    chain: &ScopeChain<'_>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    let scope = select
+        .from
+        .as_ref()
+        .map(|from| correlation_schema(storage, txid, from, arena))
+        .transpose()?
+        .flatten();
+    let child = ScopeChain {
+        scope: scope.as_ref().map(|scope| scope as &dyn ResolvesColumns),
+        parent: Some(chain),
+    };
+    select_has_outer_ref(select, &child, storage, txid, arena)
+}
+
+fn set_tree_reads_beyond<'a>(
+    tree: &'a crate::sql::ast::SetTree<'a>,
+    chain: &ScopeChain<'_>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    match tree {
+        crate::sql::ast::SetTree::Select(select) => {
+            select_reads_beyond(select, chain, storage, txid, arena)
+        }
+        crate::sql::ast::SetTree::Op { left, right, .. } => {
+            Ok(set_tree_reads_beyond(left, chain, storage, txid, arena)?
+                || set_tree_reads_beyond(right, chain, storage, txid, arena)?)
+        }
+    }
 }
 
 /// Whether a FROM item depends on a column beyond the select's own scope.
@@ -1858,7 +1975,7 @@ fn select_has_outer_ref<'a>(
 /// subquery does.
 fn table_ref_has_outer_ref<'a>(
     table: &'a crate::sql::ast::TableRef<'a>,
-    chain: &ScopeChain<'_, 'a>,
+    chain: &ScopeChain<'_>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
@@ -1897,7 +2014,7 @@ fn table_ref_has_outer_ref<'a>(
         .transpose()?
         .flatten();
     let child = ScopeChain {
-        scope: scope.as_ref(),
+        scope: scope.as_ref().map(|scope| scope as &dyn ResolvesColumns),
         parent: Some(chain),
     };
     select_has_outer_ref(select, &child, storage, txid, arena)
@@ -1908,7 +2025,7 @@ fn table_ref_has_outer_ref<'a>(
 /// column they provide themselves does not count as an outer reference.
 fn expr_has_outer_ref<'a>(
     expression: &'a Expr<'a>,
-    chain: &ScopeChain<'_, 'a>,
+    chain: &ScopeChain<'_>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
@@ -1936,7 +2053,7 @@ fn expr_has_outer_ref<'a>(
                 .transpose()?
                 .flatten();
             let child = ScopeChain {
-                scope: sscope.as_ref(),
+                scope: sscope.as_ref().map(|scope| scope as &dyn ResolvesColumns),
                 parent: Some(chain),
             };
             select_has_outer_ref(s, &child, storage, txid, arena)
@@ -1954,7 +2071,7 @@ fn expr_has_outer_ref<'a>(
                 .transpose()?
                 .flatten();
             let child = ScopeChain {
-                scope: sscope.as_ref(),
+                scope: sscope.as_ref().map(|scope| scope as &dyn ResolvesColumns),
                 parent: Some(chain),
             };
             Ok(select_has_outer_ref(select, &child, storage, txid, arena)?
@@ -1984,6 +2101,7 @@ pub(super) struct OuterSubs<'a> {
 /// correlated (deferred to per-row evaluation during the scan).
 pub(super) fn prepare_outer_subqueries<'a>(
     exprs: &[Option<&'a Expr<'a>>],
+    from: Option<&'a crate::sql::ast::FromClause<'a>>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
@@ -1994,12 +2112,24 @@ pub(super) fn prepare_outer_subqueries<'a>(
     for expression in exprs.iter().flatten() {
         collect_subqueries(expression, &mut nodes)?;
     }
+    let output_nodes = nodes.len();
+    for on in from
+        .into_iter()
+        .flat_map(|from| from.joins.iter().filter_map(|join| join.on))
+    {
+        collect_subqueries(on, &mut nodes)?;
+    }
     let mut lists = ArenaList::new(arena);
     let mut plans = ArenaList::new(arena);
     let mut corr = ArenaList::new(arena);
-    for &node in nodes.as_slice() {
+    for (index, &node) in nodes.as_slice().iter().enumerate() {
         if subquery_node_correlated(node, storage, txid, arena)? {
-            corr.push(node).map_err(|_| arena_full())?;
+            // A join condition's correlated subquery runs for each pair of
+            // rows it compares, through the statement's subquery executor;
+            // the others run once for each row the query produces.
+            if index < output_nodes {
+                corr.push(node).map_err(|_| arena_full())?;
+            }
         } else if matches!(
             node,
             Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. }
@@ -2872,7 +3002,8 @@ pub(crate) fn subquery_expression_type(
         _ => return Ok(None),
     };
     if select.set_body.is_some() {
-        return super::subquery_result_type(expression, None, storage, txid, arena)
+        let outer = super::scope::OuterColumnTypes(outer);
+        return super::subquery_result_type_with_outer(expression, &outer, storage, txid, arena)
             .map(|result| result.map(|result| result.type_oid));
     }
     let scope = select
@@ -2919,8 +3050,11 @@ pub(crate) fn subquery_expression_type(
                 })?
         }
         _ => {
-            return super::subquery_result_type(expression, None, storage, txid, arena)
-                .map(|result| result.map(|result| result.type_oid));
+            let outer = super::scope::OuterColumnTypes(outer);
+            return super::subquery_result_type_with_outer(
+                expression, &outer, storage, txid, arena,
+            )
+            .map(|result| result.map(|result| result.type_oid));
         }
     };
     let type_oid = if type_oid == crate::sql::types::oid::UNKNOWN {
@@ -3309,13 +3443,19 @@ fn run_subquery<'a>(
         .from
         .as_ref()
         .map_or(0, |from| 2 * (from.joins.len() + 1));
+    let keys = select.order_by.len();
     let inner_expressions = arena
-        .alloc_slice_with(2 + sample_capacity, |_| None)
+        .alloc_slice_with(4 + keys + sample_capacity, |_| None)
         .map_err(|_| arena_full())?;
     inner_expressions[0] = Some(item);
     inner_expressions[1] = select.where_clause;
+    inner_expressions[2] = select.limit;
+    inner_expressions[3] = select.offset;
+    for (slot, order) in inner_expressions[4..].iter_mut().zip(select.order_by) {
+        *slot = Some(order.expression);
+    }
     if let Some(from) = &select.from {
-        collect_table_sample_expressions(from, &mut inner_expressions[2..]);
+        collect_table_sample_expressions(from, &mut inner_expressions[4 + keys..]);
     }
     let inner_subs = prepare_subqueries(
         inner_expressions,
@@ -3328,11 +3468,13 @@ fn run_subquery<'a>(
         sequences,
     )?;
     let catalog = super::storage_catalog(storage, arena, txid);
+    // Subqueries in join conditions run for each pair of rows compared.
+    let join_subqueries = ProceduralSubqueries { storage, txid };
     let hooks = EvalHooks {
         group: None,
         aggs: None,
         subs: Some(&inner_subs),
-        subquery_executor: None,
+        subquery_executor: Some(&join_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -3350,7 +3492,15 @@ fn run_subquery<'a>(
         }
         // FROM-less: one row (outer columns still visible if correlated).
         // Aggregates fold over that single virtual row (zero when WHERE is
-        // false) and still yield their one output row.
+        // false) and still yield their one output row, which OFFSET and LIMIT
+        // then window like any other.
+        if !single_row_passes_window(select, arena, params, &hooks, outer)? {
+            return Ok((
+                &[],
+                false,
+                subquery_witness_with_outer(storage, txid, item, None, outer, arena)?,
+            ));
+        }
         let aggregate_columns = SubqueryColumns {
             scope: None,
             outer,
@@ -3483,6 +3633,15 @@ fn run_subquery<'a>(
     let mut agg_nodes = ArenaList::new(arena);
     collect_aggs(item, &mut agg_nodes, storage, txid, &aggregate_columns)?;
     if !agg_nodes.is_empty() {
+        // An aggregate query yields one row, which OFFSET and LIMIT window
+        // before any input row is read.
+        if !single_row_passes_window(select, arena, params, &hooks, outer)? {
+            return Ok((
+                &[],
+                false,
+                spooled_column_witness(select, storage, txid, Some(&scope), arena, item, outer)?,
+            ));
+        }
         let agg_values = fold_aggregates(
             storage,
             &scope,
@@ -3603,8 +3762,9 @@ fn run_subquery<'a>(
     }
 
     // Apply OFFSET/LIMIT over the ordered rows.
-    let offset = crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks)? as usize;
-    let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks)?;
+    let offset =
+        crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks, outer)? as usize;
+    let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks, outer)?;
     let start = offset.min(count);
     let n = ((count - start) as u64).min(limit) as usize;
     let mut saw_null = false;
@@ -3697,9 +3857,10 @@ fn run_set_subquery<'a>(
             arena,
             params,
             &bound_hooks,
+            outer,
         );
     }
-    let (start, n) = set_window(rows.len(), outer_select, arena, params, &bound_hooks)?;
+    let (start, n) = set_window(rows.len(), outer_select, arena, params, &bound_hooks, outer)?;
     let mut saw_null = false;
     // The slice is reserved before any element decodes: a record column's
     // structural decode allocates its fields from the same arena, which must
@@ -3741,8 +3902,9 @@ fn set_record_rows<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
-    let (start, n) = set_window(rows.len(), outer_select, arena, params, hooks)?;
+    let (start, n) = set_window(rows.len(), outer_select, arena, params, hooks, outer)?;
     let mut names = [""; MAX_PROJ];
     for (column, name) in names[..target.len()].iter_mut().enumerate() {
         let text = stack_format!(12, "f{}", column + 1);
@@ -3778,6 +3940,20 @@ fn set_record_rows<'a>(
     Ok((&*out, false, witness))
 }
 
+/// Whether the single row of an aggregate or FROM-less query survives its
+/// `OFFSET` and `LIMIT`, which read the enclosing row like PostgreSQL's.
+fn single_row_passes_window<'a>(
+    select: &'a Select<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<bool, SqlError> {
+    let offset = crate::sql::exec::eval_offset_pub(select.offset, arena, params, hooks, outer)?;
+    let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, hooks, outer)?;
+    Ok(offset == 0 && limit > 0)
+}
+
 /// The `OFFSET` / `LIMIT` trailing a set operation, as a `(start, count)`
 /// window over the materialized rows.
 fn set_window<'a>(
@@ -3786,9 +3962,11 @@ fn set_window<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(usize, usize), SqlError> {
-    let offset = crate::sql::exec::eval_offset_pub(outer_select.offset, arena, params, hooks)?;
-    let limit = crate::sql::exec::eval_limit_pub(outer_select.limit, arena, params, hooks)?;
+    let offset =
+        crate::sql::exec::eval_offset_pub(outer_select.offset, arena, params, hooks, outer)?;
+    let limit = crate::sql::exec::eval_limit_pub(outer_select.limit, arena, params, hooks, outer)?;
     let start = (offset as usize).min(total);
     Ok((start, ((total - start) as u64).min(limit) as usize))
 }

@@ -9008,7 +9008,8 @@ fn window_row<'r, 'a>(
 
 /// Collects aggregate-call nodes for a grouped window query: aggregates
 /// outside window functions plus those inside window arguments and keys
-/// (`sum(sum(v)) OVER (...)`: the inner sum aggregates per group).
+/// (`sum(sum(v)) OVER (...)`: the inner sum aggregates per group), and
+/// subqueries reading this query's aggregates.
 fn collect_grouped_aggs<'a>(
     e: &'a Expr<'a>,
     out: &mut ArenaList<'a, (*const Expr<'a>, &'a Expr<'a>)>,
@@ -9063,18 +9064,72 @@ fn collect_grouped_aggs<'a>(
         return Ok(());
     }
     if is_sublink(e) {
-        // The window layer evaluates subqueries above the grouped derived
-        // table, where an aggregate this query owns has no group to read.
+        // A subquery reading an aggregate this query owns runs once per group
+        // in the grouped derived table, where that aggregate has its value; the
+        // window layer reads its result like an aggregate's.
+        let mut owns = false;
         aggregate_levels::visit_owned_outer_aggregates(e, &mut |_| {
-            Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "a subquery reading an aggregate of a query with window functions is not supported"
-            ))
+            owns = true;
+            Ok(())
         })?;
+        if owns {
+            if !out.as_slice().iter().any(|(p, _)| core::ptr::eq(*p, e)) {
+                out.push((e as *const _, e)).map_err(|_| arena_full())?;
+            }
+            return Ok(());
+        }
     }
     walk_children(e, &mut |child| {
         collect_grouped_aggs(child, out, storage, txid, columns)
     })
+}
+
+/// Adds the subqueries of a grouped window query's output to `out` after its
+/// aggregates: each runs once per group in the grouped derived table, where
+/// its references to this query's grouping keys resolve and an ungrouped one
+/// fails as in a grouped query without windows. A subquery inside an
+/// aggregate's arguments runs per input row and stays there; one whose
+/// operand holds a window function stays in the window layer.
+fn collect_grouped_sublinks<'a>(
+    e: &'a Expr<'a>,
+    out: &mut ArenaList<'a, (*const Expr<'a>, &'a Expr<'a>)>,
+) -> Result<(), SqlError> {
+    if out.as_slice().iter().any(|(p, _)| core::ptr::eq(*p, e)) {
+        return Ok(());
+    }
+    if is_sublink(e) && !expr_has_window(e) {
+        return out.push((e as *const _, e)).map_err(|_| arena_full());
+    }
+    if let Expr::Call {
+        over: Some(spec),
+        args,
+        filter,
+        ..
+    } = e
+    {
+        for argument in args
+            .iter()
+            .copied()
+            .chain(spec.partition_by.iter().copied())
+        {
+            collect_grouped_sublinks(argument, out)?;
+        }
+        for key in spec.order_by {
+            collect_grouped_sublinks(key.expression, out)?;
+        }
+        if let Some(frame) = &spec.frame {
+            for bound in [&frame.start, &frame.end] {
+                if let FrameBound::Preceding(x) | FrameBound::Following(x) = bound {
+                    collect_grouped_sublinks(x, out)?;
+                }
+            }
+        }
+        if let Some(filter) = filter {
+            collect_grouped_sublinks(filter, out)?;
+        }
+        return Ok(());
+    }
+    walk_children(e, &mut |child| collect_grouped_sublinks(child, out))
 }
 
 /// Context for [`rewrite_grouped_expr`]: the inner derived table's exposed
@@ -9167,18 +9222,17 @@ fn rewrite_grouped_expr<'a>(
             // A name outside the query's sources is an outer reference, such as
             // a PL/pgSQL variable, and stays constant in every group; evaluation
             // reports it if nothing defines it. A known one is ungrouped.
-            if let Some(scope) = context.scope
-                && scope.find_column(*qualifier, name).is_err()
-            {
-                return Ok(e);
+            match context.scope {
+                Some(scope) if scope.find_column(*qualifier, name).is_err() => Ok(e),
+                Some(scope) => Err(group::ungrouped_error(e, scope)),
+                None => Err(sql_err!(
+                    sqlstate::GROUPING_ERROR,
+                    "column \"{}{}{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                    qualifier.unwrap_or(""),
+                    if qualifier.is_some() { "." } else { "" },
+                    name
+                )),
             }
-            Err(sql_err!(
-                sqlstate::GROUPING_ERROR,
-                "column \"{}{}{}\" must appear in the GROUP BY clause or be used in an aggregate function",
-                qualifier.unwrap_or(""),
-                if qualifier.is_some() { "." } else { "" },
-                name
-            ))
         }
         Expr::Unary { operator, operand , .. } => {
             alloc(Expr::Unary {source_position: e.source_position(),  operator: *operator, operand: rewrite(operand)? })
@@ -9946,7 +10000,16 @@ pub(crate) fn select_query_resumable<'a>(
     collect_table_sample_expressions(from, &mut sub_exprs[sample_start..]);
     // Uncorrelated subqueries are evaluated once; correlated ones are deferred
     // and re-evaluated per outer row during the scan.
-    let outer_subs = match prepare_outer_subqueries(sub_exprs, storage, txid, arena, params, seq) {
+    let join_subqueries = ProceduralSubqueries { storage, txid };
+    let outer_subs = match prepare_outer_subqueries(
+        sub_exprs,
+        statement.from.as_ref(),
+        storage,
+        txid,
+        arena,
+        params,
+        seq,
+    ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -9967,7 +10030,7 @@ pub(crate) fn select_query_resumable<'a>(
         group: None,
         aggs: None,
         subs: Some(&outer_subs.base),
-        subquery_executor: None,
+        subquery_executor: Some(&join_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -10032,14 +10095,16 @@ pub(crate) fn select_query_resumable<'a>(
     }
     responder.row_description(&columns[..n_cols])?;
 
-    let offset = match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks) {
-        Ok(o) => o,
-        Err(e) => return sql_fail(e),
-    };
-    let limit = match super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks) {
-        Ok(l) => l,
-        Err(e) => return sql_fail(e),
-    };
+    let offset =
+        match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, None) {
+            Ok(o) => o,
+            Err(e) => return sql_fail(e),
+        };
+    let limit =
+        match super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, None) {
+            Ok(l) => l,
+            Err(e) => return sql_fail(e),
+        };
 
     // LIMIT 0 returns no rows without scanning or projecting anything, as
     // PostgreSQL does — so a per-row error in an unreturned row does not
@@ -10832,14 +10897,16 @@ pub(crate) fn constant_select_resumable<'a>(
         }
     }
 
-    let offset = match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks) {
-        Ok(o) => o,
-        Err(e) => return sql_fail(e),
-    };
-    let limit = match super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks) {
-        Ok(l) => l,
-        Err(e) => return sql_fail(e),
-    };
+    let offset =
+        match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, None) {
+            Ok(o) => o,
+            Err(e) => return sql_fail(e),
+        };
+    let limit =
+        match super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, None) {
+            Ok(l) => l,
+            Err(e) => return sql_fail(e),
+        };
     let project_set = if limit == 0 {
         srf::ProjectSet::empty()
     } else {
@@ -11222,8 +11289,10 @@ fn select_into_rows_mode<'a>(
         }
         let (mut rows, _target, n) =
             setops::materialize_set_body_tied(storage, txid, tree, arena, params, seq, outer)?;
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+        let offset =
+            super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+        let limit =
+            super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         // A trailing ORDER BY needs one final sort over the combined multiset.
         let columns_owned = if statement.order_by.is_empty() {
             None
@@ -11432,8 +11501,9 @@ fn select_into_rows_mode<'a>(
                 ..hooks
             };
             let offset =
-                super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-            let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+                super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+            let limit =
+                super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
             if limit == 0 || offset > 0 {
                 return Ok(());
             }
@@ -11487,12 +11557,21 @@ fn select_into_rows_mode<'a>(
             }
         }
         collect_table_sample_expressions(from, &mut sub_exprs[2 + statement.items.len()..]);
-        let outer_subs = prepare_outer_subqueries(sub_exprs, storage, txid, arena, params, seq)?;
+        let join_subqueries = ProceduralSubqueries { storage, txid };
+        let outer_subs = prepare_outer_subqueries(
+            sub_exprs,
+            statement.from.as_ref(),
+            storage,
+            txid,
+            arena,
+            params,
+            seq,
+        )?;
         let hooks = EvalHooks {
             group: None,
             aggs: None,
             subs: Some(&outer_subs.base),
-            subquery_executor: None,
+            subquery_executor: Some(&join_subqueries),
             windows: None,
             catalog: Some(&catalog),
             srf_index: None,
@@ -11513,8 +11592,10 @@ fn select_into_rows_mode<'a>(
             outer_subs.correlated,
             outer,
         )?;
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+        let offset =
+            super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+        let limit =
+            super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         let start = (offset as usize).min(rows.len());
         let n = ((rows.len() - start) as u64).min(limit) as usize;
         for row in &rows[start..start + n] {
@@ -11564,8 +11645,10 @@ fn select_into_rows_mode<'a>(
                 emit,
             );
         }
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+        let offset =
+            super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+        let limit =
+            super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         if limit == 0 {
             return Ok(());
         }
@@ -11645,8 +11728,9 @@ fn select_into_rows_mode<'a>(
         return Ok(());
     };
 
-    let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-    let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+    let offset =
+        super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+    let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
     if limit == 0 {
         // Plan the schema without materializing derived inputs or evaluating
         // subqueries/projections that Limit will never request.
@@ -11686,14 +11770,23 @@ fn select_into_rows_mode<'a>(
             arena,
         },
     };
-    let outer_subs = prepare_outer_subqueries(sub_exprs, storage, txid, arena, params, seq)?;
+    let join_subqueries = ProceduralSubqueries { storage, txid };
+    let outer_subs = prepare_outer_subqueries(
+        sub_exprs,
+        statement.from.as_ref(),
+        storage,
+        txid,
+        arena,
+        params,
+        seq,
+    )?;
     let correlated = outer_subs.correlated;
     let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
     let hooks = EvalHooks {
         group: None,
         aggs: None,
         subs: Some(&outer_subs.base),
-        subquery_executor: None,
+        subquery_executor: Some(&join_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -12777,6 +12870,39 @@ pub(crate) fn subquery_result_type<'a>(
     result
 }
 
+/// [`subquery_result_type`] for a subquery whose enclosing columns are known
+/// only by their types, such as a procedural row or a correlated level.
+pub(crate) fn subquery_result_type_with_outer<'a>(
+    expression: &'a Expr<'a>,
+    outer: &dyn ColumnLookup<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<SubqueryResultType>, SqlError> {
+    let (select, array) = match expression {
+        Expr::Subquery(select) => (select, false),
+        Expr::ArraySubquery(select) => (select, true),
+        _ => return Ok(None),
+    };
+    let mark = arena.mark();
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let result = describe_select(
+        select,
+        storage,
+        txid,
+        arena,
+        &mut columns,
+        crate::sql::exec::DescriptionTarget::Sql,
+        Some(outer),
+    )
+    .and_then(|count| subquery_column_result(&columns[..count], array));
+    // SAFETY: only the scalar description escapes the describe scope.
+    unsafe {
+        arena.rewind_to(mark);
+    }
+    result.map(Some)
+}
+
 fn subquery_result_type_inner<'a>(
     expression: &Expr<'a>,
     outer_scope: Option<&QueryScope<'a>>,
@@ -12831,7 +12957,15 @@ fn subquery_result_type_inner<'a>(
             )?,
         }
     };
-    if count != 1 {
+    subquery_column_result(&columns[..count], array).map(Some)
+}
+
+/// The type of a scalar or `ARRAY` subquery producing `columns`.
+fn subquery_column_result(
+    columns: &[ColDesc<'_>],
+    array: bool,
+) -> Result<SubqueryResultType, SqlError> {
+    if columns.len() != 1 {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
             "subquery must return only one column"
@@ -12840,11 +12974,11 @@ fn subquery_result_type_inner<'a>(
     let element = columns[0];
     let element_oid = element.type_oid;
     if !array {
-        return Ok(Some(SubqueryResultType {
+        return Ok(SubqueryResultType {
             type_oid: element.type_oid,
             typlen: element.typlen,
             type_mod: element.type_mod,
-        }));
+        });
     }
     let array_oid = match super::exec::coltype_of_oid(element_oid) {
         Some(ColType::Array(_)) => Some(element_oid),
@@ -12877,12 +13011,10 @@ fn subquery_result_type_inner<'a>(
                 "ARRAY subquery result type is not supported"
             )
         })
-        .map(|type_oid| {
-            Some(SubqueryResultType {
-                type_oid,
-                typlen: -1,
-                type_mod: -1,
-            })
+        .map(|type_oid| SubqueryResultType {
+            type_oid,
+            typlen: -1,
+            type_mod: -1,
         })
 }
 
@@ -13555,20 +13687,18 @@ fn describe_scope_record_star<'q>(
     Ok(n)
 }
 
-/// Resolves column types across all tables in a join scope.
-/// Aggregate argument types inside a query that has outer references, such
-/// as PL/pgSQL variables: the query's own columns first, then the outer ones.
-/// Without outer references the query's columns alone resolve them.
-fn aggregate_outer_columns<'s, 'd, 'o, 'r, 'c>(
-    scope: Option<&'s QueryScope<'d>>,
+/// Aggregate calls resolve their arguments against the query's scope, then any
+/// outer row, with catalog identities for domains, routines and subqueries.
+fn aggregate_columns<'s, 'd, 'o, 'r, 'c>(
+    scope: &'s QueryScope<'d>,
     outer: Option<&'o dyn ColumnLookup<'r>>,
     storage: &'c Storage,
     txid: u32,
     arena: &'c Arena,
-) -> Option<subquery::SubqueryColumns<'s, 'd, 'o, 'r, 'c>> {
-    outer.map(|outer| subquery::SubqueryColumns {
-        scope,
-        outer: Some(outer),
+) -> subquery::SubqueryColumns<'s, 'd, 'o, 'r, 'c> {
+    subquery::SubqueryColumns {
+        scope: Some(scope),
+        outer,
         catalog: super::exec::CatalogCols {
             definition: None,
             alias: None,
@@ -13577,9 +13707,10 @@ fn aggregate_outer_columns<'s, 'd, 'o, 'r, 'c>(
             txid,
             arena,
         },
-    })
+    }
 }
 
+/// Resolves column types across all tables in a join scope.
 pub(super) struct ScopeCols<'s, 'd>(pub(super) &'s QueryScope<'d>);
 impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     fn is_empty_scope(&self) -> bool {

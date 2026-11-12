@@ -554,12 +554,8 @@ pub(super) fn groups_for_mask<'a>(
     let output_correlated = output_correlated.as_slice();
 
     let n_aggs = agg_nodes.len();
-    let scope_columns = super::ScopeCols(scope);
-    let outer_columns = super::aggregate_outer_columns(Some(scope), outer, storage, txid, arena);
-    let aggregate_columns: &dyn crate::sql::exec::ColTypeResolver = match &outer_columns {
-        Some(columns) => columns,
-        None => &scope_columns,
-    };
+    let aggregate_columns_resolver = super::aggregate_columns(scope, outer, storage, txid, arena);
+    let aggregate_columns: &dyn crate::sql::exec::ColTypeResolver = &aggregate_columns_resolver;
     let states: &mut [AggState] = arena
         .alloc_slice_with(n_groups * n_aggs.max(1), |_| AggState::default())
         .map_err(|_| arena_full())?;
@@ -1456,7 +1452,7 @@ fn expand_grouped_stars<'a>(
 
 /// PostgreSQL's ungrouped-column error, naming the column as `table.column`
 /// however the query spelled it.
-fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
+pub(super) fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
     let (qualifier, name) = match column {
         Expr::Column { qualifier, name } => (*qualifier, *name),
         _ => (None, ""),

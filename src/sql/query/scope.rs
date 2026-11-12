@@ -421,7 +421,7 @@ struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
 
 /// Schema construction can inspect a caller's columns without retaining values
 /// whose lifetime belongs to that caller's row scratch.
-struct OuterColumnTypes<'s, 'row>(&'s dyn ColumnLookup<'row>);
+pub(crate) struct OuterColumnTypes<'s, 'row>(pub(crate) &'s dyn ColumnLookup<'row>);
 
 impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
     fn whole_row_field_metadata(
@@ -871,6 +871,65 @@ impl<'d> QueryScope<'d> {
         Ok(())
     }
 
+    /// A derived table's columns. A set operation, or a body reading the
+    /// enclosing query's columns, is described against the columns it sees:
+    /// the enclosing row and, for `LATERAL`, the FROM items to its left.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "derived table description carries its catalog and visible columns"
+    )]
+    fn derived_definition<'a>(
+        &self,
+        storage: &'a Storage,
+        sub: &'a crate::sql::ast::Select<'a>,
+        tref: &TableRef<'_>,
+        exposed: &str,
+        txid: u32,
+        arena: &'a Arena,
+        enclosing: Option<&dyn ColumnLookup<'_>>,
+    ) -> Result<RelationDefinition<'a>, SqlError> {
+        let lateral = tref.lateral.then_some(self);
+        let contextual = match enclosing {
+            Some(_) => {
+                sub.set_body.is_some()
+                    || super::subquery::select_reads_enclosing(sub, lateral, storage, txid, arena)?
+            }
+            None => lateral.is_some() && sub.set_body.is_some(),
+        };
+        if !contextual {
+            return super::srf::describe_derived_definition(
+                storage,
+                sub,
+                exposed,
+                tref.col_alias,
+                txid,
+                arena,
+                lateral,
+            );
+        }
+        let empty = crate::sql::eval::NoColumns;
+        let lateral_types = lateral.map(ScopeTypes);
+        let enclosing_types = enclosing.map(OuterColumnTypes);
+        let visible = Chained {
+            inner: match &lateral_types {
+                Some(types) => types,
+                None => &empty,
+            },
+            outer: enclosing_types
+                .as_ref()
+                .map(|types| types as &dyn ColumnLookup<'a>),
+        };
+        super::srf::describe_contextual_derived_definition(
+            storage,
+            sub,
+            exposed,
+            tref.col_alias,
+            txid,
+            arena,
+            &visible,
+        )
+    }
+
     /// Add one FROM item, materializing a derived table if `tref` is a subquery.
     #[expect(
         clippy::too_many_arguments,
@@ -954,15 +1013,8 @@ impl<'d> QueryScope<'d> {
         // (a body may project an outer column); a plain derived table is typed
         // on its own. Its rows are materialized per outer row by the scan, so
         // register an empty placeholder here rather than running it now.
-        let mut definition = super::srf::describe_derived_definition(
-            storage,
-            sub,
-            exposed,
-            tref.col_alias,
-            txid,
-            arena,
-            tref.lateral.then_some(&*self),
-        )?;
+        let mut definition =
+            self.derived_definition(storage, sub, tref, exposed, txid, arena, outer)?;
         if let Some(slot) = tref.view_access {
             let view = storage.view(usize::from(slot));
             definition.schema = view.schema_for(txid);
@@ -992,7 +1044,7 @@ impl<'d> QueryScope<'d> {
                 sub,
                 arena,
                 params,
-                None,
+                outer,
                 sequences,
                 &mut |values| {
                     storage
@@ -1024,7 +1076,7 @@ impl<'d> QueryScope<'d> {
                 sub,
                 arena,
                 params,
-                None,
+                outer,
                 sequences,
                 &mut |values| {
                     let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
@@ -1182,15 +1234,8 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let mut definition = super::srf::describe_derived_definition(
-            storage,
-            sub,
-            exposed,
-            tref.col_alias,
-            txid,
-            arena,
-            tref.lateral.then_some(&*self),
-        )?;
+        let mut definition =
+            self.derived_definition(storage, sub, tref, exposed, txid, arena, outer)?;
         if let Some(slot) = tref.view_access {
             let view = storage.view(usize::from(slot));
             definition.schema = view.schema_for(txid);

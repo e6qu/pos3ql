@@ -2161,10 +2161,20 @@ impl<'a> RetainedSelect<'a> {
                 "cursor bounds were evaluated before its plan started"
             ));
         };
-        let offset =
-            super::super::exec::eval_offset_pub(offset, work, params, &crate::sql::eval::NO_HOOKS)?;
-        let count =
-            super::super::exec::eval_limit_pub(limit, work, params, &crate::sql::eval::NO_HOOKS)?;
+        let offset = super::super::exec::eval_offset_pub(
+            offset,
+            work,
+            params,
+            &crate::sql::eval::NO_HOOKS,
+            None,
+        )?;
+        let count = super::super::exec::eval_limit_pub(
+            limit,
+            work,
+            params,
+            &crate::sql::eval::NO_HOOKS,
+            None,
+        )?;
         *self.plan.bounds_mut() = RowBounds::Active {
             skip: 0,
             remaining: u64::MAX,
@@ -3221,12 +3231,14 @@ impl<'a> RetainedSelect<'a> {
                     arena,
                     params,
                     &super::super::eval::NO_HOOKS,
+                    None,
                 )?,
                 remaining: super::super::exec::eval_limit_pub(
                     statement.limit,
                     arena,
                     params,
                     &super::super::eval::NO_HOOKS,
+                    None,
                 )?,
             }
         } else {
@@ -3588,12 +3600,14 @@ impl<'a> RetainedSelect<'a> {
                     arena,
                     params,
                     &super::super::eval::NO_HOOKS,
+                    None,
                 )?,
                 remaining: super::super::exec::eval_limit_pub(
                     statement.limit,
                     arena,
                     params,
                     &super::super::eval::NO_HOOKS,
+                    None,
                 )?,
             }
         } else {
@@ -4005,12 +4019,14 @@ impl<'a> RetainedSelect<'a> {
                     work,
                     params,
                     &crate::sql::eval::NO_HOOKS,
+                    None,
                 )?,
                 remaining: super::super::exec::eval_limit_pub(
                     limit,
                     work,
                     params,
                     &crate::sql::eval::NO_HOOKS,
+                    None,
                 )?,
             };
         }

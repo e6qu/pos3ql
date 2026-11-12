@@ -327,21 +327,11 @@ rejected with `0A000`, and a label-qualified loop variable (`<<l>> FOR i IN
 1..2 LOOP ... l.i`) fails as an unknown table; exception conditions are
 limited to a fixed list of names (`SQLSTATE` codes work for every condition);
 trigger functions cannot open cursors (`OPEN`, cursor `FOR` loops) and fail
-with `0A000`. An aggregate in a subquery that reads only an outer query's columns
-belongs to that query, as in PostgreSQL, except through a subquery in `FROM`
-or a set operation, whose outer references fail as missing FROM-clause
-entries (see below); a `UNION` subquery reading an outer column fails the same
-way, and a correlated `LIMIT` or `JOIN ... ON` inside a subquery cannot read
-an outer column. A subquery reading an aggregate of a query that also has
-window functions fails with `0A000`. `UPDATE` and `DELETE` run their
+with `0A000`. `UPDATE` and `DELETE` run their
 subqueries once per statement, so a subquery correlated with the target table
 fails as a missing FROM-clause entry, and an aggregate of the target table in
 one is not rejected as PostgreSQL's `aggregate functions are not allowed in
-UPDATE`. An aggregate whose argument is a scalar subquery (`SELECT
-sum((SELECT v FROM u LIMIT 1)) FROM t`) fails with `42725` (`function sum is
-not unique`), and `CREATE VIEW` over a query with a correlated scalar
-subquery fails with `XX000` (`column dependency has no owning relation
-dependency`). An uncorrelated `IN`, `ANY` or `ALL` subquery runs before
+UPDATE`. An uncorrelated `IN`, `ANY` or `ALL` subquery runs before
 the query's first row, where PostgreSQL runs it at its first use: `SELECT id
 FROM t WHERE id IN (SELECT 1/x FROM z) AND false` fails with `22012` here and
 returns no rows in PostgreSQL. A SQL function whose earlier
@@ -380,9 +370,7 @@ found when the function runs. An error raised while PostgreSQL inlines a SQL fun
 variable could win. PostgreSQL fixes a function's `plpgsql.variable_conflict`
 when its creating session validates it at `CREATE FUNCTION`; pos3ql reads it
 at the backend's first call. A function-qualified parameter (`f.a` in function `f`)
-fails as a missing FROM-clause entry, as does a subquery in FROM that reads a
-column of an enclosing query (`EXISTS (SELECT 1 FROM (SELECT 10 / t.x) s)`,
-which PostgreSQL evaluates per outer row), and PL/pgSQL `INSERT`, `UPDATE` and
+fails as a missing FROM-clause entry, and PL/pgSQL `INSERT`, `UPDATE` and
 `DELETE ... RETURNING ... INTO` fail with a syntax error at `INTO`. A constant compared
 with a column inside a subquery (`SELECT (SELECT a FROM t WHERE a = 'q')`) is
 checked only when a row is compared, so an empty table returns NULL where

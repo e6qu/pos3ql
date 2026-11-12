@@ -597,7 +597,7 @@ impl CursorQuery {
         txid: u32,
         work: &Arena,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-        invocations: &crate::sql::query::RoutineInvocationState,
+        invocations: Option<&crate::sql::query::RoutineInvocationState>,
         frame: &Arena,
     ) -> Result<bool, SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
@@ -612,7 +612,7 @@ impl CursorQuery {
                         work,
                         bound.params,
                         sequences,
-                        Some(invocations),
+                        invocations,
                         frame,
                     )
             })
@@ -637,7 +637,7 @@ impl CursorQuery {
         txid: u32,
         work: &Arena,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-        invocations: &crate::sql::query::RoutineInvocationState,
+        invocations: Option<&crate::sql::query::RoutineInvocationState>,
         frame: &'frame Arena,
     ) -> Result<&'frame [Datum<'frame>], SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
@@ -653,7 +653,7 @@ impl CursorQuery {
                         work,
                         bound.params,
                         sequences,
-                        Some(invocations),
+                        invocations,
                         frame,
                     )
             })

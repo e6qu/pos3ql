@@ -368,20 +368,24 @@ pub const MAX_PROJ: usize = 1_664;
 pub const QUERY_STACK_BYTES: usize = 128 << 20;
 
 /// The session services a statement lends to the triggers it fires while it
-/// holds the engine's storage: sequence state and the session's SQL cursors.
+/// holds the engine's storage: sequence state, the session's SQL cursors, and
+/// the query workspace's scan buffers a cursor reads its next rows with.
 pub(crate) struct TriggerServices<'s> {
     pub(crate) seq_session: &'s crate::sql::guc::SeqSession,
     pub(crate) cursors: &'s mut crate::sql::cursor::CursorPool,
+    pub(crate) row_buffers: &'s mut crate::storage::RowCursorBuffers,
 }
 
 impl<'s> TriggerServices<'s> {
     pub(crate) fn new(
         seq_session: &'s crate::sql::guc::SeqSession,
         cursors: &'s mut crate::sql::cursor::CursorPool,
+        row_buffers: &'s mut crate::storage::RowCursorBuffers,
     ) -> Self {
         Self {
             seq_session,
             cursors,
+            row_buffers,
         }
     }
 
@@ -389,6 +393,7 @@ impl<'s> TriggerServices<'s> {
         TriggerServices {
             seq_session: self.seq_session,
             cursors: self.cursors,
+            row_buffers: self.row_buffers,
         }
     }
 }
@@ -401,12 +406,35 @@ pub(crate) struct ReplicationTriggerContext<'a, 'response> {
 }
 
 impl<'a, 'response> ReplicationTriggerContext<'a, 'response> {
+    /// The apply worker's session with the engine workspace's scan buffers.
     pub(crate) fn new(
-        services: TriggerServices<'a>,
+        session: ReplicationSession<'a, 'response>,
+        row_buffers: &'a mut crate::storage::RowCursorBuffers,
+    ) -> Self {
+        Self {
+            services: TriggerServices::new(session.seq_session, session.cursors, row_buffers),
+            responder: session.responder,
+        }
+    }
+}
+
+/// The apply worker's sequence state, cursors and response buffer, which the
+/// engine joins with its workspace to fire replicated rows' triggers.
+pub(crate) struct ReplicationSession<'a, 'response> {
+    seq_session: &'a crate::sql::guc::SeqSession,
+    cursors: &'a mut crate::sql::cursor::CursorPool,
+    responder: &'a mut Responder<'response>,
+}
+
+impl<'a, 'response> ReplicationSession<'a, 'response> {
+    pub(crate) fn new(
+        seq_session: &'a crate::sql::guc::SeqSession,
+        cursors: &'a mut crate::sql::cursor::CursorPool,
         responder: &'a mut Responder<'response>,
     ) -> Self {
         Self {
-            services,
+            seq_session,
+            cursors,
             responder,
         }
     }
@@ -25055,7 +25083,7 @@ impl<'s, 'a, 'b> TriggerExecContext<'s, 'a, 'b> {
                 ..
             } => (
                 &mut engine.storage,
-                TriggerServices::new(guc.seq_session(), cursors),
+                TriggerServices::new(guc.seq_session(), cursors, engine.work.row_cursor_buffers()),
             ),
         };
         (storage, self.txn, self.responder, services)
@@ -27984,7 +28012,11 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     txn,
                     context.arena,
-                    &mut TriggerServices::new(guc.seq_session(), cursors),
+                    &mut TriggerServices::new(
+                        guc.seq_session(),
+                        cursors,
+                        engine.work.row_cursor_buffers(),
+                    ),
                     tables,
                     *restart_identity,
                     *cascade,
@@ -31023,8 +31055,7 @@ fn execute_trigger_step_in<'a>(
                             PlpgsqlExecHost::Atomic { storage, services } => (
                                 super::fetch_trigger_cursor(
                                     storage,
-                                    services.seq_session,
-                                    services.cursors,
+                                    services,
                                     arena,
                                     context.txn.txid,
                                     name,
@@ -31658,8 +31689,7 @@ fn execute_trigger_step_in<'a>(
                                 PlpgsqlExecHost::Atomic { storage, services } => {
                                     super::fetch_trigger_cursor(
                                         storage,
-                                        services.seq_session,
-                                        services.cursors,
+                                        services,
                                         arena,
                                         context.txn.txid,
                                         name,

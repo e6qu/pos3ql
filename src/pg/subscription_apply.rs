@@ -913,11 +913,9 @@ impl SubscriptionApply {
                 let mut responder = Responder::new(&mut self.trigger_response);
                 responder.begin_discard_query_output(ExplainSerialize::None);
                 let result = {
-                    let mut trigger_context = crate::sql::exec::ReplicationTriggerContext::new(
-                        crate::sql::exec::TriggerServices::new(
-                            self.guc.seq_session(),
-                            &mut self.cursors,
-                        ),
+                    let session = crate::sql::exec::ReplicationSession::new(
+                        self.guc.seq_session(),
+                        &mut self.cursors,
                         &mut responder,
                     );
                     let binding = engine.resolve_subscription_relation(
@@ -931,7 +929,7 @@ impl SubscriptionApply {
                         binding,
                         new,
                         &self.arena,
-                        &mut trigger_context,
+                        session,
                     )
                 };
                 let _ = responder.finish_discard_query_output();
@@ -964,11 +962,9 @@ impl SubscriptionApply {
                 let mut responder = Responder::new(&mut self.trigger_response);
                 responder.begin_discard_query_output(ExplainSerialize::None);
                 let result = {
-                    let mut trigger_context = crate::sql::exec::ReplicationTriggerContext::new(
-                        crate::sql::exec::TriggerServices::new(
-                            self.guc.seq_session(),
-                            &mut self.cursors,
-                        ),
+                    let session = crate::sql::exec::ReplicationSession::new(
+                        self.guc.seq_session(),
+                        &mut self.cursors,
                         &mut responder,
                     );
                     let binding = engine.resolve_subscription_relation(
@@ -982,7 +978,7 @@ impl SubscriptionApply {
                         binding,
                         crate::sql::exec::ReplicationUpdate { identity, new },
                         &self.arena,
-                        &mut trigger_context,
+                        session,
                     )
                 };
                 let _ = responder.finish_discard_query_output();
@@ -1014,11 +1010,9 @@ impl SubscriptionApply {
                 let mut responder = Responder::new(&mut self.trigger_response);
                 responder.begin_discard_query_output(ExplainSerialize::None);
                 let result = {
-                    let mut trigger_context = crate::sql::exec::ReplicationTriggerContext::new(
-                        crate::sql::exec::TriggerServices::new(
-                            self.guc.seq_session(),
-                            &mut self.cursors,
-                        ),
+                    let session = crate::sql::exec::ReplicationSession::new(
+                        self.guc.seq_session(),
+                        &mut self.cursors,
                         &mut responder,
                     );
                     let binding = engine.resolve_subscription_relation(
@@ -1032,7 +1026,7 @@ impl SubscriptionApply {
                         binding,
                         old,
                         &self.arena,
-                        &mut trigger_context,
+                        session,
                     )
                 };
                 let _ = responder.finish_discard_query_output();

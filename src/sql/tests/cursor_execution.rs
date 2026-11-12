@@ -3168,3 +3168,59 @@ fn open_cursors_keep_the_tables_they_read_in_use() {
         ["1", "2"]
     );
 }
+
+/// A trigger fired inside a writing statement reads a session cursor that
+/// evaluates its rows as fetched; one that locks its rows or calls a
+/// user-defined routine for each row is rejected loudly, not misread.
+#[test]
+fn triggers_fetch_streaming_session_cursors() {
+    let config = test_config("trigger-streaming-cursor");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE streamed (a int); INSERT INTO streamed SELECT generate_series(1, 4); \
+         CREATE TABLE fetched (v int); CREATE TABLE fired (a int); \
+         CREATE FUNCTION plus(x int) RETURNS int LANGUAGE sql VOLATILE AS 'SELECT x + 1'; \
+         CREATE FUNCTION take() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         DECLARE v int; c refcursor := 'streaming'; \
+         BEGIN FETCH c INTO v; INSERT INTO fetched VALUES (v); RETURN NEW; END $$; \
+         CREATE TRIGGER take BEFORE INSERT ON fired FOR EACH ROW EXECUTE FUNCTION take()",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; DECLARE streaming NO SCROLL CURSOR FOR SELECT a * 10 FROM streamed; \
+             INSERT INTO fired VALUES (1), (2); FETCH NEXT FROM streaming; \
+             SELECT v FROM fetched ORDER BY v; ROLLBACK",
+            true
+        )),
+        ["30", "10", "20"]
+    );
+    for (declare, message) in [
+        (
+            "DECLARE streaming CURSOR FOR SELECT a FROM streamed FOR UPDATE",
+            "cursor \"streaming\" locks its rows when fetched, which is not supported in \
+             trigger execution",
+        ),
+        (
+            "DECLARE streaming NO SCROLL CURSOR FOR SELECT plus(a) FROM streamed",
+            "cursor \"streaming\" calls a user-defined routine for each fetched row, which is \
+             not supported in trigger execution",
+        ),
+    ] {
+        let output = String::from_utf8_lossy(&session.execute(
+            &mut engine,
+            &format!("BEGIN; {declare}; INSERT INTO fired VALUES (1)"),
+            true,
+        ))
+        .to_string();
+        assert!(
+            output.contains("0A000") && output.contains(message),
+            "{declare}: {output}"
+        );
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+}

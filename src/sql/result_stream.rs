@@ -482,7 +482,7 @@ impl Engine {
                         txid,
                         work,
                         Some(sequences),
-                        invocations,
+                        Some(invocations),
                         frame,
                     )
                 },
@@ -510,7 +510,7 @@ impl Engine {
                             txid,
                             work,
                             Some(sequences),
-                            invocations,
+                            Some(invocations),
                             frame,
                         )
                     },

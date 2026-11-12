@@ -317,9 +317,9 @@ PostgreSQL types it as the table's row type `t`. A row constructor casts to a ta
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. A trigger fired
-inside a writing statement cannot `FETCH` from a session cursor that
-evaluates rows as fetched, or first read one whose data-modifying `WITH`
-queries have not run (`0A000`). A `LATERAL`
+inside a writing statement cannot `FETCH` from a session cursor that locks
+its rows or calls a user-defined routine for each fetched row, or first read
+one whose data-modifying `WITH` queries have not run (`0A000`). A `LATERAL`
 subquery that reads an earlier item's column fails when its own output
 column has the same name (`SELECT * FROM generate_series(1,2) g, LATERAL
 (SELECT g) x` reports `column reference "g" is ambiguous`) or when that item

@@ -47692,6 +47692,16 @@ impl Storage {
         })
     }
 
+    /// Whether a visible routine with this name returns a set.
+    pub(crate) fn has_set_returning_routine_named(&self, name: &str, txid: u32) -> bool {
+        self.routine_entries().any(|(slot, routine)| {
+            routine.database == current_database()
+                && routine.visible_to(txid)
+                && routine.name_for(txid).as_str() == name
+                && self.routine_for(slot, txid).kind.is_set_returning()
+        })
+    }
+
     /// Visible routines with this schema and name, in catalog order.
     pub(crate) fn routine_slots_named<'s>(
         &'s self,

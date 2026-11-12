@@ -64,6 +64,30 @@ fn volatile_user_call(
     Ok(found)
 }
 
+/// Whether `expression` calls a user routine that returns a set: such an
+/// output item multiplies the source's rows, so its calls cannot run later.
+fn set_returning_user_call(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<bool, SqlError> {
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::Routine,
+        name,
+        ..
+    } = expression
+        && storage.has_set_returning_routine_named(name.rsplit('.').next().unwrap_or(name), txid)
+    {
+        return Ok(true);
+    }
+    let mut found = false;
+    crate::sql::query::walk_children(expression, &mut |child| {
+        found |= set_returning_user_call(child, storage, txid)?;
+        Ok(())
+    })?;
+    Ok(found)
+}
+
 fn alloc<'a>(arena: &'a Arena, expression: Expr<'a>) -> Result<&'a Expr<'a>, SqlError> {
     arena
         .alloc(expression)
@@ -320,6 +344,13 @@ fn split_leaf<'a>(
             .any(|item| !matches!(item, SelectItem::Expr { .. }))
     {
         return Ok(None);
+    }
+    for item in select.items {
+        if let SelectItem::Expr { expression, .. } = item
+            && set_returning_user_call(expression, storage, txid)?
+        {
+            return Ok(None);
+        }
     }
     let mut items = ArenaList::new(arena);
     let mut hidden = ArenaList::new(arena);

@@ -386,13 +386,11 @@ fn candidate_query(select: &Select<'_>) -> bool {
     select.set_body.is_none()
         && select.with.is_empty()
         && select.from.as_ref().is_some_and(|from| {
-            // A comma item limits what later `ON` conditions may name, and a
-            // parenthesized join's members are hidden behind its alias; both
-            // keep their own FROM shape, which merging would change.
-            !from.joins.iter().any(|join| join.kind == JoinKind::Comma)
-                && core::iter::once(&from.base)
-                    .chain(from.joins.iter().map(|join| &join.table))
-                    .all(|table| table.join_members.is_none())
+            // A parenthesized join's members are hidden behind its alias,
+            // which merging would change.
+            core::iter::once(&from.base)
+                .chain(from.joins.iter().map(|join| &join.table))
+                .all(|table| table.join_members.is_none())
         })
 }
 
@@ -821,6 +819,9 @@ fn pull_up_one<'a>(
                         table: inner_from.base,
                         kind: match join.kind {
                             JoinKind::Left | JoinKind::Right if count == 0 => join.kind,
+                            // A comma item stays one: later `ON` conditions
+                            // still cannot name it.
+                            JoinKind::Comma if first_on.is_none() => JoinKind::Comma,
                             _ if first_on.is_some() => JoinKind::Inner,
                             _ => JoinKind::Cross,
                         },
@@ -929,10 +930,12 @@ fn nullable_position(from: &FromClause<'_>, position: usize, body: &FromClause<'
     if entering == Some(JoinKind::Full) || later.iter().any(|join| join.kind == JoinKind::Full) {
         return Err(Stop::Keep);
     }
-    let inner_body = body
-        .joins
-        .iter()
-        .all(|join| matches!(join.kind, JoinKind::Inner | JoinKind::Cross));
+    let inner_body = body.joins.iter().all(|join| {
+        matches!(
+            join.kind,
+            JoinKind::Inner | JoinKind::Cross | JoinKind::Comma
+        )
+    });
     match entering {
         Some(JoinKind::Left | JoinKind::Right) if !body.joins.is_empty() => Err(Stop::Keep),
         Some(_) if !inner_body => Err(Stop::Keep),
@@ -946,7 +949,8 @@ fn nullable_position(from: &FromClause<'_>, position: usize, body: &FromClause<'
 fn fromless_position(from: &FromClause<'_>, position: usize) -> Step<bool> {
     let entering = (position > 0).then(|| from.joins[position - 1].kind);
     let later = &from.joins[position..];
-    let inner = |kind: JoinKind| matches!(kind, JoinKind::Inner | JoinKind::Cross);
+    let inner =
+        |kind: JoinKind| matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Comma);
     if !entering.is_none_or(inner)
         || later
             .iter()

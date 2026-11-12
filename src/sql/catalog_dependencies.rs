@@ -846,6 +846,9 @@ pub(crate) fn for_each_dependency(
                     txid,
                 )?
             };
+            // PostgreSQL records a clone's table both as its automatic owner
+            // and as its partition secondary.
+            push!(2620, clone_oid, PG_CLASS_OID, child_relation_oid, 0, "a")?;
             push!(2620, clone_oid, 2620, parent_oid, 0, "P")?;
             push!(2620, clone_oid, PG_CLASS_OID, child_relation_oid, 0, "S")?;
         }

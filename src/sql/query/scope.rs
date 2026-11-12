@@ -407,11 +407,6 @@ pub struct QueryScope<'d> {
     /// `FromClause::joins` (whose `on` is None for such joins). Filled only
     /// on the executor path (predicate synthesis needs an arena).
     pub join_on: &'d mut [Option<&'d Expr<'d>>],
-    /// Whether the FROM item being added may refer to the items before it
-    /// without `LATERAL`. PostgreSQL makes a function implicitly lateral,
-    /// except on the nullable side of a RIGHT or FULL join, where it is read
-    /// once like any other item.
-    implicit_lateral: bool,
     /// Names exposed by unaliased parenthesized joins, each a column window
     /// of the join's single derived entry.
     members: &'d [ScopeMember<'d>],
@@ -1220,7 +1215,6 @@ impl<'d> QueryScope<'d> {
             output,
             n_output: 0,
             join_on,
-            implicit_lateral: true,
             members: &[],
             join_origins: &[],
             positional_names: &[],
@@ -2576,7 +2570,7 @@ impl<'d> QueryScope<'d> {
         // (the keyword is optional for functions in PostgreSQL) unless it is
         // the nullable side of a RIGHT or FULL join. Lateral rows are built
         // per left-hand row by the scan.
-        if tref.lateral || self.n > 0 && self.implicit_lateral {
+        if tref.lateral || self.n > 0 && !self.right_of_outer_join {
             self.names[self.n] = exposed;
             self.defs.set_arena(self.n, def_reference);
             self.derived[self.n] = Some(&[]);

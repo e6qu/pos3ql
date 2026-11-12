@@ -2866,8 +2866,18 @@ def test_database_force_terminates_live_backends_with_fatal():
     victim = connect()
     victim.sendall(startup_payload(0, parameters=(("database", "wire_force_database"),)))
     drain_startup(victim)
+    # Like PostgreSQL, an ordinary DROP waits five seconds for the backend to
+    # leave before it reports the database in use.
+    admin.settimeout(15)
+    started = time.monotonic()
     blocked = simple_query(admin, "DROP DATABASE wire_force_database")
-    check("raw wire: ordinary DROP sees the live backend", has_sqlstate(blocked, "55006"), blocked)
+    waited = time.monotonic() - started
+    admin.settimeout(5)
+    check(
+        "raw wire: ordinary DROP waits for, then reports, the live backend",
+        has_sqlstate(blocked, "55006") and waited >= 4.5,
+        (waited, blocked),
+    )
     dropped = simple_query(admin, "DROP DATABASE wire_force_database WITH (FORCE)")
     check(
         "raw wire: DROP DATABASE FORCE completes",

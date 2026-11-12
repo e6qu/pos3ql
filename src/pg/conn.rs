@@ -1372,6 +1372,16 @@ impl Conn {
         if !ready {
             return None;
         }
+        // The worker may have served another database while this statement
+        // was parked; resume it in its own database, as `process` does.
+        if matches!(self.phase, Phase::Ready | Phase::SkipToSync)
+            && self
+                .auth_database
+                .is_none_or(|database| engine.select_database(database.oid).is_err())
+        {
+            self.parked = false;
+            return Some(PendingResponse::closed());
+        }
         self.parked = false;
         let output_mark = self.output_mark();
         self.publication_hold = Some(output_mark);

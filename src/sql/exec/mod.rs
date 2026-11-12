@@ -24175,17 +24175,45 @@ impl<'a> TriggerLocalScope<'_, 'a> {
                 .copied()
                 .filter(|name| self.local_index(name).is_none() && self.variable(name).is_some())
         };
+        // `NEW` and `OLD` are read by the cursor's query as parameters, as
+        // PostgreSQL passes them to a cursor's plan; a record not assigned
+        // yet is not captured.
+        let mut records = [None; 2];
+        let mut record_count = 0;
+        for name in ["new", "old"] {
+            let Ok(record) = self.transition.record(name) else {
+                continue;
+            };
+            if matches!(record, TriggerRecordValue::Unassigned) {
+                continue;
+            }
+            let fields = self.transition.structure_fields(record, name, arena)?;
+            records[record_count] = Some((name, Datum::Record(fields)));
+            record_count += 1;
+        }
+        let records = &records[..record_count];
         let captured = arena
-            .alloc_slice_with(self.locals.len() + context_names().count(), |_| {
-                super::cursor::CursorLocal {
+            .alloc_slice_with(
+                self.locals.len() + context_names().count() + records.len(),
+                |_| super::cursor::CursorLocal {
                     name: SqlName::EMPTY,
                     type_oid: 0,
                     value: Datum::Null,
                     conflict: self.invocation.variable_conflict,
-                }
-            })
+                },
+            )
             .map_err(|_| super::query::arena_full_pub())?;
-        for (index, captured) in captured.iter_mut().enumerate() {
+        let (captured_variables, captured_records) =
+            captured.split_at_mut(captured.len() - records.len());
+        for (captured, (name, value)) in captured_records
+            .iter_mut()
+            .zip(records.iter().copied().flatten())
+        {
+            captured.name = SqlName::parse(name)?;
+            captured.value = value;
+            captured.type_oid = crate::sql::types::oid::RECORD;
+        }
+        for (index, captured) in captured_variables.iter_mut().enumerate() {
             let name = self
                 .locals
                 .get(index)
